@@ -70,9 +70,9 @@ resolve_version() {
         return
     fi
 
-    local latest
-    latest="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-        | grep '"tag_name"' | head -1 | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')"
+    local latest json
+    json="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest")"
+    latest="$(echo "$json" | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -1)"
 
     if [[ -z "$latest" ]]; then
         echo "Error: failed to resolve latest version" >&2
