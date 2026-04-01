@@ -104,9 +104,12 @@ verify_checksum() {
 }
 
 # --- Main ---
+CLEANUP_DIR=""
+cleanup() { [[ -n "$CLEANUP_DIR" ]] && rm -rf "$CLEANUP_DIR"; }
+trap cleanup EXIT
+
 main() {
     local target version archive_name download_url checksums_url
-    local tmpdir
 
     target="$(detect_target)"
     echo "Detected platform: $target"
@@ -118,8 +121,9 @@ main() {
     download_url="https://github.com/${REPO}/releases/download/${version}/${archive_name}"
     checksums_url="https://github.com/${REPO}/releases/download/${version}/SHA256SUMS.txt"
 
+    local tmpdir
     tmpdir="$(mktemp -d)"
-    trap 'rm -rf "$tmpdir"' EXIT
+    CLEANUP_DIR="$tmpdir"
 
     echo "Downloading ${archive_name} ..."
     if ! curl -fSL --progress-bar -o "${tmpdir}/${archive_name}" "$download_url"; then
