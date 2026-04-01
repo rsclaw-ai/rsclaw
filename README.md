@@ -1,10 +1,10 @@
 # RsClaw
 
-**A high-performance, multi-agent AI ecosystem with seamless OpenClaw compatibility.**
+**🦀A high-performance, multi-agent AI ecosystem with seamless OpenClaw compatibility.**
 
 [![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT%2FApache--2.0-blue)](LICENSE-MIT)
-[![Binary Size](https://img.shields.io/badge/binary-~17MB-green)]()
+[![Binary Size](https://img.shields.io/badge/binary-~12MB-green)]()
 
 **English** | [中文](README_zh.md)
 
@@ -48,8 +48,8 @@ All OpenClaw config fields are supported. Unknown fields are silently ignored fo
 | Feature | RsClaw | OpenClaw |
 |---------|--------|----------|
 | Language | Rust | TypeScript/Node.js |
-| Binary size | ~17MB | ~300MB+ (node_modules) |
-| Startup time | <100ms | 2-5s |
+| Binary size | ~12MB | ~300MB+ (node_modules) |
+| Startup time | ~26ms | 2-5s |
 | Memory usage | ~20MB idle | ~1000MB+ |
 | Dependencies | 542 (Rust crates) | 1000+ (npm) |
 | Protocol compat | OpenClaw WS v3 (full) | Native |
@@ -90,6 +90,7 @@ Local commands that bypass the LLM entirely -- zero token cost, sub-millisecond 
 | Command | Description |
 |---------|-------------|
 | `/run <cmd>` | Execute any shell command via `sh -c` (supports pipes: `ls \| grep rs`) |
+| `/sh <cmd>` / `/exec <cmd>` | Aliases for /run |
 | `$ <cmd>` | Shell shortcut (same as /run) |
 | `! <cmd>` | Shell shortcut (same as /run) |
 | `/ls [args]` | List files (behaves like native `ls`, e.g. `/ls -la src/`) |
@@ -127,6 +128,18 @@ Local commands that bypass the LLM entirely -- zero token cost, sub-millisecond 
 | `/cron list` | List scheduled cron jobs |
 | `/send <to> <msg>` | Send message to a channel/user |
 
+**Context & Side Query:**
+
+| Command | Description |
+|---------|-------------|
+| `/ctx <text>` | Add persistent background context to current session |
+| `/ctx --ttl <N> <text>` | Add context that expires after N turns |
+| `/ctx --global <text>` | Add global context (all sessions) |
+| `/ctx --list` | List active context entries |
+| `/ctx --remove <id>` | Remove context entry by id |
+| `/ctx --clear` | Clear all context for this session |
+| `/btw <question>` | Side-channel quick query (bypasses agent queue, direct LLM call) |
+
 **Memory:**
 
 | Command | Description |
@@ -145,17 +158,13 @@ Local commands that bypass the LLM entirely -- zero token cost, sub-millisecond 
 | `/config_upload_size <MB>` | Set file size limit (saved to config file) |
 | `/config_upload_chars <n>` | Set text char limit (saved to config file) |
 
-**Chinese Natural Language:**
+**Skills:**
 
 | Command | Description |
 |---------|-------------|
-| `搜索 <query>` | Web search |
-| `截屏` / `截图` | Desktop screenshot |
-| `查天气 <city>` | Weather search |
-| `几点了` | Current time |
-| `今天几号` | Current date |
-| `计算 <expr>` | Calculate expression |
-| `查IP` | Show public IP address |
+| `/skill install <name>` | Install a skill from registry |
+| `/skill list` | List installed skills |
+| `/skill search <query>` | Search skill registries |
 
 ### Exec Safety Rules
 
@@ -182,9 +191,33 @@ Limits adjustable at runtime via `/set_upload_size` and `/set_upload_chars`.
 
 Automatically detects whether the current model supports images (GPT-4V, Claude 3, Gemini, Qwen-VL, etc.). Non-vision models receive `[image]` text placeholders instead of base64 data, preventing silent token waste.
 
-### Office Document Extraction
+### Native Voice Recognition (STT)
 
-DOCX, XLSX, and PPTX files are extracted to plain text natively using the zip crate -- no external tools required. Integrated into the file upload flow.
+Multi-provider speech-to-text with automatic fallback chain:
+
+1. **Candle Whisper** -- local model (`~/.local/share/rsclaw/models/whisper-tiny`), zero API cost
+2. **whisper.cpp** -- local binary, fast CPU inference
+3. **macOS SFSpeechRecognizer** -- offline, system-level
+4. **Tencent Cloud ASR** / **Alibaba Cloud ASR** -- cloud providers
+5. **OpenAI Whisper API** -- fallback
+
+Supports WeChat SILK v3, Opus, MP3, WAV, OGG, M4A, AAC, FLAC via pure-Rust symphonia decoder with ffmpeg fallback. Traditional-to-Simplified Chinese auto-conversion.
+
+### Video & Audio Processing
+
+Video files (.mp4, .mov, .avi, .mkv, .webm) are automatically processed: audio track extracted via ffmpeg, then transcribed to text. Audio files are transcribed directly. Results are injected as `[Audio transcription from {ext} file]` context.
+
+### Document Extraction
+
+Native text extraction from multiple formats, no external tools:
+
+| Format | Method |
+|--------|--------|
+| **PDF** | `pdf_extract` crate (pure Rust), `pdftotext` fallback |
+| **DOCX** | ZIP → `word/document.xml` parsing |
+| **XLSX** | ZIP → `xl/sharedStrings.xml` parsing |
+| **PPTX** | ZIP → `ppt/slides/slide*.xml` parsing |
+| **Text/Code** | Direct read (100+ extensions auto-detected) |
 
 ### Image Compression
 
@@ -270,7 +303,7 @@ Supported platforms: macOS (x86_64, ARM64), Linux (x86_64, ARM64), Windows (x86_
 git clone https://github.com/rsclaw-ai/rsclaw.git
 cd rsclaw
 cargo build --release
-# Binary at ./target/release/rsclaw (~17MB)
+# Binary at ./target/release/rsclaw (~12MB)
 ```
 
 ### Local Cross-Compilation
@@ -423,7 +456,7 @@ Example `rsclaw.json5`:
 ```json5
 {
   gateway: {
-    port: 18789,
+    port: 18888,
     bind: "loopback",
   },
   models: {
@@ -456,6 +489,107 @@ Example `rsclaw.json5`:
 LLM providers are auto-registered from:
 1. Config `models.providers` section
 2. Environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.)
+
+### Multi-Agent Configuration
+
+```json5
+{
+  agents: {
+    defaults: {
+      model: { primary: "qwen/qwen-turbo" },
+      thinking: { level: "medium" },
+    },
+    list: [
+      {
+        id: "main",
+        default: true,
+        model: { primary: "anthropic/claude-sonnet-4-5" },
+        allowed_commands: "*",
+      },
+      {
+        id: "coder",
+        model: { primary: "anthropic/claude-sonnet-4-5" },
+        workspace: "~/projects",
+        allowed_commands: "read|write|exec",
+        temperature: 0.2,
+      },
+      {
+        id: "researcher",
+        model: { primary: "openai/gpt-4o" },
+        allowed_commands: "web_search|web_fetch|memory_search",
+      },
+    ],
+    // Remote agents via A2A protocol
+    external: [
+      {
+        id: "remote-agent",
+        url: "https://remote-gateway.example.com",
+        auth_token: "${REMOTE_AGENT_TOKEN}",
+      },
+    ],
+  },
+}
+```
+
+Collaboration modes: **sequential** (chain), **parallel** (fan-out), **orchestrated** (LLM-driven tool calls via `agent_<id>`).
+
+### Multi-Channel Configuration
+
+```json5
+{
+  channels: {
+    telegram: {
+      botToken: "${TELEGRAM_BOT_TOKEN}",  // ${VAR} env var substitution
+      dmPolicy: "pairing",               // new users must enter pairing code
+      groupPolicy: "open",
+    },
+    feishu: {
+      appId: "cli_xxxx",
+      appSecret: "${FEISHU_APP_SECRET}",
+      dmPolicy: "pairing",
+    },
+    wechat: {
+      // QR scan login via `rsclaw channels login wechat`
+      dmPolicy: "pairing",
+    },
+    discord: {
+      token: "${DISCORD_BOT_TOKEN}",
+      dmPolicy: "pairing",
+      groupPolicy: "allowlist",
+      groupAllowFrom: ["server-id-1"],
+    },
+    // Custom webhook integration
+    custom: [
+      {
+        id: "my-webhook",
+        type: "webhook",
+        replyUrl: "https://your-app.example.com/callback",
+        textPath: "$.message.text",
+        senderPath: "$.message.from",
+      },
+    ],
+  },
+}
+```
+
+Each channel supports independent DM/group policies, pairing codes, health monitoring, and agent routing. All string values support `${VAR}` environment variable substitution.
+
+### DM Pairing
+
+When `dmPolicy` is set to `"pairing"`, new users must enter a 6-character pairing code (1-hour TTL) to start chatting:
+
+```bash
+# Generate a pairing code
+rsclaw pairing pair
+
+# List active pairings
+rsclaw pairing list
+
+# Revoke a pairing
+rsclaw pairing revoke <device-id>
+```
+
+Users send the pairing code as their first message. Once paired, the device is remembered and no further pairing is needed.
 
 ### Multi-Instance
 

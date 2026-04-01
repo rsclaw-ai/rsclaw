@@ -1,10 +1,10 @@
 # RsClaw
 
-**高性能多智能体 AI 生态系统，无缝兼容 OpenClaw。**
+**🦀螃蟹高性能多智能体 AI 生态系统，无缝兼容 OpenClaw。**
 
 [![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT%2FApache--2.0-blue)](LICENSE-MIT)
-[![Binary Size](https://img.shields.io/badge/binary-~17MB-green)]()
+[![Binary Size](https://img.shields.io/badge/binary-~12MB-green)]()
 
 [English](README.md) | **中文**
 
@@ -48,8 +48,8 @@ rsclaw gateway start
 | 特性 | RsClaw | OpenClaw |
 |------|--------|----------|
 | 语言 | Rust | TypeScript/Node.js |
-| 二进制体积 | ~17MB | ~300MB+（node_modules） |
-| 启动时间 | <100ms | 2-5s |
+| 二进制体积 | ~12MB | ~300MB+（node_modules） |
+| 启动时间 | ~26ms | 2-5s |
 | 内存占用 | ~20MB 空闲 | ~1000MB+ |
 | 依赖数 | 542（Rust crates） | 1000+（npm） |
 | 协议兼容 | OpenClaw WS v3（完整） | 原生 |
@@ -90,6 +90,7 @@ rsclaw gateway start
 | 命令 | 说明 |
 |------|------|
 | `/run <cmd>` | 通过 `sh -c` 执行任意 shell 命令（支持管道：`ls \| grep rs`） |
+| `/sh <cmd>` / `/exec <cmd>` | /run 的别名 |
 | `$ <cmd>` | Shell 快捷方式（同 /run） |
 | `! <cmd>` | Shell 快捷方式（同 /run） |
 | `/ls [args]` | 列出文件（和原生 `ls` 行为一致，如 `/ls -la src/`） |
@@ -127,6 +128,18 @@ rsclaw gateway start
 | `/cron list` | 列出定时任务 |
 | `/send <to> <msg>` | 发送消息到指定通道/用户 |
 
+**上下文与侧查询：**
+
+| 命令 | 说明 |
+|------|------|
+| `/ctx <text>` | 添加持久背景上下文到当前会话 |
+| `/ctx --ttl <N> <text>` | 添加上下文（N 轮后过期） |
+| `/ctx --global <text>` | 添加全局上下文（所有会话） |
+| `/ctx --list` | 列出活跃上下文 |
+| `/ctx --remove <id>` | 按 ID 移除上下文 |
+| `/ctx --clear` | 清除当前会话所有上下文 |
+| `/btw <问题>` | 侧通道快速查询（跳过智能体队列，直接 LLM 调用） |
+
 **记忆：**
 
 | 命令 | 说明 |
@@ -145,17 +158,13 @@ rsclaw gateway start
 | `/config_upload_size <MB>` | 设置文件大小限制（写入配置文件，永久生效） |
 | `/config_upload_chars <n>` | 设置文本字符限制（写入配置文件，永久生效） |
 
-**中文自然语言：**
+**技能：**
 
 | 命令 | 说明 |
 |------|------|
-| `搜索 <query>` | 网页搜索 |
-| `截屏` / `截图` | 桌面截图 |
-| `查天气 <city>` | 天气搜索 |
-| `几点了` | 当前时间 |
-| `今天几号` | 当前日期 |
-| `计算 <expr>` | 计算表达式 |
-| `查IP` | 查看公网 IP |
+| `/skill install <name>` | 从仓库安装技能 |
+| `/skill list` | 列出已安装技能 |
+| `/skill search <query>` | 搜索技能仓库 |
 
 ### 执行安全规则
 
@@ -182,9 +191,33 @@ rsclaw gateway start
 
 自动检测当前模型是否支持图片（GPT-4V、Claude 3、Gemini、Qwen-VL 等）。非视觉模型接收 `[image]` 文本占位符而非 base64 数据，避免无声的 token 浪费。
 
-### 办公文档提取
+### 原生语音识别（STT）
 
-DOCX、XLSX、PPTX 文件使用 zip crate 原生提取为纯文本 -- 无需外部工具。已集成到文件上传流程中。
+多提供商语音转文字，自动回退链：
+
+1. **Candle Whisper** -- 本地模型，零 API 成本
+2. **whisper.cpp** -- 本地二进制，CPU 快速推理
+3. **macOS SFSpeechRecognizer** -- 离线，系统级
+4. **腾讯云 ASR** / **阿里云 ASR** -- 云服务
+5. **OpenAI Whisper API** -- 兜底
+
+支持微信 SILK v3、Opus、MP3、WAV、OGG、M4A、AAC、FLAC，纯 Rust symphonia 解码器 + ffmpeg 回退。繁简中文自动转换。
+
+### 视频与音频处理
+
+视频文件（.mp4、.mov、.avi、.mkv、.webm）自动处理：ffmpeg 提取音轨，然后转写为文本。音频文件直接转写。结果作为 `[Audio transcription from {ext} file]` 上下文注入。
+
+### 文档提取
+
+原生文本提取，无需外部工具：
+
+| 格式 | 方式 |
+|------|------|
+| **PDF** | `pdf_extract` crate（纯 Rust），`pdftotext` 回退 |
+| **DOCX** | ZIP → `word/document.xml` 解析 |
+| **XLSX** | ZIP → `xl/sharedStrings.xml` 解析 |
+| **PPTX** | ZIP → `ppt/slides/slide*.xml` 解析 |
+| **文本/代码** | 直接读取（100+ 扩展名自动识别） |
 
 ### 图片压缩
 
@@ -269,7 +302,7 @@ irm https://raw.githubusercontent.com/rsclaw-ai/rsclaw/main/scripts/install.ps1 
 git clone https://github.com/rsclaw-ai/rsclaw.git
 cd rsclaw
 cargo build --release
-# 二进制文件位于 ./target/release/rsclaw（~17MB）
+# 二进制文件位于 ./target/release/rsclaw（~12MB）
 ```
 
 ### 本地交叉编译
@@ -422,7 +455,7 @@ rsclaw --version
 ```json5
 {
   gateway: {
-    port: 18789,
+    port: 18888,
     bind: "loopback",
   },
   models: {
@@ -455,6 +488,107 @@ rsclaw --version
 LLM 提供商从以下来源自动注册：
 1. 配置文件 `models.providers` 段
 2. 环境变量（`OPENAI_API_KEY`、`ANTHROPIC_API_KEY` 等）
+
+### 多智能体配置
+
+```json5
+{
+  agents: {
+    defaults: {
+      model: { primary: "qwen/qwen-turbo" },
+      thinking: { level: "medium" },
+    },
+    list: [
+      {
+        id: "main",
+        default: true,
+        model: { primary: "anthropic/claude-sonnet-4-5" },
+        allowed_commands: "*",
+      },
+      {
+        id: "coder",
+        model: { primary: "anthropic/claude-sonnet-4-5" },
+        workspace: "~/projects",
+        allowed_commands: "read|write|exec",
+        temperature: 0.2,
+      },
+      {
+        id: "researcher",
+        model: { primary: "openai/gpt-4o" },
+        allowed_commands: "web_search|web_fetch|memory_search",
+      },
+    ],
+    // 远程智能体（A2A 协议）
+    external: [
+      {
+        id: "remote-agent",
+        url: "https://remote-gateway.example.com",
+        auth_token: "${REMOTE_AGENT_TOKEN}",
+      },
+    ],
+  },
+}
+```
+
+协作模式：**顺序执行**（链式）、**并行执行**（扇出）、**编排执行**（LLM 通过 `agent_<id>` 工具调用驱动）。
+
+### 多通道配置
+
+```json5
+{
+  channels: {
+    telegram: {
+      botToken: "${TELEGRAM_BOT_TOKEN}",  // ${VAR} 环境变量替换
+      dmPolicy: "pairing",               // 新用户需输入配对码
+      groupPolicy: "open",
+    },
+    feishu: {
+      appId: "cli_xxxx",
+      appSecret: "${FEISHU_APP_SECRET}",
+      dmPolicy: "pairing",
+    },
+    wechat: {
+      // 通过 `rsclaw channels login wechat` 扫码登录
+      dmPolicy: "pairing",
+    },
+    discord: {
+      token: "${DISCORD_BOT_TOKEN}",
+      dmPolicy: "pairing",
+      groupPolicy: "allowlist",
+      groupAllowFrom: ["server-id-1"],
+    },
+    // 自定义 Webhook 集成
+    custom: [
+      {
+        id: "my-webhook",
+        type: "webhook",
+        replyUrl: "https://your-app.example.com/callback",
+        textPath: "$.message.text",
+        senderPath: "$.message.from",
+      },
+    ],
+  },
+}
+```
+
+每个通道支持独立的 DM/群组策略、配对码、健康监控和智能体路由。所有字符串值支持 `${VAR}` 环境变量替换。
+
+### DM 配对
+
+`dmPolicy` 设为 `"pairing"` 时，新用户必须输入 6 位配对码（1 小时有效）才能开始聊天：
+
+```bash
+# 生成配对码
+rsclaw pairing pair
+
+# 列出活跃配对
+rsclaw pairing list
+
+# 撤销配对
+rsclaw pairing revoke <device-id>
+```
+
+用户将配对码作为第一条消息发送。配对成功后设备被记住，无需再次配对。
 
 ### 多实例
 
