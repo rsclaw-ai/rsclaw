@@ -10,6 +10,17 @@ REPO="rsclaw-ai/rsclaw"
 BINARY="rsclaw"
 DEFAULT_PREFIX="/usr/local/bin"
 
+# GitHub proxy for regions where github.com is blocked (e.g. China).
+# Usage: GITHUB_PROXY=https://gitfast.run curl -fsSL ... | bash
+GITHUB_PROXY="${GITHUB_PROXY:-}"
+if [[ -n "$GITHUB_PROXY" ]]; then
+    GITHUB_URL="${GITHUB_PROXY}/https://github.com"
+    GITHUB_API="${GITHUB_PROXY}/https://api.github.com"
+else
+    GITHUB_URL="https://github.com"
+    GITHUB_API="https://api.github.com"
+fi
+
 # --- Defaults ---
 VERSION=""
 PREFIX="$DEFAULT_PREFIX"
@@ -71,7 +82,7 @@ resolve_version() {
     fi
 
     local latest json
-    json="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest")"
+    json="$(curl -fsSL "${GITHUB_API}/repos/${REPO}/releases/latest")"
     latest="$(echo "$json" | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -1)"
 
     if [[ -z "$latest" ]]; then
@@ -118,8 +129,8 @@ main() {
     echo "Installing rsclaw $version ..."
 
     archive_name="rsclaw-${version}-${target}.tar.gz"
-    download_url="https://github.com/${REPO}/releases/download/${version}/${archive_name}"
-    checksums_url="https://github.com/${REPO}/releases/download/${version}/SHA256SUMS.txt"
+    download_url="${GITHUB_URL}/${REPO}/releases/download/${version}/${archive_name}"
+    checksums_url="${GITHUB_URL}/${REPO}/releases/download/${version}/SHA256SUMS.txt"
 
     local tmpdir
     tmpdir="$(mktemp -d)"
