@@ -31,9 +31,11 @@ if (-not $Prefix) {
 }
 
 # GitHub proxy for regions where github.com is blocked (e.g. China).
+# Note: most proxies (ghfast.top, etc.) only support file downloads,
+# not API requests, so we always call api.github.com directly.
 $GhProxy = if ($env:GITHUB_PROXY) { $env:GITHUB_PROXY } else { "" }
 $GhUrl = if ($GhProxy) { "$GhProxy/https://github.com" } else { "https://github.com" }
-$GhApi = if ($GhProxy) { "$GhProxy/https://api.github.com" } else { "https://api.github.com" }
+$GhApi = "https://api.github.com"
 
 if ($Help) {
     Write-Host "Usage: install.ps1 [-Version VERSION] [-Prefix DIR]"
@@ -207,6 +209,44 @@ function Main {
                 Write-Host "  Run 'rsclaw --version' to verify"
             }
         }
+
+        # --- Install tray script ---
+        $trayScript = "rsclaw-tray.ps1"
+        $trayUrl = if ($GhProxy) {
+            "$GhProxy/https://raw.githubusercontent.com/$Repo/main/scripts/$trayScript"
+        } else {
+            "https://raw.githubusercontent.com/$Repo/main/scripts/$trayScript"
+        }
+        try {
+            Write-Host "Downloading tray controller ..."
+            Invoke-WebRequest -Uri $trayUrl -OutFile (Join-Path $Prefix $trayScript) -UseBasicParsing
+        } catch {
+            Write-Host "Warning: tray script download failed, skipping" -ForegroundColor Yellow
+        }
+
+        # --- Create startup shortcut ---
+        $trayPath = Join-Path $Prefix $trayScript
+        if (Test-Path $trayPath) {
+            try {
+                $startupDir = [Environment]::GetFolderPath("Startup")
+                $shortcutPath = Join-Path $startupDir "RsClaw Tray.lnk"
+                $shell = New-Object -ComObject WScript.Shell
+                $shortcut = $shell.CreateShortcut($shortcutPath)
+                $shortcut.TargetPath = "powershell.exe"
+                $shortcut.Arguments = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$trayPath`""
+                $shortcut.WorkingDirectory = $Prefix
+                $shortcut.Description = "RsClaw Gateway Tray Controller"
+                $shortcut.Save()
+                Write-Host "Tray auto-start enabled (startup shortcut created)"
+            } catch {
+                Write-Host "Warning: could not create startup shortcut: $_" -ForegroundColor Yellow
+            }
+        }
+
+        Write-Host ""
+        Write-Host "rsclaw $ver installed successfully!" -ForegroundColor Green
+        Write-Host "  Location: $Prefix\$Binary"
+        Write-Host "  Tray:     $Prefix\$trayScript"
 
         Write-Host ""
         Write-Host "Note: restart your terminal for PATH changes to take effect."

@@ -11,15 +11,16 @@ BINARY="rsclaw"
 DEFAULT_PREFIX="/usr/local/bin"
 
 # GitHub proxy for regions where github.com is blocked (e.g. China).
-# Usage: GITHUB_PROXY=https://gitfast.run curl -fsSL ... | bash
+# Usage: GITHUB_PROXY=https://ghfast.top curl -fsSL ... | bash
+# Note: most proxies only support file downloads, not API requests,
+# so we always call api.github.com directly.
 GITHUB_PROXY="${GITHUB_PROXY:-}"
 if [[ -n "$GITHUB_PROXY" ]]; then
     GITHUB_URL="${GITHUB_PROXY}/https://github.com"
-    GITHUB_API="${GITHUB_PROXY}/https://api.github.com"
 else
     GITHUB_URL="https://github.com"
-    GITHUB_API="https://api.github.com"
 fi
+GITHUB_API="https://api.github.com"
 
 # --- Defaults ---
 VERSION=""
