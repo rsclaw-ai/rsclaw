@@ -21,8 +21,8 @@ openclaw gateway stop
 # 运行 RsClaw 设置（检测 OpenClaw 数据，提供导入选项）
 rsclaw setup
 
-# 启动 RsClaw
-rsclaw gateway start
+# 启动 RsClaw（rsclaw gateway start 的简写）
+rsclaw start
 ```
 
 `rsclaw setup` 检测现有 OpenClaw 安装并提供两个选项：
@@ -73,6 +73,7 @@ rsclaw gateway start
 | 上传运行时调参 | /set_upload_size, /set_upload_chars | -- |
 | 技能仓库 | ClawHub + SkillHub（自动回退） | 仅 ClawHub |
 | computer_use | 原生截图/鼠标/键盘控制 | 仅通过浏览器 |
+| A2A 协议 | Google A2A v0.3（跨网络 agent 协作） | -- |
 | 配置格式 | JSON5 | JSON5 |
 | 热重载 | 通道变更自动重启 | 支持 |
 | 自更新 | `rsclaw update` 从 GitHub 下载 | npm update |
@@ -324,7 +325,7 @@ cargo build --release
 rsclaw setup
 
 # 启动网关
-rsclaw gateway start
+rsclaw start
 ```
 
 ---
@@ -336,7 +337,7 @@ rsclaw gateway start
 rsclaw onboard
 
 # 启动网关
-rsclaw gateway start
+rsclaw start
 
 # 查看状态
 rsclaw status
@@ -391,7 +392,7 @@ rsclaw --version
 | 13 | **Zalo** | Webhook | `accessToken` + `oaSecret`。官方账号 API。 |
 | -- | **自定义 Webhook** | Webhook POST | 发送 JSON 到 `/hooks/{name}`。通用入站处理器，支持任意平台。 |
 
-通道特性：DM/群组策略（open/pairing/allowlist/disabled）、健康监控、代码块保护的文本分块、指数退避消息重试、配对码（6 字符，1 小时有效期）、流式模式（off/partial/block/progress）、文件上传两层确认。
+通道特性：DM/群组策略（open/pairing/allowlist/disabled）、健康监控、代码块保护的文本分块、指数退避消息重试、配对码（8 字符 XXXX-XXXX，1 小时有效期）、流式模式（off/partial/block/progress）、文件上传两层确认。
 
 ---
 
@@ -575,7 +576,7 @@ LLM 提供商从以下来源自动注册：
 
 ### DM 配对
 
-`dmPolicy` 设为 `"pairing"` 时，新用户必须输入 6 位配对码（1 小时有效）才能开始聊天：
+`dmPolicy` 设为 `"pairing"` 时，新用户必须输入 8 位配对码（格式 XXXX-XXXX，1 小时有效）才能开始聊天：
 
 ```bash
 # 生成配对码
@@ -613,9 +614,102 @@ rsclaw --profile test gateway run # 使用 ~/.rsclaw-test
 
 从 ClawHub 和 SkillHub 仓库获取外部技能包。通过 `rsclaw skills install <name>` 或 `/skill install <name>` 安装。
 
-### 外部智能体
+### A2A 协议（Agent-to-Agent）
 
-通过 HTTP 调用远程智能体。工具自动注册为 `agent_<id>`。A2A（Agent-to-Agent）协议，Bearer token 认证。
+rsclaw 实现了 [Google A2A Protocol v0.3](https://a2a-protocol.org/latest/specification/)，支持跨网络的 agent 间通信。这是 rsclaw 的独有功能，OpenClaw 不支持此协议。
+
+**核心能力：**
+
+- **Agent Card 自动发现** -- 符合规范的 `/.well-known/agent.json` 端点，远程 agent 可自动发现本网关的能力和技能列表
+- **JSON-RPC 2.0 任务分发** -- 通过标准 `tasks/send` 方法向指定 agent 发送任务，支持会话保持和超时控制
+- **跨机器 agent 协作** -- 本地 agent 和远程 agent 通过 A2A 协议无缝协作，Bearer token 认证
+- **三种协作模式** -- 顺序执行（链式）、并行执行（扇出）、编排执行（LLM 驱动的 `agent_<id>` 工具调用）
+- **流式支持** -- Agent Card 声明 streaming 能力，支持流式任务响应
+
+**端点：**
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/.well-known/agent.json` | GET | Agent Card 发现，返回网关所有 agent 的能力描述 |
+| `/api/v1/a2a` | POST | JSON-RPC 2.0 任务端点，接收 `tasks/send` 请求 |
+
+**配置示例 -- 启用跨网络 A2A：**
+
+```json5
+{
+  gateway: {
+    bind: "all",   // 跨网络 A2A 必须绑定到所有接口
+    port: 18888,
+  },
+  agents: {
+    list: [
+      {
+        id: "researcher",
+        default: true,
+        model: { primary: "anthropic/claude-sonnet-4-20250514" },
+      },
+      {
+        id: "coder",
+        model: { primary: "anthropic/claude-sonnet-4-20250514" },
+      },
+    ],
+    // 连接远程 A2A 网关上的智能体
+    external: [
+      {
+        id: "remote-analyst",
+        url: "https://remote-gateway.example.com",
+        auth_token: "${REMOTE_AGENT_TOKEN}",
+      },
+    ],
+  },
+}
+```
+
+**Agent Card 示例（GET `http://host:18888/.well-known/agent.json`）：**
+
+```json
+{
+  "protocolVersion": "0.3",
+  "name": "rsclaw",
+  "description": "OpenClaw-compatible multi-agent AI gateway",
+  "url": "http://host:18888/api/v1/a2a",
+  "capabilities": { "streaming": true, "pushNotifications": false },
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain"],
+  "skills": [
+    { "id": "researcher", "name": "researcher", "inputModes": ["text/plain"], "outputModes": ["text/plain"] },
+    { "id": "coder", "name": "coder", "inputModes": ["text/plain"], "outputModes": ["text/plain"] }
+  ]
+}
+```
+
+**发送 A2A 任务（POST `http://host:18888/api/v1/a2a`）：**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "task-001",
+  "method": "tasks/send",
+  "params": {
+    "id": "task-001",
+    "message": {
+      "role": "user",
+      "parts": [{ "type": "text", "text": "Analyze the performance of module X" }]
+    },
+    "metadata": { "agentId": "researcher" }
+  }
+}
+```
+
+**协作模式详解：**
+
+| 模式 | 说明 | 适用场景 |
+|------|------|----------|
+| **顺序执行**（Sequential） | agent 按顺序运行，前一个的输出作为后一个的输入 | 流水线式处理：研究 -> 编码 -> 审查 |
+| **并行执行**（Parallel） | 所有 agent 同时运行相同输入，结果汇总 | 多角度分析、多语言翻译 |
+| **编排执行**（Orchestrated） | 主 LLM 通过 `agent_<id>` 工具调用决定调度哪个 agent | 复杂任务分解，LLM 自主编排子任务 |
+
+编排模式下，主 agent 的 LLM 可调用 `agent_researcher`、`agent_coder` 等工具，每个工具接受 `{"message": "子任务描述"}` 参数，返回子 agent 的文本回复。子 agent 使用独立的子会话（`{session}:a2a:{agent_id}`），不污染主会话上下文。
 
 ### 定时任务
 
@@ -669,7 +763,7 @@ Webhook 入口 `/hooks/:path`，支持动作分发（调用智能体、触发定
 不会。导入模式读取 OpenClaw 文件（配置、工作区、会话）但不会写入 `~/.openclaw/`。所有 RsClaw 数据存储在 `~/.rsclaw/`。
 
 **如何切换回 OpenClaw？**
-`rsclaw gateway stop && openclaw gateway start`。你的 `~/.openclaw/` 目录未被修改。
+`rsclaw stop && openclaw gateway start`。你的 `~/.openclaw/` 目录未被修改。
 
 **支持所有 OpenClaw WebSocket 方法吗？**
 已实现 33+ 方法，包括聊天流式输出。RsClaw 与 OpenClaw WebUI（控制面板）在 `http://localhost:18789` 完全线路兼容。
@@ -721,6 +815,7 @@ src/
   ws/          # WebSocket 协议 v3
   cmd/         # CLI 命令：setup、configure、security 等
   acp/         # ACP 协议（智能体 spawn/connect/run）
+  a2a/         # Google A2A v0.3 协议（server + client，跨网络 agent 协作）
 ```
 
 ### Matrix E2EE

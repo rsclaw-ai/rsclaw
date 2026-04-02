@@ -21,8 +21,8 @@ openclaw gateway stop
 # Setup RsClaw (detects OpenClaw data, offers import)
 rsclaw setup
 
-# Start RsClaw
-rsclaw gateway start
+# Start RsClaw (shorthand for rsclaw gateway start)
+rsclaw start
 ```
 
 `rsclaw setup` detects your existing OpenClaw installation and offers two options:
@@ -73,6 +73,7 @@ All OpenClaw config fields are supported. Unknown fields are silently ignored fo
 | Upload runtime tuning | /set_upload_size, /set_upload_chars | -- |
 | Skill registries | ClawHub + SkillHub (auto fallback) | ClawHub only |
 | computer_use | native screenshot/mouse/keyboard | via browser only |
+| A2A protocol | Google A2A v0.3 (cross-network agent collaboration) | -- |
 | Config format | JSON5 | JSON5 |
 | Hot reload | auto-restart on channel changes | Yes |
 | Self-update | `rsclaw update` from GitHub | npm update |
@@ -325,7 +326,7 @@ cargo build --release
 rsclaw setup
 
 # Start gateway
-rsclaw gateway start
+rsclaw start
 ```
 
 ---
@@ -337,7 +338,7 @@ rsclaw gateway start
 rsclaw onboard
 
 # Start gateway
-rsclaw gateway start
+rsclaw start
 
 # Check status
 rsclaw status
@@ -392,7 +393,7 @@ rsclaw --version
 | 13 | **Zalo** | Webhook | `accessToken` + `oaSecret`. Official Account API. |
 | -- | **Custom Webhook** | Webhook POST | Send JSON to `/hooks/{name}`. Generic inbound handler for any platform. |
 
-Channel features: DM/Group policy (open/pairing/allowlist/disabled), health monitoring, text chunking with code-fence protection, message retry with exponential backoff, pairing codes (6-char, 1-hour TTL), streaming modes (off/partial/block/progress), file upload two-layer confirmation.
+Channel features: DM/Group policy (open/pairing/allowlist/disabled), health monitoring, text chunking with code-fence protection, message retry with exponential backoff, pairing codes (8-char XXXX-XXXX, 1-hour TTL), streaming modes (off/partial/block/progress), file upload two-layer confirmation.
 
 ---
 
@@ -576,7 +577,7 @@ Each channel supports independent DM/group policies, pairing codes, health monit
 
 ### DM Pairing
 
-When `dmPolicy` is set to `"pairing"`, new users must enter a 6-character pairing code (1-hour TTL) to start chatting:
+When `dmPolicy` is set to `"pairing"`, new users must enter an 8-character pairing code (format XXXX-XXXX, 1-hour TTL) to start chatting:
 
 ```bash
 # Generate a pairing code
@@ -614,9 +615,102 @@ Hook-based plugin architecture with lifecycle events: `pre_turn`, `post_turn`, `
 
 External skill packages from ClawHub and SkillHub registries. Install via `rsclaw skills install <name>` or `/skill install <name>`.
 
-### External Agents
+### A2A Protocol (Agent-to-Agent)
 
-Remote agent invocation via HTTP. Tools auto-registered as `agent_<id>`. A2A (Agent-to-Agent) protocol with Bearer token auth.
+rsclaw implements the [Google A2A Protocol v0.3](https://a2a-protocol.org/latest/specification/), enabling cross-network agent-to-agent communication. This is a unique feature of rsclaw -- OpenClaw does not support this protocol.
+
+**Core capabilities:**
+
+- **Agent Card auto-discovery** -- spec-compliant `/.well-known/agent.json` endpoint allows remote agents to automatically discover this gateway's capabilities and skill list
+- **JSON-RPC 2.0 task dispatch** -- send tasks to specific agents via the standard `tasks/send` method, with session persistence and timeout control
+- **Cross-machine agent collaboration** -- local and remote agents collaborate seamlessly over A2A with Bearer token authentication
+- **Three collaboration modes** -- sequential (chain), parallel (fan-out), orchestrated (LLM-driven `agent_<id>` tool calls)
+- **Streaming support** -- Agent Card declares streaming capability for streaming task responses
+
+**Endpoints:**
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/.well-known/agent.json` | GET | Agent Card discovery, returns capability descriptions for all agents on this gateway |
+| `/api/v1/a2a` | POST | JSON-RPC 2.0 task endpoint, accepts `tasks/send` requests |
+
+**Configuration -- enabling cross-network A2A:**
+
+```json5
+{
+  gateway: {
+    bind: "all",   // Required for cross-network A2A
+    port: 18888,
+  },
+  agents: {
+    list: [
+      {
+        id: "researcher",
+        default: true,
+        model: { primary: "anthropic/claude-sonnet-4-20250514" },
+      },
+      {
+        id: "coder",
+        model: { primary: "anthropic/claude-sonnet-4-20250514" },
+      },
+    ],
+    // Connect to agents on a remote A2A gateway
+    external: [
+      {
+        id: "remote-analyst",
+        url: "https://remote-gateway.example.com",
+        auth_token: "${REMOTE_AGENT_TOKEN}",
+      },
+    ],
+  },
+}
+```
+
+**Agent Card example (GET `http://host:18888/.well-known/agent.json`):**
+
+```json
+{
+  "protocolVersion": "0.3",
+  "name": "rsclaw",
+  "description": "OpenClaw-compatible multi-agent AI gateway",
+  "url": "http://host:18888/api/v1/a2a",
+  "capabilities": { "streaming": true, "pushNotifications": false },
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain"],
+  "skills": [
+    { "id": "researcher", "name": "researcher", "inputModes": ["text/plain"], "outputModes": ["text/plain"] },
+    { "id": "coder", "name": "coder", "inputModes": ["text/plain"], "outputModes": ["text/plain"] }
+  ]
+}
+```
+
+**Sending an A2A task (POST `http://host:18888/api/v1/a2a`):**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "task-001",
+  "method": "tasks/send",
+  "params": {
+    "id": "task-001",
+    "message": {
+      "role": "user",
+      "parts": [{ "type": "text", "text": "Analyze the performance of module X" }]
+    },
+    "metadata": { "agentId": "researcher" }
+  }
+}
+```
+
+**Collaboration modes:**
+
+| Mode | Description | Use case |
+|------|-------------|----------|
+| **Sequential** | Agents run in order; each receives the previous agent's output as input | Pipeline processing: research -> code -> review |
+| **Parallel** | All agents run concurrently with the same input; results are collected | Multi-perspective analysis, multi-language translation |
+| **Orchestrated** | A primary LLM decides which agents to invoke via `agent_<id>` tool calls | Complex task decomposition, LLM-driven sub-task orchestration |
+
+In orchestrated mode, the primary agent's LLM can call tools like `agent_researcher`, `agent_coder`, etc. Each tool accepts a `{"message": "sub-task description"}` parameter and returns the sub-agent's text reply. Sub-agents use isolated child sessions (`{session}:a2a:{agent_id}`) to avoid polluting the parent session context.
 
 ### Cron Jobs
 
@@ -670,7 +764,7 @@ Yes. RsClaw defaults to port 18888, OpenClaw defaults to 18789. They use separat
 Never. Import mode reads OpenClaw files (config, workspace, sessions) but never writes to `~/.openclaw/`. All rsclaw data goes to `~/.rsclaw/`.
 
 **How do I switch back to OpenClaw?**
-`rsclaw gateway stop && openclaw gateway start`. Your `~/.openclaw/` is untouched.
+`rsclaw stop && openclaw gateway start`. Your `~/.openclaw/` is untouched.
 
 **Does it support all OpenClaw WebSocket methods?**
 33+ methods implemented including chat streaming. RsClaw is wire-compatible with the OpenClaw WebUI (Control Panel) at `http://localhost:18789`.
@@ -722,6 +816,7 @@ src/
   ws/          # WebSocket protocol v3
   cmd/         # CLI commands: setup, configure, security, etc.
   acp/         # ACP protocol (agent spawn/connect/run)
+  a2a/         # Google A2A v0.3 protocol (server + client, cross-network agent collaboration)
 ```
 
 ### Matrix E2EE
