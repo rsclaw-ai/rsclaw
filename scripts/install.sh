@@ -51,9 +51,9 @@ detect_target() {
     case "$os" in
         Linux)
             case "$arch" in
-                x86_64)  target="x86_64-unknown-linux-musl" ;;
-                aarch64) target="aarch64-unknown-linux-musl" ;;
-                arm64)   target="aarch64-unknown-linux-musl" ;;
+                x86_64)  target="x86_64-unknown-linux-gnu" ;;
+                aarch64) target="aarch64-unknown-linux-gnu" ;;
+                arm64)   target="aarch64-unknown-linux-gnu" ;;
                 *) echo "Error: unsupported architecture: $arch"; exit 1 ;;
             esac
             ;;
@@ -129,18 +129,34 @@ main() {
     version="$(resolve_version)"
     echo "Installing rsclaw $version ..."
 
-    archive_name="rsclaw-${version}-${target}.tar.gz"
-    download_url="${GITHUB_URL}/${REPO}/releases/download/${version}/${archive_name}"
-    checksums_url="${GITHUB_URL}/${REPO}/releases/download/${version}/SHA256SUMS.txt"
+    # Build candidate list: primary target + fallback variants
+    local targets=("$target")
+    case "$target" in
+        *-linux-gnu)  targets+=("${target/linux-gnu/linux-musl}") ;;
+        *-linux-musl) targets+=("${target/linux-musl/linux-gnu}") ;;
+    esac
 
     local tmpdir
     tmpdir="$(mktemp -d)"
     CLEANUP_DIR="$tmpdir"
 
-    echo "Downloading ${archive_name} ..."
-    if ! curl -fSL --progress-bar -o "${tmpdir}/${archive_name}" "$download_url"; then
-        echo "Error: download failed. Check version and platform."
-        echo "  URL: $download_url"
+    local downloaded=false
+    for try_target in "${targets[@]}"; do
+        archive_name="rsclaw-${version}-${try_target}.tar.gz"
+        download_url="${GITHUB_URL}/${REPO}/releases/download/${version}/${archive_name}"
+        checksums_url="${GITHUB_URL}/${REPO}/releases/download/${version}/SHA256SUMS.txt"
+
+        echo "Trying ${archive_name} ..."
+        if curl -fSL --progress-bar -o "${tmpdir}/${archive_name}" "$download_url" 2>/dev/null; then
+            target="$try_target"
+            downloaded=true
+            break
+        fi
+    done
+
+    if [[ "$downloaded" != "true" ]]; then
+        echo "Error: no pre-built binary found for ${target}."
+        echo "  Tried: ${targets[*]}"
         exit 1
     fi
 
