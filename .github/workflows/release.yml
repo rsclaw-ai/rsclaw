@@ -233,6 +233,7 @@ jobs:
     name: Create Release
     runs-on: ubuntu-latest
     needs: [build, desktop]
+    if: always() && !cancelled()
     steps:
       - uses: actions/checkout@v6
 
