@@ -1,0 +1,34 @@
+{
+  // Example: Use OpenCode ACP for feishu messages
+  "agents": {
+    "list": [
+      {
+        "id": "main",
+        "default": true,
+        "channels": ["feishu"],
+        "model": {
+          "primary": "anthropic/claude-sonnet-4-6"
+        }
+      },
+      {
+        "id": "opencode-coder",
+        "channels": ["feishu"],
+        "opencode": {
+          "command": "opencode",
+          "args": ["acp"],
+          "cwd": "."
+        }
+      }
+    ],
+    "defaults": {
+      "workspace": "~/rsclaw-workspace"
+    }
+  },
+  "channels": {
+    "feishu": {
+      "enabled": true,
+      "appId": "your-app-id",
+      "appSecret": "your-app-secret"
+    }
+  }
+}

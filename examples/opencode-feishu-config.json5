@@ -1,0 +1,38 @@
+// rsclaw config for feishu channel with OpenCode ACP agent
+// Copy this to ~/.rsclaw/rsclaw.json5 and adjust settings
+
+{
+  // Agent using OpenCode ACP (for coding tasks via feishu)
+  agents: {
+    list: [
+      {
+        id: "opencode",
+        default: true,
+        channels: ["feishu"],
+        opencode: {
+          command: "opencode",
+          args: ["acp"],
+          cwd: "."
+        }
+      }
+    ]
+  },
+  
+  // Feishu channel config
+  channels: {
+    feishu: {
+      enabled: true,
+      // These should be your actual Feishu app credentials
+      appId: "${FEISHU_APP_ID}",
+      appSecret: "${FEISHU_APP_SECRET}",
+      dmPolicy: "pairing",
+      allowFrom: ["*"]
+    }
+  },
+  
+  // Gateway config
+  gateway: {
+    port: 18789,
+    bind: "loopback"
+  }
+}

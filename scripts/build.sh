@@ -220,7 +220,8 @@ package_target() {
         fi
     else
         archive_name="${BINARY}-${VERSION}-${target}.tar.gz"
-        tar czf "${DIST_DIR}/${archive_name}" -C "$(dirname "$bin_path")" "${BINARY}${ext}"
+        COPYFILE_DISABLE=1 tar czf "${DIST_DIR}/${archive_name}" --no-xattrs -C "$(dirname "$bin_path")" "${BINARY}${ext}" 2>/dev/null || \
+        COPYFILE_DISABLE=1 tar czf "${DIST_DIR}/${archive_name}" -C "$(dirname "$bin_path")" "${BINARY}${ext}"
     fi
 
     ok "Packaged: ${DIST_DIR}/${archive_name}"

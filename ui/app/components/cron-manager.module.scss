@@ -1,0 +1,309 @@
+@import "../styles/animation.scss";
+
+.cron-manager-page {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+
+  .cron-manager-page-body {
+    padding: 20px;
+    overflow-y: auto;
+    flex: 1;
+  }
+
+  .toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+    animation: slide-in ease 0.3s;
+
+    .toolbar-title {
+      font-size: 14px;
+      color: var(--black);
+      opacity: 0.6;
+    }
+  }
+
+  .job-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    animation: slide-in ease 0.3s;
+
+    .job-card {
+      padding: 16px 20px;
+      border: var(--border-in-light);
+      background-color: var(--white);
+      transition: all 0.2s ease;
+
+      &:not(:last-child) {
+        border-bottom: 0;
+      }
+
+      &:first-child {
+        border-top-left-radius: 10px;
+        border-top-right-radius: 10px;
+      }
+
+      &:last-child {
+        border-bottom-left-radius: 10px;
+        border-bottom-right-radius: 10px;
+      }
+
+      &.disabled {
+        opacity: 0.5;
+      }
+
+      .job-card-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        margin-bottom: 8px;
+
+        .job-card-title {
+          .job-name {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--black);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+          }
+
+          .job-schedule {
+            font-size: 12px;
+            color: var(--black);
+            opacity: 0.5;
+            margin-top: 2px;
+            font-family: monospace;
+          }
+        }
+
+        .job-card-actions {
+          display: flex;
+          gap: 8px;
+          align-items: center;
+
+          .toggle-switch {
+            position: relative;
+            width: 40px;
+            height: 22px;
+            background-color: #d1d5db;
+            border-radius: 11px;
+            cursor: pointer;
+            transition: background-color 0.3s ease;
+
+            &.enabled {
+              background-color: #22c55e;
+            }
+
+            .toggle-knob {
+              position: absolute;
+              top: 2px;
+              left: 2px;
+              width: 18px;
+              height: 18px;
+              border-radius: 50%;
+              background-color: #fff;
+              transition: transform 0.3s ease;
+              box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+            }
+
+            &.enabled .toggle-knob {
+              transform: translateX(18px);
+            }
+          }
+        }
+      }
+
+      .job-card-details {
+        display: flex;
+        gap: 16px;
+        flex-wrap: wrap;
+
+        .detail-item {
+          font-size: 12px;
+          color: var(--black);
+          opacity: 0.6;
+
+          .detail-label {
+            opacity: 0.7;
+            margin-right: 4px;
+          }
+
+          .detail-value {
+            font-weight: 500;
+          }
+        }
+      }
+
+      .job-status-badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-size: 11px;
+        color: #fff;
+
+        &.active {
+          background-color: #22c55e;
+        }
+
+        &.paused {
+          background-color: #6b7280;
+        }
+
+        &.running {
+          background-color: #3b82f6;
+          animation: pulse 1.5s infinite;
+        }
+
+        &.error {
+          background-color: #ef4444;
+        }
+      }
+    }
+  }
+
+  .form-overlay {
+    border: var(--border-in-light);
+    border-radius: 10px;
+    background-color: var(--white);
+    padding: 20px;
+    margin-bottom: 16px;
+    animation: slide-in ease 0.3s;
+
+    .form-title {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--black);
+      margin-bottom: 16px;
+    }
+
+    .form-group {
+      margin-bottom: 14px;
+
+      .form-label {
+        font-size: 13px;
+        font-weight: 500;
+        color: var(--black);
+        margin-bottom: 6px;
+      }
+
+      .form-hint {
+        font-size: 11px;
+        color: var(--black);
+        opacity: 0.4;
+        margin-top: 4px;
+      }
+
+      input, select, textarea {
+        width: 100%;
+        padding: 10px 12px;
+        border: var(--border-in-light);
+        border-radius: 8px;
+        font-size: 14px;
+        background-color: var(--white);
+        color: var(--black);
+        box-sizing: border-box;
+
+        &:focus {
+          border-color: var(--primary);
+          outline: none;
+          box-shadow: 0 0 0 2px var(--primary-10);
+        }
+
+        &::placeholder {
+          color: var(--gray-300);
+        }
+      }
+
+      textarea {
+        min-height: 60px;
+        resize: vertical;
+        font-family: inherit;
+      }
+    }
+
+    .form-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 16px;
+    }
+  }
+
+  .history-panel {
+    border: var(--border-in-light);
+    border-radius: 10px;
+    background-color: var(--white);
+    padding: 16px;
+    margin-top: 12px;
+    animation: slide-in ease 0.3s;
+
+    .history-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--black);
+      margin-bottom: 12px;
+    }
+
+    .history-list {
+      .history-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 8px 0;
+        border-bottom: var(--border-in-light);
+        font-size: 12px;
+
+        &:last-child {
+          border-bottom: none;
+        }
+
+        .history-time {
+          color: var(--black);
+          opacity: 0.5;
+          font-family: monospace;
+        }
+
+        .history-result {
+          padding: 1px 6px;
+          border-radius: 3px;
+          font-size: 11px;
+          color: #fff;
+
+          &.success {
+            background-color: #22c55e;
+          }
+
+          &.failure {
+            background-color: #ef4444;
+          }
+        }
+      }
+    }
+  }
+
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 200px;
+    border: var(--border-in-light);
+    border-radius: 10px;
+    background-color: var(--white);
+    color: var(--black);
+    opacity: 0.5;
+    font-size: 14px;
+    gap: 12px;
+  }
+}
+
+@keyframes pulse {
+  0% { opacity: 0.6; }
+  50% { opacity: 1; }
+  100% { opacity: 0.6; }
+}

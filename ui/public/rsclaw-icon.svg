@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <clipPath id="rounded">
+      <rect width="512" height="512" rx="116"/>
+    </clipPath>
+  </defs>
+
+  <!-- Background -->
+  <rect width="512" height="512" rx="116" fill="#f97316"/>
+
+  <g clip-path="url(#rounded)">
+    <!-- Hex body outline -->
+    <polygon
+      points="256,144 336,188 336,276 256,320 176,276 176,188"
+      fill="none"
+      stroke="white"
+      stroke-width="10"
+      opacity="0.95"
+    />
+
+    <!-- Spoke lines: center to 3 lower vertices -->
+    <line x1="256" y1="208" x2="256" y2="144" stroke="white" stroke-width="6" opacity="0.65"/>
+    <line x1="256" y1="256" x2="336" y2="276" stroke="white" stroke-width="6" opacity="0.65"/>
+    <line x1="256" y1="256" x2="176" y2="276" stroke="white" stroke-width="6" opacity="0.65"/>
+
+    <!-- Hex vertex nodes -->
+    <circle cx="256" cy="144" r="14" fill="white" opacity="0.92"/>
+    <circle cx="336" cy="188" r="14" fill="white" opacity="0.92"/>
+    <circle cx="336" cy="276" r="14" fill="white" opacity="0.92"/>
+    <circle cx="256" cy="320" r="14" fill="white" opacity="0.92"/>
+    <circle cx="176" cy="276" r="14" fill="white" opacity="0.92"/>
+    <circle cx="176" cy="188" r="14" fill="white" opacity="0.92"/>
+
+    <!-- Center node -->
+    <circle cx="256" cy="232" r="24" fill="white" opacity="0.95"/>
+
+    <!-- LEFT CLAW ARM -->
+    <path
+      d="M176,188 Q120,144 96,96"
+      stroke="white" stroke-width="14" stroke-linecap="round" fill="none" opacity="0.95"
+    />
+    <!-- Left pincer top -->
+    <path
+      d="M96,96 Q64,56 72,32"
+      stroke="white" stroke-width="12" stroke-linecap="round" fill="none" opacity="0.9"
+    />
+    <!-- Left pincer bottom -->
+    <path
+      d="M96,96 Q48,104 40,80"
+      stroke="white" stroke-width="12" stroke-linecap="round" fill="none" opacity="0.9"
+    />
+    <!-- Left pincer tip nodes -->
+    <circle cx="72" cy="32" r="12" fill="white" opacity="0.78"/>
+    <circle cx="40" cy="80" r="12" fill="white" opacity="0.78"/>
+
+    <!-- RIGHT CLAW ARM -->
+    <path
+      d="M336,188 Q392,144 416,96"
+      stroke="white" stroke-width="14" stroke-linecap="round" fill="none" opacity="0.95"
+    />
+    <!-- Right pincer top -->
+    <path
+      d="M416,96 Q448,56 440,32"
+      stroke="white" stroke-width="12" stroke-linecap="round" fill="none" opacity="0.9"
+    />
+    <!-- Right pincer bottom -->
+    <path
+      d="M416,96 Q464,104 472,80"
+      stroke="white" stroke-width="12" stroke-linecap="round" fill="none" opacity="0.9"
+    />
+    <!-- Right pincer tip nodes -->
+    <circle cx="440" cy="32" r="12" fill="white" opacity="0.78"/>
+    <circle cx="472" cy="80" r="12" fill="white" opacity="0.78"/>
+
+    <!-- LEGS — three from bottom vertices -->
+    <line x1="216" y1="320" x2="184" y2="400" stroke="white" stroke-width="10" stroke-linecap="round" opacity="0.85"/>
+    <line x1="256" y1="320" x2="256" y2="408" stroke="white" stroke-width="10" stroke-linecap="round" opacity="0.85"/>
+    <line x1="296" y1="320" x2="328" y2="400" stroke="white" stroke-width="10" stroke-linecap="round" opacity="0.85"/>
+
+    <!-- Leg tip nodes -->
+    <circle cx="184" cy="400" r="10" fill="white" opacity="0.6"/>
+    <circle cx="256" cy="408" r="10" fill="white" opacity="0.6"/>
+    <circle cx="328" cy="400" r="10" fill="white" opacity="0.6"/>
+
+    <!-- EYES — orange circles inside hex, above center -->
+    <circle cx="224" cy="224" r="14" fill="#f97316"/>
+    <circle cx="288" cy="224" r="14" fill="#f97316"/>
+    <circle cx="224" cy="224" r="6"  fill="#c05a0a"/>
+    <circle cx="288" cy="224" r="6"  fill="#c05a0a"/>
+  </g>
+</svg>

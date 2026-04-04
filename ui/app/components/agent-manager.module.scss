@@ -1,0 +1,209 @@
+@import "../styles/animation.scss";
+
+.agent-manager-page {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+
+  .agent-manager-page-body {
+    padding: 20px;
+    overflow-y: auto;
+    flex: 1;
+  }
+
+  .toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+    animation: slide-in ease 0.3s;
+
+    .toolbar-title {
+      font-size: 14px;
+      color: var(--black);
+      opacity: 0.6;
+    }
+  }
+
+  .agent-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    animation: slide-in ease 0.3s;
+
+    .agent-card {
+      padding: 16px 20px;
+      border: var(--border-in-light);
+      background-color: var(--white);
+      transition: all 0.2s ease;
+
+      &:not(:last-child) {
+        border-bottom: 0;
+      }
+
+      &:first-child {
+        border-top-left-radius: 10px;
+        border-top-right-radius: 10px;
+      }
+
+      &:last-child {
+        border-bottom-left-radius: 10px;
+        border-bottom-right-radius: 10px;
+      }
+
+      .agent-card-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        margin-bottom: 8px;
+
+        .agent-card-title {
+          .agent-name {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--black);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+          }
+
+          .agent-id {
+            font-size: 11px;
+            color: var(--black);
+            opacity: 0.4;
+            margin-top: 2px;
+            font-family: monospace;
+          }
+        }
+
+        .agent-card-actions {
+          display: flex;
+          gap: 8px;
+          flex-shrink: 0;
+        }
+      }
+
+      .agent-card-details {
+        display: flex;
+        gap: 16px;
+        flex-wrap: wrap;
+
+        .detail-item {
+          font-size: 12px;
+          color: var(--black);
+          opacity: 0.6;
+
+          .detail-label {
+            opacity: 0.7;
+            margin-right: 4px;
+          }
+
+          .detail-value {
+            font-weight: 500;
+          }
+        }
+      }
+
+      .agent-status-badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-size: 11px;
+        color: #fff;
+        background-color: #6b7280;
+
+        &.idle {
+          background-color: #6b7280;
+        }
+
+        &.thinking {
+          background-color: #f59e0b;
+          animation: pulse 1.5s infinite;
+        }
+      }
+    }
+  }
+
+  .form-overlay {
+    border: var(--border-in-light);
+    border-radius: 10px;
+    background-color: var(--white);
+    padding: 20px;
+    margin-bottom: 16px;
+    animation: slide-in ease 0.3s;
+
+    .form-title {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--black);
+      margin-bottom: 16px;
+    }
+
+    .form-group {
+      margin-bottom: 14px;
+
+      .form-label {
+        font-size: 13px;
+        font-weight: 500;
+        color: var(--black);
+        margin-bottom: 6px;
+      }
+
+      input, select, textarea {
+        width: 100%;
+        padding: 10px 12px;
+        border: var(--border-in-light);
+        border-radius: 8px;
+        font-size: 14px;
+        background-color: var(--white);
+        color: var(--black);
+        box-sizing: border-box;
+
+        &:focus {
+          border-color: var(--primary);
+          outline: none;
+          box-shadow: 0 0 0 2px var(--primary-10);
+        }
+
+        &::placeholder {
+          color: var(--gray-300);
+        }
+      }
+
+      textarea {
+        min-height: 60px;
+        resize: vertical;
+        font-family: inherit;
+      }
+    }
+
+    .form-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 16px;
+    }
+  }
+
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 200px;
+    border: var(--border-in-light);
+    border-radius: 10px;
+    background-color: var(--white);
+    color: var(--black);
+    opacity: 0.5;
+    font-size: 14px;
+    gap: 12px;
+  }
+}
+
+@keyframes pulse {
+  0% { opacity: 0.6; }
+  50% { opacity: 1; }
+  100% { opacity: 0.6; }
+}

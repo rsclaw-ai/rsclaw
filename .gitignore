@@ -1,0 +1,29 @@
+# Build
+/target
+dist/
+
+# IDE / Editor
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/
+*.iml
+
+# Rust
+**/*.rs.bk
+
+# Node / UI
+node_modules/
+.next/
+ui/out/
+
+# Runtime
+rsclaw.json5
+workspace/
+*.tgz
+*.log
+
+# Secrets
+.env
+.env.*

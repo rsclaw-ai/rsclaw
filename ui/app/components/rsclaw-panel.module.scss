@@ -1,0 +1,1357 @@
+@import "../styles/animation.scss";
+
+// Design system variables from prototype
+$bg0: #0f0f10;
+$bg1: #161618;
+$bg2: #1e1e21;
+$bg3: #26262b;
+$bg4: #2e2e34;
+$border: rgba(255, 255, 255, 0.07);
+$border2: rgba(255, 255, 255, 0.12);
+$border3: rgba(255, 255, 255, 0.16);
+$t0: #f0eff2;
+$t1: #a8a6b2;
+$t2: #6b6877;
+$accent: #f97316;
+$accent2: #fb923c;
+$alo: rgba(249, 115, 22, 0.10);
+$amid: rgba(249, 115, 22, 0.15);
+$green: #3ecf8e;
+$glo: rgba(62, 207, 142, 0.12);
+$amber: #f5a623;
+$alo2: rgba(245, 166, 35, 0.12);
+$red: #f06565;
+$rlo: rgba(240, 101, 101, 0.12);
+$blue: #4fa3e0;
+$blo: rgba(79, 163, 224, 0.12);
+$r: 10px;
+
+.rsclaw-panel-page {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: $bg0;
+  color: $t0;
+  font-family: "DM Sans", "Geist", sans-serif;
+  font-size: 13px;
+}
+
+// Top header bar
+.panel-header {
+  height: 48px;
+  border-bottom: 1px solid $border;
+  display: flex;
+  align-items: center;
+  padding: 0 18px;
+  gap: 12px;
+  flex-shrink: 0;
+  background: $bg1;
+
+  .panel-title {
+    font-size: 14px;
+    font-weight: 500;
+    color: $t0;
+  }
+
+  .panel-sub {
+    font-size: 11px;
+    color: $t2;
+    margin-left: 4px;
+  }
+
+  .panel-header-right {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+}
+
+.panel-body {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+// Sub-navigation
+.rsp-nav {
+  width: 210px;
+  background: $bg1;
+  border-right: 1px solid $border;
+  display: flex;
+  flex-direction: column;
+  padding: 14px 10px;
+  gap: 2px;
+  flex-shrink: 0;
+  overflow-y: auto;
+}
+
+.rsp-section {
+  font-size: 10px;
+  color: $t2;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  padding: 10px 8px 4px;
+}
+
+.rsp-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  color: $t1;
+  font-size: 12px;
+  border: none;
+  background: none;
+  width: 100%;
+  text-align: left;
+  transition: all 0.12s;
+  font-family: inherit;
+
+  &:hover {
+    background: $bg3;
+    color: $t0;
+  }
+
+  &.active {
+    background: $alo;
+    color: $accent2;
+  }
+}
+
+.rsp-item-icon {
+  font-size: 14px;
+  width: 18px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.rsp-badge {
+  margin-left: auto;
+  font-size: 9px;
+  font-family: "JetBrains Mono", monospace;
+  padding: 2px 6px;
+  border-radius: 3px;
+
+  &.green {
+    background: $glo;
+    color: $green;
+  }
+
+  &.amber {
+    background: $alo2;
+    color: $amber;
+  }
+
+  &.new-badge {
+    background: $alo;
+    color: $accent2;
+  }
+}
+
+// Sub content area
+.rsp-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px 28px;
+}
+
+// ── Status Page ──────────────────────────────────────
+
+.status-banner {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: $bg2;
+  border: 1px solid $border;
+  border-left: 2px solid $accent;
+  border-radius: $r;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  padding: 14px 18px;
+  margin-bottom: 16px;
+  animation: slide-in ease 0.3s;
+}
+
+.status-led {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+
+  &.on {
+    background: $green;
+    box-shadow: 0 0 0 3px rgba(45, 212, 160, 0.2);
+  }
+
+  &.off {
+    background: $red;
+  }
+}
+
+.status-info {
+  flex: 1;
+}
+
+.status-name {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.status-addr {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  color: $t2;
+  margin-top: 2px;
+}
+
+.stat-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.stat-c {
+  background: $bg3;
+  border: 1px solid $border2;
+  border-radius: $r;
+  padding: 14px 16px;
+
+  &:last-child {
+    border-top: 2px solid $accent;
+  }
+}
+
+.stat-lbl {
+  font-size: 10px;
+  color: $t2;
+  margin-bottom: 6px;
+  letter-spacing: 0.3px;
+}
+
+.stat-val {
+  font-size: 22px;
+  font-weight: 500;
+  font-family: "JetBrains Mono", monospace;
+
+  &.g {
+    color: $green;
+  }
+
+  &.a {
+    color: $amber;
+  }
+}
+
+.stat-sub {
+  font-size: 10px;
+  color: $t2;
+  margin-top: 3px;
+}
+
+// Card
+.card {
+  background: $bg2;
+  border: 1px solid $border;
+  border-radius: $r;
+  overflow: hidden;
+  margin-bottom: 14px;
+}
+
+.card-h {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid $border;
+}
+
+.card-ht {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.card-hr {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+}
+
+// Channel rows
+.ch-row {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 10px 14px;
+  border-bottom: 1px solid $border;
+
+  &:last-child {
+    border-bottom: none;
+  }
+}
+
+.ch-ico {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.ch-n {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.ch-s {
+  font-size: 10px;
+  color: $t2;
+  margin-top: 1px;
+}
+
+// Status pills
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-family: "JetBrains Mono", monospace;
+  padding: 2px 8px;
+  border-radius: 20px;
+  margin-left: auto;
+
+  &::before {
+    content: "\25CF";
+    font-size: 6px;
+  }
+
+  &.on {
+    background: rgba(45, 212, 160, 0.08);
+    color: $green;
+    border: 1px solid rgba(45, 212, 160, 0.15);
+    &::before {
+      color: $green;
+    }
+  }
+
+  &.off {
+    background: $bg4;
+    color: $t2;
+    &::before {
+      color: $t2;
+    }
+  }
+
+  &.warn {
+    background: $alo2;
+    color: $amber;
+    &::before {
+      color: $amber;
+    }
+  }
+}
+
+// Log viewer
+.log-box {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  padding: 10px 14px;
+  background: $bg1;
+  max-height: 170px;
+  overflow-y: auto;
+  line-height: 1.9;
+}
+
+.ll {
+  display: flex;
+  gap: 10px;
+}
+
+.lts {
+  color: $t2;
+  flex-shrink: 0;
+}
+
+.llv {
+  width: 32px;
+  flex-shrink: 0;
+  font-weight: 500;
+
+  &.ok {
+    color: $green;
+  }
+  &.info {
+    color: #c07840;
+  }
+  &.warn {
+    color: $amber;
+  }
+  &.err {
+    color: $red;
+  }
+}
+
+.lm {
+  color: $t1;
+}
+
+// Buttons
+.btn {
+  font-family: "DM Sans", "Geist", sans-serif;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 6px 12px;
+  border-radius: 7px;
+  cursor: pointer;
+  border: 1px solid $border2;
+  background: transparent;
+  color: $t1;
+  transition: all 0.12s;
+
+  &:hover {
+    background: $bg4;
+    color: $t0;
+  }
+
+  &.primary {
+    background: $accent;
+    border-color: $accent;
+    color: #fff;
+    flex: 1;
+
+    &:hover {
+      opacity: 0.85;
+    }
+  }
+
+  &.danger {
+    color: $red;
+    border-color: rgba(224, 85, 85, 0.3);
+
+    &:hover {
+      background: $rlo;
+    }
+  }
+}
+
+.tb-btn {
+  padding: 5px 12px;
+  border-radius: 7px;
+  border: 1px solid $border2;
+  background: transparent;
+  color: $t1;
+  font-family: "DM Sans", "Geist", sans-serif;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.12s;
+
+  &:hover {
+    background: $bg3;
+    color: $t0;
+  }
+}
+
+// ── Config Editor ──────────────────────────────────
+
+.cfg-layout {
+  display: grid;
+  grid-template-columns: 1fr 280px;
+  gap: 16px;
+}
+
+.cfg-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.cfg-group {
+  background: $bg2;
+  border: 1px solid $border;
+  border-radius: $r;
+  overflow: hidden;
+}
+
+.cfg-gh {
+  display: flex;
+  align-items: center;
+  padding: 9px 13px;
+  background: $bg3;
+  border-bottom: 1px solid $border;
+  font-size: 10px;
+  font-weight: 500;
+  color: $t1;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  gap: 8px;
+}
+
+.cfg-f {
+  padding: 10px 13px;
+  border-bottom: 1px solid $border;
+
+  &:last-child {
+    border-bottom: none;
+  }
+}
+
+.cfg-lbl {
+  font-size: 10px;
+  color: $t2;
+  margin-bottom: 4px;
+  font-family: "JetBrains Mono", monospace;
+}
+
+.cfg-input {
+  width: 100%;
+  background: $bg3;
+  border: 1px solid $border2;
+  border-radius: 7px;
+  padding: 6px 9px;
+  color: $t0;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11.5px;
+  outline: none;
+  transition: border-color 0.12s;
+
+  &:focus {
+    border-color: $accent;
+  }
+}
+
+.cfg-select {
+  width: 100%;
+  background: $bg3;
+  border: 1px solid $border2;
+  border-radius: 7px;
+  padding: 6px 9px;
+  color: $t0;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11.5px;
+  outline: none;
+  cursor: pointer;
+  -webkit-appearance: none;
+  transition: border-color 0.12s;
+
+  &:focus {
+    border-color: $accent;
+  }
+}
+
+.f-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+// Toggle
+.tgl-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.tgl-desc {
+  font-size: 12px;
+  color: $t0;
+}
+
+.tgl {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+}
+
+.tgl-input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.tgl-track {
+  width: 34px;
+  height: 18px;
+  border-radius: 9px;
+  background: $bg4;
+  transition: background 0.18s;
+}
+
+.tgl-input:checked + .tgl-track {
+  background: $accent;
+}
+
+.tgl-knob {
+  position: absolute;
+  left: 2px;
+  top: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  transition: left 0.18s;
+  pointer-events: none;
+}
+
+.tgl-input:checked ~ .tgl-knob {
+  left: 18px;
+}
+
+// Preview panel
+.preview-panel {
+  position: sticky;
+  top: 0;
+}
+
+.preview-inner {
+  height: calc(100vh - 48px - 48px);
+  display: flex;
+  flex-direction: column;
+  background: $bg1;
+  border: 1px solid $border;
+  border-radius: $r;
+  overflow: hidden;
+}
+
+.prev-h {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 13px;
+  border-bottom: 1px solid $border;
+  flex-shrink: 0;
+}
+
+.prev-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: $green;
+}
+
+.prev-ht {
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.prev-file {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+  color: $t2;
+  margin-left: auto;
+}
+
+.prev-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 14px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  line-height: 1.85;
+  color: $t1;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.prev-foot {
+  padding: 10px 12px;
+  border-top: 1px solid $border;
+  display: flex;
+  gap: 7px;
+  flex-shrink: 0;
+}
+
+// JSON5 syntax coloring
+.json-key {
+  color: #7eb8f7;
+}
+.json-str {
+  color: #98d4a8;
+}
+.json-num {
+  color: $amber;
+}
+.json-bool {
+  color: $red;
+}
+.json-comment {
+  color: #3a3a45;
+}
+
+// ── Agent Manager ──────────────────────────────────
+
+.page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.page-title {
+  font-size: 16px;
+  font-weight: 500;
+}
+
+.page-sub {
+  font-size: 11px;
+  color: $t2;
+  margin-top: 2px;
+}
+
+.note {
+  display: flex;
+  gap: 8px;
+  padding: 9px 12px;
+  border-radius: 7px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  margin-bottom: 12px;
+
+  &.info {
+    background: rgba(249, 115, 22, 0.08);
+    border: 1px solid rgba(249, 115, 22, 0.18);
+    color: #c07840;
+  }
+
+  &.warn {
+    background: $alo2;
+    border: 1px solid rgba(240, 165, 0, 0.2);
+    color: $amber;
+  }
+}
+
+.agent-card {
+  background: $bg2;
+  border: 1px solid $border;
+  border-radius: $r;
+  overflow: hidden;
+  margin-bottom: 10px;
+  transition: border-color 0.12s;
+
+  &:hover {
+    border-color: $border2;
+  }
+}
+
+.agent-card-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid $border;
+}
+
+.agent-card-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: $alo;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.agent-card-name {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.agent-card-model {
+  font-size: 10px;
+  color: $t2;
+  font-family: "JetBrains Mono", monospace;
+  margin-top: 1px;
+}
+
+.agent-card-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+}
+
+.agent-card-body {
+  padding: 10px 14px;
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.agent-card-field {
+  .agent-field-label {
+    font-size: 10px;
+    color: $t2;
+    margin-bottom: 3px;
+  }
+
+  .agent-field-value {
+    font-size: 11px;
+    font-family: "JetBrains Mono", monospace;
+    color: $t1;
+  }
+}
+
+// ── Wizard ──────────────────────────────────────────
+
+.wiz-steps {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  margin-bottom: 24px;
+}
+
+.wiz-step {
+  display: flex;
+  align-items: center;
+  flex: 1;
+
+  &:last-child {
+    flex: 0;
+  }
+}
+
+.step-c {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 500;
+  font-family: "JetBrains Mono", monospace;
+  border: 1.5px solid $border2;
+  background: $bg3;
+  color: $t2;
+  flex-shrink: 0;
+  transition: all 0.2s;
+
+  &.done {
+    background: $green;
+    border-color: $green;
+    color: #fff;
+  }
+
+  &.active {
+    background: $accent;
+    border-color: $accent;
+    color: #fff;
+    box-shadow: 0 0 0 3px rgba(249, 115, 22, 0.18);
+  }
+}
+
+.step-line {
+  flex: 1;
+  height: 1.5px;
+  background: $border2;
+  margin: 0 5px;
+
+  &.done {
+    background: $green;
+  }
+}
+
+.wiz-card {
+  background: $bg2;
+  border: 1px solid $border;
+  border-radius: 14px;
+  padding: 24px;
+}
+
+.wiz-title {
+  font-size: 16px;
+  font-weight: 500;
+  margin-bottom: 5px;
+}
+
+.wiz-sub {
+  font-size: 12px;
+  color: $t1;
+  line-height: 1.6;
+  margin-bottom: 20px;
+}
+
+.wiz-nav {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 20px;
+}
+
+// Provider grid (wizard step 2)
+.provider-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 9px;
+  margin-bottom: 14px;
+}
+
+.prov-card {
+  border: 1.5px solid $border;
+  border-radius: 9px;
+  padding: 11px 13px;
+  cursor: pointer;
+  transition: all 0.12s;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+
+  &:hover {
+    border-color: $border2;
+    background: $bg3;
+  }
+
+  &.sel {
+    border-color: $accent;
+    background: $alo;
+  }
+}
+
+.prov-logo {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  background: $bg4;
+  flex-shrink: 0;
+}
+
+.prov-n {
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.prov-s {
+  font-size: 10px;
+  color: $t2;
+  margin-top: 1px;
+}
+
+// Channel grid (wizard step 3)
+.ch-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 7px;
+  margin-bottom: 14px;
+}
+
+.ch-pick {
+  border: 1.5px solid $border;
+  border-radius: 9px;
+  padding: 11px 8px;
+  cursor: pointer;
+  transition: all 0.12s;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  text-align: center;
+
+  &:hover {
+    border-color: $border2;
+    background: $bg3;
+  }
+
+  &.sel {
+    border-color: $accent;
+    background: $alo;
+  }
+}
+
+.ch-pick-ico {
+  font-size: 18px;
+}
+
+.ch-pick-n {
+  font-size: 10px;
+  font-weight: 500;
+}
+
+// Launch checks (wizard step 4)
+.launch-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.lcheck {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 10px 13px;
+  border-radius: 8px;
+  background: $bg3;
+}
+
+.lcheck-ico {
+  font-size: 14px;
+}
+
+.lcheck-lbl {
+  font-size: 12px;
+  flex: 1;
+}
+
+.lcheck-res {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+
+  &.ok {
+    color: $green;
+  }
+  &.loading {
+    color: $amber;
+  }
+  &.wait {
+    color: $t2;
+  }
+}
+
+.success-box {
+  background: $glo;
+  border: 1px solid rgba(45, 212, 160, 0.25);
+  border-radius: 9px;
+  padding: 14px 16px;
+  margin-top: 12px;
+}
+
+.success-box-title {
+  color: $green;
+  font-weight: 500;
+  margin-bottom: 4px;
+  font-size: 13px;
+}
+
+.success-box-body {
+  font-size: 11.5px;
+  color: $t1;
+}
+
+// Detection row (wizard step 1)
+.det-row {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 11px 14px;
+  background: $bg3;
+  border: 1px solid $border;
+  border-radius: 9px;
+  margin-bottom: 8px;
+}
+
+.det-ico {
+  font-size: 16px;
+}
+
+.det-lbl {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.det-sub {
+  font-size: 10px;
+  color: $t2;
+  margin-top: 1px;
+  font-family: "JetBrains Mono", monospace;
+}
+
+// Modal overlay
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modal-content {
+  background: $bg2;
+  border: 1px solid $border;
+  border-radius: 14px;
+  padding: 24px;
+  width: 480px;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+
+.modal-title {
+  font-size: 16px;
+  font-weight: 500;
+  margin-bottom: 16px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+.empty-state {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 120px;
+  border: 1px solid $border;
+  border-radius: $r;
+  background: $bg2;
+  color: $t2;
+  font-size: 13px;
+}
+
+// ── Gateway Action Modal ─────────────────────────────
+
+.gw-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(5, 5, 7, 0.72);
+  backdrop-filter: blur(3px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  animation: fadein 0.18s ease;
+}
+
+.gw-modal {
+  width: 320px;
+  background: $bg3;
+  border: 1px solid $border2;
+  border-radius: 16px;
+  overflow: hidden;
+  box-shadow: 0 16px 48px rgba(0,0,0,0.7), 0 4px 16px rgba(0,0,0,0.4);
+  animation: slide-in 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.gw-modal-body {
+  padding: 24px 22px 0;
+}
+
+.gw-modal-icon {
+  width: 52px;
+  height: 52px;
+  border-radius: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto 14px;
+  font-size: 22px;
+
+  &.red { background: rgba(217,95,95,0.08); border: 1px solid rgba(217,95,95,0.2); }
+  &.amber { background: rgba(249,115,22,0.1); border: 1px solid rgba(249,115,22,0.2); }
+  &.green { background: rgba(45,212,160,0.08); border: 1px solid rgba(45,212,160,0.18); }
+}
+
+.gw-modal-title {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.4px;
+  color: $t0;
+  text-align: center;
+  margin-bottom: 6px;
+}
+
+.gw-modal-sub {
+  font-size: 12px;
+  color: $t2;
+  text-align: center;
+  line-height: 1.6;
+  margin-bottom: 16px;
+}
+
+.gw-modal-status {
+  background: $bg2;
+  border: 1px solid $border;
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.gw-modal-stat {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.gw-modal-stat-label {
+  font-size: 11px;
+  color: $t2;
+}
+
+.gw-modal-stat-val {
+  font-size: 11px;
+  font-family: "JetBrains Mono", monospace;
+  font-weight: 500;
+}
+
+.gw-modal-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 11px;
+  line-height: 1.6;
+  margin-top: 10px;
+
+  &.danger { background: rgba(217,95,95,0.07); border: 1px solid rgba(217,95,95,0.14); color: #a05050; }
+  &.warn { background: rgba(249,115,22,0.07); border: 1px solid rgba(249,115,22,0.14); color: #8a6030; }
+  &.ok { background: rgba(45,212,160,0.06); border: 1px solid rgba(45,212,160,0.14); color: #2a7060; }
+}
+
+.gw-modal-actions {
+  display: flex;
+  gap: 8px;
+  padding: 16px 22px 20px;
+}
+
+.gw-btn-cancel {
+  flex: 1;
+  padding: 10px;
+  border-radius: 9px;
+  border: 1px solid $border2;
+  background: $bg2;
+  color: $t2;
+  font-size: 12px;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.12s;
+
+  &:hover { background: $bg4; color: $t1; }
+}
+
+.gw-btn-confirm {
+  flex: 1;
+  padding: 10px;
+  border-radius: 9px;
+  border: none;
+  font-size: 12px;
+  font-weight: 700;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.13s;
+  color: #fff;
+
+  &:disabled { opacity: 0.55; cursor: not-allowed; }
+
+  &.stop { background: #d95f5f; box-shadow: 0 2px 10px rgba(217,95,95,0.28); }
+  &.stop:hover:not(:disabled) { background: #e07070; }
+
+  &.restart { background: $accent; box-shadow: 0 2px 10px rgba(249,115,22,0.28); }
+  &.restart:hover:not(:disabled) { background: $accent2; }
+
+  &.start { background: #1d9e75; box-shadow: 0 2px 10px rgba(29,158,117,0.25); }
+  &.start:hover:not(:disabled) { background: #22b885; }
+}
+
+@keyframes gw-spin { to { transform: rotate(360deg); } }
+.gw-spinner {
+  display: inline-block;
+  width: 13px;
+  height: 13px;
+  border: 2px solid rgba(255,255,255,0.3);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: gw-spin 0.7s linear infinite;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+
+// ── Workspace Editor ──────────────────────────────────
+
+.ws-layout {
+  display: grid;
+  grid-template-columns: 180px 1fr;
+  gap: 12px;
+  height: calc(100vh - 48px - 120px);
+}
+
+.ws-file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-y: auto;
+  background: $bg2;
+  border: 1px solid $border;
+  border-radius: $r;
+  padding: 8px;
+}
+
+.ws-file-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: $t1;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.12s;
+
+  &:hover {
+    background: $bg3;
+    color: $t0;
+  }
+
+  &.active {
+    background: $alo;
+    color: $accent2;
+  }
+}
+
+.ws-new-file {
+  padding: 6px 8px;
+  border-top: 1px solid $border;
+  margin-top: 4px;
+}
+
+.ws-editor {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid $border;
+  border-radius: $r;
+  overflow: hidden;
+}
+
+.ws-textarea {
+  flex: 1;
+  width: 100%;
+  background: $bg1;
+  color: $t0;
+  border: none;
+  outline: none;
+  resize: none;
+  padding: 14px 16px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+  line-height: 1.8;
+  box-sizing: border-box;
+
+  &::placeholder {
+    color: $t2;
+  }
+}

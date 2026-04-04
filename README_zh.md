@@ -1,12 +1,12 @@
 # RsClaw
 
-**🦀螃蟹高性能多智能体 AI 生态系统，无缝兼容 OpenClaw。**
+**High-performance AI gateway with native OpenClaw A2A orchestration.**
 
 [![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/License-MIT%2FApache--2.0-blue)](LICENSE-MIT)
+[![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
 [![Binary Size](https://img.shields.io/badge/binary-~12MB-green)]()
 
-[English](README.md) | **中文**
+[English](README.md) | **中文** | [日本語](README_ja.md) | [한국어](README_ko.md) | [ไทย](README_th.md) | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | [Русский](README_ru.md)
 
 RsClaw 是 [OpenClaw](https://github.com/openclaw/openclaw) 的 Rust 全新重写，提供相同的多智能体 AI 网关协议，同时实现 10 倍启动速度、10 倍更小体积，零 Node.js 依赖。
 
@@ -749,7 +749,6 @@ rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
 
 ## 许可证
 
-本项目双许可，任选其一：
+本项目使用 [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE) 许可。
 
-- Apache License, Version 2.0（[LICENSE-APACHE](LICENSE-APACHE) 或 <http://www.apache.org/licenses/LICENSE-2.0>）
-- MIT License（[LICENSE-MIT](LICENSE-MIT) 或 <http://opensource.org/licenses/MIT>）
+这意味着你可以自由使用、修改和分发本软件，但任何修改版本（包括通过网络提供服务）都必须以相同许可证开源。

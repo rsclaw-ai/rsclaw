@@ -1,0 +1,27 @@
+//! rsclaw library crate — exposes all modules for integration tests and
+//! future embedding use-cases.  The binary entry-point is in `main.rs`.
+
+pub mod a2a;
+pub mod acp;
+pub mod agent;
+pub mod browser;
+pub mod channel;
+pub mod cli;
+pub mod cmd;
+pub mod config;
+pub mod cron;
+pub mod events;
+pub mod gateway;
+pub mod hooks;
+pub mod i18n;
+pub mod mcp;
+pub mod migrate;
+pub mod plugin;
+pub mod provider;
+pub mod server;
+pub mod skill;
+pub mod store;
+pub mod sys;
+pub mod ws;
+
+pub use sys::MemoryTier;

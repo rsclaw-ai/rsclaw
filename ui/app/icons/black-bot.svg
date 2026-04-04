@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="30" height="30" viewBox="0 0 512 512">
+  <defs>
+    <clipPath id="rounded-dark">
+      <rect width="512" height="512" rx="116"/>
+    </clipPath>
+  </defs>
+
+  <rect width="512" height="512" rx="116" fill="#111316"/>
+
+  <g clip-path="url(#rounded-dark)">
+    <polygon
+      points="256,144 336,188 336,276 256,320 176,276 176,188"
+      fill="none" stroke="#f97316" stroke-width="10" opacity="0.95"
+    />
+
+    <line x1="256" y1="208" x2="256" y2="144" stroke="#f97316" stroke-width="6" opacity="0.6"/>
+    <line x1="256" y1="256" x2="336" y2="276" stroke="#f97316" stroke-width="6" opacity="0.6"/>
+    <line x1="256" y1="256" x2="176" y2="276" stroke="#f97316" stroke-width="6" opacity="0.6"/>
+
+    <circle cx="256" cy="144" r="14" fill="#f97316" opacity="0.88"/>
+    <circle cx="336" cy="188" r="14" fill="#f97316" opacity="0.88"/>
+    <circle cx="336" cy="276" r="14" fill="#f97316" opacity="0.88"/>
+    <circle cx="256" cy="320" r="14" fill="#f97316" opacity="0.88"/>
+    <circle cx="176" cy="276" r="14" fill="#f97316" opacity="0.88"/>
+    <circle cx="176" cy="188" r="14" fill="#f97316" opacity="0.88"/>
+
+    <circle cx="256" cy="232" r="24" fill="#f97316" opacity="0.95"/>
+
+    <path d="M176,188 Q120,144 96,96"   stroke="#f97316" stroke-width="14" stroke-linecap="round" fill="none" opacity="0.95"/>
+    <path d="M96,96 Q64,56 72,32"        stroke="#f97316" stroke-width="12" stroke-linecap="round" fill="none" opacity="0.88"/>
+    <path d="M96,96 Q48,104 40,80"       stroke="#f97316" stroke-width="12" stroke-linecap="round" fill="none" opacity="0.88"/>
+    <circle cx="72" cy="32" r="12" fill="#f97316" opacity="0.7"/>
+    <circle cx="40" cy="80" r="12" fill="#f97316" opacity="0.7"/>
+
+    <path d="M336,188 Q392,144 416,96"   stroke="#f97316" stroke-width="14" stroke-linecap="round" fill="none" opacity="0.95"/>
+    <path d="M416,96 Q448,56 440,32"      stroke="#f97316" stroke-width="12" stroke-linecap="round" fill="none" opacity="0.88"/>
+    <path d="M416,96 Q464,104 472,80"     stroke="#f97316" stroke-width="12" stroke-linecap="round" fill="none" opacity="0.88"/>
+    <circle cx="440" cy="32" r="12" fill="#f97316" opacity="0.7"/>
+    <circle cx="472" cy="80" r="12" fill="#f97316" opacity="0.7"/>
+
+    <line x1="216" y1="320" x2="184" y2="400" stroke="#f97316" stroke-width="10" stroke-linecap="round" opacity="0.82"/>
+    <line x1="256" y1="320" x2="256" y2="408" stroke="#f97316" stroke-width="10" stroke-linecap="round" opacity="0.82"/>
+    <line x1="296" y1="320" x2="328" y2="400" stroke="#f97316" stroke-width="10" stroke-linecap="round" opacity="0.82"/>
+    <circle cx="184" cy="400" r="10" fill="#f97316" opacity="0.55"/>
+    <circle cx="256" cy="408" r="10" fill="#f97316" opacity="0.55"/>
+    <circle cx="328" cy="400" r="10" fill="#f97316" opacity="0.55"/>
+  </g>
+</svg>

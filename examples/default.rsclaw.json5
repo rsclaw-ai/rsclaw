@@ -1,0 +1,193 @@
+// rsclaw.json5 — Default configuration template
+// All sections are optional. Uncomment and modify as needed.
+// JSON5 syntax: comments, trailing commas, unquoted keys.
+// Environment variables: ${VAR} syntax supported in string fields.
+// Secrets: use { source: "env", id: "VAR" } for sensitive values.
+{
+  // =================================================================
+  // GATEWAY — HTTP server, networking, authentication
+  // =================================================================
+  gateway: {
+    port: 18888,                    // TCP port (default: 18888)
+    bind: "loopback",               // "loopback", "all", "custom", or IP address
+    // bindAddress: "192.168.1.100", // Custom IP (when bind is "custom" or IP)
+    language: "Chinese",            // Default: "English". Options: Chinese, Japanese, Korean, etc.
+    processingTimeout: 60,          // Seconds before "Processing..." indicator (0=disabled)
+    // auth: {
+    //   mode: "token",
+    //   token: "${RSCLAW_AUTH_TOKEN}",  // Or: { source: "env", id: "RSCLAW_AUTH_TOKEN" }
+    // },
+  },
+
+  // =================================================================
+  // MODELS — LLM provider registry
+  // =================================================================
+  models: {
+    providers: {
+      // anthropic: {
+      //   apiKey: "${ANTHROPIC_API_KEY}",
+      // },
+      // openai: {
+      //   apiKey: "${OPENAI_API_KEY}",
+      // },
+      // ollama: {
+      //   api: "ollama",
+      //   baseUrl: "http://localhost:11434/v1",
+      //   apiKey: "ollama",
+      // },
+      // custom: {
+      //   api: "openai-completions",
+      //   baseUrl: "https://api.example.com/v1",
+      //   apiKey: "${CUSTOM_API_KEY}",
+      // },
+    },
+  },
+
+  // =================================================================
+  // AGENTS — Agent definitions
+  // =================================================================
+  agents: {
+    defaults: {
+      compaction: {
+        mode: "layered",            // "default", "safeguard", "layered"
+        keepRecentPairs: 5,
+        extractFacts: true,
+      },
+      // model: {
+      //   primary: "anthropic/claude-sonnet-4-20250514",
+      // },
+      // timeoutSeconds: 600,
+      // workspace: "~/.rsclaw/workspace",
+    },
+    list: [
+      {
+        id: "main",
+        default: true,
+        model: {
+          primary: "anthropic/claude-sonnet-4-20250514",
+          toolset: "full",          // "minimal" (6), "standard" (12), "full" (all)
+        },
+        workspace: "~/.rsclaw/workspace",
+        // system: "You are a helpful assistant.",
+        // channels: [],             // Empty = all channels. ["telegram"] = only telegram.
+      },
+      // {
+      //   id: "researcher",
+      //   model: { primary: "anthropic/claude-sonnet-4-20250514", toolset: "minimal" },
+      //   system: "You are a research assistant.",
+      //   channels: ["telegram"],
+      // },
+    ],
+    // External agents (A2A cross-machine collaboration)
+    // external: [
+    //   {
+    //     id: "remote_agent",
+    //     url: "http://192.168.0.100:18888",
+    //     authToken: "${REMOTE_AUTH_TOKEN}",
+    //     // remoteAgentId: "main",   // Target specific remote agent
+    //   },
+    // ],
+  },
+
+  // =================================================================
+  // CHANNELS — Messaging platform connections
+  // =================================================================
+  channels: {
+    // telegram: {
+    //   botToken: "${TELEGRAM_BOT_TOKEN}",
+    //   dmPolicy: "open",           // "open", "pairing", "allowlist", "disabled"
+    //   groupPolicy: "allowlist",
+    // },
+    // feishu: {
+    //   appId: "cli_xxx",
+    //   appSecret: "${FEISHU_APP_SECRET}",
+    //   brand: "feishu",            // "feishu" or "lark"
+    //   connectionMode: "websocket",
+    //   dmPolicy: "pairing",
+    //   groupPolicy: "allowlist",
+    // },
+    // dingtalk: {
+    //   appKey: "xxx",
+    //   appSecret: "${DINGTALK_APP_SECRET}",
+    //   dmPolicy: "pairing",
+    //   groupPolicy: "allowlist",
+    // },
+    // wechat: {
+    //   botId: "xxx@im.bot",
+    //   botToken: "${WECHAT_BOT_TOKEN}",
+    //   dmPolicy: "pairing",
+    //   groupPolicy: "allowlist",
+    // },
+    // wecom: {
+    //   botId: "xxx",
+    //   secret: "${WECOM_SECRET}",
+    //   dmPolicy: "pairing",
+    //   groupPolicy: "open",
+    // },
+    // discord: {
+    //   token: "${DISCORD_BOT_TOKEN}",
+    //   dmPolicy: "allowlist",
+    // },
+    // slack: {
+    //   botToken: "${SLACK_BOT_TOKEN}",
+    //   appToken: "${SLACK_APP_TOKEN}",
+    //   dmPolicy: "allowlist",
+    // },
+    // matrix: {
+    //   homeserver: "https://matrix.org",
+    //   accessToken: "${MATRIX_ACCESS_TOKEN}",
+    //   userId: "@bot:matrix.org",
+    //   deviceId: "xxx",
+    // },
+  },
+
+  // =================================================================
+  // TOOLS — Tool configuration
+  // =================================================================
+  tools: {
+    exec: {
+      safety: false,              // Enable exec safety rules
+    },
+    upload: {
+      maxFileSize: 52428800,      // 50MB
+      maxTextChars: 20000,
+    },
+    webSearch: {
+      // provider: "bing-free",   // "bing-free", "duckduckgo", "google", "bing", "brave"
+      // braveApiKey: "${BRAVE_API_KEY}",
+      // googleApiKey: "${GOOGLE_API_KEY}",
+      // googleCx: "search-engine-id",
+      // bingApiKey: "${BING_API_KEY}",
+    },
+  },
+
+  // =================================================================
+  // MEMORY — Long-term memory
+  // =================================================================
+  memory: {
+    recallTopK: 10,               // Results per backend before fusion
+    recallFinalK: 5,              // Final results after RRF
+  },
+
+  // =================================================================
+  // CRON — Scheduled jobs (also see cron/jobs.json)
+  // =================================================================
+  // cron: {
+  //   enabled: true,
+  //   maxConcurrentRuns: 2,
+  // },
+
+  // =================================================================
+  // SESSION — Conversation persistence
+  // =================================================================
+  // session: {
+  //   dmScope: "per-channel-peer",  // "main", "per-peer", "per-channel-peer", "per-account-channel-peer"
+  // },
+
+  // =================================================================
+  // LOGGING
+  // =================================================================
+  // logging: {
+  //   level: "info",               // "trace", "debug", "info", "warn", "error"
+  // },
+}

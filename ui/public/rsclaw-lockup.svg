@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="128" viewBox="0 0 640 128">
+  <defs>
+    <clipPath id="rounded-lock">
+      <rect width="128" height="128" rx="29"/>
+    </clipPath>
+  </defs>
+
+  <!-- Icon mark background -->
+  <rect width="128" height="128" rx="29" fill="#f97316"/>
+
+  <g clip-path="url(#rounded-lock)">
+    <!-- Hex body outline -->
+    <polygon points="64,36 84,47 84,69 64,80 44,69 44,47" fill="none" stroke="white" stroke-width="2.5" opacity="0.95"/>
+
+    <!-- Spoke lines -->
+    <line x1="64" y1="52" x2="64" y2="36" stroke="white" stroke-width="1.5" opacity="0.65"/>
+    <line x1="64" y1="64" x2="84" y2="69" stroke="white" stroke-width="1.5" opacity="0.65"/>
+    <line x1="64" y1="64" x2="44" y2="69" stroke="white" stroke-width="1.5" opacity="0.65"/>
+
+    <!-- Hex vertex nodes -->
+    <circle cx="64" cy="36" r="3.5" fill="white" opacity="0.92"/>
+    <circle cx="84" cy="47" r="3.5" fill="white" opacity="0.92"/>
+    <circle cx="84" cy="69" r="3.5" fill="white" opacity="0.92"/>
+    <circle cx="64" cy="80" r="3.5" fill="white" opacity="0.92"/>
+    <circle cx="44" cy="69" r="3.5" fill="white" opacity="0.92"/>
+    <circle cx="44" cy="47" r="3.5" fill="white" opacity="0.92"/>
+
+    <!-- Center node -->
+    <circle cx="64" cy="58" r="6" fill="white" opacity="0.95"/>
+
+    <!-- Left claw arm -->
+    <path d="M44,47 Q30,36 24,24" stroke="white" stroke-width="3.5" stroke-linecap="round" fill="none" opacity="0.95"/>
+    <path d="M24,24 Q16,14 18,8" stroke="white" stroke-width="3" stroke-linecap="round" fill="none" opacity="0.9"/>
+    <path d="M24,24 Q12,26 10,20" stroke="white" stroke-width="3" stroke-linecap="round" fill="none" opacity="0.9"/>
+    <circle cx="18" cy="8" r="3" fill="white" opacity="0.78"/>
+    <circle cx="10" cy="20" r="3" fill="white" opacity="0.78"/>
+
+    <!-- Right claw arm -->
+    <path d="M84,47 Q98,36 104,24" stroke="white" stroke-width="3.5" stroke-linecap="round" fill="none" opacity="0.95"/>
+    <path d="M104,24 Q112,14 110,8" stroke="white" stroke-width="3" stroke-linecap="round" fill="none" opacity="0.9"/>
+    <path d="M104,24 Q116,26 118,20" stroke="white" stroke-width="3" stroke-linecap="round" fill="none" opacity="0.9"/>
+    <circle cx="110" cy="8" r="3" fill="white" opacity="0.78"/>
+    <circle cx="118" cy="20" r="3" fill="white" opacity="0.78"/>
+
+    <!-- Legs -->
+    <line x1="54" y1="80" x2="46" y2="100" stroke="white" stroke-width="2.5" stroke-linecap="round" opacity="0.85"/>
+    <line x1="64" y1="80" x2="64" y2="102" stroke="white" stroke-width="2.5" stroke-linecap="round" opacity="0.85"/>
+    <line x1="74" y1="80" x2="82" y2="100" stroke="white" stroke-width="2.5" stroke-linecap="round" opacity="0.85"/>
+
+    <!-- Eyes -->
+    <circle cx="56" cy="58" r="3.5" fill="#f97316"/>
+    <circle cx="72" cy="58" r="3.5" fill="#f97316"/>
+    <circle cx="56" cy="58" r="1.5" fill="#c05a0a"/>
+    <circle cx="72" cy="58" r="1.5" fill="#c05a0a"/>
+  </g>
+
+  <!-- Wordmark -->
+  <text
+    x="152"
+    y="82"
+    font-family="Geist, -apple-system, BlinkMacSystemFont, sans-serif"
+    font-size="68"
+    font-weight="900"
+    letter-spacing="-3"
+    fill="#f0eef8"
+  >RsClaw</text>
+
+  <!-- Tagline -->
+  <text
+    x="155"
+    y="108"
+    font-family="JetBrains Mono, Fira Code, Consolas, monospace"
+    font-size="14"
+    font-weight="400"
+    letter-spacing="1.5"
+    fill="#3a3844"
+  >MULTI-AGENT AI GATEWAY</text>
+</svg>

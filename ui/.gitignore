@@ -1,0 +1,7 @@
+.next/
+node_modules/
+*.tsbuildinfo
+ui/node_modules/
+out/
+src-tauri/binaries/
+src-tauri/target/
