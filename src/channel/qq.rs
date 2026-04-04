@@ -70,7 +70,9 @@ fn de_string_or_u64<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Resu
         fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("u64 or string")
         }
-        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<u64, E> { Ok(v) }
+        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<u64, E> {
+            Ok(v)
+        }
         fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<u64, E> {
             v.parse().map_err(de::Error::custom)
         }
@@ -108,7 +110,18 @@ pub struct QQBotChannel {
     /// Callback: (sender_id, text, target_id, is_group, msg_id, images, files).
     /// msg_id is required for passive replies.
     #[allow(clippy::type_complexity)]
-    on_message: Arc<dyn Fn(String, String, String, bool, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>) + Send + Sync>,
+    on_message: Arc<
+        dyn Fn(
+                String,
+                String,
+                String,
+                bool,
+                String,
+                Vec<crate::agent::registry::ImageAttachment>,
+                Vec<crate::agent::registry::FileAttachment>,
+            ) + Send
+            + Sync,
+    >,
 }
 
 impl QQBotChannel {
@@ -118,7 +131,18 @@ impl QQBotChannel {
         app_secret: impl Into<String>,
         sandbox: bool,
         intents: Option<u32>,
-        on_message: Arc<dyn Fn(String, String, String, bool, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>) + Send + Sync>,
+        on_message: Arc<
+            dyn Fn(
+                    String,
+                    String,
+                    String,
+                    bool,
+                    String,
+                    Vec<crate::agent::registry::ImageAttachment>,
+                    Vec<crate::agent::registry::FileAttachment>,
+                ) + Send
+                + Sync,
+        >,
     ) -> Self {
         Self::new_with_overrides(app_id, app_secret, sandbox, intents, on_message, None, None)
     }
@@ -129,7 +153,18 @@ impl QQBotChannel {
         app_secret: impl Into<String>,
         sandbox: bool,
         intents: Option<u32>,
-        on_message: Arc<dyn Fn(String, String, String, bool, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>) + Send + Sync>,
+        on_message: Arc<
+            dyn Fn(
+                    String,
+                    String,
+                    String,
+                    bool,
+                    String,
+                    Vec<crate::agent::registry::ImageAttachment>,
+                    Vec<crate::agent::registry::FileAttachment>,
+                ) + Send
+                + Sync,
+        >,
         api_base_override: Option<String>,
         token_url_override: Option<String>,
     ) -> Self {
@@ -501,7 +536,15 @@ impl QQBotChannel {
                 if !text.is_empty() || !images.is_empty() || !files.is_empty() {
                     info!(sender = %sender, channel = %channel_id, "qq: guild message received");
                     // Prefix channel_id with "guild:" to distinguish from group openid
-                    (self.on_message)(sender, text, format!("guild:{channel_id}"), false, msg_id, images, files);
+                    (self.on_message)(
+                        sender,
+                        text,
+                        format!("guild:{channel_id}"),
+                        false,
+                        msg_id,
+                        images,
+                        files,
+                    );
                 }
             }
             "DIRECT_MESSAGE_CREATE" => {
@@ -519,7 +562,15 @@ impl QQBotChannel {
 
                 if !text.is_empty() || !images.is_empty() || !files.is_empty() {
                     info!(sender = %sender, "qq: guild DM received");
-                    (self.on_message)(sender, text, format!("guild_dm:{guild_id}"), false, msg_id, images, files);
+                    (self.on_message)(
+                        sender,
+                        text,
+                        format!("guild_dm:{guild_id}"),
+                        false,
+                        msg_id,
+                        images,
+                        files,
+                    );
                 }
             }
             "RESUMED" => {
@@ -536,7 +587,10 @@ impl QQBotChannel {
         &self,
         data: &Value,
         text: &mut String,
-    ) -> (Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>) {
+    ) -> (
+        Vec<crate::agent::registry::ImageAttachment>,
+        Vec<crate::agent::registry::FileAttachment>,
+    ) {
         let mut images = Vec::new();
         let mut file_attachments: Vec<crate::agent::registry::FileAttachment> = Vec::new();
         let attachments = match data.get("attachments").and_then(|v| v.as_array()) {
@@ -546,7 +600,10 @@ impl QQBotChannel {
 
         for att in attachments {
             let url = att.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            let content_type = att.get("content_type").and_then(|v| v.as_str()).unwrap_or("");
+            let content_type = att
+                .get("content_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let filename = att.get("filename").and_then(|v| v.as_str()).unwrap_or("");
             if url.is_empty() {
                 continue;
@@ -602,21 +659,23 @@ impl QQBotChannel {
             } else if super::is_video_attachment(content_type, filename) {
                 // Extract audio from video and transcribe
                 match crate::channel::transcription::download_file(&self.client, &full_url).await {
-                    Ok(bytes) => {
-                        match extract_audio_and_transcribe(&self.client, &bytes).await {
-                            Ok(t) if !t.is_empty() => {
-                                info!(chars = t.len(), "qq: video audio transcribed");
-                                *text = t;
-                            }
-                            Ok(_) => warn!("qq: video transcription returned empty"),
-                            Err(e) => warn!("qq: video transcription failed: {e:#}"),
+                    Ok(bytes) => match extract_audio_and_transcribe(&self.client, &bytes).await {
+                        Ok(t) if !t.is_empty() => {
+                            info!(chars = t.len(), "qq: video audio transcribed");
+                            *text = t;
                         }
-                    }
+                        Ok(_) => warn!("qq: video transcription returned empty"),
+                        Err(e) => warn!("qq: video transcription failed: {e:#}"),
+                    },
                     Err(e) => warn!("qq: failed to download video: {e:#}"),
                 }
             } else {
                 // File attachment -- route through agent file handling.
-                let fname = if filename.is_empty() { "file.bin" } else { filename };
+                let fname = if filename.is_empty() {
+                    "file.bin"
+                } else {
+                    filename
+                };
                 match crate::channel::transcription::download_file(&self.client, &full_url).await {
                     Ok(bytes) => {
                         info!(size = bytes.len(), fname, "qq: file downloaded");
@@ -699,22 +758,17 @@ impl Channel for QQBotChannel {
 
             for image_data in &msg.images {
                 use base64::Engine;
-                let (mime, b64) = if let Some(rest) =
-                    image_data.strip_prefix("data:image/png;base64,")
-                {
-                    ("image/png", rest)
-                } else if let Some(rest) =
-                    image_data.strip_prefix("data:image/jpeg;base64,")
-                {
-                    ("image/jpeg", rest)
-                } else if let Some(rest) =
-                    image_data.strip_prefix("data:image/webp;base64,")
-                {
-                    ("image/webp", rest)
-                } else {
-                    warn!("qq: unrecognised image data URI prefix, skipping");
-                    continue;
-                };
+                let (mime, b64) =
+                    if let Some(rest) = image_data.strip_prefix("data:image/png;base64,") {
+                        ("image/png", rest)
+                    } else if let Some(rest) = image_data.strip_prefix("data:image/jpeg;base64,") {
+                        ("image/jpeg", rest)
+                    } else if let Some(rest) = image_data.strip_prefix("data:image/webp;base64,") {
+                        ("image/webp", rest)
+                    } else {
+                        warn!("qq: unrecognised image data URI prefix, skipping");
+                        continue;
+                    };
 
                 let bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
                     Ok(b) if !b.is_empty() => b,
@@ -724,7 +778,11 @@ impl Channel for QQBotChannel {
                     }
                 };
 
-                let filename = if mime == "image/jpeg" { "image.jpg" } else { "image.png" };
+                let filename = if mime == "image/jpeg" {
+                    "image.jpg"
+                } else {
+                    "image.png"
+                };
 
                 // QQ Bot API: two-step image send:
                 // 1. POST /v2/users|groups/{id}/files -> get file_info
@@ -768,7 +826,10 @@ impl Channel for QQBotChannel {
                     warn!("qq: image upload failed {upload_status}: {upload_text}");
                     continue;
                 }
-                info!(response = &upload_text[..upload_text.len().min(500)], "qq: image upload response");
+                info!(
+                    response = &upload_text[..upload_text.len().min(500)],
+                    "qq: image upload response"
+                );
                 let file_info: serde_json::Value = match serde_json::from_str(&upload_text) {
                     Ok(v) => v,
                     Err(e) => {
@@ -783,8 +844,10 @@ impl Channel for QQBotChannel {
                 } else {
                     format!("{}/v2/users/{}/messages", self.api_base, msg.target_id)
                 };
-                // QQ API expects media as { file_info: "..." } where file_info is the string value
-                let file_info_str = file_info.get("file_info")
+                // QQ API expects media as { file_info: "..." } where file_info is the string
+                // value
+                let file_info_str = file_info
+                    .get("file_info")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let send_body = json!({
@@ -885,7 +948,13 @@ async fn extract_audio_and_transcribe(client: &Client, video_bytes: &[u8]) -> Re
     let audio_bytes = std::fs::read(&audio_path)?;
     let _ = std::fs::remove_file(&audio_path);
 
-    crate::channel::transcription::transcribe_audio(client, &audio_bytes, "video_audio.ogg", "audio/ogg").await
+    crate::channel::transcription::transcribe_audio(
+        client,
+        &audio_bytes,
+        "video_audio.ogg",
+        "audio/ogg",
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

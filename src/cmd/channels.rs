@@ -1,23 +1,24 @@
 use anyhow::Result;
 
-use super::config_json::{load_config_json, remove_nested_value, set_nested_value};
-use super::style::*;
+use super::{
+    config_json::{load_config_json, remove_nested_value, set_nested_value},
+    style::*,
+};
 use crate::{cli::ChannelsCommand, config};
 
 pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
     let config = config::load()?;
     match sub {
         ChannelsCommand::List | ChannelsCommand::Status => {
-            banner(&format!("rsclaw channels v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!(
+                "rsclaw channels v{}",
+                env!("RSCLAW_BUILD_VERSION")
+            ));
             let ch = &config.channel.channels;
             let is_on = |b: Option<&crate::config::schema::ChannelBase>| {
                 b.is_some_and(|b| b.enabled.unwrap_or(true))
             };
-            println!(
-                "  {:<14} {}",
-                bold("CHANNEL"),
-                bold("STATUS")
-            );
+            println!("  {:<14} {}", bold("CHANNEL"), bold("STATUS"));
             if is_on(ch.telegram.as_ref().map(|c| &c.base)) {
                 println!("  {:<14} {}", "telegram", green("enabled"));
             }
@@ -78,7 +79,10 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
             ok(&format!("removed channel '{}'", cyan(&channel)));
         }
         ChannelsCommand::Login { channel } => {
-            banner(&format!("rsclaw channel login v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!(
+                "rsclaw channel login v{}",
+                env!("RSCLAW_BUILD_VERSION")
+            ));
             match channel.as_str() {
                 "wechat" | "weixin" | "openclaw-weixin" => {
                     kv("channel", &cyan("WeChat Personal"));
@@ -149,26 +153,35 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                     crate::channel::auth::dingtalk_auth::login(&client, app_key, app_secret, None)
                         .await?;
                 }
-                "telegram" => kv("action", &format!(
-                    "set {} in your config",
-                    cyan("channels.telegram.botToken = \"${TELEGRAM_BOT_TOKEN}\"")
-                )),
-                "discord" => kv("action", &format!(
-                    "set {} in your config",
-                    cyan("channels.discord.token = \"${DISCORD_BOT_TOKEN}\"")
-                )),
-                "slack" => kv("action", &format!(
-                    "set {} in your config",
-                    cyan("channels.slack.botToken and channels.slack.appToken")
-                )),
-                "whatsapp" => kv("action", &format!(
-                    "set {} in your config",
-                    cyan("channels.whatsapp.apiKey")
-                )),
-                "signal" => kv("action", &format!(
-                    "set {} in your config",
-                    cyan("channels.signal.phoneNumber")
-                )),
+                "telegram" => kv(
+                    "action",
+                    &format!(
+                        "set {} in your config",
+                        cyan("channels.telegram.botToken = \"${TELEGRAM_BOT_TOKEN}\"")
+                    ),
+                ),
+                "discord" => kv(
+                    "action",
+                    &format!(
+                        "set {} in your config",
+                        cyan("channels.discord.token = \"${DISCORD_BOT_TOKEN}\"")
+                    ),
+                ),
+                "slack" => kv(
+                    "action",
+                    &format!(
+                        "set {} in your config",
+                        cyan("channels.slack.botToken and channels.slack.appToken")
+                    ),
+                ),
+                "whatsapp" => kv(
+                    "action",
+                    &format!("set {} in your config", cyan("channels.whatsapp.apiKey")),
+                ),
+                "signal" => kv(
+                    "action",
+                    &format!("set {} in your config", cyan("channels.signal.phoneNumber")),
+                ),
                 _ => kv("action", "set the required credentials in your config"),
             }
         }
@@ -179,18 +192,25 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                 remove_nested_value(&mut val, &full);
             }
             std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
-            ok(&format!("removed credentials for channel '{}'", cyan(&channel)));
+            ok(&format!(
+                "removed credentials for channel '{}'",
+                cyan(&channel)
+            ));
         }
 
         ChannelsCommand::Pair { code } => {
             // Approve a pairing code by calling the running gateway's API.
             let config = config::load()?;
-            let port = std::env::var("RSCLAW_PORT").ok()
+            let port = std::env::var("RSCLAW_PORT")
+                .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(config.gateway.port);
             let api_url = format!("http://127.0.0.1:{port}/api/v1/channels/pair");
             let client = reqwest::Client::new();
-            let auth_token_val = config.gateway.auth_token.clone()
+            let auth_token_val = config
+                .gateway
+                .auth_token
+                .clone()
                 .or_else(|| std::env::var("RSCLAW_AUTH_TOKEN").ok())
                 .unwrap_or_default();
             let auth_token = auth_token_val.as_str();
@@ -207,7 +227,11 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                     let body: serde_json::Value = r.json().await.unwrap_or_default();
                     let peer = body["peerId"].as_str().unwrap_or("unknown");
                     let channel = body["channel"].as_str().unwrap_or("unknown");
-                    ok(&format!("approved peer {} on {}", bold(peer), cyan(channel)));
+                    ok(&format!(
+                        "approved peer {} on {}",
+                        bold(peer),
+                        cyan(channel)
+                    ));
 
                     // Also persist to openclaw-compatible credentials file.
                     persist_allow_from(channel, peer);
@@ -216,7 +240,9 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                     let status = r.status();
                     let body = r.text().await.unwrap_or_default();
                     if status.as_u16() == 401 {
-                        err_msg("unauthorized -- check RSCLAW_AUTH_TOKEN or gateway.auth.token config");
+                        err_msg(
+                            "unauthorized -- check RSCLAW_AUTH_TOKEN or gateway.auth.token config",
+                        );
                     } else {
                         err_msg(&format!("pair failed ({status}): {body}"));
                     }
@@ -226,7 +252,10 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                     println!(
                         "      Pairing codes can only be approved while the gateway is running."
                     );
-                    println!("      Start the gateway first: {}", bold("rsclaw gateway start"));
+                    println!(
+                        "      Start the gateway first: {}",
+                        bold("rsclaw gateway start")
+                    );
                 }
             }
         }
@@ -249,12 +278,15 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                 }
             }
 
-            // 2. Call gateway API to revoke from memory + redb (gateway holds the redb lock).
+            // 2. Call gateway API to revoke from memory + redb (gateway holds the redb
+            //    lock).
             let config = crate::config::load().ok();
-            let port = std::env::var("RSCLAW_PORT").ok()
+            let port = std::env::var("RSCLAW_PORT")
+                .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or_else(|| config.as_ref().map_or(18888, |c| c.gateway.port));
-            let auth_token = config.as_ref()
+            let auth_token = config
+                .as_ref()
                 .and_then(|c| c.gateway.auth_token.as_deref())
                 .unwrap_or("");
             let api_url = format!("http://127.0.0.1:{port}/api/v1/channels/unpair");
@@ -283,22 +315,67 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
             }
 
             if changed {
-                ok(&format!("revoked peer {} from {}", bold(&peer), cyan(&channel)));
+                ok(&format!(
+                    "revoked peer {} from {}",
+                    bold(&peer),
+                    cyan(&channel)
+                ));
             } else {
-                warn_msg(&format!("peer {} not found in {} allowFrom or pairing list", bold(&peer), cyan(&channel)));
+                warn_msg(&format!(
+                    "peer {} not found in {} allowFrom or pairing list",
+                    bold(&peer),
+                    cyan(&channel)
+                ));
             }
         }
 
         ChannelsCommand::Capabilities { channel } => {
-            banner(&format!("rsclaw channel capabilities v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!(
+                "rsclaw channel capabilities v{}",
+                env!("RSCLAW_BUILD_VERSION")
+            ));
             let caps = match channel.as_str() {
-                "telegram" => vec!["text", "image", "audio", "video", "document", "sticker", "location", "inline-query", "dm", "group"],
-                "discord" => vec!["text", "image", "audio", "video", "embed", "reaction", "dm", "group", "thread"],
-                "slack" => vec!["text", "image", "file", "block-kit", "reaction", "dm", "group", "thread"],
-                "whatsapp" => vec!["text", "image", "audio", "video", "document", "location", "dm", "group"],
+                "telegram" => vec![
+                    "text",
+                    "image",
+                    "audio",
+                    "video",
+                    "document",
+                    "sticker",
+                    "location",
+                    "inline-query",
+                    "dm",
+                    "group",
+                ],
+                "discord" => vec![
+                    "text", "image", "audio", "video", "embed", "reaction", "dm", "group", "thread",
+                ],
+                "slack" => vec![
+                    "text",
+                    "image",
+                    "file",
+                    "block-kit",
+                    "reaction",
+                    "dm",
+                    "group",
+                    "thread",
+                ],
+                "whatsapp" => vec![
+                    "text", "image", "audio", "video", "document", "location", "dm", "group",
+                ],
                 "signal" => vec!["text", "image", "audio", "video", "dm", "group"],
-                "feishu" | "lark" => vec!["text", "image", "file", "interactive-card", "dm", "group"],
-                "dingtalk" => vec!["text", "image", "file", "markdown", "action-card", "dm", "group"],
+                "feishu" | "lark" => {
+                    vec!["text", "image", "file", "interactive-card", "dm", "group"]
+                }
+                "dingtalk" => vec![
+                    "text",
+                    "image",
+                    "file",
+                    "markdown",
+                    "action-card",
+                    "dm",
+                    "group",
+                ],
                 "qq" => vec!["text", "image", "audio", "dm", "group"],
                 "wechat" => vec!["text", "image", "file", "dm", "group"],
                 "wecom" => vec!["text", "image", "file", "markdown", "dm", "group"],
@@ -314,13 +391,14 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
         ChannelsCommand::Resolve { channel, name } => {
             let config = config::load()?;
             let port = config.gateway.port;
-            let auth_token_val = config.gateway.auth_token.clone()
+            let auth_token_val = config
+                .gateway
+                .auth_token
+                .clone()
                 .or_else(|| std::env::var("RSCLAW_AUTH_TOKEN").ok())
                 .unwrap_or_default();
             let auth_token = auth_token_val.as_str();
-            let url = format!(
-                "http://127.0.0.1:{port}/api/v1/channels/{channel}/resolve"
-            );
+            let url = format!("http://127.0.0.1:{port}/api/v1/channels/{channel}/resolve");
             let client = reqwest::Client::new();
             match client
                 .get(&url)
@@ -332,7 +410,12 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value = resp.json().await.unwrap_or_default();
                     let id = body["id"].as_str().unwrap_or("(not found)");
-                    ok(&format!("{}: {} -> {}", cyan(&channel), bold(&name), green(id)));
+                    ok(&format!(
+                        "{}: {} -> {}",
+                        cyan(&channel),
+                        bold(&name),
+                        green(id)
+                    ));
                 }
                 Ok(resp) => {
                     err_msg(&format!("resolve failed: HTTP {}", resp.status()));
@@ -343,15 +426,20 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
             }
         }
         ChannelsCommand::Paired { channel } => {
-            banner(&format!("rsclaw paired peers v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!(
+                "rsclaw paired peers v{}",
+                env!("RSCLAW_BUILD_VERSION")
+            ));
             let channels_to_check: Vec<String> = if let Some(ch) = channel {
                 vec![ch]
             } else {
                 vec![
-                    "telegram", "discord", "slack", "whatsapp", "qq",
-                    "feishu", "dingtalk", "wechat", "wecom", "matrix",
-                    "line", "zalo",
-                ].into_iter().map(String::from).collect()
+                    "telegram", "discord", "slack", "whatsapp", "qq", "feishu", "dingtalk",
+                    "wechat", "wecom", "matrix", "line", "zalo",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect()
             };
 
             // Open redb to read persisted pairings.
@@ -359,7 +447,8 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
             let redb_store = crate::store::redb_store::RedbStore::open(
                 &data_dir.join("redb/data.redb"),
                 crate::sys::detect_memory_tier(),
-            ).ok();
+            )
+            .ok();
 
             let mut found_any = false;
             for ch in &channels_to_check {
@@ -372,7 +461,9 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                     && let Some(arr) = val.get("allowFrom").and_then(|v| v.as_array())
                 {
                     for item in arr {
-                        if let Some(id) = item.as_str() && !peers.contains(&id.to_owned()) {
+                        if let Some(id) = item.as_str()
+                            && !peers.contains(&id.to_owned())
+                        {
                             peers.push(id.to_owned());
                         }
                     }
@@ -421,9 +512,7 @@ pub fn persist_allow_from_pub(channel: &str, peer_id: &str) {
 
 fn persist_allow_from(channel: &str, peer_id: &str) {
     // Write to rsclaw credential path.
-    for path in [
-        rsclaw_allow_from_path(channel),
-    ] {
+    for path in [rsclaw_allow_from_path(channel)] {
         let mut val = if let Ok(content) = std::fs::read_to_string(&path) {
             serde_json::from_str(&content)
                 .unwrap_or(serde_json::json!({"version": 1, "allowFrom": []}))

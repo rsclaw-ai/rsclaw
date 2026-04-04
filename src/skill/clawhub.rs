@@ -116,10 +116,26 @@ fn skillhub_urls() -> SkillhubUrls {
         let defs: Defs = toml::from_str(&defaults_str).unwrap_or_default();
         if let Some(sh) = defs.skill_registries.get("skillhub") {
             SkillhubUrls {
-                index: sh.get("index_url").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
-                download: sh.get("download_url").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
-                search: sh.get("search_url").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
-                primary_download: sh.get("primary_download_url").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
+                index: sh
+                    .get("index_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                download: sh
+                    .get("download_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                search: sh
+                    .get("search_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                primary_download: sh
+                    .get("primary_download_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
             }
         } else {
             SkillhubUrls::default()
@@ -277,20 +293,20 @@ impl ClawhubClient {
             .map(|arr| {
                 arr.iter()
                     .map(|item| SearchResult {
-                        slug: item["slug"]
-                            .as_str()
-                            .unwrap_or("unknown")
-                            .to_owned(),
+                        slug: item["slug"].as_str().unwrap_or("unknown").to_owned(),
                         version: item["version"].as_str().map(|s| s.to_owned()),
                         description: item["summary"]
                             .as_str()
                             .or_else(|| item["description"].as_str())
                             .map(|s| s.to_owned()),
-                        downloads: item["downloads"].as_u64()
+                        downloads: item["downloads"]
+                            .as_u64()
                             .or_else(|| item["download_count"].as_u64()),
-                        installs: item["installs"].as_u64()
+                        installs: item["installs"]
+                            .as_u64()
                             .or_else(|| item["install_count"].as_u64()),
-                        stars: item["stars"].as_u64()
+                        stars: item["stars"]
+                            .as_u64()
                             .or_else(|| item["favorites"].as_u64())
                             .or_else(|| item["star_count"].as_u64()),
                     })
@@ -428,10 +444,7 @@ impl ClawhubClient {
         let dir_name = url
             .split('?')
             .nth(1)
-            .and_then(|qs| {
-                qs.split('&')
-                    .find_map(|p| p.strip_prefix("slug="))
-            })
+            .and_then(|qs| qs.split('&').find_map(|p| p.strip_prefix("slug=")))
             .unwrap_or_else(|| {
                 url.rsplit('/')
                     .find(|s| !s.is_empty() && !s.contains('?'))
@@ -519,11 +532,14 @@ impl ClawhubClient {
                                     .as_str()
                                     .or_else(|| item["description"].as_str())
                                     .map(|s| s.to_owned()),
-                                downloads: item["downloads"].as_u64()
+                                downloads: item["downloads"]
+                                    .as_u64()
                                     .or_else(|| item["download_count"].as_u64()),
-                                installs: item["installs"].as_u64()
+                                installs: item["installs"]
+                                    .as_u64()
                                     .or_else(|| item["install_count"].as_u64()),
-                                stars: item["stars"].as_u64()
+                                stars: item["stars"]
+                                    .as_u64()
                                     .or_else(|| item["favorites"].as_u64())
                                     .or_else(|| item["star_count"].as_u64()),
                             })
@@ -548,18 +564,38 @@ impl ClawhubClient {
                     .map(|arr| {
                         arr.iter()
                             .filter(|item| {
-                                let slug = item["slug"].as_str().or_else(|| item["name"].as_str()).unwrap_or("");
-                                let desc = item["summary"].as_str().or_else(|| item["description"].as_str()).unwrap_or("");
-                                slug.to_lowercase().contains(&query_lower) || desc.to_lowercase().contains(&query_lower)
+                                let slug = item["slug"]
+                                    .as_str()
+                                    .or_else(|| item["name"].as_str())
+                                    .unwrap_or("");
+                                let desc = item["summary"]
+                                    .as_str()
+                                    .or_else(|| item["description"].as_str())
+                                    .unwrap_or("");
+                                slug.to_lowercase().contains(&query_lower)
+                                    || desc.to_lowercase().contains(&query_lower)
                             })
                             .take(10)
                             .map(|item| SearchResult {
-                                slug: item["slug"].as_str().or_else(|| item["name"].as_str()).unwrap_or("unknown").to_owned(),
+                                slug: item["slug"]
+                                    .as_str()
+                                    .or_else(|| item["name"].as_str())
+                                    .unwrap_or("unknown")
+                                    .to_owned(),
                                 version: item["version"].as_str().map(|s| s.to_owned()),
-                                description: item["summary"].as_str().or_else(|| item["description"].as_str()).map(|s| s.to_owned()),
-                                downloads: item["downloads"].as_u64().or_else(|| item["download_count"].as_u64()),
-                                installs: item["installs"].as_u64().or_else(|| item["install_count"].as_u64()),
-                                stars: item["stars"].as_u64().or_else(|| item["favorites"].as_u64()),
+                                description: item["summary"]
+                                    .as_str()
+                                    .or_else(|| item["description"].as_str())
+                                    .map(|s| s.to_owned()),
+                                downloads: item["downloads"]
+                                    .as_u64()
+                                    .or_else(|| item["download_count"].as_u64()),
+                                installs: item["installs"]
+                                    .as_u64()
+                                    .or_else(|| item["install_count"].as_u64()),
+                                stars: item["stars"]
+                                    .as_u64()
+                                    .or_else(|| item["favorites"].as_u64()),
                             })
                             .collect()
                     })

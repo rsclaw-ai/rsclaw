@@ -66,13 +66,19 @@ pub struct LineChannel {
     api_data_base: String,
     client: Client,
     #[allow(clippy::type_complexity)]
-    on_message: Arc<dyn Fn(String, String, bool, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync>,
+    on_message: Arc<
+        dyn Fn(String, String, bool, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync,
+    >,
 }
 
 impl LineChannel {
     pub fn new(
         channel_access_token: impl Into<String>,
-        on_message: Arc<dyn Fn(String, String, bool, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync>,
+        on_message: Arc<
+            dyn Fn(String, String, bool, Vec<crate::agent::registry::ImageAttachment>)
+                + Send
+                + Sync,
+        >,
     ) -> Self {
         Self::with_api_base(channel_access_token, None, on_message)
     }
@@ -80,12 +86,17 @@ impl LineChannel {
     pub fn with_api_base(
         channel_access_token: impl Into<String>,
         api_base: Option<String>,
-        on_message: Arc<dyn Fn(String, String, bool, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync>,
+        on_message: Arc<
+            dyn Fn(String, String, bool, Vec<crate::agent::registry::ImageAttachment>)
+                + Send
+                + Sync,
+        >,
     ) -> Self {
         let base = api_base.unwrap_or_else(|| LINE_API_BASE.to_owned());
         // Derive data API base by replacing the messaging host.
         let data_base = base.replace("api.line.me", "api-data.line.me");
-        // If the replacement had no effect (custom base), fall back to default data base.
+        // If the replacement had no effect (custom base), fall back to default data
+        // base.
         let data_base = if data_base != base {
             data_base
         } else {
@@ -134,62 +145,73 @@ impl LineChannel {
                         continue;
                     }
                 }
-                "image" => {
-                    match self.download_line_content(&msg.id).await {
-                        Ok(bytes) => {
-                            use base64::Engine;
-                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                            images.push(crate::agent::registry::ImageAttachment {
-                                data: format!("data:image/jpeg;base64,{b64}"),
-                                mime_type: "image/jpeg".to_owned(),
-                            });
-                            text = crate::i18n::t("describe_image", crate::i18n::default_lang());
-                            info!(size = bytes.len(), "LINE: image downloaded");
-                        }
-                        Err(e) => {
-                            warn!("LINE: image download failed: {e:#}");
-                            continue;
-                        }
+                "image" => match self.download_line_content(&msg.id).await {
+                    Ok(bytes) => {
+                        use base64::Engine;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        images.push(crate::agent::registry::ImageAttachment {
+                            data: format!("data:image/jpeg;base64,{b64}"),
+                            mime_type: "image/jpeg".to_owned(),
+                        });
+                        text = crate::i18n::t("describe_image", crate::i18n::default_lang());
+                        info!(size = bytes.len(), "LINE: image downloaded");
                     }
-                }
-                "audio" => {
-                    match self.download_line_content(&msg.id).await {
-                        Ok(bytes) => {
-                            match crate::channel::transcription::transcribe_audio(
-                                &self.client, &bytes, "voice.m4a", "audio/mp4",
-                            ).await {
-                                Ok(t) if !t.is_empty() => {
-                                    info!(chars = t.len(), "LINE: audio transcribed");
-                                    text = t;
-                                }
-                                Ok(_) => { warn!("LINE: audio transcription returned empty"); continue; }
-                                Err(e) => { warn!("LINE: audio transcription failed: {e:#}"); continue; }
+                    Err(e) => {
+                        warn!("LINE: image download failed: {e:#}");
+                        continue;
+                    }
+                },
+                "audio" => match self.download_line_content(&msg.id).await {
+                    Ok(bytes) => {
+                        match crate::channel::transcription::transcribe_audio(
+                            &self.client,
+                            &bytes,
+                            "voice.m4a",
+                            "audio/mp4",
+                        )
+                        .await
+                        {
+                            Ok(t) if !t.is_empty() => {
+                                info!(chars = t.len(), "LINE: audio transcribed");
+                                text = t;
+                            }
+                            Ok(_) => {
+                                warn!("LINE: audio transcription returned empty");
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!("LINE: audio transcription failed: {e:#}");
+                                continue;
                             }
                         }
-                        Err(e) => {
-                            warn!("LINE: audio download failed: {e:#}");
-                            continue;
-                        }
                     }
-                }
-                "video" => {
-                    match self.download_line_content(&msg.id).await {
-                        Ok(bytes) => {
-                            match line_extract_audio_and_transcribe(&self.client, &bytes).await {
-                                Ok(t) if !t.is_empty() => {
-                                    info!(chars = t.len(), "LINE: video audio transcribed");
-                                    text = t;
-                                }
-                                Ok(_) => { warn!("LINE: video transcription returned empty"); continue; }
-                                Err(e) => { warn!("LINE: video transcription failed: {e:#}"); continue; }
+                    Err(e) => {
+                        warn!("LINE: audio download failed: {e:#}");
+                        continue;
+                    }
+                },
+                "video" => match self.download_line_content(&msg.id).await {
+                    Ok(bytes) => {
+                        match line_extract_audio_and_transcribe(&self.client, &bytes).await {
+                            Ok(t) if !t.is_empty() => {
+                                info!(chars = t.len(), "LINE: video audio transcribed");
+                                text = t;
+                            }
+                            Ok(_) => {
+                                warn!("LINE: video transcription returned empty");
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!("LINE: video transcription failed: {e:#}");
+                                continue;
                             }
                         }
-                        Err(e) => {
-                            warn!("LINE: video download failed: {e:#}");
-                            continue;
-                        }
                     }
-                }
+                    Err(e) => {
+                        warn!("LINE: video download failed: {e:#}");
+                        continue;
+                    }
+                },
                 "file" => {
                     let filename = msg.file_name.as_deref().unwrap_or("file");
                     match self.download_line_content(&msg.id).await {
@@ -306,22 +328,17 @@ impl Channel for LineChannel {
 
             for image_data in &msg.images {
                 use base64::Engine;
-                let (mime, b64) = if let Some(rest) =
-                    image_data.strip_prefix("data:image/png;base64,")
-                {
-                    ("image/png", rest)
-                } else if let Some(rest) =
-                    image_data.strip_prefix("data:image/jpeg;base64,")
-                {
-                    ("image/jpeg", rest)
-                } else if let Some(rest) =
-                    image_data.strip_prefix("data:image/webp;base64,")
-                {
-                    ("image/webp", rest)
-                } else {
-                    warn!("LINE: unrecognised image data URI prefix, skipping");
-                    continue;
-                };
+                let (mime, b64) =
+                    if let Some(rest) = image_data.strip_prefix("data:image/png;base64,") {
+                        ("image/png", rest)
+                    } else if let Some(rest) = image_data.strip_prefix("data:image/jpeg;base64,") {
+                        ("image/jpeg", rest)
+                    } else if let Some(rest) = image_data.strip_prefix("data:image/webp;base64,") {
+                        ("image/webp", rest)
+                    } else {
+                        warn!("LINE: unrecognised image data URI prefix, skipping");
+                        continue;
+                    };
 
                 let bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
                     Ok(b) if !b.is_empty() => b,
@@ -331,7 +348,11 @@ impl Channel for LineChannel {
                     }
                 };
 
-                let filename = if mime == "image/jpeg" { "image.jpg" } else { "image.png" };
+                let filename = if mime == "image/jpeg" {
+                    "image.jpg"
+                } else {
+                    "image.png"
+                };
 
                 // Upload image via LINE's blob upload API.
                 // Returns a blob ID usable as originalContentUrl.
@@ -359,10 +380,7 @@ impl Channel for LineChannel {
                     Ok(r) if r.status().is_success() => {
                         // LINE's audience group upload returns a blob resource URL.
                         if let Ok(body) = r.json::<serde_json::Value>().await {
-                            if let Some(blob_url) = body
-                                .get("url")
-                                .and_then(|v| v.as_str())
-                            {
+                            if let Some(blob_url) = body.get("url").and_then(|v| v.as_str()) {
                                 let blob_owned = blob_url.to_owned();
                                 let _ = self.send_image(&msg.target_id, &blob_owned).await;
                                 debug!("LINE: image sent via blob upload");
@@ -443,7 +461,13 @@ async fn line_extract_audio_and_transcribe(
     let audio_bytes = std::fs::read(&audio_path)?;
     let _ = std::fs::remove_file(&audio_path);
 
-    crate::channel::transcription::transcribe_audio(client, &audio_bytes, "video_audio.ogg", "audio/ogg").await
+    crate::channel::transcription::transcribe_audio(
+        client,
+        &audio_bytes,
+        "video_audio.ogg",
+        "audio/ogg",
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

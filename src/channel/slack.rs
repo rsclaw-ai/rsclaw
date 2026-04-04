@@ -50,8 +50,7 @@ impl SlackChannel {
         Self {
             bot_token: bot_token.into(),
             app_token,
-            api_base: api_base
-                .unwrap_or_else(|| SLACK_API_BASE.to_owned()),
+            api_base: api_base.unwrap_or_else(|| SLACK_API_BASE.to_owned()),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -203,11 +202,16 @@ impl SlackChannel {
                                 let url = file["url_private_download"].as_str().unwrap_or("");
                                 let filename = file["name"].as_str().unwrap_or("file");
                                 let mimetype = file["mimetype"].as_str().unwrap_or("");
-                                if url.is_empty() { continue; }
+                                if url.is_empty() {
+                                    continue;
+                                }
 
-                                let download = self.client.get(url)
+                                let download = self
+                                    .client
+                                    .get(url)
                                     .bearer_auth(&self.bot_token)
-                                    .send().await;
+                                    .send()
+                                    .await;
                                 let bytes = match download {
                                     Ok(resp) if resp.status().is_success() => {
                                         resp.bytes().await.ok().map(|b| b.to_vec())
@@ -216,30 +220,55 @@ impl SlackChannel {
                                 };
 
                                 if let Some(bytes) = bytes {
-                                    if mimetype.starts_with("audio/") || mimetype.starts_with("video/") {
+                                    if mimetype.starts_with("audio/")
+                                        || mimetype.starts_with("video/")
+                                    {
                                         match crate::channel::transcription::transcribe_audio(
-                                            &self.client, &bytes, filename, mimetype,
-                                        ).await {
+                                            &self.client,
+                                            &bytes,
+                                            filename,
+                                            mimetype,
+                                        )
+                                        .await
+                                        {
                                             Ok(t) => {
-                                                info!("Slack: file transcribed ({} chars)", t.len());
-                                                if !text.is_empty() { text.push('\n'); }
+                                                info!(
+                                                    "Slack: file transcribed ({} chars)",
+                                                    t.len()
+                                                );
+                                                if !text.is_empty() {
+                                                    text.push('\n');
+                                                }
                                                 text.push_str(&t);
                                             }
                                             Err(_) => {
-                                                if !text.is_empty() { text.push('\n'); }
-                                                text.push_str(&format!("[{mimetype} file: {filename}]"));
+                                                if !text.is_empty() {
+                                                    text.push('\n');
+                                                }
+                                                text.push_str(&format!(
+                                                    "[{mimetype} file: {filename}]"
+                                                ));
                                             }
                                         }
                                     } else if mimetype.starts_with("image/") {
-                                        if !text.is_empty() { text.push('\n'); }
-                                        text.push_str(&crate::i18n::t("image_file_received", crate::i18n::default_lang()));
+                                        if !text.is_empty() {
+                                            text.push('\n');
+                                        }
+                                        text.push_str(&crate::i18n::t(
+                                            "image_file_received",
+                                            crate::i18n::default_lang(),
+                                        ));
                                     } else {
                                         let processed = slack_process_file(filename, &bytes);
-                                        if !text.is_empty() { text.push('\n'); }
+                                        if !text.is_empty() {
+                                            text.push('\n');
+                                        }
                                         text.push_str(&processed);
                                     }
                                 } else {
-                                    if !text.is_empty() { text.push('\n'); }
+                                    if !text.is_empty() {
+                                        text.push('\n');
+                                    }
                                     text.push_str(&format!("[file download failed: {filename}]"));
                                 }
                             }
@@ -314,10 +343,13 @@ impl Channel for SlackChannel {
                     .text("filename", "image.png")
                     .text("title", "Image")
                     .part("file", part);
-                match self.client.post(format!("{}/files.upload", self.api_base))
+                match self
+                    .client
+                    .post(format!("{}/files.upload", self.api_base))
                     .header("Authorization", format!("Bearer {}", self.bot_token))
                     .multipart(form)
-                    .send().await
+                    .send()
+                    .await
                 {
                     Ok(resp) if !resp.status().is_success() => {
                         let status = resp.status();
@@ -365,8 +397,8 @@ impl Channel for SlackChannel {
 
 fn slack_is_text_file(name: &str) -> bool {
     let exts = [
-        ".txt", ".md", ".csv", ".json", ".toml", ".yaml", ".yml", ".xml", ".html",
-        ".rs", ".py", ".js", ".ts", ".go", ".sh", ".log", ".conf", ".cfg", ".c", ".h", ".java",
+        ".txt", ".md", ".csv", ".json", ".toml", ".yaml", ".yml", ".xml", ".html", ".rs", ".py",
+        ".js", ".ts", ".go", ".sh", ".log", ".conf", ".cfg", ".c", ".h", ".java",
     ];
     exts.iter().any(|e| name.ends_with(e))
 }
@@ -396,25 +428,40 @@ fn slack_process_file(filename: &str, bytes: &[u8]) -> String {
         }
     } else if lower.ends_with(".docx") || lower.ends_with(".xlsx") || lower.ends_with(".pptx") {
         if let Some(text) = crate::channel::extract_office_text(filename, bytes) {
-            let label = if lower.ends_with(".docx") { "Word" }
-                else if lower.ends_with(".xlsx") { "Excel" }
-                else { "PowerPoint" };
+            let label = if lower.ends_with(".docx") {
+                "Word"
+            } else if lower.ends_with(".xlsx") {
+                "Excel"
+            } else {
+                "PowerPoint"
+            };
             format!("[{label}: {filename}]\n{}", &text[..text.len().min(20000)])
         } else {
-            let label = if lower.ends_with(".docx") { "Word" }
-                else if lower.ends_with(".xlsx") { "Excel" }
-                else { "PowerPoint" };
+            let label = if lower.ends_with(".docx") {
+                "Word"
+            } else if lower.ends_with(".xlsx") {
+                "Excel"
+            } else {
+                "PowerPoint"
+            };
             format!("[{label} file: {filename} ({} bytes)]", bytes.len())
         }
     } else if slack_is_text_file(&lower) {
         let text = String::from_utf8_lossy(bytes);
-        format!("[File: {filename}]\n```\n{}\n```", &text[..text.len().min(20000)])
+        format!(
+            "[File: {filename}]\n```\n{}\n```",
+            &text[..text.len().min(20000)]
+        )
     } else {
         let ws = crate::config::loader::base_dir().join("workspace/uploads");
         let _ = std::fs::create_dir_all(&ws);
         let dest = ws.join(filename);
         let _ = std::fs::write(&dest, bytes);
-        format!("[File saved: {filename} ({} bytes) at {}]", bytes.len(), dest.display())
+        format!(
+            "[File saved: {filename} ({} bytes) at {}]",
+            bytes.len(),
+            dest.display()
+        )
     }
 }
 

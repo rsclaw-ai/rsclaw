@@ -1,8 +1,9 @@
 //! ACP integration tests
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use rsclaw::acp::{AcpCallbackHandler, AcpClient, SessionEvent, types::*};
-use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Mock handler for testing

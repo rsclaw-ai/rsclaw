@@ -66,8 +66,8 @@ pub struct AgentMessage {
     pub channel: String,
     /// Peer / user ID (used for session isolation).
     pub peer_id: String,
-    /// Chat/conversation ID for replies (for platforms like Feishu where reply ID differs from user ID).
-    /// If empty, defaults to peer_id.
+    /// Chat/conversation ID for replies (for platforms like Feishu where reply
+    /// ID differs from user ID). If empty, defaults to peer_id.
     pub chat_id: String,
     /// One-shot sender for the agent's response.
     pub reply_tx: tokio::sync::oneshot::Sender<AgentReply>,
@@ -269,7 +269,8 @@ impl AgentRegistry {
     /// Route a message to the correct agent for a specific channel account.
     ///
     /// Routing priority:
-    ///   1. Agents with `channels` containing `"channel:account"` (exact match).
+    ///   1. Agents with `channels` containing `"channel:account"` (exact
+    ///      match).
     ///   2. Agents with `channels` containing `"channel"` (bare channel match).
     ///   3. Default agent (fallback).
     pub fn route_account(&self, channel: &str, account: Option<&str>) -> Result<Arc<AgentHandle>> {
@@ -370,6 +371,7 @@ mod tests {
                 channel_max_restarts_per_hour: 10,
                 auth_token_configured: false,
                 auth_token_is_plaintext: false,
+                bind_address: None,
             },
             agents: AgentsRuntime {
                 defaults: Default::default(),

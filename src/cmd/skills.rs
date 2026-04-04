@@ -25,12 +25,7 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
                 );
                 for s in skills {
                     let desc = s.description.as_deref().unwrap_or("-");
-                    println!(
-                        "{:<24} {:<8} {}",
-                        cyan(&s.name),
-                        s.tools.len(),
-                        desc
-                    );
+                    println!("{:<24} {:<8} {}", cyan(&s.name), s.tools.len(), desc);
                 }
             }
         }
@@ -38,19 +33,34 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
             Some(s) => {
                 println!("{}", bold(&s.name));
                 println!();
-                println!("  {:<14} {}", dim("Version"), s.version.as_deref().unwrap_or("-"));
-                println!("  {:<14} {}", dim("Description"), s.description.as_deref().unwrap_or("-"));
+                println!(
+                    "  {:<14} {}",
+                    dim("Version"),
+                    s.version.as_deref().unwrap_or("-")
+                );
+                println!(
+                    "  {:<14} {}",
+                    dim("Description"),
+                    s.description.as_deref().unwrap_or("-")
+                );
                 if !s.tools.is_empty() {
                     println!();
                     println!("  {} ({})", bold("Tools"), s.tools.len());
                     for t in &s.tools {
-                        println!("    {} {}", cyan(&t.name), dim(&format!("-- {}", t.description)));
+                        println!(
+                            "    {} {}",
+                            cyan(&t.name),
+                            dim(&format!("-- {}", t.description))
+                        );
                     }
                 }
             }
             None => {
                 eprintln!("Skill '{}' not found locally.", skill);
-                eprintln!("Use `rsclaw skills search {}` to find it on the registry.", skill);
+                eprintln!(
+                    "Use `rsclaw skills search {}` to find it on the registry.",
+                    skill
+                );
                 std::process::exit(1);
             }
         },
@@ -112,14 +122,19 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
                         if has_stats {
                             println!(
                                 "{:<24} {:<10} {:>10} {:>10} {:>8}  {}",
-                                bold("NAME"), bold("VERSION"),
-                                bold("DOWNLOADS"), bold("INSTALLS"), bold("STARS"),
+                                bold("NAME"),
+                                bold("VERSION"),
+                                bold("DOWNLOADS"),
+                                bold("INSTALLS"),
+                                bold("STARS"),
                                 bold("DESCRIPTION"),
                             );
                         } else {
                             println!(
                                 "{:<24} {:<10}  {}",
-                                bold("NAME"), bold("VERSION"), bold("DESCRIPTION"),
+                                bold("NAME"),
+                                bold("VERSION"),
+                                bold("DESCRIPTION"),
                             );
                         }
                         for r in &results {
@@ -132,18 +147,22 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
                             };
                             let ver = r.version.as_deref().unwrap_or("-");
                             if has_stats {
-                                let dl = r.downloads.map(format_count).unwrap_or_else(|| "-".into());
-                                let inst = r.installs.map(format_count).unwrap_or_else(|| "-".into());
+                                let dl =
+                                    r.downloads.map(format_count).unwrap_or_else(|| "-".into());
+                                let inst =
+                                    r.installs.map(format_count).unwrap_or_else(|| "-".into());
                                 let stars = r.stars.map(format_count).unwrap_or_else(|| "-".into());
                                 println!(
                                     "{:<24} {:<10} {:>10} {:>10} {:>8}  {}",
-                                    cyan(&r.slug), dim(ver), dl, inst, stars, desc,
+                                    cyan(&r.slug),
+                                    dim(ver),
+                                    dl,
+                                    inst,
+                                    stars,
+                                    desc,
                                 );
                             } else {
-                                println!(
-                                    "{:<24} {:<10}  {}",
-                                    cyan(&r.slug), dim(ver), desc,
-                                );
+                                println!("{:<24} {:<10}  {}", cyan(&r.slug), dim(ver), desc,);
                             }
                         }
                         println!();

@@ -138,7 +138,10 @@ async fn test_cron_job_runs() {
     let cfg = runtime_with_agent("agent-a");
 
     // Build registry + receivers.
-    let (registry, mut receivers) = AgentRegistry::from_config_with_receivers(&cfg, std::sync::Arc::new(rsclaw::provider::registry::ProviderRegistry::new()));
+    let (registry, mut receivers) = AgentRegistry::from_config_with_receivers(
+        &cfg,
+        std::sync::Arc::new(rsclaw::provider::registry::ProviderRegistry::new()),
+    );
 
     // Spawn an echo task for "agent-a".
     if let Some(mut rx) = receivers.remove("agent-a") {
@@ -180,7 +183,10 @@ async fn test_cron_job_runs() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_cron_enable_disable() {
     let cfg = runtime_with_agent("agent-b");
-    let (registry, mut receivers) = AgentRegistry::from_config_with_receivers(&cfg, std::sync::Arc::new(rsclaw::provider::registry::ProviderRegistry::new()));
+    let (registry, mut receivers) = AgentRegistry::from_config_with_receivers(
+        &cfg,
+        std::sync::Arc::new(rsclaw::provider::registry::ProviderRegistry::new()),
+    );
 
     if let Some(mut rx) = receivers.remove("agent-b") {
         tokio::spawn(async move {
@@ -242,7 +248,10 @@ async fn test_cron_enable_disable() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_cron_invalid_agent() {
     let cfg = runtime_with_agent("real-agent");
-    let (registry, _receivers) = AgentRegistry::from_config_with_receivers(&cfg, std::sync::Arc::new(rsclaw::provider::registry::ProviderRegistry::new()));
+    let (registry, _receivers) = AgentRegistry::from_config_with_receivers(
+        &cfg,
+        std::sync::Arc::new(rsclaw::provider::registry::ProviderRegistry::new()),
+    );
 
     let data_dir = tempfile::tempdir().expect("tempdir");
     let job = make_job("job-bad-agent", "* * * * *", "nonexistent-agent", true);
@@ -294,7 +303,10 @@ fn test_cron_schedule_stored_verbatim() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_cron_trigger_unknown_job_returns_error() {
     let cfg = runtime_with_agent("agent-c");
-    let (registry, _receivers) = AgentRegistry::from_config_with_receivers(&cfg, std::sync::Arc::new(rsclaw::provider::registry::ProviderRegistry::new()));
+    let (registry, _receivers) = AgentRegistry::from_config_with_receivers(
+        &cfg,
+        std::sync::Arc::new(rsclaw::provider::registry::ProviderRegistry::new()),
+    );
 
     let data_dir = tempfile::tempdir().expect("tempdir");
     let runner = CronRunner::new(

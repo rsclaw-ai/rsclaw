@@ -27,6 +27,8 @@ pub mod custom;
 pub mod dingtalk;
 pub mod discord;
 pub mod feishu;
+pub mod line;
+pub mod matrix;
 pub mod qq;
 pub mod signal;
 pub mod slack;
@@ -36,8 +38,6 @@ pub mod tts;
 pub mod wechat;
 pub mod wecom;
 pub mod whatsapp;
-pub mod line;
-pub mod matrix;
 pub mod zalo;
 
 use std::{
@@ -166,13 +166,17 @@ impl PairingStore {
         self.approved.remove(peer_id);
     }
 
-    /// List pending pairing requests (not yet approved). Returns (code, peer_id, seconds_remaining).
+    /// List pending pairing requests (not yet approved). Returns (code,
+    /// peer_id, seconds_remaining).
     pub fn list_pending(&mut self) -> Vec<(String, String, u64)> {
-        self.pending.retain(|e| e.created_at.elapsed() < PAIRING_TTL);
+        self.pending
+            .retain(|e| e.created_at.elapsed() < PAIRING_TTL);
         self.pending
             .iter()
             .map(|e| {
-                let remaining = PAIRING_TTL.as_secs().saturating_sub(e.created_at.elapsed().as_secs());
+                let remaining = PAIRING_TTL
+                    .as_secs()
+                    .saturating_sub(e.created_at.elapsed().as_secs());
                 (e.code.clone(), e.peer_id.clone(), remaining)
             })
             .collect()
@@ -188,7 +192,9 @@ fn generate_pairing_code() -> String {
     const CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I to avoid confusion
     let mut rng = rand::rng();
     let part = |rng: &mut rand::rngs::ThreadRng| -> String {
-        (0..4).map(|_| CHARS[rng.random_range(0..CHARS.len())] as char).collect()
+        (0..4)
+            .map(|_| CHARS[rng.random_range(0..CHARS.len())] as char)
+            .collect()
     };
     format!("{}-{}", part(&mut rng), part(&mut rng))
 }
@@ -228,8 +234,13 @@ impl DmPolicyEnforcer {
         }
     }
 
-    /// Enable persistence: load approved peers from redb on init, write-through on approve/revoke.
-    pub fn with_persistence(mut self, channel: &str, store: Arc<crate::store::redb_store::RedbStore>) -> Self {
+    /// Enable persistence: load approved peers from redb on init, write-through
+    /// on approve/revoke.
+    pub fn with_persistence(
+        mut self,
+        channel: &str,
+        store: Arc<crate::store::redb_store::RedbStore>,
+    ) -> Self {
         self.channel_name = channel.to_owned();
         // Load previously approved peers from redb.
         if let Ok(pairs) = store.list_pairings(channel) {
@@ -238,7 +249,11 @@ impl DmPolicyEnforcer {
                 ps.approved.insert(peer_id);
             }
             if !ps.approved.is_empty() {
-                info!(channel, count = ps.approved.len(), "loaded persisted pairing approvals");
+                info!(
+                    channel,
+                    count = ps.approved.len(),
+                    "loaded persisted pairing approvals"
+                );
             }
         }
         self.store = Some(store);
@@ -503,9 +518,7 @@ fn extract_xlsx_text(bytes: &[u8]) -> Option<String> {
     if let Ok(mut ss) = archive.by_name("xl/sharedStrings.xml") {
         let mut xml = String::new();
         std::io::Read::read_to_string(&mut ss, &mut xml).ok()?;
-        let clean = regex::Regex::new(r"<[^>]+>")
-            .ok()?
-            .replace_all(&xml, " ");
+        let clean = regex::Regex::new(r"<[^>]+>").ok()?.replace_all(&xml, " ");
         text.push_str(&clean);
     }
 

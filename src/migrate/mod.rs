@@ -122,8 +122,8 @@ pub fn rsclaw_dir_exists() -> bool {
     }
 }
 
-/// Print a one-line notice when OpenClaw is detected but rsclaw is not yet set up.
-/// Returns true if a notice was printed.
+/// Print a one-line notice when OpenClaw is detected but rsclaw is not yet set
+/// up. Returns true if a notice was printed.
 pub fn maybe_print_openclaw_notice() -> bool {
     if openclaw_dir_exists() && !rsclaw_dir_exists() {
         println!("  Detected OpenClaw installation. Run `rsclaw migrate` for options.");

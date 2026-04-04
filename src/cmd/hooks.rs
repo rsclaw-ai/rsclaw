@@ -1,7 +1,6 @@
 use anyhow::Result;
 
-use super::config_json::load_config_json;
-use super::style::*;
+use super::{config_json::load_config_json, style::*};
 use crate::{cli::HooksCommand, config};
 
 pub async fn cmd_hooks(sub: HooksCommand) -> Result<()> {
@@ -15,11 +14,7 @@ pub async fn cmd_hooks(sub: HooksCommand) -> Result<()> {
                     if mappings.is_empty() {
                         warn_msg("hooks enabled -- no mappings configured");
                     } else {
-                        println!(
-                            "  {:<20} {}",
-                            bold("PATH"),
-                            bold("AGENT")
-                        );
+                        println!("  {:<20} {}", bold("PATH"), bold("AGENT"));
                         for m in mappings {
                             let path = m.match_.path.as_deref().unwrap_or("(any)");
                             let agent = m.agent_id.as_deref().unwrap_or("main");
@@ -34,7 +29,11 @@ pub async fn cmd_hooks(sub: HooksCommand) -> Result<()> {
             Some(h) if h.enabled => {
                 ok(&format!(
                     "hooks enabled, token:{}",
-                    if h.token.is_some() { green("set") } else { yellow("unset") }
+                    if h.token.is_some() {
+                        green("set")
+                    } else {
+                        yellow("unset")
+                    }
                 ));
             }
             _ => warn_msg("hooks disabled"),
@@ -64,16 +63,25 @@ pub async fn cmd_hooks(sub: HooksCommand) -> Result<()> {
             let (path, mut val) = load_config_json()?;
             hooks_set_mapping_enabled(&mut val, &id, true)?;
             std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
-            ok(&format!("hook mapping '{}' enabled", cyan(&format!("/{id}"))));
+            ok(&format!(
+                "hook mapping '{}' enabled",
+                cyan(&format!("/{id}"))
+            ));
         }
         HooksCommand::Disable { id } => {
             let (path, mut val) = load_config_json()?;
             hooks_set_mapping_enabled(&mut val, &id, false)?;
             std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
-            ok(&format!("hook mapping '{}' disabled", cyan(&format!("/{id}"))));
+            ok(&format!(
+                "hook mapping '{}' disabled",
+                cyan(&format!("/{id}"))
+            ));
         }
         HooksCommand::Install => {
-            banner(&format!("rsclaw hooks install v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!(
+                "rsclaw hooks install v{}",
+                env!("RSCLAW_BUILD_VERSION")
+            ));
             let port = config.gateway.port;
             let path = config
                 .ops
@@ -82,7 +90,10 @@ pub async fn cmd_hooks(sub: HooksCommand) -> Result<()> {
                 .and_then(|h| h.path.as_deref())
                 .unwrap_or("/api/v1/hook");
             let token_set = config.ops.hooks.as_ref().is_some_and(|h| h.token.is_some());
-            kv("webhook URL", &bold(&format!("http://127.0.0.1:{port}{path}")));
+            kv(
+                "webhook URL",
+                &bold(&format!("http://127.0.0.1:{port}{path}")),
+            );
             if !token_set {
                 warn_msg("set hooks.token in config to require authentication");
             } else {

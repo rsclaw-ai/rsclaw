@@ -159,11 +159,19 @@ pub struct TelegramChannel {
     api_base: String,
     client: Client,
     retry: RetryConfig,
-    /// Callback: called with (peer_id, text, chat_id, is_group, thread_id, images, files).
+    /// Callback: called with (peer_id, text, chat_id, is_group, thread_id,
+    /// images, files).
     #[allow(clippy::type_complexity)]
     on_message: Arc<
-        dyn Fn(i64, String, i64, bool, Option<i64>, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>)
-            + Send
+        dyn Fn(
+                i64,
+                String,
+                i64,
+                bool,
+                Option<i64>,
+                Vec<crate::agent::registry::ImageAttachment>,
+                Vec<crate::agent::registry::FileAttachment>,
+            ) + Send
             + Sync,
     >,
 }
@@ -188,8 +196,7 @@ impl TelegramChannel {
     ) -> Self {
         Self {
             token: token.into(),
-            api_base: api_base
-                .unwrap_or_else(|| "https://api.telegram.org".to_owned()),
+            api_base: api_base.unwrap_or_else(|| "https://api.telegram.org".to_owned()),
             client: Client::builder()
                 .timeout(Duration::from_secs(35))
                 .build()
@@ -431,31 +438,43 @@ impl TelegramChannel {
         let resp: TgResponse<TgFile> = match serde_json::from_str(&raw_text) {
             Ok(r) => r,
             Err(e) => {
-                warn!(file_id = file_id, response = &raw_text[..raw_text.len().min(300)], "Telegram getFile parse error: {e}");
+                warn!(
+                    file_id = file_id,
+                    response = &raw_text[..raw_text.len().min(300)],
+                    "Telegram getFile parse error: {e}"
+                );
                 anyhow::bail!("Telegram getFile parse error");
             }
         };
         if !resp.ok {
-            warn!(file_id = file_id, response = &raw_text[..raw_text.len().min(300)], "Telegram getFile failed");
+            warn!(
+                file_id = file_id,
+                response = &raw_text[..raw_text.len().min(300)],
+                "Telegram getFile failed"
+            );
         }
 
         let file_path = match resp.result {
             Some(f) if f.file_path.is_some() => f.file_path.unwrap(),
             Some(_) => {
-                warn!(file_id = file_id, "Telegram getFile: no file_path (file may exceed 20MB bot limit)");
+                warn!(
+                    file_id = file_id,
+                    "Telegram getFile: no file_path (file may exceed 20MB bot limit)"
+                );
                 anyhow::bail!("Telegram getFile returned no file_path");
             }
             None => {
-                warn!(file_id = file_id, ok = resp.ok, "Telegram getFile: no result");
+                warn!(
+                    file_id = file_id,
+                    ok = resp.ok,
+                    "Telegram getFile: no result"
+                );
                 anyhow::bail!("Telegram getFile returned no file_path");
             }
         };
 
         // 2. Download the file.
-        let download_url = format!(
-            "{}/file/bot{}/{}",
-            self.api_base, self.token, file_path
-        );
+        let download_url = format!("{}/file/bot{}/{}", self.api_base, self.token, file_path);
         let bytes = self.client.get(&download_url).send().await?.bytes().await?;
 
         debug!(size = bytes.len(), path = %file_path, "downloaded file from Telegram");
@@ -629,92 +648,112 @@ impl Channel for TelegramChannel {
                             offset = update.update_id + 1;
 
                             if let Some(msg) = &update.message {
-                                let mut tg_file_attachments: Vec<crate::agent::registry::FileAttachment> = Vec::new();
+                                let mut tg_file_attachments: Vec<
+                                    crate::agent::registry::FileAttachment,
+                                > = Vec::new();
                                 // Try text first, then voice/audio transcription, then caption.
-                                let text =
-                                    if let Some(t) = msg.text.clone().filter(|s| !s.is_empty()) {
-                                        t
-                                    } else if let Some(ref voice) = msg.voice {
-                                        match self.transcribe_voice(&voice.file_id).await {
-                                            Ok(t) => {
-                                                info!("voice transcribed ({} chars)", t.len());
-                                                t
-                                            }
-                                            Err(e) => {
-                                                warn!("voice transcription failed: {e:#}");
-                                                continue;
-                                            }
+                                let text = if let Some(t) =
+                                    msg.text.clone().filter(|s| !s.is_empty())
+                                {
+                                    t
+                                } else if let Some(ref voice) = msg.voice {
+                                    match self.transcribe_voice(&voice.file_id).await {
+                                        Ok(t) => {
+                                            info!("voice transcribed ({} chars)", t.len());
+                                            t
                                         }
-                                    } else if let Some(ref audio) = msg.audio {
-                                        match self.transcribe_voice(&audio.file_id).await {
-                                            Ok(t) => {
-                                                info!("audio transcribed ({} chars)", t.len());
-                                                t
-                                            }
-                                            Err(e) => {
-                                                warn!("audio transcription failed: {e:#}");
-                                                continue;
-                                            }
+                                        Err(e) => {
+                                            warn!("voice transcription failed: {e:#}");
+                                            continue;
                                         }
-                                    } else if let Some(ref video) = msg.video {
-                                        match self.download_file(&video.file_id).await {
-                                            Ok(bytes) => {
-                                                match crate::channel::transcription::transcribe_audio(
-                                                    &self.client, &bytes, "video.mp4", "video/mp4",
-                                                ).await {
-                                                    Ok(text) => {
-                                                        info!("video transcribed ({} chars)", text.len());
-                                                        text
-                                                    }
-                                                    Err(_) => crate::i18n::t("video_message_received", crate::i18n::default_lang()),
+                                    }
+                                } else if let Some(ref audio) = msg.audio {
+                                    match self.transcribe_voice(&audio.file_id).await {
+                                        Ok(t) => {
+                                            info!("audio transcribed ({} chars)", t.len());
+                                            t
+                                        }
+                                        Err(e) => {
+                                            warn!("audio transcription failed: {e:#}");
+                                            continue;
+                                        }
+                                    }
+                                } else if let Some(ref video) = msg.video {
+                                    match self.download_file(&video.file_id).await {
+                                        Ok(bytes) => {
+                                            match crate::channel::transcription::transcribe_audio(
+                                                &self.client,
+                                                &bytes,
+                                                "video.mp4",
+                                                "video/mp4",
+                                            )
+                                            .await
+                                            {
+                                                Ok(text) => {
+                                                    info!(
+                                                        "video transcribed ({} chars)",
+                                                        text.len()
+                                                    );
+                                                    text
                                                 }
-                                            }
-                                            Err(e) => {
-                                                let err_msg = format!("{e:#}");
-                                                let reply = if err_msg.contains("too big") {
-                                                    warn!("video too large for Telegram Bot API (>20MB)");
-                                                    "Video exceeds Telegram 20MB bot limit. Send a smaller file or share via link."
-                                                } else {
-                                                    warn!("video download failed: {err_msg}");
-                                                    "Video download failed."
-                                                };
-                                                // Direct reply, skip LLM.
-                                                let _ = self.client
-                                                    .post(self.api_url("sendMessage"))
-                                                    .json(&json!({
-                                                        "chat_id": msg.chat.id,
-                                                        "text": reply,
-                                                    }))
-                                                    .send()
-                                                    .await;
-                                                continue;
+                                                Err(_) => crate::i18n::t(
+                                                    "video_message_received",
+                                                    crate::i18n::default_lang(),
+                                                ),
                                             }
                                         }
-                                    } else if let Some(ref doc) = msg.document {
-                                        let filename = doc.file_name.as_deref().unwrap_or("file");
-                                        match self.download_file(&doc.file_id).await {
-                                            Ok(bytes) => {
-                                                tg_file_attachments.push(crate::agent::registry::FileAttachment {
+                                        Err(e) => {
+                                            let err_msg = format!("{e:#}");
+                                            let reply = if err_msg.contains("too big") {
+                                                warn!(
+                                                    "video too large for Telegram Bot API (>20MB)"
+                                                );
+                                                "Video exceeds Telegram 20MB bot limit. Send a smaller file or share via link."
+                                            } else {
+                                                warn!("video download failed: {err_msg}");
+                                                "Video download failed."
+                                            };
+                                            // Direct reply, skip LLM.
+                                            let _ = self
+                                                .client
+                                                .post(self.api_url("sendMessage"))
+                                                .json(&json!({
+                                                    "chat_id": msg.chat.id,
+                                                    "text": reply,
+                                                }))
+                                                .send()
+                                                .await;
+                                            continue;
+                                        }
+                                    }
+                                } else if let Some(ref doc) = msg.document {
+                                    let filename = doc.file_name.as_deref().unwrap_or("file");
+                                    match self.download_file(&doc.file_id).await {
+                                        Ok(bytes) => {
+                                            tg_file_attachments.push(
+                                                crate::agent::registry::FileAttachment {
                                                     filename: filename.to_owned(),
                                                     data: bytes,
-                                                    mime_type: "application/octet-stream".to_owned(),
-                                                });
-                                                String::new()
-                                            }
-                                            Err(e) => {
-                                                format!("[file download failed: {e}]")
-                                            }
+                                                    mime_type: "application/octet-stream"
+                                                        .to_owned(),
+                                                },
+                                            );
+                                            String::new()
                                         }
-                                    } else if let Some(t) =
-                                        msg.caption.clone().filter(|s| !s.is_empty())
-                                    {
-                                        t
-                                    } else if msg.photo.is_some() {
-                                        // Photo with no caption — use placeholder text.
-                                        crate::i18n::t("describe_image", crate::i18n::default_lang())
-                                    } else {
-                                        continue;
-                                    };
+                                        Err(e) => {
+                                            format!("[file download failed: {e}]")
+                                        }
+                                    }
+                                } else if let Some(t) =
+                                    msg.caption.clone().filter(|s| !s.is_empty())
+                                {
+                                    t
+                                } else if msg.photo.is_some() {
+                                    // Photo with no caption — use placeholder text.
+                                    crate::i18n::t("describe_image", crate::i18n::default_lang())
+                                } else {
+                                    continue;
+                                };
 
                                 // Download photo attachments for vision support.
                                 let mut images = Vec::new();
@@ -754,7 +793,13 @@ impl Channel for TelegramChannel {
                                 debug!(peer_id, chat_id, is_group, "Telegram message received");
 
                                 (self.on_message)(
-                                    peer_id, text, chat_id, is_group, thread, images, tg_file_attachments,
+                                    peer_id,
+                                    text,
+                                    chat_id,
+                                    is_group,
+                                    thread,
+                                    images,
+                                    tg_file_attachments,
                                 );
                             }
                         }

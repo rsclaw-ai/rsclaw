@@ -46,7 +46,6 @@ pub fn load_quiet() -> Result<RuntimeConfig> {
 }
 
 fn load_from_path(path: &std::path::Path) -> Result<RuntimeConfig> {
-
     let runtime = load_json5(&path)
         .with_context(|| format!("failed to load config: {}", path.display()))?
         .into_runtime()?;

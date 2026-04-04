@@ -62,9 +62,11 @@ impl FailoverManager {
             let (provider_name, model_id) = registry.resolve_model(model_str);
             req.model = model_id.to_owned();
 
-            let profiles = self.order.get(provider_name).cloned().unwrap_or_else(|| {
-                vec!["default".to_owned()]
-            });
+            let profiles = self
+                .order
+                .get(provider_name)
+                .cloned()
+                .unwrap_or_else(|| vec!["default".to_owned()]);
 
             for profile_id in &profiles {
                 if self.is_cooling_down(profile_id) {

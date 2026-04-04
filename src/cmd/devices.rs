@@ -60,7 +60,10 @@ pub async fn cmd_devices(sub: DevicesCommand) -> Result<()> {
                     let role = d.role.as_deref().unwrap_or("unknown");
                     let status = d.status.as_deref().unwrap_or("unknown");
                     let paired = d.paired_at.as_deref().unwrap_or("-");
-                    println!("{}  name:{name}  role:{role}  status:{status}  paired:{paired}", d.id);
+                    println!(
+                        "{}  name:{name}  role:{role}  status:{status}  paired:{paired}",
+                        d.id
+                    );
                 }
             }
         }

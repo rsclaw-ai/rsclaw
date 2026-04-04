@@ -9,8 +9,7 @@
 pub mod redb_store;
 pub mod search;
 
-use std::path::Path;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use anyhow::Result;
 pub use redb_store::RedbStore;

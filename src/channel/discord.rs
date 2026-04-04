@@ -424,7 +424,9 @@ impl DiscordChannel {
                                     let url = att["url"].as_str().unwrap_or("");
                                     let filename = att["filename"].as_str().unwrap_or("file");
                                     let content_type = att["content_type"].as_str().unwrap_or("");
-                                    if url.is_empty() { continue; }
+                                    if url.is_empty() {
+                                        continue;
+                                    }
 
                                     let download = self.client.get(url).send().await;
                                     let bytes = match download {
@@ -435,37 +437,67 @@ impl DiscordChannel {
                                     };
 
                                     if let Some(bytes) = bytes {
-                                        if content_type.starts_with("audio/") || content_type.starts_with("video/") {
+                                        if content_type.starts_with("audio/")
+                                            || content_type.starts_with("video/")
+                                        {
                                             match crate::channel::transcription::transcribe_audio(
-                                                &self.client, &bytes, filename, content_type,
-                                            ).await {
+                                                &self.client,
+                                                &bytes,
+                                                filename,
+                                                content_type,
+                                            )
+                                            .await
+                                            {
                                                 Ok(text) => {
-                                                    info!("Discord: attachment transcribed ({} chars)", text.len());
-                                                    if !content.is_empty() { content.push('\n'); }
+                                                    info!(
+                                                        "Discord: attachment transcribed ({} chars)",
+                                                        text.len()
+                                                    );
+                                                    if !content.is_empty() {
+                                                        content.push('\n');
+                                                    }
                                                     content.push_str(&text);
                                                 }
                                                 Err(_) => {
-                                                    if !content.is_empty() { content.push('\n'); }
-                                                    content.push_str(&format!("[{content_type} attachment: {filename}]"));
+                                                    if !content.is_empty() {
+                                                        content.push('\n');
+                                                    }
+                                                    content.push_str(&format!(
+                                                        "[{content_type} attachment: {filename}]"
+                                                    ));
                                                 }
                                             }
                                         } else if content_type.starts_with("image/") {
-                                            // Image: note it for now (no vision vec in Discord callback)
-                                            if !content.is_empty() { content.push('\n'); }
-                                            content.push_str(&crate::i18n::t("image_attachment_received", crate::i18n::default_lang()));
+                                            // Image: note it for now (no vision vec in Discord
+                                            // callback)
+                                            if !content.is_empty() {
+                                                content.push('\n');
+                                            }
+                                            content.push_str(&crate::i18n::t(
+                                                "image_attachment_received",
+                                                crate::i18n::default_lang(),
+                                            ));
                                         } else {
                                             let processed = discord_process_file(filename, &bytes);
-                                            if !content.is_empty() { content.push('\n'); }
+                                            if !content.is_empty() {
+                                                content.push('\n');
+                                            }
                                             content.push_str(&processed);
                                         }
                                     } else {
-                                        if !content.is_empty() { content.push('\n'); }
-                                        content.push_str(&format!("[attachment download failed: {filename}]"));
+                                        if !content.is_empty() {
+                                            content.push('\n');
+                                        }
+                                        content.push_str(&format!(
+                                            "[attachment download failed: {filename}]"
+                                        ));
                                     }
                                 }
                             }
 
-                            if content.is_empty() { continue; }
+                            if content.is_empty() {
+                                continue;
+                            }
                             debug!(peer = %peer_id, channel = %channel_id, "Discord: MESSAGE_CREATE");
                             (self.on_message)(peer_id, content, channel_id, is_guild);
                         }
@@ -526,16 +558,11 @@ impl Channel for DiscordChannel {
                         continue;
                     }
                 };
-                let form = reqwest::multipart::Form::new()
-                    .part("files[0]", part)
-                    .text(
-                        "payload_json",
-                        serde_json::json!({"content": ""}).to_string(),
-                    );
-                let url = format!(
-                    "{}/channels/{}/messages",
-                    self.api_base, msg.target_id
+                let form = reqwest::multipart::Form::new().part("files[0]", part).text(
+                    "payload_json",
+                    serde_json::json!({"content": ""}).to_string(),
                 );
+                let url = format!("{}/channels/{}/messages", self.api_base, msg.target_id);
                 match self
                     .client
                     .post(&url)
@@ -587,8 +614,8 @@ impl Channel for DiscordChannel {
 
 fn discord_is_text_file(name: &str) -> bool {
     let exts = [
-        ".txt", ".md", ".csv", ".json", ".toml", ".yaml", ".yml", ".xml", ".html",
-        ".rs", ".py", ".js", ".ts", ".go", ".sh", ".log", ".conf", ".cfg", ".c", ".h", ".java",
+        ".txt", ".md", ".csv", ".json", ".toml", ".yaml", ".yml", ".xml", ".html", ".rs", ".py",
+        ".js", ".ts", ".go", ".sh", ".log", ".conf", ".cfg", ".c", ".h", ".java",
     ];
     exts.iter().any(|e| name.ends_with(e))
 }
@@ -618,25 +645,40 @@ fn discord_process_file(filename: &str, bytes: &[u8]) -> String {
         }
     } else if lower.ends_with(".docx") || lower.ends_with(".xlsx") || lower.ends_with(".pptx") {
         if let Some(text) = crate::channel::extract_office_text(filename, bytes) {
-            let label = if lower.ends_with(".docx") { "Word" }
-                else if lower.ends_with(".xlsx") { "Excel" }
-                else { "PowerPoint" };
+            let label = if lower.ends_with(".docx") {
+                "Word"
+            } else if lower.ends_with(".xlsx") {
+                "Excel"
+            } else {
+                "PowerPoint"
+            };
             format!("[{label}: {filename}]\n{}", &text[..text.len().min(20000)])
         } else {
-            let label = if lower.ends_with(".docx") { "Word" }
-                else if lower.ends_with(".xlsx") { "Excel" }
-                else { "PowerPoint" };
+            let label = if lower.ends_with(".docx") {
+                "Word"
+            } else if lower.ends_with(".xlsx") {
+                "Excel"
+            } else {
+                "PowerPoint"
+            };
             format!("[{label} file: {filename} ({} bytes)]", bytes.len())
         }
     } else if discord_is_text_file(&lower) {
         let text = String::from_utf8_lossy(bytes);
-        format!("[File: {filename}]\n```\n{}\n```", &text[..text.len().min(20000)])
+        format!(
+            "[File: {filename}]\n```\n{}\n```",
+            &text[..text.len().min(20000)]
+        )
     } else {
         let ws = crate::config::loader::base_dir().join("workspace/uploads");
         let _ = std::fs::create_dir_all(&ws);
         let dest = ws.join(filename);
         let _ = std::fs::write(&dest, bytes);
-        format!("[File saved: {filename} ({} bytes) at {}]", bytes.len(), dest.display())
+        format!(
+            "[File saved: {filename} ({} bytes) at {}]",
+            bytes.len(),
+            dest.display()
+        )
     }
 }
 

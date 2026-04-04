@@ -1,8 +1,11 @@
-use anyhow::Result;
 use std::path::PathBuf;
 
-use super::config_json::{load_config_json, remove_nested_value, set_nested_value};
-use super::style::*;
+use anyhow::Result;
+
+use super::{
+    config_json::{load_config_json, remove_nested_value, set_nested_value},
+    style::*,
+};
 use crate::{
     cli::{
         AliasesCommand, AuthOrderCommand, FallbacksCommand, ImageFallbacksCommand,
@@ -67,7 +70,10 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
             ok(&format!("image model set to '{}'", cyan(&model)));
         }
         ModelsCommand::Scan => {
-            banner(&format!("rsclaw model scan v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!(
+                "rsclaw model scan v{}",
+                env!("RSCLAW_BUILD_VERSION")
+            ));
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()?;
@@ -79,7 +85,10 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
                         warn_msg("ollama: no models found");
                     } else {
                         for m in models {
-                            item("-", &format!("ollama/{}", m["name"].as_str().unwrap_or("?")));
+                            item(
+                                "-",
+                                &format!("ollama/{}", m["name"].as_str().unwrap_or("?")),
+                            );
                         }
                     }
                 }
@@ -88,7 +97,10 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
         }
         ModelsCommand::Aliases(sub) => match sub {
             AliasesCommand::List => {
-                banner(&format!("rsclaw model aliases v{}", env!("RSCLAW_BUILD_VERSION")));
+                banner(&format!(
+                    "rsclaw model aliases v{}",
+                    env!("RSCLAW_BUILD_VERSION")
+                ));
                 let config = config::load()?;
                 let aliases = config.agents.defaults.models.as_ref();
                 if aliases.is_none_or(|a| a.is_empty()) {
@@ -119,7 +131,10 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
         },
         ModelsCommand::Fallbacks(sub) => match sub {
             FallbacksCommand::List => {
-                banner(&format!("rsclaw model fallbacks v{}", env!("RSCLAW_BUILD_VERSION")));
+                banner(&format!(
+                    "rsclaw model fallbacks v{}",
+                    env!("RSCLAW_BUILD_VERSION")
+                ));
                 let config = config::load()?;
                 let fallbacks = config
                     .agents
@@ -177,7 +192,10 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
         },
         ModelsCommand::ImageFallbacks(sub) => match sub {
             ImageFallbacksCommand::List => {
-                banner(&format!("rsclaw image fallbacks v{}", env!("RSCLAW_BUILD_VERSION")));
+                banner(&format!(
+                    "rsclaw image fallbacks v{}",
+                    env!("RSCLAW_BUILD_VERSION")
+                ));
                 let config = config::load()?;
                 let fallbacks = config
                     .agents
@@ -235,14 +253,26 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
         },
         ModelsCommand::Auth(sub) => match sub {
             ModelsAuthCommand::Add => {
-                banner(&format!("rsclaw models auth v{}", env!("RSCLAW_BUILD_VERSION")));
+                banner(&format!(
+                    "rsclaw models auth v{}",
+                    env!("RSCLAW_BUILD_VERSION")
+                ));
                 println!("  Add a provider to rsclaw.json5:");
                 println!();
                 println!("  {}", dim(r#"models: {"#));
                 println!("  {}", dim(r#"  providers: {"#));
-                println!("  {}", dim(r#"    anthropic: { apiKey: "${ANTHROPIC_API_KEY}" },"#));
-                println!("  {}", dim(r#"    openai:    { apiKey: "${OPENAI_API_KEY}" },"#));
-                println!("  {}", dim(r#"    ollama:    { baseUrl: "http://localhost:11434" },"#));
+                println!(
+                    "  {}",
+                    dim(r#"    anthropic: { apiKey: "${ANTHROPIC_API_KEY}" },"#)
+                );
+                println!(
+                    "  {}",
+                    dim(r#"    openai:    { apiKey: "${OPENAI_API_KEY}" },"#)
+                );
+                println!(
+                    "  {}",
+                    dim(r#"    ollama:    { baseUrl: "http://localhost:11434" },"#)
+                );
                 println!("  {}", dim(r#"  }"#));
                 println!("  {}", dim(r#"}"#));
             }
@@ -255,7 +285,10 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
                 std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
                 ok("gateway.authToken generated");
                 kv("token", &bold(&token));
-                println!("  {}", dim("Use this token in Authorization: Bearer <token> headers"));
+                println!(
+                    "  {}",
+                    dim("Use this token in Authorization: Bearer <token> headers")
+                );
             }
             ModelsAuthCommand::PasteToken => {
                 use std::io::BufRead as _;
@@ -290,9 +323,7 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
                     kv("provider", &cyan(&provider));
                     println!(
                         "  {}",
-                        dim(&format!(
-                            "configure via models.providers.{provider}.order"
-                        ))
+                        dim(&format!("configure via models.providers.{provider}.order"))
                     );
                 }
                 AuthOrderCommand::Set { provider, order } => {
@@ -326,16 +357,37 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 const WHISPER_TINY_FILES: &[(&str, &str)] = &[
-    ("config.json", "https://huggingface.co/openai/whisper-tiny/resolve/main/config.json"),
-    ("tokenizer.json", "https://huggingface.co/openai/whisper-tiny/resolve/main/tokenizer.json"),
-    ("model.safetensors", "https://huggingface.co/openai/whisper-tiny/resolve/main/model.safetensors"),
-    ("generation_config.json", "https://huggingface.co/openai/whisper-tiny/resolve/main/generation_config.json"),
+    (
+        "config.json",
+        "https://huggingface.co/openai/whisper-tiny/resolve/main/config.json",
+    ),
+    (
+        "tokenizer.json",
+        "https://huggingface.co/openai/whisper-tiny/resolve/main/tokenizer.json",
+    ),
+    (
+        "model.safetensors",
+        "https://huggingface.co/openai/whisper-tiny/resolve/main/model.safetensors",
+    ),
+    (
+        "generation_config.json",
+        "https://huggingface.co/openai/whisper-tiny/resolve/main/generation_config.json",
+    ),
 ];
 
 const BGE_SMALL_ZH_FILES: &[(&str, &str)] = &[
-    ("config.json", "https://huggingface.co/BAAI/bge-small-zh-v1.5/resolve/main/config.json"),
-    ("tokenizer.json", "https://huggingface.co/BAAI/bge-small-zh-v1.5/resolve/main/tokenizer.json"),
-    ("model.safetensors", "https://huggingface.co/BAAI/bge-small-zh-v1.5/resolve/main/model.safetensors"),
+    (
+        "config.json",
+        "https://huggingface.co/BAAI/bge-small-zh-v1.5/resolve/main/config.json",
+    ),
+    (
+        "tokenizer.json",
+        "https://huggingface.co/BAAI/bge-small-zh-v1.5/resolve/main/tokenizer.json",
+    ),
+    (
+        "model.safetensors",
+        "https://huggingface.co/BAAI/bge-small-zh-v1.5/resolve/main/model.safetensors",
+    ),
 ];
 
 async fn cmd_download_embedding(model: Option<String>) -> Result<()> {
@@ -362,7 +414,10 @@ fn cmd_list_installed() {
     let base_dir = crate::config::loader::base_dir();
     let models_dir = base_dir.join("models");
 
-    banner(&format!("rsclaw installed models v{}", env!("RSCLAW_BUILD_VERSION")));
+    banner(&format!(
+        "rsclaw installed models v{}",
+        env!("RSCLAW_BUILD_VERSION")
+    ));
 
     let mut found = false;
 
@@ -370,7 +425,12 @@ fn cmd_list_installed() {
     let zh_dir = models_dir.join("bge-small-zh");
     if zh_dir.join("config.json").exists() {
         let size = dir_size(&zh_dir);
-        println!("  {}    {}    {}MB", cyan("bge-small-zh"), dim("BAAI/bge-small-zh-v1.5"), size / 1_000_000);
+        println!(
+            "  {}    {}    {}MB",
+            cyan("bge-small-zh"),
+            dim("BAAI/bge-small-zh-v1.5"),
+            size / 1_000_000
+        );
         found = true;
     }
 
@@ -378,7 +438,12 @@ fn cmd_list_installed() {
     let en_dir = models_dir.join("bge-small-en");
     if en_dir.join("config.json").exists() {
         let size = dir_size(&en_dir);
-        println!("  {}    {}    {}MB", cyan("bge-small-en"), dim("BAAI/bge-small-en-v1.5"), size / 1_000_000);
+        println!(
+            "  {}    {}    {}MB",
+            cyan("bge-small-en"),
+            dim("BAAI/bge-small-en-v1.5"),
+            size / 1_000_000
+        );
         found = true;
     }
 
@@ -386,7 +451,12 @@ fn cmd_list_installed() {
     let whisper_dir = models_dir.join("whisper-tiny");
     if whisper_dir.join("config.json").exists() {
         let size = dir_size(&whisper_dir);
-        println!("  {}    {}    {}MB", cyan("whisper-tiny"), dim("openai/whisper-tiny"), size / 1_000_000);
+        println!(
+            "  {}    {}    {}MB",
+            cyan("whisper-tiny"),
+            dim("openai/whisper-tiny"),
+            size / 1_000_000
+        );
         found = true;
     }
 
@@ -409,10 +479,7 @@ async fn download_model(name: &str, dest: &PathBuf, files: &[(&str, &str)]) -> R
             continue;
         }
         print!("  {} ... ", bold(filename));
-        let resp = client.get(*url)
-            .send()
-            .await?
-            .error_for_status()?;
+        let resp = client.get(*url).send().await?.error_for_status()?;
         let bytes = resp.bytes().await?;
         std::fs::write(&dest_path, &bytes)?;
         println!("{}MB", bytes.len() / 1_000_000);

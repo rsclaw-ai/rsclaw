@@ -1,7 +1,6 @@
 use anyhow::Result;
 
-use crate::cli::UninstallArgs;
-use crate::config;
+use crate::{cli::UninstallArgs, config};
 
 pub async fn cmd_uninstall(args: UninstallArgs) -> Result<()> {
     let base_dir = config::loader::base_dir();
@@ -37,10 +36,8 @@ pub async fn cmd_uninstall(args: UninstallArgs) -> Result<()> {
         } else {
             println!("uninstalling gateway service...");
             // Delegate to gateway uninstall logic.
-            let gw_result = crate::cmd::gateway::cmd_gateway(
-                crate::cli::GatewayCommand::Uninstall,
-            )
-            .await;
+            let gw_result =
+                crate::cmd::gateway::cmd_gateway(crate::cli::GatewayCommand::Uninstall).await;
             match gw_result {
                 Ok(()) => println!("  service removed"),
                 Err(e) => println!("  service removal: {e}"),

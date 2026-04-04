@@ -4599,7 +4599,10 @@ fn resolve_bind_addr(config: &RuntimeConfig) -> SocketAddr {
         if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
             return SocketAddr::new(ip, port);
         }
-        tracing::warn!(addr = addr.as_str(), "invalid bind_address, falling back to bind mode");
+        tracing::warn!(
+            addr = addr.as_str(),
+            "invalid bind_address, falling back to bind mode"
+        );
     }
     match config.gateway.bind {
         BindMode::Auto | BindMode::Lan => SocketAddr::from(([0, 0, 0, 0], port)),

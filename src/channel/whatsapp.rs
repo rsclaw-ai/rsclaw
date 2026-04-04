@@ -81,7 +81,8 @@ pub struct WhatsAppChannel {
     api_base: String,
     client: Client,
     #[allow(clippy::type_complexity)]
-    on_message: Arc<dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync>,
+    on_message:
+        Arc<dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync>,
     // (from_number, text, images)
 }
 
@@ -89,7 +90,9 @@ impl WhatsAppChannel {
     pub fn new(
         phone_number_id: impl Into<String>,
         access_token: impl Into<String>,
-        on_message: Arc<dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync>,
+        on_message: Arc<
+            dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync,
+        >,
     ) -> Self {
         Self::with_api_base(phone_number_id, access_token, None, on_message)
     }
@@ -98,7 +101,9 @@ impl WhatsAppChannel {
         phone_number_id: impl Into<String>,
         access_token: impl Into<String>,
         api_base: Option<String>,
-        on_message: Arc<dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync>,
+        on_message: Arc<
+            dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync,
+        >,
     ) -> Self {
         Self {
             phone_number_id: phone_number_id.into(),
@@ -124,8 +129,7 @@ impl WhatsAppChannel {
             .client
             .post(format!(
                 "{}/{}/messages",
-                self.api_base,
-                self.phone_number_id
+                self.api_base, self.phone_number_id
             ))
             .bearer_auth(&self.access_token)
             .json(&body)
@@ -160,14 +164,19 @@ impl WhatsAppChannel {
                                 if let Some(ref media) = msg.image {
                                     match self.download_whatsapp_media(&media.id).await {
                                         Ok(bytes) => {
-                                            let mime = media.mime_type.as_deref().unwrap_or("image/jpeg");
+                                            let mime =
+                                                media.mime_type.as_deref().unwrap_or("image/jpeg");
                                             use base64::Engine;
-                                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                            let b64 = base64::engine::general_purpose::STANDARD
+                                                .encode(&bytes);
                                             images.push(crate::agent::registry::ImageAttachment {
                                                 data: format!("data:{mime};base64,{b64}"),
                                                 mime_type: mime.to_owned(),
                                             });
-                                            text = crate::i18n::t("describe_image", crate::i18n::default_lang());
+                                            text = crate::i18n::t(
+                                                "describe_image",
+                                                crate::i18n::default_lang(),
+                                            );
                                             info!(size = bytes.len(), "WhatsApp image downloaded");
                                         }
                                         Err(e) => {
@@ -181,16 +190,35 @@ impl WhatsAppChannel {
                                 if let Some(ref media) = msg.audio {
                                     match self.download_whatsapp_media(&media.id).await {
                                         Ok(bytes) => {
-                                            let mime = media.mime_type.as_deref().unwrap_or("audio/ogg");
+                                            let mime =
+                                                media.mime_type.as_deref().unwrap_or("audio/ogg");
                                             match crate::channel::transcription::transcribe_audio(
-                                                &self.client, &bytes, "voice.ogg", mime,
-                                            ).await {
+                                                &self.client,
+                                                &bytes,
+                                                "voice.ogg",
+                                                mime,
+                                            )
+                                            .await
+                                            {
                                                 Ok(t) if !t.is_empty() => {
-                                                    info!(chars = t.len(), "WhatsApp voice transcribed");
+                                                    info!(
+                                                        chars = t.len(),
+                                                        "WhatsApp voice transcribed"
+                                                    );
                                                     text = t;
                                                 }
-                                                Ok(_) => { warn!("WhatsApp voice transcription returned empty"); continue; }
-                                                Err(e) => { warn!("WhatsApp voice transcription failed: {e:#}"); continue; }
+                                                Ok(_) => {
+                                                    warn!(
+                                                        "WhatsApp voice transcription returned empty"
+                                                    );
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        "WhatsApp voice transcription failed: {e:#}"
+                                                    );
+                                                    continue;
+                                                }
                                             }
                                         }
                                         Err(e) => {
@@ -204,13 +232,31 @@ impl WhatsAppChannel {
                                 if let Some(ref media) = msg.video {
                                     match self.download_whatsapp_media(&media.id).await {
                                         Ok(bytes) => {
-                                            match whatsapp_extract_audio_and_transcribe(&self.client, &bytes).await {
+                                            match whatsapp_extract_audio_and_transcribe(
+                                                &self.client,
+                                                &bytes,
+                                            )
+                                            .await
+                                            {
                                                 Ok(t) if !t.is_empty() => {
-                                                    info!(chars = t.len(), "WhatsApp video audio transcribed");
+                                                    info!(
+                                                        chars = t.len(),
+                                                        "WhatsApp video audio transcribed"
+                                                    );
                                                     text = t;
                                                 }
-                                                Ok(_) => { warn!("WhatsApp video transcription returned empty"); continue; }
-                                                Err(e) => { warn!("WhatsApp video transcription failed: {e:#}"); continue; }
+                                                Ok(_) => {
+                                                    warn!(
+                                                        "WhatsApp video transcription returned empty"
+                                                    );
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        "WhatsApp video transcription failed: {e:#}"
+                                                    );
+                                                    continue;
+                                                }
                                             }
                                         }
                                         Err(e) => {
@@ -228,10 +274,15 @@ impl WhatsAppChannel {
                                             if is_text_file(filename) {
                                                 if let Ok(content) = String::from_utf8(bytes) {
                                                     text = format!("[File: {filename}]\n{content}");
-                                                    info!(name = filename, "WhatsApp text file received");
+                                                    info!(
+                                                        name = filename,
+                                                        "WhatsApp text file received"
+                                                    );
                                                 }
                                             } else {
-                                                debug!("WhatsApp: non-text document ignored: {filename}");
+                                                debug!(
+                                                    "WhatsApp: non-text document ignored: {filename}"
+                                                );
                                                 continue;
                                             }
                                         }
@@ -316,22 +367,17 @@ impl Channel for WhatsAppChannel {
             for image_data in &msg.images {
                 // WhatsApp Cloud API: first upload media, then send.
                 use base64::Engine;
-                let (mime, b64) = if let Some(rest) =
-                    image_data.strip_prefix("data:image/png;base64,")
-                {
-                    ("image/png", rest)
-                } else if let Some(rest) =
-                    image_data.strip_prefix("data:image/jpeg;base64,")
-                {
-                    ("image/jpeg", rest)
-                } else if let Some(rest) =
-                    image_data.strip_prefix("data:image/webp;base64,")
-                {
-                    ("image/webp", rest)
-                } else {
-                    warn!("whatsapp: unrecognised image data URI prefix, skipping");
-                    continue;
-                };
+                let (mime, b64) =
+                    if let Some(rest) = image_data.strip_prefix("data:image/png;base64,") {
+                        ("image/png", rest)
+                    } else if let Some(rest) = image_data.strip_prefix("data:image/jpeg;base64,") {
+                        ("image/jpeg", rest)
+                    } else if let Some(rest) = image_data.strip_prefix("data:image/webp;base64,") {
+                        ("image/webp", rest)
+                    } else {
+                        warn!("whatsapp: unrecognised image data URI prefix, skipping");
+                        continue;
+                    };
 
                 let bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
                     Ok(b) if !b.is_empty() => b,
@@ -341,7 +387,11 @@ impl Channel for WhatsAppChannel {
                     }
                 };
 
-                let filename = if mime == "image/jpeg" { "image.jpg" } else { "image.png" };
+                let filename = if mime == "image/jpeg" {
+                    "image.jpg"
+                } else {
+                    "image.png"
+                };
 
                 // Upload media.
                 let part = match reqwest::multipart::Part::bytes(bytes)
@@ -358,11 +408,7 @@ impl Channel for WhatsAppChannel {
                     .text("messaging_product", "whatsapp")
                     .text("type", mime)
                     .part("file", part);
-                let upload_url = format!(
-                    "{}/{}/media",
-                    self.api_base,
-                    self.phone_number_id
-                );
+                let upload_url = format!("{}/{}/media", self.api_base, self.phone_number_id);
                 let upload_resp = self
                     .client
                     .post(&upload_url)
@@ -393,11 +439,7 @@ impl Channel for WhatsAppChannel {
                 };
 
                 // Send image message.
-                let send_url = format!(
-                    "{}/{}/messages",
-                    self.api_base,
-                    self.phone_number_id
-                );
+                let send_url = format!("{}/{}/messages", self.api_base, self.phone_number_id);
                 match self
                     .client
                     .post(&send_url)
@@ -485,7 +527,13 @@ async fn whatsapp_extract_audio_and_transcribe(
     let audio_bytes = std::fs::read(&audio_path)?;
     let _ = std::fs::remove_file(&audio_path);
 
-    crate::channel::transcription::transcribe_audio(client, &audio_bytes, "video_audio.ogg", "audio/ogg").await
+    crate::channel::transcription::transcribe_audio(
+        client,
+        &audio_bytes,
+        "video_audio.ogg",
+        "audio/ogg",
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

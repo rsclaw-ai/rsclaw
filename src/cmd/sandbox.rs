@@ -33,7 +33,10 @@ pub async fn cmd_sandbox(sub: SandboxCommand) -> Result<()> {
             }
         }
         SandboxCommand::Explain => {
-            banner(&format!("rsclaw sandbox explain v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!(
+                "rsclaw sandbox explain v{}",
+                env!("RSCLAW_BUILD_VERSION")
+            ));
             println!("  Each agent runs in its own isolated environment.");
             println!(
                 "  Configure via {} in rsclaw.json5 / openclaw.json",
@@ -51,10 +54,16 @@ pub async fn cmd_sandbox(sub: SandboxCommand) -> Result<()> {
                         .and_then(|d| d.image.as_deref())
                         .unwrap_or("(default)");
                     let target = id.as_deref().unwrap_or("all");
-                    ok(&format!("sandbox recreate '{}' -- image:{}", cyan(target), bold(image)));
+                    ok(&format!(
+                        "sandbox recreate '{}' -- image:{}",
+                        cyan(target),
+                        bold(image)
+                    ));
                     println!(
                         "  {}",
-                        dim("Send SIGUSR1 to the gateway process or restart it to rebuild containers")
+                        dim(
+                            "Send SIGUSR1 to the gateway process or restart it to rebuild containers"
+                        )
                     );
                 }
             }

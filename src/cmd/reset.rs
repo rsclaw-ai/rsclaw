@@ -1,4 +1,4 @@
-﻿use anyhow::Result;
+use anyhow::Result;
 
 use super::style::*;
 use crate::{
@@ -12,11 +12,17 @@ pub async fn cmd_reset(args: ResetArgs) -> Result<()> {
     let scope = args.scope.as_deref().unwrap_or("full");
 
     if args.dry_run {
-        banner(&format!("rsclaw reset (dry run) v{}", env!("RSCLAW_BUILD_VERSION")));
+        banner(&format!(
+            "rsclaw reset (dry run) v{}",
+            env!("RSCLAW_BUILD_VERSION")
+        ));
         match scope {
             "config" => {
                 if let Some(path) = config::loader::detect_config_path() {
-                    warn_msg(&format!("would remove config: {}", bold(&path.display().to_string())));
+                    warn_msg(&format!(
+                        "would remove config: {}",
+                        bold(&path.display().to_string())
+                    ));
                 } else {
                     warn_msg("no config file found");
                 }
@@ -46,18 +52,32 @@ pub async fn cmd_reset(args: ResetArgs) -> Result<()> {
     match scope {
         "config" => {
             if let Some(path) = config::loader::detect_config_path() {
-                println!("  {} {}", red("removing"), bold(&path.display().to_string()));
+                println!(
+                    "  {} {}",
+                    red("removing"),
+                    bold(&path.display().to_string())
+                );
                 std::fs::remove_file(&path)?;
-                ok(&format!("removed config: {}", dim(&path.display().to_string())));
+                ok(&format!(
+                    "removed config: {}",
+                    dim(&path.display().to_string())
+                ));
             } else {
                 warn_msg("no config file found");
             }
         }
         "full" => {
             if base_dir.exists() {
-                println!("  {} {}", red("removing"), bold(&base_dir.display().to_string()));
+                println!(
+                    "  {} {}",
+                    red("removing"),
+                    bold(&base_dir.display().to_string())
+                );
                 std::fs::remove_dir_all(&base_dir)?;
-                ok(&format!("removed state dir: {}", dim(&base_dir.display().to_string())));
+                ok(&format!(
+                    "removed state dir: {}",
+                    dim(&base_dir.display().to_string())
+                ));
             } else {
                 warn_msg(&format!(
                     "state dir not found: {}",
@@ -108,10 +128,7 @@ fn build_update_client(timeout_secs: u64) -> Result<reqwest::Client> {
 }
 
 async fn do_update(args: &UpdateArgs) -> Result<()> {
-    banner(&format!(
-        "rsclaw update v{}",
-        env!("RSCLAW_BUILD_VERSION")
-    ));
+    banner(&format!("rsclaw update v{}", env!("RSCLAW_BUILD_VERSION")));
 
     let timeout_secs = args.timeout.unwrap_or(30);
     let client = build_update_client(timeout_secs)?;
@@ -125,7 +142,9 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
         if let Ok(resp) = client.get(RSCLAW_VERSION_URL).send().await {
             if resp.status().is_success() {
                 if let Ok(d) = resp.json::<serde_json::Value>().await {
-                    if d.get("tag_name").is_some() { data = Some(d); }
+                    if d.get("tag_name").is_some() {
+                        data = Some(d);
+                    }
                 }
             }
         }
@@ -188,8 +207,14 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
     let candidates: Vec<&str> = match (os, arch) {
         ("macos", "aarch64") => vec!["rsclaw-aarch64-apple-darwin"],
         ("macos", "x86_64") => vec!["rsclaw-x86_64-apple-darwin"],
-        ("linux", "x86_64") => vec!["rsclaw-x86_64-unknown-linux-gnu", "rsclaw-x86_64-unknown-linux-musl"],
-        ("linux", "aarch64") => vec!["rsclaw-aarch64-unknown-linux-gnu", "rsclaw-aarch64-unknown-linux-musl"],
+        ("linux", "x86_64") => vec![
+            "rsclaw-x86_64-unknown-linux-gnu",
+            "rsclaw-x86_64-unknown-linux-musl",
+        ],
+        ("linux", "aarch64") => vec![
+            "rsclaw-aarch64-unknown-linux-gnu",
+            "rsclaw-aarch64-unknown-linux-musl",
+        ],
         ("windows", "x86_64") => vec!["rsclaw-x86_64-pc-windows-msvc"],
         ("windows", "aarch64") => vec!["rsclaw-aarch64-pc-windows-msvc"],
         _ => anyhow::bail!("unsupported platform: {os}-{arch}"),
@@ -225,7 +250,11 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
 
     // 4. Download binary
     println!("  {} downloading {asset_name}...", dim("[..]"));
-    let download = if url.contains("github.com") || url.contains("githubusercontent.com") { proxy_url(&url) } else { url.clone() };
+    let download = if url.contains("github.com") || url.contains("githubusercontent.com") {
+        proxy_url(&url)
+    } else {
+        url.clone()
+    };
     let binary = client.get(&download).send().await?.bytes().await?;
 
     if binary.is_empty() {
@@ -246,10 +275,7 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            &current_exe,
-            std::fs::Permissions::from_mode(0o755),
-        )?;
+        std::fs::set_permissions(&current_exe, std::fs::Permissions::from_mode(0o755))?;
     }
 
     println!("  {} updated to {latest_version}", green("[ok]"));

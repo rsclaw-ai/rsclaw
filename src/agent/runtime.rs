@@ -2966,7 +2966,8 @@ impl AgentRuntime {
     }
 
     async fn tool_read(&self, args: Value) -> Result<Value> {
-        let path = args["path"].as_str()
+        let path = args["path"]
+            .as_str()
             .or_else(|| args["file_path"].as_str())
             .or_else(|| args["filename"].as_str())
             .or_else(|| args["file"].as_str())
@@ -3064,7 +3065,8 @@ impl AgentRuntime {
         }
 
         // Handle various parameter names LLMs might use.
-        let path = args["path"].as_str()
+        let path = args["path"]
+            .as_str()
             .or_else(|| args["file_path"].as_str())
             .or_else(|| args["filename"].as_str())
             .or_else(|| args["file"].as_str())
@@ -3561,7 +3563,8 @@ impl AgentRuntime {
 
     async fn tool_exec(&self, args: Value) -> Result<Value> {
         tracing::debug!(?args, "tool_exec called");
-        // Accept both "command" (rsclaw native) and "cmd"+"args" (preparse/openclaw format).
+        // Accept both "command" (rsclaw native) and "cmd"+"args" (preparse/openclaw
+        // format).
         let command = if let Some(cmd) = args["command"].as_str() {
             cmd.to_owned()
         } else if let Some(cmd) = args["cmd"].as_str() {
@@ -3731,13 +3734,11 @@ impl AgentRuntime {
         let entry = AgentEntry {
             id: id.clone(),
             default: Some(false),
-            workspace: Some(
-                crate::config::loader::path_to_forward_slash(
-                    &dirs_next::home_dir()
-                        .unwrap_or_default()
-                        .join(format!(".rsclaw/workspace/{id}")),
-                ),
-            ),
+            workspace: Some(crate::config::loader::path_to_forward_slash(
+                &dirs_next::home_dir()
+                    .unwrap_or_default()
+                    .join(format!(".rsclaw/workspace/{id}")),
+            )),
             model: Some(ModelConfig {
                 primary: Some(model),
                 fallbacks: None,
@@ -4650,11 +4651,11 @@ $synth.Speak('{}')
             )),
         }
     }
-
 }
 
 /// Read cron jobs from the OpenClaw-compatible jobs.json file.
-/// Handles both bare array `[...]` and wrapped `{"version":1,"jobs":[...]}` formats.
+/// Handles both bare array `[...]` and wrapped `{"version":1,"jobs":[...]}`
+/// formats.
 async fn read_cron_jobs(path: &std::path::Path) -> Vec<Value> {
     let data = tokio::fs::read_to_string(path)
         .await
@@ -4844,7 +4845,12 @@ impl AgentRuntime {
         let port = self.config.gateway.port;
         let client = reqwest::Client::new();
         let base = format!("http://127.0.0.1:{port}/api/v1");
-        let auth_token = self.config.gateway.auth_token.as_deref().unwrap_or_default();
+        let auth_token = self
+            .config
+            .gateway
+            .auth_token
+            .as_deref()
+            .unwrap_or_default();
 
         let auth_header = if auth_token.is_empty() {
             String::new()
@@ -5579,14 +5585,7 @@ fn toolset_allowed_names(
     toolset: &str,
     custom_tools: Option<&Vec<String>>,
 ) -> Option<std::collections::HashSet<String>> {
-    const MINIMAL: &[&str] = &[
-        "exec",
-        "read",
-        "write",
-        "web_search",
-        "web_fetch",
-        "memory",
-    ];
+    const MINIMAL: &[&str] = &["exec", "read", "write", "web_search", "web_fetch", "memory"];
     const STANDARD: &[&str] = &[
         "exec",
         "read",
@@ -6267,7 +6266,10 @@ Example - Large file (SPLIT INTO MULTIPLE CALLS):
     }
 
     // External remote agent A2A tools (remote gateways).
-    tracing::debug!(count = external_agents.len(), "build_tool_list: external agents");
+    tracing::debug!(
+        count = external_agents.len(),
+        "build_tool_list: external agents"
+    );
     for ext in external_agents {
         if ext.id == caller_id {
             continue;

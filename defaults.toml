@@ -1,0 +1,377 @@
+# rsclaw defaults — provider, channel, and search engine definitions
+#
+# Edit this file to customize providers, channels, search engines, etc.
+# Generated on first `rsclaw setup` and never overwritten.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Providers
+# ──────────────────────────────────────────────────────────────────────────────
+
+[[providers]]
+name       = "qwen"
+label      = "Qwen"
+env_var    = "DASHSCOPE_API_KEY"
+model      = "qwen/qwen-plus"
+base_url   = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+needs_key  = true
+
+[[providers]]
+name       = "minimax"
+label      = "MiniMax"
+env_var    = "MINIMAX_API_KEY"
+model      = "minimax/MiniMax-M2.5"
+base_url   = "https://api.minimax.chat/v1"
+needs_key  = true
+
+[[providers]]
+name       = "deepseek"
+label      = "DeepSeek"
+env_var    = "DEEPSEEK_API_KEY"
+model      = "deepseek/deepseek-chat"
+base_url   = "https://api.deepseek.com"
+needs_key  = true
+
+[[providers]]
+name       = "kimi"
+label      = "Kimi"
+env_var    = "MOONSHOT_API_KEY"
+model      = "kimi/kimi-k2.5"
+base_url   = "https://api.moonshot.cn/v1"
+needs_key  = true
+
+[[providers]]
+name       = "zhipu"
+label      = "Zhipu (GLM)"
+env_var    = "ZHIPU_API_KEY"
+model      = "zhipu/glm-4-plus"
+base_url   = "https://open.bigmodel.cn/api/paas/v4"
+needs_key  = true
+
+[[providers]]
+name       = "gaterouter"
+label      = "GateRouter"
+env_var    = "GATEROUTER_API_KEY"
+model      = "gaterouter/auto"
+base_url   = "https://api.gaterouter.ai/openai/v1"
+needs_key  = true
+
+[[providers]]
+name       = "openrouter"
+label      = "OpenRouter"
+env_var    = "OPENROUTER_API_KEY"
+model      = "openrouter/anthropic/claude-sonnet-4.6"
+base_url   = "https://openrouter.ai/api/v1"
+needs_key  = true
+
+[[providers]]
+name       = "anthropic"
+label      = "Anthropic (Claude)"
+env_var    = "ANTHROPIC_API_KEY"
+model      = "anthropic/claude-sonnet-4-6"
+base_url   = ""
+needs_key  = true
+
+[[providers]]
+name       = "openai"
+label      = "OpenAI (GPT)"
+env_var    = "OPENAI_API_KEY"
+model      = "openai/gpt-4o"
+base_url   = ""
+needs_key  = true
+
+[[providers]]
+name       = "gemini"
+label      = "Google Gemini"
+env_var    = "GEMINI_API_KEY"
+model      = "gemini/gemini-2.5-flash"
+base_url   = ""
+needs_key  = true
+
+[[providers]]
+name       = "xai"
+label      = "xAI (Grok)"
+env_var    = "XAI_API_KEY"
+model      = "xai/grok-3"
+base_url   = "https://api.x.ai/v1"
+needs_key  = true
+
+[[providers]]
+name       = "groq"
+label      = "Groq"
+env_var    = "GROQ_API_KEY"
+model      = "groq/llama-3.3-70b-versatile"
+base_url   = "https://api.groq.com/openai/v1"
+needs_key  = true
+
+[[providers]]
+name       = "siliconflow"
+label      = "SiliconFlow"
+env_var    = "SILICONFLOW_API_KEY"
+model      = "siliconflow/deepseek-ai/DeepSeek-V3"
+base_url   = "https://api.siliconflow.cn/v1"
+needs_key  = true
+
+[[providers]]
+name       = "ollama"
+label      = "Ollama (local)"
+env_var    = ""
+model      = "ollama/llama3.3"
+base_url   = "http://127.0.0.1:11434"
+needs_key  = false
+
+[[providers]]
+name       = "custom"
+label      = "Custom Provider"
+env_var    = ""
+model      = ""
+base_url   = ""
+needs_key  = false
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Channels
+# ──────────────────────────────────────────────────────────────────────────────
+
+[[channels]]
+name  = "feishu"
+label = "Feishu / Lark"
+login = true
+fields = [
+  { key = "appId",     prompt = "App ID",     secret = false },
+  { key = "appSecret", prompt = "App Secret", secret = true  },
+]
+
+[[channels]]
+name  = "wechat"
+label = "Weixin"
+login = true
+fields = [
+  { key = "botToken", prompt = "Bot Token (from QR login)", secret = true  },
+  { key = "botId",    prompt = "Bot ID",                     secret = false },
+]
+
+[[channels]]
+name  = "wecom"
+label = "WeCom"
+fields = [
+  { key = "botId",  prompt = "Bot ID",  secret = false },
+  { key = "secret",  prompt = "Secret",  secret = true  },
+]
+
+[[channels]]
+name  = "qq"
+label = "QQ Bot"
+fields = [
+  { key = "appId",     prompt = "App ID",     secret = false },
+  { key = "appSecret", prompt = "App Secret", secret = true  },
+]
+
+[[channels]]
+name  = "dingtalk"
+label = "DingTalk"
+fields = [
+  { key = "appKey",    prompt = "App Key",    secret = false },
+  { key = "appSecret", prompt = "App Secret", secret = true  },
+]
+
+[[channels]]
+name  = "telegram"
+label = "Telegram"
+fields = [
+  { key = "botToken", prompt = "Bot Token", secret = true },
+]
+
+[[channels]]
+name  = "matrix"
+label = "Matrix"
+fields = [
+  { key = "homeserver",  prompt = "Homeserver URL (e.g. https://matrix.org)", secret = false },
+  { key = "accessToken", prompt = "Access Token", secret = true },
+  { key = "userId",      prompt = "Bot User ID (e.g. @bot:matrix.org)", secret = false },
+  { key = "deviceId",    prompt = "Device ID (optional, auto-generated)", secret = false },
+  { key = "recoveryKey", prompt = "E2EE Recovery Key (optional)", secret = true },
+]
+
+[[channels]]
+name  = "discord"
+label = "Discord"
+fields = [
+  { key = "token", prompt = "Bot Token", secret = true },
+]
+
+[[channels]]
+name  = "slack"
+label = "Slack"
+fields = [
+  { key = "botToken", prompt = "Bot Token", secret = true },
+  { key = "appToken", prompt = "App Token", secret = true },
+]
+
+[[channels]]
+name  = "whatsapp"
+label = "WhatsApp"
+fields = [
+  { key = "phoneNumberId", prompt = "Phone Number ID", secret = false },
+  { key = "accessToken",   prompt = "Access Token",    secret = true  },
+]
+
+[[channels]]
+name  = "signal"
+label = "Signal"
+fields = [
+  { key = "phoneNumber", prompt = "Phone Number (E.164)", secret = false },
+]
+
+[[channels]]
+name  = "line"
+label = "LINE"
+fields = [
+  { key = "channelAccessToken", prompt = "Channel Access Token", secret = true },
+  { key = "channelSecret",      prompt = "Channel Secret",       secret = true },
+]
+
+[[channels]]
+name  = "zalo"
+label = "Zalo"
+fields = [
+  { key = "accessToken", prompt = "Access Token", secret = true },
+  { key = "oaSecret",    prompt = "OA Secret",    secret = true },
+]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Search Engines (used by web_search tool)
+# ──────────────────────────────────────────────────────────────────────────────
+
+[[search_engines]]
+name     = "duckduckgo"
+label    = "DuckDuckGo"
+url      = "https://html.duckduckgo.com/html/"
+env_var  = ""
+
+[[search_engines]]
+name     = "brave"
+label    = "Brave Search"
+url      = "https://api.search.brave.com/res/v1/web/search"
+env_var  = "BRAVE_API_KEY"
+
+[[search_engines]]
+name     = "google"
+label    = "Google"
+url      = "https://www.googleapis.com/customsearch/v1"
+env_var  = "GOOGLE_SEARCH_API_KEY"
+
+[[search_engines]]
+name     = "bing"
+label    = "Bing"
+url      = "https://api.bing.microsoft.com/v7.0/search"
+env_var  = "BING_API_KEY"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Skill Registries (used by rsclaw skills install/search)
+# ──────────────────────────────────────────────────────────────────────────────
+
+[skill_registries.clawhub]
+label        = "ClawHub"
+api_base     = "https://clawhub.ai/api"
+
+[skill_registries.skillhub]
+label        = "SkillHub (Tencent COS)"
+index_url    = "https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/skills.json"
+download_url = "https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/skills/{slug}.zip"
+search_url   = "https://lightmake.site/api/v1/search"
+primary_download_url = "https://lightmake.site/api/v1/download"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Exec Safety Rules
+# ──────────────────────────────────────────────────────────────────────────────
+
+[exec_safety]
+deny = [
+  "\\bsudo\\b",
+  "\\brunas\\b",
+  "rm\\s+-rf\\s+[/~]",
+  "rd\\s+/s\\s+/q\\s+[A-Z]:\\\\",
+  "del\\s+/f\\s+/s\\s+/q\\s+[A-Z]:\\\\",
+  "\\bmkfs\\b",
+  "\\bdd\\b\\s+if=.*of=/dev/",
+  "\\bformat\\b\\s+[A-Z]:",
+  "\\bdiskpart\\b",
+  ":\\(\\)\\s*\\{",
+  "%0\\|%0",
+  "\\bshutdown\\b",
+  "\\breboot\\b",
+  "\\bhalt\\b",
+  "\\bpoweroff\\b",
+  "\\bkill\\s+-9\\s+(-1|1)$",
+  "iptables\\s+-F",
+  "\\bufw\\s+disable\\b",
+  "pfctl\\s+-d",
+  "\\bpasswd\\b",
+  "\\buseradd\\b",
+  "\\buserdel\\b",
+  "curl.*\\|.*sh",
+  "wget.*\\|.*bash",
+  "powershell.*-ep\\s+bypass",
+  "iex\\(iwr",
+  "\\benv\\b$",
+  "\\bprintenv\\b$",
+  "crontab\\s+-r",
+  "systemctl\\s+disable",
+  "launchctl\\s+unload",
+  "csrutil\\s+disable",
+  "reg\\s+delete\\s+HKLM",
+  ">\\s*/dev/",
+  ">\\s*/etc/",
+  ">\\s*/usr/",
+  ">\\s*/bin/",
+  ">\\s*~/.bashrc",
+  ">\\s*~/.zshrc",
+  ">\\s*~/.profile",
+  ">\\s*~/.ssh/",
+  "tee\\s+/etc/",
+  "tee\\s+/dev/",
+  # Block reading sensitive files
+  "cat.*~/.ssh/",
+  "cat.*/\\.ssh/",
+  "cat.*/etc/shadow",
+  "cat.*/etc/gshadow",
+  "cat.*/etc/master\\.passwd",
+  "less.*~/.ssh/",
+  "head.*~/.ssh/",
+  "tail.*~/.ssh/",
+  "cp.*~/.ssh/",
+  "scp.*id_rsa",
+  "scp.*id_ed25519",
+  "base64.*id_rsa",
+  "base64.*id_ed25519",
+  "xxd.*id_rsa",
+  "xxd.*id_ed25519",
+  "cat.*/\\.env",
+  "cat.*/\\.aws/credentials",
+  "cat.*/\\.kube/config",
+  "cat.*/\\.docker/config\\.json",
+  "cat.*/\\.gnupg/",
+  "cat.*/\\.netrc",
+  "cat.*/\\.pgpass",
+  # AI tool credentials & config (contain API keys)
+  "cat.*/\\.claude/",
+  "cat.*/\\.opencode/",
+  "cat.*/\\.openclaw/credentials",
+  "cat.*/\\.rsclaw/credentials",
+  "cat.*openclaw\\.json",
+  "cat.*rsclaw\\.json5",
+  "cat.*auth-profiles\\.json",
+]
+
+confirm = [
+  "rm\\s+-rf",
+  "rd\\s+/s",
+  "git\\s+push\\s+--force",
+  "git\\s+reset\\s+--hard",
+  "git\\s+clean\\s+-fd",
+  "drop\\s+(database|table)",
+  "truncate\\s+table",
+  "docker\\s+(rm|rmi|system\\s+prune)",
+  "kubectl\\s+delete",
+]
+
+allow = []

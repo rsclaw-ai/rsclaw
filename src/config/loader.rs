@@ -9,8 +9,8 @@ use tracing::debug;
 
 use super::schema::Config;
 
-/// Convert a path to a string using forward slashes (cross-platform safe for JSON/config).
-/// On Windows, backslashes in paths break JSON string parsing.
+/// Convert a path to a string using forward slashes (cross-platform safe for
+/// JSON/config). On Windows, backslashes in paths break JSON string parsing.
 pub fn path_to_forward_slash(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
@@ -202,7 +202,8 @@ pub fn detect_config_path() -> Option<PathBuf> {
 ///
 /// Resolution order:
 ///   1. `RSCLAW_BASE_DIR` (set by `--base-dir`, `--dev`, `--profile`)
-///   2. Parent dir of the detected config file (if config is in ~/.openclaw/, base_dir = ~/.openclaw/)
+///   2. Parent dir of the detected config file (if config is in ~/.openclaw/,
+///      base_dir = ~/.openclaw/)
 ///   3. `~/.rsclaw` (default)
 pub fn base_dir() -> PathBuf {
     // 1. Explicit override

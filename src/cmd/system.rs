@@ -1,7 +1,9 @@
 use anyhow::Result;
 
-use super::config_json::{load_config_json, set_nested_value};
-use super::style::*;
+use super::{
+    config_json::{load_config_json, set_nested_value},
+    style::*,
+};
 use crate::{
     cli::{HeartbeatCommand, SystemCommand},
     config,
@@ -10,7 +12,10 @@ use crate::{
 pub async fn cmd_system(sub: SystemCommand) -> Result<()> {
     match sub {
         SystemCommand::Event => {
-            banner(&format!("rsclaw system event v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!(
+                "rsclaw system event v{}",
+                env!("RSCLAW_BUILD_VERSION")
+            ));
             kv("stream", &dim("/api/v1/stream (SSE)"));
             println!(
                 "  {}",
@@ -18,7 +23,10 @@ pub async fn cmd_system(sub: SystemCommand) -> Result<()> {
             );
         }
         SystemCommand::Presence => {
-            banner(&format!("rsclaw system presence v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!(
+                "rsclaw system presence v{}",
+                env!("RSCLAW_BUILD_VERSION")
+            ));
             let hb_file = config::loader::base_dir().join("var/data/heartbeat.json");
             if hb_file.exists() {
                 let raw = std::fs::read_to_string(&hb_file)?;

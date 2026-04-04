@@ -4,8 +4,7 @@
 //! into the system prompt for all subsequent LLM calls.  TTL-based entries
 //! auto-expire after N turns.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;

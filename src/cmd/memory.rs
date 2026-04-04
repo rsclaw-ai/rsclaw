@@ -24,7 +24,10 @@ pub async fn cmd_memory(sub: MemoryCommand) -> Result<()> {
             }
         }
         MemoryCommand::Search(args) => {
-            banner(&format!("rsclaw memory search v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!(
+                "rsclaw memory search v{}",
+                env!("RSCLAW_BUILD_VERSION")
+            ));
             let mut mem =
                 agent::memory::MemoryStore::open(&data_dir, Some(&model_dir), tier, search_cfg)
                     .await?;
@@ -50,7 +53,10 @@ pub async fn cmd_memory(sub: MemoryCommand) -> Result<()> {
                 agent::memory::MemoryStore::open(&data_dir, Some(&model_dir), tier, search_cfg)
                     .await?;
             let count = mem.reindex().await?;
-            ok(&format!("re-indexed {} document(s)", bold(&count.to_string())));
+            ok(&format!(
+                "re-indexed {} document(s)",
+                bold(&count.to_string())
+            ));
         }
     }
     Ok(())

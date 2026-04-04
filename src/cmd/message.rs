@@ -1,17 +1,12 @@
 use anyhow::{Context, Result};
 
-use crate::cli::message::*;
-use crate::config;
+use crate::{cli::message::*, config};
 
 /// Resolve gateway URL and auth token from config.
 fn gateway_client() -> Result<(reqwest::Client, String, String)> {
     let cfg = config::load().context("failed to load config — run `rsclaw setup` first")?;
     let port = cfg.gateway.port;
-    let token = cfg
-        .gateway
-        .auth_token
-        .clone()
-        .unwrap_or_default();
+    let token = cfg.gateway.auth_token.clone().unwrap_or_default();
     let base = format!("http://127.0.0.1:{port}");
     Ok((reqwest::Client::new(), base, token))
 }
@@ -94,28 +89,100 @@ pub async fn cmd_message(sub: MessageCommand) -> Result<()> {
     match sub {
         MessageCommand::Send(args) => message_send(args).await,
         MessageCommand::Read(args) => message_read(args).await,
-        MessageCommand::Broadcast(args) => { stub("broadcast"); let _ = args; Ok(()) }
+        MessageCommand::Broadcast(args) => {
+            stub("broadcast");
+            let _ = args;
+            Ok(())
+        }
         MessageCommand::Edit(args) => message_edit(args).await,
         MessageCommand::Delete(args) => message_delete(args).await,
-        MessageCommand::Pin(args) => { stub("pin"); let _ = args; Ok(()) }
-        MessageCommand::Unpin(args) => { stub("unpin"); let _ = args; Ok(()) }
-        MessageCommand::Pins(args) => { stub("pins"); let _ = args; Ok(()) }
-        MessageCommand::React(args) => { stub("react"); let _ = args; Ok(()) }
-        MessageCommand::Reactions(args) => { stub("reactions"); let _ = args; Ok(()) }
-        MessageCommand::Poll(args) => { stub("poll"); let _ = args; Ok(()) }
-        MessageCommand::Search(args) => { stub("search"); let _ = args; Ok(()) }
-        MessageCommand::Thread(sub) => { stub(&format!("thread {sub:?}")); Ok(()) }
-        MessageCommand::Voice(sub) => { stub(&format!("voice {sub:?}")); Ok(()) }
-        MessageCommand::Sticker(sub) => { stub(&format!("sticker {sub:?}")); Ok(()) }
-        MessageCommand::Emoji(sub) => { stub(&format!("emoji {sub:?}")); Ok(()) }
-        MessageCommand::Ban(args) => { stub("ban"); let _ = args; Ok(()) }
-        MessageCommand::Kick(args) => { stub("kick"); let _ = args; Ok(()) }
-        MessageCommand::Timeout(args) => { stub("timeout"); let _ = args; Ok(()) }
-        MessageCommand::Member(sub) => { stub(&format!("member {sub:?}")); Ok(()) }
-        MessageCommand::Role(sub) => { stub(&format!("role {sub:?}")); Ok(()) }
-        MessageCommand::Permissions(args) => { stub("permissions"); let _ = args; Ok(()) }
-        MessageCommand::Channel(sub) => { stub(&format!("channel {sub:?}")); Ok(()) }
-        MessageCommand::Event(sub) => { stub(&format!("event {sub:?}")); Ok(()) }
+        MessageCommand::Pin(args) => {
+            stub("pin");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Unpin(args) => {
+            stub("unpin");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Pins(args) => {
+            stub("pins");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::React(args) => {
+            stub("react");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Reactions(args) => {
+            stub("reactions");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Poll(args) => {
+            stub("poll");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Search(args) => {
+            stub("search");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Thread(sub) => {
+            stub(&format!("thread {sub:?}"));
+            Ok(())
+        }
+        MessageCommand::Voice(sub) => {
+            stub(&format!("voice {sub:?}"));
+            Ok(())
+        }
+        MessageCommand::Sticker(sub) => {
+            stub(&format!("sticker {sub:?}"));
+            Ok(())
+        }
+        MessageCommand::Emoji(sub) => {
+            stub(&format!("emoji {sub:?}"));
+            Ok(())
+        }
+        MessageCommand::Ban(args) => {
+            stub("ban");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Kick(args) => {
+            stub("kick");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Timeout(args) => {
+            stub("timeout");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Member(sub) => {
+            stub(&format!("member {sub:?}"));
+            Ok(())
+        }
+        MessageCommand::Role(sub) => {
+            stub(&format!("role {sub:?}"));
+            Ok(())
+        }
+        MessageCommand::Permissions(args) => {
+            stub("permissions");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Channel(sub) => {
+            stub(&format!("channel {sub:?}"));
+            Ok(())
+        }
+        MessageCommand::Event(sub) => {
+            stub(&format!("event {sub:?}"));
+            Ok(())
+        }
     }
 }
 
@@ -142,10 +209,7 @@ async fn message_send(args: MessageSendArgs) -> Result<()> {
 
 async fn message_read(args: MessageReadArgs) -> Result<()> {
     let limit_str = args.limit.unwrap_or(20).to_string();
-    let mut query: Vec<(&str, &str)> = vec![
-        ("target", &args.target),
-        ("limit", &limit_str),
-    ];
+    let mut query: Vec<(&str, &str)> = vec![("target", &args.target), ("limit", &limit_str)];
     let ch;
     if let Some(ref c) = args.channel {
         ch = c.clone();

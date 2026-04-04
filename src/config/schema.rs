@@ -99,7 +99,8 @@ pub struct GatewayConfig {
     pub hot_reload: Option<Value>,
     /// Default response language (e.g. "Chinese", "English", "Japanese").
     pub language: Option<String>,
-    /// Seconds before sending "Processing..." indicator. 0 = disabled. Default: 10.
+    /// Seconds before sending "Processing..." indicator. 0 = disabled. Default:
+    /// 10.
     pub processing_timeout: Option<u64>,
 }
 
@@ -210,7 +211,8 @@ pub struct ExternalAgentConfig {
     /// Optional bearer token for the remote gateway.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
-    /// Remote agent ID to target. If omitted, uses the remote gateway's default agent.
+    /// Remote agent ID to target. If omitted, uses the remote gateway's default
+    /// agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_agent_id: Option<String>,
 }
@@ -281,7 +283,8 @@ pub struct AgentEntry {
     /// empty/null = none (default for non-main agents).
     pub allowed_commands: Option<String>,
     /// rsclaw extension: use OpenCode ACP client instead of LLM
-    /// When set, this agent spawns opencode acp subprocess and routes all prompts through it.
+    /// When set, this agent spawns opencode acp subprocess and routes all
+    /// prompts through it.
     pub opencode: Option<OpenCodeConfig>,
     /// OpenClaw-specific
     pub agent_dir: Option<String>,
@@ -323,9 +326,11 @@ pub struct ModelConfig {
     pub image_fallbacks: Option<Vec<String>>,
     pub thinking: Option<ThinkingConfig>,
     /// Whether to send tool definitions to the model. Default: true.
-    /// Set to false for reasoning models (deepseek-r1, qwen-r1) that don't support tools.
+    /// Set to false for reasoning models (deepseek-r1, qwen-r1) that don't
+    /// support tools.
     pub tools_enabled: Option<bool>,
-    /// Tool set level: "minimal" (7 core), "standard" (12, default), "full" (all 32+).
+    /// Tool set level: "minimal" (7 core), "standard" (12, default), "full"
+    /// (all 32+).
     pub toolset: Option<String>,
     /// Extra tool names to include on top of the toolset level.
     /// Also used as a whitelist when toolset is not set.
@@ -533,9 +538,10 @@ pub struct ProviderConfig {
     pub api: Option<ApiFormat>,
     pub models: Option<Vec<ModelDef>>,
     pub enabled: Option<bool>,
-    /// Custom User-Agent header for HTTP requests to this provider (rsclaw extension).
-    /// Does not affect OpenClaw config files to maintain compatibility.
-    /// Can be overridden by RSCLAW_<PROVIDER>_USER_AGENT environment variable.
+    /// Custom User-Agent header for HTTP requests to this provider (rsclaw
+    /// extension). Does not affect OpenClaw config files to maintain
+    /// compatibility. Can be overridden by RSCLAW_<PROVIDER>_USER_AGENT
+    /// environment variable.
     #[serde(default, skip_deserializing)]
     pub user_agent: Option<String>,
 }
@@ -691,7 +697,8 @@ pub struct CustomChannelConfig {
     pub reply_url: Option<String>,
     /// HTTP method for reply (default: POST).
     pub reply_method: Option<String>,
-    /// Reply body template with {{sender}}, {{chat_id}}, {{reply}}, {{is_group}} placeholders.
+    /// Reply body template with {{sender}}, {{chat_id}}, {{reply}},
+    /// {{is_group}} placeholders.
     pub reply_template: Option<String>,
     /// Extra headers for reply HTTP call.
     pub reply_headers: Option<HashMap<String, String>>,
@@ -864,7 +871,8 @@ pub struct DiscordConfig {
     pub guilds: Option<HashMap<String, Value>>,
     pub accounts: Option<HashMap<String, Value>>,
     pub retry: Option<RetryConfig>,
-    /// Gateway WebSocket URL override (for testing). Defaults to wss://gateway.discord.gg/?v=10&encoding=json
+    /// Gateway WebSocket URL override (for testing). Defaults to
+    /// wss://gateway.discord.gg/?v=10&encoding=json
     pub gateway_url: Option<String>,
     /// HTTP API base URL override (for testing). Defaults to https://discord.com/api/v10
     pub api_base: Option<String>,
@@ -920,7 +928,8 @@ pub struct SignalConfig {
     pub phone: Option<String>,
     pub text_chunk_limit: Option<usize>,
     pub retry: Option<RetryConfig>,
-    /// Path to signal-cli binary (default: "signal-cli"). Can point to a mock script.
+    /// Path to signal-cli binary (default: "signal-cli"). Can point to a mock
+    /// script.
     pub cli_path: Option<String>,
     pub accounts: Option<HashMap<String, Value>>,
 }

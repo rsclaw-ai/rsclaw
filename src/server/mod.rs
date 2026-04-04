@@ -182,7 +182,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/channels/wechat/qr-login", post(wechat_qr_start))
         .route("/channels/wechat/qr-status", post(wechat_qr_status))
         .route("/workspace/files", get(list_workspace_files))
-        .route("/workspace/files/{*path}", get(read_workspace_file).put(write_workspace_file))
+        .route(
+            "/workspace/files/{*path}",
+            get(read_workspace_file).put(write_workspace_file),
+        )
         .route("/stream", get(stream_sse))
         .route("/a2a", post(crate::a2a::server::a2a_rpc_handler));
 
@@ -615,8 +618,10 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
                 })*
             }
         }
-        check_ch!(telegram, discord, slack, whatsapp, signal, feishu,
-                   dingtalk, wecom, wechat, qq, line, zalo, matrix);
+        check_ch!(
+            telegram, discord, slack, whatsapp, signal, feishu, dingtalk, wecom, wechat, qq, line,
+            zalo, matrix
+        );
         chs
     };
 
@@ -626,12 +631,20 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
         let cutoff = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as i64 - 86400;
-        all.iter().filter(|key| {
-            state.store.db.get_session_meta(key).ok().flatten()
-                .map(|m| m.last_active > cutoff)
-                .unwrap_or(false)
-        }).count()
+            .as_secs() as i64
+            - 86400;
+        all.iter()
+            .filter(|key| {
+                state
+                    .store
+                    .db
+                    .get_session_meta(key)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.last_active > cutoff)
+                    .unwrap_or(false)
+            })
+            .count()
     };
 
     // Memory usage (RSS on supported platforms).
@@ -647,13 +660,18 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
                 .and_then(|o| String::from_utf8(o.stdout).ok())
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .map(|kb| {
-                    if kb > 1024 { format!("{} MB", kb / 1024) }
-                    else { format!("{} KB", kb) }
+                    if kb > 1024 {
+                        format!("{} MB", kb / 1024)
+                    } else {
+                        format!("{} KB", kb)
+                    }
                 })
                 .unwrap_or_else(|| "--".into())
         }
         #[cfg(not(target_os = "macos"))]
-        { "--".to_string() }
+        {
+            "--".to_string()
+        }
     };
 
     Json(serde_json::json!({
@@ -814,11 +832,13 @@ async fn get_config(State(_state): State<AppState>) -> Response {
         Ok(content) => Json(serde_json::json!({
             "raw": content,
             "path": config_path.display().to_string(),
-        })).into_response(),
+        }))
+        .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -840,7 +860,8 @@ async fn save_config(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": format!("invalid config: {e}")})),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // Backup current file.
@@ -852,13 +873,15 @@ async fn save_config(
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
-        ).into_response();
+        )
+            .into_response();
     }
 
     Json(serde_json::json!({
         "saved": true,
         "path": config_path.display().to_string(),
-    })).into_response()
+    }))
+    .into_response()
 }
 
 async fn get_session_messages(
@@ -1019,7 +1042,11 @@ async fn openai_chat_completions(
 
     // Subscribe to event_bus BEFORE sending message to agent,
     // so we don't miss early deltas for streaming responses.
-    let event_rx = if req.stream { Some(state.event_bus.subscribe()) } else { None };
+    let event_rx = if req.stream {
+        Some(state.event_bus.subscribe())
+    } else {
+        None
+    };
 
     if handle.tx.send(msg).await.is_err() {
         return (
@@ -1077,18 +1104,27 @@ async fn openai_chat_completions(
         let mut response_headers = axum::http::HeaderMap::new();
         response_headers.insert(
             header::CONTENT_TYPE,
-            "text/event-stream; charset=utf-8".parse().expect("header value"),
+            "text/event-stream; charset=utf-8"
+                .parse()
+                .expect("header value"),
         );
         response_headers.insert(
             header::CACHE_CONTROL,
             "no-cache".parse().expect("header value"),
         );
         response_headers.insert(
-            "x-accel-buffering".parse::<axum::http::HeaderName>().expect("header name"),
+            "x-accel-buffering"
+                .parse::<axum::http::HeaderName>()
+                .expect("header name"),
             "no".parse().expect("header value"),
         );
 
-        return (StatusCode::OK, response_headers, axum::body::Body::from_stream(stream)).into_response();
+        return (
+            StatusCode::OK,
+            response_headers,
+            axum::body::Body::from_stream(stream),
+        )
+            .into_response();
     }
 
     let timeout_secs = state.config.agents.defaults.timeout_seconds.unwrap_or(600) as u64;
@@ -1279,7 +1315,8 @@ struct WhatsAppVerifyParams {
 /// Meta webhook verification (GET /hooks/whatsapp).
 async fn whatsapp_verify(Query(params): Query<WhatsAppVerifyParams>) -> impl IntoResponse {
     // Meta sends GET with hub.mode=subscribe, hub.verify_token, hub.challenge.
-    // We accept any verify_token for now (operator should secure via WHATSAPP_VERIFY_TOKEN env).
+    // We accept any verify_token for now (operator should secure via
+    // WHATSAPP_VERIFY_TOKEN env).
     let expected = std::env::var("WHATSAPP_VERIFY_TOKEN").unwrap_or_default();
     if params.hub_mode.as_deref() == Some("subscribe")
         && (expected.is_empty() || params.hub_verify_token.as_deref() == Some(expected.as_str()))
@@ -1421,36 +1458,60 @@ async fn test_provider(Json(req): Json<TestProviderRequest>) -> Response {
     // Resolve provider API base URL and auth.
     // Most providers use OpenAI-compatible /v1/models with Bearer token.
     let (base_url, auth_style) = match req.provider.as_str() {
-        "anthropic"   => ("https://api.anthropic.com".to_owned(), "x-api-key"),
-        "openai"      => ("https://api.openai.com".to_owned(), "bearer"),
-        "deepseek"    => ("https://api.deepseek.com".to_owned(), "bearer"),
-        "qwen"        => ("https://dashscope.aliyuncs.com/compatible-mode".to_owned(), "bearer"),
-        "minimax"     => ("https://api.minimax.chat".to_owned(), "bearer"),
-        "kimi"        => ("https://api.moonshot.cn".to_owned(), "bearer"),
-        "zhipu"       => ("https://open.bigmodel.cn/api/paas".to_owned(), "bearer"),
-        "groq"        => ("https://api.groq.com/openai".to_owned(), "bearer"),
-        "grok"        => ("https://api.x.ai".to_owned(), "bearer"),
-        "gemini"      => ("https://generativelanguage.googleapis.com".to_owned(), "bearer"),
+        "anthropic" => ("https://api.anthropic.com".to_owned(), "x-api-key"),
+        "openai" => ("https://api.openai.com".to_owned(), "bearer"),
+        "deepseek" => ("https://api.deepseek.com".to_owned(), "bearer"),
+        "qwen" => (
+            "https://dashscope.aliyuncs.com/compatible-mode".to_owned(),
+            "bearer",
+        ),
+        "minimax" => ("https://api.minimax.chat".to_owned(), "bearer"),
+        "kimi" => ("https://api.moonshot.cn".to_owned(), "bearer"),
+        "zhipu" => ("https://open.bigmodel.cn/api/paas".to_owned(), "bearer"),
+        "groq" => ("https://api.groq.com/openai".to_owned(), "bearer"),
+        "grok" => ("https://api.x.ai".to_owned(), "bearer"),
+        "gemini" => (
+            "https://generativelanguage.googleapis.com".to_owned(),
+            "bearer",
+        ),
         "siliconflow" => ("https://api.siliconflow.cn".to_owned(), "bearer"),
-        "openrouter"  => ("https://openrouter.ai/api".to_owned(), "bearer"),
-        "gaterouter"  => (req.base_url.clone().unwrap_or_else(|| "https://api.gaterouter.com".to_owned()), "bearer"),
+        "openrouter" => ("https://openrouter.ai/api".to_owned(), "bearer"),
+        "gaterouter" => (
+            req.base_url
+                .clone()
+                .unwrap_or_else(|| "https://api.gaterouter.com".to_owned()),
+            "bearer",
+        ),
         "ollama" => {
             let base = req.base_url.as_deref().unwrap_or("http://localhost:11434");
             (base.trim_end_matches('/').to_owned(), "none")
         }
         "custom" => {
             let base = req.base_url.as_deref().unwrap_or("http://localhost:8080");
-            (base.trim_end_matches('/').to_owned(), if req.api_key.is_empty() { "none" } else { "bearer" })
+            (
+                base.trim_end_matches('/').to_owned(),
+                if req.api_key.is_empty() {
+                    "none"
+                } else {
+                    "bearer"
+                },
+            )
         }
         _ => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "unknown provider"}))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "unknown provider"})),
+            )
+                .into_response();
         }
     };
 
     let url = format!("{}/v1/models", base_url);
     let mut request = client.get(&url);
     match auth_style {
-        "bearer" => { request = request.header("Authorization", format!("Bearer {}", req.api_key)); }
+        "bearer" => {
+            request = request.header("Authorization", format!("Bearer {}", req.api_key));
+        }
         "x-api-key" => {
             request = request.header("x-api-key", &req.api_key);
             request = request.header("anthropic-version", "2023-06-01");
@@ -1465,19 +1526,25 @@ async fn test_provider(Json(req): Json<TestProviderRequest>) -> Response {
         Ok(resp) => {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            (StatusCode::OK, Json(serde_json::json!({
-                "ok": false,
-                "status": status,
-                "error": if status == 401 { "Invalid API key" } else { "Request failed" },
-                "detail": body.chars().take(200).collect::<String>(),
-            }))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "status": status,
+                    "error": if status == 401 { "Invalid API key" } else { "Request failed" },
+                    "detail": body.chars().take(200).collect::<String>(),
+                })),
+            )
+                .into_response()
         }
-        Err(e) => {
-            (StatusCode::OK, Json(serde_json::json!({
+        Err(e) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
                 "ok": false,
                 "error": e.to_string(),
-            }))).into_response()
-        }
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -1490,29 +1557,51 @@ async fn list_provider_models(Json(req): Json<TestProviderRequest>) -> Response 
 
     // Reuse same provider URL resolution as test_provider.
     let (base_url, auth_style) = match req.provider.as_str() {
-        "anthropic"   => ("https://api.anthropic.com".to_owned(), "x-api-key"),
-        "openai"      => ("https://api.openai.com".to_owned(), "bearer"),
-        "deepseek"    => ("https://api.deepseek.com".to_owned(), "bearer"),
-        "qwen"        => ("https://dashscope.aliyuncs.com/compatible-mode".to_owned(), "bearer"),
-        "minimax"     => ("https://api.minimax.chat".to_owned(), "bearer"),
-        "kimi"        => ("https://api.moonshot.cn".to_owned(), "bearer"),
-        "zhipu"       => ("https://open.bigmodel.cn/api/paas".to_owned(), "bearer"),
-        "groq"        => ("https://api.groq.com/openai".to_owned(), "bearer"),
-        "grok"        => ("https://api.x.ai".to_owned(), "bearer"),
-        "gemini"      => ("https://generativelanguage.googleapis.com".to_owned(), "bearer"),
+        "anthropic" => ("https://api.anthropic.com".to_owned(), "x-api-key"),
+        "openai" => ("https://api.openai.com".to_owned(), "bearer"),
+        "deepseek" => ("https://api.deepseek.com".to_owned(), "bearer"),
+        "qwen" => (
+            "https://dashscope.aliyuncs.com/compatible-mode".to_owned(),
+            "bearer",
+        ),
+        "minimax" => ("https://api.minimax.chat".to_owned(), "bearer"),
+        "kimi" => ("https://api.moonshot.cn".to_owned(), "bearer"),
+        "zhipu" => ("https://open.bigmodel.cn/api/paas".to_owned(), "bearer"),
+        "groq" => ("https://api.groq.com/openai".to_owned(), "bearer"),
+        "grok" => ("https://api.x.ai".to_owned(), "bearer"),
+        "gemini" => (
+            "https://generativelanguage.googleapis.com".to_owned(),
+            "bearer",
+        ),
         "siliconflow" => ("https://api.siliconflow.cn".to_owned(), "bearer"),
-        "openrouter"  => ("https://openrouter.ai/api".to_owned(), "bearer"),
-        "gaterouter"  => (req.base_url.clone().unwrap_or_else(|| "https://api.gaterouter.com".to_owned()), "bearer"),
+        "openrouter" => ("https://openrouter.ai/api".to_owned(), "bearer"),
+        "gaterouter" => (
+            req.base_url
+                .clone()
+                .unwrap_or_else(|| "https://api.gaterouter.com".to_owned()),
+            "bearer",
+        ),
         "ollama" => {
             let base = req.base_url.as_deref().unwrap_or("http://localhost:11434");
             (base.trim_end_matches('/').to_owned(), "none")
         }
         "custom" => {
             let base = req.base_url.as_deref().unwrap_or("http://localhost:8080");
-            (base.trim_end_matches('/').to_owned(), if req.api_key.is_empty() { "none" } else { "bearer" })
+            (
+                base.trim_end_matches('/').to_owned(),
+                if req.api_key.is_empty() {
+                    "none"
+                } else {
+                    "bearer"
+                },
+            )
         }
         _ => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "unknown provider"}))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "unknown provider"})),
+            )
+                .into_response();
         }
     };
 
@@ -1525,7 +1614,9 @@ async fn list_provider_models(Json(req): Json<TestProviderRequest>) -> Response 
 
     let mut request = client.get(&url);
     match auth_style {
-        "bearer" => { request = request.header("Authorization", format!("Bearer {}", req.api_key)); }
+        "bearer" => {
+            request = request.header("Authorization", format!("Bearer {}", req.api_key));
+        }
         "x-api-key" => {
             request = request.header("x-api-key", &req.api_key);
             request = request.header("anthropic-version", "2023-06-01");
@@ -1537,23 +1628,34 @@ async fn list_provider_models(Json(req): Json<TestProviderRequest>) -> Response 
         Ok(resp) if resp.status().is_success() => {
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
             // Normalize: extract model IDs from different API formats
-            let models: Vec<String> = if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
+            let models: Vec<String> = if let Some(data) =
+                body.get("data").and_then(|d| d.as_array())
+            {
                 // OpenAI/Anthropic format: { data: [{ id: "..." }] }
-                data.iter().filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.to_owned())).collect()
+                data.iter()
+                    .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.to_owned()))
+                    .collect()
             } else if let Some(models) = body.get("models").and_then(|m| m.as_array()) {
                 // Ollama format: { models: [{ name: "..." }] }
-                models.iter().filter_map(|m| m.get("name").and_then(|v| v.as_str()).map(|s| s.to_owned())).collect()
+                models
+                    .iter()
+                    .filter_map(|m| m.get("name").and_then(|v| v.as_str()).map(|s| s.to_owned()))
+                    .collect()
             } else {
                 vec![]
             };
             Json(serde_json::json!({"models": models})).into_response()
         }
-        Ok(resp) => {
-            (StatusCode::OK, Json(serde_json::json!({"models": [], "error": format!("HTTP {}", resp.status())}))).into_response()
-        }
-        Err(e) => {
-            (StatusCode::OK, Json(serde_json::json!({"models": [], "error": e.to_string()}))).into_response()
-        }
+        Ok(resp) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"models": [], "error": format!("HTTP {}", resp.status())})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"models": [], "error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1569,11 +1671,13 @@ async fn wechat_qr_start() -> Response {
         Ok((qrcode_url, qrcode_token)) => Json(serde_json::json!({
             "qrcode_url": qrcode_url,
             "qrcode_token": qrcode_token,
-        })).into_response(),
+        }))
+        .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -1586,19 +1690,24 @@ struct QrStatusRequest {
 /// Poll WeChat QR scan status. Returns bot_token + bot_id when scanned.
 async fn wechat_qr_status(Json(req): Json<QrStatusRequest>) -> Response {
     let client = reqwest::Client::new();
-    match crate::channel::wechat::WeChatPersonalChannel::poll_qr_status(&client, &req.qrcode_token).await {
+    match crate::channel::wechat::WeChatPersonalChannel::poll_qr_status(&client, &req.qrcode_token)
+        .await
+    {
         Ok(Some((bot_token, bot_id))) => Json(serde_json::json!({
             "status": "ok",
             "bot_token": bot_token,
             "bot_id": bot_id,
-        })).into_response(),
+        }))
+        .into_response(),
         Ok(None) => Json(serde_json::json!({
             "status": "waiting",
-        })).into_response(),
+        }))
+        .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -1650,7 +1759,11 @@ async fn run_doctor_cmd(fix: bool) -> Response {
                         "message": clean[6..].trim(),
                     }));
                 } else if clean.starts_with("[err]") || clean.starts_with("[error]") {
-                    let msg = if clean.starts_with("[err]") { &clean[5..] } else { &clean[7..] };
+                    let msg = if clean.starts_with("[err]") {
+                        &clean[5..]
+                    } else {
+                        &clean[7..]
+                    };
                     checks.push(serde_json::json!({
                         "status": "error",
                         "message": msg.trim(),
@@ -1667,12 +1780,14 @@ async fn run_doctor_cmd(fix: bool) -> Response {
                 "checks": checks,
                 "raw": stdout,
                 "stderr": stderr,
-            })).into_response()
+            }))
+            .into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -1686,7 +1801,8 @@ struct LogsQuery {
 }
 
 /// GET /api/v1/logs?limit=50
-/// Read the last N lines from the gateway log file, parse into structured entries.
+/// Read the last N lines from the gateway log file, parse into structured
+/// entries.
 async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
     let limit = q.limit.unwrap_or(50).min(200);
     let log_path = crate::config::loader::log_file();
@@ -1740,8 +1856,13 @@ async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
             chrono::NaiveDateTime::parse_from_str(&ts[..19], "%Y-%m-%dT%H:%M:%S")
                 .ok()
                 .map(|naive| {
-                    let utc = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc);
-                    utc.with_timezone(&chrono::Local).format("%H:%M:%S").to_string()
+                    let utc = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                        naive,
+                        chrono::Utc,
+                    );
+                    utc.with_timezone(&chrono::Local)
+                        .format("%H:%M:%S")
+                        .to_string()
                 })
                 .unwrap_or_else(|| ts[11..19].to_owned())
         } else {
@@ -1785,9 +1906,7 @@ struct WorkspaceQuery {
 
 /// GET /api/v1/workspace/files?agent=xxx
 /// List .md files in a workspace directory.
-async fn list_workspace_files(
-    Query(q): Query<WorkspaceQuery>,
-) -> Response {
+async fn list_workspace_files(Query(q): Query<WorkspaceQuery>) -> Response {
     let ws = resolve_workspace(q.agent.as_deref());
     if !ws.exists() {
         return Json(serde_json::json!({ "files": [] })).into_response();
@@ -1804,7 +1923,8 @@ async fn list_workspace_files(
         }
     }
     files.sort();
-    Json(serde_json::json!({ "files": files, "workspace": ws.display().to_string() })).into_response()
+    Json(serde_json::json!({ "files": files, "workspace": ws.display().to_string() }))
+        .into_response()
 }
 
 /// GET /api/v1/workspace/files/{path}?agent=xxx
@@ -1823,18 +1943,21 @@ async fn read_workspace_file(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "invalid file path"})),
-        ).into_response();
+        )
+            .into_response();
     }
     let full_path = ws.join(file_name);
     match std::fs::read_to_string(&full_path) {
         Ok(content) => Json(serde_json::json!({
             "file": file_name,
             "content": content,
-        })).into_response(),
+        }))
+        .into_response(),
         Err(_) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "file not found"})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -1859,7 +1982,8 @@ async fn write_workspace_file(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "invalid file path"})),
-        ).into_response();
+        )
+            .into_response();
     }
     // Create workspace dir if it doesn't exist.
     if !ws.exists() {
@@ -1867,7 +1991,8 @@ async fn write_workspace_file(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": e.to_string()})),
-            ).into_response();
+            )
+                .into_response();
         }
     }
     let full_path = ws.join(file_name);
@@ -1875,10 +2000,12 @@ async fn write_workspace_file(
         Ok(()) => Json(serde_json::json!({
             "ok": true,
             "file": file_name,
-        })).into_response(),
+        }))
+        .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
