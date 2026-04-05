@@ -115,7 +115,7 @@ jobs:
             os: ubuntu-latest
             sidecar_ext: ""
             bundle_ext: deb
-            bundle_path: ui/src-tauri/target/release/bundle/deb/*.deb
+            bundle_path: ui/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             sidecar_ext: ""
@@ -126,22 +126,22 @@ jobs:
             os: macos-14
             sidecar_ext: ""
             bundle_ext: dmg
-            bundle_path: ui/src-tauri/target/release/bundle/dmg/*.dmg
+            bundle_path: ui/src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
           - target: aarch64-apple-darwin
             os: macos-14
             sidecar_ext: ""
             bundle_ext: dmg
-            bundle_path: ui/src-tauri/target/release/bundle/dmg/*.dmg
+            bundle_path: ui/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             sidecar_ext: ".exe"
             bundle_ext: msi
-            bundle_path: ui/src-tauri/target/release/bundle/msi/*.msi
+            bundle_path: ui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
           - target: aarch64-pc-windows-msvc
             os: windows-latest
             sidecar_ext: ".exe"
             bundle_ext: msi
-            bundle_path: ui/src-tauri/target/release/bundle/msi/*.msi
+            bundle_path: ui/src-tauri/target/aarch64-pc-windows-msvc/release/bundle/msi/*.msi
 
     steps:
       - uses: actions/checkout@v6
