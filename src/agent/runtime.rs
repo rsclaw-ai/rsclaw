@@ -2144,14 +2144,13 @@ impl AgentRuntime {
                 from_agent
                     .or(from_defaults)
                     .or(from_provider)
-                    .unwrap_or(65536)
             };
             let req = LlmRequest {
                 model: model.to_owned(),
                 messages,
                 tools: tools.clone(),
                 system: Some(system_prompt.to_owned()),
-                max_tokens: Some(configured_max_tokens),
+                max_tokens: configured_max_tokens,
                 temperature: None,
                 thinking_budget,
             };
