@@ -98,6 +98,7 @@ enum PendingStage {
     /// File processed, waiting for token confirmation.
     TokenConfirm {
         extracted_text: String,
+        #[allow(dead_code)]
         estimated_tokens: usize,
     },
 }
@@ -105,9 +106,12 @@ enum PendingStage {
 struct PendingFile {
     filename: String,
     path: std::path::PathBuf,
+    #[allow(dead_code)]
     size: usize,
+    #[allow(dead_code)]
     mime_type: String,
     /// Pre-encoded image data, if the file is an image.
+    #[allow(dead_code)]
     images: Vec<super::registry::ImageAttachment>,
     stage: PendingStage,
 }
@@ -377,7 +381,7 @@ impl AgentRuntime {
             // Event collection task - runs in background
             let notif_tx_clone = notif_tx_bg.clone();
             let target_id_clone = target_id_bg.clone();
-            let event_collector = tokio::spawn(async move {
+            let _event_collector = tokio::spawn(async move {
                 let mut pending = String::new();
                 let mut interval = 0u64;
                 loop {
@@ -664,7 +668,7 @@ impl AgentRuntime {
             status.text_preview.clear();
         }
 
-        let agent_cfg = &self.handle.config;
+        let _agent_cfg = &self.handle.config;
 
         // Resolve language for user-facing channel messages.
         let i18n_lang = self
@@ -1364,7 +1368,6 @@ impl AgentRuntime {
                     pending_analysis: None,
                 });
             }
-            _ => {}
         }
 
         let agent_cfg = &self.handle.config;

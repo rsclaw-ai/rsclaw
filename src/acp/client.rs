@@ -390,7 +390,9 @@ pub enum SessionEvent {
 struct AcpState {
     next_id: i64,
     session_id: Option<SessionId>,
+    #[allow(dead_code)]
     pending_requests: HashMap<i64, mpsc::Sender<Result<serde_json::Value>>>,
+    #[allow(dead_code)]
     handler: Arc<dyn AcpCallbackHandler>,
     capabilities: Option<AgentCapabilities>,
     agent_info: Option<Implementation>,
@@ -412,6 +414,7 @@ enum SubprocessCmd {
 
 /// Internal message from subprocess to client
 #[derive(Debug)]
+#[allow(dead_code)]
 enum SubprocessEvent {
     Response {
         id: i64,
@@ -1261,7 +1264,7 @@ async fn handle_session_update(
                             "工具开始",
                             &format!("执行工具: {}", title.clone().unwrap_or_default()),
                         );
-                        if let Ok(mut nm) = notification_manager.try_lock() {
+                        if let Ok(nm) = notification_manager.try_lock() {
                             nm.send(&notif.with_session_id(session_id.clone().unwrap_or_default()))
                                 .await;
                         }
@@ -1284,7 +1287,7 @@ async fn handle_session_update(
                             "工具完成",
                             &format!("工具执行完成: {}", title.clone().unwrap_or_default()),
                         );
-                        if let Ok(mut nm) = notification_manager.try_lock() {
+                        if let Ok(nm) = notification_manager.try_lock() {
                             nm.send(&notif.with_session_id(session_id.clone().unwrap_or_default()))
                                 .await;
                         }
@@ -1309,7 +1312,7 @@ async fn handle_session_update(
                             ),
                         )
                         .with_burn_after_read();
-                        if let Ok(mut nm) = notification_manager.try_lock() {
+                        if let Ok(nm) = notification_manager.try_lock() {
                             nm.send(&notif.with_session_id(session_id.clone().unwrap_or_default()))
                                 .await;
                         }
@@ -1359,7 +1362,7 @@ async fn handle_session_update(
                     ),
                 )
                 .with_burn_after_read();
-                if let Ok(mut nm) = notification_manager.try_lock() {
+                if let Ok(nm) = notification_manager.try_lock() {
                     nm.send(&notif).await;
                 }
             }

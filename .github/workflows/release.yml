@@ -22,10 +22,10 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             archive: tar.gz
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             archive: tar.gz
             cross: true
           - target: x86_64-apple-darwin
@@ -112,16 +112,11 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             sidecar_ext: ""
             bundle_ext: deb
             bundle_path: ui/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            sidecar_ext: ""
-            bundle_ext: deb
-            bundle_path: ui/src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/deb/*.deb
-            cross_target: aarch64-unknown-linux-gnu
+          # aarch64-linux desktop disabled: cross-compile + GTK deps too complex for now
           - target: x86_64-apple-darwin
             os: macos-14
             sidecar_ext: ""

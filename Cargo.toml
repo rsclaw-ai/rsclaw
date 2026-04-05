@@ -1,6 +1,6 @@
 [package]
 name = "rsclaw"
-version = "2026.4.4"
+version = "2026.4.5"
 edition = "2024"
 rust-version = "1.91"
 description = "High-performance AI gateway with native OpenClaw A2A orchestration"
@@ -107,6 +107,7 @@ default = ["openclaw-migrate"]
 channel-matrix = ["dep:matrix-sdk"]
 openclaw-migrate = ["rusqlite"]
 tray = ["dep:tray-icon", "dep:muda"]
+silk = []
 
 [profile.release]
 lto = true

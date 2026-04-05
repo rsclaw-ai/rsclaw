@@ -1067,7 +1067,7 @@ impl WeChatPersonalChannel {
             .await?;
 
         // API may return upload_param (raw) or upload_full_url (full CDN URL).
-        let (cdn_upload_url, upload_param_for_download) =
+        let (cdn_upload_url, _upload_param_for_download) =
             if let Some(p) = upload_resp.upload_param.clone() {
                 // Build URL ourselves.
                 let url = format!(

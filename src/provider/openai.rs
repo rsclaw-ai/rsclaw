@@ -24,6 +24,7 @@ pub struct OpenAiProvider {
     /// When true, reasoning models use ollama native /api/chat with think=true.
     is_ollama: bool,
     /// Custom User-Agent header.
+    #[allow(dead_code)]
     user_agent: Option<String>,
 }
 

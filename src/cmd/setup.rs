@@ -134,14 +134,15 @@ pub const DEFAULT_CONFIG: &str = r#"// rsclaw configuration (JSON5)
 // ---------------------------------------------------------------------------
 
 /// Recursively copy a directory tree (files only, skips symlinks).
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<()> {
+#[allow(dead_code)]
+fn _copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let ft = entry.file_type()?;
         let dest = dst.join(entry.file_name());
         if ft.is_dir() {
-            copy_dir_recursive(&entry.path(), &dest)?;
+            _copy_dir_recursive(&entry.path(), &dest)?;
         } else if ft.is_file() {
             std::fs::copy(entry.path(), &dest)?;
         }

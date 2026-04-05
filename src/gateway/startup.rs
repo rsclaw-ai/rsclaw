@@ -1017,7 +1017,7 @@ fn start_channels(
             .unwrap_or(crate::config::schema::GroupPolicy::Allowlist);
         let group_allow_from: Vec<String> =
             tg_cfg.base.group_allow_from.clone().unwrap_or_default();
-        let mut allow_from: Vec<String> = tg_cfg.base.allow_from.clone().unwrap_or_default();
+        let allow_from: Vec<String> = tg_cfg.base.allow_from.clone().unwrap_or_default();
 
         let enforcer = Arc::new(
             crate::channel::DmPolicyEnforcer::new(dm_policy.clone(), allow_from)
@@ -5343,6 +5343,7 @@ fn start_matrix_if_configured(
         );
 
         let matrix = Arc::new({
+            #[allow(unused_mut)]
             let mut ch = crate::channel::matrix::MatrixChannel::new(
                 homeserver,
                 access_token,

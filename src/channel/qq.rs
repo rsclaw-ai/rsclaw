@@ -778,7 +778,7 @@ impl Channel for QQBotChannel {
                     }
                 };
 
-                let filename = if mime == "image/jpeg" {
+                let _filename = if mime == "image/jpeg" {
                     "image.jpg"
                 } else {
                     "image.png"
@@ -907,7 +907,8 @@ impl Channel for QQBotChannel {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn is_text_file(name: &str) -> bool {
+#[allow(dead_code)]
+fn _is_text_file(name: &str) -> bool {
     let exts = [
         ".txt", ".md", ".csv", ".json", ".toml", ".yaml", ".yml", ".xml", ".html", ".rs", ".py",
         ".js", ".ts", ".go", ".sh", ".log", ".conf", ".cfg",
