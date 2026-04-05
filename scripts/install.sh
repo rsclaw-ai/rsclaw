@@ -83,8 +83,8 @@ resolve_version() {
     fi
 
     local latest json
-    # Fetch releases from version API (auto-proxy for China) and pick CLI release (v*, not app-v*)
-    json="$(curl -fsSL "https://app.rsclaw.ai/api/version")"
+    # Fetch recent releases and pick the first CLI release (v*, not app-v*)
+    json="$(curl -fsSL "${GITHUB_API}/repos/${REPO}/releases?per_page=10")"
     latest="$(echo "$json" | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | grep -v '^app-' | head -1)"
 
     if [[ -z "$latest" ]]; then
