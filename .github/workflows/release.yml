@@ -243,6 +243,10 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Flatten nested desktop artifacts
+        run: |
+          find artifacts -mindepth 2 -type f \( -name "*.dmg" -o -name "*.msi" -o -name "*.deb" -o -name "*.AppImage" \) -exec mv {} artifacts/ \;
+
       - name: Generate checksums
         run: |
           cd artifacts
