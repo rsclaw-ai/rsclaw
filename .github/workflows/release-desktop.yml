@@ -115,10 +115,13 @@ jobs:
       - name: Rename artifact
         shell: bash
         run: |
+          # Strip "app-" prefix from tag for clean filename: app-v2026.4.6 -> v2026.4.6
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="${TAG#app-}"
           for f in ${{ matrix.bundle_path }}; do
             dir=$(dirname "$f")
             ext="${f##*.}"
-            mv "$f" "$dir/RsClaw-${{ github.ref_name }}-${{ matrix.target }}.$ext"
+            mv "$f" "$dir/RsClaw-${VERSION}-${{ matrix.target }}.$ext"
           done
 
       - name: Upload artifact
