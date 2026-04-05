@@ -3,12 +3,10 @@
 //! Reads OpenClaw's native JSONL session files and sessions.json indices,
 //! converting them into rsclaw's internal message format for import.
 
-use std::{
-    collections::HashMap,
-    fs,
-    io::{BufRead, BufReader},
-    path::{Path, PathBuf},
-};
+use std::collections::HashMap;
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -299,7 +297,10 @@ pub fn scan_openclaw(dir: &Path) -> Result<OpenClawScanResult> {
     if cron_path.is_file() {
         if let Ok(data) = fs::read_to_string(&cron_path) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
-                result.total_cron_jobs = val["jobs"].as_array().map(|a| a.len()).unwrap_or(0);
+                result.total_cron_jobs = val["jobs"]
+                    .as_array()
+                    .map(|a| a.len())
+                    .unwrap_or(0);
             }
         }
     }
@@ -408,8 +409,7 @@ pub fn read_session_messages(jsonl_path: &Path) -> Result<Vec<ConvertedMessage>>
 ///
 /// Content can be:
 /// - A simple string (typically for user messages)
-/// - An array of content blocks (for assistant messages with
-///   text/thinking/tool_use)
+/// - An array of content blocks (for assistant messages with text/thinking/tool_use)
 fn extract_text_content(content: &Option<serde_json::Value>) -> String {
     match content {
         None => String::new(),
@@ -525,8 +525,8 @@ pub fn resolve_jsonl_path(sessions_dir: &Path, descriptor: &SessionDescriptor) -
 ///
 /// OpenClaw keys vary in format:
 ///   "main"                         -> "agent:{agent_id}:main"
-///   "agent:main:main"              -> "agent:main:main" (already
-/// rsclaw-compatible)   "agent:main:telegram:direct:x" -> keep as-is
+///   "agent:main:main"              -> "agent:main:main" (already rsclaw-compatible)
+///   "agent:main:telegram:direct:x" -> keep as-is
 ///
 /// The goal is to produce keys that match rsclaw's `derive_session_key` output
 /// so imported history is found when the user continues chatting.
@@ -543,8 +543,7 @@ pub fn make_rsclaw_session_key(openclaw_key: &str, agent_id: &str) -> String {
 /// Generate session key aliases for migration compatibility.
 ///
 /// OpenClaw keys include accountId: `agent:main:feishu:default:direct:ou_xxx`
-/// rsclaw's default per-channel-peer omits it:
-/// `agent:main:feishu:direct:ou_xxx`
+/// rsclaw's default per-channel-peer omits it: `agent:main:feishu:direct:ou_xxx`
 ///
 /// Also handles channel name remapping (e.g. openclaw-weixin -> wechat).
 ///
@@ -588,8 +587,7 @@ pub fn generate_session_aliases(
                 let remapped = format!("agent:{agent_id}:{new_channel}:direct:{peer_id}");
                 aliases.push((remapped, stored_key.clone()));
                 // Also with accountId
-                let remapped_with_acc =
-                    format!("agent:{agent_id}:{new_channel}:{_account_id}:direct:{peer_id}");
+                let remapped_with_acc = format!("agent:{agent_id}:{new_channel}:{_account_id}:direct:{peer_id}");
                 aliases.push((remapped_with_acc, stored_key.clone()));
             }
         }
@@ -821,19 +819,21 @@ pub fn import_sessions_to_redb(
 // Workspace file migration
 // ---------------------------------------------------------------------------
 
-/// Workspace .md files to copy (not MEMORY.md -- that goes into memory store).
+/// Workspace .md files to copy (MEMORY.md is also copied as-is for system prompt,
+/// AND parsed into memory store for vector search).
 const WORKSPACE_FILES: &[&str] = &[
-    "IDENTITY.md",
     "SOUL.md",
-    "USER.md",
+    "IDENTITY.md",
     "AGENTS.md",
-    "TOOLS.md",
-    "HEARTBEAT.md",
-    "BOOTSTRAP.md",
+    "USER.md",
+    "MEMORY.md",
 ];
 
 /// Copy workspace .md files from an OpenClaw workspace dir to rsclaw workspace.
-pub fn copy_workspace_files(src_workspace: &Path, dst_workspace: &Path) -> Result<usize> {
+pub fn copy_workspace_files(
+    src_workspace: &Path,
+    dst_workspace: &Path,
+) -> Result<usize> {
     if !src_workspace.is_dir() {
         return Ok(0);
     }
@@ -914,7 +914,10 @@ pub struct MemoryEntry {
 }
 
 /// Read MEMORY.md and memory/*.md from a workspace, split by ## headings.
-pub fn read_workspace_memories(workspace_dir: &Path, agent_id: &str) -> Result<Vec<MemoryEntry>> {
+pub fn read_workspace_memories(
+    workspace_dir: &Path,
+    agent_id: &str,
+) -> Result<Vec<MemoryEntry>> {
     let mut entries = Vec::new();
 
     // 1. MEMORY.md
@@ -932,13 +935,14 @@ pub fn read_workspace_memories(workspace_dir: &Path, agent_id: &str) -> Result<V
             for entry in dir_entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                    let filename = path
-                        .file_name()
+                    let filename = path.file_name()
                         .unwrap_or_default()
                         .to_string_lossy()
                         .to_string();
                     if let Ok(content) = fs::read_to_string(&path) {
-                        let mut split = split_markdown_by_headings(&content, agent_id, &filename);
+                        let mut split = split_markdown_by_headings(
+                            &content, agent_id, &filename,
+                        );
                         entries.append(&mut split);
                     }
                 }
@@ -986,8 +990,7 @@ fn split_markdown_by_headings(
             current_title = heading.trim().to_owned();
             current_lines.clear();
         } else if line.starts_with("# ") && current_title.is_empty() && current_lines.is_empty() {
-            // Skip top-level `# Title` header (document title, not a memory
-            // entry).
+            // Skip top-level `# Title` header (document title, not a memory entry).
         } else {
             current_lines.push(line);
         }
@@ -1016,17 +1019,24 @@ fn split_markdown_by_headings(
 /// Read memory from an OpenClaw SQLite database.
 /// Supports both new format (chunks table) and legacy format (memories table).
 #[cfg(feature = "openclaw-migrate")]
-pub fn read_sqlite_memories(db_path: &Path, agent_id: &str) -> Result<Vec<MemoryEntry>> {
+pub fn read_sqlite_memories(
+    db_path: &Path,
+    agent_id: &str,
+) -> Result<Vec<MemoryEntry>> {
     use rusqlite::Connection;
 
-    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
 
     let mut entries = Vec::new();
 
     // Try new format: chunks table (path + text).
     if has_table(&conn, "chunks") {
-        let mut stmt = conn
-            .prepare("SELECT path, text FROM chunks WHERE text != '' ORDER BY updated_at DESC")?;
+        let mut stmt = conn.prepare(
+            "SELECT path, text FROM chunks WHERE text != '' ORDER BY updated_at DESC"
+        )?;
         let rows: Vec<MemoryEntry> = stmt
             .query_map([], |row| {
                 let path: String = row.get(0)?;
@@ -1035,10 +1045,7 @@ pub fn read_sqlite_memories(db_path: &Path, agent_id: &str) -> Result<Vec<Memory
                     title: path,
                     content: text,
                     agent_id: agent_id.to_owned(),
-                    source_file: format!(
-                        "sqlite:chunks:{}",
-                        crate::config::loader::path_to_forward_slash(db_path)
-                    ),
+                    source_file: format!("sqlite:chunks:{}", crate::config::loader::path_to_forward_slash(db_path)),
                 })
             })?
             .filter_map(|r| r.ok())
@@ -1054,7 +1061,9 @@ pub fn read_sqlite_memories(db_path: &Path, agent_id: &str) -> Result<Vec<Memory
             .unwrap_or_else(|| "CAST(rowid AS TEXT)".to_owned());
         let content_expr = pick_column(&columns, &["content", "value", "text", "memory"]);
         if let Some(content_col) = content_expr {
-            let sql = format!("SELECT {key_expr} AS k, {content_col} AS v FROM memories");
+            let sql = format!(
+                "SELECT {key_expr} AS k, {content_col} AS v FROM memories"
+            );
             let mut stmt = conn.prepare(&sql)?;
             let rows: Vec<MemoryEntry> = stmt
                 .query_map([], |row| {
@@ -1064,10 +1073,7 @@ pub fn read_sqlite_memories(db_path: &Path, agent_id: &str) -> Result<Vec<Memory
                         title: key,
                         content,
                         agent_id: agent_id.to_owned(),
-                        source_file: format!(
-                            "sqlite:memories:{}",
-                            crate::config::loader::path_to_forward_slash(db_path)
-                        ),
+                        source_file: format!("sqlite:memories:{}", crate::config::loader::path_to_forward_slash(db_path)),
                     })
                 })?
                 .filter_map(|r| r.ok())
@@ -1095,8 +1101,7 @@ fn has_table(conn: &rusqlite::Connection, name: &str) -> bool {
         "SELECT name FROM sqlite_master WHERE type='table' AND name=?1 LIMIT 1",
         [name],
         |_| Ok(()),
-    )
-    .is_ok()
+    ).is_ok()
 }
 
 #[cfg(feature = "openclaw-migrate")]
@@ -1178,15 +1183,10 @@ pub fn collect_all_memories(openclaw_dir: &Path, config_json: &str) -> Result<Ve
 
     // Fallback: scan all workspace-* dirs not covered by config.
     if let Ok(dir_entries) = fs::read_dir(openclaw_dir) {
-        let known: std::collections::HashSet<String> =
-            all.iter().map(|e| e.agent_id.clone()).collect();
+        let known: std::collections::HashSet<String> = all.iter().map(|e| e.agent_id.clone()).collect();
         for entry in dir_entries.flatten() {
             let path = entry.path();
-            let name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
             if path.is_dir() && name.starts_with("workspace-") {
                 let agent_id = name.strip_prefix("workspace-").unwrap_or(&name);
                 if !known.contains(agent_id) {
@@ -1216,11 +1216,7 @@ pub fn collect_all_memories(openclaw_dir: &Path, config_json: &str) -> Result<Ve
                         .to_string_lossy()
                         .to_string();
                     // brain.db -> "main"
-                    let agent_id = if agent_id == "brain" {
-                        "main".to_owned()
-                    } else {
-                        agent_id
-                    };
+                    let agent_id = if agent_id == "brain" { "main".to_owned() } else { agent_id };
                     sqlite_paths.push((path, agent_id));
                 }
             }
@@ -1231,15 +1227,13 @@ pub fn collect_all_memories(openclaw_dir: &Path, config_json: &str) -> Result<Ve
     if let Ok(dir_entries) = fs::read_dir(openclaw_dir) {
         for entry in dir_entries.flatten() {
             let path = entry.path();
-            let name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
             if path.is_dir() && name.starts_with("workspace") {
                 let brain_db = path.join("memory").join("brain.db");
                 if brain_db.is_file() {
-                    let agent_id = name.strip_prefix("workspace-").unwrap_or("main").to_owned();
+                    let agent_id = name.strip_prefix("workspace-")
+                        .unwrap_or("main")
+                        .to_owned();
                     sqlite_paths.push((brain_db, agent_id));
                 }
             }

@@ -1,9 +1,7 @@
 use anyhow::Result;
 
-use super::{
-    config_json::{load_config_json, set_nested_value},
-    style::*,
-};
+use super::config_json::{load_config_json, set_nested_value};
+use super::style::*;
 use crate::{cli::AgentsCommand, config};
 
 pub async fn cmd_agents(sub: AgentsCommand) -> Result<()> {
@@ -76,10 +74,7 @@ pub async fn cmd_agents(sub: AgentsCommand) -> Result<()> {
             ok(&format!("deleted agent '{}'", cyan(&id)));
         }
         AgentsCommand::Bindings => {
-            banner(&format!(
-                "rsclaw agent bindings v{}",
-                env!("RSCLAW_BUILD_VERSION")
-            ));
+            banner(&format!("rsclaw agent bindings v{}", env!("RSCLAW_BUILD_VERSION")));
             let config = config::load()?;
             if config.agents.bindings.is_empty() {
                 warn_msg("no bindings configured");
@@ -130,10 +125,7 @@ pub async fn cmd_agents(sub: AgentsCommand) -> Result<()> {
                 val["bindings"] = serde_json::json!([binding]);
             }
             std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
-            ok(&format!(
-                "added binding for agent '{}'",
-                cyan(&args.agent_id)
-            ));
+            ok(&format!("added binding for agent '{}'", cyan(&args.agent_id)));
         }
         AgentsCommand::Unbind { binding_id } => {
             // binding_id is the agent_id for simplicity (remove first match)

@@ -15,7 +15,7 @@ import dynamic from "next/dynamic";
 import { Path, SlotID } from "../constant";
 import { ErrorBoundary } from "./error";
 import { ToastContainer } from "./toast-container";
-import { isFirstLaunch } from "../lib/first-launch";
+import { isFirstLaunch, resetSetup } from "../lib/first-launch";
 import { setGatewayUrl, setAuthToken } from "../lib/rsclaw-api";
 
 import { getISOLang, getLang } from "../locales";
@@ -229,10 +229,25 @@ function Screen() {
         }
       } catch {}
     })();
-    // First launch: redirect to onboarding
-    if (isFirstLaunch() && location.pathname !== Path.Onboarding) {
-      navigate(Path.Onboarding);
-    }
+    // First launch or missing config: redirect to onboarding
+    (async () => {
+      let needsOnboarding = isFirstLaunch();
+      if (!needsOnboarding) {
+        try {
+          const invoke = (window as any).__TAURI__?.invoke;
+          if (invoke) {
+            const setupDone = await invoke("check_setup");
+            if (!setupDone) {
+              needsOnboarding = true;
+              resetSetup();
+            }
+          }
+        } catch {}
+      }
+      if (needsOnboarding && location.pathname !== Path.Onboarding) {
+        navigate(Path.Onboarding);
+      }
+    })();
   }, []);
 
   const isOnboarding = location.pathname === Path.Onboarding;

@@ -1,9 +1,7 @@
 use anyhow::Result;
 
-use crate::{
-    cli::directory::{DirectoryCommand, GroupsCommand, PeersCommand},
-    config,
-};
+use crate::cli::directory::{DirectoryCommand, GroupsCommand, PeersCommand};
+use crate::config;
 
 /// Build gateway base URL from config.
 fn gateway_url(port: u16) -> String {
@@ -129,7 +127,8 @@ pub async fn cmd_directory(sub: DirectoryCommand) -> Result<()> {
                 }
             }
             GroupsCommand::Members { channel, group_id } => {
-                let url = format!("{base}/api/v1/directory/{channel}/groups/{group_id}/members");
+                let url =
+                    format!("{base}/api/v1/directory/{channel}/groups/{group_id}/members");
                 let resp = client
                     .get(&url)
                     .header("Authorization", format!("Bearer {auth_token}"))

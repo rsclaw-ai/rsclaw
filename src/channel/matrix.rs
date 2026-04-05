@@ -9,7 +9,7 @@
 // =========================================================================
 
 #[cfg(feature = "channel-matrix")]
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration, path::PathBuf};
 
 #[cfg(feature = "channel-matrix")]
 use anyhow::{Context, Result};
@@ -17,13 +17,13 @@ use anyhow::{Context, Result};
 use futures::future::BoxFuture;
 #[cfg(feature = "channel-matrix")]
 use matrix_sdk::{
-    Client as MatrixSdkClient, Room, RoomState, SessionMeta,
     config::SyncSettings,
     matrix_auth::{MatrixSession, MatrixSessionTokens},
     ruma::events::room::message::{
         ImageMessageEventContent, MessageType, OriginalSyncRoomMessageEvent,
         RoomMessageEventContent,
     },
+    Client as MatrixSdkClient, Room, RoomState, SessionMeta,
 };
 #[cfg(feature = "channel-matrix")]
 use tracing::{debug, info, warn};
@@ -41,17 +41,7 @@ pub struct MatrixChannel {
     device_id: Option<String>,
     recovery_key: Option<String>,
     store_path: PathBuf,
-    on_message: Arc<
-        dyn Fn(
-                String,
-                String,
-                String,
-                bool,
-                Vec<crate::agent::registry::ImageAttachment>,
-                Vec<crate::agent::registry::FileAttachment>,
-            ) + Send
-            + Sync,
-    >,
+    on_message: Arc<dyn Fn(String, String, String, bool, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>) + Send + Sync>,
     client: Arc<tokio::sync::OnceCell<MatrixSdkClient>>,
 }
 
@@ -61,17 +51,7 @@ impl MatrixChannel {
         homeserver: impl Into<String>,
         access_token: impl Into<String>,
         user_id: impl Into<String>,
-        on_message: Arc<
-            dyn Fn(
-                    String,
-                    String,
-                    String,
-                    bool,
-                    Vec<crate::agent::registry::ImageAttachment>,
-                    Vec<crate::agent::registry::FileAttachment>,
-                ) + Send
-                + Sync,
-        >,
+        on_message: Arc<dyn Fn(String, String, String, bool, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>) + Send + Sync>,
     ) -> Self {
         let base = crate::config::loader::base_dir();
         Self {
@@ -97,62 +77,52 @@ impl MatrixChannel {
     }
 
     async fn get_client(&self) -> Result<MatrixSdkClient> {
-        let client = self
-            .client
-            .get_or_try_init(|| async {
-                // Create store dir
-                tokio::fs::create_dir_all(&self.store_path).await?;
+        let client = self.client.get_or_try_init(|| async {
+            // Create store dir
+            tokio::fs::create_dir_all(&self.store_path).await?;
 
-                // Build client with sqlite store for E2EE crypto state
-                let client = MatrixSdkClient::builder()
-                    .homeserver_url(&self.homeserver)
-                    .sqlite_store(&self.store_path, None)
-                    .build()
-                    .await
-                    .context("Matrix: failed to build SDK client")?;
+            // Build client with sqlite store for E2EE crypto state
+            let client = MatrixSdkClient::builder()
+                .homeserver_url(&self.homeserver)
+                .sqlite_store(&self.store_path, None)
+                .build()
+                .await
+                .context("Matrix: failed to build SDK client")?;
 
-                // Restore session from access token
-                let user_id: matrix_sdk::ruma::OwnedUserId = self
-                    .user_id
-                    .parse()
-                    .map_err(|e| anyhow::anyhow!("Matrix: invalid user_id: {e}"))?;
+            // Restore session from access token
+            let user_id: matrix_sdk::ruma::OwnedUserId = self.user_id.parse()
+                .map_err(|e| anyhow::anyhow!("Matrix: invalid user_id: {e}"))?;
 
-                let device_id = self.device_id.clone().unwrap_or_else(|| {
-                    let local =
-                        &self.user_id[1..self.user_id.find(':').unwrap_or(self.user_id.len())];
+            let device_id = self.device_id.clone()
+                .unwrap_or_else(|| {
+                    let local = &self.user_id[1..self.user_id.find(':').unwrap_or(self.user_id.len())];
                     format!("RSCLAW_{}", local.to_uppercase())
                 });
 
-                let session = MatrixSession {
-                    meta: SessionMeta {
-                        user_id,
-                        device_id: device_id.into(),
-                    },
-                    tokens: MatrixSessionTokens {
-                        access_token: self.access_token.clone(),
-                        refresh_token: None,
-                    },
-                };
-                client
-                    .matrix_auth()
-                    .restore_session(session)
-                    .await
-                    .context("Matrix: failed to restore session")?;
-                info!("Matrix: session restored");
+            let session = MatrixSession {
+                meta: SessionMeta {
+                    user_id,
+                    device_id: device_id.into(),
+                },
+                tokens: MatrixSessionTokens {
+                    access_token: self.access_token.clone(),
+                    refresh_token: None,
+                },
+            };
+            client.matrix_auth().restore_session(session).await
+                .context("Matrix: failed to restore session")?;
+            info!("Matrix: session restored");
 
-                // E2EE key recovery if configured
-                if let Some(ref key) = self.recovery_key {
-                    match client.encryption().recovery().recover(key).await {
-                        Ok(()) => info!("Matrix: E2EE recovery successful"),
-                        Err(e) => warn!(
-                            "Matrix: E2EE recovery failed: {e} (unencrypted rooms still work)"
-                        ),
-                    }
+            // E2EE key recovery if configured
+            if let Some(ref key) = self.recovery_key {
+                match client.encryption().recovery().recover(key).await {
+                    Ok(()) => info!("Matrix: E2EE recovery successful"),
+                    Err(e) => warn!("Matrix: E2EE recovery failed: {e} (unencrypted rooms still work)"),
                 }
+            }
 
-                Ok::<MatrixSdkClient, anyhow::Error>(client)
-            })
-            .await?;
+            Ok::<MatrixSdkClient, anyhow::Error>(client)
+        }).await?;
 
         Ok(client.clone())
     }
@@ -160,19 +130,14 @@ impl MatrixChannel {
 
 #[cfg(feature = "channel-matrix")]
 impl Channel for MatrixChannel {
-    fn name(&self) -> &str {
-        "matrix"
-    }
+    fn name(&self) -> &str { "matrix" }
 
     fn send(&self, msg: OutboundMessage) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             let client = self.get_client().await?;
-            let room_id: matrix_sdk::ruma::OwnedRoomId = msg
-                .target_id
-                .parse()
+            let room_id: matrix_sdk::ruma::OwnedRoomId = msg.target_id.parse()
                 .map_err(|e| anyhow::anyhow!("Matrix: invalid room_id: {e}"))?;
-            let room = client
-                .get_room(&room_id)
+            let room = client.get_room(&room_id)
                 .ok_or_else(|| anyhow::anyhow!("Matrix: room not found: {}", msg.target_id))?;
 
             let chunk_cfg = ChunkConfig {
@@ -182,8 +147,7 @@ impl Channel for MatrixChannel {
             };
             for chunk in &chunk_text(&msg.text, &chunk_cfg) {
                 let content = RoomMessageEventContent::text_plain(chunk);
-                room.send(content)
-                    .await
+                room.send(content).await
                     .context("Matrix: send message failed")?;
             }
 
@@ -213,10 +177,13 @@ impl Channel for MatrixChannel {
                 match upload_resp {
                     Ok(resp) => {
                         let content_uri = resp.content_uri;
-                        let img_content =
-                            ImageMessageEventContent::plain("image.png".to_owned(), content_uri);
-                        let msg_content =
-                            RoomMessageEventContent::new(MessageType::Image(img_content));
+                        let img_content = ImageMessageEventContent::plain(
+                            "image.png".to_owned(),
+                            content_uri,
+                        );
+                        let msg_content = RoomMessageEventContent::new(
+                            MessageType::Image(img_content),
+                        );
                         if let Err(e) = room.send(msg_content).await {
                             warn!(idx, "Matrix SDK: image send failed: {e}");
                         }
@@ -429,24 +396,20 @@ impl Channel for MatrixChannel {
             });
 
             // Run sync loop with callback for visibility
-            client
-                .sync_with_callback(sync_settings, |response| async move {
-                    let room_count = response.rooms.join.len();
-                    if room_count > 0 {
-                        debug!(
-                            rooms = room_count,
-                            "Matrix: SDK sync response with room events"
-                        );
-                    }
-                    matrix_sdk::LoopCtrl::Continue
-                })
-                .await
+            client.sync_with_callback(sync_settings, |response| async move {
+                let room_count = response.rooms.join.len();
+                if room_count > 0 {
+                    debug!(rooms = room_count, "Matrix: SDK sync response with room events");
+                }
+                matrix_sdk::LoopCtrl::Continue
+            }).await
                 .map_err(|e| anyhow::anyhow!("Matrix: sync failed: {e}"))?;
 
             Ok(())
         })
     }
 }
+
 
 // =========================================================================
 // reqwest fallback implementation (no feature)
@@ -477,17 +440,7 @@ pub struct MatrixChannel {
     access_token: String,
     user_id: String, // bot's own user ID, to skip own messages
     client: Client,
-    on_message: Arc<
-        dyn Fn(
-                String,
-                String,
-                String,
-                bool,
-                Vec<crate::agent::registry::ImageAttachment>,
-                Vec<crate::agent::registry::FileAttachment>,
-            ) + Send
-            + Sync,
-    >,
+    on_message: Arc<dyn Fn(String, String, String, bool, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>) + Send + Sync>,
     // (sender_id, text, room_id, is_room, images, files)
 }
 
@@ -497,17 +450,7 @@ impl MatrixChannel {
         homeserver: impl Into<String>,
         access_token: impl Into<String>,
         user_id: impl Into<String>,
-        on_message: Arc<
-            dyn Fn(
-                    String,
-                    String,
-                    String,
-                    bool,
-                    Vec<crate::agent::registry::ImageAttachment>,
-                    Vec<crate::agent::registry::FileAttachment>,
-                ) + Send
-                + Sync,
-        >,
+        on_message: Arc<dyn Fn(String, String, String, bool, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>) + Send + Sync>,
     ) -> Self {
         Self {
             homeserver: homeserver.into().trim_end_matches('/').to_owned(),
@@ -626,15 +569,16 @@ impl Channel for MatrixChannel {
             let mut since: Option<String> = None;
 
             loop {
-                let mut url = format!("{}/_matrix/client/v3/sync?timeout=30000", self.homeserver);
+                let mut url = format!(
+                    "{}/_matrix/client/v3/sync?timeout=30000",
+                    self.homeserver
+                );
                 if let Some(ref s) = since {
                     url.push_str(&format!("&since={s}"));
                 }
                 // First sync: filter to only get recent messages, not full history
                 if since.is_none() {
-                    url.push_str(
-                        "&filter=%7B%22room%22%3A%7B%22timeline%22%3A%7B%22limit%22%3A0%7D%7D%7D",
-                    );
+                    url.push_str("&filter=%7B%22room%22%3A%7B%22timeline%22%3A%7B%22limit%22%3A0%7D%7D%7D");
                 }
 
                 debug!(url = &url[..url.len().min(120)], "Matrix: sync request");
@@ -650,14 +594,15 @@ impl Channel for MatrixChannel {
                         match resp.json::<serde_json::Value>().await {
                             Ok(body) => {
                                 // Update since token
-                                if let Some(nb) = body.get("next_batch").and_then(|v| v.as_str()) {
+                                if let Some(nb) =
+                                    body.get("next_batch").and_then(|v| v.as_str())
+                                {
                                     debug!(next_batch = nb, "Matrix: sync ok");
                                     since = Some(nb.to_owned());
                                 }
 
                                 // Process room events
-                                let room_count = body
-                                    .pointer("/rooms/join")
+                                let room_count = body.pointer("/rooms/join")
                                     .and_then(|v| v.as_object())
                                     .map(|o| o.len())
                                     .unwrap_or(0);
@@ -714,9 +659,7 @@ impl Channel for MatrixChannel {
                                                             .get("body")
                                                             .and_then(|v| v.as_str())
                                                             .unwrap_or("");
-                                                        if text.is_empty() {
-                                                            continue;
-                                                        }
+                                                        if text.is_empty() { continue; }
 
                                                         info!(from = %sender, room = %room_id, text_len = text.len(), "Matrix: text message");
                                                         (self.on_message)(
@@ -730,62 +673,35 @@ impl Channel for MatrixChannel {
                                                     }
                                                     "m.image" => {
                                                         // Download image from Matrix media repo
-                                                        let mxc_url = content
-                                                            .get("url")
-                                                            .and_then(|v| v.as_str())
-                                                            .unwrap_or("");
-                                                        if mxc_url.is_empty() {
-                                                            continue;
-                                                        }
+                                                        let mxc_url = content.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                                                        if mxc_url.is_empty() { continue; }
 
                                                         // Convert mxc://server/media_id to https://server/_matrix/media/v3/download/server/media_id
-                                                        let download_url = if let Some(rest) =
-                                                            mxc_url.strip_prefix("mxc://")
-                                                        {
-                                                            format!(
-                                                                "{}/_matrix/client/v1/media/download/{}",
-                                                                self.homeserver, rest
-                                                            )
+                                                        let download_url = if let Some(rest) = mxc_url.strip_prefix("mxc://") {
+                                                            format!("{}/_matrix/client/v1/media/download/{}", self.homeserver, rest)
                                                         } else {
                                                             continue;
                                                         };
 
                                                         debug!(url = %download_url, "Matrix: downloading image");
                                                         // Try authenticated download (spec v1.11+)
-                                                        let resp_result = self
-                                                            .client
-                                                            .get(&download_url)
+                                                        let resp_result = self.client.get(&download_url)
                                                             .bearer_auth(&self.access_token)
-                                                            .send()
-                                                            .await;
-                                                        // If auth fails, try unauthenticated (older
-                                                        // servers)
+                                                            .send().await;
+                                                        // If auth fails, try unauthenticated (older servers)
                                                         let resp_result = match &resp_result {
                                                             Ok(r) if !r.status().is_success() => {
-                                                                let unauth_url = download_url
-                                                                    .replace(
-                                                                        "/_matrix/client/v1/media/",
-                                                                        "/_matrix/media/v3/",
-                                                                    );
-                                                                self.client
-                                                                    .get(&unauth_url)
-                                                                    .send()
-                                                                    .await
+                                                                let unauth_url = download_url.replace("/_matrix/client/v1/media/", "/_matrix/media/v3/");
+                                                                self.client.get(&unauth_url).send().await
                                                             }
                                                             _ => resp_result,
                                                         };
                                                         match resp_result {
-                                                            Ok(resp)
-                                                                if resp.status().is_success() =>
-                                                            {
-                                                                if let Ok(bytes) =
-                                                                    resp.bytes().await
-                                                                {
+                                                            Ok(resp) if resp.status().is_success() => {
+                                                                if let Ok(bytes) = resp.bytes().await {
                                                                     use base64::Engine;
                                                                     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                                                    let data_url = format!(
-                                                                        "data:image/png;base64,{b64}"
-                                                                    );
+                                                                    let data_url = format!("data:image/png;base64,{b64}");
                                                                     info!(from = %sender, room = %room_id, size = bytes.len(), "Matrix: image received");
                                                                     (self.on_message)(
                                                                         sender.to_owned(),
@@ -801,57 +717,29 @@ impl Channel for MatrixChannel {
                                                                 }
                                                             }
                                                             Ok(resp) => {
-                                                                warn!(
-                                                                    "Matrix: image download failed: {}",
-                                                                    resp.status()
-                                                                );
+                                                                warn!("Matrix: image download failed: {}", resp.status());
                                                             }
                                                             Err(e) => {
-                                                                warn!(
-                                                                    "Matrix: image download error: {e}"
-                                                                );
+                                                                warn!("Matrix: image download error: {e}");
                                                             }
                                                         }
                                                     }
                                                     "m.audio" | "m.video" => {
                                                         // Download audio and transcribe
-                                                        let mxc_url = content
-                                                            .get("url")
-                                                            .and_then(|v| v.as_str())
-                                                            .unwrap_or("");
-                                                        if mxc_url.is_empty() {
-                                                            continue;
-                                                        }
+                                                        let mxc_url = content.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                                                        if mxc_url.is_empty() { continue; }
 
-                                                        let download_url = if let Some(rest) =
-                                                            mxc_url.strip_prefix("mxc://")
-                                                        {
-                                                            format!(
-                                                                "{}/_matrix/client/v1/media/download/{}",
-                                                                self.homeserver, rest
-                                                            )
+                                                        let download_url = if let Some(rest) = mxc_url.strip_prefix("mxc://") {
+                                                            format!("{}/_matrix/client/v1/media/download/{}", self.homeserver, rest)
                                                         } else {
                                                             continue;
                                                         };
 
-                                                        match self
-                                                            .client
-                                                            .get(&download_url)
-                                                            .bearer_auth(&self.access_token)
-                                                            .send()
-                                                            .await
-                                                        {
-                                                            Ok(resp)
-                                                                if resp.status().is_success() =>
-                                                            {
-                                                                if let Ok(bytes) =
-                                                                    resp.bytes().await
-                                                                {
-                                                                    let mime = content
-                                                                        .get("info")
-                                                                        .and_then(|i| {
-                                                                            i.get("mimetype")
-                                                                        })
+                                                        match self.client.get(&download_url).bearer_auth(&self.access_token).send().await {
+                                                            Ok(resp) if resp.status().is_success() => {
+                                                                if let Ok(bytes) = resp.bytes().await {
+                                                                    let mime = content.get("info")
+                                                                        .and_then(|i| i.get("mimetype"))
                                                                         .and_then(|v| v.as_str())
                                                                         .unwrap_or("audio/ogg");
                                                                     match crate::channel::transcription::transcribe_audio(
@@ -872,18 +760,11 @@ impl Channel for MatrixChannel {
                                                                     }
                                                                 }
                                                             }
-                                                            _ => {
-                                                                warn!(
-                                                                    "Matrix: audio download failed"
-                                                                );
-                                                            }
+                                                            _ => { warn!("Matrix: audio download failed"); }
                                                         }
                                                     }
                                                     _ => {
-                                                        debug!(
-                                                            msgtype,
-                                                            "Matrix: unsupported message type"
-                                                        );
+                                                        debug!(msgtype, "Matrix: unsupported message type");
                                                         continue;
                                                     }
                                                 }
@@ -898,11 +779,7 @@ impl Channel for MatrixChannel {
                     Ok(resp) => {
                         let status = resp.status();
                         let body = resp.text().await.unwrap_or_default();
-                        warn!(
-                            "Matrix: sync error {} -- {}",
-                            status,
-                            &body[..body.len().min(200)]
-                        );
+                        warn!("Matrix: sync error {} -- {}", status, &body[..body.len().min(200)]);
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                     Err(e) => {
@@ -917,12 +794,12 @@ impl Channel for MatrixChannel {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[cfg(not(feature = "channel-matrix"))]
     use std::sync::Arc;
 
     #[cfg(not(feature = "channel-matrix"))]
     use super::super::Channel;
-    use super::*;
 
     #[test]
     fn channel_name() {
@@ -953,19 +830,20 @@ mod tests {
         )
     }
 
-    /// Call sync once against mock_matrix.py and expect room events with text
-    /// messages.
+    /// Call sync once against mock_matrix.py and expect room events with text messages.
     ///
     /// Run: python3 /tmp/mock_matrix.py  (in a separate terminal)
-    /// Then: cargo test -p rsclaw matrix::tests::mock_sync_returns_events --
-    /// --ignored
+    /// Then: cargo test -p rsclaw matrix::tests::mock_sync_returns_events -- --ignored
     #[cfg(not(feature = "channel-matrix"))]
     #[tokio::test]
     #[ignore]
     async fn mock_sync_returns_events() {
         let ch = mock_channel(std::sync::Arc::new(std::sync::Mutex::new(vec![])));
 
-        let url = format!("{}/_matrix/client/v3/sync?timeout=30000", ch.homeserver);
+        let url = format!(
+            "{}/_matrix/client/v3/sync?timeout=30000",
+            ch.homeserver
+        );
         let resp = ch
             .client
             .get(&url)
@@ -1002,12 +880,10 @@ mod tests {
         assert_eq!(text, "Hello from mock Matrix");
     }
 
-    /// Call sync twice; second call (with since token) should return empty
-    /// events.
+    /// Call sync twice; second call (with since token) should return empty events.
     ///
     /// Run: python3 /tmp/mock_matrix.py  (restart before test)
-    /// Then: cargo test -p rsclaw matrix::tests::mock_sync_empty_second --
-    /// --ignored
+    /// Then: cargo test -p rsclaw matrix::tests::mock_sync_empty_second -- --ignored
     #[cfg(not(feature = "channel-matrix"))]
     #[tokio::test]
     #[ignore]
@@ -1015,7 +891,10 @@ mod tests {
         let ch = mock_channel(std::sync::Arc::new(std::sync::Mutex::new(vec![])));
 
         // First sync
-        let url = format!("{}/_matrix/client/v3/sync?timeout=30000", ch.homeserver);
+        let url = format!(
+            "{}/_matrix/client/v3/sync?timeout=30000",
+            ch.homeserver
+        );
         let first: serde_json::Value = ch
             .client
             .get(&url)
@@ -1048,7 +927,9 @@ mod tests {
             .await
             .expect("parse second sync");
 
-        let rooms = second.pointer("/rooms/join").and_then(|v| v.as_object());
+        let rooms = second
+            .pointer("/rooms/join")
+            .and_then(|v| v.as_object());
         let event_count = rooms
             .map(|r| {
                 r.values()

@@ -7,13 +7,17 @@ export function setGatewayUrl(url: string) {
   GATEWAY_URL = url;
 }
 export function getGatewayUrl() {
+  if (GATEWAY_URL && GATEWAY_URL !== "http://localhost:18888") return GATEWAY_URL;
+  try { return localStorage.getItem("rsclaw-gateway-url") || GATEWAY_URL; } catch {}
   return GATEWAY_URL;
 }
 export function setAuthToken(token: string) {
   AUTH_TOKEN = token;
 }
 export function getAuthToken() {
-  return AUTH_TOKEN;
+  if (AUTH_TOKEN) return AUTH_TOKEN;
+  try { return localStorage.getItem("rsclaw-auth-token") || ""; } catch {}
+  return "";
 }
 
 export async function gatewayFetch(

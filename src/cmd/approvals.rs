@@ -1,10 +1,9 @@
 use anyhow::Result;
 
+use crate::cli::approvals::{AllowlistCommand, ApprovalsCommand};
+use crate::config;
+
 use super::config_json::{load_config_json, set_nested_value};
-use crate::{
-    cli::approvals::{AllowlistCommand, ApprovalsCommand},
-    config,
-};
 
 pub async fn cmd_approvals(sub: ApprovalsCommand) -> Result<()> {
     match sub {
@@ -108,7 +107,9 @@ pub async fn cmd_approvals(sub: ApprovalsCommand) -> Result<()> {
                     .collect();
 
                 if filtered.len() == before {
-                    anyhow::bail!("pattern '{pattern}' not found in allowlist for agent '{agent}'");
+                    anyhow::bail!(
+                        "pattern '{pattern}' not found in allowlist for agent '{agent}'"
+                    );
                 }
 
                 set_nested_value(&mut val, &key, serde_json::json!(filtered))?;

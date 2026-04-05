@@ -112,29 +112,90 @@ export function setUserStopped(v: boolean) { try { localStorage.setItem("rsclaw-
 function getUserStopped() { try { return localStorage.getItem("rsclaw-user-stopped") === "1"; } catch { return false; } }
 
 function GatewayStatus({ narrow }: { narrow: boolean }) {
-  const [status, setStatus] = React.useState<"online" | "offline" | "checking">("checking");
-  const [showConfirm, setShowConfirm] = React.useState(false);
+  const [status, setStatus] = React.useState<"online" | "offline" | "checking" | "starting" | "failed">("checking");
+  const [confirmAction, setConfirmAction] = React.useState<"start"|"restart"|"stop"|null>(null);
   const [starting, setStarting] = React.useState(false);
+  const [errorMsg, setErrorMsg] = React.useState("");
+  const failCount = React.useRef(0);
   const autoStarted = React.useRef(false);
   const navigate = useNavigate();
   const zh = getLang() === "cn";
 
   const doStart = async () => {
     setStarting(true);
-    setStatus("starting" as any);
+    setStatus("starting");
+    setErrorMsg("");
     try {
       const tauriInvoke = (window as any).__TAURI__?.invoke;
       if (tauriInvoke) await tauriInvoke("start_gateway");
       setUserStopped(false);
       setTimeout(() => {
         getHealth()
-          .then(() => { setStatus("online"); setStarting(false); })
-          .catch(() => { setStatus("offline"); setStarting(false); });
-      }, 3000);
+          .then(() => { setStatus("online"); setStarting(false); failCount.current = 0; setErrorMsg(""); })
+          .catch(() => {
+            failCount.current++;
+            setStarting(false);
+            setStatus("failed");
+            if (failCount.current >= 2) {
+              setErrorMsg(zh ? "网关启动失败，请检查端口是否被占用或配置是否正确" : "Gateway failed to start. Check port conflicts or config errors.");
+            }
+          });
+      }, 1000);
+    } catch (e: any) {
+      failCount.current++;
+      setStarting(false);
+      setStatus("failed");
+      setErrorMsg(String(e?.message || e || ""));
+    }
+  };
+
+  const doStop = async () => {
+    try {
+      const tauriInvoke = (window as any).__TAURI__?.invoke;
+      if (tauriInvoke) await tauriInvoke("stop_gateway");
+      setUserStopped(true);
+      setStatus("offline");
+      setErrorMsg("");
+      failCount.current = 0;
+    } catch {}
+  };
+
+  const doRestart = async () => {
+    setStarting(true);
+    setStatus("starting");
+    setErrorMsg("");
+    try {
+      const tauriInvoke = (window as any).__TAURI__?.invoke;
+      if (tauriInvoke) {
+        await tauriInvoke("stop_gateway");
+        await new Promise((r) => setTimeout(r, 500));
+        await tauriInvoke("start_gateway");
+      }
+      setTimeout(() => {
+        getHealth()
+          .then(() => { setStatus("online"); setStarting(false); failCount.current = 0; setErrorMsg(""); })
+          .catch(() => {
+            failCount.current++;
+            setStarting(false);
+            setStatus("failed");
+          });
+      }, 1000);
     } catch {
       setStarting(false);
-      setStatus("offline");
+      setStatus("failed");
     }
+  };
+
+  const doDiagnose = async () => {
+    navigate(Path.RsClawPanel + "?tab=doctor");
+  };
+
+  const executeConfirm = () => {
+    const action = confirmAction;
+    setConfirmAction(null);
+    if (action === "start") doStart();
+    else if (action === "restart") doRestart();
+    else if (action === "stop") doStop();
   };
 
   React.useEffect(() => {
@@ -158,17 +219,15 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
   }, []);
 
   const isOnline = status === "online";
-  const isStarting = status === ("starting" as any) || starting;
-  const color = isOnline ? "#2dd4a0" : isStarting ? "#f5a623" : "#d95f5f";
+  const isFailed = status === "failed";
+  const isChecking = status === "checking";
+  const isStarting = status === "starting" || starting;
+  const color = isOnline ? "#2dd4a0" : (isStarting || isChecking) ? "#f5a623" : isFailed ? "#d95f5f" : "#d95f5f";
   const label = isOnline ? Locale.RsClawPanel.Running
     : isStarting ? (zh ? "\u542F\u52A8\u4E2D..." : "Starting...")
+    : isChecking ? (zh ? "\u68C0\u67E5\u4E2D..." : "Checking...")
+    : isFailed ? (zh ? "\u542F\u52A8\u5931\u8D25" : "Start Failed")
     : Locale.RsClawPanel.Offline;
-
-  const handleStartGateway = async () => {
-    setShowConfirm(false);
-    autoStarted.current = false;
-    await doStart();
-  };
 
   return (
     <div
@@ -179,36 +238,94 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
       <span className={styles["gateway-dot"]} style={{ background: color }} />
       {!narrow && (
         <>
-          <span className={styles["gateway-label"]}>{label}</span>
-          {!isOnline && !isStarting && (
-            <button
-              onClick={(e) => { e.stopPropagation(); setShowConfirm(true); }}
-              style={{
-                marginLeft: "auto",
-                padding: "2px 8px",
-                fontSize: "10px",
-                fontWeight: 600,
-                borderRadius: "5px",
-                border: "none",
-                background: "#f97316",
-                color: "#fff",
-                cursor: "pointer",
-                fontFamily: "inherit",
-                transition: "background 0.12s",
-              }}
-              onMouseEnter={(e) => (e.currentTarget.style.background = "#fb923c")}
-              onMouseLeave={(e) => (e.currentTarget.style.background = "#f97316")}
-            >
-              {Locale.RsClawPanel.Status.Start}
-            </button>
+          <span className={styles["gateway-label"]} style={{ flex: 1 }}>{label}</span>
+          {!isStarting && !isChecking && (
+            <div style={{ display: "flex", gap: 4, marginLeft: "auto" }} onClick={(e) => e.stopPropagation()}>
+              {isFailed ? (
+                <>
+                  <button
+                    onClick={() => doStart()}
+                    style={{
+                      padding: "2px 8px", borderRadius: 5, fontSize: 11, fontFamily: "inherit",
+                      border: "1px solid rgba(249,115,22,.25)", background: "transparent",
+                      color: "rgba(249,115,22,.8)", cursor: "pointer", transition: "color .12s",
+                    }}
+                    onMouseEnter={(e) => (e.currentTarget.style.color = "rgba(249,115,22,1)")}
+                    onMouseLeave={(e) => (e.currentTarget.style.color = "rgba(249,115,22,.8)")}
+                  >
+                    {zh ? "\u91CD\u8BD5" : "Retry"}
+                  </button>
+                  <button
+                    onClick={doDiagnose}
+                    style={{
+                      padding: "2px 8px", borderRadius: 5, fontSize: 11, fontFamily: "inherit",
+                      border: "1px solid rgba(255,255,255,.12)", background: "transparent",
+                      color: "rgba(255,255,255,.4)", cursor: "pointer", transition: "color .12s",
+                    }}
+                    onMouseEnter={(e) => (e.currentTarget.style.color = "rgba(255,255,255,.65)")}
+                    onMouseLeave={(e) => (e.currentTarget.style.color = "rgba(255,255,255,.4)")}
+                  >
+                    {zh ? "\u8BCA\u65AD" : "Diagnose"}
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    onClick={() => setConfirmAction("restart")}
+                    style={{
+                      padding: "2px 8px", borderRadius: 5, fontSize: 11, fontFamily: "inherit",
+                      border: "1px solid rgba(255,255,255,.12)", background: "transparent",
+                      color: "rgba(255,255,255,.4)", cursor: "pointer", transition: "color .12s",
+                    }}
+                    onMouseEnter={(e) => (e.currentTarget.style.color = "rgba(255,255,255,.65)")}
+                    onMouseLeave={(e) => (e.currentTarget.style.color = "rgba(255,255,255,.4)")}
+                  >
+                    {zh ? "\u91CD\u542F" : "Restart"}
+                  </button>
+                  {isOnline ? (
+                    <button
+                      onClick={() => setConfirmAction("stop")}
+                      style={{
+                        padding: "2px 8px", borderRadius: 5, fontSize: 11, fontFamily: "inherit",
+                        border: "1px solid rgba(217,95,95,.2)", background: "transparent",
+                        color: "rgba(217,95,95,.7)", cursor: "pointer", transition: "color .12s",
+                      }}
+                      onMouseEnter={(e) => (e.currentTarget.style.color = "rgba(217,95,95,.9)")}
+                      onMouseLeave={(e) => (e.currentTarget.style.color = "rgba(217,95,95,.7)")}
+                    >
+                      {zh ? "\u505C\u6B62" : "Stop"}
+                    </button>
+                  ) : (
+                    <button
+                      onClick={() => setConfirmAction("start")}
+                      style={{
+                        padding: "2px 8px", borderRadius: 5, fontSize: 11, fontFamily: "inherit",
+                        border: "1px solid rgba(249,115,22,.25)", background: "transparent",
+                        color: "rgba(249,115,22,.8)", cursor: "pointer", transition: "color .12s",
+                      }}
+                      onMouseEnter={(e) => (e.currentTarget.style.color = "rgba(249,115,22,1)")}
+                      onMouseLeave={(e) => (e.currentTarget.style.color = "rgba(249,115,22,.8)")}
+                    >
+                      {zh ? "\u542F\u52A8" : "Start"}
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
           )}
-          {starting && (
+          {isStarting && (
             <span style={{ marginLeft: "auto", fontSize: 10, color: "#f97316" }}>...</span>
           )}
         </>
       )}
+      {/* Error message after 2+ failures */}
+      {!narrow && isFailed && errorMsg && (
+        <div style={{ fontSize: 9, color: "#d95f5f", padding: "2px 8px 0", lineHeight: 1.3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {errorMsg}
+        </div>
+      )}
       {/* Confirm popover */}
-      {showConfirm && (
+      {confirmAction && (
         <div onClick={(e) => e.stopPropagation()} style={{
           position: "absolute", bottom: "100%", left: 0, right: 0,
           marginBottom: 6, padding: "10px 12px",
@@ -217,16 +334,23 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
           zIndex: 100,
         }}>
           <div style={{ fontSize: 11, color: "var(--black)", marginBottom: 8 }}>
-            {zh ? "\u786E\u8BA4\u542F\u52A8\u7F51\u5173\uFF1F" : "Start gateway?"}
+            {confirmAction === "stop" ? (zh ? "\u786E\u8BA4\u505C\u6B62\u7F51\u5173\uFF1F" : "Stop gateway?")
+              : confirmAction === "restart" ? (zh ? "\u786E\u8BA4\u91CD\u542F\u7F51\u5173\uFF1F" : "Restart gateway?")
+              : (zh ? "\u786E\u8BA4\u542F\u52A8\u7F51\u5173\uFF1F" : "Start gateway?")}
           </div>
           <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
-            <button onClick={() => setShowConfirm(false)}
+            <button onClick={() => setConfirmAction(null)}
               style={{ fontSize: 10, padding: "3px 10px", borderRadius: 5, border: "1px solid var(--border-in-light)", background: "transparent", color: "var(--black)", cursor: "pointer" }}>
               {zh ? "\u53D6\u6D88" : "Cancel"}
             </button>
-            <button onClick={handleStartGateway}
-              style={{ fontSize: 10, padding: "3px 10px", borderRadius: 5, border: "none", background: "#f97316", color: "#fff", cursor: "pointer", fontWeight: 600 }}>
-              {zh ? "\u542F\u52A8" : "Start"}
+            <button onClick={executeConfirm}
+              style={{
+                fontSize: 10, padding: "3px 10px", borderRadius: 5, border: "none", cursor: "pointer", fontWeight: 600,
+                background: confirmAction === "stop" ? "#d95f5f" : "#f97316", color: "#fff",
+              }}>
+              {confirmAction === "stop" ? (zh ? "\u505C\u6B62" : "Stop")
+                : confirmAction === "restart" ? (zh ? "\u91CD\u542F" : "Restart")
+                : (zh ? "\u542F\u52A8" : "Start")}
             </button>
           </div>
         </div>

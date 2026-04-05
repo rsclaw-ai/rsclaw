@@ -98,7 +98,6 @@ enum PendingStage {
     /// File processed, waiting for token confirmation.
     TokenConfirm {
         extracted_text: String,
-        #[allow(dead_code)]
         estimated_tokens: usize,
     },
 }
@@ -106,12 +105,9 @@ enum PendingStage {
 struct PendingFile {
     filename: String,
     path: std::path::PathBuf,
-    #[allow(dead_code)]
     size: usize,
-    #[allow(dead_code)]
     mime_type: String,
     /// Pre-encoded image data, if the file is an image.
-    #[allow(dead_code)]
     images: Vec<super::registry::ImageAttachment>,
     stage: PendingStage,
 }
@@ -381,7 +377,7 @@ impl AgentRuntime {
             // Event collection task - runs in background
             let notif_tx_clone = notif_tx_bg.clone();
             let target_id_clone = target_id_bg.clone();
-            let _event_collector = tokio::spawn(async move {
+            let event_collector = tokio::spawn(async move {
                 let mut pending = String::new();
                 let mut interval = 0u64;
                 loop {
@@ -668,7 +664,7 @@ impl AgentRuntime {
             status.text_preview.clear();
         }
 
-        let _agent_cfg = &self.handle.config;
+        let agent_cfg = &self.handle.config;
 
         // Resolve language for user-facing channel messages.
         let i18n_lang = self
@@ -1368,6 +1364,7 @@ impl AgentRuntime {
                     pending_analysis: None,
                 });
             }
+            _ => {}
         }
 
         let agent_cfg = &self.handle.config;
@@ -2944,6 +2941,29 @@ impl AgentRuntime {
         {
             tracing::warn!("BM25 index failed for memory_put doc: {e:#}");
         }
+        // Also append to MEMORY.md for persistent system prompt injection
+        let ws_str = self
+            .handle
+            .config
+            .workspace
+            .clone()
+            .or_else(|| self.config.agents.defaults.workspace.clone())
+            .unwrap_or_else(|| "~/.rsclaw/workspace".to_owned());
+        let ws = if ws_str.starts_with('~') {
+            dirs_next::home_dir().unwrap_or_default().join(&ws_str[2..])
+        } else {
+            std::path::PathBuf::from(&ws_str)
+        };
+        let memory_path = ws.join("MEMORY.md");
+        let entry = format!("\n## {}\n{}\n", chrono::Local::now().format("%Y-%m-%d %H:%M"), text);
+        if let Err(e) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&memory_path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, entry.as_bytes()))
+        {
+            tracing::warn!("failed to append to MEMORY.md: {e:#}");
+        }
         Ok(json!({"stored": true, "id": id}))
     }
 
@@ -2969,8 +2989,7 @@ impl AgentRuntime {
     }
 
     async fn tool_read(&self, args: Value) -> Result<Value> {
-        let path = args["path"]
-            .as_str()
+        let path = args["path"].as_str()
             .or_else(|| args["file_path"].as_str())
             .or_else(|| args["filename"].as_str())
             .or_else(|| args["file"].as_str())
@@ -3068,8 +3087,7 @@ impl AgentRuntime {
         }
 
         // Handle various parameter names LLMs might use.
-        let path = args["path"]
-            .as_str()
+        let path = args["path"].as_str()
             .or_else(|| args["file_path"].as_str())
             .or_else(|| args["filename"].as_str())
             .or_else(|| args["file"].as_str())
@@ -3566,8 +3584,7 @@ impl AgentRuntime {
 
     async fn tool_exec(&self, args: Value) -> Result<Value> {
         tracing::debug!(?args, "tool_exec called");
-        // Accept both "command" (rsclaw native) and "cmd"+"args" (preparse/openclaw
-        // format).
+        // Accept both "command" (rsclaw native) and "cmd"+"args" (preparse/openclaw format).
         let command = if let Some(cmd) = args["command"].as_str() {
             cmd.to_owned()
         } else if let Some(cmd) = args["cmd"].as_str() {
@@ -3737,11 +3754,13 @@ impl AgentRuntime {
         let entry = AgentEntry {
             id: id.clone(),
             default: Some(false),
-            workspace: Some(crate::config::loader::path_to_forward_slash(
-                &dirs_next::home_dir()
-                    .unwrap_or_default()
-                    .join(format!(".rsclaw/workspace/{id}")),
-            )),
+            workspace: Some(
+                crate::config::loader::path_to_forward_slash(
+                    &dirs_next::home_dir()
+                        .unwrap_or_default()
+                        .join(format!(".rsclaw/workspace/{id}")),
+                ),
+            ),
             model: Some(ModelConfig {
                 primary: Some(model),
                 fallbacks: None,
@@ -4654,11 +4673,11 @@ $synth.Speak('{}')
             )),
         }
     }
+
 }
 
 /// Read cron jobs from the OpenClaw-compatible jobs.json file.
-/// Handles both bare array `[...]` and wrapped `{"version":1,"jobs":[...]}`
-/// formats.
+/// Handles both bare array `[...]` and wrapped `{"version":1,"jobs":[...]}` formats.
 async fn read_cron_jobs(path: &std::path::Path) -> Vec<Value> {
     let data = tokio::fs::read_to_string(path)
         .await
@@ -4848,12 +4867,7 @@ impl AgentRuntime {
         let port = self.config.gateway.port;
         let client = reqwest::Client::new();
         let base = format!("http://127.0.0.1:{port}/api/v1");
-        let auth_token = self
-            .config
-            .gateway
-            .auth_token
-            .as_deref()
-            .unwrap_or_default();
+        let auth_token = self.config.gateway.auth_token.as_deref().unwrap_or_default();
 
         let auth_header = if auth_token.is_empty() {
             String::new()
@@ -5588,7 +5602,14 @@ fn toolset_allowed_names(
     toolset: &str,
     custom_tools: Option<&Vec<String>>,
 ) -> Option<std::collections::HashSet<String>> {
-    const MINIMAL: &[&str] = &["exec", "read", "write", "web_search", "web_fetch", "memory"];
+    const MINIMAL: &[&str] = &[
+        "exec",
+        "read",
+        "write",
+        "web_search",
+        "web_fetch",
+        "memory",
+    ];
     const STANDARD: &[&str] = &[
         "exec",
         "read",
@@ -6269,10 +6290,7 @@ Example - Large file (SPLIT INTO MULTIPLE CALLS):
     }
 
     // External remote agent A2A tools (remote gateways).
-    tracing::debug!(
-        count = external_agents.len(),
-        "build_tool_list: external agents"
-    );
+    tracing::debug!(count = external_agents.len(), "build_tool_list: external agents");
     for ext in external_agents {
         if ext.id == caller_id {
             continue;

@@ -9,11 +9,9 @@
 //!   - Total character limit:    `bootstrap_total_max_chars` (default 150 000).
 //!   - Load order follows AGENTS.md §20 "System Prompt assembly".
 
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    time::SystemTime,
-};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use chrono::Local;
 use tracing::debug;

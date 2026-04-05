@@ -1035,6 +1035,7 @@ function _Chat() {
         { title: "/compact", content: getLang() === "cn" ? "\u538B\u7F29\u4E0A\u4E0B\u6587" : "Compact context" },
         { title: "/memory", content: getLang() === "cn" ? "\u67E5\u770B/\u7BA1\u7406\u8BB0\u5FC6" : "View/manage memory" },
         { title: "/status", content: getLang() === "cn" ? "\u67E5\u770B\u7F51\u5173\u72B6\u6001" : "View gateway status" },
+        { title: "/pair", content: getLang() === "cn" ? "\u5FEB\u901F\u914D\u5BF9" : "Quick pairing" },
       ];
       const searchText = text.slice(1).toLowerCase();
       setPromptHints(searchText ? cmds.filter((c) => c.title.toLowerCase().includes(searchText)) : cmds);
@@ -1070,10 +1071,11 @@ function _Chat() {
       if (prompt.title.startsWith("/")) {
         const cmd = prompt.title.toLowerCase();
         if (cmd === "/help") {
-          // Show help in chat as a local message
           setUserInput("");
-          const helpText = prompt.content || (getLang() === "cn" ? "\u53EF\u7528\u547D\u4EE4\uFF1A/help /reset /new /model /agent /system /clear /compact /memory /status" : "Commands: /help /reset /new /model /agent /system /clear /compact /memory /status");
-          chatStore.onUserInput(helpText, []);
+          doSubmit("/help");
+        } else if (cmd === "/pair") {
+          setUserInput("");
+          doSubmit("/pair");
         } else if (cmd === "/reset" || cmd === "/clear") {
           chatStore.resetSession(chatStore.currentSession());
         } else if (cmd === "/new") {

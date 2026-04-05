@@ -403,7 +403,22 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                 .and_then(|k| k.as_plain().map(str::to_owned))
                 .or_else(|| std::env::var(format!("{}_API_KEY", name.to_uppercase())).ok());
 
-            let base_url = provider_cfg.base_url.clone();
+            let base_url = provider_cfg.base_url.clone().or_else(|| {
+                // Fall back to well-known base URLs for named providers.
+                match name.as_str() {
+                    "qwen"        => Some("https://dashscope.aliyuncs.com/compatible-mode/v1".to_owned()),
+                    "deepseek"    => Some("https://api.deepseek.com/v1".to_owned()),
+                    "kimi" | "moonshot" => Some("https://api.moonshot.cn/v1".to_owned()),
+                    "zhipu"       => Some("https://open.bigmodel.cn/api/paas/v4".to_owned()),
+                    "minimax"     => Some("https://api.minimax.chat/v1".to_owned()),
+                    "siliconflow" => Some("https://api.siliconflow.cn/v1".to_owned()),
+                    "groq"        => Some("https://api.groq.com/openai/v1".to_owned()),
+                    "openrouter"  => Some("https://openrouter.ai/api/v1".to_owned()),
+                    "gaterouter"  => Some("https://api.gaterouter.com/v1".to_owned()),
+                    "grok" | "xai" => Some("https://api.x.ai/v1".to_owned()),
+                    _ => None,
+                }
+            });
 
             // Determine API format: explicit `api` field > name-based inference.
             let api_format = provider_cfg.api.clone().unwrap_or_else(|| {
@@ -484,7 +499,7 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
     let compat_providers = [
         // --- International ---
         ("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY"),
-        ("deepseek", "https://api.deepseek.com", "DEEPSEEK_API_KEY"),
+        ("deepseek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY"),
         ("mistral", "https://api.mistral.ai/v1", "MISTRAL_API_KEY"),
         (
             "together",
@@ -1017,7 +1032,7 @@ fn start_channels(
             .unwrap_or(crate::config::schema::GroupPolicy::Allowlist);
         let group_allow_from: Vec<String> =
             tg_cfg.base.group_allow_from.clone().unwrap_or_default();
-        let allow_from: Vec<String> = tg_cfg.base.allow_from.clone().unwrap_or_default();
+        let mut allow_from: Vec<String> = tg_cfg.base.allow_from.clone().unwrap_or_default();
 
         let enforcer = Arc::new(
             crate::channel::DmPolicyEnforcer::new(dm_policy.clone(), allow_from)
@@ -4599,10 +4614,7 @@ fn resolve_bind_addr(config: &RuntimeConfig) -> SocketAddr {
         if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
             return SocketAddr::new(ip, port);
         }
-        tracing::warn!(
-            addr = addr.as_str(),
-            "invalid bind_address, falling back to bind mode"
-        );
+        tracing::warn!(addr = addr.as_str(), "invalid bind_address, falling back to bind mode");
     }
     match config.gateway.bind {
         BindMode::Auto | BindMode::Lan => SocketAddr::from(([0, 0, 0, 0], port)),
@@ -5343,7 +5355,6 @@ fn start_matrix_if_configured(
         );
 
         let matrix = Arc::new({
-            #[allow(unused_mut)]
             let mut ch = crate::channel::matrix::MatrixChannel::new(
                 homeserver,
                 access_token,

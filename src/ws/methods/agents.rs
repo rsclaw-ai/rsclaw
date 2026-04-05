@@ -154,7 +154,10 @@ pub async fn agents_create(ctx: MethodCtx) -> MethodResult {
         // Handle "model": wrap plain string as { "primary": value }
         if let Some(model_val) = params.get("model") {
             if let Some(s) = model_val.as_str() {
-                obj.insert("model".to_owned(), serde_json::json!({ "primary": s }));
+                obj.insert(
+                    "model".to_owned(),
+                    serde_json::json!({ "primary": s }),
+                );
             } else {
                 obj.insert("model".to_owned(), model_val.clone());
             }
@@ -162,7 +165,9 @@ pub async fn agents_create(ctx: MethodCtx) -> MethodResult {
         // Handle "toolset": place inside model object.
         if let Some(toolset_val) = params.get("toolset") {
             let ts = if let Some(arr) = toolset_val.as_array() {
-                arr.first().and_then(|v| v.as_str()).unwrap_or("standard")
+                arr.first()
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("standard")
             } else {
                 toolset_val.as_str().unwrap_or("standard")
             };
@@ -223,8 +228,8 @@ pub async fn agents_update(ctx: MethodCtx) -> MethodResult {
             }
         }
 
-        // Handle "model" specially: if it's a plain string, wrap as { "primary": value
-        // } to match the config schema where model is an object.
+        // Handle "model" specially: if it's a plain string, wrap as { "primary": value }
+        // to match the config schema where model is an object.
         if let Some(model_val) = params.get("model") {
             if let Some(s) = model_val.as_str() {
                 if obj.get("model").is_some_and(|v| v.is_object()) {
@@ -232,7 +237,10 @@ pub async fn agents_update(ctx: MethodCtx) -> MethodResult {
                         m.insert("primary".to_owned(), serde_json::json!(s));
                     }
                 } else {
-                    obj.insert("model".to_owned(), serde_json::json!({ "primary": s }));
+                    obj.insert(
+                        "model".to_owned(),
+                        serde_json::json!({ "primary": s }),
+                    );
                 }
             } else {
                 obj.insert("model".to_owned(), model_val.clone());
@@ -240,11 +248,12 @@ pub async fn agents_update(ctx: MethodCtx) -> MethodResult {
         }
 
         // Handle "toolset": place inside model object (model.toolset in config schema).
-        // Frontend sends toolset as ["full"] or ["standard"] array -- extract first
-        // element.
+        // Frontend sends toolset as ["full"] or ["standard"] array -- extract first element.
         if let Some(toolset_val) = params.get("toolset") {
             let ts = if let Some(arr) = toolset_val.as_array() {
-                arr.first().and_then(|v| v.as_str()).unwrap_or("standard")
+                arr.first()
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("standard")
             } else {
                 toolset_val.as_str().unwrap_or("standard")
             };

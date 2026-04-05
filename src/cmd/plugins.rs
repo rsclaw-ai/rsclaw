@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
-use super::{config_json::load_config_json, style::*};
+use super::config_json::load_config_json;
+use super::style::*;
 use crate::{
     cli::PluginsCommand,
     config::loader::base_dir,
@@ -23,16 +24,10 @@ pub async fn cmd_plugins(sub: PluginsCommand) -> Result<()> {
         PluginsCommand::Doctor => plugins_doctor(),
         PluginsCommand::Inspect { plugin } => plugins_inspect(&plugin),
         PluginsCommand::Marketplace => {
-            banner(&format!(
-                "rsclaw plugins marketplace v{}",
-                env!("RSCLAW_BUILD_VERSION")
-            ));
+            banner(&format!("rsclaw plugins marketplace v{}", env!("RSCLAW_BUILD_VERSION")));
             let url = "https://clawhub.ai/plugins";
             kv("marketplace", &bold(url));
-            println!(
-                "  {}",
-                dim("Browse and install plugins with: rsclaw plugins install <spec>")
-            );
+            println!("  {}", dim("Browse and install plugins with: rsclaw plugins install <spec>"));
             Ok(())
         }
         PluginsCommand::Uninstall { plugin } => plugins_uninstall(&plugin),
@@ -50,10 +45,7 @@ fn plugins_list() -> Result<()> {
     let plugins = scan_plugins(&dir)?;
 
     if plugins.is_empty() {
-        warn_msg(&format!(
-            "no plugins installed in {}",
-            dim(&dir.display().to_string())
-        ));
+        warn_msg(&format!("no plugins installed in {}", dim(&dir.display().to_string())));
         return Ok(());
     }
 
@@ -143,11 +135,7 @@ fn install_from_path(src: &std::path::Path) -> Result<()> {
     copy_dir_recursive(src, &dest)
         .with_context(|| format!("copy {} -> {}", src.display(), dest.display()))?;
 
-    ok(&format!(
-        "installed '{}' to {}",
-        cyan(&manifest.name),
-        dim(&dest.display().to_string())
-    ));
+    ok(&format!("installed '{}' to {}", cyan(&manifest.name), dim(&dest.display().to_string())));
     Ok(())
 }
 
@@ -248,10 +236,7 @@ fn plugins_set_enabled(name: &str, enabled: bool) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn plugins_doctor() -> Result<()> {
-    banner(&format!(
-        "rsclaw plugins doctor v{}",
-        env!("RSCLAW_BUILD_VERSION")
-    ));
+    banner(&format!("rsclaw plugins doctor v{}", env!("RSCLAW_BUILD_VERSION")));
 
     // Check runtimes
     let runtimes = [
@@ -340,7 +325,8 @@ fn plugins_inspect(name: &str) -> Result<()> {
 
     let content = std::fs::read_to_string(&manifest_path)
         .with_context(|| format!("read {}", manifest_path.display()))?;
-    let val: serde_json::Value = serde_json::from_str(&content).context("parse manifest JSON")?;
+    let val: serde_json::Value =
+        serde_json::from_str(&content).context("parse manifest JSON")?;
     println!("{}", serde_json::to_string_pretty(&val)?);
     Ok(())
 }
@@ -365,10 +351,7 @@ fn plugins_uninstall(name: &str) -> Result<()> {
             .and_then(|v| v.as_object_mut())
         {
             entries.remove(name);
-            let _ = std::fs::write(
-                &path,
-                serde_json::to_string_pretty(&val).unwrap_or_default(),
-            );
+            let _ = std::fs::write(&path, serde_json::to_string_pretty(&val).unwrap_or_default());
         }
     }
 
@@ -381,10 +364,7 @@ fn plugins_uninstall(name: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn plugins_update(name: Option<&str>) -> Result<()> {
-    banner(&format!(
-        "rsclaw plugins update v{}",
-        env!("RSCLAW_BUILD_VERSION")
-    ));
+    banner(&format!("rsclaw plugins update v{}", env!("RSCLAW_BUILD_VERSION")));
     let dir = plugins_dir();
     let plugins = scan_plugins(&dir)?;
 
@@ -406,9 +386,6 @@ async fn plugins_update(name: Option<&str>) -> Result<()> {
             p.version.as_deref().unwrap_or("?")
         );
     }
-    println!(
-        "  {}",
-        dim("Use `rsclaw plugins install <spec>` to update a specific plugin.")
-    );
+    println!("  {}", dim("Use `rsclaw plugins install <spec>` to update a specific plugin."));
     Ok(())
 }

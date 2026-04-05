@@ -146,8 +146,7 @@ impl MemoryDoc {
             return;
         }
 
-        // Demote to Peripheral: relevance_score < 0.15 OR (age > 60 days AND
-        // access_count < 3)
+        // Demote to Peripheral: relevance_score < 0.15 OR (age > 60 days AND access_count < 3)
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -963,8 +962,7 @@ impl MemoryStore {
         Ok(count)
     }
 
-    /// Count tokens precisely using the loaded tokenizer (or heuristic
-    /// fallback).
+    /// Count tokens precisely using the loaded tokenizer (or heuristic fallback).
     pub fn count_tokens(&self, text: &str) -> usize {
         self.embedder.count_tokens(text)
     }

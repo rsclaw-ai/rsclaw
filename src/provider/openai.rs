@@ -24,7 +24,6 @@ pub struct OpenAiProvider {
     /// When true, reasoning models use ollama native /api/chat with think=true.
     is_ollama: bool,
     /// Custom User-Agent header.
-    #[allow(dead_code)]
     user_agent: Option<String>,
 }
 
@@ -355,36 +354,27 @@ impl OpenAiProvider {
                                 let done = v["done"].as_bool().unwrap_or(false);
                                 if done {
                                     // Close thinking block if still open
-                                    if in_thinking.swap(false, std::sync::atomic::Ordering::Relaxed)
-                                    {
-                                        return Some(Ok(StreamEvent::TextDelta(
-                                            "</think>".to_owned(),
-                                        )));
+                                    if in_thinking.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                                        return Some(Ok(StreamEvent::TextDelta("</think>".to_owned())));
                                     }
                                     return Some(Ok(StreamEvent::Done { usage: None }));
                                 }
 
                                 // Emit thinking content with boundary tags
                                 if !thinking.is_empty() {
-                                    let was_thinking = in_thinking
-                                        .swap(true, std::sync::atomic::Ordering::Relaxed);
+                                    let was_thinking = in_thinking.swap(true, std::sync::atomic::Ordering::Relaxed);
                                     if !was_thinking {
                                         // First thinking chunk: prepend <think>
-                                        return Some(Ok(StreamEvent::TextDelta(format!(
-                                            "<think>{thinking}"
-                                        ))));
+                                        return Some(Ok(StreamEvent::TextDelta(format!("<think>{thinking}"))));
                                     }
                                     return Some(Ok(StreamEvent::TextDelta(thinking.to_owned())));
                                 }
 
                                 if !content.is_empty() {
-                                    let was_thinking = in_thinking
-                                        .swap(false, std::sync::atomic::Ordering::Relaxed);
+                                    let was_thinking = in_thinking.swap(false, std::sync::atomic::Ordering::Relaxed);
                                     if was_thinking {
                                         // Transition from thinking to content: close tag
-                                        return Some(Ok(StreamEvent::TextDelta(format!(
-                                            "</think>{content}"
-                                        ))));
+                                        return Some(Ok(StreamEvent::TextDelta(format!("</think>{content}"))));
                                     }
                                     Some(Ok(StreamEvent::TextDelta(content.to_owned())))
                                 } else {
@@ -411,10 +401,29 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
 
     let mut body = json!({
         "model":      req.model,
-        "max_tokens": req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         "stream":     true,
         "messages":   messages,
     });
+    if let Some(max_tokens) = req.max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
+
+    // Thinking/reasoning mode: configurable via agents.defaults.thinking or per-agent thinking.
+    // Default: disabled. When enabled with budget > 0, model uses reasoning_content field.
+    match req.thinking_budget {
+        Some(budget) if budget > 0 => {
+            body["enable_thinking"] = json!(true);
+            body["thinking_budget"] = json!(budget);
+        }
+        _ => {
+            // Disable by default for models that auto-enable thinking (Qwen3, DeepSeek-R1).
+            if req.model.to_lowercase().starts_with("qwen")
+                || req.model.to_lowercase().contains("deepseek-r1")
+            {
+                body["enable_thinking"] = json!(false);
+            }
+        }
+    }
 
     if let Some(sys) = &req.system {
         // Prepend a system message if not already present.
@@ -669,8 +678,7 @@ fn parse_event(data: &str) -> Option<StreamEvent> {
         static IN_REASONING: RefCell<bool> = const { RefCell::new(false) };
     }
     // Only handle reasoning_content (DeepSeek). Ignore "reasoning" field
-    // (Ollama/Qwen3) since thinking mode is disabled — content field has the actual
-    // reply.
+    // (Ollama/Qwen3) since thinking mode is disabled — content field has the actual reply.
     let reasoning_text = delta["reasoning_content"]
         .as_str()
         .filter(|s| !s.is_empty());
@@ -693,9 +701,7 @@ fn parse_event(data: &str) -> Option<StreamEvent> {
     // Not reasoning — close think tag if we were reasoning
     let was_reasoning = IN_REASONING.with(|r| {
         let was = *r.borrow();
-        if was {
-            *r.borrow_mut() = false;
-        }
+        if was { *r.borrow_mut() = false; }
         was
     });
 

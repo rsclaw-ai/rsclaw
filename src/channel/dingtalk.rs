@@ -357,8 +357,7 @@ impl DingTalkChannel {
         .await
     }
 
-    /// Download a media file (picture/video/file) via DingTalk robot
-    /// messageFiles API.
+    /// Download a media file (picture/video/file) via DingTalk robot messageFiles API.
     async fn download_media_file(&self, download_code: &str) -> Result<Vec<u8>> {
         let token = self.get_access_token().await?;
         let url = format!("{}/v1.0/robot/messageFiles/download", self.api_base);

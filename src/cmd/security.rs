@@ -20,17 +20,16 @@ pub async fn cmd_security(sub: SecurityCommand) -> Result<()> {
 
 #[cfg(unix)]
 async fn cmd_security_audit(args: crate::cli::SecurityAuditArgs) -> Result<()> {
-    banner(&format!(
-        "rsclaw security audit v{}",
-        env!("RSCLAW_BUILD_VERSION")
-    ));
+    banner(&format!("rsclaw security audit v{}", env!("RSCLAW_BUILD_VERSION")));
 
     let base = crate::config::loader::base_dir();
     let mut issues: Vec<String> = Vec::new();
     let mut fixed = 0usize;
 
     // 1. Config file permissions -- must not be world-readable.
-    for cfg_path in [base.join("rsclaw.json5")] {
+    for cfg_path in [
+        base.join("rsclaw.json5"),
+    ] {
         if !cfg_path.exists() {
             continue;
         }
@@ -115,10 +114,7 @@ async fn cmd_security_audit(args: crate::cli::SecurityAuditArgs) -> Result<()> {
             }
             if !args.fix {
                 println!();
-                println!(
-                    "  {}",
-                    dim("Run with --fix to auto-correct where possible.")
-                );
+                println!("  {}", dim("Run with --fix to auto-correct where possible."));
             }
         }
     }
@@ -134,10 +130,7 @@ async fn cmd_security_audit(args: crate::cli::SecurityAuditArgs) -> Result<()> {
         }
         #[cfg(windows)]
         {
-            println!(
-                "  {} deep permission scan skipped (Windows uses ACL, not mode bits)",
-                dim("[--]")
-            );
+            println!("  {} deep permission scan skipped (Windows uses ACL, not mode bits)", dim("[--]"));
         }
     }
 

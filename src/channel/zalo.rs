@@ -64,16 +64,13 @@ pub struct ZaloChannel {
     api_base: String,
     client: Client,
     #[allow(clippy::type_complexity)]
-    on_message:
-        Arc<dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync>,
+    on_message: Arc<dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync>,
 }
 
 impl ZaloChannel {
     pub fn new(
         access_token: impl Into<String>,
-        on_message: Arc<
-            dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync,
-        >,
+        on_message: Arc<dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync>,
     ) -> Self {
         Self::with_api_base(access_token, None, on_message)
     }
@@ -81,9 +78,7 @@ impl ZaloChannel {
     pub fn with_api_base(
         access_token: impl Into<String>,
         api_base: Option<String>,
-        on_message: Arc<
-            dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync,
-        >,
+        on_message: Arc<dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync>,
     ) -> Self {
         Self {
             access_token: access_token.into(),
@@ -125,15 +120,18 @@ impl ZaloChannel {
             }
             "user_send_image" => {
                 // Image URL may be in message.url or message.attachments[].payload.url
-                let url = webhook.message.as_ref().and_then(|m| {
-                    m.url.as_deref().or_else(|| {
-                        m.attachments.as_ref().and_then(|atts| {
-                            atts.first()
-                                .and_then(|a| a.payload.as_ref())
-                                .and_then(|p| p.url.as_deref())
+                let url = webhook
+                    .message
+                    .as_ref()
+                    .and_then(|m| {
+                        m.url.as_deref().or_else(|| {
+                            m.attachments.as_ref().and_then(|atts| {
+                                atts.first()
+                                    .and_then(|a| a.payload.as_ref())
+                                    .and_then(|p| p.url.as_deref())
+                            })
                         })
-                    })
-                });
+                    });
 
                 if let Some(url) = url {
                     match crate::channel::transcription::download_file(&self.client, url).await {
@@ -155,39 +153,31 @@ impl ZaloChannel {
                 }
             }
             "user_send_audio" => {
-                let url = webhook.message.as_ref().and_then(|m| {
-                    m.url.as_deref().or_else(|| {
-                        m.attachments.as_ref().and_then(|atts| {
-                            atts.first()
-                                .and_then(|a| a.payload.as_ref())
-                                .and_then(|p| p.url.as_deref())
+                let url = webhook
+                    .message
+                    .as_ref()
+                    .and_then(|m| {
+                        m.url.as_deref().or_else(|| {
+                            m.attachments.as_ref().and_then(|atts| {
+                                atts.first()
+                                    .and_then(|a| a.payload.as_ref())
+                                    .and_then(|p| p.url.as_deref())
+                            })
                         })
-                    })
-                });
+                    });
 
                 if let Some(url) = url {
                     match crate::channel::transcription::download_file(&self.client, url).await {
                         Ok(bytes) => {
                             match crate::channel::transcription::transcribe_audio(
-                                &self.client,
-                                &bytes,
-                                "voice.mp3",
-                                "audio/mpeg",
-                            )
-                            .await
-                            {
+                                &self.client, &bytes, "voice.mp3", "audio/mpeg",
+                            ).await {
                                 Ok(t) if !t.is_empty() => {
                                     info!(chars = t.len(), "Zalo: audio transcribed");
                                     text = t;
                                 }
-                                Ok(_) => {
-                                    warn!("Zalo: audio transcription returned empty");
-                                    return Ok(());
-                                }
-                                Err(e) => {
-                                    warn!("Zalo: audio transcription failed: {e:#}");
-                                    return Ok(());
-                                }
+                                Ok(_) => { warn!("Zalo: audio transcription returned empty"); return Ok(()); }
+                                Err(e) => { warn!("Zalo: audio transcription failed: {e:#}"); return Ok(()); }
                             }
                         }
                         Err(e) => {
@@ -198,15 +188,18 @@ impl ZaloChannel {
                 }
             }
             "user_send_video" => {
-                let url = webhook.message.as_ref().and_then(|m| {
-                    m.url.as_deref().or_else(|| {
-                        m.attachments.as_ref().and_then(|atts| {
-                            atts.first()
-                                .and_then(|a| a.payload.as_ref())
-                                .and_then(|p| p.url.as_deref())
+                let url = webhook
+                    .message
+                    .as_ref()
+                    .and_then(|m| {
+                        m.url.as_deref().or_else(|| {
+                            m.attachments.as_ref().and_then(|atts| {
+                                atts.first()
+                                    .and_then(|a| a.payload.as_ref())
+                                    .and_then(|p| p.url.as_deref())
+                            })
                         })
-                    })
-                });
+                    });
 
                 if let Some(url) = url {
                     match crate::channel::transcription::download_file(&self.client, url).await {
@@ -216,14 +209,8 @@ impl ZaloChannel {
                                     info!(chars = t.len(), "Zalo: video audio transcribed");
                                     text = t;
                                 }
-                                Ok(_) => {
-                                    warn!("Zalo: video transcription returned empty");
-                                    return Ok(());
-                                }
-                                Err(e) => {
-                                    warn!("Zalo: video transcription failed: {e:#}");
-                                    return Ok(());
-                                }
+                                Ok(_) => { warn!("Zalo: video transcription returned empty"); return Ok(()); }
+                                Err(e) => { warn!("Zalo: video transcription failed: {e:#}"); return Ok(()); }
                             }
                         }
                         Err(e) => {
@@ -245,15 +232,11 @@ impl ZaloChannel {
                                     .and_then(|p| p.url.as_deref())
                             })
                         });
-                        let name = m
-                            .attachments
-                            .as_ref()
-                            .and_then(|atts| {
-                                atts.first()
-                                    .and_then(|a| a.payload.as_ref())
-                                    .and_then(|p| p.name.as_deref())
-                            })
-                            .unwrap_or("file");
+                        let name = m.attachments.as_ref().and_then(|atts| {
+                            atts.first()
+                                .and_then(|a| a.payload.as_ref())
+                                .and_then(|p| p.name.as_deref())
+                        }).unwrap_or("file");
                         (u, name)
                     })
                     .unwrap_or((None, "file"));
@@ -333,17 +316,22 @@ impl Channel for ZaloChannel {
 
             for image_data in &msg.images {
                 use base64::Engine;
-                let (mime, b64) =
-                    if let Some(rest) = image_data.strip_prefix("data:image/png;base64,") {
-                        ("image/png", rest)
-                    } else if let Some(rest) = image_data.strip_prefix("data:image/jpeg;base64,") {
-                        ("image/jpeg", rest)
-                    } else if let Some(rest) = image_data.strip_prefix("data:image/webp;base64,") {
-                        ("image/webp", rest)
-                    } else {
-                        warn!("Zalo: unrecognised image data URI prefix, skipping");
-                        continue;
-                    };
+                let (mime, b64) = if let Some(rest) =
+                    image_data.strip_prefix("data:image/png;base64,")
+                {
+                    ("image/png", rest)
+                } else if let Some(rest) =
+                    image_data.strip_prefix("data:image/jpeg;base64,")
+                {
+                    ("image/jpeg", rest)
+                } else if let Some(rest) =
+                    image_data.strip_prefix("data:image/webp;base64,")
+                {
+                    ("image/webp", rest)
+                } else {
+                    warn!("Zalo: unrecognised image data URI prefix, skipping");
+                    continue;
+                };
 
                 let bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
                     Ok(b) if !b.is_empty() => b,
@@ -353,11 +341,7 @@ impl Channel for ZaloChannel {
                     }
                 };
 
-                let filename = if mime == "image/jpeg" {
-                    "image.jpg"
-                } else {
-                    "image.png"
-                };
+                let filename = if mime == "image/jpeg" { "image.jpg" } else { "image.png" };
 
                 // Upload image to Zalo OA.
                 let upload_url = format!("{}/upload/image", self.api_base);
@@ -505,13 +489,7 @@ async fn zalo_extract_audio_and_transcribe(
     let audio_bytes = std::fs::read(&audio_path)?;
     let _ = std::fs::remove_file(&audio_path);
 
-    crate::channel::transcription::transcribe_audio(
-        client,
-        &audio_bytes,
-        "video_audio.ogg",
-        "audio/ogg",
-    )
-    .await
+    crate::channel::transcription::transcribe_audio(client, &audio_bytes, "video_audio.ogg", "audio/ogg").await
 }
 
 // ---------------------------------------------------------------------------

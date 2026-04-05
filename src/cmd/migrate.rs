@@ -7,13 +7,9 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 
 use super::style::{banner, bold, dim, err_msg, green, item, kv, ok, warn_msg};
-use crate::{
-    cli::MigrateArgs,
-    migrate::{
-        MigrateMode, detect_openclaw_dir,
-        openclaw::{self, ImportStats},
-    },
-};
+use crate::cli::MigrateArgs;
+use crate::migrate::openclaw::{self, ImportStats};
+use crate::migrate::{MigrateMode, detect_openclaw_dir};
 
 const VERSION: &str = env!("RSCLAW_BUILD_VERSION");
 
@@ -161,10 +157,7 @@ fn show_scan_results(openclaw_dir: &PathBuf) -> Result<openclaw::OpenClawScanRes
     kv("  Sessions:", &bold(&scan.total_sessions.to_string()));
     kv("  JSONL files:", &scan.total_jsonl_files.to_string());
     kv("  Memory (JSONL):", &scan.total_memories.to_string());
-    kv(
-        "  Memory (MEMORY.md):",
-        &scan.total_memory_md_files.to_string(),
-    );
+    kv("  Memory (MEMORY.md):", &scan.total_memory_md_files.to_string());
     kv("  Memory (SQLite):", &scan.total_memory_dbs.to_string());
     kv("  Workspaces:", &scan.total_workspaces.to_string());
     kv("  Skills:", &scan.total_skills.to_string());
@@ -175,10 +168,7 @@ fn show_scan_results(openclaw_dir: &PathBuf) -> Result<openclaw::OpenClawScanRes
 }
 
 /// Public entry point for setup.rs to call the unified import logic.
-pub fn import_data_from(
-    openclaw_dir: &std::path::Path,
-    rsclaw_dir: &std::path::Path,
-) -> Result<()> {
+pub fn import_data_from(openclaw_dir: &std::path::Path, rsclaw_dir: &std::path::Path) -> Result<()> {
     import_data(&openclaw_dir.to_path_buf(), &rsclaw_dir.to_path_buf())
 }
 
@@ -233,14 +223,10 @@ fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()> {
                     // Remove openclaw-specific fields.
                     obj.remove("memorySearch");
                     // Set rsclaw defaults.
-                    obj.insert(
-                        "workspace".to_owned(),
-                        serde_json::Value::String("~/.rsclaw/workspace".to_owned()),
-                    );
-                    obj.insert(
-                        "compaction".to_owned(),
-                        serde_json::json!({"mode": "layered"}),
-                    );
+                    obj.insert("workspace".to_owned(),
+                        serde_json::Value::String("~/.rsclaw/workspace".to_owned()));
+                    obj.insert("compaction".to_owned(),
+                        serde_json::json!({"mode": "layered"}));
                 }
             }
             // Build agent->channels map from OpenClaw bindings.
@@ -248,57 +234,36 @@ fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()> {
                 std::collections::HashMap::new();
             if let Some(bindings) = config.get("bindings").and_then(|v| v.as_array()) {
                 for binding in bindings {
-                    let agent_id = binding
-                        .get("agentId")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let channel = binding
-                        .pointer("/match/channel")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let account = binding
-                        .pointer("/match/accountId")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let agent_id = binding.get("agentId").and_then(|v| v.as_str()).unwrap_or("");
+                    let channel = binding.pointer("/match/channel").and_then(|v| v.as_str()).unwrap_or("");
+                    let account = binding.pointer("/match/accountId").and_then(|v| v.as_str()).unwrap_or("");
                     if !agent_id.is_empty() && !channel.is_empty() {
                         let ch_key = if account.is_empty() {
                             channel.to_owned()
                         } else {
                             format!("{channel}:{account}")
                         };
-                        agent_channels
-                            .entry(agent_id.to_owned())
-                            .or_default()
-                            .push(ch_key);
+                        agent_channels.entry(agent_id.to_owned()).or_default().push(ch_key);
                     }
                 }
             }
 
             // Rewrite per-agent workspaces, strip agentDir, add channels from bindings.
-            if let Some(list) = agents_cfg
-                .pointer_mut("/list")
-                .and_then(|v| v.as_array_mut())
-            {
+            if let Some(list) = agents_cfg.pointer_mut("/list").and_then(|v| v.as_array_mut()) {
                 for agent in list.iter_mut() {
                     if let Some(obj) = agent.as_object_mut() {
-                        let agent_id = obj
-                            .get("id")
+                        let agent_id = obj.get("id")
                             .and_then(|v| v.as_str())
                             .unwrap_or("main")
                             .to_owned();
                         obj.remove("agentDir");
                         if obj.contains_key("workspace") {
-                            obj.insert(
-                                "workspace".to_owned(),
-                                serde_json::Value::String(format!(
-                                    "~/.rsclaw/workspace-{agent_id}"
-                                )),
-                            );
+                            obj.insert("workspace".to_owned(),
+                                serde_json::Value::String(format!("~/.rsclaw/workspace-{agent_id}")));
                         }
                         // Inject channels from bindings.
                         if let Some(chs) = agent_channels.get(&agent_id) {
-                            let ch_values: Vec<serde_json::Value> = chs
-                                .iter()
+                            let ch_values: Vec<serde_json::Value> = chs.iter()
                                 .map(|c| serde_json::Value::String(c.clone()))
                                 .collect();
                             obj.insert("channels".to_owned(), serde_json::Value::Array(ch_values));
@@ -312,8 +277,9 @@ fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()> {
         // Channels: only migrate supported channel configs, skip installs/plugins.
         if let Some(channels) = config.get("channels").and_then(|v| v.as_object()) {
             let supported = [
-                "telegram", "feishu", "dingtalk", "wechat", "wecom", "discord", "slack",
-                "whatsapp", "signal", "qq", "line", "zalo", "matrix",
+                "telegram", "feishu", "dingtalk", "wechat", "wecom",
+                "discord", "slack", "whatsapp", "signal", "qq",
+                "line", "zalo", "matrix",
             ];
             let mut ch_cfg = serde_json::Map::new();
             for (name, val) in channels {
@@ -383,11 +349,7 @@ fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()> {
                         expanded
                     } else if let Some(dirname) = expanded.file_name() {
                         let remapped = openclaw_dir.join(dirname);
-                        if remapped.is_dir() {
-                            remapped
-                        } else {
-                            expanded
-                        }
+                        if remapped.is_dir() { remapped } else { expanded }
                     } else {
                         expanded
                     }
@@ -414,11 +376,7 @@ fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()> {
     if let Ok(entries) = std::fs::read_dir(openclaw_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
             if path.is_dir() && name.starts_with("workspace-") {
                 let dst = rsclaw_dir.join(&name);
                 if !dst.exists() {
@@ -491,13 +449,7 @@ fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()> {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
                 if let Some(allow_from) = val.get("allowFrom").and_then(|v| v.as_array()) {
                     if !allow_from.is_empty() {
-                        item(
-                            "*",
-                            &format!(
-                                "{} feishu allowFrom entries found (add to channels.feishu.allowFrom in config)",
-                                allow_from.len()
-                            ),
-                        );
+                        item("*", &format!("{} feishu allowFrom entries found (add to channels.feishu.allowFrom in config)", allow_from.len()));
                     }
                 }
             }
@@ -524,7 +476,8 @@ fn import_memories_to_redb(
     let db_path = mem_dir.join("memory.redb");
     let db = redb::Database::create(&db_path)?;
 
-    let table_def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("memory_docs");
+    let table_def: redb::TableDefinition<&str, &[u8]> =
+        redb::TableDefinition::new("memory_docs");
 
     // Ensure table exists.
     {
@@ -569,21 +522,13 @@ fn import_memories_to_redb(
         stats.memories += 1;
     }
 
-    item(
-        "*",
-        &format!(
-            "{} memory entries imported (embedding on next startup)",
-            stats.memories
-        ),
-    );
+    item("*", &format!("{} memory entries imported (embedding on next startup)", stats.memories));
     Ok(())
 }
 
 fn md5_short(text: &str) -> String {
-    use std::{
-        collections::hash_map::DefaultHasher,
-        hash::{Hash, Hasher},
-    };
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
@@ -600,10 +545,7 @@ fn print_import_stats(stats: &ImportStats) {
             bold(&stats.memories.to_string())
         ),
     );
-    kv(
-        "  Workspace files:",
-        &bold(&stats.workspace_files.to_string()),
-    );
+    kv("  Workspace files:", &bold(&stats.workspace_files.to_string()));
     kv("  Skills:", &bold(&stats.skills.to_string()));
     if stats.aliases > 0 {
         kv("  Session aliases:", &bold(&stats.aliases.to_string()));
@@ -631,47 +573,30 @@ mod tests {
             std::collections::HashMap::new();
         if let Some(bindings) = config.get("bindings").and_then(|v| v.as_array()) {
             for binding in bindings {
-                let agent_id = binding
-                    .get("agentId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let channel = binding
-                    .pointer("/match/channel")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let account = binding
-                    .pointer("/match/accountId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let agent_id = binding.get("agentId").and_then(|v| v.as_str()).unwrap_or("");
+                let channel = binding.pointer("/match/channel").and_then(|v| v.as_str()).unwrap_or("");
+                let account = binding.pointer("/match/accountId").and_then(|v| v.as_str()).unwrap_or("");
                 if !agent_id.is_empty() && !channel.is_empty() {
                     let ch_key = if account.is_empty() {
                         channel.to_owned()
                     } else {
                         format!("{channel}:{account}")
                     };
-                    agent_channels
-                        .entry(agent_id.to_owned())
-                        .or_default()
-                        .push(ch_key);
+                    agent_channels.entry(agent_id.to_owned()).or_default().push(ch_key);
                 }
             }
         }
 
         // Inject channels from bindings into agents list.
-        if let Some(list) = agents_cfg
-            .pointer_mut("/list")
-            .and_then(|v| v.as_array_mut())
-        {
+        if let Some(list) = agents_cfg.pointer_mut("/list").and_then(|v| v.as_array_mut()) {
             for agent in list.iter_mut() {
                 if let Some(obj) = agent.as_object_mut() {
-                    let agent_id = obj
-                        .get("id")
+                    let agent_id = obj.get("id")
                         .and_then(|v| v.as_str())
                         .unwrap_or("main")
                         .to_owned();
                     if let Some(chs) = agent_channels.get(&agent_id) {
-                        let ch_values: Vec<serde_json::Value> = chs
-                            .iter()
+                        let ch_values: Vec<serde_json::Value> = chs.iter()
                             .map(|c| serde_json::Value::String(c.clone()))
                             .collect();
                         obj.insert("channels".to_owned(), serde_json::Value::Array(ch_values));
@@ -734,10 +659,7 @@ mod tests {
         let sales = &result["list"][1];
         let support = &result["list"][2];
         assert_eq!(sales["channels"], json!(["feishu:sales-bot"]));
-        assert_eq!(
-            support["channels"],
-            json!(["feishu:support-bot", "dingtalk"])
-        );
+        assert_eq!(support["channels"], json!(["feishu:support-bot", "dingtalk"]));
     }
 
     #[test]

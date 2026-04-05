@@ -15,7 +15,7 @@ pub mod feishu_auth;
 
 use anyhow::{Context, Result};
 use qrcode::QrCode;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Display a URL as a QR code in the terminal.
 ///
@@ -355,9 +355,7 @@ pub fn save_token(platform: &str, token_data: &serde_json::Value) -> Result<()> 
     }
 
     // Ensure the channel is enabled
-    section
-        .entry("enabled")
-        .or_insert(serde_json::Value::Bool(true));
+    section.entry("enabled").or_insert(serde_json::Value::Bool(true));
 
     // Write back
     let json = serde_json::to_string_pretty(&config)?;

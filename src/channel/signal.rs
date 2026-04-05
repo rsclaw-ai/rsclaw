@@ -159,8 +159,8 @@ impl Channel for SignalChannel {
                             continue;
                         }
                     };
-                    let tmp_path =
-                        std::env::temp_dir().join(format!("rsclaw_signal_img_{idx}.png"));
+                    let tmp_path = std::env::temp_dir()
+                        .join(format!("rsclaw_signal_img_{idx}.png"));
                     if let Err(e) = std::fs::write(&tmp_path, &bytes) {
                         tracing::warn!(idx, "signal: write temp image failed: {e}");
                         continue;

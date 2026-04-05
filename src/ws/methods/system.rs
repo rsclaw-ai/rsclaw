@@ -254,9 +254,7 @@ pub async fn logs_tail(ctx: MethodCtx) -> MethodResult {
     let base = crate::config::loader::base_dir();
     let candidates = [
         configured.clone(),
-        crate::config::loader::log_file()
-            .to_string_lossy()
-            .into_owned(),
+        crate::config::loader::log_file().to_string_lossy().into_owned(),
         base.join("gateway.log").to_string_lossy().into_owned(),
         base.join("logs/gateway.log").to_string_lossy().into_owned(),
     ];

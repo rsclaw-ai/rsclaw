@@ -32,16 +32,37 @@ type VersionType = "date" | "tag";
 const RSCLAW_VERSION_URL = "https://app.rsclaw.ai/api/version";
 
 async function getVersion(type: VersionType) {
-  // Primary: check app.rsclaw.ai/api/version (GitHub releases/latest format)
+  // Desktop uses app-v* tags, CLI uses v* tags
+  const tagPrefix = isApp ? "app-v" : "v";
+  const matchTag = (t: string) => t.startsWith(tagPrefix) && (isApp || !t.startsWith("app-"));
+
+  // Primary: app.rsclaw.ai/api/version (array of release objects)
   try {
     const resp = await fetch(RSCLAW_VERSION_URL, { signal: AbortSignal.timeout(5000) });
     if (resp.ok) {
       const data = await resp.json();
-      if (data.tag_name) return data.tag_name;
+      if (Array.isArray(data)) {
+        const release = data.find((r: any) => r.tag_name && matchTag(r.tag_name));
+        if (release?.tag_name) return release.tag_name;
+      } else if (data?.tag_name) {
+        return data.tag_name;
+      }
     }
   } catch {}
 
-  // Fallback: GitHub tags
+  // Fallback: GitHub releases API (same array format)
+  try {
+    const resp = await fetch("https://api.github.com/repos/rsclaw-ai/rsclaw/releases?per_page=10", { signal: AbortSignal.timeout(5000) });
+    if (resp.ok) {
+      const data = await resp.json();
+      if (Array.isArray(data)) {
+        const release = data.find((r: any) => r.tag_name && matchTag(r.tag_name));
+        if (release?.tag_name) return release.tag_name;
+      }
+    }
+  } catch {}
+
+  // Legacy fallback: GitHub tags
   if (type === "date") {
     const data = (await (await fetch(FETCH_COMMIT_URL)).json()) as {
       commit: {

@@ -99,7 +99,6 @@ pub fn resolve_openai_key() -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Decode WeChat SILK v3 audio to 16-bit 16kHz mono WAV.
-#[allow(unreachable_code, unused_variables)]
 fn decode_silk_to_wav(silk_bytes: &[u8]) -> Result<Vec<u8>> {
     // Strip WeChat \x02 prefix if present
     let raw = if silk_bytes.first() == Some(&0x02) {
@@ -225,10 +224,7 @@ async fn transcribe_macos(audio_bytes: &[u8], file_name: &str) -> Result<String>
             warn!("symphonia decode failed ({e:#}), trying afconvert");
             let convert_ok = tokio::process::Command::new("afconvert")
                 .args([
-                    "-f",
-                    "WAVE",
-                    "-d",
-                    "LEI16@16000",
+                    "-f", "WAVE", "-d", "LEI16@16000",
                     audio_path.to_str().unwrap_or(""),
                     wav_path.to_str().unwrap_or(""),
                 ])
@@ -909,15 +905,16 @@ fn decode_audio_to_pcm_ext(audio_bytes: &[u8], file_ext: Option<&str>) -> Result
         }
     }
     // Detect format hint for symphonia
-    let hint = file_ext.or_else(|| {
-        if audio_bytes.len() >= 12 && audio_bytes[4..].windows(4).any(|w| w == b"ftyp") {
-            Some("mp4")
-        } else if audio_bytes.starts_with(b"\x1aE\xdf\xa3") {
-            Some("webm")
-        } else {
-            None
-        }
-    });
+    let hint = file_ext
+        .or_else(|| {
+            if audio_bytes.len() >= 12 && audio_bytes[4..].windows(4).any(|w| w == b"ftyp") {
+                Some("mp4")
+            } else if audio_bytes.starts_with(b"\x1aE\xdf\xa3") {
+                Some("webm")
+            } else {
+                None
+            }
+        });
     // Try symphonia (MP3/AAC/WAV/FLAC/MP4/MKV)
     if let Ok(samples) = decode_audio_symphonia_with_hint(audio_bytes, hint) {
         return Ok(samples);
@@ -927,8 +924,7 @@ fn decode_audio_to_pcm_ext(audio_bytes: &[u8], file_ext: Option<&str>) -> Result
     decode_audio_ffmpeg(audio_bytes, ext)
 }
 
-/// Fallback: use ffmpeg CLI to convert any audio/video to 16kHz mono WAV, then
-/// read PCM.
+/// Fallback: use ffmpeg CLI to convert any audio/video to 16kHz mono WAV, then read PCM.
 fn decode_audio_ffmpeg(audio_bytes: &[u8], ext: &str) -> Result<Vec<f32>> {
     let tmp_dir = std::env::temp_dir();
     let id = uuid::Uuid::new_v4();
@@ -939,37 +935,16 @@ fn decode_audio_ffmpeg(audio_bytes: &[u8], ext: &str) -> Result<Vec<f32>> {
     info!(input = %input_path.display(), ext = %ext, bytes = audio_bytes.len(), "ffmpeg fallback: converting");
     let output = std::process::Command::new("ffmpeg")
         .args([
-            "-i",
-            input_path.to_str().unwrap_or(""),
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-f",
-            "wav",
-            "-y",
-            wav_path.to_str().unwrap_or(""),
+            "-i", input_path.to_str().unwrap_or(""),
+            "-ar", "16000", "-ac", "1", "-f", "wav",
+            "-y", wav_path.to_str().unwrap_or(""),
         ])
         .output();
     let _ = std::fs::remove_file(&input_path);
-    let status = output
-        .as_ref()
-        .map(|o| o.status)
-        .map_err(|e| anyhow::anyhow!("{e}"));
+    let status = output.as_ref().map(|o| o.status).map_err(|e| anyhow::anyhow!("{e}"));
     if let Ok(ref o) = output {
         let stderr = String::from_utf8_lossy(&o.stderr);
-        warn!(
-            "ffmpeg exit={} stderr_tail: {}",
-            o.status,
-            stderr
-                .chars()
-                .rev()
-                .take(300)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect::<String>()
-        );
+        warn!("ffmpeg exit={} stderr_tail: {}", o.status, stderr.chars().rev().take(300).collect::<String>().chars().rev().collect::<String>());
     }
 
     match status {
@@ -985,10 +960,7 @@ fn decode_audio_ffmpeg(audio_bytes: &[u8], ext: &str) -> Result<Vec<f32>> {
                         s as f32 / 32768.0
                     })
                     .collect();
-                info!(
-                    samples = samples.len(),
-                    "ffmpeg fallback: decoded to 16kHz PCM"
-                );
+                info!(samples = samples.len(), "ffmpeg fallback: decoded to 16kHz PCM");
                 Ok(samples)
             } else {
                 anyhow::bail!("ffmpeg: WAV output too short")
@@ -1016,13 +988,9 @@ fn decode_ogg_opus(audio_bytes: &[u8]) -> Result<Vec<f32>> {
             // First packet is the Opus header
             if packet.data.len() >= 12 && &packet.data[..8] == b"OpusHead" {
                 channels = packet.data[9] as usize;
-                if channels == 0 {
-                    channels = 1;
-                }
-                decoder = Some(
-                    opus_decoder::OpusDecoder::new(48000, channels)
-                        .map_err(|e| anyhow::anyhow!("opus decoder init: {e}"))?,
-                );
+                if channels == 0 { channels = 1; }
+                decoder = Some(opus_decoder::OpusDecoder::new(48000, channels)
+                    .map_err(|e| anyhow::anyhow!("opus decoder init: {e}"))?);
             }
             continue;
         }
@@ -1081,14 +1049,13 @@ fn decode_ogg_opus(audio_bytes: &[u8]) -> Result<Vec<f32>> {
 }
 
 /// Decode non-Opus audio (MP3, AAC, WAV, OGG Vorbis, FLAC) via symphonia.
-fn decode_audio_symphonia_with_hint(
-    audio_bytes: &[u8],
-    ext_hint: Option<&str>,
-) -> Result<Vec<f32>> {
-    use symphonia::core::{
-        audio::SampleBuffer, codecs::DecoderOptions, formats::FormatOptions, io::MediaSourceStream,
-        meta::MetadataOptions, probe::Hint,
-    };
+fn decode_audio_symphonia_with_hint(audio_bytes: &[u8], ext_hint: Option<&str>) -> Result<Vec<f32>> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
 
     let cursor = std::io::Cursor::new(audio_bytes.to_vec());
     let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
@@ -1209,14 +1176,12 @@ fn write_wav_from_pcm(samples: &[f32], sample_rate: u32) -> Vec<u8> {
 // Candle Whisper (pure Rust — placeholder, requires model download)
 // ---------------------------------------------------------------------------
 
-/// Transcribe using candle-transformers whisper model (pure Rust, zero external
-/// deps).
+/// Transcribe using candle-transformers whisper model (pure Rust, zero external deps).
 ///
 /// Requires whisper-tiny model files at `<base_dir>/models/whisper-tiny/`:
 ///   - config.json, tokenizer.json, model.safetensors
 ///
-/// Download: `huggingface-cli download openai/whisper-tiny --local-dir
-/// ~/.rsclaw/models/whisper-tiny`
+/// Download: `huggingface-cli download openai/whisper-tiny --local-dir ~/.rsclaw/models/whisper-tiny`
 async fn transcribe_candle(audio_bytes: &[u8]) -> Result<String> {
     let model_dir = crate::config::loader::base_dir().join("models/whisper-tiny");
     if !model_dir.join("config.json").exists() {
@@ -1229,8 +1194,8 @@ async fn transcribe_candle(audio_bytes: &[u8]) -> Result<String> {
     }
 
     // Decode audio to 16 kHz mono PCM
-    let pcm =
-        decode_audio_to_pcm(audio_bytes).context("failed to decode audio for candle whisper")?;
+    let pcm = decode_audio_to_pcm(audio_bytes)
+        .context("failed to decode audio for candle whisper")?;
 
     info!(samples = pcm.len(), "decoded audio for candle whisper");
 
@@ -1245,13 +1210,8 @@ async fn transcribe_candle(audio_bytes: &[u8]) -> Result<String> {
 
     if resolve_openai_key().is_some() {
         warn!("candle whisper not yet fully implemented, falling back to OpenAI");
-        return transcribe_openai(
-            &reqwest::Client::new(),
-            audio_bytes,
-            "voice.ogg",
-            "audio/ogg",
-        )
-        .await;
+        return transcribe_openai(&reqwest::Client::new(), audio_bytes, "voice.ogg", "audio/ogg")
+            .await;
     }
 
     anyhow::bail!(
@@ -1288,3 +1248,4 @@ fn base64_encode(data: &[u8]) -> String {
     }
     result
 }
+

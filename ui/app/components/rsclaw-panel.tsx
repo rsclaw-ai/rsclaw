@@ -1537,23 +1537,36 @@ function AgentManagerPage() {
   const [idError, setIdError] = useState("");
   const [channelAccounts, setChannelAccounts] = useState<Record<string, string[]>>({});
   const [configModels, setConfigModels] = useState<string[]>([]);
+  const [configProviders, setConfigProviders] = useState<{ id: string; hasKey: boolean }[]>([]);
+  const [selectedProvider, setSelectedProvider] = useState("");
+  const [providerModels, setProviderModels] = useState<string[]>([]);
+  const [loadingModels, setLoadingModels] = useState(false);
 
   const fetchAgentList = useCallback(async () => {
+    // Read directly from config file (no gateway API dependency)
+    const invoke = (window as any).__TAURI__?.invoke;
+    if (!invoke) return;
     try {
-      const data = await getAgents();
-      setAgentList(Array.isArray(data) ? data : data.agents || []);
-    } catch {
-      // Gateway not available - read from config file via Tauri
-      try {
-        const invoke = (window as any).__TAURI__?.invoke;
-        if (invoke) {
-          const raw: string = await invoke("read_config_file");
-          const cfg = JSON.parse(raw || "{}");
-          const list = cfg.agents?.list || [];
-          if (list.length > 0) setAgentList(list);
+      const raw: string = await invoke("read_config_file");
+      const cfg = JSON.parse(raw || "{}");
+      // Auto-fix legacy string model fields in config
+      let needsWrite = false;
+      for (const a of (cfg.agents?.list || [])) {
+        if (typeof a.model === "string") {
+          a.model = a.model ? { primary: a.model } : undefined;
+          needsWrite = true;
         }
-      } catch {}
-    }
+      }
+      if (needsWrite) {
+        try { await invoke("write_config", { content: JSON.stringify(cfg, null, 2) }); } catch {}
+      }
+      const list = (cfg.agents?.list || []).map((a: any) => {
+        const rawModel = a.model;
+        const modelStr = typeof rawModel === "string" ? rawModel : rawModel?.primary || "";
+        return { ...a, model: modelStr, status: a.status || "idle" };
+      });
+      setAgentList(list);
+    } catch {}
   }, []);
 
   useEffect(() => {
@@ -1565,38 +1578,37 @@ function AgentManagerPage() {
         if (invoke) {
           const accts: Record<string, string[]> = await invoke("get_channel_accounts");
           setChannelAccounts(accts || {});
-          // Read config to extract provider names and model aliases
+          // Read config to extract providers and model aliases
           try {
             const raw: string = await invoke("read_config_file");
             const cfg = JSON.parse(raw || "{}");
             const models: string[] = [];
+            const providers: { id: string; hasKey: boolean }[] = [];
             // Add model aliases from agents.defaults.models
             const defaults = cfg?.agents?.defaults?.models;
             if (defaults && typeof defaults === "object") {
               Object.keys(defaults).forEach((alias) => {
                 const val = defaults[alias];
-                const entry = typeof val === "string" ? val : val?.model || alias;
-                models.push(entry);
+                models.push(typeof val === "string" ? val : val?.model || alias);
               });
             }
-            // Add provider-based models from models.providers
+            // Extract providers with their API key status
             const provs = cfg?.models?.providers;
             if (provs && typeof provs === "object") {
               Object.keys(provs).forEach((provName) => {
-                // Check if provider has specific models listed
                 const provConf = provs[provName];
+                const hasKey = !!(provConf?.apiKey || provConf?.baseUrl);
+                providers.push({ id: provName, hasKey });
                 if (provConf?.models && Array.isArray(provConf.models)) {
                   provConf.models.forEach((m: any) => {
                     const id = typeof m === "string" ? m : m?.id || m?.name;
                     if (id) models.push(`${provName}/${id}`);
                   });
-                } else {
-                  // Just add provider name as prefix placeholder
-                  models.push(`${provName}/`);
                 }
               });
             }
             setConfigModels(models);
+            setConfigProviders(providers);
           } catch {}
         }
       } catch {}
@@ -1621,38 +1633,73 @@ function AgentManagerPage() {
       id: newId.trim(),
       name: newName || undefined,
       avatar: newAvatar || undefined,
-      model: newModel || undefined,
-      system: newSystem || undefined,
+      model: newModel ? { primary: newModel, toolset: newToolset } : undefined,
       channels: newChannels.length > 0 ? newChannels : [],
-      toolset: [newToolset],
     };
-    console.log("[AgentManager] saving agent:", JSON.stringify(agent, null, 2));
     try {
-      if (editAgent) {
-        // Update existing agent
-        await gatewayFetch(`/api/v1/agents/${encodeURIComponent(editAgent.id)}`, {
-          method: "PATCH",
-          body: JSON.stringify(agent),
-        });
-      } else {
-        await saveAgent(agent);
+      const invoke = (window as any).__TAURI__?.invoke;
+      if (!invoke) throw new Error("Tauri not available");
+      // Write agent config to JSON file
+      const raw: string = await invoke("read_config_file");
+      const cfg = JSON.parse(raw || "{}");
+      if (!cfg.agents) cfg.agents = {};
+      if (!cfg.agents.list) cfg.agents.list = [];
+      // Migrate any legacy string model fields to { primary: "..." } format
+      for (const a of cfg.agents.list) {
+        if (typeof a.model === "string") {
+          a.model = a.model ? { primary: a.model } : undefined;
+        }
       }
+      const idx = cfg.agents.list.findIndex((a: any) => a.id === agent.id);
+      if (idx >= 0) {
+        cfg.agents.list[idx] = { ...cfg.agents.list[idx], ...agent };
+      } else {
+        cfg.agents.list.push(agent);
+      }
+      await invoke("write_config", { content: JSON.stringify(cfg, null, 2) });
+      // Write SOUL.md to agent workspace if system prompt provided
+      if (newSystem.trim()) {
+        try {
+          await invoke("write_workspace_file", {
+            agentId: agent.id,
+            fileName: "SOUL.md",
+            content: newSystem,
+          });
+        } catch {}
+      }
+      try { await reloadConfig(); } catch {}
+      // Re-read from config to refresh list
       await fetchAgentList();
       setShowModal(false);
       resetForm();
+      toast.success(getLang() === "cn" ? "\u5DF2\u4FDD\u5B58" : "Saved");
     } catch (e) {
       toast.fromError(Locale.RsClawPanel.Agents.SaveFailed, e);
     }
   };
 
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+
   const handleDeleteAgent = async (id: string) => {
-    // Simple confirmation via window.confirm is acceptable for destructive actions.
-    // TODO: replace with custom modal if needed.
-    if (!window.confirm(Locale.RsClawPanel.Agents.ConfirmDelete(id))) return;
     try {
-      await deleteAgent(id);
-      await fetchAgentList();
+      // Optimistic update: remove from list immediately
+      setAgentList((prev) => prev.filter((a) => a.id !== id));
+      setConfirmDeleteId(null);
+      // Delete from config file via Tauri
+      const invoke = (window as any).__TAURI__?.invoke;
+      if (invoke) {
+        const raw: string = await invoke("read_config_file");
+        const cfg = JSON.parse(raw || "{}");
+        if (cfg.agents?.list) {
+          cfg.agents.list = cfg.agents.list.filter((a: any) => a.id !== id);
+          await invoke("write_config", { content: JSON.stringify(cfg, null, 2) });
+          try { await reloadConfig(); } catch {}
+        }
+      }
+      toast.success(getLang() === "cn" ? "\u5DF2\u5220\u9664" : "Deleted");
     } catch (e) {
+      // Revert optimistic update on failure
+      await fetchAgentList();
       toast.fromError(Locale.RsClawPanel.Agents.DeleteFailed, e);
     }
   };
@@ -1682,19 +1729,51 @@ function AgentManagerPage() {
     setNewId(agent.id);
     setNewName(agent.name || "");
     setNewAvatar(agent.avatar || "");
-    setNewModel(agent.model);
+    setNewModel(agent.model || "");
     setNewChannels(agent.channels || []);
     setNewToolset(agent.toolset?.[0] || "full");
     setNewSystem("");
+    setSelectedProvider("");
+    setProviderModels([]);
     setShowModal(true);
-    // Also read channels from config file (API may not return them)
     try {
       const invoke = (window as any).__TAURI__?.invoke;
       if (invoke) {
         const raw = await invoke("read_config_file");
         const cfg = JSON.parse(raw || "{}");
         const agentCfg = (cfg.agents?.list || []).find((a: any) => a.id === agent.id);
-        if (agentCfg?.channels) setNewChannels(agentCfg.channels);
+        if (agentCfg) {
+          if (agentCfg.name) setNewName(agentCfg.name);
+          if (agentCfg.avatar) setNewAvatar(agentCfg.avatar);
+          if (agentCfg.model) {
+            const m = agentCfg.model;
+            setNewModel(typeof m === "string" ? m : m?.primary || "");
+            if (m?.toolset) setNewToolset(m.toolset);
+          }
+          if (agentCfg.channels) setNewChannels(agentCfg.channels);
+          if (agentCfg.toolset?.[0]) setNewToolset(agentCfg.toolset[0]);
+        }
+        // Read SOUL.md from agent workspace
+        try {
+          const soul = await invoke("read_workspace_file", { agentId: agent.id, fileName: "SOUL.md" });
+          if (soul) setNewSystem(soul);
+        } catch {}
+        // Set provider from model string (e.g. "openai/gpt-4" -> provider "openai")
+        const rawModel = agentCfg?.model;
+        const model = typeof rawModel === "string" ? rawModel : rawModel?.primary || agent.model || "";
+        if (model.includes("/")) {
+          setSelectedProvider(model.split("/")[0]);
+        }
+        // Refresh providers from config
+        const providers: { id: string; hasKey: boolean }[] = [];
+        const provs = cfg?.models?.providers;
+        if (provs && typeof provs === "object") {
+          Object.keys(provs).forEach((provName) => {
+            const provConf = provs[provName];
+            providers.push({ id: provName, hasKey: !!(provConf?.apiKey || provConf?.baseUrl) });
+          });
+        }
+        if (providers.length > 0) setConfigProviders(providers);
       }
     } catch {}
   };
@@ -1708,6 +1787,9 @@ function AgentManagerPage() {
     setNewToolset("full");
     setNewSystem("");
     setIdError("");
+    setSelectedProvider("");
+    setProviderModels([]);
+    setLoadingModels(false);
   };
 
   if (wsAgentId) {
@@ -1783,12 +1865,36 @@ function AgentManagerPage() {
                 >
                   {Locale.RsClawPanel.Agents.Edit}
                 </button>
-                <button
-                  className={`${styles["btn"]} ${styles["danger"]}`}
-                  onClick={() => handleDeleteAgent(agent.id)}
-                >
-                  {Locale.RsClawPanel.Agents.Delete}
-                </button>
+                <div style={{ position: "relative", display: "inline-block" }}>
+                  <button
+                    className={`${styles["btn"]} ${styles["danger"]}`}
+                    onClick={() => setConfirmDeleteId(confirmDeleteId === agent.id ? null : agent.id)}
+                  >
+                    {Locale.RsClawPanel.Agents.Delete}
+                  </button>
+                  {confirmDeleteId === agent.id && (
+                    <div onClick={(e) => e.stopPropagation()} style={{
+                      position: "absolute", top: "100%", right: 0, marginTop: 6,
+                      padding: "10px 12px", minWidth: 180,
+                      background: "var(--white)", border: "1px solid var(--border-in-light)",
+                      borderRadius: 8, boxShadow: "0 4px 12px rgba(0,0,0,0.3)", zIndex: 100,
+                    }}>
+                      <div style={{ fontSize: 11, color: "var(--black)", marginBottom: 8 }}>
+                        {getLang() === "cn" ? `\u786E\u8BA4\u5220\u9664 ${agent.name || agent.id}\uFF1F` : `Delete ${agent.name || agent.id}?`}
+                      </div>
+                      <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+                        <button onClick={() => setConfirmDeleteId(null)}
+                          style={{ fontSize: 10, padding: "3px 10px", borderRadius: 5, border: "1px solid var(--border-in-light)", background: "transparent", color: "var(--black)", cursor: "pointer" }}>
+                          {getLang() === "cn" ? "\u53D6\u6D88" : "Cancel"}
+                        </button>
+                        <button onClick={() => handleDeleteAgent(agent.id)}
+                          style={{ fontSize: 10, padding: "3px 10px", borderRadius: 5, border: "none", cursor: "pointer", fontWeight: 600, background: "#d95f5f", color: "#fff" }}>
+                          {getLang() === "cn" ? "\u5220\u9664" : "Delete"}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
             <div className={styles["agent-card-body"]}>
@@ -1912,48 +2018,77 @@ function AgentManagerPage() {
               )}
             </div>
 
-            {/* System Prompt */}
-            <div className={styles["cfg-f"]}>
-              <div className={styles["cfg-lbl"]}>{getLang() === "cn" ? "系统提示词" : "System Prompt"}</div>
-              <textarea
-                className={styles["cfg-input"]}
-                value={newSystem}
-                onChange={(e) => setNewSystem(e.target.value)}
-                placeholder={getLang() === "cn" ? "你是一个专注于 XXX 的助手..." : "You are an assistant specialized in..."}
-                rows={4}
-                style={{ resize: "vertical", fontFamily: "inherit", lineHeight: 1.6 }}
-              />
-            </div>
-
-            {/* Model - select from providers */}
+            {/* Model - select provider then pick model */}
             <div className={styles["cfg-f"]}>
               <div className={styles["cfg-lbl"]}>{Locale.RsClawPanel.Agents.Model}</div>
+              {/* Provider selector */}
               <select
                 className={styles["cfg-select"]}
-                value={configModels.includes(newModel) || newModel === "" || newModel === "custom" ? newModel : "custom"}
-                onChange={(e) => setNewModel(e.target.value)}
+                value={selectedProvider}
+                onChange={async (e) => {
+                  const provId = e.target.value;
+                  setSelectedProvider(provId);
+                  setProviderModels([]);
+                  if (!provId) { setNewModel(""); return; }
+                  // Fetch models from provider via Tauri (direct client request, no gateway)
+                  setLoadingModels(true);
+                  try {
+                    const invoke = (window as any).__TAURI__?.invoke;
+                    if (invoke) {
+                      const raw: string = await invoke("read_config_file");
+                      const cfg = JSON.parse(raw || "{}");
+                      const provConf = cfg?.models?.providers?.[provId] || {};
+                      const apiKey = provConf.apiKey || "";
+                      const baseUrl = provConf.baseUrl || undefined;
+                      const result = await invoke("test_provider", { provider: provId, apiKey, baseUrl });
+                      if (result.ok && result.models?.length > 0) {
+                        setProviderModels(result.models);
+                      }
+                    }
+                  } catch {} finally { setLoadingModels(false); }
+                }}
               >
-                <option value="">{getLang() === "cn" ? "-- 使用默认模型 --" : "-- Use default model --"}</option>
-                {configModels.filter((m) => !m.endsWith("/")).map((m) => (
-                  <option key={m} value={m}>{m}</option>
+                <option value="">{getLang() === "cn" ? "-- \u9009\u62E9\u63D0\u4F9B\u5546 --" : "-- Select provider --"}</option>
+                {configProviders.map((p) => (
+                  <option key={p.id} value={p.id}>{p.id}{!p.hasKey ? (getLang() === "cn" ? " (\u672A\u914D\u7F6E)" : " (not configured)") : ""}</option>
                 ))}
-                {configModels.filter((m) => m.endsWith("/")).length > 0 && (
-                  <optgroup label={getLang() === "cn" ? "可用提供商" : "Available Providers"}>
-                    {configModels.filter((m) => m.endsWith("/")).map((m) => (
-                      <option key={m} value={m} disabled style={{ color: "#888" }}>{m.slice(0, -1)}</option>
-                    ))}
-                  </optgroup>
-                )}
-                <option value="custom">{getLang() === "cn" ? "自定义..." : "Custom..."}</option>
               </select>
-              {(newModel === "custom" || (newModel && !configModels.includes(newModel) && newModel !== "")) && (
-                <input
-                  className={styles["cfg-input"]}
-                  style={{ marginTop: "6px" }}
-                  placeholder="provider/model-name"
-                  value={newModel === "custom" ? "" : newModel}
-                  onChange={(e) => setNewModel(e.target.value)}
-                />
+              {/* Model selector (shown after provider selected) */}
+              {selectedProvider && (
+                <div style={{ marginTop: "6px" }}>
+                  {loadingModels ? (
+                    <div style={{ fontSize: 11, color: "#f97316", padding: "6px 0" }}>{getLang() === "cn" ? "\u52A0\u8F7D\u6A21\u578B\u5217\u8868..." : "Loading models..."}</div>
+                  ) : providerModels.length > 0 ? (
+                    <select
+                      className={styles["cfg-select"]}
+                      value={newModel}
+                      onChange={(e) => setNewModel(e.target.value)}
+                    >
+                      <option value="">{getLang() === "cn" ? "-- \u9009\u62E9\u6A21\u578B --" : "-- Select model --"}</option>
+                      {providerModels.map((m) => (
+                        <option key={m} value={`${selectedProvider}/${m}`}>{m}</option>
+                      ))}
+                    </select>
+                  ) : (
+                    <div style={{ fontSize: 10, color: "#4a4858", padding: "4px 0" }}>
+                      {getLang() === "cn" ? "\u672A\u83B7\u53D6\u5230\u6A21\u578B\uFF0C\u8BF7\u624B\u52A8\u8F93\u5165" : "No models found, enter manually"}
+                    </div>
+                  )}
+                  {/* Manual input always available */}
+                  <input
+                    className={styles["cfg-input"]}
+                    style={{ marginTop: "6px" }}
+                    placeholder={`${selectedProvider}/model-name`}
+                    value={newModel}
+                    onChange={(e) => setNewModel(e.target.value)}
+                  />
+                </div>
+              )}
+              {/* Show current model when editing */}
+              {!selectedProvider && newModel && (
+                <div style={{ fontSize: 11, color: "#a8a6b2", marginTop: 4 }}>
+                  {getLang() === "cn" ? "\u5F53\u524D: " : "Current: "}{newModel}
+                </div>
               )}
             </div>
 
@@ -2200,14 +2335,31 @@ function SetupWizardPage() {
     setLaunchChecks([...checks]);
 
     try {
-      // Step 1: Write config
-      const configJson = generateConfig();
+      // Step 1: Write config (merge with existing to preserve auth token)
+      const newConfig = JSON.parse(generateConfig());
       const tauriInvoke = (window as any).__TAURI__?.invoke;
       if (tauriInvoke) {
         try { await tauriInvoke("run_setup"); } catch {}
-        await tauriInvoke("write_config", { content: configJson });
+        let existing: any = {};
+        try {
+          const raw: string = await tauriInvoke("read_config_file");
+          existing = JSON.parse(raw || "{}");
+        } catch {}
+        const merged = { ...newConfig };
+        merged.gateway = { ...(existing.gateway || {}), ...(newConfig.gateway || {}) };
+        if (existing.gateway?.auth) {
+          merged.gateway.auth = existing.gateway.auth;
+        }
+        const allChannels = { ...(newConfig.channels || {}), ...(existing.channels || {}) };
+        for (const [ch, val] of Object.entries(newConfig.channels || {})) {
+          if (allChannels[ch] && Object.keys(val as any).length > 0) {
+            allChannels[ch] = { ...allChannels[ch], ...(val as any) };
+          }
+        }
+        merged.channels = allChannels;
+        await tauriInvoke("write_config", { content: JSON.stringify(merged, null, 2) });
       } else {
-        await saveConfig({ raw: configJson });
+        await saveConfig({ raw: JSON.stringify(newConfig, null, 2) });
       }
       checks[0].status = "ok";
       checks[1].status = "loading";
@@ -2816,34 +2968,63 @@ interface DoctorCheck {
 
 function DoctorPage() {
   const [checks, setChecks] = useState<DoctorCheck[]>([]);
-  const [running, setRunning] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [fixing, setFixing] = useState(false);
   const [hasRun, setHasRun] = useState(false);
 
-  const handleCheck = async () => {
-    setRunning(true);
+  // Parse CLI output lines into DoctorCheck items
+  const parseOutput = (output: string): DoctorCheck[] => {
+    const lines = output.split("\n");
+    const results: DoctorCheck[] = [];
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.includes("[ok]")) {
+        results.push({ status: "ok", message: trimmed.replace(/\[ok\]/g, "").trim() });
+      } else if (trimmed.includes("[warn]")) {
+        results.push({ status: "warn", message: trimmed.replace(/\[warn\]/g, "").trim() });
+      } else if (trimmed.includes("[fixed]")) {
+        results.push({ status: "fixed", message: trimmed.replace(/\[fixed\]/g, "").trim() });
+      } else if (trimmed.includes("[fix-failed]")) {
+        results.push({ status: "error", message: trimmed.replace(/\[fix-failed\]/g, "").trim() });
+      } else if (trimmed.includes("checks passed")) {
+        results.push({ status: "ok", message: trimmed });
+      }
+    }
+    return results;
+  };
+
+  const runCliDoctor = async (fix: boolean) => {
+    const invoke = (window as any).__TAURI__?.invoke;
+    if (!invoke) {
+      toast.error("Tauri not available");
+      return;
+    }
     try {
-      const data = await runDoctor();
-      setChecks(data.checks || []);
+      const args = fix ? ["doctor", "--fix", "--yes"] : ["doctor"];
+      const output: string = await invoke("run_rsclaw_cli", { args });
+      setChecks(parseOutput(output));
       setHasRun(true);
-    } catch (e) {
-      toast.fromError("Doctor", e);
-    } finally {
-      setRunning(false);
+    } catch (e: any) {
+      // CLI may write to both stdout and stderr; try to parse error output too
+      const errStr = String(e?.message || e || "");
+      const parsed = parseOutput(errStr);
+      if (parsed.length > 0) {
+        setChecks(parsed);
+        setHasRun(true);
+      } else {
+        toast.fromError("Doctor", e);
+      }
     }
   };
 
+  const handleCheck = async () => {
+    setChecking(true);
+    try { await runCliDoctor(false); } finally { setChecking(false); }
+  };
+
   const handleFix = async () => {
-    setRunning(true);
-    try {
-      const data = await runDoctorFix();
-      setChecks(data.checks || []);
-      setHasRun(true);
-      toast.success(Locale.RsClawPanel.Doctor.PageTitle);
-    } catch (e) {
-      toast.fromError("Doctor Fix", e);
-    } finally {
-      setRunning(false);
-    }
+    setFixing(true);
+    try { await runCliDoctor(true); } finally { setFixing(false); }
   };
 
   const statusIcon = (s: string) => {
@@ -2867,16 +3048,16 @@ function DoctorPage() {
           <button
             className={styles["btn"]}
             onClick={handleCheck}
-            disabled={running}
+            disabled={checking || fixing}
           >
-            {running ? Locale.RsClawPanel.Doctor.Running : Locale.RsClawPanel.Doctor.RunCheck}
+            {checking ? Locale.RsClawPanel.Doctor.Running : Locale.RsClawPanel.Doctor.RunCheck}
           </button>
           <button
             className={`${styles["btn"]} ${styles["primary"]}`}
             onClick={handleFix}
-            disabled={running}
+            disabled={checking || fixing}
           >
-            {running ? Locale.RsClawPanel.Doctor.Fixing : Locale.RsClawPanel.Doctor.RunFix}
+            {fixing ? Locale.RsClawPanel.Doctor.Fixing : Locale.RsClawPanel.Doctor.RunFix}
           </button>
         </div>
       </div>
@@ -2992,11 +3173,19 @@ function TauriConfigPageInner() {
       const hasKey = !!apiKey || provDef?.isUrl;
       if (!hasKey) continue;
       // Check if provider has a selected default model in config
-      const defaultModels = config?.agents?.defaults?.models || {};
       let selModel = "";
-      for (const [alias, val] of Object.entries(defaultModels) as [string, any][]) {
-        const modelStr = typeof val === "string" ? val : val?.model || "";
-        if (modelStr.startsWith(provId + "/")) { selModel = modelStr; break; }
+      // Check agents.defaults.model.primary first
+      const primary = config?.agents?.defaults?.model?.primary || "";
+      if (primary.startsWith(provId + "/")) {
+        selModel = primary.split("/").slice(1).join("/");
+      }
+      // Also check agents.defaults.models (alias table)
+      if (!selModel) {
+        const defaultModels = config?.agents?.defaults?.models || {};
+        for (const [, val] of Object.entries(defaultModels) as [string, any][]) {
+          const modelStr = typeof val === "string" ? val : val?.model || "";
+          if (modelStr.startsWith(provId + "/")) { selModel = modelStr.split("/").slice(1).join("/"); break; }
+        }
       }
       // If provider has key configured, mark as connected
       testState[provId] = "ok";
@@ -3115,7 +3304,21 @@ function TauriConfigPageInner() {
 
   // ── Toggle helpers ──
   const toggleProv = (id: string) => {
-    setOpenProvs((prev) => { const s = new Set(prev); if (s.has(id)) s.delete(id); else s.add(id); return s; });
+    setOpenProvs((prev) => {
+      const s = new Set(prev);
+      if (s.has(id)) { s.delete(id); } else {
+        s.add(id);
+        // Auto-test when opening a provider card that has a key but hasn't been tested
+        const apiKey = getVal(`models.providers.${id}.apiKey`, "");
+        const baseUrl = getVal(`models.providers.${id}.baseUrl`, "");
+        const hasKey = !!apiKey || ALL_PROVIDERS[id]?.isUrl;
+        const notTested = !provTest[id] || provTest[id] === "idle";
+        if (hasKey && notTested) {
+          setTimeout(() => handleTestProvider(id), 100);
+        }
+      }
+      return s;
+    });
   };
   const toggleCh = (id: string) => {
     setOpenChs((prev) => { const s = new Set(prev); if (s.has(id)) s.delete(id); else s.add(id); return s; });
@@ -3141,21 +3344,19 @@ function TauriConfigPageInner() {
         res = await testProviderKey(provId, apiKey, baseUrl || undefined);
       }
       if (res.ok || res.success) {
-        setProvTest((prev) => ({ ...prev, [provId]: "ok" }));
-        toast.success(zh ? `${provId} \u8FDE\u63A5\u6210\u529F` : `${provId} connected`);
-        // Use models from test_provider response or fetch separately
-        const apiModels = res.models || [];
+        // Must have models to be considered connected
+        const apiModels: string[] = (res.models || []).map((m: any) => typeof m === "string" ? m : m.id).filter(Boolean);
         if (apiModels.length > 0) {
-          setProvModels((prev) => ({ ...prev, [provId]: apiModels.slice(0, 20).map((m: any) => ({ id: typeof m === "string" ? m : m.id, tag: "" })) }));
-        } else if (!tauriInvoke) {
-          try {
-            const mRes = await listProviderModels(provId, apiKey, baseUrl || undefined);
-            const models = (mRes.models || []).map((m: any) => ({ id: typeof m === "string" ? m : m.id, tag: "" }));
-            setProvModels((prev) => ({ ...prev, [provId]: models.length > 0 ? models : (MODELS[provId] || []).map((m) => ({ id: m.id, tag: zh ? m.tag : m.tagEn })) }));
-          } catch {}
+          setProvTest((prev) => ({ ...prev, [provId]: "ok" }));
+          setProvModels((prev) => ({ ...prev, [provId]: apiModels.slice(0, 30).map((id) => {
+            const fallback = (MODELS[provId] || []).find((fm) => fm.id === id);
+            return { id, tag: fallback ? (zh ? fallback.tag : fallback.tagEn) : "" };
+          }) }));
+          toast.success(zh ? `${provId} \u8FDE\u63A5\u6210\u529F (${apiModels.length} \u4E2A\u6A21\u578B)` : `${provId} connected (${apiModels.length} models)`);
         } else {
-          const fallback = (MODELS[provId] || []).map((m) => ({ id: m.id, tag: zh ? m.tag : m.tagEn }));
-          setProvModels((prev) => ({ ...prev, [provId]: fallback }));
+          // API key works but no models returned
+          setProvTest((prev) => ({ ...prev, [provId]: "err" }));
+          setProvErr((prev) => ({ ...prev, [provId]: zh ? "API Key \u6709\u6548\u4F46\u672A\u83B7\u53D6\u5230\u6A21\u578B\u5217\u8868" : "API Key valid but no models returned" }));
         }
       } else {
         setProvTest((prev) => ({ ...prev, [provId]: "err" }));
@@ -3221,6 +3422,13 @@ function TauriConfigPageInner() {
             if (status === "done") {
               if (qrPollRef.current) clearInterval(qrPollRef.current);
               setQrStatus((prev) => ({ ...prev, [chId]: zh ? "\u2713 \u767B\u5F55\u6210\u529F" : "\u2713 Login success" }));
+              // Reload config to pick up token written by channel login command
+              try {
+                const content: string = await tauriInvoke("read_config_file");
+                const updated = JSON.parse(content || "{}");
+                setConfig(updated);
+                setRaw(JSON.stringify(updated, null, 2));
+              } catch {}
               return;
             }
             // Check for QR image
@@ -3258,30 +3466,36 @@ function TauriConfigPageInner() {
     return [];
   };
 
-  const ensureAccountsObj = (chId: string) => {
-    const chConf = getVal(`channels.${chId}`, {});
-    if (chConf.accounts && typeof chConf.accounts === "object") return;
-    // Migrate flat fields into accounts.default
-    const fields = CRED_FIELDS[chId] || [];
-    const hasFlat = fields.some((f) => chConf[f.key]);
-    if (hasFlat) {
-      const acctData: any = {};
-      fields.forEach((f) => { if (chConf[f.key]) acctData[f.key] = chConf[f.key]; });
-      if (chConf.dmPolicy) acctData.dmPolicy = chConf.dmPolicy;
-      if (chConf.label) acctData.label = chConf.label;
-      updateConfig(`channels.${chId}.accounts`, { default: acctData });
-      // Remove flat fields
-      fields.forEach((f) => { if (chConf[f.key]) deleteConfig(`channels.${chId}.${f.key}`); });
-      if (chConf.dmPolicy) deleteConfig(`channels.${chId}.dmPolicy`);
-    } else {
-      updateConfig(`channels.${chId}.accounts`, {});
-    }
-  };
-
   const addAccount = (chId: string) => {
-    ensureAccountsObj(chId);
+    // Single atomic config update to avoid stale state overwrites
+    const newConfig = JSON.parse(JSON.stringify(config));
+    // Ensure channels.{chId} exists
+    if (!newConfig.channels) newConfig.channels = {};
+    if (!newConfig.channels[chId]) newConfig.channels[chId] = {};
+    const chConf = newConfig.channels[chId];
+
+    // Migrate legacy flat fields into accounts.default if needed
+    if (!chConf.accounts || typeof chConf.accounts !== "object") {
+      const fields = CRED_FIELDS[chId] || [];
+      const hasFlat = fields.some((f) => chConf[f.key]);
+      if (hasFlat) {
+        const acctData: any = {};
+        fields.forEach((f) => { if (chConf[f.key]) { acctData[f.key] = chConf[f.key]; delete chConf[f.key]; } });
+        if (chConf.dmPolicy) { acctData.dmPolicy = chConf.dmPolicy; delete chConf.dmPolicy; }
+        if (chConf.label) { acctData.label = chConf.label; delete chConf.label; }
+        chConf.accounts = { default: acctData };
+      } else {
+        chConf.accounts = {};
+      }
+    }
+
+    // Add the new account
     const newId = chId + "-" + Date.now().toString(36);
-    updateConfig(`channels.${chId}.accounts.${newId}`, { label: "" });
+    chConf.accounts[newId] = { label: "" };
+
+    setConfig(newConfig);
+    setRaw(JSON.stringify(newConfig, null, 2));
+    setDirty(true);
     setOpenChs((prev) => new Set(prev).add(chId));
     setOpenAccts((prev) => ({ ...prev, [`${chId}-${newId}`]: true }));
   };
@@ -3480,45 +3694,81 @@ function TauriConfigPageInner() {
                   <div style={{ maxHeight: isOpen ? 600 : 0, overflow: "hidden", transition: "max-height .28s ease" }}>
                     <div style={{ padding: "0 16px 16px", borderTop: `1px solid ${V.bd}` }}>
                       <div style={{ paddingTop: 14 }}>
-                        <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>{p.keyLabel}</div>
-                        <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-                          <input
-                            style={{ flex: 1, background: V.bg4, border: `1px solid ${testSt === "ok" ? V.green : testSt === "err" ? V.red : V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", transition: "border-color .12s" }}
-                            type={p.isUrl ? "text" : "password"}
-                            placeholder={p.keyPlaceholder}
-                            value={p.isUrl ? (baseUrl || apiKey) : apiKey}
-                            onChange={(e) => {
-                              if (p.isUrl) {
+                        {/* Ollama: single Base URL field */}
+                        {p.id === "ollama" ? (
+                          <div style={{ marginBottom: 8 }}>
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>Base URL</div>
+                            <div style={{ display: "flex", gap: 8 }}>
+                              <input
+                                style={{ flex: 1, background: V.bg4, border: `1px solid ${testSt === "ok" ? V.green : testSt === "err" ? V.red : V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", transition: "border-color .12s" }}
+                                type="text"
+                                placeholder="http://localhost:11434"
+                                value={baseUrl || "http://localhost:11434"}
+                                onChange={(e) => {
+                                  updateConfig(`models.providers.${p.id}.baseUrl`, e.target.value);
+                                  setProvTest((prev) => ({ ...prev, [p.id]: "idle" }));
+                                }}
+                              />
+                              <button onClick={() => handleTestProvider(p.id)} disabled={testSt === "testing"}
+                                style={{ padding: "8px 14px", borderRadius: 7, border: `1px solid ${testSt === "ok" ? V.gbrd : testSt === "err" ? V.rbrd : testSt === "testing" ? V.obrd : V.bd2}`, background: testSt === "ok" ? V.glo : V.bg4, color: testSt === "ok" ? V.green : testSt === "err" ? V.red : testSt === "testing" ? V.or : V.t1, fontSize: 11, fontWeight: 500, cursor: testSt === "testing" ? "not-allowed" : "pointer", whiteSpace: "nowrap", flexShrink: 0, display: "flex", alignItems: "center", gap: 5, transition: "all .13s" }}>
+                                {testSt === "testing" ? <><Spinner />{zh ? "\u8FDE\u63A5\u4E2D" : "Testing"}</> : testSt === "ok" ? (zh ? "\u2713 \u5DF2\u8FDE\u63A5" : "\u2713 Connected") : testSt === "err" ? (zh ? "\u91CD\u65B0\u6D4B\u8BD5" : "Retry") : (zh ? "\u6D4B\u8BD5\u8FDE\u63A5" : "Test")}
+                              </button>
+                            </div>
+                          </div>
+                        ) : p.id === "custom" ? (
+                          /* Custom: Base URL + API Key */
+                          <div style={{ marginBottom: 8 }}>
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>Base URL <span style={{ color: V.t3 }}>{zh ? "(\u4EE5 /v1 \u7ED3\u5C3E)" : "(ending with /v1)"}</span></div>
+                            <input
+                              style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", marginBottom: 8 }}
+                              type="text"
+                              placeholder="https://api.example.com/v1"
+                              value={baseUrl}
+                              onChange={(e) => {
                                 updateConfig(`models.providers.${p.id}.baseUrl`, e.target.value);
-                                updateConfig(`models.providers.${p.id}.apiKey`, e.target.value);
-                              } else {
-                                updateConfig(`models.providers.${p.id}.apiKey`, e.target.value);
-                              }
-                              setProvTest((prev) => ({ ...prev, [p.id]: "idle" }));
-                            }}
-                          />
-                          <button
-                            onClick={() => handleTestProvider(p.id)}
-                            disabled={testSt === "testing"}
-                            style={{ padding: "8px 14px", borderRadius: 7, border: `1px solid ${testSt === "ok" ? V.gbrd : testSt === "err" ? V.rbrd : testSt === "testing" ? V.obrd : V.bd2}`, background: testSt === "ok" ? V.glo : V.bg4, color: testSt === "ok" ? V.green : testSt === "err" ? V.red : testSt === "testing" ? V.or : V.t1, fontSize: 11, fontWeight: 500, cursor: testSt === "testing" ? "not-allowed" : "pointer", whiteSpace: "nowrap", flexShrink: 0, display: "flex", alignItems: "center", gap: 5, transition: "all .13s" }}
-                          >
-                            {testSt === "testing" ? <><Spinner />{zh ? "\u8FDE\u63A5\u4E2D" : "Testing"}</> :
-                             testSt === "ok" ? (zh ? "\u2713 \u5DF2\u8FDE\u63A5" : "\u2713 Connected") :
-                             testSt === "err" ? (zh ? "\u91CD\u65B0\u6D4B\u8BD5" : "Retry") :
-                             (zh ? "\u6D4B\u8BD5\u8FDE\u63A5" : "Test")}
-                          </button>
-                        </div>
-                        {/* Base URL only for ollama/custom */}
-                        {(p.id === "ollama" || p.id === "custom") && (<div style={{ marginBottom: 8 }}>
-                          <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 4 }}>Base URL <span style={{ color: V.t3 }}>{p.isUrl ? "" : (zh ? "(\u53EF\u9009)" : "(optional)")}</span></div>
-                          <input
-                            style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "7px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11, outline: "none" }}
-                            type="text"
-                            placeholder={p.isUrl ? "http://localhost:11434/v1" : (zh ? "\u9ED8\u8BA4" : "default")}
-                            value={baseUrl}
-                            onChange={(e) => updateConfig(`models.providers.${p.id}.baseUrl`, e.target.value)}
-                          />
-                        </div>)}
+                                setProvTest((prev) => ({ ...prev, [p.id]: "idle" }));
+                              }}
+                            />
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>API Key <span style={{ color: V.t3 }}>{zh ? "(\u53EF\u9009)" : "(optional)"}</span></div>
+                            <div style={{ display: "flex", gap: 8 }}>
+                              <input
+                                style={{ flex: 1, background: V.bg4, border: `1px solid ${testSt === "ok" ? V.green : testSt === "err" ? V.red : V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", transition: "border-color .12s" }}
+                                type="password"
+                                placeholder="sk-..."
+                                value={apiKey}
+                                onChange={(e) => {
+                                  updateConfig(`models.providers.${p.id}.apiKey`, e.target.value);
+                                  setProvTest((prev) => ({ ...prev, [p.id]: "idle" }));
+                                }}
+                              />
+                              <button onClick={() => handleTestProvider(p.id)} disabled={testSt === "testing"}
+                                style={{ padding: "8px 14px", borderRadius: 7, border: `1px solid ${testSt === "ok" ? V.gbrd : testSt === "err" ? V.rbrd : testSt === "testing" ? V.obrd : V.bd2}`, background: testSt === "ok" ? V.glo : V.bg4, color: testSt === "ok" ? V.green : testSt === "err" ? V.red : testSt === "testing" ? V.or : V.t1, fontSize: 11, fontWeight: 500, cursor: testSt === "testing" ? "not-allowed" : "pointer", whiteSpace: "nowrap", flexShrink: 0, display: "flex", alignItems: "center", gap: 5, transition: "all .13s" }}>
+                                {testSt === "testing" ? <><Spinner />{zh ? "\u8FDE\u63A5\u4E2D" : "Testing"}</> : testSt === "ok" ? (zh ? "\u2713 \u5DF2\u8FDE\u63A5" : "\u2713 Connected") : testSt === "err" ? (zh ? "\u91CD\u65B0\u6D4B\u8BD5" : "Retry") : (zh ? "\u6D4B\u8BD5\u8FDE\u63A5" : "Test")}
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          /* Standard providers: API Key field */
+                          <div style={{ marginBottom: 8 }}>
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>{p.keyLabel}</div>
+                            <div style={{ display: "flex", gap: 8 }}>
+                              <input
+                                style={{ flex: 1, background: V.bg4, border: `1px solid ${testSt === "ok" ? V.green : testSt === "err" ? V.red : V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", transition: "border-color .12s" }}
+                                type="password"
+                                placeholder={p.keyPlaceholder}
+                                value={apiKey}
+                                onChange={(e) => {
+                                  updateConfig(`models.providers.${p.id}.apiKey`, e.target.value);
+                                  setProvTest((prev) => ({ ...prev, [p.id]: "idle" }));
+                                }}
+                              />
+                              <button onClick={() => handleTestProvider(p.id)} disabled={testSt === "testing"}
+                                style={{ padding: "8px 14px", borderRadius: 7, border: `1px solid ${testSt === "ok" ? V.gbrd : testSt === "err" ? V.rbrd : testSt === "testing" ? V.obrd : V.bd2}`, background: testSt === "ok" ? V.glo : V.bg4, color: testSt === "ok" ? V.green : testSt === "err" ? V.red : testSt === "testing" ? V.or : V.t1, fontSize: 11, fontWeight: 500, cursor: testSt === "testing" ? "not-allowed" : "pointer", whiteSpace: "nowrap", flexShrink: 0, display: "flex", alignItems: "center", gap: 5, transition: "all .13s" }}>
+                                {testSt === "testing" ? <><Spinner />{zh ? "\u8FDE\u63A5\u4E2D" : "Testing"}</> : testSt === "ok" ? (zh ? "\u2713 \u5DF2\u8FDE\u63A5" : "\u2713 Connected") : testSt === "err" ? (zh ? "\u91CD\u65B0\u6D4B\u8BD5" : "Retry") : (zh ? "\u6D4B\u8BD5\u8FDE\u63A5" : "Test")}
+                              </button>
+                            </div>
+                          </div>
+                        )}
                         {/* Error message */}
                         {testSt === "err" && errMsg && (
                           <div style={{ fontSize: 11, color: V.red, marginBottom: 8, padding: "6px 10px", background: V.rlo, border: `1px solid ${V.rbrd}`, borderRadius: 6 }}>{errMsg}</div>
@@ -3609,7 +3859,7 @@ function TauriConfigPageInner() {
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
                       {connCount > 0 ? (
-                        <span style={{ fontSize: 9.5, padding: "2px 8px", borderRadius: 20, fontFamily: V.mono, fontWeight: 500, background: V.glo, color: V.green, border: `1px solid ${V.gbrd}` }}>{connCount} connected</span>
+                        <span style={{ fontSize: 9.5, padding: "2px 8px", borderRadius: 20, fontFamily: V.mono, fontWeight: 500, background: V.glo, color: V.green, border: `1px solid ${V.gbrd}` }}>{connCount} {zh ? "\u5DF2\u914D\u7F6E" : "configured"}</span>
                       ) : (
                         <span style={{ fontSize: 9.5, padding: "2px 8px", borderRadius: 20, fontFamily: V.mono, fontWeight: 500, background: V.bg4, color: V.t2, border: `1px solid ${V.bd2}` }}>{zh ? "\u672A\u914D\u7F6E" : "none"}</span>
                       )}
@@ -3645,9 +3895,9 @@ function TauriConfigPageInner() {
                               </div>
                               <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
                                 {hasAnyCred ? (
-                                  <span style={{ fontSize: 9, padding: "2px 7px", borderRadius: 20, fontFamily: V.mono, fontWeight: 500, background: V.glo, color: V.green, border: `1px solid ${V.gbrd}` }}>connected</span>
+                                  <span style={{ fontSize: 9, padding: "2px 7px", borderRadius: 20, fontFamily: V.mono, fontWeight: 500, background: V.glo, color: V.green, border: `1px solid ${V.gbrd}` }}>{c.hasQr ? (zh ? "\u5DF2\u8FDE\u63A5" : "connected") : (zh ? "\u5DF2\u914D\u7F6E" : "configured")}</span>
                                 ) : (
-                                  <span style={{ fontSize: 9, padding: "2px 7px", borderRadius: 20, fontFamily: V.mono, fontWeight: 500, background: V.bg4, color: V.t2, border: `1px solid ${V.bd2}` }}>idle</span>
+                                  <span style={{ fontSize: 9, padding: "2px 7px", borderRadius: 20, fontFamily: V.mono, fontWeight: 500, background: V.bg4, color: V.t2, border: `1px solid ${V.bd2}` }}>{zh ? "\u672A\u914D\u7F6E" : "idle"}</span>
                                 )}
                                 <Chevron open={aOpen} />
                               </div>
@@ -3715,15 +3965,6 @@ function TauriConfigPageInner() {
                                             <input style={{ ...fInput, width: "100%", minWidth: 0 }} type={f.type} placeholder={f.ph} value={getVal(`${aPath}.${f.key}`, "")} onChange={(e) => updateConfig(`${aPath}.${f.key}`, e.target.value)} />
                                           </div>
                                         ))}
-                                        {/* DM Policy for channels that support it */}
-                                        {(c.id === "wechat" || c.id === "wecom" || c.id === "telegram") && (
-                                          <div style={{ marginBottom: 10 }}>
-                                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, letterSpacing: 0.3, marginBottom: 4 }}>DM Policy</div>
-                                            <select style={{ ...fSelect, width: "100%", minWidth: 0 }} value={getVal(`${aPath}.dmPolicy`, "open")} onChange={(e) => updateConfig(`${aPath}.dmPolicy`, e.target.value)}>
-                                              {DM_POLICIES.map((p) => <option key={p} value={p}>{p}</option>)}
-                                            </select>
-                                          </div>
-                                        )}
                                         {/* Brand select for feishu */}
                                         {c.id === "feishu" && (
                                           <div style={{ marginBottom: 10 }}>
@@ -3746,15 +3987,6 @@ function TauriConfigPageInner() {
                                         <input style={{ ...fInput, width: "100%", minWidth: 0 }} type={f.type} placeholder={f.ph} value={getVal(`${aPath}.${f.key}`, "")} onChange={(e) => updateConfig(`${aPath}.${f.key}`, e.target.value)} />
                                       </div>
                                     ))}
-                                    {/* DM Policy for telegram */}
-                                    {c.id === "telegram" && (
-                                      <div style={{ marginBottom: 10 }}>
-                                        <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, letterSpacing: 0.3, marginBottom: 4 }}>DM Policy</div>
-                                        <select style={{ ...fSelect, width: "100%", minWidth: 0 }} value={getVal(`${aPath}.dmPolicy`, "open")} onChange={(e) => updateConfig(`${aPath}.dmPolicy`, e.target.value)}>
-                                          {DM_POLICIES.map((p) => <option key={p} value={p}>{p}</option>)}
-                                        </select>
-                                      </div>
-                                    )}
                                     {fields.length === 0 && (
                                       <div style={{ fontSize: 11, color: V.t3, padding: "10px 0" }}>{zh ? "\u6B64\u901A\u9053\u65E0\u989D\u5916\u51ED\u8BC1\u5B57\u6BB5" : "No credential fields for this channel"}</div>
                                     )}
@@ -3763,10 +3995,34 @@ function TauriConfigPageInner() {
 
                                 {/* Delete button at bottom */}
                                 <div style={{ display: "flex", justifyContent: "space-between", marginTop: 12, paddingTop: 10, borderTop: `1px solid ${V.bd}` }}>
-                                  <button onClick={() => removeAccount(c.id, acct.id)}
-                                    style={{ fontSize: 11, padding: "5px 12px", borderRadius: 5, cursor: "pointer", background: V.rlo, color: V.red, border: `1px solid ${V.rbrd}`, fontFamily: V.mono, transition: "all .12s" }}>
-                                    {zh ? "\u5220\u9664" : "Delete"}
-                                  </button>
+                                  <div style={{ position: "relative", display: "inline-block" }}>
+                                    <button onClick={() => setOpenAccts((prev) => ({ ...prev, [`del-${c.id}-${acct.id}`]: !prev[`del-${c.id}-${acct.id}`] }))}
+                                      style={{ fontSize: 11, padding: "5px 12px", borderRadius: 5, cursor: "pointer", background: V.rlo, color: V.red, border: `1px solid ${V.rbrd}`, fontFamily: V.mono, transition: "all .12s" }}>
+                                      {zh ? "\u5220\u9664" : "Delete"}
+                                    </button>
+                                    {openAccts[`del-${c.id}-${acct.id}`] && (
+                                      <div onClick={(e) => e.stopPropagation()} style={{
+                                        position: "absolute", bottom: "100%", right: 0, marginBottom: 6,
+                                        padding: "10px 12px", minWidth: 160,
+                                        background: "var(--white)", border: "1px solid var(--border-in-light)",
+                                        borderRadius: 8, boxShadow: "0 4px 12px rgba(0,0,0,0.3)", zIndex: 100,
+                                      }}>
+                                        <div style={{ fontSize: 11, color: "var(--black)", marginBottom: 8 }}>
+                                          {zh ? `\u786E\u8BA4\u5220\u9664\u8D26\u53F7 ${acctLabel || acct.id}\uFF1F` : `Delete account ${acctLabel || acct.id}?`}
+                                        </div>
+                                        <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+                                          <button onClick={() => setOpenAccts((prev) => ({ ...prev, [`del-${c.id}-${acct.id}`]: false }))}
+                                            style={{ fontSize: 10, padding: "3px 10px", borderRadius: 5, border: "1px solid var(--border-in-light)", background: "transparent", color: "var(--black)", cursor: "pointer" }}>
+                                            {zh ? "\u53D6\u6D88" : "Cancel"}
+                                          </button>
+                                          <button onClick={() => { removeAccount(c.id, acct.id); setOpenAccts((prev) => ({ ...prev, [`del-${c.id}-${acct.id}`]: false })); }}
+                                            style={{ fontSize: 10, padding: "3px 10px", borderRadius: 5, border: "none", cursor: "pointer", fontWeight: 600, background: "#d95f5f", color: "#fff" }}>
+                                            {zh ? "\u5220\u9664" : "Delete"}
+                                          </button>
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
                                 </div>
                               </div>
                             </div>
@@ -3780,6 +4036,63 @@ function TauriConfigPageInner() {
                         <span style={{ fontSize: 16, lineHeight: "1", verticalAlign: "middle", marginRight: 4 }}>+</span>
                         {zh ? "\u6DFB\u52A0\u8D26\u53F7" : "Add Account"}
                       </button>
+
+                      {/* Channel-level policies (shared across all accounts) */}
+                      {accounts.length > 0 && (
+                        <div style={{ marginTop: 12, padding: "12px 14px", background: V.bg3, border: `1px solid ${V.bd}`, borderRadius: 9 }}>
+                          <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, letterSpacing: 0.3, marginBottom: 8, textTransform: "uppercase" }}>
+                            {zh ? "\u901A\u9053\u7B56\u7565" : "Channel Policies"}
+                          </div>
+                          {/* DM Policy */}
+                          <div style={{ marginBottom: 10 }}>
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, letterSpacing: 0.3, marginBottom: 4 }}>dmPolicy</div>
+                            <select style={{ ...fSelect, width: "100%", minWidth: 0 }} value={getVal(`channels.${c.id}.dmPolicy`, "pairing")} onChange={(e) => updateConfig(`channels.${c.id}.dmPolicy`, e.target.value)}>
+                              {DM_POLICIES.map((p) => <option key={p} value={p}>{p}</option>)}
+                            </select>
+                          </div>
+                          {/* allowFrom - shown when dmPolicy=allowlist */}
+                          {getVal(`channels.${c.id}.dmPolicy`, "pairing") === "allowlist" && (
+                            <div style={{ marginBottom: 10 }}>
+                              <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, letterSpacing: 0.3, marginBottom: 4 }}>
+                                allowFrom <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u6BCF\u884C\u4E00\u4E2A\u7528\u6237 ID)" : "(one user ID per line)"}</span>
+                              </div>
+                              <textarea
+                                style={{ ...fInput, width: "100%", minWidth: 0, minHeight: 60, resize: "vertical", fontFamily: V.mono, fontSize: 11, lineHeight: 1.6 }}
+                                placeholder={zh ? "\u7528\u6237ID1\n\u7528\u6237ID2\n..." : "user_id_1\nuser_id_2\n..."}
+                                value={(getVal(`channels.${c.id}.allowFrom`, []) as string[]).join("\n")}
+                                onChange={(e) => {
+                                  const ids = e.target.value.split("\n").map((s: string) => s.trim()).filter(Boolean);
+                                  updateConfig(`channels.${c.id}.allowFrom`, ids);
+                                }}
+                              />
+                            </div>
+                          )}
+                          {/* Group Policy */}
+                          <div style={{ marginBottom: 10 }}>
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, letterSpacing: 0.3, marginBottom: 4 }}>groupPolicy</div>
+                            <select style={{ ...fSelect, width: "100%", minWidth: 0 }} value={getVal(`channels.${c.id}.groupPolicy`, "allowlist")} onChange={(e) => updateConfig(`channels.${c.id}.groupPolicy`, e.target.value)}>
+                              {["allowlist", "open", "disabled"].map((p) => <option key={p} value={p}>{p}</option>)}
+                            </select>
+                          </div>
+                          {/* groupAllowFrom - shown when groupPolicy=allowlist */}
+                          {getVal(`channels.${c.id}.groupPolicy`, "allowlist") === "allowlist" && (
+                            <div>
+                              <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, letterSpacing: 0.3, marginBottom: 4 }}>
+                                groupAllowFrom <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u6BCF\u884C\u4E00\u4E2A\u7FA4 ID)" : "(one group ID per line)"}</span>
+                              </div>
+                              <textarea
+                                style={{ ...fInput, width: "100%", minWidth: 0, minHeight: 60, resize: "vertical", fontFamily: V.mono, fontSize: 11, lineHeight: 1.6 }}
+                                placeholder={zh ? "\u7FA4ID1\n\u7FA4ID2\n..." : "group_id_1\ngroup_id_2\n..."}
+                                value={(getVal(`channels.${c.id}.groupAllowFrom`, []) as string[]).join("\n")}
+                                onChange={(e) => {
+                                  const ids = e.target.value.split("\n").map((s: string) => s.trim()).filter(Boolean);
+                                  updateConfig(`channels.${c.id}.groupAllowFrom`, ids);
+                                }}
+                              />
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -4107,6 +4420,10 @@ function CronTaskPage() {
                       <button onClick={() => openEdit(job)}
                         style={{ padding: "4px 9px", borderRadius: 6, border: `1px solid ${V2.bd2}`, background: "transparent", color: V2.t2, fontSize: 10, fontWeight: 500, cursor: "pointer" }}>
                         {zh ? "\u7F16\u8F91" : "Edit"}
+                      </button>
+                      <button onClick={() => { if (window.confirm(zh ? `\u786E\u8BA4\u5220\u9664 "${job.name || job.id}"\uFF1F` : `Delete "${job.name || job.id}"?`)) deleteJob(job.id); }}
+                        style={{ padding: "4px 9px", borderRadius: 6, border: "1px solid rgba(217,95,95,.2)", background: "transparent", color: "rgba(217,95,95,.7)", fontSize: 10, fontWeight: 500, cursor: "pointer" }}>
+                        {zh ? "\u5220\u9664" : "Delete"}
                       </button>
                       <Toggle checked={job.enabled} onChange={() => toggleJob(job)} />
                     </div>
@@ -4602,11 +4919,6 @@ export function RsClawPanel() {
             >
               <span className={styles["rsp-item-icon"]}>&#x1F4E1;</span>
               {Locale.RsClawPanel.Nav.GatewayStatus}
-              <span
-                className={`${styles["rsp-badge"]} ${gatewayRunning ? styles["green"] : styles["amber"]}`}
-              >
-                {gatewayRunning ? Locale.RsClawPanel.Running : Locale.RsClawPanel.Offline}
-              </span>
             </button>
 
             <div className={styles["rsp-section"]}>{Locale.RsClawPanel.Nav.Config}</div>
@@ -4621,7 +4933,7 @@ export function RsClawPanel() {
               className={`${styles["rsp-item"]} ${activePage === "pairing" ? styles["active"] : ""}`}
               onClick={() => setActivePage("pairing")}
             >
-              <span className={styles["rsp-item-icon"]}>&#x2705;</span>
+              <span className={styles["rsp-item-icon"]}>&#x1F510;</span>
               {getLang() === "cn" ? "\u914D\u5BF9\u5BA1\u6279" : "Pairing Approval"}
             </button>
 

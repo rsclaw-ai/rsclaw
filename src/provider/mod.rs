@@ -101,8 +101,7 @@ pub struct LlmRequest {
 pub enum StreamEvent {
     /// Assistant text delta
     TextDelta(String),
-    /// Reasoning/thinking delta (collected separately, used as fallback if
-    /// content is empty)
+    /// Reasoning/thinking delta (collected separately, used as fallback if content is empty)
     ReasoningDelta(String),
     /// Tool call requested by the model
     ToolCall {

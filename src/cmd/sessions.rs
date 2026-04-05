@@ -14,10 +14,7 @@ pub async fn cmd_sessions(sub: SessionsCommand) -> Result<()> {
                 if args.json {
                     println!("[]");
                 } else {
-                    banner(&format!(
-                        "rsclaw sessions v{}",
-                        env!("RSCLAW_BUILD_VERSION")
-                    ));
+                    banner(&format!("rsclaw sessions v{}", env!("RSCLAW_BUILD_VERSION")));
                     warn_msg("no sessions");
                 }
             } else if args.json {
@@ -27,10 +24,7 @@ pub async fn cmd_sessions(sub: SessionsCommand) -> Result<()> {
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&arr)?);
             } else {
-                banner(&format!(
-                    "rsclaw sessions v{}",
-                    env!("RSCLAW_BUILD_VERSION")
-                ));
+                banner(&format!("rsclaw sessions v{}", env!("RSCLAW_BUILD_VERSION")));
                 kv("total", &bold(&sessions.len().to_string()));
                 println!();
                 for s in &sessions {
@@ -69,10 +63,7 @@ pub async fn cmd_sessions(sub: SessionsCommand) -> Result<()> {
                     store.db.delete_session(k)?;
                     deleted += 1;
                 }
-                ok(&format!(
-                    "deleted {} session(s)",
-                    bold(&deleted.to_string())
-                ));
+                ok(&format!("deleted {} session(s)", bold(&deleted.to_string())));
             }
         }
     }

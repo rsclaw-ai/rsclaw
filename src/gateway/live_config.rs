@@ -78,16 +78,9 @@ impl LiveConfig {
         // config snapshot from startup.
         {
             let old_agents = self.agents.read().await;
-            let old_primary = old_agents
-                .defaults
-                .model
-                .as_ref()
+            let old_primary = old_agents.defaults.model.as_ref()
                 .and_then(|m| m.primary.as_deref());
-            let new_primary = new
-                .agents
-                .defaults
-                .model
-                .as_ref()
+            let new_primary = new.agents.defaults.model.as_ref()
                 .and_then(|m| m.primary.as_deref());
             if old_primary != new_primary || old_agents.list.len() != new.agents.list.len() {
                 restart_fields.push("agents/model".to_owned());
@@ -194,7 +187,6 @@ mod tests {
             channel_max_restarts_per_hour: 10,
             auth_token_configured: false,
             auth_token_is_plaintext: false,
-            bind_address: None,
         }
     }
 

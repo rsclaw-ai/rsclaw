@@ -88,7 +88,7 @@ interface WizText {
 const T: Record<WizLang, WizText> = {
   cn: {
     welcome: "\u5F00\u59CB\u8BBE\u7F6E",
-    subtitle: "\u8783\u87F9\u9AD8\u6027\u80FD\u591A\u667A\u80FD\u4F53AI\u5F15\u64CE \u00B7 Multi-Agent AI Engine",
+    subtitle: "\u8783\u87F9\u9AD8\u6027\u80FD\u591A\u667A\u80FD\u4F53AI\u5F15\u64CE \u00B7 Multi-Agent AI Gateway",
     step1Title: "\u68C0\u6D4B\u73AF\u5883",
     step1Sub: "\u68C0\u67E5 rsclaw \u662F\u5426\u5DF2\u5B89\u88C5\uFF0C\u4EE5\u53CA\u662F\u5426\u6709 OpenClaw \u6570\u636E\u53EF\u8FC1\u79FB\u3002",
     step2Title: "\u9009\u62E9 LLM \u63D0\u4F9B\u5546",
@@ -150,7 +150,7 @@ const T: Record<WizLang, WizText> = {
   },
   en: {
     welcome: "Get started",
-    subtitle: "Multi-Agent AI Engine \u00B7 High-Performance Engine",
+    subtitle: "Multi-Agent AI Gateway \u00B7 High-Performance Engine",
     step1Title: "Environment check",
     step1Sub: "Check if rsclaw is installed and if there is OpenClaw data to migrate.",
     step2Title: "Choose LLM provider",
@@ -336,7 +336,7 @@ const T: Record<WizLang, WizText> = {
   },
   de: {
     welcome: "Einrichtung starten",
-    subtitle: "Multi-Agent AI Engine \u00B7 Hochleistungs-Engine",
+    subtitle: "Multi-Agent AI Gateway \u00B7 Hochleistungs-Engine",
     step1Title: "Umgebung pr\u00FCfen",
     step1Sub: "Pr\u00FCft, ob rsclaw installiert ist.",
     step2Title: "LLM-Anbieter w\u00E4hlen",
@@ -584,7 +584,7 @@ const T: Record<WizLang, WizText> = {
   },
   th: {
     welcome: "\u0E40\u0E23\u0E34\u0E48\u0E21\u0E15\u0E31\u0E49\u0E07\u0E04\u0E48\u0E32",
-    subtitle: "Multi-Agent AI Engine \u00B7 \u0E40\u0E04\u0E23\u0E37\u0E48\u0E2D\u0E07\u0E22\u0E19\u0E15\u0E4C\u0E1B\u0E23\u0E30\u0E2A\u0E34\u0E17\u0E18\u0E34\u0E20\u0E32\u0E1E\u0E2A\u0E39\u0E07",
+    subtitle: "Multi-Agent AI Gateway \u00B7 \u0E40\u0E04\u0E23\u0E37\u0E48\u0E2D\u0E07\u0E22\u0E19\u0E15\u0E4C\u0E1B\u0E23\u0E30\u0E2A\u0E34\u0E17\u0E18\u0E34\u0E20\u0E32\u0E1E\u0E2A\u0E39\u0E07",
     step1Title: "\u0E15\u0E23\u0E27\u0E08\u0E2A\u0E2D\u0E1A\u0E2A\u0E20\u0E32\u0E1E\u0E41\u0E27\u0E14\u0E25\u0E49\u0E2D\u0E21",
     step1Sub: "\u0E15\u0E23\u0E27\u0E08\u0E2A\u0E2D\u0E1A\u0E27\u0E48\u0E32 rsclaw \u0E15\u0E34\u0E14\u0E15\u0E31\u0E49\u0E07\u0E41\u0E25\u0E49\u0E27\u0E2B\u0E23\u0E37\u0E2D\u0E44\u0E21\u0E48",
     step2Title: "\u0E40\u0E25\u0E37\u0E2D\u0E01\u0E1C\u0E39\u0E49\u0E43\u0E2B\u0E49\u0E1A\u0E23\u0E34\u0E01\u0E32\u0E23 LLM",
@@ -646,7 +646,7 @@ const T: Record<WizLang, WizText> = {
   },
   vi: {
     welcome: "B\u1EAFt \u0111\u1EA7u thi\u1EBFt l\u1EADp",
-    subtitle: "Multi-Agent AI Engine \u00B7 \u0110\u1ED9ng c\u01A1 hi\u1EC7u su\u1EA5t cao",
+    subtitle: "Multi-Agent AI Gateway \u00B7 \u0110\u1ED9ng c\u01A1 hi\u1EC7u su\u1EA5t cao",
     step1Title: "Ki\u1EC3m tra m\u00F4i tr\u01B0\u1EDDng",
     step1Sub: "Ki\u1EC3m tra xem rsclaw \u0111\u00E3 c\u00E0i \u0111\u1EB7t ch\u01B0a.",
     step2Title: "Ch\u1ECDn nh\u00E0 cung c\u1EA5p LLM",
@@ -838,24 +838,58 @@ export interface ChannelDef {
   hasQr: boolean;
   qrLabel?: string;
   qrLabelEn?: string;
-  credFields: { label: string; labelEn: string; type: string; placeholder: string }[];
+  credFields: { key: string; label: string; type: string; ph: string }[];
 }
 
 // All channels (lookup)
 export const ALL_CHANNELS: Record<string, ChannelDef> = {
-  feishu:   { id: "feishu",   icon: "\u98DE", name: "\u98DE\u4E66 / Lark", nameEn: "Feishu / Lark",  hasQr: true, qrLabel: "\u626B\u7801", qrLabelEn: "QR", credFields: [] },
+  feishu:   { id: "feishu",   icon: "\u98DE", name: "\u98DE\u4E66 / Lark", nameEn: "Feishu / Lark",  hasQr: true, qrLabel: "\u626B\u7801", qrLabelEn: "QR", credFields: [
+    { key: "appId", label: "App ID", type: "text", ph: "cli_xxx" },
+    { key: "appSecret", label: "App Secret", type: "password", ph: "" },
+  ] },
   wechat:   { id: "wechat",   icon: "\u5FAE", name: "\u5FAE\u4FE1",        nameEn: "Weixin",         hasQr: true, qrLabel: "\u626B\u7801", qrLabelEn: "QR", credFields: [] },
-  wecom:    { id: "wecom",    icon: "WC",     name: "\u4F01\u4E1A\u5FAE\u4FE1", nameEn: "WeCom",     hasQr: false, credFields: [] },
-  qq:       { id: "qq",       icon: "QQ",     name: "QQ Bot",              nameEn: "QQ Bot",          hasQr: false, credFields: [] },
-  dingtalk: { id: "dingtalk", icon: "DT",     name: "\u9489\u9489",        nameEn: "DingTalk",        hasQr: false, credFields: [] },
-  telegram: { id: "telegram", icon: "Tg",     name: "Telegram",            nameEn: "Telegram",        hasQr: false, credFields: [] },
-  matrix:   { id: "matrix",   icon: "Mx",     name: "Matrix",              nameEn: "Matrix",          hasQr: false, credFields: [] },
-  discord:  { id: "discord",  icon: "Dc",     name: "Discord",             nameEn: "Discord",         hasQr: false, credFields: [] },
-  slack:    { id: "slack",    icon: "Sl",     name: "Slack",               nameEn: "Slack",           hasQr: false, credFields: [] },
-  whatsapp: { id: "whatsapp", icon: "WA",     name: "WhatsApp",            nameEn: "WhatsApp",        hasQr: false, credFields: [] },
-  signal:   { id: "signal",   icon: "Sg",     name: "Signal",              nameEn: "Signal",          hasQr: false, credFields: [] },
-  line:     { id: "line",     icon: "Li",     name: "LINE",                nameEn: "LINE",            hasQr: false, credFields: [] },
-  zalo:     { id: "zalo",     icon: "Za",     name: "Zalo",                nameEn: "Zalo",            hasQr: false, credFields: [] },
+  wecom:    { id: "wecom",    icon: "WC",     name: "\u4F01\u4E1A\u5FAE\u4FE1", nameEn: "WeCom",     hasQr: false, credFields: [
+    { key: "botId", label: "Bot ID", type: "text", ph: "" },
+    { key: "secret", label: "Secret", type: "password", ph: "" },
+  ] },
+  qq:       { id: "qq",       icon: "QQ",     name: "QQ Bot",              nameEn: "QQ Bot",          hasQr: false, credFields: [
+    { key: "appId", label: "App ID", type: "text", ph: "" },
+    { key: "appSecret", label: "App Secret", type: "password", ph: "" },
+  ] },
+  dingtalk: { id: "dingtalk", icon: "DT",     name: "\u9489\u9489",        nameEn: "DingTalk",        hasQr: false, credFields: [
+    { key: "appKey", label: "App Key", type: "text", ph: "" },
+    { key: "appSecret", label: "App Secret", type: "password", ph: "" },
+  ] },
+  telegram: { id: "telegram", icon: "Tg",     name: "Telegram",            nameEn: "Telegram",        hasQr: false, credFields: [
+    { key: "botToken", label: "Bot Token", type: "password", ph: "123456:ABC-DEF..." },
+  ] },
+  matrix:   { id: "matrix",   icon: "Mx",     name: "Matrix",              nameEn: "Matrix",          hasQr: false, credFields: [
+    { key: "homeserver", label: "Homeserver", type: "text", ph: "https://matrix.org" },
+    { key: "userId", label: "User ID", type: "text", ph: "@bot:matrix.org" },
+    { key: "accessToken", label: "Access Token", type: "password", ph: "" },
+  ] },
+  discord:  { id: "discord",  icon: "Dc",     name: "Discord",             nameEn: "Discord",         hasQr: false, credFields: [
+    { key: "token", label: "Bot Token", type: "password", ph: "" },
+  ] },
+  slack:    { id: "slack",    icon: "Sl",     name: "Slack",               nameEn: "Slack",           hasQr: false, credFields: [
+    { key: "botToken", label: "Bot Token", type: "password", ph: "xoxb-..." },
+    { key: "appToken", label: "App Token", type: "password", ph: "xapp-..." },
+  ] },
+  whatsapp: { id: "whatsapp", icon: "WA",     name: "WhatsApp",            nameEn: "WhatsApp",        hasQr: false, credFields: [
+    { key: "phoneNumberId", label: "Phone Number ID", type: "text", ph: "" },
+    { key: "accessToken", label: "Access Token", type: "password", ph: "" },
+  ] },
+  signal:   { id: "signal",   icon: "Sg",     name: "Signal",              nameEn: "Signal",          hasQr: false, credFields: [
+    { key: "phone", label: "Phone Number", type: "text", ph: "+1234567890" },
+  ] },
+  line:     { id: "line",     icon: "Li",     name: "LINE",                nameEn: "LINE",            hasQr: false, credFields: [
+    { key: "channelSecret", label: "Channel Secret", type: "password", ph: "" },
+    { key: "channelAccessToken", label: "Access Token", type: "password", ph: "" },
+  ] },
+  zalo:     { id: "zalo",     icon: "Za",     name: "Zalo",                nameEn: "Zalo",            hasQr: false, credFields: [
+    { key: "accessToken", label: "Access Token", type: "password", ph: "" },
+    { key: "oaSecret", label: "OA Secret", type: "password", ph: "" },
+  ] },
 };
 
 export const CH_ORDER_ZH = ["feishu","wechat","wecom","qq","dingtalk","telegram","matrix","discord","slack","whatsapp","signal","line","zalo"];
@@ -1648,7 +1682,8 @@ export function OnboardingPage() {
       }
       setTimeout(() => {
         markSetupComplete();
-        navigate(Path.Home);
+        // Reload to ensure auth token is picked up by all modules
+        window.location.href = "/";
       }, 2000);
     } catch (e: any) {
       setMigrateResult("error");
@@ -1781,13 +1816,10 @@ export function OnboardingPage() {
     setChs((prev) => {
       const c: Record<string, any> = {};
       for (const [k, v] of Object.entries(prev)) {
-        c[k] = { ...v, enabled: k === id };
+        c[k] = { ...v, enabled: k === id ? !v.enabled : false };
       }
       return c;
     });
-    if (id === "wechat" || id === "feishu") {
-      startChannelQr(id);
-    }
   };
 
   const setChTab = (chId: string, tab: "qr" | "cred") => {
@@ -1833,9 +1865,17 @@ export function OnboardingPage() {
           const status: string = await tauriInvoke("channel_login_status");
           if (status === "done") {
             if (qrPollRef.current) clearInterval(qrPollRef.current);
+            // Read credentials written by sidecar into state
+            let loginCreds: Record<string, string> = {};
+            try {
+              const raw: string = await tauriInvoke("read_config_file");
+              const cfg = JSON.parse(raw || "{}");
+              const chCfg = cfg?.channels?.[channelId] || {};
+              loginCreds = { ...chCfg };
+            } catch {}
             setChs((prev) => {
               const c = { ...prev };
-              c[channelId] = { ...c[channelId], qrStatus: "confirmed" };
+              c[channelId] = { ...c[channelId], qrStatus: "confirmed", credValues: { ...c[channelId]?.credValues, ...loginCreds } };
               return c;
             });
             return;
@@ -1944,15 +1984,50 @@ export function OnboardingPage() {
       const userPort = parseInt(port) || 18888;
       setGatewayUrl(`http://localhost:${userPort}`);
 
-      // 1: write config
+      // 1: write config (merge with existing to preserve QR login tokens)
       update(0, "loading");
-      const configJson = generateConfig();
+      const newConfig = JSON.parse(generateConfig());
       const tauriInvoke = (window as any).__TAURI__?.invoke;
       if (tauriInvoke) {
         try { await tauriInvoke("run_setup"); } catch {} // may fail without tty, ok
-        await tauriInvoke("write_config", { content: configJson });
+        // Read existing config (may contain botToken from QR login)
+        let existing: any = {};
+        try {
+          const raw: string = await tauriInvoke("read_config_file");
+          existing = JSON.parse(raw || "{}");
+        } catch {}
+        // Deep merge: preserve auth token, channel credentials from existing config
+        const merged = { ...newConfig };
+        // Preserve gateway.auth from setup-generated config
+        merged.gateway = { ...(existing.gateway || {}), ...(newConfig.gateway || {}) };
+        if (existing.gateway?.auth) {
+          merged.gateway.auth = existing.gateway.auth;
+        }
+        // Merge channels: new channels + existing channels (preserve QR login tokens)
+        const allChannels = { ...(newConfig.channels || {}), ...(existing.channels || {}) };
+        // Overlay new credential values on top of existing
+        for (const [ch, val] of Object.entries(newConfig.channels || {})) {
+          if (allChannels[ch] && Object.keys(val as any).length > 0) {
+            allChannels[ch] = { ...allChannels[ch], ...(val as any) };
+          }
+        }
+        merged.channels = allChannels;
+        await tauriInvoke("write_config", { content: JSON.stringify(merged, null, 2) });
       } else {
-        await saveConfig({ raw: configJson });
+        await saveConfig({ raw: JSON.stringify(newConfig, null, 2) });
+      }
+      // Re-read gateway URL and auth token from the merged config
+      if (tauriInvoke) {
+        try {
+          const gw: any = await tauriInvoke("get_gateway_port");
+          if (gw?.url) {
+            setGatewayUrl(gw.url);
+            if (gw.token) {
+              setAuthToken(gw.token);
+              try { localStorage.setItem("rsclaw-auth-token", gw.token); } catch {}
+            }
+          }
+        } catch {}
       }
       update(0, "ok");
 
@@ -1995,12 +2070,12 @@ export function OnboardingPage() {
 
   const finish = () => {
     markSetupComplete();
-    navigate(Path.Home);
+    window.location.href = "/";
   };
 
   const skipAll = () => {
     markSetupComplete();
-    navigate(Path.RsClawPanel);
+    window.location.href = "/#/rsclaw-panel";
   };
 
   const stepState = (n: number) => (n < step ? "done" : n === step ? "active" : "todo");
@@ -2074,7 +2149,7 @@ export function OnboardingPage() {
             </div>
             {step === 0 ? (
               <div style={{ fontSize: 11, color: V.t2, textAlign: "center", lineHeight: 1.6, maxWidth: 380 }}>
-                {"\u8783\u87F9\u9AD8\u6027\u80FD\u591A\u667A\u80FD\u4F53AI\u5F15\u64CE \u00B7 Multi-Agent AI Engine"}
+                {"\u8783\u87F9\u9AD8\u6027\u80FD\u591A\u667A\u80FD\u4F53AI\u5F15\u64CE \u00B7 Multi-Agent AI Gateway"}
               </div>
             ) : (
               <div style={S.logoSub}>
@@ -2202,7 +2277,7 @@ export function OnboardingPage() {
                       {isZh ? "\u8FC1\u79FB\u5B89\u88C5" : "Migrate & Install"}
                     </button>
                     <button style={{ ...S.btnPrev, flex: 1, padding: "10px 0", fontSize: 13 }} onClick={() => setStep(2)}>
-                      {isZh ? "\u5168\u65B0\u5B89\u88C5" : "Fresh Install"}
+                      {isZh ? "\u5168\u65B0\u5B89\u88C5" : "New Install"}
                     </button>
                   </div>
                 </div>
@@ -2365,7 +2440,15 @@ export function OnboardingPage() {
                 <button style={S.btnPrev} onClick={() => setStep(1)}>{t.prev}</button>
                 <button
                   style={canNextStep2 ? S.btnNext : S.btnNextDisabled}
-                  onClick={() => canNextStep2 && setStep(3)}
+                  onClick={async () => {
+                    if (!canNextStep2) return;
+                    // Ensure rsclaw dirs + config exist before channel login
+                    try {
+                      const invoke = (window as any).__TAURI__?.invoke;
+                      if (invoke) await invoke("run_setup");
+                    } catch {}
+                    setStep(3);
+                  }}
                   disabled={!canNextStep2}
                 >{t.next}</button>
               </div>
@@ -2416,10 +2499,8 @@ export function OnboardingPage() {
                 })}
               </div>
 
-              {/* Channel credential expand area */}
-              {(() => {
-                const activeId = Object.entries(chs).find(([_, v]) => v.enabled)?.[0];
-                if (!activeId) return null;
+              {/* Channel credential expand area - show all enabled channels */}
+              {Object.entries(chs).filter(([_, v]) => v.enabled).map(([activeId]) => {
                 const chDef = CHANNELS.find((c) => c.id === activeId);
                 if (!chDef) return null;
 
@@ -2445,7 +2526,8 @@ export function OnboardingPage() {
                 const hasQr = chDef.hasQr;
 
                 return (
-                  <div style={{ marginTop: 12, background: V.bg3, border: `1px solid ${V.bd}`, borderRadius: 10, padding: 16, maxHeight: 220, overflowY: "auto" }}>
+                  <div key={activeId} style={{ marginTop: 12, background: V.bg3, border: `1px solid ${V.bd}`, borderRadius: 10, padding: 16, maxHeight: 220, overflowY: "auto" }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: V.t0, marginBottom: 8 }}>{isZh ? chDef.name : chDef.nameEn}</div>
                     {/* QR / Credential tabs for wechat/feishu */}
                     {hasQr && (
                       <div style={{ display: "flex", gap: 0, borderBottom: `1px solid ${V.bd}`, marginBottom: 12, marginLeft: -16, marginRight: -16, paddingLeft: 16, paddingRight: 16 }}>
@@ -2506,13 +2588,15 @@ export function OnboardingPage() {
                         <input
                           type={f.type}
                           placeholder={f.ph}
+                          value={cs.credValues?.[f.key] || ""}
+                          onChange={(e) => setChCred(activeId, f.key, e.target.value)}
                           style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "7px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none" }}
                         />
                       </div>
                     ))}
                   </div>
                 );
-              })()}
+              })}
 
               <div style={S.navRow}>
                 <button style={S.btnPrev} onClick={() => setStep(2)}>{t.prev}</button>

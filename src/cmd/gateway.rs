@@ -32,7 +32,9 @@ pub fn spawn_gateway_bg_pub() -> Result<std::process::Child> {
         .create(true)
         .append(true)
         .open(&log_path)
-        .unwrap_or_else(|_| std::fs::File::open(null_path).expect("failed to open null device"));
+        .unwrap_or_else(|_| {
+            std::fs::File::open(null_path).expect("failed to open null device")
+        });
     let log_file2 = log_file
         .try_clone()
         .unwrap_or_else(|_| std::fs::File::open(null_path).expect("failed to open null device"));

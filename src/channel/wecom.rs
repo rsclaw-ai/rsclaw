@@ -6,14 +6,18 @@
 //!
 //! Reconnects automatically with exponential back-off on disconnect.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use futures::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use reqwest::Client;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{debug, error, info, warn};
 
@@ -135,17 +139,13 @@ impl WeComChannel {
             }
 
             let delay = Duration::from_secs(backoff_secs);
-            warn!(
-                delay_secs = backoff_secs,
-                "WeCom WS: reconnecting after delay"
-            );
+            warn!(delay_secs = backoff_secs, "WeCom WS: reconnecting after delay");
             tokio::time::sleep(delay).await;
             backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF.as_secs());
         }
     }
 
-    /// Run a single WebSocket session: connect, authenticate, heartbeat,
-    /// receive.
+    /// Run a single WebSocket session: connect, authenticate, heartbeat, receive.
     async fn run_single_connection(
         self: &Arc<Self>,
         outbound_rx: &mut mpsc::UnboundedReceiver<String>,
@@ -185,14 +185,12 @@ impl WeComChannel {
             debug!(raw = %txt, "WeCom WS: auth response raw");
             let v: Value = serde_json::from_str(txt).unwrap_or_default();
             // errcode can be at top level or inside body
-            let errcode = v
-                .get("errcode")
+            let errcode = v.get("errcode")
                 .or_else(|| v.get("body").and_then(|b| b.get("errcode")))
                 .and_then(|c| c.as_i64())
                 .unwrap_or(-1);
             if errcode != 0 {
-                let errmsg = v
-                    .get("errmsg")
+                let errmsg = v.get("errmsg")
                     .or_else(|| v.get("body").and_then(|b| b.get("errmsg")))
                     .and_then(|m| m.as_str())
                     .unwrap_or("unknown");
@@ -280,11 +278,7 @@ impl WeComChannel {
 
         let cmd = frame.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
         let raw_preview = frame.to_string();
-        debug!(
-            cmd,
-            raw = &raw_preview[..raw_preview.len().min(300)],
-            "WeCom WS: frame received"
-        );
+        debug!(cmd, raw = &raw_preview[..raw_preview.len().min(300)], "WeCom WS: frame received");
 
         // Route upload RPC responses back to pending waiters via req_id.
         // These frames are responses to our own requests (errcode present,
@@ -320,10 +314,7 @@ impl WeComChannel {
 
     /// Process an inbound `aibot_msg_callback` frame.
     async fn handle_message(self: &Arc<Self>, frame: &Value) {
-        let frame_type = frame
-            .get("type")
-            .and_then(|t| t.as_str())
-            .unwrap_or("unknown");
+        let frame_type = frame.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
         debug!(frame_type = %frame_type, "WeCom: WS frame received");
 
         let body = match frame.get("body") {
@@ -355,10 +346,7 @@ impl WeComChannel {
             .and_then(|m| m.as_str())
             .unwrap_or("text");
         // Log body keys for debugging unrecognized message types.
-        let body_keys: Vec<&str> = body
-            .as_object()
-            .map(|m| m.keys().map(|k| k.as_str()).collect())
-            .unwrap_or_default();
+        let body_keys: Vec<&str> = body.as_object().map(|m| m.keys().map(|k| k.as_str()).collect()).unwrap_or_default();
         info!(msgtype = %msgtype, keys = ?body_keys, "WeCom: message received");
 
         let mut text = String::new();
@@ -384,16 +372,8 @@ impl WeComChannel {
                     .to_owned();
                 // If platform transcription is empty, download and transcribe ourselves.
                 if text.trim().is_empty() {
-                    let url = body
-                        .get("voice")
-                        .and_then(|v| v.get("url"))
-                        .and_then(|u| u.as_str())
-                        .unwrap_or("");
-                    let aeskey = body
-                        .get("voice")
-                        .and_then(|v| v.get("aeskey"))
-                        .and_then(|k| k.as_str())
-                        .unwrap_or("");
+                    let url = body.get("voice").and_then(|v| v.get("url")).and_then(|u| u.as_str()).unwrap_or("");
+                    let aeskey = body.get("voice").and_then(|v| v.get("aeskey")).and_then(|k| k.as_str()).unwrap_or("");
                     if !url.is_empty() {
                         match self.download_media(url, aeskey).await {
                             Ok(bytes) => {
@@ -434,8 +414,7 @@ impl WeComChannel {
                                 mime_type: "image/jpeg".to_string(),
                             });
                             if text.is_empty() {
-                                text =
-                                    crate::i18n::t("describe_image", crate::i18n::default_lang());
+                                text = crate::i18n::t("describe_image", crate::i18n::default_lang());
                             }
                         }
                         Err(e) => {
@@ -475,10 +454,7 @@ impl WeComChannel {
                                     mime_type: mime.clone(),
                                 });
                                 if text.is_empty() {
-                                    text = crate::i18n::t(
-                                        "describe_image",
-                                        crate::i18n::default_lang(),
-                                    );
+                                    text = crate::i18n::t("describe_image", crate::i18n::default_lang());
                                 }
                             } else {
                                 files.push(crate::agent::registry::FileAttachment {
@@ -535,7 +511,10 @@ impl WeComChannel {
                     .and_then(|a| a.as_array())
                 {
                     for item in items {
-                        let item_type = item.get("msgtype").and_then(|t| t.as_str()).unwrap_or("");
+                        let item_type = item
+                            .get("msgtype")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("");
                         match item_type {
                             "text" => {
                                 let t = item
@@ -567,14 +546,19 @@ impl WeComChannel {
                                             use base64::Engine;
                                             let b64 = base64::engine::general_purpose::STANDARD
                                                 .encode(&bytes);
-                                            let data_url = format!("data:image/jpeg;base64,{b64}");
-                                            images.push(crate::agent::registry::ImageAttachment {
-                                                data: data_url,
-                                                mime_type: "image/jpeg".to_string(),
-                                            });
+                                            let data_url =
+                                                format!("data:image/jpeg;base64,{b64}");
+                                            images.push(
+                                                crate::agent::registry::ImageAttachment {
+                                                    data: data_url,
+                                                    mime_type: "image/jpeg".to_string(),
+                                                },
+                                            );
                                         }
                                         Err(e) => {
-                                            error!("WeCom: mixed image download failed: {e:#}");
+                                            error!(
+                                                "WeCom: mixed image download failed: {e:#}"
+                                            );
                                         }
                                     }
                                 }
@@ -643,13 +627,11 @@ impl WeComChannel {
 
         // If data starts with known magic bytes, it's already decrypted.
         // JPEG: FF D8 FF, PNG: 89 50 4E 47, MP4 ftyp: xx xx xx xx 66 74 79 70
-        let dominated = bytes.len() >= 4
-            && (
-                (bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) // JPEG
+        let dominated = bytes.len() >= 4 && (
+            (bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) // JPEG
             || (bytes[0] == 0x89 && &bytes[1..4] == b"PNG")            // PNG
-            || (bytes.len() >= 8 && &bytes[4..8] == b"ftyp")
-                // MP4/MOV
-            );
+            || (bytes.len() >= 8 && &bytes[4..8] == b"ftyp")          // MP4/MOV
+        );
         if dominated {
             debug!("WeCom: media already decrypted (magic bytes detected), skipping AES");
             return Ok(bytes.to_vec());
@@ -664,10 +646,7 @@ impl WeComChannel {
             .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(aeskey))
             .context("WeCom: invalid aeskey base64")?;
         if key_bytes.len() != 32 {
-            warn!(
-                len = key_bytes.len(),
-                "WeCom: aeskey not 32 bytes, returning raw"
-            );
+            warn!(len = key_bytes.len(), "WeCom: aeskey not 32 bytes, returning raw");
             return Ok(bytes.to_vec());
         }
 
@@ -676,8 +655,8 @@ impl WeComChannel {
         let mut data = bytes.to_vec();
 
         // CBC decrypt: XOR with previous ciphertext block (or IV for first block).
-        let cipher =
-            aes::Aes256::new_from_slice(&key_bytes).context("WeCom: AES-256 key init failed")?;
+        let cipher = aes::Aes256::new_from_slice(&key_bytes)
+            .context("WeCom: AES-256 key init failed")?;
 
         let mut prev_block = iv;
         for chunk in data.chunks_mut(16) {
@@ -698,10 +677,7 @@ impl WeComChannel {
         if let Some(&pad_len) = data.last() {
             let pad_len = pad_len as usize;
             if pad_len > 0 && pad_len <= 16 && data.len() >= pad_len {
-                if data[data.len() - pad_len..]
-                    .iter()
-                    .all(|&b| b == pad_len as u8)
-                {
+                if data[data.len() - pad_len..].iter().all(|&b| b == pad_len as u8) {
                     data.truncate(data.len() - pad_len);
                 }
             }
@@ -788,20 +764,12 @@ impl WeComChannel {
             }
         });
         debug!(req_id = %init_req_id, total_size, chunk_count, "WeCom: upload init");
-        let init_resp = self
-            .send_rpc(&init_req_id, init_frame)
-            .await
+        let init_resp = self.send_rpc(&init_req_id, init_frame).await
             .context("WeCom: upload init RPC")?;
 
-        let errcode = init_resp
-            .get("errcode")
-            .and_then(|c| c.as_i64())
-            .unwrap_or(-1);
+        let errcode = init_resp.get("errcode").and_then(|c| c.as_i64()).unwrap_or(-1);
         if errcode != 0 {
-            let errmsg = init_resp
-                .get("errmsg")
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown");
+            let errmsg = init_resp.get("errmsg").and_then(|m| m.as_str()).unwrap_or("unknown");
             bail!("WeCom: upload init failed ({errcode}): {errmsg}");
         }
         let upload_id = init_resp
@@ -831,19 +799,11 @@ impl WeComChannel {
                 chunk_size = chunk.len(),
                 "WeCom: upload chunk"
             );
-            let chunk_resp = self
-                .send_rpc(&chunk_req_id, chunk_frame)
-                .await
+            let chunk_resp = self.send_rpc(&chunk_req_id, chunk_frame).await
                 .with_context(|| format!("WeCom: upload chunk {chunk_index} RPC"))?;
-            let errcode = chunk_resp
-                .get("errcode")
-                .and_then(|c| c.as_i64())
-                .unwrap_or(-1);
+            let errcode = chunk_resp.get("errcode").and_then(|c| c.as_i64()).unwrap_or(-1);
             if errcode != 0 {
-                let errmsg = chunk_resp
-                    .get("errmsg")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("unknown");
+                let errmsg = chunk_resp.get("errmsg").and_then(|m| m.as_str()).unwrap_or("unknown");
                 bail!("WeCom: upload chunk {chunk_index} failed ({errcode}): {errmsg}");
             }
         }
@@ -858,19 +818,11 @@ impl WeComChannel {
             }
         });
         debug!(req_id = %finish_req_id, upload_id = %upload_id, "WeCom: upload finish");
-        let finish_resp = self
-            .send_rpc(&finish_req_id, finish_frame)
-            .await
+        let finish_resp = self.send_rpc(&finish_req_id, finish_frame).await
             .context("WeCom: upload finish RPC")?;
-        let errcode = finish_resp
-            .get("errcode")
-            .and_then(|c| c.as_i64())
-            .unwrap_or(-1);
+        let errcode = finish_resp.get("errcode").and_then(|c| c.as_i64()).unwrap_or(-1);
         if errcode != 0 {
-            let errmsg = finish_resp
-                .get("errmsg")
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown");
+            let errmsg = finish_resp.get("errmsg").and_then(|m| m.as_str()).unwrap_or("unknown");
             bail!("WeCom: upload finish failed ({errcode}): {errmsg}");
         }
         let media_id = finish_resp
@@ -896,16 +848,11 @@ impl WeComChannel {
             }
         });
         debug!(req_id = %req_id, chat_id, media_id, "WeCom: sending image message");
-        let resp = self
-            .send_rpc(&req_id, frame)
-            .await
+        let resp = self.send_rpc(&req_id, frame).await
             .context("WeCom: send image message RPC")?;
         let errcode = resp.get("errcode").and_then(|c| c.as_i64()).unwrap_or(-1);
         if errcode != 0 {
-            let errmsg = resp
-                .get("errmsg")
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown");
+            let errmsg = resp.get("errmsg").and_then(|m| m.as_str()).unwrap_or("unknown");
             bail!("WeCom: send image message failed ({errcode}): {errmsg}");
         }
         Ok(())

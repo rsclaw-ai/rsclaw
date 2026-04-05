@@ -2,13 +2,11 @@
 //!
 //! Some models (Kimi, Qwen, GLM, MiniMax) emit malformed JSON during streaming
 //! where there's garbage text before the actual JSON arguments. This module
-//! provides repair logic to extract usable arguments from such malformed
-//! chunks.
+//! provides repair logic to extract usable arguments from such malformed chunks.
 
 use serde_json::Value;
 
-/// Result of extracting usable tool call arguments from potentially malformed
-/// input.
+/// Result of extracting usable tool call arguments from potentially malformed input.
 #[derive(Debug)]
 pub struct ToolCallRepair {
     pub args: Value,
@@ -25,9 +23,8 @@ pub enum RepairKind {
     Repaired,
 }
 
-/// Extract a balanced JSON prefix from raw text that may have garbage
-/// before/after. Returns (json_string, start_index) or None if no valid JSON
-/// found.
+/// Extract a balanced JSON prefix from raw text that may have garbage before/after.
+/// Returns (json_string, start_index) or None if no valid JSON found.
 pub fn extract_balanced_json_prefix(raw: &str) -> Option<(String, usize)> {
     let mut start = 0;
     while start < raw.len() {
@@ -130,8 +127,7 @@ fn is_allowed_trailing_suffix(suffix: &str) -> bool {
     })
 }
 
-/// Try to extract usable tool call arguments from raw text that may be
-/// malformed.
+/// Try to extract usable tool call arguments from raw text that may be malformed.
 pub fn try_extract_usable_args(raw: &str) -> Option<ToolCallRepair> {
     if raw.trim().is_empty() {
         return None;
@@ -179,9 +175,8 @@ pub fn try_extract_usable_args(raw: &str) -> Option<ToolCallRepair> {
         }
     }
 
-    // NEW: If JSON parsing failed but we found a valid JSON boundary, try to fix
-    // common issues This handles cases where model sends unescaped newlines in
-    // string values
+    // NEW: If JSON parsing failed but we found a valid JSON boundary, try to fix common issues
+    // This handles cases where model sends unescaped newlines in string values
     if !json_part.is_empty() {
         // Try escaping common issues and re-parse
         let fixed = json_part
@@ -202,8 +197,8 @@ pub fn try_extract_usable_args(raw: &str) -> Option<ToolCallRepair> {
     }
 
     // NEW: Handle INCOMPLETE but otherwise valid JSON
-    // If the JSON structure looks valid (starts with { and has some key-value
-    // pairs) but is truncated at the end, try to fix common truncation patterns
+    // If the JSON structure looks valid (starts with { and has some key-value pairs)
+    // but is truncated at the end, try to fix common truncation patterns
     if json_part.starts_with('{') && json_part.contains(':') {
         // Try to find the last complete key-value pair and close the JSON
         let incomplete = json_part.to_string();

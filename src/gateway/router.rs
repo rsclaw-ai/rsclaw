@@ -99,8 +99,7 @@ impl Router {
     // Channel declaration matcher
     // -----------------------------------------------------------------------
 
-    /// Match agents by `channels` declaration, supporting "channel:account"
-    /// format.
+    /// Match agents by `channels` declaration, supporting "channel:account" format.
     ///
     /// Priority: exact "channel:account" > bare "channel" > no match.
     fn match_channel_declaration(&self, channel: &str, account: Option<&str>) -> Option<String> {
@@ -110,9 +109,7 @@ impl Router {
         let mut bare: Vec<&str> = Vec::new();
 
         for a in &self.config.agents.list {
-            let Some(chs) = a.channels.as_ref() else {
-                continue;
-            };
+            let Some(chs) = a.channels.as_ref() else { continue };
             if let Some(q) = &qualified {
                 if chs.iter().any(|c| c == q) {
                     exact.push(&a.id);
@@ -160,11 +157,9 @@ fn binding_matches(rule: &BindingMatch, msg: &InboundMessage) -> bool {
     if rule.path.as_ref().is_some_and(|path| path != &msg.path) {
         return false;
     }
-    if rule
-        .account_id
-        .as_ref()
-        .is_some_and(|aid| msg.account_id.as_ref().map_or(true, |m| m != aid))
-    {
+    if rule.account_id.as_ref().is_some_and(|aid| {
+        msg.account_id.as_ref().map_or(true, |m| m != aid)
+    }) {
         return false;
     }
     true
@@ -202,7 +197,6 @@ mod tests {
                 channel_max_restarts_per_hour: 10,
                 auth_token_configured: false,
                 auth_token_is_plaintext: false,
-                bind_address: None,
             },
             agents: AgentsRuntime {
                 defaults: Default::default(),
@@ -417,22 +411,16 @@ mod tests {
         );
         // Exact account match.
         assert_eq!(
-            router
-                .route(&msg_with_account("feishu", "u1", "sales-bot"))
-                .unwrap(),
+            router.route(&msg_with_account("feishu", "u1", "sales-bot")).unwrap(),
             "sales"
         );
         assert_eq!(
-            router
-                .route(&msg_with_account("feishu", "u1", "support-bot"))
-                .unwrap(),
+            router.route(&msg_with_account("feishu", "u1", "support-bot")).unwrap(),
             "support"
         );
         // Unknown account falls back to default (no bare "feishu" declaration).
         assert_eq!(
-            router
-                .route(&msg_with_account("feishu", "u1", "unknown"))
-                .unwrap(),
+            router.route(&msg_with_account("feishu", "u1", "unknown")).unwrap(),
             "main"
         );
     }
@@ -448,13 +436,14 @@ mod tests {
             vec![],
         );
         assert_eq!(
-            router
-                .route(&msg_with_account("feishu", "u1", "any-bot"))
-                .unwrap(),
+            router.route(&msg_with_account("feishu", "u1", "any-bot")).unwrap(),
             "fs_all"
         );
         // Also matches without account_id.
-        assert_eq!(router.route(&msg("feishu", "u1")).unwrap(), "fs_all");
+        assert_eq!(
+            router.route(&msg("feishu", "u1")).unwrap(),
+            "fs_all"
+        );
     }
 
     #[test]
@@ -469,16 +458,12 @@ mod tests {
             vec![],
         );
         assert_eq!(
-            router
-                .route(&msg_with_account("feishu", "u1", "vip-bot"))
-                .unwrap(),
+            router.route(&msg_with_account("feishu", "u1", "vip-bot")).unwrap(),
             "vip"
         );
         // Other accounts fall through to bare match.
         assert_eq!(
-            router
-                .route(&msg_with_account("feishu", "u1", "other"))
-                .unwrap(),
+            router.route(&msg_with_account("feishu", "u1", "other")).unwrap(),
             "general"
         );
     }
@@ -486,7 +471,10 @@ mod tests {
     #[test]
     fn binding_with_account_id_matches() {
         let router = make_router(
-            vec![agent("main", true, None), agent("dt_agent", false, None)],
+            vec![
+                agent("main", true, None),
+                agent("dt_agent", false, None),
+            ],
             vec![BindingConfig {
                 kind: None,
                 agent_id: "dt_agent".to_owned(),
@@ -502,16 +490,12 @@ mod tests {
         );
         // Matches when account_id matches.
         assert_eq!(
-            router
-                .route(&msg_with_account("dingtalk", "u1", "corp-bot"))
-                .unwrap(),
+            router.route(&msg_with_account("dingtalk", "u1", "corp-bot")).unwrap(),
             "dt_agent"
         );
         // Does NOT match a different account.
         assert_eq!(
-            router
-                .route(&msg_with_account("dingtalk", "u1", "other"))
-                .unwrap(),
+            router.route(&msg_with_account("dingtalk", "u1", "other")).unwrap(),
             "main"
         );
     }

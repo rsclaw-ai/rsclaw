@@ -1,6 +1,7 @@
 use anyhow::Result;
 
-use crate::{cli::agent_turn::AgentTurnArgs, config};
+use crate::cli::agent_turn::AgentTurnArgs;
+use crate::config;
 
 pub async fn cmd_agent_turn(args: AgentTurnArgs) -> Result<()> {
     let cfg = config::load().ok();

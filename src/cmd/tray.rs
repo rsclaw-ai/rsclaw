@@ -7,7 +7,11 @@ use anyhow::Result;
 #[cfg(feature = "tray")]
 pub fn cmd_tray() -> Result<()> {
     use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-    use tray_icon::{Icon, TrayIcon, TrayIconBuilder, menu::MenuEvent as TrayMenuEvent};
+    use tray_icon::{
+        TrayIcon, TrayIconBuilder,
+        menu::MenuEvent as TrayMenuEvent,
+        Icon,
+    };
 
     let menu = Menu::new();
 
@@ -158,7 +162,7 @@ fn load_icon() -> tray_icon::Icon {
             let dy = y as f32 - center;
             let idx = ((y * size + x) * 4) as usize;
             if dx * dx + dy * dy <= radius * radius {
-                rgba[idx] = 0xe8; // R
+                rgba[idx] = 0xe8;     // R
                 rgba[idx + 1] = 0x59; // G
                 rgba[idx + 2] = 0x0c; // B
                 rgba[idx + 3] = 0xff; // A
@@ -177,10 +181,7 @@ fn open_terminal_with(args: &[&str]) {
     {
         let cmd = format!("{} {}", exe.display(), args.join(" "));
         let _ = std::process::Command::new("osascript")
-            .args([
-                "-e",
-                &format!("tell application \"Terminal\" to do script \"{}\"", cmd),
-            ])
+            .args(["-e", &format!("tell application \"Terminal\" to do script \"{}\"", cmd)])
             .spawn();
     }
 
@@ -225,16 +226,12 @@ fn open_config() {
 
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("notepad")
-            .arg(&config_path)
-            .spawn();
+        let _ = std::process::Command::new("notepad").arg(&config_path).spawn();
     }
 
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("xdg-open")
-            .arg(&config_path)
-            .spawn();
+        let _ = std::process::Command::new("xdg-open").arg(&config_path).spawn();
     }
 }
 

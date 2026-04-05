@@ -20,7 +20,7 @@ const en: LocaleType = {
     Later: "Later",
     SaasTips: "Too Complex, Use Immediately Now",
     TopTips:
-      "RsClaw Multi-Agent AI Engine - route to any model through a single endpoint",
+      "RsClaw Multi-Agent AI Gateway - route to any model through a single endpoint",
   },
   ChatItem: {
     ChatItemCount: (count: number) => `${count} messages`,
@@ -316,7 +316,7 @@ const en: LocaleType = {
         Title: "Use RsClaw AI",
         Label: "",
         SubTitle:
-          "RsClaw Multi-Agent AI Engine - unified access to all models",
+          "RsClaw Multi-Agent AI Gateway - unified access to all models",
         ChatNow: "Start Now",
       },
       AccessCode: {
@@ -912,7 +912,7 @@ const en: LocaleType = {
   },
 
   RsClawPanel: {
-    Splash: "Welcome to RsClaw Multi-Agent AI Engine!",
+    Splash: "Welcome to RsClaw Multi-Agent AI Gateway!",
     Title: "RsClaw Console",
     BackToChat: "Back to Chat",
     Running: "running",
@@ -920,7 +920,7 @@ const en: LocaleType = {
 
     SubTitle: "High-performance multi-agent AI engine",
     Sidebar: {
-      Service: "Service",
+      Service: "Gateway",
       ServiceTitle: "Gateway Status",
       Config: "Config",
       ConfigTitle: "Configuration",

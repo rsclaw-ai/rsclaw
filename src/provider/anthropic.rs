@@ -12,7 +12,7 @@ use super::{
     TokenUsage,
 };
 
-pub const ANTHROPIC_API_BASE: &str = "https://api.anthrop.com";
+pub const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 

@@ -168,8 +168,7 @@ pub struct FeishuChannel {
 /// text, fall back to plain text for short simple messages.
 /// Convert markdown text to Feishu post (rich text) format.
 /// Supports: bold(**), code(`), links, paragraphs.
-#[allow(dead_code)]
-fn _markdown_to_feishu_post(text: &str) -> serde_json::Value {
+fn markdown_to_feishu_post(text: &str) -> serde_json::Value {
     let mut content: Vec<Vec<serde_json::Value>> = Vec::new();
 
     for line in text.split('\n') {

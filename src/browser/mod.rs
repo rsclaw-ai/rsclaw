@@ -7,8 +7,8 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
         atomic::{AtomicU32, AtomicU64, Ordering},
+        Arc,
     },
     time::Duration,
 };
@@ -56,11 +56,7 @@ fn total_system_memory_bytes() -> u64 {
                 0,
             );
         }
-        if size > 0 {
-            size
-        } else {
-            8 * 1024 * 1024 * 1024
-        } // fallback 8GB
+        if size > 0 { size } else { 8 * 1024 * 1024 * 1024 } // fallback 8GB
     }
     #[cfg(target_os = "linux")]
     {
@@ -89,15 +85,11 @@ fn available_memory_bytes() -> u64 {
             let mut inactive: u64 = 0;
             for line in text.lines() {
                 if line.starts_with("Pages free:") {
-                    free = line
-                        .split(':')
-                        .nth(1)
+                    free = line.split(':').nth(1)
                         .map(|s| s.trim().trim_end_matches('.').parse().unwrap_or(0))
                         .unwrap_or(0);
                 } else if line.starts_with("Pages inactive:") {
-                    inactive = line
-                        .split(':')
-                        .nth(1)
+                    inactive = line.split(':').nth(1)
                         .map(|s| s.trim().trim_end_matches('.').parse().unwrap_or(0))
                         .unwrap_or(0);
                 }
@@ -111,9 +103,7 @@ fn available_memory_bytes() -> u64 {
         if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
             for line in meminfo.lines() {
                 if line.starts_with("MemAvailable:") {
-                    let kb: u64 = line
-                        .split_whitespace()
-                        .nth(1)
+                    let kb: u64 = line.split_whitespace().nth(1)
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(0);
                     return kb * 1024;
@@ -240,10 +230,7 @@ impl Drop for ChromeProcess {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
         ACTIVE_INSTANCES.fetch_sub(1, Ordering::Relaxed);
-        debug!(
-            "Chrome instance dropped, active={}",
-            ACTIVE_INSTANCES.load(Ordering::Relaxed)
-        );
+        debug!("Chrome instance dropped, active={}", ACTIVE_INSTANCES.load(Ordering::Relaxed));
     }
 }
 
@@ -588,7 +575,10 @@ impl BrowserSession {
             })
             .unwrap_or_default();
 
-        let ref_count = parsed.get("refCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let ref_count = parsed
+            .get("refCount")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
 
         // Rebuild refs map: @e1 .. @eN -> data-ref attribute values.
         for i in 1..=ref_count {
@@ -715,9 +705,7 @@ impl BrowserSession {
             bail!("select: element {eref} not found");
         }
 
-        Ok(
-            json!({ "action": "select", "ref": eref, "text": format!("Selected {value} on {eref}") }),
-        )
+        Ok(json!({ "action": "select", "ref": eref, "text": format!("Selected {value} on {eref}") }))
     }
 
     async fn cmd_check(&self, args: &Value, check: bool) -> Result<Value> {
@@ -744,9 +732,7 @@ impl BrowserSession {
         }
 
         let verb = if check { "Checked" } else { "Unchecked" };
-        Ok(
-            json!({ "action": if check { "check" } else { "uncheck" }, "ref": eref, "text": format!("{verb} {eref}") }),
-        )
+        Ok(json!({ "action": if check { "check" } else { "uncheck" }, "ref": eref, "text": format!("{verb} {eref}") }))
     }
 
     async fn cmd_scroll(&self, args: &Value) -> Result<Value> {
@@ -759,9 +745,7 @@ impl BrowserSession {
         let js = format!("window.scrollBy(0, {delta})");
         self.eval_js(&js).await?;
 
-        Ok(
-            json!({ "action": "scroll", "direction": direction, "text": format!("Scrolled {direction}") }),
-        )
+        Ok(json!({ "action": "scroll", "direction": direction, "text": format!("Scrolled {direction}") }))
     }
 
     async fn cmd_screenshot(&self) -> Result<Value> {
@@ -770,7 +754,10 @@ impl BrowserSession {
             .send("Page.captureScreenshot", json!({ "format": "png" }))
             .await?;
 
-        let data = result.get("data").and_then(|v| v.as_str()).unwrap_or("");
+        let data = result
+            .get("data")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         Ok(json!({
             "action": "screenshot",
@@ -781,7 +768,10 @@ impl BrowserSession {
     async fn cmd_pdf(&self) -> Result<Value> {
         let result = self.cdp.send("Page.printToPDF", json!({})).await?;
 
-        let data = result.get("data").and_then(|v| v.as_str()).unwrap_or("");
+        let data = result
+            .get("data")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         Ok(json!({
             "action": "pdf",
@@ -838,7 +828,10 @@ impl BrowserSession {
             .or_else(|| args.get("text"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(15);
+        let timeout_secs = args
+            .get("timeout")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(15);
 
         let js = match target {
             "url" => format!(r#"location.href.includes('{}')"#, escape_js_string(value)),
@@ -847,7 +840,10 @@ impl BrowserSession {
                 escape_js_string(value)
             ),
             // Default: wait for an element matching a CSS selector.
-            _ => format!(r#"!!document.querySelector('{}')"#, escape_js_string(value)),
+            _ => format!(
+                r#"!!document.querySelector('{}')"#,
+                escape_js_string(value)
+            ),
         };
 
         let deadline = time::Instant::now() + Duration::from_secs(timeout_secs);
@@ -936,7 +932,9 @@ impl BrowserSession {
             )
             .await?;
 
-        let value = result.get("result").and_then(|r| r.get("value"));
+        let value = result
+            .get("result")
+            .and_then(|r| r.get("value"));
 
         match value {
             Some(Value::String(s)) => Ok(s.clone()),

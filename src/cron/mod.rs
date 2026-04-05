@@ -28,15 +28,13 @@ use crate::{
 // CronJob — serialisable description of a single scheduled task
 // ---------------------------------------------------------------------------
 
-/// Schedule descriptor — supports both rsclaw flat format and OpenClaw nested
-/// format.
+/// Schedule descriptor — supports both rsclaw flat format and OpenClaw nested format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CronSchedule {
     /// Flat string: "*/30 9-11 * * 1-5" (rsclaw native).
     Flat(String),
-    /// Nested object: { kind: "cron", expr: "...", tz: "Asia/Shanghai" }
-    /// (OpenClaw compat).
+    /// Nested object: { kind: "cron", expr: "...", tz: "Asia/Shanghai" } (OpenClaw compat).
     Nested {
         #[serde(default)]
         kind: Option<String>,
@@ -70,8 +68,7 @@ impl CronSchedule {
 pub enum CronPayload {
     /// Plain text message (rsclaw native).
     Text(String),
-    /// Structured payload: { kind: "systemEvent", text: "..." } (OpenClaw
-    /// compat).
+    /// Structured payload: { kind: "systemEvent", text: "..." } (OpenClaw compat).
     Structured {
         #[serde(default)]
         kind: Option<String>,
@@ -129,8 +126,7 @@ pub struct CronJob {
     /// Message/payload: flat string or nested {kind, text} object.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<CronPayload>,
-    /// Plain message field (rsclaw native, takes precedence if payload is
-    /// absent).
+    /// Plain message field (rsclaw native, takes precedence if payload is absent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     // -- OpenClaw compat fields --
@@ -280,9 +276,9 @@ impl CronRunner {
 
             let tokio_job = if let Some(tz_str) = cron_job.timezone() {
                 // Timezone-aware scheduling.
-                let tz: chrono_tz::Tz = tz_str.parse().with_context(|| {
-                    format!("invalid timezone `{tz_str}` for job `{}`", cron_job.id)
-                })?;
+                let tz: chrono_tz::Tz = tz_str
+                    .parse()
+                    .with_context(|| format!("invalid timezone `{tz_str}` for job `{}`", cron_job.id))?;
                 Job::new_async_tz(schedule.as_str(), tz, move |_uuid, _scheduler| {
                     let job = job_clone.clone();
                     let agents = Arc::clone(&agents);

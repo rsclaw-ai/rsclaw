@@ -1,4 +1,4 @@
-use anyhow::Result;
+﻿use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -13,10 +13,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
 
-use super::{
-    gateway::gateway_pid_file,
-    style::{banner, dim, green, kv, red},
-};
+use super::gateway::gateway_pid_file;
+use super::style::{banner, dim, green, kv, red};
 use crate::{
     cli::{HealthArgs, LogsArgs, StatusArgs, TuiArgs},
     config,
@@ -90,11 +88,7 @@ pub async fn cmd_status(args: StatusArgs) -> Result<()> {
         // Gateway status
         let gw_status = gateway_status_str();
         let running = gw_status.starts_with("running");
-        let status_display = if running {
-            green(&gw_status)
-        } else {
-            red(&gw_status)
-        };
+        let status_display = if running { green(&gw_status) } else { red(&gw_status) };
         kv("Gateway:", &status_display);
 
         // Suppress tracing output during config load for status display
@@ -126,57 +120,23 @@ pub async fn cmd_status(args: StatusArgs) -> Result<()> {
                 // Channels -- enumerate active ones from the per-platform Option fields
                 let ch = &cfg.channel.channels;
                 let mut ch_names: Vec<&str> = Vec::new();
-                if ch.telegram.is_some() {
-                    ch_names.push("telegram");
-                }
-                if ch.discord.is_some() {
-                    ch_names.push("discord");
-                }
-                if ch.slack.is_some() {
-                    ch_names.push("slack");
-                }
-                if ch.whatsapp.is_some() {
-                    ch_names.push("whatsapp");
-                }
-                if ch.signal.is_some() {
-                    ch_names.push("signal");
-                }
-                if ch.imessage.is_some() {
-                    ch_names.push("imessage");
-                }
-                if ch.mattermost.is_some() {
-                    ch_names.push("mattermost");
-                }
-                if ch.msteams.is_some() {
-                    ch_names.push("msteams");
-                }
-                if ch.googlechat.is_some() {
-                    ch_names.push("googlechat");
-                }
-                if ch.feishu.is_some() {
-                    ch_names.push("feishu");
-                }
-                if ch.dingtalk.is_some() {
-                    ch_names.push("dingtalk");
-                }
-                if ch.wecom.is_some() {
-                    ch_names.push("wecom");
-                }
-                if ch.wechat.is_some() {
-                    ch_names.push("wechat");
-                }
-                if ch.qq.is_some() {
-                    ch_names.push("qq");
-                }
-                if ch.line.is_some() {
-                    ch_names.push("line");
-                }
-                if ch.zalo.is_some() {
-                    ch_names.push("zalo");
-                }
-                if ch.matrix.is_some() {
-                    ch_names.push("matrix");
-                }
+                if ch.telegram.is_some() { ch_names.push("telegram"); }
+                if ch.discord.is_some() { ch_names.push("discord"); }
+                if ch.slack.is_some() { ch_names.push("slack"); }
+                if ch.whatsapp.is_some() { ch_names.push("whatsapp"); }
+                if ch.signal.is_some() { ch_names.push("signal"); }
+                if ch.imessage.is_some() { ch_names.push("imessage"); }
+                if ch.mattermost.is_some() { ch_names.push("mattermost"); }
+                if ch.msteams.is_some() { ch_names.push("msteams"); }
+                if ch.googlechat.is_some() { ch_names.push("googlechat"); }
+                if ch.feishu.is_some() { ch_names.push("feishu"); }
+                if ch.dingtalk.is_some() { ch_names.push("dingtalk"); }
+                if ch.wecom.is_some() { ch_names.push("wecom"); }
+                if ch.wechat.is_some() { ch_names.push("wechat"); }
+                if ch.qq.is_some() { ch_names.push("qq"); }
+                if ch.line.is_some() { ch_names.push("line"); }
+                if ch.zalo.is_some() { ch_names.push("zalo"); }
+                if ch.matrix.is_some() { ch_names.push("matrix"); }
                 let ch_count = ch_names.len();
                 if ch_count > 0 {
                     kv(
@@ -204,17 +164,24 @@ pub async fn cmd_status(args: StatusArgs) -> Result<()> {
                         })
                         .unwrap_or("--");
                     if agent_count == 1 {
-                        kv("Agent:", &format!("{} (model: {})", first.id, model));
+                        kv(
+                            "Agent:",
+                            &format!("{} (model: {})", first.id, model),
+                        );
                     } else {
                         kv(
                             "Agents:",
-                            &format!("{} + {} more (model: {})", first.id, agent_count - 1, model),
+                            &format!(
+                                "{} + {} more (model: {})",
+                                first.id,
+                                agent_count - 1,
+                                model
+                            ),
                         );
                     }
                 } else {
                     // agents.list empty 鈥?default "main" agent is auto-synthesized
-                    let model = cfg
-                        .agents
+                    let model = cfg.agents
                         .defaults
                         .model
                         .as_ref()

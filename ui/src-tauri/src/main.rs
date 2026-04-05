@@ -1,12 +1,85 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(target_os = "macos")]
+#[macro_use]
+extern crate objc;
+
 mod stream;
 
 use tauri::api::process::Command;
 use tauri::{
     CustomMenuItem, Manager, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem,
 };
+
+// ---------------------------------------------------------------------------
+// macOS: restore hidden window when user clicks dock icon
+// ---------------------------------------------------------------------------
+#[cfg(target_os = "macos")]
+mod mac_dock {
+    use std::sync::OnceLock;
+    use tauri::Manager;
+    use objc::declare::ClassDecl;
+    use objc::runtime::{BOOL, Object, Sel, YES};
+
+    static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+    extern "C" fn handle_reopen(_self: &Object, _cmd: Sel, _app: *mut Object, _has_visible: BOOL) -> BOOL {
+        if let Some(handle) = APP_HANDLE.get() {
+            if let Some(win) = handle.get_window("main") {
+                let _ = win.show();
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+        }
+        YES
+    }
+
+    /// Install a new NSApplicationDelegate that handles dock icon clicks.
+    /// Must be called from `setup()` after Tauri has configured its own delegate.
+    pub fn install(handle: tauri::AppHandle) {
+        APP_HANDLE.get_or_init(|| handle);
+
+        unsafe {
+            // Create a new delegate class with the reopen handler
+            if let Some(mut decl) = ClassDecl::new("RsClawDockDelegate", objc::class!(NSObject)) {
+                decl.add_method(
+                    objc::sel!(applicationShouldHandleReopen:hasVisibleWindows:),
+                    handle_reopen as extern "C" fn(&Object, Sel, *mut Object, BOOL) -> BOOL,
+                );
+                let cls = decl.register();
+                let delegate: *mut Object = objc::msg_send![cls, new];
+                let app: *mut Object = objc::msg_send![objc::class!(NSApplication), sharedApplication];
+                let _: () = objc::msg_send![app, setDelegate: delegate];
+            }
+        }
+    }
+}
+
+/// Check if a process is alive (cross-platform).
+fn is_process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // kill -0 checks if process exists without sending a signal
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+    #[cfg(windows)]
+    {
+        // tasklist /FI checks if a specific PID exists
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+            .unwrap_or(false)
+    }
+}
 
 fn run_rsclaw_command(args: &[&str]) -> Result<String, String> {
     // Try sidecar first; if it doesn't exist, fall back to PATH.
@@ -49,6 +122,40 @@ fn run_rsclaw_command(args: &[&str]) -> Result<String, String> {
 }
 
 // -- Tauri commands for frontend --
+
+/// Run rsclaw-cli with arbitrary arguments and return combined stdout+stderr.
+#[tauri::command]
+fn run_rsclaw_cli(args: Vec<String>) -> Result<String, String> {
+    let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    // Try sidecar first, fallback to PATH
+    let result = Command::new_sidecar("rsclaw-cli")
+        .ok()
+        .and_then(|cmd| cmd.args(&str_args).output().ok());
+
+    let (stdout, stderr, success) = match result {
+        Some(o) => (o.stdout, o.stderr, o.status.success()),
+        None => {
+            let o = std::process::Command::new("rsclaw")
+                .args(&str_args)
+                .output()
+                .map_err(|e| format!("Failed to execute rsclaw: {}", e))?;
+            (
+                String::from_utf8_lossy(&o.stdout).to_string(),
+                String::from_utf8_lossy(&o.stderr).to_string(),
+                o.status.success(),
+            )
+        }
+    };
+
+    // Return combined output (doctor writes to both stdout and stderr)
+    let combined = format!("{}{}", stdout, stderr);
+    if success {
+        Ok(combined)
+    } else {
+        // Still return output even on failure (doctor may report issues as non-zero exit)
+        Ok(combined)
+    }
+}
 
 #[tauri::command]
 fn start_gateway() -> Result<String, String> {
@@ -93,6 +200,26 @@ fn get_config_path() -> Result<String, String> {
 #[tauri::command]
 fn run_setup() -> Result<String, String> {
     run_rsclaw_command(&["setup", "--non-interactive"])
+}
+
+/// Write a file to an agent's workspace directory (~/.rsclaw/workspace-{agentId}/{fileName})
+#[tauri::command]
+fn write_workspace_file(agent_id: String, file_name: String, content: String) -> Result<String, String> {
+    let home = dirs::home_dir().ok_or("no home dir")?;
+    let ws_dir = home.join(".rsclaw").join(format!("workspace-{}", agent_id));
+    let _ = std::fs::create_dir_all(&ws_dir);
+    let file_path = ws_dir.join(&file_name);
+    std::fs::write(&file_path, &content)
+        .map_err(|e| format!("write failed: {e}"))?;
+    Ok(file_path.to_string_lossy().to_string())
+}
+
+/// Read a file from an agent's workspace directory
+#[tauri::command]
+fn read_workspace_file(agent_id: String, file_name: String) -> Result<String, String> {
+    let home = dirs::home_dir().ok_or("no home dir")?;
+    let file_path = home.join(".rsclaw").join(format!("workspace-{}", agent_id)).join(&file_name);
+    std::fs::read_to_string(&file_path).map_err(|e| format!("read failed: {e}"))
 }
 
 /// Write config file to ~/.rsclaw/rsclaw.json5
@@ -670,6 +797,8 @@ fn handle_tray_event(app: &tauri::AppHandle, event: SystemTrayEvent) {
                 }
             }
             "quit" => {
+                // Stop gateway (rsclaw-cli) before quitting
+                let _ = stop_gateway();
                 std::process::exit(0);
             }
             _ => {}
@@ -707,21 +836,37 @@ fn main() {
             uninstall_skill,
             search_skills,
             test_provider,
+            write_workspace_file,
+            read_workspace_file,
+            run_rsclaw_cli,
             migrate_openclaw,
             set_auto_start,
             get_auto_start,
         ])
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .setup(|_app| {
-            // App setup complete. Gateway is managed via UI controls.
-            // DevTools enabled via "devtools" feature in Cargo.toml
+            // NOTE: mac_dock::install disabled temporarily for debugging close behavior
+            // #[cfg(target_os = "macos")]
+            // mac_dock::install(app.handle());
             Ok(())
         })
         .on_window_event(|event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event.event() {
-                // Hide window instead of quitting — keep gateway running
-                event.window().hide().unwrap_or_default();
-                api.prevent_close();
+                // Check if gateway is running by testing its pid file
+                let pid_path = dirs::home_dir()
+                    .map(|h| h.join(".rsclaw").join("var").join("run").join("gateway.pid"));
+                let pid_content = pid_path.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
+                let pid_val = pid_content.as_ref().and_then(|s| s.trim().parse::<u32>().ok());
+                let gw_running = pid_val.is_some_and(|pid| is_process_alive(pid));
+
+
+
+                if gw_running {
+                    // Gateway running: minimize to dock, keep backend alive
+                    // Click dock thumbnail to restore
+                    let _ = event.window().minimize();
+                    api.prevent_close();
+                }
             }
         })
         .run(tauri::generate_context!())
