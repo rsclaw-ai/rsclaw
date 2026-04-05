@@ -33,7 +33,7 @@ hnsw_rs    = "0.3"
 
 # Local inference, BGE-Small embeddings (W8)
 candle-core         = "0.9"
-candle-nn           = "0.9"
+candle-nn           = "0.10"
 candle-transformers = "0.9"
 
 # Serialization
