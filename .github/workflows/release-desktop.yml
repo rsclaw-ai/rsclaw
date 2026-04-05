@@ -1,9 +1,9 @@
-name: Release
+name: Release Desktop
 
 on:
   push:
     tags:
-      - "v*"
+      - "app-v*"
 
 permissions:
   contents: write
@@ -14,96 +14,6 @@ env:
   RSCLAW_BUILD_DATE: ${{ github.event.head_commit.timestamp }}
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
-            archive: tar.gz
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04
-            archive: tar.gz
-            cross: true
-          - target: x86_64-apple-darwin
-            os: macos-14
-            archive: tar.gz
-          - target: aarch64-apple-darwin
-            os: macos-14
-            archive: tar.gz
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: zip
-          - target: aarch64-pc-windows-msvc
-            os: windows-latest
-            archive: zip
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.91"
-          targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Install protoc (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-
-      - name: Install protoc (macOS)
-        if: runner.os == 'macOS'
-        run: brew install protobuf
-
-      - name: Install protoc (Windows)
-        if: runner.os == 'Windows'
-        run: choco install protoc -y
-
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
-      - name: Build (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
-          else
-            cargo build --release --target ${{ matrix.target }}
-          fi
-
-      - name: Build (Windows)
-        if: runner.os == 'Windows'
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Package (tar.gz)
-        if: matrix.archive == 'tar.gz'
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../rsclaw-${{ github.ref_name }}-${{ matrix.target }}.tar.gz rsclaw
-          cd ../../..
-
-      - name: Package (zip)
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          Compress-Archive -Path "target/${{ matrix.target }}/release/rsclaw.exe" `
-            -DestinationPath "rsclaw-${{ github.ref_name }}-${{ matrix.target }}.zip"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: rsclaw-${{ matrix.target }}
-          path: rsclaw-${{ github.ref_name }}-${{ matrix.target }}.${{ matrix.archive }}
-
   desktop:
     name: Desktop ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
@@ -116,7 +26,6 @@ jobs:
             sidecar_ext: ""
             bundle_ext: deb
             bundle_path: ui/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
-          # aarch64-linux desktop disabled: cross-compile + GTK deps too complex for now
           - target: x86_64-apple-darwin
             os: macos-14
             sidecar_ext: ""
@@ -158,34 +67,23 @@ jobs:
       - name: Install yarn
         run: npm install -g yarn
 
-      - name: Install protoc (Linux)
+      - name: Install deps (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libwebkit2gtk-4.0-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
 
-      - name: Install protoc (macOS)
+      - name: Install deps (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
 
-      - name: Install protoc (Windows)
+      - name: Install deps (Windows)
         if: runner.os == 'Windows'
         run: choco install protoc -y
 
-      # Build the rsclaw CLI binary for this target
-      - name: Build rsclaw binary (native)
-        if: "!matrix.cross_target"
+      - name: Build CLI sidecar
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Install cross
-        if: matrix.cross_target
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
-      - name: Build rsclaw binary (cross)
-        if: matrix.cross_target
-        run: cross build --release --target ${{ matrix.target }}
-
-      # Place sidecar binary with Tauri naming convention
       - name: Place sidecar (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -218,7 +116,7 @@ jobs:
             mv "$f" "$dir/RsClaw-${{ github.ref_name }}-${{ matrix.target }}.$ext"
           done
 
-      - name: Upload desktop artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: RsClaw-desktop-${{ matrix.target }}
@@ -226,9 +124,9 @@ jobs:
             ui/src-tauri/target/**/bundle/**/*RsClaw*${{ matrix.target }}*
 
   release:
-    name: Create Release
+    name: Create Desktop Release
     runs-on: ubuntu-latest
-    needs: [build, desktop]
+    needs: desktop
     if: always() && !cancelled()
     steps:
       - uses: actions/checkout@v6
@@ -238,21 +136,19 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Flatten nested desktop artifacts
+      - name: Flatten nested artifacts
         run: |
-          find artifacts -mindepth 2 -type f \( -name "*.dmg" -o -name "*.msi" -o -name "*.deb" -o -name "*.AppImage" \) -exec mv {} artifacts/ \;
+          find artifacts -mindepth 2 -type f \( -name "*.dmg" -o -name "*.msi" -o -name "*.deb" \) -exec mv {} artifacts/ \;
 
       - name: Generate checksums
         run: |
           cd artifacts
-          sha256sum rsclaw-* RsClaw-* 2>/dev/null > SHA256SUMS.txt || true
+          sha256sum RsClaw-* 2>/dev/null > SHA256SUMS-desktop.txt || true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
-            artifacts/rsclaw-*
             artifacts/RsClaw-*
-            artifacts/SHA256SUMS.txt
-
+            artifacts/SHA256SUMS-desktop.txt
