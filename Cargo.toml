@@ -26,7 +26,7 @@ rustls       = { version = "0.23", default-features = false, features = ["aws_lc
 
 # Storage
 redb         = "2"
-tantivy      = "0.22"
+tantivy      = "0.26"
 
 # HNSW vector index for memory search (replaced LanceDB to cut ~500 deps)
 hnsw_rs    = "0.3"
