@@ -83,8 +83,9 @@ resolve_version() {
     fi
 
     local latest json
-    json="$(curl -fsSL "${GITHUB_API}/repos/${REPO}/releases/latest")"
-    latest="$(echo "$json" | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -1)"
+    # Fetch recent releases and pick the first CLI release (v*, not app-v*)
+    json="$(curl -fsSL "${GITHUB_API}/repos/${REPO}/releases?per_page=10")"
+    latest="$(echo "$json" | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | grep -v '^app-' | head -1)"
 
     if [[ -z "$latest" ]]; then
         echo "Error: failed to resolve latest version" >&2
