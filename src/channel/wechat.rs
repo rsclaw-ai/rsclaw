@@ -1284,6 +1284,10 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    fn init_crypto() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
     /// Build a WeChatPersonalChannel pointing at the mock server.
     fn mock_channel(received: Arc<Mutex<Vec<String>>>) -> Arc<WeChatPersonalChannel> {
         let rx = Arc::clone(&received);
@@ -1299,6 +1303,7 @@ mod tests {
     /// Verify `with_base_url` overrides the default.
     #[test]
     fn with_base_url_overrides_default() {
+        init_crypto();
         let ch = WeChatPersonalChannel::new(
             "tok".to_owned(),
             Arc::new(|_, _, _, _| {}),
@@ -1310,6 +1315,7 @@ mod tests {
     /// Verify trailing slash is stripped.
     #[test]
     fn with_base_url_strips_trailing_slash() {
+        init_crypto();
         let ch = WeChatPersonalChannel::new(
             "tok".to_owned(),
             Arc::new(|_, _, _, _| {}),

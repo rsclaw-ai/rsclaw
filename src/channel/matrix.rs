@@ -801,8 +801,13 @@ mod tests {
     #[cfg(not(feature = "channel-matrix"))]
     use super::super::Channel;
 
+    fn init_crypto() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
     #[test]
     fn channel_name() {
+        init_crypto();
         let ch = MatrixChannel::new(
             "https://matrix.org",
             "token",

@@ -472,22 +472,42 @@ mod tests {
 
     #[test]
     fn missing_file_gets_placeholder() {
+        // Use a "workspace" sub-dir inside tempdir so that base_dir()
+        // fallback won't find the real ~/.rsclaw/workspace/SOUL.md.
         let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("workspace");
+        fs::create_dir_all(&ws).expect("mkdir");
         // Write only AGENTS.md; others should get placeholders.
-        fs::write(tmp.path().join("AGENTS.md"), "# Agents").expect("agents");
+        fs::write(ws.join("AGENTS.md"), "# Agents").expect("agents");
+
+        // Temporarily override RSCLAW_BASE_DIR so base_dir() resolves inside
+        // the temp directory, preventing fallback to the real workspace.
+        let orig = std::env::var("RSCLAW_BASE_DIR").ok();
+        // SAFETY: test is single-threaded for this env var access.
+        unsafe { std::env::set_var("RSCLAW_BASE_DIR", tmp.path()); }
 
         let ctx = WorkspaceContext::load(
-            tmp.path(),
+            &ws,
             SessionType::Normal,
             false,
             DEFAULT_MAX_CHARS_PER_FILE,
             DEFAULT_TOTAL_MAX_CHARS,
         );
 
-        let soul = ctx.soul_md.as_deref().unwrap_or("");
+        // Restore env.
+        // SAFETY: test is single-threaded for this env var access.
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var("RSCLAW_BASE_DIR", v),
+                None => std::env::remove_var("RSCLAW_BASE_DIR"),
+            }
+        }
+
+        // Missing file → field is None (no fallback available).
         assert!(
-            soul.contains("not found"),
-            "expected placeholder, got: {soul}"
+            ctx.soul_md.is_none(),
+            "expected None for missing SOUL.md, got: {:?}",
+            ctx.soul_md
         );
     }
 

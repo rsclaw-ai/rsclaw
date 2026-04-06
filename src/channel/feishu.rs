@@ -1345,8 +1345,13 @@ impl Channel for FeishuChannel {
 mod tests {
     use super::*;
 
+    fn init_crypto() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
     #[test]
     fn channel_name() {
+        init_crypto();
         let ch = FeishuChannel::new(
             "app_id",
             "app_secret",

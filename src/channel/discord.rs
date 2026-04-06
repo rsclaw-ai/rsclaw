@@ -648,14 +648,20 @@ fn discord_process_file(filename: &str, bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn init_crypto() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
     #[test]
     fn channel_name() {
+        init_crypto();
         let ch = DiscordChannel::new("token", false, Arc::new(|_, _, _, _| {}), None, None);
         assert_eq!(ch.name(), "discord");
     }
 
     #[test]
     fn auth_header_format() {
+        init_crypto();
         let ch = DiscordChannel::new("my-token", false, Arc::new(|_, _, _, _| {}), None, None);
         assert_eq!(ch.auth_header(), "Bot my-token");
     }

@@ -233,23 +233,23 @@ mod tests {
     #[test]
     fn detects_warning_before_critical() {
         // With dual thresholds: warn=3, crit=5
+        // count >= warning_threshold triggers Warning, count >= critical triggers Critical
         let mut d = LoopDetector::with_dual_thresholds(10, 3, 5);
-        assert!(is_ok(&d.check("read")));
-        assert!(is_ok(&d.check("read")));
-        assert!(is_ok(&d.check("read"))); // 3rd call = warning
-        assert!(is_warning(&d.check("read")));
-        assert!(is_critical(&d.check("read"))); // 5th = critical
+        assert!(is_ok(&d.check("read")));     // count=1
+        assert!(is_ok(&d.check("read")));     // count=2
+        assert!(is_warning(&d.check("read"))); // count=3 >= warn(3)
+        assert!(is_warning(&d.check("read"))); // count=4
+        assert!(is_critical(&d.check("read"))); // count=5 >= crit(5)
     }
 
     #[test]
     fn single_threshold_constructor_sets_critical_above() {
-        // LoopDetector::new with threshold=3 should set warning=3, critical=4
+        // LoopDetector::new with threshold=3 sets warning=3, critical=4
         let mut d = LoopDetector::new(10, 3);
-        assert!(is_ok(&d.check("exec")));
-        assert!(is_ok(&d.check("exec")));
-        assert!(is_ok(&d.check("exec")));
-        assert!(is_warning(&d.check("exec")));
-        assert!(is_critical(&d.check("exec")));
+        assert!(is_ok(&d.check("exec")));      // count=1
+        assert!(is_ok(&d.check("exec")));      // count=2
+        assert!(is_warning(&d.check("exec"))); // count=3 >= warn(3)
+        assert!(is_critical(&d.check("exec"))); // count=4 >= crit(4)
     }
 
     #[test]
