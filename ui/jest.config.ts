@@ -14,6 +14,7 @@ const config: Config = {
   setupFilesAfterEnv: ["<rootDir>/jest.setup.ts"],
   moduleNameMapper: {
     "^@/(.*)$": "<rootDir>/$1",
+    "^nanoid$": "<rootDir>/test/__mocks__/nanoid.ts",
   },
   extensionsToTreatAsEsm: [".ts", ".tsx"],
   injectGlobals: true,

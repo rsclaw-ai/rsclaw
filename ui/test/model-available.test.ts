@@ -2,8 +2,9 @@ import { isModelNotavailableInServer } from "../app/utils/model";
 
 describe("isModelNotavailableInServer", () => {
   test("test model will return false, which means the model is available", () => {
+    // "main" is the only model in DEFAULT_MODELS with provider id "openai"
     const customModels = "";
-    const modelName = "gpt-4";
+    const modelName = "main";
     const providerNames = "OpenAI";
     const result = isModelNotavailableInServer(
       customModels,
