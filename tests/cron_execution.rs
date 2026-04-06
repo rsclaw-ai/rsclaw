@@ -65,6 +65,7 @@ fn runtime_with_agent(agent_id: &str) -> RuntimeConfig {
             port: 0,
             mode: GatewayMode::Local,
             bind: BindMode::Loopback,
+            bind_address: None,
             reload: ReloadMode::Hybrid,
             auth_token: None,
             auth_token_configured: false,
