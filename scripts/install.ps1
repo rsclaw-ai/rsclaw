@@ -1,10 +1,10 @@
 # rsclaw installer for Windows
 # Usage:
-#   irm https://raw.githubusercontent.com/rsclaw-ai/rsclaw/main/scripts/install.ps1 | iex
+#   irm https://app.rsclaw.ai/scripts/install.ps1 | iex
 #   .\install.ps1 -Version v0.1.0 -Prefix C:\tools\rsclaw
 #
 # China mirror:
-#   $env:GITHUB_PROXY="https://gitfast.run"; irm https://gitfast.run/https://raw.githubusercontent.com/rsclaw-ai/rsclaw/main/scripts/install.ps1 | iex
+#   $env:GITHUB_PROXY="https://gitfast.run"; irm https://gitfast.run/https://app.rsclaw.ai/scripts/install.ps1 | iex
 
 param(
     [string]$Version = "",

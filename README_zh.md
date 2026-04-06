@@ -286,12 +286,12 @@ rsclaw gateway start
 
 ```bash
 # macOS / Linux（自动检测平台）
-curl -fsSL https://raw.githubusercontent.com/rsclaw-ai/rsclaw/main/scripts/install.sh | bash
+curl -fsSL https://app.rsclaw.ai/scripts/install.sh | bash
 ```
 
 ```powershell
 # Windows（PowerShell）
-irm https://raw.githubusercontent.com/rsclaw-ai/rsclaw/main/scripts/install.ps1 | iex
+irm https://app.rsclaw.ai/scripts/install.ps1 | iex
 ```
 
 支持平台：macOS (x86_64, ARM64)、Linux (x86_64, ARM64)、Windows (x86_64, ARM64)。

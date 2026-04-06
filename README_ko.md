@@ -27,12 +27,12 @@ RsClaw는 [OpenClaw](https://github.com/openclaw/openclaw)를 Rust로 완전히 
 
 ```bash
 # macOS / Linux (플랫폼 자동 감지)
-curl -fsSL https://raw.githubusercontent.com/rsclaw-ai/rsclaw/main/scripts/install.sh | bash
+curl -fsSL https://app.rsclaw.ai/scripts/install.sh | bash
 ```
 
 ```powershell
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/rsclaw-ai/rsclaw/main/scripts/install.ps1 | iex
+irm https://app.rsclaw.ai/scripts/install.ps1 | iex
 ```
 
 ### 소스에서 빌드

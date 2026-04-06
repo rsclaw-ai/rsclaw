@@ -26,12 +26,12 @@ RsClaw ist eine komplette Neuentwicklung von [OpenClaw](https://github.com/openc
 
 ```bash
 # macOS / Linux (automatische Plattformerkennung)
-curl -fsSL https://raw.githubusercontent.com/rsclaw-ai/rsclaw/main/scripts/install.sh | bash
+curl -fsSL https://app.rsclaw.ai/scripts/install.sh | bash
 ```
 
 ```powershell
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/rsclaw-ai/rsclaw/main/scripts/install.ps1 | iex
+irm https://app.rsclaw.ai/scripts/install.ps1 | iex
 ```
 
 ### Aus Quellcode kompilieren

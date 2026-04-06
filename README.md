@@ -288,12 +288,12 @@ Place a `defaults.toml` in `$base_dir/` to override the built-in defaults at run
 
 ```bash
 # macOS / Linux (auto-detect platform)
-curl -fsSL https://raw.githubusercontent.com/rsclaw-ai/rsclaw/main/scripts/install.sh | bash
+curl -fsSL https://app.rsclaw.ai/scripts/install.sh | bash
 ```
 
 ```powershell
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/rsclaw-ai/rsclaw/main/scripts/install.ps1 | iex
+irm https://app.rsclaw.ai/scripts/install.ps1 | iex
 ```
 
 Supported platforms: macOS (x86_64, ARM64), Linux (x86_64, ARM64), Windows (x86_64, ARM64).

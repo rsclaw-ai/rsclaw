@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # rsclaw installer for macOS and Linux
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/rsclaw-ai/rsclaw/main/scripts/install.sh | bash
+#   curl -fsSL https://app.rsclaw.ai/scripts/install.sh | bash
 #   curl -fsSL ... | bash -s -- --version v0.1.0 --prefix /opt/rsclaw
 
 set -euo pipefail

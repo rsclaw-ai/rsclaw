@@ -26,12 +26,12 @@ RsClaw la ban viet lai hoan toan cua [OpenClaw](https://github.com/openclaw/open
 
 ```bash
 # macOS / Linux (tu dong phat hien nen tang)
-curl -fsSL https://raw.githubusercontent.com/rsclaw-ai/rsclaw/main/scripts/install.sh | bash
+curl -fsSL https://app.rsclaw.ai/scripts/install.sh | bash
 ```
 
 ```powershell
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/rsclaw-ai/rsclaw/main/scripts/install.ps1 | iex
+irm https://app.rsclaw.ai/scripts/install.ps1 | iex
 ```
 
 ### Xay dung tu ma nguon
