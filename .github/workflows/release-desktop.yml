@@ -106,7 +106,7 @@ jobs:
 
       - name: Install UI dependencies
         working-directory: ui
-        run: yarn install --frozen-lockfile
+        run: HUSKY=0 yarn install --frozen-lockfile
 
       - name: Build Tauri app
         working-directory: ui
