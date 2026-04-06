@@ -82,9 +82,19 @@ resolve_version() {
         return
     fi
 
-    local latest json
-    json="$(curl -fsSL "${GITHUB_API}/repos/${REPO}/releases/latest")"
-    latest="$(echo "$json" | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -1)"
+    local latest="" json
+
+    # Primary: app.rsclaw.ai/api/version (array of releases, find CLI tag v*)
+    json="$(curl -fsSL --max-time 5 "https://app.rsclaw.ai/api/version" 2>/dev/null)" || true
+    if [[ -n "$json" ]]; then
+        latest="$(echo "$json" | sed -n 's/.*"tag_name" *: *"\(v[^"]*\)".*/\1/p' | grep -v '^app-' | head -1)"
+    fi
+
+    # Fallback: GitHub releases API
+    if [[ -z "$latest" ]]; then
+        json="$(curl -fsSL --max-time 10 "${GITHUB_API}/repos/${REPO}/releases?per_page=10" 2>/dev/null)" || true
+        latest="$(echo "$json" | sed -n 's/.*"tag_name" *: *"\(v[^"]*\)".*/\1/p' | grep -v '^app-' | head -1)"
+    fi
 
     if [[ -z "$latest" ]]; then
         echo "Error: failed to resolve latest version" >&2

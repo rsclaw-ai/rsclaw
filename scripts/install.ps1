@@ -79,22 +79,29 @@ function Get-LatestVersion {
     if ($Version -ne "") {
         return $Version
     }
+
+    # Primary: app.rsclaw.ai/api/version (array of releases, find CLI tag v*)
     try {
-        $response = Invoke-WebRequest -Uri "$GhApi/repos/$Repo/releases/latest" -UseBasicParsing
-        $json = $response.Content | ConvertFrom-Json
-        return $json.tag_name
-    }
-    catch {
-        # Fallback: try Invoke-RestMethod
-        try {
-            $release = Invoke-RestMethod -Uri "$GhApi/repos/$Repo/releases/latest"
-            return $release.tag_name
+        $releases = Invoke-RestMethod -Uri "https://app.rsclaw.ai/api/version" -TimeoutSec 5
+        foreach ($r in $releases) {
+            if ($r.tag_name -match '^v' -and $r.tag_name -notmatch '^app-') {
+                return $r.tag_name
+            }
         }
-        catch {
-            Write-Host "Error: failed to resolve latest version: $_" -ForegroundColor Red
-            exit 1
+    } catch {}
+
+    # Fallback: GitHub releases API
+    try {
+        $releases = Invoke-RestMethod -Uri "$GhApi/repos/$Repo/releases?per_page=10" -TimeoutSec 10
+        foreach ($r in $releases) {
+            if ($r.tag_name -match '^v' -and $r.tag_name -notmatch '^app-') {
+                return $r.tag_name
+            }
         }
-    }
+    } catch {}
+
+    Write-Host "Error: failed to resolve latest version" -ForegroundColor Red
+    exit 1
 }
 
 # --- Verify checksum ---
