@@ -76,8 +76,19 @@ detect_target() {
 }
 
 # --- Resolve version ---
-# Global: release JSON cached for resolve_version + resolve_download_url
+# Global: release JSON cached for version + download URL resolution
 RELEASE_JSON=""
+
+# Fetch release data from API (call once in main, not in subshell)
+fetch_release_data() {
+    # Primary: app.rsclaw.ai/api/version
+    RELEASE_JSON="$(curl -fsSL --max-time 5 "https://app.rsclaw.ai/api/version" 2>/dev/null)" || true
+
+    # Fallback: GitHub releases API
+    if [[ -z "$RELEASE_JSON" ]]; then
+        RELEASE_JSON="$(curl -fsSL --max-time 10 "${GITHUB_API}/repos/${REPO}/releases?per_page=10" 2>/dev/null)" || true
+    fi
+}
 
 resolve_version() {
     if [[ -n "$VERSION" ]]; then
@@ -86,16 +97,7 @@ resolve_version() {
     fi
 
     local latest=""
-
-    # Primary: app.rsclaw.ai/api/version (array of releases, find CLI tag v*)
-    RELEASE_JSON="$(curl -fsSL --max-time 5 "https://app.rsclaw.ai/api/version" 2>/dev/null)" || true
     if [[ -n "$RELEASE_JSON" ]]; then
-        latest="$(echo "$RELEASE_JSON" | grep -o '"tag_name" *: *"[^"]*"' | grep -o '"v[^"]*"' | tr -d '"' | grep -v '^app-' | sort -rV | head -1)"
-    fi
-
-    # Fallback: GitHub releases API
-    if [[ -z "$latest" ]]; then
-        RELEASE_JSON="$(curl -fsSL --max-time 10 "${GITHUB_API}/repos/${REPO}/releases?per_page=10" 2>/dev/null)" || true
         latest="$(echo "$RELEASE_JSON" | grep -o '"tag_name" *: *"[^"]*"' | grep -o '"v[^"]*"' | tr -d '"' | grep -v '^app-' | sort -rV | head -1)"
     fi
 
@@ -154,6 +156,7 @@ main() {
     target="$(detect_target)"
     echo "Detected platform: $target"
 
+    fetch_release_data
     version="$(resolve_version)"
     echo "Installing rsclaw $version ..."
 
