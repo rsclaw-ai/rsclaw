@@ -143,33 +143,10 @@ function Expand-Zip {
     }
 }
 
-# --- Check VC++ Runtime ---
-function Ensure-VCRuntime {
-    $dll = "VCRUNTIME140.dll"
-    $found = [System.IO.File]::Exists("$env:SystemRoot\System32\$dll") -or
-             [System.IO.File]::Exists("$env:SystemRoot\SysWOW64\$dll")
-    if ($found) { return }
-
-    Write-Host "Visual C++ Runtime not found, installing ..." -ForegroundColor Yellow
-    $vcUrl = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
-    $vcPath = Join-Path ([System.IO.Path]::GetTempPath()) "vc_redist.x64.exe"
-    try {
-        Invoke-WebRequest -Uri $vcUrl -OutFile $vcPath -UseBasicParsing
-        Start-Process -FilePath $vcPath -ArgumentList "/install", "/quiet", "/norestart" -Wait
-        Remove-Item -Path $vcPath -Force -ErrorAction SilentlyContinue
-        Write-Host "Visual C++ Runtime installed" -ForegroundColor Green
-    } catch {
-        Write-Host "Warning: could not install VC++ Runtime automatically." -ForegroundColor Yellow
-        Write-Host "  Download manually: https://aka.ms/vs/17/release/vc_redist.x64.exe"
-    }
-}
-
 # --- Main ---
 function Main {
     $target = Get-Target
     Write-Host "Detected platform: $target"
-
-    Ensure-VCRuntime
 
     $ver = Get-LatestVersion
     Write-Host "Installing rsclaw $ver ..."
