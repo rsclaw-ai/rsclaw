@@ -298,6 +298,20 @@ irm https://raw.githubusercontent.com/rsclaw-ai/rsclaw/main/scripts/install.ps1 
 
 Supported platforms: macOS (x86_64, ARM64), Linux (x86_64, ARM64), Windows (x86_64, ARM64).
 
+### Desktop App
+
+Download from [Releases](https://github.com/rsclaw-ai/rsclaw/releases): `.dmg` (macOS), `.msi` (Windows), `.deb` (Linux).
+
+**macOS security note:** The app is not yet code-signed. After installing, run:
+
+```bash
+# 1. Allow apps from anywhere (System Settings > Privacy & Security)
+sudo spctl --master-disable
+
+# 2. Remove quarantine attribute
+sudo xattr -rd com.apple.quarantine /Applications/RsClaw.app
+```
+
 ### From Source
 
 ```bash

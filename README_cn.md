@@ -297,6 +297,20 @@ irm https://raw.githubusercontent.com/rsclaw-ai/rsclaw/main/scripts/install.ps1 
 
 支持平台：macOS (x86_64, ARM64)、Linux (x86_64, ARM64)、Windows (x86_64, ARM64)。
 
+### 桌面客户端
+
+从 [Releases](https://github.com/rsclaw-ai/rsclaw/releases) 下载：`.dmg` (macOS)、`.msi` (Windows)、`.deb` (Linux)。
+
+**macOS 安全提示：** 应用尚未签名，安装后需要执行：
+
+```bash
+# 1. 允许任何来源的应用（系统设置 > 隐私与安全性）
+sudo spctl --master-disable
+
+# 2. 移除隔离属性
+sudo xattr -rd com.apple.quarantine /Applications/RsClaw.app
+```
+
 ### 从源码编译
 
 ```bash
