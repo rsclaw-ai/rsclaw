@@ -90,13 +90,13 @@ resolve_version() {
     # Primary: app.rsclaw.ai/api/version (array of releases, find CLI tag v*)
     RELEASE_JSON="$(curl -fsSL --max-time 5 "https://app.rsclaw.ai/api/version" 2>/dev/null)" || true
     if [[ -n "$RELEASE_JSON" ]]; then
-        latest="$(echo "$RELEASE_JSON" | sed -n 's/.*"tag_name" *: *"\(v[^"]*\)".*/\1/p' | grep -v '^app-' | head -1)"
+        latest="$(echo "$RELEASE_JSON" | grep -o '"tag_name" *: *"[^"]*"' | grep -o '"v[^"]*"' | tr -d '"' | grep -v '^app-' | sort -rV | head -1)"
     fi
 
     # Fallback: GitHub releases API
     if [[ -z "$latest" ]]; then
         RELEASE_JSON="$(curl -fsSL --max-time 10 "${GITHUB_API}/repos/${REPO}/releases?per_page=10" 2>/dev/null)" || true
-        latest="$(echo "$RELEASE_JSON" | sed -n 's/.*"tag_name" *: *"\(v[^"]*\)".*/\1/p' | grep -v '^app-' | head -1)"
+        latest="$(echo "$RELEASE_JSON" | grep -o '"tag_name" *: *"[^"]*"' | grep -o '"v[^"]*"' | tr -d '"' | grep -v '^app-' | sort -rV | head -1)"
     fi
 
     if [[ -z "$latest" ]]; then
