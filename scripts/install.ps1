@@ -160,8 +160,10 @@ function Main {
 
     try {
         Write-Host "Downloading $archiveName ..."
+        Write-Host "  URL: $downloadUrl"
         try {
-            Invoke-WebRequest -Uri $downloadUrl -OutFile (Join-Path $tmpDir $archiveName) -UseBasicParsing
+            $ProgressPreference = 'SilentlyContinue'
+            Invoke-WebRequest -Uri $downloadUrl -OutFile (Join-Path $tmpDir $archiveName) -UseBasicParsing -TimeoutSec 120
         }
         catch {
             Write-Host "Error: download failed." -ForegroundColor Red
