@@ -76,24 +76,27 @@ detect_target() {
 }
 
 # --- Resolve version ---
+# Global: release JSON cached for resolve_version + resolve_download_url
+RELEASE_JSON=""
+
 resolve_version() {
     if [[ -n "$VERSION" ]]; then
         echo "$VERSION"
         return
     fi
 
-    local latest="" json
+    local latest=""
 
     # Primary: app.rsclaw.ai/api/version (array of releases, find CLI tag v*)
-    json="$(curl -fsSL --max-time 5 "https://app.rsclaw.ai/api/version" 2>/dev/null)" || true
-    if [[ -n "$json" ]]; then
-        latest="$(echo "$json" | sed -n 's/.*"tag_name" *: *"\(v[^"]*\)".*/\1/p' | grep -v '^app-' | head -1)"
+    RELEASE_JSON="$(curl -fsSL --max-time 5 "https://app.rsclaw.ai/api/version" 2>/dev/null)" || true
+    if [[ -n "$RELEASE_JSON" ]]; then
+        latest="$(echo "$RELEASE_JSON" | sed -n 's/.*"tag_name" *: *"\(v[^"]*\)".*/\1/p' | grep -v '^app-' | head -1)"
     fi
 
     # Fallback: GitHub releases API
     if [[ -z "$latest" ]]; then
-        json="$(curl -fsSL --max-time 10 "${GITHUB_API}/repos/${REPO}/releases?per_page=10" 2>/dev/null)" || true
-        latest="$(echo "$json" | sed -n 's/.*"tag_name" *: *"\(v[^"]*\)".*/\1/p' | grep -v '^app-' | head -1)"
+        RELEASE_JSON="$(curl -fsSL --max-time 10 "${GITHUB_API}/repos/${REPO}/releases?per_page=10" 2>/dev/null)" || true
+        latest="$(echo "$RELEASE_JSON" | sed -n 's/.*"tag_name" *: *"\(v[^"]*\)".*/\1/p' | grep -v '^app-' | head -1)"
     fi
 
     if [[ -z "$latest" ]]; then
@@ -101,6 +104,21 @@ resolve_version() {
         exit 1
     fi
     echo "$latest"
+}
+
+# Extract browser_download_url for a given filename from cached release JSON
+resolve_download_url() {
+    local filename="$1"
+    if [[ -n "$RELEASE_JSON" ]]; then
+        local url
+        url="$(echo "$RELEASE_JSON" | grep -o "\"browser_download_url\" *: *\"[^\"]*${filename}\"" | head -1 | sed 's/.*"\(http[^"]*\)".*/\1/')"
+        if [[ -n "$url" ]]; then
+            echo "$url"
+            return
+        fi
+    fi
+    # Fallback: construct URL from GITHUB_URL
+    echo "${GITHUB_URL}/${REPO}/releases/download/${VERSION:-latest}/${filename}"
 }
 
 # --- Verify checksum ---
@@ -153,8 +171,8 @@ main() {
     local downloaded=false
     for try_target in "${targets[@]}"; do
         archive_name="rsclaw-${version}-${try_target}.tar.gz"
-        download_url="${GITHUB_URL}/${REPO}/releases/download/${version}/${archive_name}"
-        checksums_url="${GITHUB_URL}/${REPO}/releases/download/${version}/SHA256SUMS.txt"
+        download_url="$(resolve_download_url "$archive_name")"
+        checksums_url="$(resolve_download_url "SHA256SUMS.txt")"
 
         echo "Trying ${archive_name} ..."
         if curl -fSL --progress-bar -o "${tmpdir}/${archive_name}" "$download_url" 2>/dev/null; then

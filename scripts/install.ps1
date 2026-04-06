@@ -74,7 +74,9 @@ function Get-Target {
     }
 }
 
-# --- Resolve version ---
+# --- Resolve version + cache release data ---
+$script:ReleaseData = $null
+
 function Get-LatestVersion {
     if ($Version -ne "") {
         return $Version
@@ -82,8 +84,8 @@ function Get-LatestVersion {
 
     # Primary: app.rsclaw.ai/api/version (array of releases, find CLI tag v*)
     try {
-        $releases = Invoke-RestMethod -Uri "https://app.rsclaw.ai/api/version" -TimeoutSec 5
-        foreach ($r in $releases) {
+        $script:ReleaseData = Invoke-RestMethod -Uri "https://app.rsclaw.ai/api/version" -TimeoutSec 5
+        foreach ($r in $script:ReleaseData) {
             if ($r.tag_name -match '^v' -and $r.tag_name -notmatch '^app-') {
                 return $r.tag_name
             }
@@ -92,8 +94,8 @@ function Get-LatestVersion {
 
     # Fallback: GitHub releases API
     try {
-        $releases = Invoke-RestMethod -Uri "$GhApi/repos/$Repo/releases?per_page=10" -TimeoutSec 10
-        foreach ($r in $releases) {
+        $script:ReleaseData = Invoke-RestMethod -Uri "$GhApi/repos/$Repo/releases?per_page=10" -TimeoutSec 10
+        foreach ($r in $script:ReleaseData) {
             if ($r.tag_name -match '^v' -and $r.tag_name -notmatch '^app-') {
                 return $r.tag_name
             }
@@ -102,6 +104,24 @@ function Get-LatestVersion {
 
     Write-Host "Error: failed to resolve latest version" -ForegroundColor Red
     exit 1
+}
+
+# Extract browser_download_url for a given filename from cached release data
+function Get-DownloadUrl {
+    param([string]$FileName)
+    if ($script:ReleaseData) {
+        foreach ($r in $script:ReleaseData) {
+            if ($r.assets) {
+                foreach ($a in $r.assets) {
+                    if ($a.name -like "*$FileName*") {
+                        return $a.browser_download_url
+                    }
+                }
+            }
+        }
+    }
+    # Fallback
+    return "$GhUrl/$Repo/releases/download/$Version/$FileName"
 }
 
 # --- Verify checksum ---
@@ -152,8 +172,8 @@ function Main {
     Write-Host "Installing rsclaw $ver ..."
 
     $archiveName = "rsclaw-$ver-$target.zip"
-    $downloadUrl = "$GhUrl/$Repo/releases/download/$ver/$archiveName"
-    $checksumsUrl = "$GhUrl/$Repo/releases/download/$ver/SHA256SUMS.txt"
+    $downloadUrl = Get-DownloadUrl $archiveName
+    $checksumsUrl = Get-DownloadUrl "SHA256SUMS.txt"
 
     $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "rsclaw-install-$(Get-Random)"
     New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
