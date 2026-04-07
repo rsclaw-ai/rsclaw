@@ -8,19 +8,19 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 [[providers]]
-name       = "qwen"
-label      = "Qwen"
-env_var    = "DASHSCOPE_API_KEY"
-model      = "qwen/qwen-plus"
-base_url   = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-needs_key  = true
-
-[[providers]]
 name       = "doubao"
 label      = "Doubao (ByteDance)"
 env_var    = "ARK_API_KEY"
 model      = "doubao/doubao-seed-2-0-pro-260215"
 base_url   = "https://ark.cn-beijing.volces.com/api/v3"
+needs_key  = true
+
+[[providers]]
+name       = "qwen"
+label      = "Qwen (千问)"
+env_var    = "DASHSCOPE_API_KEY"
+model      = "qwen/qwen-plus"
+base_url   = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 needs_key  = true
 
 [[providers]]

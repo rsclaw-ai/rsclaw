@@ -492,10 +492,11 @@ function ConfigEditorPage() {
   const [providers, setProviders] = useState<{
     name: string; key: string; enabled: boolean; apiKey: string; baseUrl: string; apiType?: ApiType;
   }[]>([
+    { name: "Doubao (\u8C46\u5305)", key: "doubao", enabled: false, apiKey: "", baseUrl: "" },
+    { name: "Qwen (\u5343\u95EE)", key: "qwen", enabled: false, apiKey: "", baseUrl: "" },
     { name: "Anthropic", key: "anthropic", enabled: false, apiKey: "", baseUrl: "" },
     { name: "OpenAI", key: "openai", enabled: false, apiKey: "", baseUrl: "" },
     { name: "DeepSeek", key: "deepseek", enabled: false, apiKey: "", baseUrl: "" },
-    { name: "Doubao (\u8C46\u5305)", key: "doubao", enabled: false, apiKey: "", baseUrl: "" },
     { name: "Ollama", key: "ollama", enabled: true, apiKey: "", baseUrl: "http://localhost:11434" },
     { name: "Custom Provider", key: "custom", enabled: false, apiKey: "", baseUrl: "" },
   ]);
@@ -548,9 +549,9 @@ function ConfigEditorPage() {
     if (amt) setAgentMaxTokens(parseInt(amt, 10) || 4096);
 
     // Models - try to detect provider blocks
-    const providerNames = ["anthropic", "openai", "deepseek", "doubao", "ollama", "custom"];
+    const providerNames = ["doubao", "qwen", "anthropic", "openai", "deepseek", "ollama", "custom"];
     const displayNames: Record<string, string> = {
-      anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", doubao: "Doubao (\u8C46\u5305)", ollama: "Ollama", custom: "Custom Provider",
+      doubao: "Doubao (\u8C46\u5305)", qwen: "Qwen (\u5343\u95EE)", anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", ollama: "Ollama", custom: "Custom Provider",
     };
     const newProviders = providerNames.map((pName) => {
       // Look for a block like anthropic: { ... }

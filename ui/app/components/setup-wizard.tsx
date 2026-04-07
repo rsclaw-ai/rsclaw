@@ -63,6 +63,12 @@ const PROVIDERS = [
     placeholder: "xxxxxxxx-xxxx-...",
   },
   {
+    id: "qwen",
+    name: "Qwen (\u5343\u95EE)",
+    desc: "Alibaba Cloud DashScope",
+    placeholder: "sk-...",
+  },
+  {
     id: "ollama",
     name: "Ollama",
     desc: "Local models, no API key needed",
