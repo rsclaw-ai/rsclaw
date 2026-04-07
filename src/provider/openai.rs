@@ -505,6 +505,7 @@ impl OpenAiProvider {
             }
         }
 
+        tracing::info!(count = data_uris.len(), "upload_images: found data URIs to upload");
         // Upload each unique data URI
         for uri in data_uris {
             match self.upload_image_to_files(&uri).await {

@@ -594,13 +594,23 @@ impl WeChatPersonalChannel {
                                         match self.download_media_source(&src).await {
                                             Ok(bytes) => {
                                                 info!(size = bytes.len(), "wechat: video downloaded");
+                                                // Send as both ImageAttachment (for vision models
+                                                // that support video) and FileAttachment (for
+                                                // audio transcription fallback on other models).
+                                                use base64::Engine;
+                                                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                                let data_uri = format!("data:video/mp4;base64,{b64}");
+                                                let img = crate::agent::registry::ImageAttachment {
+                                                    data: data_uri,
+                                                    mime_type: "video/mp4".to_owned(),
+                                                };
                                                 let fa = crate::agent::registry::FileAttachment {
                                                     filename: "video.mp4".to_owned(),
                                                     data: bytes,
                                                     mime_type: "video/mp4".to_owned(),
                                                 };
                                                 if !from.is_empty() {
-                                                    (self.on_message)(from.clone(), String::new(), vec![], vec![fa]);
+                                                    (self.on_message)(from.clone(), crate::i18n::t("describe_video", crate::i18n::default_lang()), vec![img], vec![fa]);
                                                 }
                                             }
                                             Err(e) => warn!("wechat: video download failed: {e:#}"),

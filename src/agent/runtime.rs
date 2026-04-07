@@ -1385,7 +1385,19 @@ impl AgentRuntime {
 
         // ---------------------------------------------------------------
         // File attachment: auto-detect video/audio for direct transcription
+        // Skip video transcription if vision model has video as ImageAttachment
+        // (the provider will handle it as input_video with file_id).
         // ---------------------------------------------------------------
+        // If doubao has video as ImageAttachment, drop the FileAttachment copy
+        // so it goes through vision (file_id upload) instead of audio transcription.
+        let has_video_image = images.iter().any(|img| img.mime_type.starts_with("video/"));
+        let cur_model = self.resolve_model_name();
+        let is_doubao = cur_model.to_lowercase().contains("doubao") || cur_model.to_lowercase().contains("seed");
+        let files: Vec<_> = if has_video_image && is_doubao {
+            files.into_iter().filter(|f| !crate::channel::is_video_attachment(&f.mime_type, &f.filename)).collect()
+        } else {
+            files
+        };
         let (media_files, regular_files): (Vec<_>, Vec<_>) = files.into_iter().partition(|f| {
             crate::channel::is_video_attachment(&f.mime_type, &f.filename)
                 || crate::channel::is_audio_attachment(&f.mime_type, &f.filename)
@@ -1811,9 +1823,14 @@ impl AgentRuntime {
             vec![]
         };
         // Compress images before sending to LLM to save tokens.
+        // Skip compression for video attachments — they go to Files API directly.
         let compressed_images: Vec<_> = images
             .iter()
             .filter_map(|img| {
+                if img.mime_type.starts_with("video/") {
+                    // Pass video through without compression
+                    return Some(img.clone());
+                }
                 compress_image_for_llm(&img.data).map(|data| super::registry::ImageAttachment {
                     data,
                     mime_type: "image/jpeg".to_owned(),

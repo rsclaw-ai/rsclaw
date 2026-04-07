@@ -178,6 +178,18 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "fr" => "Décrivez cette image.",
         "de" => "Beschreiben Sie dieses Bild.",
     );
+    msg!("describe_video",
+        "en" => "Analyze this video.",
+        "zh" => "分析一下这个视频。",
+        "th" => "วิเคราะห์วิดีโอนี้",
+        "vi" => "Phan tich video nay.",
+        "ja" => "この動画を分析してください。",
+        "es" => "Analiza este video.",
+        "ko" => "이 동영상을 분석해 주세요.",
+        "ru" => "Проанализируйте это видео.",
+        "fr" => "Analysez cette vidéo.",
+        "de" => "Analysieren Sie dieses Video.",
+    );
 
     msg!("image_received",
         "en" => "[image received]",
