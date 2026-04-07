@@ -20,6 +20,11 @@
 //!   POST   /hooks/:path                     webhook ingress (see hooks module)
 //!   POST   /v1/chat/completions             OpenAI-compatible chat endpoint
 //!   GET    /v1/models                       OpenAI-compatible models list
+//!   POST   /v1/files                        upload a file (multipart)
+//!   GET    /v1/files                        list uploaded files
+//!   GET    /v1/files/:id                    retrieve file metadata
+//!   GET    /v1/files/:id/content            download file content
+//!   DELETE /v1/files/:id                    delete a file
 //!   GET    /ws                              WebSocket gateway protocol
 //! (OpenClaw WS)
 
@@ -35,6 +40,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
+    extract::Multipart,
     routing::{get, patch, post},
 };
 use futures::{Stream, StreamExt as _};
@@ -204,6 +210,10 @@ pub fn build_router(state: AppState) -> Router {
         // OpenAI-compatible endpoints — allow any OpenAI API client to connect.
         .route("/v1/chat/completions", post(openai_chat_completions))
         .route("/v1/models", get(openai_list_models))
+        // OpenAI Files API — file upload/management for doubao and other providers.
+        .route("/v1/files", post(upload_file).get(list_files))
+        .route("/v1/files/{file_id}", get(get_file_meta).delete(delete_file))
+        .route("/v1/files/{file_id}/content", get(get_file_content))
         // WebSocket gateway — auth is handled inside the WS handshake.
         // OpenClaw WebUI connects on "/" (root), "/ws", or "/gateway-ws".
         .route("/ws", get(crate::ws::ws_handler))
@@ -1886,4 +1896,308 @@ async fn write_workspace_file(
             Json(serde_json::json!({"error": e.to_string()})),
         ).into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI Files API
+// ---------------------------------------------------------------------------
+
+/// Directory where uploaded files are stored.
+fn files_dir() -> std::path::PathBuf {
+    dirs_next::home_dir()
+        .unwrap_or_default()
+        .join(".rsclaw/var/data/files")
+}
+
+/// File metadata stored alongside each uploaded file.
+#[derive(Debug, Serialize, Deserialize)]
+struct FileObject {
+    id: String,
+    object: String,
+    bytes: u64,
+    created_at: u64,
+    filename: String,
+    purpose: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+}
+
+/// Generate a unique file ID: `file-{timestamp_hex}{random_hex}`.
+fn generate_file_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let rnd: u32 = rand::random();
+    format!("file-{ts:x}{rnd:08x}")
+}
+
+/// Read metadata JSON for a file ID.
+fn read_file_meta_from_disk(file_id: &str) -> Option<FileObject> {
+    let dir = files_dir();
+    let meta_path = dir.join(format!("{file_id}.meta.json"));
+    let data = std::fs::read_to_string(&meta_path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+/// Derive Content-Type from file extension.
+fn content_type_for(filename: &str) -> &'static str {
+    match filename.rsplit('.').next().map(|e| e.to_ascii_lowercase()).as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("pdf") => "application/pdf",
+        Some("txt") => "text/plain",
+        Some("json") => "application/json",
+        Some("csv") => "text/csv",
+        Some("mp3") => "audio/mpeg",
+        Some("mp4") => "video/mp4",
+        Some("wav") => "audio/wav",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Build the content URL for a file.
+async fn file_content_url(state: &AppState, file_id: &str) -> String {
+    let port = state.live.gateway.read().await.port;
+    format!("http://localhost:{port}/v1/files/{file_id}/content")
+}
+
+/// POST /v1/files — upload a file via multipart/form-data.
+async fn upload_file(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let dir = files_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("cannot create files dir: {e}")})),
+        )
+            .into_response();
+    }
+
+    let mut file_data: Option<(String, Vec<u8>)> = None; // (filename, bytes)
+    let mut purpose = String::from("assistants");
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "file" => {
+                let filename = field
+                    .file_name()
+                    .unwrap_or("upload")
+                    .to_string();
+                match field.bytes().await {
+                    Ok(b) => file_data = Some((filename, b.to_vec())),
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"error": format!("failed to read file: {e}")})),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            "purpose" => {
+                if let Ok(b) = field.bytes().await {
+                    purpose = String::from_utf8_lossy(&b).to_string();
+                }
+            }
+            _ => { /* ignore unknown fields */ }
+        }
+    }
+
+    let Some((filename, data)) = file_data else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "missing 'file' field in multipart form"})),
+        )
+            .into_response();
+    };
+
+    let file_id = generate_file_id();
+    let stored_name = format!("{file_id}_{filename}");
+    let file_path = dir.join(&stored_name);
+
+    if let Err(e) = std::fs::write(&file_path, &data) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to write file: {e}")})),
+        )
+            .into_response();
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let url = file_content_url(&state, &file_id).await;
+
+    let meta = FileObject {
+        id: file_id.clone(),
+        object: "file".to_string(),
+        bytes: data.len() as u64,
+        created_at: now,
+        filename: filename.clone(),
+        purpose,
+        url: Some(url),
+    };
+
+    let meta_json = serde_json::to_string_pretty(&meta).unwrap_or_default();
+    let meta_path = dir.join(format!("{file_id}.meta.json"));
+    if let Err(e) = std::fs::write(&meta_path, &meta_json) {
+        // Clean up the data file on metadata write failure.
+        let _ = std::fs::remove_file(&file_path);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to write metadata: {e}")})),
+        )
+            .into_response();
+    }
+
+    info!(file_id = %meta.id, filename = %meta.filename, bytes = meta.bytes, "file uploaded");
+    Json(serde_json::json!(meta)).into_response()
+}
+
+/// GET /v1/files — list all uploaded files.
+async fn list_files(State(state): State<AppState>) -> impl IntoResponse {
+    let dir = files_dir();
+    let mut files: Vec<serde_json::Value> = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".meta.json"))
+            {
+                if let Ok(data) = std::fs::read_to_string(&path) {
+                    if let Ok(mut obj) = serde_json::from_str::<serde_json::Value>(&data) {
+                        // Refresh the URL in case the port changed.
+                        if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
+                            let url = file_content_url(&state, id).await;
+                            obj["url"] = serde_json::Value::String(url);
+                        }
+                        files.push(obj);
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by created_at descending (newest first).
+    files.sort_by(|a, b| {
+        let ta = a.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+        let tb = b.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+        tb.cmp(&ta)
+    });
+
+    Json(serde_json::json!({
+        "object": "list",
+        "data": files,
+    }))
+}
+
+/// GET /v1/files/{file_id} — retrieve file metadata.
+async fn get_file_meta(
+    State(state): State<AppState>,
+    Path(file_id): Path<String>,
+) -> impl IntoResponse {
+    match read_file_meta_from_disk(&file_id) {
+        Some(mut meta) => {
+            meta.url = Some(file_content_url(&state, &file_id).await);
+            Json(serde_json::json!(meta)).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("file {file_id} not found")})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /v1/files/{file_id}/content — download file content.
+async fn get_file_content(Path(file_id): Path<String>) -> impl IntoResponse {
+    let dir = files_dir();
+
+    // Find the data file matching this file_id prefix.
+    let data_file = std::fs::read_dir(&dir)
+        .ok()
+        .and_then(|entries| {
+            entries.flatten().find(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(&format!("{file_id}_")) && !name.ends_with(".meta.json")
+            })
+        })
+        .map(|e| e.path());
+
+    let Some(path) = data_file else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("file {file_id} not found")})),
+        )
+            .into_response();
+    };
+
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    let ct = content_type_for(filename);
+
+    match std::fs::read(&path) {
+        Ok(data) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, ct.parse().unwrap());
+            (headers, data).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to read file: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /v1/files/{file_id} — delete a file.
+async fn delete_file(Path(file_id): Path<String>) -> impl IntoResponse {
+    let dir = files_dir();
+
+    // Remove the metadata file.
+    let meta_path = dir.join(format!("{file_id}.meta.json"));
+    let meta_existed = meta_path.exists();
+    let _ = std::fs::remove_file(&meta_path);
+
+    // Remove the data file.
+    let data_removed = std::fs::read_dir(&dir)
+        .ok()
+        .and_then(|entries| {
+            entries.flatten().find(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(&format!("{file_id}_")) && !name.ends_with(".meta.json")
+            })
+        })
+        .map(|e| {
+            let _ = std::fs::remove_file(e.path());
+            true
+        })
+        .unwrap_or(false);
+
+    if meta_existed || data_removed {
+        info!(file_id = %file_id, "file deleted");
+    }
+
+    Json(serde_json::json!({
+        "id": file_id,
+        "object": "file",
+        "deleted": true,
+    }))
 }

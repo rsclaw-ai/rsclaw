@@ -17,7 +17,7 @@ tokio        = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 
 # Web framework
-axum         = { version = "0.8", features = ["ws"] }
+axum         = { version = "0.8", features = ["ws", "multipart"] }
 
 # HTTP client
 # TLS: use aws-lc-rs instead of ring for better cross-compilation (esp. Windows ARM64)

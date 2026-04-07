@@ -689,10 +689,7 @@ fn parse_sse_chunk(chunk: Result<bytes::Bytes>) -> Vec<Result<StreamEvent>> {
         Err(e) => return vec![Err(e)],
     };
 
-    let text = match std::str::from_utf8(&bytes) {
-        Ok(t) => t,
-        Err(e) => return vec![Err(anyhow::anyhow!("UTF-8 error: {e}"))],
-    };
+    let text = String::from_utf8_lossy(&bytes);
 
     let mut events = Vec::new();
     let mut has_data_line = false;
@@ -1040,10 +1037,7 @@ fn parse_responses_sse_chunk(chunk: Result<bytes::Bytes>) -> Vec<Result<StreamEv
         Err(e) => return vec![Err(e)],
     };
 
-    let text = match std::str::from_utf8(&bytes) {
-        Ok(t) => t,
-        Err(e) => return vec![Err(anyhow::anyhow!("UTF-8 error: {e}"))],
-    };
+    let text = String::from_utf8_lossy(&bytes);
 
     let mut events = Vec::new();
     // Track the current event type from `event:` lines
