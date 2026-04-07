@@ -951,7 +951,9 @@ fn build_responses_body(req: &LlmRequest, file_id_map: &HashMap<String, String>)
         body["instructions"] = json!(system_parts.join("\n\n"));
     }
 
-    body["max_output_tokens"] = json!(req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS));
+    if let Some(max_tokens) = req.max_tokens {
+        body["max_output_tokens"] = json!(max_tokens);
+    }
 
     if let Some(t) = req.temperature {
         body["temperature"] = json!(t);

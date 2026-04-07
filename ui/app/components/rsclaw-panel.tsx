@@ -67,6 +67,7 @@ interface AgentInfo {
   status: string;
   toolset?: string[];
   channels?: string[];
+  maxTokens?: number;
 }
 
 interface GatewayHealth {
@@ -486,7 +487,7 @@ function ConfigEditorPage() {
   const [processingTimeout, setProcessingTimeout] = useState(120);
   const [authToken, setAuthToken] = useState("");
   const [agentModel, setAgentModel] = useState("");
-  const [agentMaxTokens, setAgentMaxTokens] = useState(4096);
+  const [agentMaxTokens, setAgentMaxTokens] = useState(0);
 
   // Parsed config fields - Models
   const [providers, setProviders] = useState<{
@@ -840,10 +841,10 @@ function ConfigEditorPage() {
         </div>
         <div style={{ ...fieldRow, borderBottom: "none" }}>
           <div>
-            <div style={fieldLabel}>Max Tokens</div>
+            <div style={fieldLabel}>Max Tokens <span style={{ color: "#666", fontWeight: 400 }}>(0 = auto)</span></div>
           </div>
           <input style={fieldInput} type="number" value={agentMaxTokens}
-            onChange={(e) => { setAgentMaxTokens(parseInt(e.target.value, 10) || 4096); markDirty(); }} />
+            onChange={(e) => { setAgentMaxTokens(parseInt(e.target.value, 10) || 0); markDirty(); }} />
         </div>
       </div>
     </div>
@@ -1603,6 +1604,7 @@ function AgentManagerPage() {
   const [newModel, setNewModel] = useState("");
   const [newChannels, setNewChannels] = useState<string[]>([]);
   const [newToolset, setNewToolset] = useState("full");
+  const [newMaxTokens, setNewMaxTokens] = useState(0);
   const [newSystem, setNewSystem] = useState("");
   const [idError, setIdError] = useState("");
   const [channelAccounts, setChannelAccounts] = useState<Record<string, string[]>>({});
@@ -1633,7 +1635,7 @@ function AgentManagerPage() {
       const list = (cfg.agents?.list || []).map((a: any) => {
         const rawModel = a.model;
         const modelStr = typeof rawModel === "string" ? rawModel : rawModel?.primary || "";
-        return { ...a, model: modelStr, status: a.status || "idle" };
+        return { ...a, model: modelStr, status: a.status || "idle", maxTokens: rawModel?.maxTokens || a.maxTokens || 0 };
       });
       setAgentList(list);
     } catch {}
@@ -1703,7 +1705,7 @@ function AgentManagerPage() {
       id: newId.trim(),
       name: newName || undefined,
       avatar: newAvatar || undefined,
-      model: newModel ? { primary: newModel, toolset: newToolset } : undefined,
+      model: newModel ? { primary: newModel, toolset: newToolset, ...(newMaxTokens > 0 ? { maxTokens: newMaxTokens } : {}) } : (newMaxTokens > 0 ? { maxTokens: newMaxTokens } : undefined),
       channels: newChannels.length > 0 ? newChannels : [],
     };
     try {
@@ -1802,6 +1804,7 @@ function AgentManagerPage() {
     setNewModel(agent.model || "");
     setNewChannels(agent.channels || []);
     setNewToolset(agent.toolset?.[0] || "full");
+    setNewMaxTokens(agent.maxTokens || 0);
     setNewSystem("");
     setSelectedProvider("");
     setProviderModels([]);
@@ -1855,6 +1858,7 @@ function AgentManagerPage() {
     setNewModel("");
     setNewChannels([]);
     setNewToolset("full");
+    setNewMaxTokens(0);
     setNewSystem("");
     setIdError("");
     setSelectedProvider("");
@@ -2238,6 +2242,19 @@ function AgentManagerPage() {
                   </div>
                 ))}
               </div>
+            </div>
+
+            {/* Max Tokens */}
+            <div className={styles["cfg-f"]}>
+              <div className={styles["cfg-lbl"]}>Max Tokens <span style={{ color: "#666", fontWeight: 400 }}>(0 = auto)</span></div>
+              <input
+                className={styles["cfg-input"]}
+                type="number"
+                value={newMaxTokens}
+                onChange={(e) => setNewMaxTokens(parseInt(e.target.value) || 0)}
+                placeholder="0"
+                style={{ maxWidth: 120 }}
+              />
             </div>
 
             <div className={styles["modal-actions"]}>
@@ -3710,12 +3727,19 @@ function TauriConfigPageInner() {
               </div>
               <input style={{ ...fInput, minWidth: 100 }} type="number" value={getVal("agents.defaults.compaction.keepRecentPairs", 5)} onChange={(e) => updateConfig("agents.defaults.compaction.keepRecentPairs", parseInt(e.target.value) || 5)} />
             </div>
-            <div style={{ ...fieldRow, borderBottom: "none" }}>
+            <div style={fieldRow}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u8BF7\u6C42\u8D85\u65F6" : "Timeout"}</div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.timeoutSeconds ({zh ? "\u79D2" : "sec"})</div>
               </div>
               <input style={{ ...fInput, minWidth: 100 }} type="number" value={getVal("agents.defaults.timeoutSeconds", 600)} onChange={(e) => updateConfig("agents.defaults.timeoutSeconds", parseInt(e.target.value) || 600)} />
+            </div>
+            <div style={{ ...fieldRow, borderBottom: "none" }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>Max Tokens <span style={{ color: V.t3, fontWeight: 400 }}>(0 = auto)</span></div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.maxTokens</div>
+              </div>
+              <input style={{ ...fInput, minWidth: 100 }} type="number" value={getVal("agents.defaults.model.maxTokens", 0)} onChange={(e) => updateConfig("agents.defaults.model.maxTokens", parseInt(e.target.value) || 0)} />
             </div>
           </div>
         </div>)}
