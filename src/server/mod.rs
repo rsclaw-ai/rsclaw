@@ -1902,6 +1902,17 @@ async fn write_workspace_file(
 // OpenAI Files API
 // ---------------------------------------------------------------------------
 
+/// Maximum file upload size (100 MB). TODO: make configurable via gateway.max_upload_size.
+const MAX_UPLOAD_SIZE: usize = 100 * 1024 * 1024;
+
+/// Validate a file_id to prevent path traversal attacks.
+fn validate_file_id(file_id: &str) -> Result<(), Response> {
+    if !file_id.starts_with("file-") || file_id.contains('/') || file_id.contains('\\') || file_id.contains("..") {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid file_id"}))).into_response());
+    }
+    Ok(())
+}
+
 /// Directory where uploaded files are stored.
 fn files_dir() -> std::path::PathBuf {
     dirs_next::home_dir()
@@ -2019,6 +2030,13 @@ async fn upload_file(
             .into_response();
     };
 
+    // Max upload size: 100 MB (gateway.max_upload_size TODO).
+    if data.len() > MAX_UPLOAD_SIZE {
+        return (StatusCode::PAYLOAD_TOO_LARGE, Json(serde_json::json!({
+            "error": "file too large, max 100MB"
+        }))).into_response();
+    }
+
     let file_id = generate_file_id();
     let stored_name = format!("{file_id}_{filename}");
     let file_path = dir.join(&stored_name);
@@ -2109,6 +2127,7 @@ async fn get_file_meta(
     State(state): State<AppState>,
     Path(file_id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(e) = validate_file_id(&file_id) { return e; }
     match read_file_meta_from_disk(&file_id) {
         Some(mut meta) => {
             meta.url = Some(file_content_url(&state, &file_id).await);
@@ -2124,6 +2143,7 @@ async fn get_file_meta(
 
 /// GET /v1/files/{file_id}/content — download file content.
 async fn get_file_content(Path(file_id): Path<String>) -> impl IntoResponse {
+    if let Err(e) = validate_file_id(&file_id) { return e; }
     let dir = files_dir();
 
     // Find the data file matching this file_id prefix.
@@ -2168,6 +2188,7 @@ async fn get_file_content(Path(file_id): Path<String>) -> impl IntoResponse {
 
 /// DELETE /v1/files/{file_id} — delete a file.
 async fn delete_file(Path(file_id): Path<String>) -> impl IntoResponse {
+    if let Err(e) = validate_file_id(&file_id) { return e.into_response(); }
     let dir = files_dir();
 
     // Remove the metadata file.
@@ -2199,5 +2220,5 @@ async fn delete_file(Path(file_id): Path<String>) -> impl IntoResponse {
         "id": file_id,
         "object": "file",
         "deleted": true,
-    }))
+    })).into_response()
 }

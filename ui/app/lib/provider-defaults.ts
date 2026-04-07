@@ -13,7 +13,7 @@ export const API_TYPE_LABELS: Record<ApiType, string> = {
 export const API_TYPE_DEFAULT_URLS: Record<ApiType, string> = {
   openai: "https://api.openai.com/v1",
   "openai-responses": "https://api.openai.com/v1",
-  anthropic: "https://api.anthropic.com",
+  anthropic: "https://api.anthropic.com/v1",
   gemini: "https://generativelanguage.googleapis.com/v1beta",
   ollama: "http://localhost:11434",
 };

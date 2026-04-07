@@ -1398,6 +1398,9 @@ impl AgentRuntime {
             let mut remaining = Vec::new();
             for f in files {
                 if crate::channel::is_video_attachment(&f.mime_type, &f.filename) {
+                    // NOTE: During base64 encoding, both f.data and the b64 string
+                    // (~133% of original) coexist in memory. The 100 MB upload limit
+                    // (MAX_UPLOAD_SIZE) bounds the worst case to ~233 MB peak.
                     use base64::Engine;
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&f.data);
                     let mime = if f.mime_type.is_empty() { "video/mp4" } else { &f.mime_type };

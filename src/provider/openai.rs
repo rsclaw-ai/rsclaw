@@ -144,6 +144,7 @@ impl LlmProvider for OpenAiProvider {
                 "openai: request prepared"
             );
             // Dump full body to temp file for debugging
+            #[cfg(debug_assertions)]
             let _ = std::fs::write(
                 std::env::temp_dir().join("rsclaw_last_request.json"),
                 &body_str,
@@ -538,6 +539,7 @@ impl OpenAiProvider {
             body_len = body_str.len(),
             "openai-responses: request prepared"
         );
+        #[cfg(debug_assertions)]
         let _ = std::fs::write(
             std::env::temp_dir().join("rsclaw_last_responses_request.json"),
             &body_str,
@@ -882,22 +884,10 @@ fn parse_event(data: &str) -> Option<StreamEvent> {
         return Some(StreamEvent::ToolCall { id, name, input });
     }
 
-    // Text delta — check "content" first, then "reasoning_content"/"reasoning".
-    // Do NOT strip <think> tags here — tags span multiple chunks.
-    // The runtime strips them from the accumulated buffer after the stream ends.
-    if let Some(text) = delta["content"].as_str()
-        && !text.is_empty()
-    {
-        return Some(StreamEvent::TextDelta(text.to_owned()));
-    }
-    // DeepSeek: reasoning_content, Qwen/Ollama: reasoning — wrap in <think>
-    // tags so the runtime can stream them to the user and strip them later.
-    use std::cell::RefCell;
-    thread_local! {
-        static IN_REASONING: RefCell<bool> = const { RefCell::new(false) };
-    }
-    // Only handle reasoning_content (DeepSeek). Ignore "reasoning" field
-    // (Ollama/Qwen3) since thinking mode is disabled — content field has the actual reply.
+    // Text / reasoning deltas — stateless: emit ReasoningDelta or TextDelta
+    // based solely on which field is present in this chunk. No cross-chunk state
+    // needed (the old thread_local IN_REASONING was unsafe with concurrent streams
+    // on the same tokio thread).
     let reasoning_text = delta["reasoning_content"]
         .as_str()
         .filter(|s| !s.is_empty());
@@ -905,34 +895,9 @@ fn parse_event(data: &str) -> Option<StreamEvent> {
     let is_done = choice["finish_reason"].is_string();
 
     if let Some(text) = reasoning_text {
-        // Reasoning chunk
-        return IN_REASONING.with(|r| {
-            let was = *r.borrow();
-            *r.borrow_mut() = true;
-            if !was {
-                Some(StreamEvent::TextDelta(format!("<think>{text}")))
-            } else {
-                Some(StreamEvent::TextDelta(text.to_owned()))
-            }
-        });
+        return Some(StreamEvent::ReasoningDelta(text.to_owned()));
     }
 
-    // Not reasoning — close think tag if we were reasoning
-    let was_reasoning = IN_REASONING.with(|r| {
-        let was = *r.borrow();
-        if was { *r.borrow_mut() = false; }
-        was
-    });
-
-    if was_reasoning {
-        if let Some(text) = content_text {
-            return Some(StreamEvent::TextDelta(format!("</think>{text}")));
-        }
-        // No content yet, just close the tag
-        return Some(StreamEvent::TextDelta("</think>".to_owned()));
-    }
-
-    // Normal content (not reasoning)
     if let Some(text) = content_text {
         return Some(StreamEvent::TextDelta(text.to_owned()));
     }
@@ -1227,9 +1192,9 @@ fn parse_responses_event(data: &str, event_type: Option<&str>) -> Option<StreamE
         "response.output_item.done" => {
             let item = &v["item"];
             if item["type"].as_str() == Some("function_call") {
-                let id = item["id"]
+                let id = item["call_id"]
                     .as_str()
-                    .or_else(|| item["call_id"].as_str())
+                    .or_else(|| item["id"].as_str())
                     .unwrap_or("")
                     .to_owned();
                 let name = item["name"].as_str().unwrap_or("").to_owned();
