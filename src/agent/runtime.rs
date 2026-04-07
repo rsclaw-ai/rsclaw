@@ -2578,14 +2578,16 @@ impl AgentRuntime {
 
                 let (result_text, result_images) = match result {
                     Ok(v) => {
-                        // Extract images from tool result (e.g. computer_use screenshot)
-                        // to avoid passing large base64 back to LLM.
-                        if let Some(img) = v.get("image").and_then(|i| i.as_str()) {
-                            let desc = v.get("action").and_then(|a| a.as_str()).unwrap_or("tool");
+                        // Extract images from tool result to avoid passing large
+                        // base64 back to LLM. Check "image" (screenshot) and "url" (image gen).
+                        let img_data = v.get("image").and_then(|i| i.as_str())
+                            .or_else(|| v.get("url").and_then(|u| u.as_str()).filter(|u| u.starts_with("data:image/")));
+                        if let Some(img) = img_data {
+                            let desc = v.get("revised_prompt").and_then(|p| p.as_str())
+                                .or_else(|| v.get("action").and_then(|a| a.as_str()))
+                                .unwrap_or("image generated");
                             (
-                                format!(
-                                    "{{\"action\":\"{desc}\",\"status\":\"image sent to user\"}}"
-                                ),
+                                format!("{{\"status\":\"image sent to user\",\"description\":\"{desc}\"}}"),
                                 vec![img.to_owned()],
                             )
                         } else {
