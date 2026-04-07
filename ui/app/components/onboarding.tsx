@@ -156,7 +156,7 @@ const T: Record<WizLang, WizText> = {
   },
   en: {
     welcome: "Get started",
-    subtitle: "Multi-Agent AI Gateway \u00B7 High-Performance Engine",
+    subtitle: "High-perf Multi-Agent AI Gateway",
     step1Title: "Environment check",
     step1Sub: "Check if rsclaw is installed and if there is OpenClaw data to migrate.",
     step2Title: "Choose LLM provider",
@@ -342,7 +342,7 @@ const T: Record<WizLang, WizText> = {
   },
   de: {
     welcome: "Einrichtung starten",
-    subtitle: "Multi-Agent AI Gateway \u00B7 Hochleistungs-Engine",
+    subtitle: "High-perf Multi-Agent AI Gateway",
     step1Title: "Umgebung pr\u00FCfen",
     step1Sub: "Pr\u00FCft, ob rsclaw installiert ist.",
     step2Title: "LLM-Anbieter w\u00E4hlen",
@@ -2271,7 +2271,7 @@ export function OnboardingPage() {
               </div>
             ) : (
               <div style={S.logoSub}>
-                {t.subtitle.toUpperCase()}
+                {t.subtitle}
               </div>
             )}
           </div>
