@@ -676,39 +676,9 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
         .timeout(std::time::Duration::from_secs(15))
         .build().unwrap_or_default();
 
-    // Anthropic protocol: test with /messages (not /models — many proxies don't support it)
     let is_anthropic = effective_api_type == "anthropic";
     let is_ollama = effective_api_type == "ollama";
     let is_gemini = effective_api_type == "gemini" || provider == "gemini";
-
-    if is_anthropic {
-        let url = format!("{effective_base}/messages");
-        let resp = client.post(&url)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&serde_json::json!({
-                "model": "claude-3-5-sonnet-20240620",
-                "max_tokens": 1,
-                "messages": [{"role": "user", "content": "hi"}],
-            }))
-            .send()
-            .await;
-        return match resp {
-            Ok(r) if r.status().is_success() || r.status().as_u16() == 400 => {
-                // 200 = ok, 400 = model not found but key is valid
-                Ok(serde_json::json!({"ok": true, "models": ["claude-sonnet-4-20250514", "claude-opus-4-5", "claude-haiku-4-5-20251001"]}))
-            }
-            Ok(r) if r.status().as_u16() == 401 || r.status().as_u16() == 403 => {
-                Ok(serde_json::json!({"ok": false, "error": "Invalid API key"}))
-            }
-            Ok(r) => {
-                let body = r.text().await.unwrap_or_default();
-                Ok(serde_json::json!({"ok": false, "error": body.chars().take(200).collect::<String>()}))
-            }
-            Err(e) => Ok(serde_json::json!({"ok": false, "error": e.to_string()})),
-        };
-    }
 
     let url = if is_ollama {
         format!("{effective_base}/api/tags")
@@ -721,6 +691,10 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
     let mut req = client.get(&url);
     match auth_style {
         "bearer" => { req = req.header("Authorization", format!("Bearer {api_key}")); }
+        "x-api-key" => {
+            req = req.header("x-api-key", &api_key);
+            req = req.header("anthropic-version", "2023-06-01");
+        }
         _ => {} // gemini uses query param, ollama needs no auth
     }
 
