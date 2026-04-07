@@ -574,7 +574,7 @@ export function SideBar(props: { className?: string }) {
       >
         <GatewayStatus narrow={shouldNarrow} />
         {!shouldNarrow && (
-          <div className={styles["sidebar-quick-nav"]} style={{ gridTemplateColumns: "1fr 1fr 1fr" }}>
+          <div className={styles["sidebar-quick-nav"]}>
             {[
               { tab: "status", icon: "\uD83D\uDCE1", label: Locale.RsClawPanel.Sidebar.Service },
               { tab: "config", icon: "\u2699\uFE0F", label: Locale.RsClawPanel.Sidebar.Config },
