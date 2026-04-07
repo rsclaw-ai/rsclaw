@@ -916,29 +916,20 @@ fn main() {
             Ok(())
         })
         .on_window_event(|event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event.event() {
-                // Check if gateway is running by testing its pid file
-                let pid_path = dirs::home_dir()
-                    .map(|h| h.join(".rsclaw").join("var").join("run").join("gateway.pid"));
-                let pid_content = pid_path.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
-                let pid_val = pid_content.as_ref().and_then(|s| s.trim().parse::<u32>().ok());
-                let gw_running = pid_val.is_some_and(|pid| is_process_alive(pid));
-
-
-
-                if gw_running {
-                    // Gateway running: minimize to dock, keep backend alive
-                    // Click dock thumbnail to restore
-                    let _ = event.window().minimize();
-                    api.prevent_close();
-                }
+            if let tauri::WindowEvent::CloseRequested { .. } = event.event() {
+                // Let the window close normally. Gateway keeps running as a
+                // background process. App exit (Cmd+Q, dock Quit) triggers
+                // RunEvent::Exit which stops the gateway.
             }
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app_handle, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
-                let _ = stop_gateway();
+            match event {
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+                    let _ = stop_gateway();
+                }
+                _ => {}
             }
         });
 }

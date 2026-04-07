@@ -2147,9 +2147,11 @@ export function OnboardingPage() {
       }
       update(0, "ok");
 
-      // 2: start gateway
+      // 2: start gateway (stop any existing one first)
       update(1, "loading");
       if (tauriInvoke) {
+        try { await tauriInvoke("stop_gateway"); } catch {}
+        await new Promise((r) => setTimeout(r, 1000));
         await tauriInvoke("start_gateway");
       }
       await new Promise((r) => setTimeout(r, 2500));
