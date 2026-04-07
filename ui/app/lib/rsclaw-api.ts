@@ -95,18 +95,18 @@ export async function clearSession(sessionKey: string) {
   ).then((r) => r.json());
 }
 
-export async function testProviderKey(provider: string, apiKey: string, baseUrl?: string) {
+export async function testProviderKey(provider: string, apiKey: string, baseUrl?: string, apiType?: string) {
   return gatewayFetch("/api/v1/providers/test", {
     method: "POST",
-    body: JSON.stringify({ provider, api_key: apiKey, base_url: baseUrl }),
+    body: JSON.stringify({ provider, api_key: apiKey, base_url: baseUrl, api_type: apiType }),
     signal: AbortSignal.timeout(20000),
   }).then((r) => r.json());
 }
 
-export async function listProviderModels(provider: string, apiKey: string, baseUrl?: string) {
+export async function listProviderModels(provider: string, apiKey: string, baseUrl?: string, apiType?: string) {
   return gatewayFetch("/api/v1/providers/models", {
     method: "POST",
-    body: JSON.stringify({ provider, api_key: apiKey, base_url: baseUrl }),
+    body: JSON.stringify({ provider, api_key: apiKey, base_url: baseUrl, api_type: apiType }),
     signal: AbortSignal.timeout(20000),
   }).then((r) => r.json());
 }

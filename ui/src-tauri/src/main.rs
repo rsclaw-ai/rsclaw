@@ -631,61 +631,111 @@ fn uninstall_skill(name: String) -> Result<String, String> {
 
 /// Test provider API key by calling /v1/models directly (no gateway needed).
 #[tauri::command]
-async fn test_provider(provider: String, api_key: String, base_url: Option<String>) -> Result<serde_json::Value, String> {
-    let (url_base, auth_style) = match provider.as_str() {
-        "anthropic"   => ("https://api.anthropic.com".to_owned(), "x-api-key"),
-        "openai"      => ("https://api.openai.com".to_owned(), "bearer"),
-        "deepseek"    => ("https://api.deepseek.com".to_owned(), "bearer"),
-        "qwen"        => ("https://dashscope.aliyuncs.com/compatible-mode".to_owned(), "bearer"),
-        "minimax"     => ("https://api.minimax.chat".to_owned(), "bearer"),
-        "kimi"        => ("https://api.moonshot.cn".to_owned(), "bearer"),
-        "zhipu"       => ("https://open.bigmodel.cn/api/paas".to_owned(), "bearer"),
-        "groq"        => ("https://api.groq.com/openai".to_owned(), "bearer"),
-        "grok"        => ("https://api.x.ai".to_owned(), "bearer"),
-        "gemini"      => ("https://generativelanguage.googleapis.com".to_owned(), "bearer"),
-        "siliconflow" => ("https://api.siliconflow.cn".to_owned(), "bearer"),
-        "openrouter"  => ("https://openrouter.ai/api".to_owned(), "bearer"),
-        "gaterouter"  => (base_url.clone().unwrap_or_else(|| "https://api.gaterouter.ai/openai".to_owned()), "bearer"),
-        "ollama"      => (base_url.clone().unwrap_or_else(|| "http://localhost:11434".to_owned()).trim_end_matches('/').to_owned(), "none"),
-        "custom"      => (base_url.clone().unwrap_or_else(|| "http://localhost:8080".to_owned()).trim_end_matches('/').to_owned(), if api_key.is_empty() { "none" } else { "bearer" }),
+async fn test_provider(provider: String, api_key: String, base_url: Option<String>, api_type: Option<String>) -> Result<serde_json::Value, String> {
+    // Resolve the effective API type for custom providers
+    let effective_api_type = if provider == "custom" {
+        api_type.as_deref().unwrap_or("openai")
+    } else {
+        provider.as_str()
+    };
+
+    // Resolve base URL: explicit base_url param > provider default
+    let default_base = match provider.as_str() {
+        "anthropic"   => "https://api.anthropic.com",
+        "openai"      => "https://api.openai.com/v1",
+        "deepseek"    => "https://api.deepseek.com/v1",
+        "qwen"        => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "doubao"      => "https://ark.cn-beijing.volces.com/api/v3",
+        "minimax"     => "https://api.minimax.chat/v1",
+        "kimi"        => "https://api.moonshot.cn/v1",
+        "zhipu"       => "https://open.bigmodel.cn/api/paas/v4",
+        "groq"        => "https://api.groq.com/openai/v1",
+        "grok"        => "https://api.x.ai/v1",
+        "gemini"      => "https://generativelanguage.googleapis.com/v1beta",
+        "siliconflow" => "https://api.siliconflow.cn/v1",
+        "openrouter"  => "https://openrouter.ai/api/v1",
+        "gaterouter"  => "https://api.gaterouter.com/v1",
+        "ollama"      => "http://localhost:11434",
+        "custom"      => "",
         _ => return Ok(serde_json::json!({"ok": false, "error": "unknown provider"})),
     };
-    // Use base_url override if provided (except already handled above)
-    let effective_base = if !matches!(provider.as_str(), "gaterouter"|"ollama"|"custom") {
-        base_url.unwrap_or(url_base)
-    } else { url_base };
-    let url = if provider == "ollama" {
-        format!("{}/api/tags", effective_base)
-    } else {
-        format!("{}/v1/models", effective_base)
+    let effective_base = base_url
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| default_base.to_owned());
+    let effective_base = effective_base.trim_end_matches('/');
+
+    // Check if base URL already has a version suffix (e.g. /v1, /v3, /v4, /v1beta)
+    let has_version = effective_base.rsplit('/').next()
+        .is_some_and(|seg| seg.starts_with('v') && seg.len() >= 2 && seg.as_bytes()[1].is_ascii_digit());
+
+    // Determine auth style based on provider or api_type
+    let auth_style = match effective_api_type {
+        "anthropic" => "x-api-key",
+        "gemini"    => "gemini-key",  // query param auth
+        "ollama"    => "none",
+        _ => if api_key.is_empty() { "none" } else { "bearer" },
     };
+
+    // Build models list URL
+    let is_ollama = effective_api_type == "ollama";
+    let is_gemini = effective_api_type == "gemini" || provider == "gemini";
+    let url = if is_ollama {
+        format!("{effective_base}/api/tags")
+    } else if is_gemini {
+        // Gemini uses query param auth and already has /v1beta
+        if has_version {
+            format!("{effective_base}/models?key={api_key}")
+        } else {
+            format!("{effective_base}/v1beta/models?key={api_key}")
+        }
+    } else if has_version {
+        format!("{effective_base}/models")
+    } else {
+        format!("{effective_base}/v1/models")
+    };
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build().unwrap_or_default();
     let mut req = client.get(&url);
+
+    // Set auth headers (skip for gemini — uses query param above)
     match auth_style {
-        "bearer" => { req = req.header("Authorization", format!("Bearer {}", api_key)); }
+        "bearer" => { req = req.header("Authorization", format!("Bearer {api_key}")); }
         "x-api-key" => {
             req = req.header("x-api-key", &api_key);
             req = req.header("anthropic-version", "2023-06-01");
         }
-        _ => {}
+        _ => {} // "none" or "gemini-key" (already in URL)
     }
+
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            // Extract model IDs
+            // Extract model IDs — handle different response formats
             let models: Vec<String> = if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
+                // OpenAI format: { data: [{ id: "..." }] }
                 data.iter().filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.to_owned())).collect()
             } else if let Some(models) = body.get("models").and_then(|m| m.as_array()) {
-                models.iter().filter_map(|m| m.get("name").and_then(|v| v.as_str()).map(|s| s.to_owned())).collect()
+                // Ollama / Gemini format: { models: [{ name: "..." }] }
+                models.iter().filter_map(|m| {
+                    m.get("name").or_else(|| m.get("id"))
+                        .and_then(|v| v.as_str())
+                        // Gemini returns "models/gemini-2.5-flash" — strip prefix
+                        .map(|s| s.strip_prefix("models/").unwrap_or(s).to_owned())
+                }).collect()
             } else { vec![] };
             Ok(serde_json::json!({"ok": true, "models": models}))
         }
         Ok(resp) => {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            Ok(serde_json::json!({"ok": false, "error": if status == 401 { "Invalid API key" } else { &body[..body.len().min(200)] }}))
+            let msg = if status == 401 || status == 403 {
+                "Invalid API key".to_owned()
+            } else {
+                body[..body.len().min(200)].to_owned()
+            };
+            Ok(serde_json::json!({"ok": false, "error": msg}))
         }
         Err(e) => Ok(serde_json::json!({"ok": false, "error": e.to_string()})),
     }
@@ -869,6 +919,11 @@ fn main() {
                 }
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                let _ = stop_gateway();
+            }
+        });
 }

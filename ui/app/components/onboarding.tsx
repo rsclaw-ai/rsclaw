@@ -774,11 +774,14 @@ export interface ProviderDef {
   keyPlaceholder: string;
   isUrl?: boolean;
   sep?: boolean;
+  hasBaseUrl?: boolean;
+  defaultBaseUrl?: string;
 }
 
 // All providers (unordered lookup table)
 export const ALL_PROVIDERS: Record<string, ProviderDef> = {
   qwen:        { id: "qwen",        name: "Qwen",              tag: "\u56FD\u5185\u76F4\u8FDE",       tagEn: "China direct",      keyLabel: "DashScope API Key",   keyPlaceholder: "sk-..." },
+  doubao:      { id: "doubao",      name: "Doubao (\u8C46\u5305)", tag: "\u5B57\u8282\u8DF3\u52A8",     tagEn: "ByteDance",         keyLabel: "ARK API Key",         keyPlaceholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", hasBaseUrl: true, defaultBaseUrl: "https://ark.cn-beijing.volces.com/api/v3" },
   minimax:     { id: "minimax",     name: "MiniMax",            tag: "\u56FD\u5185",                  tagEn: "China",             keyLabel: "MiniMax API Key",     keyPlaceholder: "eyJ..." },
   deepseek:    { id: "deepseek",    name: "DeepSeek",           tag: "\u4F4E\u6210\u672C",            tagEn: "Low cost",          keyLabel: "DeepSeek API Key",    keyPlaceholder: "sk-..." },
   kimi:        { id: "kimi",        name: "Kimi",               tag: "\u56FD\u5185",                  tagEn: "China",             keyLabel: "Kimi API Key",        keyPlaceholder: "sk-..." },
@@ -795,8 +798,8 @@ export const ALL_PROVIDERS: Record<string, ProviderDef> = {
   siliconflow: { id: "siliconflow", name: "SiliconFlow",        tag: "\u56FD\u5185\u52A0\u901F",      tagEn: "China accel",       keyLabel: "SiliconFlow Key",     keyPlaceholder: "sk-..." },
 };
 
-export const PROV_ORDER_ZH = ["qwen","minimax","deepseek","kimi","zhipu","ollama","custom","gaterouter","openrouter","anthropic","openai","gemini","grok","groq","siliconflow"];
-export const PROV_ORDER_EN = ["anthropic","openai","gemini","grok","openrouter","ollama","custom","groq","qwen","minimax","deepseek","kimi","zhipu","gaterouter","siliconflow"];
+export const PROV_ORDER_ZH = ["qwen","doubao","minimax","deepseek","kimi","zhipu","ollama","custom","gaterouter","openrouter","anthropic","openai","gemini","grok","groq","siliconflow"];
+export const PROV_ORDER_EN = ["anthropic","openai","gemini","grok","openrouter","ollama","custom","groq","qwen","doubao","minimax","deepseek","kimi","zhipu","gaterouter","siliconflow"];
 
 function getProviders(lang?: string): ProviderDef[] {
   const isZhOrder = (lang || getLang()) === "cn";
@@ -816,6 +819,10 @@ export const MODELS: Record<string, ModelDef[]> = {
     { id: "qwen-max", tag: "\u63A8\u8350", tagEn: "Recommended", rec: true },
     { id: "qwen-plus", tag: "\u5747\u8861", tagEn: "Balanced", rec: false },
     { id: "qwen-turbo", tag: "\u5FEB\u901F", tagEn: "Fast", rec: false },
+  ],
+  doubao: [
+    { id: "doubao-seed-2-0-pro-260215", tag: "\u63A8\u8350", tagEn: "Recommended", rec: true },
+    { id: "doubao-1-5-pro-256k-250115", tag: "\u957F\u6587\u672C", tagEn: "Long context", rec: false },
   ],
   deepseek: [
     { id: "deepseek-chat", tag: "\u901A\u7528", tagEn: "General", rec: true },
@@ -1573,9 +1580,12 @@ export function OnboardingPage() {
     Object.values(ALL_PROVIDERS).forEach((p) => {
       const ps = makeProvState(false, p.isUrl);
       if (p.id === "custom") {
-        // Custom provider defaults to openai api_type
-        ps.apiType = "openai";
-        ps.baseUrl = API_TYPE_DEFAULT_URLS["openai"];
+        // Leave apiType and baseUrl empty - user picks them
+        ps.apiType = undefined;
+        ps.baseUrl = "";
+      } else if (p.hasBaseUrl && p.defaultBaseUrl) {
+        // Pre-fill default URL for providers with editable URL (e.g. doubao)
+        ps.baseUrl = p.defaultBaseUrl;
       }
       m[p.id] = ps;
     });
@@ -1788,7 +1798,7 @@ export function OnboardingPage() {
       p[id] = {
         ...p[id],
         apiType,
-        baseUrl: API_TYPE_DEFAULT_URLS[apiType],
+        baseUrl: "",
         testStatus: "idle",
         models: null,
         selectedModel: null,
@@ -1802,8 +1812,8 @@ export function OnboardingPage() {
   const testProvider = async (id: string) => {
     const prov = provs[id];
     const isCustom = id === "custom";
-    const needsKey = !isCustom || API_TYPE_NEEDS_KEY[prov.apiType || "openai"];
-    if (needsKey && !prov.apiKey.trim()) {
+    const keyRequired = !isCustom || API_TYPE_NEEDS_KEY[prov.apiType || "openai"];
+    if (keyRequired && !prov.apiKey.trim()) {
       setProvs((prev) => {
         const p = { ...prev };
         p[id] = { ...p[id], testError: t.enterKey, inputState: "err" };
@@ -1823,18 +1833,19 @@ export function OnboardingPage() {
       const provDef = PROVIDERS.find((p) => p.id === id);
       // For custom provider, use the dedicated baseUrl field; for isUrl providers (ollama), also use baseUrl
       const baseUrl = id === "custom"
-        ? (prov.baseUrl || API_TYPE_DEFAULT_URLS[prov.apiType || "openai"])
-        : (provDef?.isUrl ? prov.baseUrl : undefined);
+        ? (prov.baseUrl || (prov.apiType ? API_TYPE_DEFAULT_URLS[prov.apiType] : undefined))
+        : ((provDef?.isUrl || provDef?.hasBaseUrl) ? prov.baseUrl : undefined);
       const tauriInvoke = (window as any).__TAURI__?.invoke;
       let result: any;
       let modelIds: string[] = [];
       if (tauriInvoke) {
-        result = await tauriInvoke("test_provider", { provider: id, apiKey: prov.apiKey, baseUrl: baseUrl || null });
+        result = await tauriInvoke("test_provider", { provider: id, apiKey: prov.apiKey, baseUrl: baseUrl || null, apiType: id === "custom" ? (prov.apiType || null) : null });
         modelIds = result.models || [];
       } else {
-        result = await testProviderKey(id, prov.apiKey, baseUrl);
+        const apiTypeParam = id === "custom" ? (prov.apiType || undefined) : undefined;
+        result = await testProviderKey(id, prov.apiKey, baseUrl, apiTypeParam);
         if (result.ok) {
-          const modelResult = await listProviderModels(id, prov.apiKey, baseUrl);
+          const modelResult = await listProviderModels(id, prov.apiKey, baseUrl, apiTypeParam);
           modelIds = modelResult.models || [];
         }
       }
@@ -2003,14 +2014,16 @@ export function OnboardingPage() {
       if (!ps.selected || !ps.selectedModel) continue;
       if (id === "custom") {
         const apiType = ps.apiType || "openai";
-        const baseUrl = ps.baseUrl || API_TYPE_DEFAULT_URLS[apiType];
-        const entry: Record<string, any> = { api: apiType, baseUrl };
+        const entry: Record<string, any> = { api: apiType };
+        if (ps.baseUrl) entry.baseUrl = ps.baseUrl;
         if (ps.apiKey) entry.apiKey = ps.apiKey;
         providers[id] = entry;
       } else if (PROVIDERS.find((p) => p.id === id)?.isUrl) {
         providers[id] = { api: "ollama", baseUrl: ps.baseUrl || ps.apiKey };
       } else if (ps.apiKey) {
-        providers[id] = { apiKey: ps.apiKey };
+        const entry: Record<string, any> = { apiKey: ps.apiKey };
+        if (ps.baseUrl) entry.baseUrl = ps.baseUrl;
+        providers[id] = entry;
       } else {
         providers[id] = {};
       }
@@ -2074,34 +2087,35 @@ export function OnboardingPage() {
       const userPort = parseInt(port) || 18888;
       setGatewayUrl(`http://localhost:${userPort}`);
 
-      // 1: write config (merge with existing to preserve QR login tokens)
+      // 1: write config — deep merge into existing, never delete existing keys
       update(0, "loading");
       const newConfig = JSON.parse(generateConfig());
       const tauriInvoke = (window as any).__TAURI__?.invoke;
+
+      // Deep merge helper: recursively merge src into dst without deleting dst keys
+      const deepMerge = (dst: any, src: any): any => {
+        if (!src || typeof src !== "object" || Array.isArray(src)) return src;
+        const result = { ...(dst || {}) };
+        for (const [k, v] of Object.entries(src)) {
+          if (v && typeof v === "object" && !Array.isArray(v) && typeof result[k] === "object" && !Array.isArray(result[k])) {
+            result[k] = deepMerge(result[k], v);
+          } else {
+            result[k] = v;
+          }
+        }
+        return result;
+      };
+
       if (tauriInvoke) {
-        try { await tauriInvoke("run_setup"); } catch {} // may fail without tty, ok
-        // Read existing config (may contain botToken from QR login)
+        try { await tauriInvoke("run_setup"); } catch {} // ensure dirs exist
+        // Read existing config — this is the source of truth
         let existing: any = {};
         try {
           const raw: string = await tauriInvoke("read_config_file");
           existing = JSON.parse(raw || "{}");
         } catch {}
-        // Deep merge: preserve auth token, channel credentials from existing config
-        const merged = { ...newConfig };
-        // Preserve gateway.auth from setup-generated config
-        merged.gateway = { ...(existing.gateway || {}), ...(newConfig.gateway || {}) };
-        if (existing.gateway?.auth) {
-          merged.gateway.auth = existing.gateway.auth;
-        }
-        // Merge channels: new channels + existing channels (preserve QR login tokens)
-        const allChannels = { ...(newConfig.channels || {}), ...(existing.channels || {}) };
-        // Overlay new credential values on top of existing
-        for (const [ch, val] of Object.entries(newConfig.channels || {})) {
-          if (allChannels[ch] && Object.keys(val as any).length > 0) {
-            allChannels[ch] = { ...allChannels[ch], ...(val as any) };
-          }
-        }
-        merged.channels = allChannels;
+        // Deep merge: existing config is base, new config overlays on top
+        const merged = deepMerge(existing, newConfig);
         await tauriInvoke("write_config", { content: JSON.stringify(merged, null, 2) });
       } else {
         await saveConfig({ raw: JSON.stringify(newConfig, null, 2) });
@@ -2474,7 +2488,7 @@ export function OnboardingPage() {
                 const ps = provs[activeId];
                 const isCustom = activeId === "custom";
                 const curApiType: ApiType = ps.apiType || "openai";
-                const needsKey = !isCustom || API_TYPE_NEEDS_KEY[curApiType];
+                const keyRequired = !isCustom || API_TYPE_NEEDS_KEY[curApiType];
                 const inputFieldStyle = { flex: 1, background: "#1f2126", border: `1px solid ${ps.inputState === "ok" ? "#2dd4a0" : ps.inputState === "err" ? "#d95f5f" : "rgba(255,255,255,0.09)"}`, borderRadius: 7, padding: "7px 10px", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none" } as const;
                 const fieldLabelStyle = { fontSize: 10, color: "#2e2c3a", letterSpacing: 0.4, marginBottom: 5, fontFamily: "'JetBrains Mono', monospace" } as const;
                 const plainInputStyle = { width: "100%", background: "#1f2126", border: "1px solid rgba(255,255,255,0.09)", borderRadius: 7, padding: "7px 10px", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none", boxSizing: "border-box" } as const;
@@ -2503,9 +2517,9 @@ export function OnboardingPage() {
                         <input
                           type="text"
                           style={plainInputStyle}
-                          value={ps.baseUrl || API_TYPE_DEFAULT_URLS[curApiType]}
+                          value={ps.baseUrl}
                           onChange={(e) => setProvBaseUrl(activeId, e.target.value)}
-                          placeholder={API_TYPE_DEFAULT_URLS[curApiType]}
+                          placeholder="https://your-api-server.com/v1"
                         />
                       </div>
                     )}
@@ -2531,45 +2545,42 @@ export function OnboardingPage() {
                               : t.test}
                           </button>
                         </div>
+                        {pDef.hasBaseUrl && (
+                          <div style={{ marginBottom: 10 }}>
+                            <div style={fieldLabelStyle}>API URL</div>
+                            <input
+                              type="text"
+                              style={plainInputStyle}
+                              value={ps.baseUrl}
+                              onChange={(e) => setProvBaseUrl(activeId, e.target.value)}
+                              placeholder={pDef.defaultBaseUrl || "https://..."}
+                            />
+                          </div>
+                        )}
                       </>
                     )}
-                    {/* Custom Provider: API Key field (hidden for ollama) + test button row */}
+                    {/* Custom Provider: API Key + test button row */}
                     {isCustom && (
                       <div style={{ marginBottom: 10 }}>
-                        {needsKey && (
-                          <>
-                            <div style={fieldLabelStyle}>API Key</div>
-                            <div style={{ display: "flex", gap: 8, marginBottom: 0 }}>
-                              <input
-                                type="password"
-                                style={inputFieldStyle}
-                                value={ps.apiKey}
-                                onChange={(e) => setProvKey(activeId, e.target.value)}
-                                placeholder="sk-..."
-                              />
-                              <button
-                                onClick={() => testProvider(activeId)}
-                                disabled={ps.testStatus === "testing"}
-                                style={{ padding: "7px 13px", borderRadius: 7, border: `1px solid ${ps.testStatus === "success" ? "rgba(45,212,160,0.18)" : "rgba(255,255,255,0.09)"}`, background: ps.testStatus === "success" ? "rgba(45,212,160,0.07)" : "#1f2126", color: ps.testStatus === "success" ? "#2dd4a0" : "#9896a4", fontSize: 11, fontWeight: 500, cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0, fontFamily: "inherit" }}
-                              >
-                                {ps.testStatus === "testing" ? (<>{renderSpinner()}{t.testing}</>)
-                                  : ps.testStatus === "success" ? t.connected
-                                  : t.test}
-                              </button>
-                            </div>
-                          </>
-                        )}
-                        {!needsKey && (
+                        <div style={fieldLabelStyle}>API Key{!keyRequired && <span style={{ color: "#666", fontWeight: 400 }}> (optional)</span>}</div>
+                        <div style={{ display: "flex", gap: 8, marginBottom: 0 }}>
+                          <input
+                            type="password"
+                            style={inputFieldStyle}
+                            value={ps.apiKey}
+                            onChange={(e) => setProvKey(activeId, e.target.value)}
+                            placeholder={keyRequired ? "sk-..." : "(optional)"}
+                          />
                           <button
                             onClick={() => testProvider(activeId)}
                             disabled={ps.testStatus === "testing"}
-                            style={{ padding: "7px 13px", borderRadius: 7, border: `1px solid ${ps.testStatus === "success" ? "rgba(45,212,160,0.18)" : "rgba(255,255,255,0.09)"}`, background: ps.testStatus === "success" ? "rgba(45,212,160,0.07)" : "#1f2126", color: ps.testStatus === "success" ? "#2dd4a0" : "#9896a4", fontSize: 11, fontWeight: 500, cursor: "pointer", whiteSpace: "nowrap", fontFamily: "inherit" }}
+                            style={{ padding: "7px 13px", borderRadius: 7, border: `1px solid ${ps.testStatus === "success" ? "rgba(45,212,160,0.18)" : "rgba(255,255,255,0.09)"}`, background: ps.testStatus === "success" ? "rgba(45,212,160,0.07)" : "#1f2126", color: ps.testStatus === "success" ? "#2dd4a0" : "#9896a4", fontSize: 11, fontWeight: 500, cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0, fontFamily: "inherit" }}
                           >
                             {ps.testStatus === "testing" ? (<>{renderSpinner()}{t.testing}</>)
                               : ps.testStatus === "success" ? t.connected
                               : t.test}
                           </button>
-                        )}
+                        </div>
                       </div>
                     )}
                     {ps.testError && <div style={{ fontSize: 11, color: "#d95f5f", marginBottom: 8 }}>{ps.testError}</div>}

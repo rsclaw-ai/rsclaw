@@ -491,8 +491,9 @@ function ConfigEditorPage() {
     { name: "Anthropic", key: "anthropic", enabled: false, apiKey: "", baseUrl: "" },
     { name: "OpenAI", key: "openai", enabled: false, apiKey: "", baseUrl: "" },
     { name: "DeepSeek", key: "deepseek", enabled: false, apiKey: "", baseUrl: "" },
+    { name: "Doubao (\u8C46\u5305)", key: "doubao", enabled: false, apiKey: "", baseUrl: "" },
     { name: "Ollama", key: "ollama", enabled: true, apiKey: "", baseUrl: "http://localhost:11434" },
-    { name: "Custom Provider", key: "custom", enabled: false, apiKey: "", baseUrl: API_TYPE_DEFAULT_URLS["openai"], apiType: "openai" as ApiType },
+    { name: "Custom Provider", key: "custom", enabled: false, apiKey: "", baseUrl: "" },
   ]);
 
   // Parsed config fields - Channels
@@ -543,9 +544,9 @@ function ConfigEditorPage() {
     if (amt) setAgentMaxTokens(parseInt(amt, 10) || 4096);
 
     // Models - try to detect provider blocks
-    const providerNames = ["anthropic", "openai", "deepseek", "ollama", "custom"];
+    const providerNames = ["anthropic", "openai", "deepseek", "doubao", "ollama", "custom"];
     const displayNames: Record<string, string> = {
-      anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", ollama: "Ollama", custom: "Custom Provider",
+      anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", doubao: "Doubao (\u8C46\u5305)", ollama: "Ollama", custom: "Custom Provider",
     };
     const newProviders = providerNames.map((pName) => {
       // Look for a block like anthropic: { ... }
@@ -556,15 +557,15 @@ function ConfigEditorPage() {
       const baseUrl = extractVal(block, "baseUrl") || extractVal(block, "base_url") || "";
       const enabled = extractVal(block, "enabled");
       const apiField = extractVal(block, "api") || extractVal(block, "api_type");
-      const apiType: ApiType = (apiField === "anthropic" || apiField === "gemini" || apiField === "ollama")
+      const apiType: ApiType | undefined = (apiField === "anthropic" || apiField === "gemini" || apiField === "ollama" || apiField === "openai")
         ? (apiField as ApiType)
-        : "openai";
+        : undefined;
       return {
         name: displayNames[pName] || pName,
         key: pName,
         enabled: enabled !== undefined ? enabled === "true" : (pName === "custom" ? !!baseUrl : apiKey.length > 0),
         apiKey,
-        baseUrl: baseUrl || (pName === "custom" ? API_TYPE_DEFAULT_URLS[apiType] : ""),
+        baseUrl: baseUrl || "",
         ...(pName === "custom" ? { apiType } : {}),
       };
     });
@@ -757,8 +758,8 @@ function ConfigEditorPage() {
   };
   const statusPill = (status: string): React.CSSProperties => ({
     padding: "2px 10px", borderRadius: "10px", fontSize: "11px", fontWeight: 500,
-    background: status === "configured" ? "rgba(240,165,0,0.12)" : "rgba(0,0,0,0.06)",
-    color: status === "configured" ? "#f0a500" : "#999",
+    background: status === "configured" ? "rgba(45,212,160,0.12)" : status === "pending" ? "rgba(240,165,0,0.12)" : "rgba(0,0,0,0.06)",
+    color: status === "configured" ? "#2dd4a0" : status === "pending" ? "#f0a500" : "#999",
   });
   const sliderContainer: React.CSSProperties = {
     display: "flex", alignItems: "center", gap: "10px", width: "220px",
@@ -847,8 +848,20 @@ function ConfigEditorPage() {
     <div>
       {providers.map((prov, idx) => {
         const isCustom = prov.key === "custom";
-        const curApiType: ApiType = prov.apiType || "openai";
-        const showKey = !isCustom || API_TYPE_NEEDS_KEY[curApiType];
+        const curApiType: ApiType | undefined = prov.apiType;
+        const keyOptional = isCustom && curApiType && !API_TYPE_NEEDS_KEY[curApiType];
+        const isZh = getLang() === "cn";
+        // Determine configuration status
+        const hasCredentials = prov.apiKey.length > 0 || (["ollama", "custom"].includes(prov.key) && prov.baseUrl.length > 0);
+        const badgeLabel = prov.enabled
+          ? (hasCredentials ? (isZh ? "已配置" : "Configured") : (isZh ? "待配置" : "Pending"))
+          : (isZh ? "关闭" : "OFF");
+        const badgeBg = prov.enabled
+          ? (hasCredentials ? "rgba(45,212,160,0.12)" : "rgba(240,165,0,0.12)")
+          : "rgba(0,0,0,0.06)";
+        const badgeColor = prov.enabled
+          ? (hasCredentials ? "#2dd4a0" : "#f0a500")
+          : "#999";
         return (
         <div key={prov.key} style={providerCard}>
           <div style={providerHeader}>
@@ -856,10 +869,10 @@ function ConfigEditorPage() {
               <span style={providerName}>{prov.name}</span>
               <span style={{
                 padding: "2px 8px", borderRadius: "8px", fontSize: "11px",
-                background: prov.enabled ? "rgba(240,165,0,0.12)" : "rgba(0,0,0,0.06)",
-                color: prov.enabled ? "#f0a500" : "#999",
+                background: badgeBg,
+                color: badgeColor,
               }}>
-                {prov.enabled ? "ON" : "OFF"}
+                {badgeLabel}
               </span>
             </div>
             <Toggle on={prov.enabled} onToggle={() => {
@@ -874,26 +887,28 @@ function ConfigEditorPage() {
               <div style={fieldLabel}>API Type</div>
               <select
                 style={{ ...fieldInput, cursor: "pointer" }}
-                value={curApiType}
+                value={curApiType || ""}
                 onChange={(e) => {
-                  const at = e.target.value as ApiType;
+                  const val = e.target.value;
+                  if (!val) return;
+                  const at = val as ApiType;
                   const next = [...providers];
-                  next[idx] = { ...next[idx], apiType: at, baseUrl: API_TYPE_DEFAULT_URLS[at] };
+                  next[idx] = { ...next[idx], apiType: at, baseUrl: "" };
                   setProviders(next);
                   markDirty();
                 }}
               >
+                {!curApiType && <option value="">-- Select --</option>}
                 {(Object.keys(API_TYPE_LABELS) as ApiType[]).map((at) => (
                   <option key={at} value={at}>{API_TYPE_LABELS[at]}</option>
                 ))}
               </select>
             </div>
           )}
-          {showKey && (
-            <div style={fieldRow}>
-              <div style={fieldLabel}>API Key</div>
+          <div style={fieldRow}>
+              <div style={fieldLabel}>API Key{keyOptional ? <span style={{ color: "#999", fontWeight: 400 }}> (optional)</span> : null}</div>
               <input style={fieldInput} type="password" value={prov.apiKey}
-                placeholder={prov.key === "ollama" ? "(local, no key needed)" : "sk-..."}
+                placeholder={(prov.key === "ollama" || keyOptional) ? "(optional)" : "sk-..."}
                 onChange={(e) => {
                   const next = [...providers];
                   next[idx] = { ...next[idx], apiKey: e.target.value };
@@ -901,11 +916,10 @@ function ConfigEditorPage() {
                   markDirty();
                 }} />
             </div>
-          )}
           <div style={{ ...fieldRow, borderBottom: "none" }}>
             <div style={fieldLabel}>Base URL</div>
             <input style={fieldInput} value={prov.baseUrl}
-              placeholder={isCustom ? API_TYPE_DEFAULT_URLS[curApiType] : "(default)"}
+              placeholder={isCustom ? "https://your-api-server.com/v1" : "(default)"}
               onChange={(e) => {
                 const next = [...providers];
                 next[idx] = { ...next[idx], baseUrl: e.target.value };
@@ -1073,8 +1087,10 @@ function ConfigEditorPage() {
                     {cc.enabled && Object.values(cc.fields).some(Boolean) ? chDef.id + " \u00B7 " + cc.dmPolicy : (zh ? "\u672A\u914D\u7F6E" : "Not configured")}
                   </div>
                 </div>
-                <span style={statusPill(cc.enabled ? "configured" : "disabled")}>
-                  {cc.enabled ? "connected" : (zh ? "\u672A\u542F\u7528" : "disabled")}
+                <span style={statusPill(cc.enabled ? (Object.values(cc.fields).some(Boolean) ? "configured" : "pending") : "disabled")}>
+                  {cc.enabled
+                    ? (Object.values(cc.fields).some(Boolean) ? (zh ? "\u5DF2\u914D\u7F6E" : "Configured") : (zh ? "\u5F85\u914D\u7F6E" : "Pending"))
+                    : (zh ? "\u672A\u542F\u7528" : "disabled")}
                 </span>
                 <div onClick={(e) => e.stopPropagation()}>
                   <Toggle on={cc.enabled} onToggle={() => toggleChannelEnabled(chDef.id)} />

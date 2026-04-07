@@ -57,6 +57,12 @@ const PROVIDERS = [
     placeholder: "sk-...",
   },
   {
+    id: "doubao",
+    name: "Doubao (\u8C46\u5305)",
+    desc: "ByteDance, API URL editable",
+    placeholder: "xxxxxxxx-xxxx-...",
+  },
+  {
     id: "ollama",
     name: "Ollama",
     desc: "Local models, no API key needed",
@@ -138,7 +144,7 @@ export function SetupWizardPage() {
       if (config.provider === "custom") {
         providerConfig.custom = {
           api: config.apiType,
-          baseUrl: config.baseUrl || API_TYPE_DEFAULT_URLS[config.apiType],
+          baseUrl: config.baseUrl,
           ...(config.apiKey ? { apiKey: config.apiKey } : {}),
           enabled: true,
         };
@@ -221,7 +227,7 @@ export function SetupWizardPage() {
                       updates.baseUrl = "http://localhost:11434";
                     } else if (provider.id === "custom") {
                       updates.apiType = "openai";
-                      updates.baseUrl = API_TYPE_DEFAULT_URLS["openai"];
+                      updates.baseUrl = "";
                     } else {
                       updates.baseUrl = "";
                     }
@@ -246,7 +252,7 @@ export function SetupWizardPage() {
                   value={config.apiType}
                   onChange={(e) => {
                     const at = e.target.value as ApiType;
-                    updateConfig({ apiType: at, baseUrl: API_TYPE_DEFAULT_URLS[at] });
+                    updateConfig({ apiType: at, baseUrl: "" });
                   }}
                 >
                   {(Object.keys(API_TYPE_LABELS) as ApiType[]).map((at) => (
@@ -260,7 +266,7 @@ export function SetupWizardPage() {
                 <div className={styles["form-label"]}>Base URL</div>
                 <input
                   type="text"
-                  placeholder={API_TYPE_DEFAULT_URLS[config.apiType]}
+                  placeholder="https://your-api-server.com/v1"
                   value={config.baseUrl}
                   onChange={(e) => updateConfig({ baseUrl: e.target.value })}
                 />
@@ -285,6 +291,17 @@ export function SetupWizardPage() {
                   placeholder={selectedProvider.placeholder}
                   value={config.apiKey}
                   onChange={(e) => updateConfig({ apiKey: e.target.value })}
+                />
+              </div>
+            )}
+            {config.provider === "doubao" && (
+              <div className={styles["form-group"]}>
+                <div className={styles["form-label"]}>API URL</div>
+                <input
+                  type="text"
+                  placeholder="https://ark.cn-beijing.volces.com/api/v3"
+                  value={config.baseUrl}
+                  onChange={(e) => updateConfig({ baseUrl: e.target.value })}
                 />
               </div>
             )}
@@ -358,7 +375,7 @@ export function SetupWizardPage() {
                 <div className={styles["summary-item"]}>
                   <span className={styles["summary-label"]}>Base URL</span>
                   <span className={styles["summary-value"]}>
-                    {config.baseUrl || API_TYPE_DEFAULT_URLS[config.apiType]}
+                    {config.baseUrl || "(not set)"}
                   </span>
                 </div>
               )}

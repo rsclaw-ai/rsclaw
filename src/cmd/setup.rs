@@ -774,6 +774,13 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                         StepResult::Back => { wiz_step = STEP_PROVIDER; }
                         StepResult::Cancel => { println!("  {}", crate::i18n::t("cli_setup_cancelled", lang)); return Ok(()); }
                     }
+                } else if provider.name == "doubao" {
+                    let default_url = if base_url.is_empty() { provider.base_url.to_string() } else { base_url.clone() };
+                    match input_step("  Doubao API URL", default_url) {
+                        StepResult::Next(val) => { base_url = val; wiz_step = STEP_API_KEY; }
+                        StepResult::Back => { wiz_step = STEP_PROVIDER; }
+                        StepResult::Cancel => { println!("  {}", crate::i18n::t("cli_setup_cancelled", lang)); return Ok(()); }
+                    }
                 } else {
                     base_url.clear();
                     wiz_step = STEP_API_KEY;
@@ -818,7 +825,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                     StepResult::Back => {
                         let prov = &defs.providers[provider_idx];
                         if prov.name == "ollama" { wiz_step = STEP_BASE_URL; }
-                        else if prov.name == "custom" { wiz_step = STEP_API_KEY; }
+                        else if prov.name == "custom" || prov.name == "doubao" { wiz_step = STEP_API_KEY; }
                         else if !prov.needs_key { wiz_step = STEP_PROVIDER; }
                         else { wiz_step = STEP_API_KEY; }
                     }
@@ -1446,6 +1453,14 @@ async fn configure_model(
             .and_then(|v| v.as_str().map(|s| s.to_owned()))
             .unwrap_or_else(|| "https://api.example.com".to_string());
         match input_step("  API base URL", current) {
+            StepResult::Next(u) => new_base_url = u,
+            StepResult::Back | StepResult::Cancel => return Ok(()),
+        }
+    } else if provider.name == "doubao" {
+        let current = get_nested_value(val, "models.providers.doubao.baseUrl")
+            .and_then(|v| v.as_str().map(|s| s.to_owned()))
+            .unwrap_or_else(|| provider.base_url.to_string());
+        match input_step("  Doubao API URL", current) {
             StepResult::Next(u) => new_base_url = u,
             StepResult::Back | StepResult::Cancel => return Ok(()),
         }

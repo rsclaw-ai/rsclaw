@@ -1409,6 +1409,99 @@ struct TestProviderRequest {
     provider: String,
     api_key: String,
     base_url: Option<String>,
+    api_type: Option<String>,
+}
+
+/// Resolve URL and build an authenticated request for provider model listing.
+/// Shared logic between test_provider and list_provider_models.
+fn build_provider_models_request(
+    client: &reqwest::Client,
+    req: &TestProviderRequest,
+) -> Result<reqwest::RequestBuilder, String> {
+    use crate::provider::defaults as prov_defaults;
+
+    // For custom providers, resolve auth/URL based on api_type
+    let effective_type = if req.provider == "custom" {
+        req.api_type.as_deref().unwrap_or("openai")
+    } else {
+        req.provider.as_str()
+    };
+
+    let (default_url, default_auth) = prov_defaults::resolve_base_url(&req.provider);
+
+    // Resolve base URL
+    let base_url = if let Some(ref explicit) = req.base_url {
+        if !explicit.is_empty() { explicit.trim_end_matches('/').to_owned() }
+        else if !default_url.is_empty() { default_url }
+        else { return Err("no base URL provided".to_owned()); }
+    } else if !default_url.is_empty() {
+        default_url
+    } else {
+        return Err("unknown provider".to_owned());
+    };
+
+    // Determine auth style — custom provider uses api_type, others use provider default
+    let auth_style = if req.provider == "custom" {
+        match effective_type {
+            "anthropic" => "x-api-key",
+            "gemini" => "gemini-key",
+            "ollama" => "none",
+            _ => if req.api_key.is_empty() { "none" } else { "bearer" },
+        }
+    } else if effective_type == "gemini" {
+        "gemini-key"
+    } else {
+        default_auth
+    };
+
+    // Build models URL — Gemini needs ?key= query param
+    let is_ollama = effective_type == "ollama";
+    let is_gemini = effective_type == "gemini";
+    let url = if is_ollama {
+        prov_defaults::models_url("ollama", &base_url)
+    } else if is_gemini {
+        let trimmed = base_url.trim_end_matches('/');
+        if prov_defaults::has_version_suffix(trimmed) {
+            format!("{trimmed}/models?key={}", req.api_key)
+        } else {
+            format!("{trimmed}/v1beta/models?key={}", req.api_key)
+        }
+    } else {
+        prov_defaults::models_url(&req.provider, &base_url)
+    };
+
+    let mut request = client.get(&url);
+    match auth_style {
+        "bearer" => { request = request.header("Authorization", format!("Bearer {}", req.api_key)); }
+        "x-api-key" => {
+            request = request.header("x-api-key", &req.api_key);
+            request = request.header("anthropic-version", "2023-06-01");
+        }
+        _ => {} // "none" or "gemini-key" (already in URL)
+    }
+
+    Ok(request)
+}
+
+/// Extract model IDs from different provider response formats.
+fn extract_model_ids(body: &serde_json::Value) -> Vec<String> {
+    if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
+        // OpenAI/Anthropic format: { data: [{ id: "..." }] }
+        data.iter()
+            .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.to_owned()))
+            .collect()
+    } else if let Some(models) = body.get("models").and_then(|m| m.as_array()) {
+        // Ollama / Gemini format: { models: [{ name: "..." }] }
+        models.iter()
+            .filter_map(|m| {
+                m.get("name").or_else(|| m.get("id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.strip_prefix("models/").unwrap_or(s).to_owned())
+            })
+            .collect()
+    } else {
+        vec![]
+    }
 }
 
 /// POST /api/v1/providers/test - validate an API key against a provider
@@ -1418,37 +1511,10 @@ async fn test_provider(Json(req): Json<TestProviderRequest>) -> Response {
         .build()
         .unwrap_or_default();
 
-    // Resolve base URL from defaults.toml → hardcoded fallback.
-    use crate::provider::defaults as prov_defaults;
-    let (base_url, auth_style) = {
-        let (default_url, default_auth) = prov_defaults::resolve_base_url(&req.provider);
-        match req.provider.as_str() {
-            "ollama" | "custom" => {
-                let fallback = if default_url.is_empty() { "http://localhost:8080" } else { &default_url };
-                let base = req.base_url.as_deref().unwrap_or(fallback);
-                let auth = if req.provider == "custom" && !req.api_key.is_empty() { "bearer" } else { default_auth };
-                (base.trim_end_matches('/').to_owned(), auth)
-            }
-            _ if default_url.is_empty() => {
-                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "unknown provider"}))).into_response();
-            }
-            _ => {
-                let base = req.base_url.as_deref().map(|u| u.trim_end_matches('/')).unwrap_or(&default_url);
-                (base.to_owned(), default_auth)
-            }
-        }
+    let request = match build_provider_models_request(&client, &req) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
     };
-
-    let url = prov_defaults::models_url(&req.provider, &base_url);
-    let mut request = client.get(&url);
-    match auth_style {
-        "bearer" => { request = request.header("Authorization", format!("Bearer {}", req.api_key)); }
-        "x-api-key" => {
-            request = request.header("x-api-key", &req.api_key);
-            request = request.header("anthropic-version", "2023-06-01");
-        }
-        _ => {} // no auth (ollama)
-    }
 
     match request.send().await {
         Ok(resp) if resp.status().is_success() => {
@@ -1460,7 +1526,7 @@ async fn test_provider(Json(req): Json<TestProviderRequest>) -> Response {
             (StatusCode::OK, Json(serde_json::json!({
                 "ok": false,
                 "status": status,
-                "error": if status == 401 { "Invalid API key" } else { "Request failed" },
+                "error": if status == 401 || status == 403 { "Invalid API key" } else { "Request failed" },
                 "detail": body.chars().take(200).collect::<String>(),
             }))).into_response()
         }
@@ -1480,51 +1546,15 @@ async fn list_provider_models(Json(req): Json<TestProviderRequest>) -> Response 
         .build()
         .unwrap_or_default();
 
-    // Resolve base URL from defaults.toml → hardcoded fallback.
-    use crate::provider::defaults as prov_defaults;
-    let (base_url, auth_style) = {
-        let (default_url, default_auth) = prov_defaults::resolve_base_url(&req.provider);
-        match req.provider.as_str() {
-            "ollama" | "custom" => {
-                let fallback = if default_url.is_empty() { "http://localhost:8080" } else { &default_url };
-                let base = req.base_url.as_deref().unwrap_or(fallback);
-                let auth = if req.provider == "custom" && !req.api_key.is_empty() { "bearer" } else { default_auth };
-                (base.trim_end_matches('/').to_owned(), auth)
-            }
-            _ if default_url.is_empty() => {
-                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "unknown provider"}))).into_response();
-            }
-            _ => {
-                let base = req.base_url.as_deref().map(|u| u.trim_end_matches('/')).unwrap_or(&default_url);
-                (base.to_owned(), default_auth)
-            }
-        }
+    let request = match build_provider_models_request(&client, &req) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"models": [], "error": e}))).into_response(),
     };
-
-    let url = prov_defaults::models_url(&req.provider, &base_url);
-    let mut request = client.get(&url);
-    match auth_style {
-        "bearer" => { request = request.header("Authorization", format!("Bearer {}", req.api_key)); }
-        "x-api-key" => {
-            request = request.header("x-api-key", &req.api_key);
-            request = request.header("anthropic-version", "2023-06-01");
-        }
-        _ => {}
-    }
 
     match request.send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            // Normalize: extract model IDs from different API formats
-            let models: Vec<String> = if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
-                // OpenAI/Anthropic format: { data: [{ id: "..." }] }
-                data.iter().filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.to_owned())).collect()
-            } else if let Some(models) = body.get("models").and_then(|m| m.as_array()) {
-                // Ollama format: { models: [{ name: "..." }] }
-                models.iter().filter_map(|m| m.get("name").and_then(|v| v.as_str()).map(|s| s.to_owned())).collect()
-            } else {
-                vec![]
-            };
+            let models = extract_model_ids(&body);
             Json(serde_json::json!({"models": models})).into_response()
         }
         Ok(resp) => {

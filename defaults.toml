@@ -16,6 +16,14 @@ base_url   = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 needs_key  = true
 
 [[providers]]
+name       = "doubao"
+label      = "Doubao (ByteDance)"
+env_var    = "ARK_API_KEY"
+model      = "doubao/doubao-seed-2-0-pro-260215"
+base_url   = "https://ark.cn-beijing.volces.com/api/v3"
+needs_key  = true
+
+[[providers]]
 name       = "minimax"
 label      = "MiniMax"
 env_var    = "MINIMAX_API_KEY"
@@ -68,7 +76,7 @@ name       = "anthropic"
 label      = "Anthropic (Claude)"
 env_var    = "ANTHROPIC_API_KEY"
 model      = "anthropic/claude-sonnet-4-6"
-base_url   = ""
+base_url   = "https://api.anthropic.com"
 needs_key  = true
 
 [[providers]]
@@ -76,7 +84,7 @@ name       = "openai"
 label      = "OpenAI (GPT)"
 env_var    = "OPENAI_API_KEY"
 model      = "openai/gpt-4o"
-base_url   = ""
+base_url   = "https://api.openai.com/v1"
 needs_key  = true
 
 [[providers]]
@@ -84,7 +92,7 @@ name       = "gemini"
 label      = "Google Gemini"
 env_var    = "GEMINI_API_KEY"
 model      = "gemini/gemini-2.5-flash"
-base_url   = ""
+base_url   = "https://generativelanguage.googleapis.com/v1beta"
 needs_key  = true
 
 [[providers]]
