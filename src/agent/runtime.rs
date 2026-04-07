@@ -4430,8 +4430,12 @@ $bitmap.Dispose()
         let effective_url = cfg_url.unwrap_or(base_url);
         let api_key = cfg_key
             .or_else(|| std::env::var(format!("{}_API_KEY", prov_name.to_uppercase())).ok())
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-            .ok_or_else(|| anyhow!("image: no API key found for provider {prov_name}"))?;
+            .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+        let Some(api_key) = api_key else {
+            return Ok(json!({
+                "error": format!("AI image generation requires a provider with image API support (doubao, openai, qwen). Current provider '{prov_name}' has no API key configured.")
+            }));
+        };
 
         let url = format!("{}/images/generations", effective_url.trim_end_matches('/'));
 

@@ -676,7 +676,6 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
         .timeout(std::time::Duration::from_secs(15))
         .build().unwrap_or_default();
 
-    let is_anthropic = effective_api_type == "anthropic";
     let is_ollama = effective_api_type == "ollama";
     let is_gemini = effective_api_type == "gemini" || provider == "gemini";
 
@@ -889,21 +888,11 @@ fn main() {
             // mac_dock::install(app.handle());
             Ok(())
         })
-        .on_window_event(|event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event.event() {
-                // Let the window close normally. Gateway keeps running as a
-                // background process. App exit (Cmd+Q, dock Quit) triggers
-                // RunEvent::Exit which stops the gateway.
-            }
-        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app_handle, event| {
-            match event {
-                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
-                    let _ = stop_gateway();
-                }
-                _ => {}
+            if let tauri::RunEvent::Exit = event {
+                let _ = stop_gateway();
             }
         });
 }
