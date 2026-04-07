@@ -920,10 +920,16 @@ function ConfigEditorPage() {
                   markDirty();
                 }} />
             </div>
+          {(isCustom || prov.key === "doubao" || prov.key === "ollama") && (
           <div style={{ ...fieldRow, borderBottom: "none" }}>
-            <div style={fieldLabel}>Base URL</div>
+            <div style={fieldLabel}>API URL</div>
             <input style={fieldInput} value={prov.baseUrl}
-              placeholder={isCustom ? "https://your-api-server.com/v1" : "(default)"}
+              placeholder={
+                isCustom ? "https://your-api-server.com" :
+                prov.key === "doubao" ? "https://ark.cn-beijing.volces.com/api/v3" :
+                prov.key === "ollama" ? "http://localhost:11434" :
+                "(default)"
+              }
               onChange={(e) => {
                 const next = [...providers];
                 next[idx] = { ...next[idx], baseUrl: e.target.value };
@@ -931,6 +937,7 @@ function ConfigEditorPage() {
                 markDirty();
               }} />
           </div>
+          )}
         </div>
         );
       })}
