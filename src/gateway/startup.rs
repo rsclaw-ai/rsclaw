@@ -32,7 +32,7 @@ use crate::{
     provider::{
         LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
         anthropic::AnthropicProvider, failover::FailoverManager, gemini::GeminiProvider,
-        openai::OpenAiProvider, openai_responses::OpenAiResponsesProvider,
+        openai::OpenAiProvider,
         registry::ProviderRegistry,
     },
     server::{AppState, serve},
@@ -467,9 +467,9 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                 (_, &crate::config::schema::ApiFormat::OpenAiResponses) => {
                     let key = api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok());
                     if let Some(url) = base_url {
-                        Arc::new(OpenAiResponsesProvider::with_base_url(url, key))
+                        Arc::new(OpenAiProvider::responses(url, key))
                     } else {
-                        Arc::new(OpenAiResponsesProvider::new(key.unwrap_or_default()))
+                        Arc::new(OpenAiProvider::responses(crate::provider::openai::OPENAI_API_BASE, key))
                     }
                 }
                 _ => {
@@ -600,7 +600,7 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
         {
             registry.register(
                 "doubao",
-                Arc::new(OpenAiResponsesProvider::with_base_url(
+                Arc::new(OpenAiProvider::responses(
                     "https://ark.cn-beijing.volces.com/api/v3",
                     Some(key),
                 )),
@@ -613,7 +613,7 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
         {
             registry.register(
                 "bytedance",
-                Arc::new(OpenAiResponsesProvider::with_base_url(
+                Arc::new(OpenAiProvider::responses(
                     "https://ark.cn-beijing.volces.com/api/v3",
                     Some(key),
                 )),

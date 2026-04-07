@@ -9,7 +9,6 @@ pub mod defaults;
 pub mod failover;
 pub mod gemini;
 pub mod openai;
-pub mod openai_responses;
 pub mod registry;
 
 use std::pin::Pin;

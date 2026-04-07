@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod:*)",
+      "Bash(bash -n /Users/oopos/dev/github-rsclaw/tools/lib.sh)",
+      "Bash(bash -n /Users/oopos/dev/github-rsclaw/tools/parallel-feature.sh)",
+      "Bash(bash -n /Users/oopos/dev/github-rsclaw/tools/parallel-channels.sh)",
+      "Bash(bash -n /Users/oopos/dev/github-rsclaw/tools/review-pipeline.sh)",
+      "Bash(bash -n /Users/oopos/dev/github-rsclaw/tools/orchestrator_zh.sh)",
+      "Bash(find /Users/oopos/dev/github-rsclaw/ui/src -type f -name *.tsx -o -name *.ts)",
+      "Bash(grep -r \"setupWizard\\\\|SetupWizard\\\\|onboarding\\\\|Onboarding\" /Users/oopos/dev/github-rsclaw/ui/app/store --include=*.ts --include=*.tsx)",
+      "Bash(npx tsc:*)",
+      "Bash(yarn test:*)",
+      "Bash(npx jest:*)",
+      "Bash(RSCLAW_BUILD_VERSION=dev RSCLAW_BUILD_DATE=test cargo check)",
+      "Bash(RSCLAW_BUILD_VERSION=dev RSCLAW_BUILD_DATE=test cargo test --lib -- schema)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(yarn build:*)",
+      "Bash(yarn tauri:*)",
+      "Bash(ls -lh /Users/oopos/dev/github-rsclaw/ui/src-tauri/target/release/bundle/macos/*.app)",
+      "Bash(ls -lh /Users/oopos/dev/github-rsclaw/ui/src-tauri/target/release/bundle/dmg/*.dmg)",
+      "Bash(ls:*)",
+      "Bash(open:*)",
+      "Bash(cargo check:*)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(json.dumps\\(d.get\\(''''gateway'''',{}\\), indent=2\\)\\)\")",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(json.dumps\\(d.get\\(''''agents'''',{}\\), indent=2\\)\\)\")",
+      "Bash(git checkout:*)",
+      "Bash(curl:*)",
+      "Bash(find /Users/oopos/dev/github-rsclaw -name test_db.sh -o -name *openai.rs -o -name *anthropic.rs)",
+      "WebSearch",
+      "WebFetch(domain:developers.openai.com)",
+      "WebFetch(domain:platform.openai.com)",
+      "WebFetch(domain:www.datacamp.com)",
+      "Bash(cargo test:*)",
+      "Bash(RSCLAW_BUILD_VERSION=dev RSCLAW_BUILD_DATE=test cargo test --lib openai_responses)",
+      "Bash(RSCLAW_BUILD_VERSION=dev RSCLAW_BUILD_DATE=test cargo test --lib openai)"
+    ]
+  }
+}

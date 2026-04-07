@@ -27,3 +27,9 @@ workspace/
 # Secrets
 .env
 .env.*
+
+# Claude
+/CLAUDE.md
+
+# Sub-agent worktrees
+.worktrees/
