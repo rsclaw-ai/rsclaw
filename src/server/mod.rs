@@ -1420,34 +1420,36 @@ async fn test_provider(Json(req): Json<TestProviderRequest>) -> Response {
 
     // Resolve provider API base URL and auth.
     // Most providers use OpenAI-compatible /v1/models with Bearer token.
-    let (base_url, auth_style) = match req.provider.as_str() {
-        "anthropic"   => ("https://api.anthropic.com".to_owned(), "x-api-key"),
-        "openai"      => ("https://api.openai.com".to_owned(), "bearer"),
-        "deepseek"    => ("https://api.deepseek.com".to_owned(), "bearer"),
-        "qwen"        => ("https://dashscope.aliyuncs.com/compatible-mode".to_owned(), "bearer"),
-        "minimax"     => ("https://api.minimax.chat".to_owned(), "bearer"),
-        "kimi"        => ("https://api.moonshot.cn".to_owned(), "bearer"),
-        "zhipu"       => ("https://open.bigmodel.cn/api/paas".to_owned(), "bearer"),
-        "groq"        => ("https://api.groq.com/openai".to_owned(), "bearer"),
-        "grok"        => ("https://api.x.ai".to_owned(), "bearer"),
-        "gemini"      => ("https://generativelanguage.googleapis.com".to_owned(), "bearer"),
-        "siliconflow" => ("https://api.siliconflow.cn".to_owned(), "bearer"),
-        "openrouter"  => ("https://openrouter.ai/api".to_owned(), "bearer"),
-        "gaterouter"  => (req.base_url.clone().unwrap_or_else(|| "https://api.gaterouter.com".to_owned()), "bearer"),
-        "ollama" => {
-            let base = req.base_url.as_deref().unwrap_or("http://localhost:11434");
-            (base.trim_end_matches('/').to_owned(), "none")
-        }
-        "custom" => {
-            let base = req.base_url.as_deref().unwrap_or("http://localhost:8080");
-            (base.trim_end_matches('/').to_owned(), if req.api_key.is_empty() { "none" } else { "bearer" })
-        }
-        _ => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "unknown provider"}))).into_response();
+    // Resolve base URL from shared registry (single source of truth).
+    let (base_url, auth_style) = {
+        use crate::provider::registry::provider_base_url;
+        let (default_url, default_auth) = provider_base_url(&req.provider);
+        match req.provider.as_str() {
+            "ollama" | "custom" => {
+                let base = req.base_url.as_deref().unwrap_or(if default_url.is_empty() { "http://localhost:8080" } else { default_url });
+                let auth = if req.provider == "custom" && !req.api_key.is_empty() { "bearer" } else { default_auth };
+                (base.trim_end_matches('/').to_owned(), auth)
+            }
+            _ if default_url.is_empty() => {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "unknown provider"}))).into_response();
+            }
+            _ => {
+                let base = req.base_url.as_deref().map(|u| u.trim_end_matches('/')).unwrap_or(default_url);
+                (base.to_owned(), default_auth)
+            }
         }
     };
 
-    let url = format!("{}/v1/models", base_url);
+    // If base_url already ends with a version path (/v1, /v4, etc.), append /models directly.
+    let trimmed = base_url.trim_end_matches('/');
+    let has_version = trimmed.rsplit('/').next().is_some_and(|seg| {
+        seg.len() >= 2 && seg.starts_with('v') && seg[1..].chars().all(|c| c.is_ascii_digit())
+    });
+    let url = if has_version {
+        format!("{trimmed}/models")
+    } else {
+        format!("{trimmed}/v1/models")
+    };
     let mut request = client.get(&url);
     match auth_style {
         "bearer" => { request = request.header("Authorization", format!("Bearer {}", req.api_key)); }
@@ -1488,39 +1490,38 @@ async fn list_provider_models(Json(req): Json<TestProviderRequest>) -> Response 
         .build()
         .unwrap_or_default();
 
-    // Reuse same provider URL resolution as test_provider.
-    let (base_url, auth_style) = match req.provider.as_str() {
-        "anthropic"   => ("https://api.anthropic.com".to_owned(), "x-api-key"),
-        "openai"      => ("https://api.openai.com".to_owned(), "bearer"),
-        "deepseek"    => ("https://api.deepseek.com".to_owned(), "bearer"),
-        "qwen"        => ("https://dashscope.aliyuncs.com/compatible-mode".to_owned(), "bearer"),
-        "minimax"     => ("https://api.minimax.chat".to_owned(), "bearer"),
-        "kimi"        => ("https://api.moonshot.cn".to_owned(), "bearer"),
-        "zhipu"       => ("https://open.bigmodel.cn/api/paas".to_owned(), "bearer"),
-        "groq"        => ("https://api.groq.com/openai".to_owned(), "bearer"),
-        "grok"        => ("https://api.x.ai".to_owned(), "bearer"),
-        "gemini"      => ("https://generativelanguage.googleapis.com".to_owned(), "bearer"),
-        "siliconflow" => ("https://api.siliconflow.cn".to_owned(), "bearer"),
-        "openrouter"  => ("https://openrouter.ai/api".to_owned(), "bearer"),
-        "gaterouter"  => (req.base_url.clone().unwrap_or_else(|| "https://api.gaterouter.com".to_owned()), "bearer"),
-        "ollama" => {
-            let base = req.base_url.as_deref().unwrap_or("http://localhost:11434");
-            (base.trim_end_matches('/').to_owned(), "none")
-        }
-        "custom" => {
-            let base = req.base_url.as_deref().unwrap_or("http://localhost:8080");
-            (base.trim_end_matches('/').to_owned(), if req.api_key.is_empty() { "none" } else { "bearer" })
-        }
-        _ => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "unknown provider"}))).into_response();
+    // Resolve base URL from shared registry (single source of truth).
+    let (base_url, auth_style) = {
+        use crate::provider::registry::provider_base_url;
+        let (default_url, default_auth) = provider_base_url(&req.provider);
+        match req.provider.as_str() {
+            "ollama" | "custom" => {
+                let base = req.base_url.as_deref().unwrap_or(if default_url.is_empty() { "http://localhost:8080" } else { default_url });
+                let auth = if req.provider == "custom" && !req.api_key.is_empty() { "bearer" } else { default_auth };
+                (base.trim_end_matches('/').to_owned(), auth)
+            }
+            _ if default_url.is_empty() => {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "unknown provider"}))).into_response();
+            }
+            _ => {
+                let base = req.base_url.as_deref().map(|u| u.trim_end_matches('/')).unwrap_or(default_url);
+                (base.to_owned(), default_auth)
+            }
         }
     };
 
-    // Ollama uses /api/tags, everything else uses /v1/models
+    // Ollama uses /api/tags, everything else uses /v1/models.
+    // If base_url already ends with a version path (/v1, /v4, etc.), append /models directly.
+    let trimmed = base_url.trim_end_matches('/');
+    let has_version = trimmed.rsplit('/').next().is_some_and(|seg| {
+        seg.len() >= 2 && seg.starts_with('v') && seg[1..].chars().all(|c| c.is_ascii_digit())
+    });
     let url = if req.provider == "ollama" {
-        format!("{}/api/tags", base_url)
+        format!("{trimmed}/api/tags")
+    } else if has_version {
+        format!("{trimmed}/models")
     } else {
-        format!("{}/v1/models", base_url)
+        format!("{trimmed}/v1/models")
     };
 
     let mut request = client.get(&url);

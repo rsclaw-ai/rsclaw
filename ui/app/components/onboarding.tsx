@@ -1740,7 +1740,8 @@ export function OnboardingPage() {
 
     try {
       // Test provider API directly (Tauri) or via gateway (browser)
-      const baseUrl = id === "ollama" ? prov.apiKey : undefined;
+      const provDef = PROVIDERS.find((p) => p.id === id);
+      const baseUrl = provDef?.isUrl ? prov.apiKey : undefined;
       const tauriInvoke = (window as any).__TAURI__?.invoke;
       let result: any;
       let modelIds: string[] = [];
