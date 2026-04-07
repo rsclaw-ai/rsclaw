@@ -1384,20 +1384,39 @@ impl AgentRuntime {
         }
 
         // ---------------------------------------------------------------
-        // File attachment: auto-detect video/audio for direct transcription
-        // Skip video transcription if vision model has video as ImageAttachment
-        // (the provider will handle it as input_video with file_id).
+        // File attachment: auto-detect video/audio for direct transcription.
+        // For doubao (Responses API): convert video FileAttachments to
+        // ImageAttachments so they go through Files API → input_video.
+        // This is unified here so all channels benefit without changes.
         // ---------------------------------------------------------------
-        // If doubao has video as ImageAttachment, drop the FileAttachment copy
-        // so it goes through vision (file_id upload) instead of audio transcription.
-        let has_video_image = images.iter().any(|img| img.mime_type.starts_with("video/"));
         let cur_model = self.resolve_model_name();
         let is_doubao = cur_model.to_lowercase().contains("doubao") || cur_model.to_lowercase().contains("seed");
-        let files: Vec<_> = if has_video_image && is_doubao {
-            files.into_iter().filter(|f| !crate::channel::is_video_attachment(&f.mime_type, &f.filename)).collect()
-        } else {
-            files
-        };
+        let mut files = files;
+        let mut images = images;
+        let mut text_override: Option<String> = None;
+        if is_doubao {
+            let mut remaining = Vec::new();
+            for f in files {
+                if crate::channel::is_video_attachment(&f.mime_type, &f.filename) {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&f.data);
+                    let mime = if f.mime_type.is_empty() { "video/mp4" } else { &f.mime_type };
+                    let data_uri = format!("data:{mime};base64,{b64}");
+                    images.push(super::registry::ImageAttachment {
+                        data: data_uri,
+                        mime_type: mime.to_owned(),
+                    });
+                    if text.is_empty() && text_override.is_none() {
+                        text_override = Some(crate::i18n::t("describe_video", crate::i18n::default_lang()));
+                    }
+                    info!(size = f.data.len(), "video FileAttachment → ImageAttachment for vision");
+                } else {
+                    remaining.push(f);
+                }
+            }
+            files = remaining;
+        }
+        let text = text_override.as_deref().unwrap_or(text);
         let (media_files, regular_files): (Vec<_>, Vec<_>) = files.into_iter().partition(|f| {
             crate::channel::is_video_attachment(&f.mime_type, &f.filename)
                 || crate::channel::is_audio_attachment(&f.mime_type, &f.filename)

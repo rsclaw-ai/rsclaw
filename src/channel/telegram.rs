@@ -657,17 +657,17 @@ impl Channel for TelegramChannel {
                                             }
                                         }
                                     } else if let Some(ref video) = msg.video {
+                                        // Send video as FileAttachment — runtime decides
+                                        // whether to use vision (doubao) or transcription.
                                         match self.download_file(&video.file_id).await {
                                             Ok(bytes) => {
-                                                match crate::channel::transcription::transcribe_audio(
-                                                    &self.client, &bytes, "video.mp4", "video/mp4",
-                                                ).await {
-                                                    Ok(text) => {
-                                                        info!("video transcribed ({} chars)", text.len());
-                                                        text
-                                                    }
-                                                    Err(_) => crate::i18n::t("video_message_received", crate::i18n::default_lang()),
-                                                }
+                                                info!(size = bytes.len(), "telegram: video downloaded");
+                                                tg_file_attachments.push(crate::agent::registry::FileAttachment {
+                                                    filename: "video.mp4".to_owned(),
+                                                    data: bytes,
+                                                    mime_type: "video/mp4".to_owned(),
+                                                });
+                                                String::new()
                                             }
                                             Err(e) => {
                                                 let err_msg = format!("{e:#}");
@@ -678,7 +678,6 @@ impl Channel for TelegramChannel {
                                                     warn!("video download failed: {err_msg}");
                                                     "Video download failed."
                                                 };
-                                                // Direct reply, skip LLM.
                                                 let _ = self.client
                                                     .post(self.api_url("sendMessage"))
                                                     .json(&json!({

@@ -918,17 +918,14 @@ impl FeishuChannel {
                     .await
                 {
                     Ok(bytes) => {
-                        match transcribe_audio(&self.client, &bytes, "video.mp4", "video/mp4").await
-                        {
-                            Ok(text) => {
-                                info!(chars = text.len(), "feishu: video transcribed");
-                                text
-                            }
-                            Err(_) => crate::i18n::t(
-                                "video_message_received",
-                                crate::i18n::default_lang(),
-                            ),
-                        }
+                        // Send as FileAttachment — runtime decides vision vs transcription
+                        info!(size = bytes.len(), "feishu: video downloaded");
+                        file_attachments.push(crate::agent::registry::FileAttachment {
+                            filename: "video.mp4".to_owned(),
+                            data: bytes,
+                            mime_type: "video/mp4".to_owned(),
+                        });
+                        String::new()
                     }
                     Err(e) => {
                         warn!("feishu: video download failed: {e:#}");

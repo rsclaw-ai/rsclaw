@@ -600,17 +600,15 @@ impl QQBotChannel {
                     Err(e) => warn!("qq: failed to download audio: {e:#}"),
                 }
             } else if super::is_video_attachment(content_type, filename) {
-                // Extract audio from video and transcribe
+                // Send as FileAttachment — runtime decides vision vs transcription
                 match crate::channel::transcription::download_file(&self.client, &full_url).await {
                     Ok(bytes) => {
-                        match extract_audio_and_transcribe(&self.client, &bytes).await {
-                            Ok(t) if !t.is_empty() => {
-                                info!(chars = t.len(), "qq: video audio transcribed");
-                                *text = t;
-                            }
-                            Ok(_) => warn!("qq: video transcription returned empty"),
-                            Err(e) => warn!("qq: video transcription failed: {e:#}"),
-                        }
+                        info!(size = bytes.len(), "qq: video downloaded");
+                        file_attachments.push(crate::agent::registry::FileAttachment {
+                            filename: filename.to_owned(),
+                            data: bytes,
+                            mime_type: content_type.to_owned(),
+                        });
                     }
                     Err(e) => warn!("qq: failed to download video: {e:#}"),
                 }
