@@ -1890,10 +1890,10 @@ function AgentManagerPage() {
           </div>
         </div>
         <button
-          className={`${styles["btn"]} ${styles["primary"]}`}
           onClick={openAddModal}
+          style={{ padding: "8px 16px", borderRadius: 9, border: "none", background: "#f97316", color: "#fff", fontSize: 12, fontWeight: 700, boxShadow: "0 2px 8px rgba(249,115,22,.28)", cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}
         >
-          {Locale.RsClawPanel.Agents.NewAgent}
+          + {Locale.RsClawPanel.Agents.NewAgent}
         </button>
       </div>
 
@@ -2248,9 +2248,9 @@ function AgentManagerPage() {
                 {Locale.RsClawPanel.Agents.Cancel}
               </button>
               <button
-                className={`${styles["btn"]} ${styles["primary"]}`}
                 onClick={handleSaveAgent}
                 disabled={!newId.trim() || !!idError}
+                style={{ padding: "8px 20px", borderRadius: 9, border: "none", background: "#f97316", color: "#fff", fontSize: 12, fontWeight: 700, cursor: !newId.trim() || !!idError ? "not-allowed" : "pointer", opacity: !newId.trim() || !!idError ? 0.5 : 1 }}
               >
                 {editAgent ? Locale.RsClawPanel.Agents.Update : Locale.RsClawPanel.Agents.Create}
               </button>
@@ -3831,8 +3831,23 @@ function TauriConfigPageInner() {
                             </div>
                           </div>
                         ) : (
-                          /* Standard providers: API Key field */
+                          /* Standard providers: API Key + optional Base URL */
                           <div style={{ marginBottom: 8 }}>
+                            {p.id === "doubao" && (
+                              <>
+                                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>API URL</div>
+                                <input
+                                  style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", marginBottom: 8 }}
+                                  type="text"
+                                  placeholder="https://ark.cn-beijing.volces.com/api/v3"
+                                  value={baseUrl}
+                                  onChange={(e) => {
+                                    updateConfig(`models.providers.${p.id}.baseUrl`, e.target.value);
+                                    setProvTest((prev) => ({ ...prev, [p.id]: "idle" }));
+                                  }}
+                                />
+                              </>
+                            )}
                             <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>{p.keyLabel}</div>
                             <div style={{ display: "flex", gap: 8 }}>
                               <input
