@@ -4492,7 +4492,7 @@ $bitmap.Dispose()
                 "prompt": prompt,
                 "size": size,
                 "n": 1,
-                "response_format": "b64_json"
+                "response_format": "url"
             }))
             .send()
             .await
@@ -4509,26 +4509,24 @@ $bitmap.Dispose()
             return Err(anyhow!("image: API error: {err_msg}"));
         }
 
-        // Prefer b64_json (inline base64), fallback to url
-        let image_result = if let Some(b64) = body["data"][0]["b64_json"].as_str() {
-            format!("data:image/png;base64,{b64}")
-        } else if let Some(url) = body["data"][0]["url"].as_str() {
-            // Download the image to get bytes, convert to data URI
-            match reqwest::Client::new().get(url).send().await {
+        // Get URL then download image bytes and convert to data URI
+        let image_result = if let Some(img_url) = body["data"][0]["url"].as_str() {
+            use base64::Engine;
+            match reqwest::Client::new().get(img_url).timeout(std::time::Duration::from_secs(60)).send().await {
                 Ok(r) if r.status().is_success() => {
-                    use base64::Engine;
                     match r.bytes().await {
                         Ok(bytes) => {
                             let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                             format!("data:image/png;base64,{b64}")
                         }
-                        _ => url.to_owned(),
+                        Err(e) => return Err(anyhow!("image: download failed: {e}")),
                     }
                 }
-                _ => url.to_owned(),
+                Ok(r) => return Err(anyhow!("image: download returned {}", r.status())),
+                Err(e) => return Err(anyhow!("image: download error: {e}")),
             }
         } else {
-            String::new()
+            return Err(anyhow!("image: no URL in response"));
         };
 
         let revised = body["data"][0]["revised_prompt"]
