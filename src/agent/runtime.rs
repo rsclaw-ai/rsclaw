@@ -4413,15 +4413,52 @@ $bitmap.Dispose()
             .ok_or_else(|| anyhow!("image: `prompt` required"))?;
         let size = args["size"].as_str().unwrap_or("1024x1024");
 
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .map_err(|_| anyhow!("image: OPENAI_API_KEY not set — cannot generate images"))?;
+        // Resolve image generation endpoint from current model's provider
+        let model = self.resolve_model_name();
+        let (prov_name, _) = crate::provider::registry::ProviderRegistry::parse_model(&model);
+        let (base_url, auth_style) = crate::provider::defaults::resolve_base_url(prov_name);
+
+        // Also check provider config for api_key and base_url overrides
+        let cfg_key = self.config.model.models.as_ref()
+            .and_then(|m| m.providers.get(prov_name))
+            .and_then(|p| p.api_key.as_ref())
+            .and_then(|k| k.as_plain().map(str::to_owned));
+        let cfg_url = self.config.model.models.as_ref()
+            .and_then(|m| m.providers.get(prov_name))
+            .and_then(|p| p.base_url.clone());
+
+        let effective_url = cfg_url.unwrap_or(base_url);
+        let api_key = cfg_key
+            .or_else(|| std::env::var(format!("{}_API_KEY", prov_name.to_uppercase())).ok())
+            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+            .ok_or_else(|| anyhow!("image: no API key found for provider {prov_name}"))?;
+
+        let url = format!("{}/images/generations", effective_url.trim_end_matches('/'));
+
+        // Determine default model for image generation
+        let image_model = args["model"].as_str().unwrap_or_else(|| {
+            match prov_name {
+                "doubao" | "bytedance" => "doubao-seedream-3-0-t2i-250220",
+                "openai" => "dall-e-3",
+                "qwen" => "wanx-v1",
+                _ => "dall-e-3",
+            }
+        });
 
         let client = reqwest::Client::new();
-        let resp = client
-            .post("https://api.openai.com/v1/images/generations")
-            .header("Authorization", format!("Bearer {api_key}"))
+        let mut builder = client.post(&url);
+        match auth_style {
+            "x-api-key" => {
+                builder = builder.header("x-api-key", &api_key);
+            }
+            _ => {
+                builder = builder.header("Authorization", format!("Bearer {api_key}"));
+            }
+        }
+
+        let resp = builder
             .json(&json!({
-                "model": "dall-e-3",
+                "model": image_model,
                 "prompt": prompt,
                 "size": size,
                 "n": 1,
@@ -4451,7 +4488,8 @@ $bitmap.Dispose()
         Ok(json!({
             "url": url,
             "revised_prompt": revised,
-            "size": size
+            "size": size,
+            "model": image_model
         }))
     }
 
