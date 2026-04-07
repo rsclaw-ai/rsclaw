@@ -4411,12 +4411,17 @@ $bitmap.Dispose()
         let prompt = args["prompt"]
             .as_str()
             .ok_or_else(|| anyhow!("image: `prompt` required"))?;
-        let size = args["size"].as_str().unwrap_or("1024x1024");
 
         // Resolve image generation endpoint from current model's provider
         let model = self.resolve_model_name();
         let (prov_name, _) = crate::provider::registry::ProviderRegistry::parse_model(&model);
         let (base_url, auth_style) = crate::provider::defaults::resolve_base_url(prov_name);
+
+        let default_size = match prov_name {
+            "doubao" | "bytedance" => "2048x2048",
+            _ => "1024x1024",
+        };
+        let size = args["size"].as_str().unwrap_or(default_size);
 
         // Also check provider config for api_key and base_url overrides
         let cfg_key = self.config.model.models.as_ref()
@@ -4427,24 +4432,43 @@ $bitmap.Dispose()
             .and_then(|m| m.providers.get(prov_name))
             .and_then(|p| p.base_url.clone());
 
-        let effective_url = cfg_url.unwrap_or(base_url);
-        let api_key = cfg_key
-            .or_else(|| std::env::var(format!("{}_API_KEY", prov_name.to_uppercase())).ok())
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok());
-        let Some(api_key) = api_key else {
+        // Providers with standard OpenAI images API
+        let image_providers = ["doubao", "bytedance", "openai"];
+        let (img_url, img_key, img_prov) = if image_providers.contains(&prov_name) {
+            let url = cfg_url.unwrap_or(base_url);
+            let key = cfg_key
+                .or_else(|| std::env::var(format!("{}_API_KEY", prov_name.to_uppercase())).ok())
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+            (url, key, prov_name)
+        } else {
+            // Current provider doesn't support images API — try doubao then openai
+            let fallback = [("doubao", "ARK_API_KEY"), ("openai", "OPENAI_API_KEY")];
+            let mut found = None;
+            for (fb_prov, fb_env) in fallback {
+                let fb_cfg = self.config.model.models.as_ref()
+                    .and_then(|m| m.providers.get(fb_prov));
+                let fb_key = fb_cfg.and_then(|p| p.api_key.as_ref()).and_then(|k| k.as_plain().map(str::to_owned))
+                    .or_else(|| std::env::var(fb_env).ok());
+                if let Some(key) = fb_key {
+                    let fb_url = fb_cfg.and_then(|p| p.base_url.clone())
+                        .unwrap_or_else(|| crate::provider::defaults::resolve_base_url(fb_prov).0);
+                    found = Some((fb_url, Some(key), fb_prov));
+                    break;
+                }
+            }
+            found.unwrap_or_else(|| (cfg_url.unwrap_or(base_url), None, prov_name))
+        };
+        let Some(api_key) = img_key else {
             return Ok(json!({
-                "error": format!("AI image generation requires a provider with image API support (doubao, openai, qwen). Current provider '{prov_name}' has no API key configured.")
+                "error": format!("AI image generation requires doubao or openai provider with API key configured. Current provider '{prov_name}' does not support image generation.")
             }));
         };
 
-        let url = format!("{}/images/generations", effective_url.trim_end_matches('/'));
-
-        // Determine default model for image generation
+        let url = format!("{}/images/generations", img_url.trim_end_matches('/'));
         let image_model = args["model"].as_str().unwrap_or_else(|| {
-            match prov_name {
-                "doubao" | "bytedance" => "doubao-seedream-3-0-t2i-250220",
+            match img_prov {
+                "doubao" | "bytedance" => "doubao-seedream-5-0-260128",
                 "openai" => "dall-e-3",
-                "qwen" => "wanx-v1",
                 _ => "dall-e-3",
             }
         });
