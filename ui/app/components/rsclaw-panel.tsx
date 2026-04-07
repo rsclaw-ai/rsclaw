@@ -3398,20 +3398,20 @@ function TauriConfigPageInner() {
   const handleTestProvider = async (provId: string) => {
     const apiKey = getVal(`models.providers.${provId}.apiKey`, "");
     const baseUrl = getVal(`models.providers.${provId}.baseUrl`, "");
-    if (!apiKey && !ALL_PROVIDERS[provId]?.isUrl) {
+    const apiType = provId === "custom" ? (getVal(`models.providers.${provId}.api`, "") || getVal(`models.providers.${provId}.api_type`, "")) : undefined;
+    if (!apiKey && provId !== "ollama" && !(provId === "custom" && apiType === "ollama")) {
       toast.error(zh ? "请先填写 API Key" : "Enter API Key first");
       return;
     }
     setProvTest((prev) => ({ ...prev, [provId]: "testing" }));
     setProvErr((prev) => ({ ...prev, [provId]: "" }));
     try {
-      // Test directly via Tauri (no gateway needed) or fallback to gateway API
       const tauriInvoke = (window as any).__TAURI__?.invoke;
       let res: any;
       if (tauriInvoke) {
-        res = await tauriInvoke("test_provider", { provider: provId, apiKey, baseUrl: baseUrl || null });
+        res = await tauriInvoke("test_provider", { provider: provId, apiKey, baseUrl: baseUrl || null, apiType: apiType || null });
       } else {
-        res = await testProviderKey(provId, apiKey, baseUrl || undefined);
+        res = await testProviderKey(provId, apiKey, baseUrl || undefined, apiType || undefined);
       }
       if (res.ok || res.success) {
         // Must have models to be considered connected

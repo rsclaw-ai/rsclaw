@@ -94,7 +94,7 @@ interface WizText {
 const T: Record<WizLang, WizText> = {
   cn: {
     welcome: "\u5F00\u59CB\u8BBE\u7F6E",
-    subtitle: "\u8783\u87F9\u9AD8\u6027\u80FD\u591A\u667A\u80FD\u4F53AI\u5F15\u64CE \u00B7 Multi-Agent AI Gateway",
+    subtitle: "\u8783\u87F9\u9AD8\u6027\u80FD\u591A\u667A\u80FD\u4F53AI\u7F51\u5173 \u00B7 Multi-Agent AI Gateway",
     step1Title: "\u68C0\u6D4B\u73AF\u5883",
     step1Sub: "\u68C0\u67E5 rsclaw \u662F\u5426\u5DF2\u5B89\u88C5\uFF0C\u4EE5\u53CA\u662F\u5426\u6709 OpenClaw \u6570\u636E\u53EF\u8FC1\u79FB\u3002",
     step2Title: "\u9009\u62E9 LLM \u63D0\u4F9B\u5546",
@@ -798,7 +798,7 @@ export const ALL_PROVIDERS: Record<string, ProviderDef> = {
   siliconflow: { id: "siliconflow", name: "SiliconFlow",        tag: "\u56FD\u5185\u52A0\u901F",      tagEn: "China accel",       keyLabel: "SiliconFlow Key",     keyPlaceholder: "sk-..." },
 };
 
-export const PROV_ORDER_ZH = ["doubao","qwen","minimax","deepseek","kimi","zhipu","ollama","custom","gaterouter","openrouter","anthropic","openai","gemini","grok","groq","siliconflow"];
+export const PROV_ORDER_ZH = ["doubao","qwen","custom","minimax","deepseek","kimi","zhipu","ollama","gaterouter","openrouter","anthropic","openai","gemini","grok","groq","siliconflow"];
 export const PROV_ORDER_EN = ["anthropic","openai","gemini","grok","openrouter","ollama","custom","groq","doubao","qwen","minimax","deepseek","kimi","zhipu","gaterouter","siliconflow"];
 
 function getProviders(lang?: string): ProviderDef[] {
@@ -2267,7 +2267,7 @@ export function OnboardingPage() {
             </div>
             {step === 0 ? (
               <div style={{ fontSize: 11, color: V.t2, textAlign: "center", lineHeight: 1.6, maxWidth: 380 }}>
-                {"\u8783\u87F9\u9AD8\u6027\u80FD\u591A\u667A\u80FD\u4F53AI\u5F15\u64CE \u00B7 Multi-Agent AI Gateway"}
+                {"\u8783\u87F9\u9AD8\u6027\u80FD\u591A\u667A\u80FD\u4F53AI\u7F51\u5173 \u00B7 Multi-Agent AI Gateway"}
               </div>
             ) : (
               <div style={S.logoSub}>
