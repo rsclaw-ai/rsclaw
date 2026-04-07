@@ -32,7 +32,8 @@ use crate::{
     provider::{
         LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
         anthropic::AnthropicProvider, failover::FailoverManager, gemini::GeminiProvider,
-        openai::OpenAiProvider, registry::ProviderRegistry,
+        openai::OpenAiProvider, openai_responses::OpenAiResponsesProvider,
+        registry::ProviderRegistry,
     },
     server::{AppState, serve},
     skill::{SkillRegistry, load_skills},
@@ -426,6 +427,7 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                 match name.as_str() {
                     "anthropic" => ApiFormat::Anthropic,
                     "gemini" => ApiFormat::Gemini,
+                    "doubao" | "bytedance" => ApiFormat::OpenAiResponses,
                     _ => ApiFormat::OpenAiCompletions,
                 }
             });
@@ -462,8 +464,16 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                         Arc::new(OpenAiProvider::ollama("http://localhost:11434/v1", key))
                     }
                 }
+                (_, &crate::config::schema::ApiFormat::OpenAiResponses) => {
+                    let key = api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok());
+                    if let Some(url) = base_url {
+                        Arc::new(OpenAiResponsesProvider::with_base_url(url, key))
+                    } else {
+                        Arc::new(OpenAiResponsesProvider::new(key.unwrap_or_default()))
+                    }
+                }
                 _ => {
-                    // OpenAI-compatible (covers openai-completions, openai-responses,
+                    // OpenAI-compatible (covers openai-completions,
                     // llama.cpp, vLLM, SGLang, etc.)
                     let key = api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok());
                     if let Some(url) = base_url {
@@ -556,16 +566,6 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
         ("stepfun", "https://api.stepfun.com/v1", "STEPFUN_API_KEY"),
         ("lingyi", "https://api.lingyiwanwu.com/v1", "LINGYI_API_KEY"),
         (
-            "doubao",
-            "https://ark.cn-beijing.volces.com/api/v3",
-            "DOUBAO_API_KEY",
-        ),
-        (
-            "bytedance",
-            "https://ark.cn-beijing.volces.com/api/v3",
-            "DOUBAO_API_KEY",
-        ), // alias for doubao
-        (
             "baidu",
             "https://qianfan.baidubce.com/v2",
             "QIANFAN_API_KEY",
@@ -589,6 +589,34 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
             registry.register(
                 name,
                 Arc::new(OpenAiProvider::with_base_url(base_url, Some(key))),
+            );
+        }
+    }
+
+    // Doubao / ByteDance — uses OpenAI Responses API format.
+    if !registry.names().contains(&"doubao") {
+        if let Ok(key) = std::env::var("ARK_API_KEY")
+            .or_else(|_| std::env::var("DOUBAO_API_KEY"))
+        {
+            registry.register(
+                "doubao",
+                Arc::new(OpenAiResponsesProvider::with_base_url(
+                    "https://ark.cn-beijing.volces.com/api/v3",
+                    Some(key),
+                )),
+            );
+        }
+    }
+    if !registry.names().contains(&"bytedance") {
+        if let Ok(key) = std::env::var("ARK_API_KEY")
+            .or_else(|_| std::env::var("DOUBAO_API_KEY"))
+        {
+            registry.register(
+                "bytedance",
+                Arc::new(OpenAiResponsesProvider::with_base_url(
+                    "https://ark.cn-beijing.volces.com/api/v3",
+                    Some(key),
+                )),
             );
         }
     }
