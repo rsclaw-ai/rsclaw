@@ -114,7 +114,7 @@ impl FailoverManager {
             }
         }
 
-        Err(anyhow!("all providers and fallbacks exhausted"))
+        Err(anyhow!("LLM service unavailable — provider rate limited or API key invalid. Please check your provider configuration or try again later."))
     }
 
     fn is_cooling_down(&self, profile_id: &str) -> bool {
