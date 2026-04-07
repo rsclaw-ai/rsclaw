@@ -239,7 +239,7 @@ function StatusPage() {
           <div className={styles["status-name"]}>{Locale.RsClawPanel.Status.GatewayName}</div>
           <div className={styles["status-addr"]}>
             {health.running
-              ? `localhost:${health.port || 18888} · ${Locale.RsClawPanel.Status.Uptime} ${health.uptime || "N/A"}`
+              ? `rsclaw gateway v${health.version || "?"} · localhost:${health.port || 18888} · ${Locale.RsClawPanel.Status.Uptime} ${health.uptime || "N/A"}`
               : Locale.RsClawPanel.Status.NotResponding}
           </div>
         </div>
@@ -401,6 +401,10 @@ function StatusPage() {
                   <div className={styles["gw-modal-stat"]}>
                     <div className={styles["gw-modal-stat-label"]}>{Locale.RsClawPanel.Status.CurrentStatus}</div>
                     <div className={styles["gw-modal-stat-val"]} style={{ color: "#2dd4a0" }}>{Locale.RsClawPanel.Running}</div>
+                  </div>
+                  <div className={styles["gw-modal-stat"]}>
+                    <div className={styles["gw-modal-stat-label"]}>{"Version"}</div>
+                    <div className={styles["gw-modal-stat-val"]} style={{ color: "#6b6877" }}>v{health.version || "unknown"}</div>
                   </div>
                   <div className={styles["gw-modal-stat"]}>
                     <div className={styles["gw-modal-stat-label"]}>{Locale.RsClawPanel.Status.ChannelCount}</div>
