@@ -1517,6 +1517,32 @@ async fn test_provider(Json(req): Json<TestProviderRequest>) -> Response {
         .build()
         .unwrap_or_default();
 
+    // Anthropic protocol: test with /messages instead of /models (proxies often don't support /models)
+    let effective_type = if req.provider == "custom" { req.api_type.as_deref().unwrap_or("openai") } else { req.provider.as_str() };
+    if effective_type == "anthropic" {
+        use crate::provider::defaults as prov_defaults;
+        let (default_url, _) = prov_defaults::resolve_base_url(&req.provider);
+        let base = req.base_url.as_deref().filter(|u| !u.is_empty()).unwrap_or(&default_url);
+        let url = format!("{}/messages", base.trim_end_matches('/'));
+        let resp = client.post(&url)
+            .header("x-api-key", &req.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({"model":"claude-3-5-sonnet-20240620","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}))
+            .send().await;
+        return match resp {
+            Ok(r) if r.status().is_success() || r.status().as_u16() == 400 => {
+                Json(serde_json::json!({"ok": true, "status": 200})).into_response()
+            }
+            Ok(r) => {
+                let st = r.status().as_u16();
+                let body = r.text().await.unwrap_or_default();
+                (StatusCode::OK, Json(serde_json::json!({"ok": false, "status": st, "error": if st == 401 || st == 403 { "Invalid API key" } else { "Request failed" }, "detail": body.chars().take(200).collect::<String>()}))).into_response()
+            }
+            Err(e) => (StatusCode::OK, Json(serde_json::json!({"ok": false, "error": e.to_string()}))).into_response(),
+        };
+    }
+
     let request = match build_provider_models_request(&client, &req) {
         Ok(r) => r,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),

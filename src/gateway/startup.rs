@@ -407,7 +407,7 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
             let base_url = provider_cfg.base_url.clone().or_else(|| {
                 // Fall back to well-known base URLs for named providers.
                 match name.as_str() {
-                    "qwen"        => Some("https://dashscope.aliyuncs.com/compatible-mode/v1".to_owned()),
+                    "qwen"        => Some("https://dashscope.aliyuncs.com/api/v1".to_owned()),
                     "deepseek"    => Some("https://api.deepseek.com/v1".to_owned()),
                     "kimi" | "moonshot" => Some("https://api.moonshot.cn/v1".to_owned()),
                     "zhipu"       => Some("https://open.bigmodel.cn/api/paas/v4".to_owned()),
@@ -548,7 +548,7 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
         ),
         (
             "qwen",
-            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "https://dashscope.aliyuncs.com/api/v1",
             "DASHSCOPE_API_KEY",
         ),
         ("kimi", "https://api.moonshot.cn/v1", "MOONSHOT_API_KEY"), // Kimi = Moonshot

@@ -22,7 +22,7 @@ fn builtin_base_url(provider: &str) -> (&'static str, &'static str) {
         "anthropic"          => ("https://api.anthropic.com/v1",                       "x-api-key"),
         "openai"             => ("https://api.openai.com/v1",                         "bearer"),
         "deepseek"           => ("https://api.deepseek.com/v1",                       "bearer"),
-        "qwen"               => ("https://dashscope.aliyuncs.com/compatible-mode/v1", "bearer"),
+        "qwen"               => ("https://dashscope.aliyuncs.com/api/v1",             "bearer"),
         "doubao"             => ("https://ark.cn-beijing.volces.com/api/v3",          "bearer"),
         "minimax"            => ("https://api.minimax.chat/v1",                       "bearer"),
         "kimi" | "moonshot"  => ("https://api.moonshot.cn/v1",                        "bearer"),
