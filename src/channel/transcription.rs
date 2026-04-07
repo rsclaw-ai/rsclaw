@@ -111,40 +111,44 @@ fn decode_silk_to_wav(silk_bytes: &[u8]) -> Result<Vec<u8>> {
     #[cfg(feature = "silk")]
     let pcm_bytes: Vec<u8> =
         silk_rs::decode_silk(raw, 24000).map_err(|e| anyhow::anyhow!("silk decode: {e:?}"))?;
+
     #[cfg(not(feature = "silk"))]
-    let pcm_bytes: Vec<u8> = {
+    {
         warn!("SILK decoding requires `silk` feature flag");
         return Err(anyhow::anyhow!(
             "SILK decoding not available: compile with --features silk"
         ));
-    };
+    }
 
-    // Build WAV header (16-bit mono PCM)
-    let sample_rate: u32 = 24000;
-    let channels: u16 = 1;
-    let bits_per_sample: u16 = 16;
-    let data_len: u32 = pcm_bytes.len() as u32;
-    let chunk_size: u32 = 36 + data_len;
-    let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
-    let block_align = channels * bits_per_sample / 8;
+    #[cfg(feature = "silk")]
+    {
+        // Build WAV header (16-bit mono PCM)
+        let sample_rate: u32 = 24000;
+        let channels: u16 = 1;
+        let bits_per_sample: u16 = 16;
+        let data_len: u32 = pcm_bytes.len() as u32;
+        let chunk_size: u32 = 36 + data_len;
+        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
+        let block_align = channels * bits_per_sample / 8;
 
-    let mut wav = Vec::with_capacity(44 + data_len as usize);
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&chunk_size.to_le_bytes());
-    wav.extend_from_slice(b"WAVE");
-    wav.extend_from_slice(b"fmt ");
-    wav.extend_from_slice(&16u32.to_le_bytes()); // chunk size
-    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM format
-    wav.extend_from_slice(&channels.to_le_bytes());
-    wav.extend_from_slice(&sample_rate.to_le_bytes());
-    wav.extend_from_slice(&byte_rate.to_le_bytes());
-    wav.extend_from_slice(&block_align.to_le_bytes());
-    wav.extend_from_slice(&bits_per_sample.to_le_bytes());
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&data_len.to_le_bytes());
-    wav.extend_from_slice(&pcm_bytes);
+        let mut wav = Vec::with_capacity(44 + data_len as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&chunk_size.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes()); // chunk size
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM format
+        wav.extend_from_slice(&channels.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&byte_rate.to_le_bytes());
+        wav.extend_from_slice(&block_align.to_le_bytes());
+        wav.extend_from_slice(&bits_per_sample.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.extend_from_slice(&pcm_bytes);
 
-    Ok(wav)
+        Ok(wav)
+    }
 }
 
 // ---------------------------------------------------------------------------

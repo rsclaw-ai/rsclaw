@@ -33,6 +33,7 @@ pub fn minimal_config(port: u16) -> RuntimeConfig {
             port,
             mode: GatewayMode::Local,
             bind: BindMode::Loopback,
+            bind_address: None,
             reload: ReloadMode::Hybrid,
             auth_token: None,
             auth_token_configured: false,
@@ -100,8 +101,13 @@ pub async fn start_server(addr: SocketAddr) {
         ))),
         ws_conns: Arc::new(rsclaw::ws::ConnRegistry::new()),
         feishu: Arc::new(tokio::sync::OnceCell::new()),
+        wecom: Arc::new(tokio::sync::OnceCell::new()),
+        whatsapp: Arc::new(tokio::sync::OnceCell::new()),
+        line: Arc::new(tokio::sync::OnceCell::new()),
+        zalo: Arc::new(tokio::sync::OnceCell::new()),
         started_at: std::time::Instant::now(),
         dm_enforcers: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        custom_webhooks: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     };
 
     // Leak tempdir — store must stay live for the lifetime of the server task.

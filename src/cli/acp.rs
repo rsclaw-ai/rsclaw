@@ -49,6 +49,7 @@ pub enum AcpCommand {
         #[arg(long)]
         cwd: Option<String>,
 
+        /// Agent type: "opencode" or "claudecode"
         #[arg(long, default_value = "opencode")]
         command: String,
     },
@@ -88,6 +89,7 @@ pub enum AcpCommand {
 pub enum AgentCommand {
     #[command(name = "spawn", about = "Spawn a new agent")]
     Spawn {
+        /// Agent type: "opencode" or "claudecode"
         #[arg(long, default_value = "opencode")]
         agent_type: String,
 

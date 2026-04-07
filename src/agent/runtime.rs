@@ -213,6 +213,7 @@ pub struct AgentRuntime {
     btw_manager: super::btw::BtwManager,
     notification_tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
     opencode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
+    claudecode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
     /// In-memory session alias cache: alias_key → canonical session_key.
     /// Loaded from redb on first use, avoids repeated DB lookups.
     session_aliases: std::collections::HashMap<String, String>,
@@ -275,6 +276,7 @@ impl AgentRuntime {
             btw_manager,
             notification_tx,
             opencode_client: Arc::new(tokio::sync::OnceCell::new()),
+            claudecode_client: Arc::new(tokio::sync::OnceCell::new()),
             session_aliases,
         }
     }
@@ -516,6 +518,303 @@ impl AgentRuntime {
 
         Ok(serde_json::json!({
             "output": "OpenCode 任务已提交，完成后将推送结果。",
+            "status": "submitted",
+            "session_id": session_id_clone
+        }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Claude Code ACP integration
+    // -----------------------------------------------------------------------
+
+    /// Get or create the Claude Code ACP client.
+    /// Uses claude-agent-acp which wraps Claude Agent SDK with ACP protocol.
+    async fn get_claudecode_client(&self) -> Result<crate::acp::client::AcpClient> {
+        if let Some(client) = self.claudecode_client.get() {
+            return Ok(client.clone());
+        }
+
+        // Find claude-agent-acp executable
+        // Can be installed via npm: npm install -g @agentclientprotocol/claude-agent-acp
+        let (command, args) = if let Ok(path) = which::which("claude-agent-acp") {
+            (path.to_string_lossy().to_string(), vec![])
+        } else if let Ok(path) = std::env::var("CLAUDE_AGENT_ACP_PATH") {
+            // If it's a .js file, run with node
+            if path.ends_with(".js") {
+                ("node".to_string(), vec![path])
+            } else {
+                (path, vec![])
+            }
+        } else {
+            // Try common npm global install paths
+            let npm_global = std::env::var("npm_config_prefix").ok();
+            let js_path = npm_global
+                .as_ref()
+                .map(|p| {
+                    let mut path = std::path::PathBuf::from(p);
+                    path.push("node_modules");
+                    path.push("@agentclientprotocol");
+                    path.push("claude-agent-acp");
+                    path.push("dist");
+                    path.push("index.js");
+                    path
+                })
+                .or_else(|| {
+                    dirs_next::home_dir().map(|h| {
+                        let mut path = h;
+                        path.push(".npm-global");
+                        path.push("node_modules");
+                        path.push("@agentclientprotocol");
+                        path.push("claude-agent-acp");
+                        path.push("dist");
+                        path.push("index.js");
+                        path
+                    })
+                })
+                .or_else(|| {
+                    dirs_next::home_dir().map(|h| {
+                        let mut path = h;
+                        path.push("node_modules");
+                        path.push("@agentclientprotocol");
+                        path.push("claude-agent-acp");
+                        path.push("dist");
+                        path.push("index.js");
+                        path
+                    })
+                });
+
+            match js_path {
+                Some(p) if p.exists() => {
+                    // .js files need to be run with node
+                    ("node".to_string(), vec![p.to_string_lossy().to_string()])
+                }
+                _ => {
+                    // Fallback - let spawn handle the error
+                    ("claude-agent-acp".to_string(), vec![])
+                }
+            }
+        };
+
+        tracing::info!(command = %command, "Claude Code: starting subprocess");
+
+        // Use agent's workspace directory
+        let cwd = self
+            .handle
+            .config
+            .workspace
+            .as_deref()
+            .or(self.config.agents.defaults.workspace.as_deref())
+            .map(expand_tilde)
+            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"))
+            .to_string_lossy()
+            .to_string();
+
+        tracing::info!(cwd = %cwd, args = ?args, "Claude Code: using workspace directory");
+
+        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let client = crate::acp::client::AcpClient::spawn(&command, &args_ref).await?;
+        client
+            .initialize("rsclaw", env!("RSCLAW_BUILD_VERSION"))
+            .await?;
+
+        // Create session with model if configured
+        let model = self
+            .handle
+            .config
+            .claudecode
+            .as_ref()
+            .and_then(|c| c.model.clone())
+            .or_else(|| std::env::var("CLAUDE_MODEL").ok());
+        let session_resp = client.create_session(&cwd, model.as_deref(), None).await?;
+
+        tracing::info!(
+            session_id = %session_resp.session_id,
+            "Claude Code session created"
+        );
+
+        self.claudecode_client.set(client.clone()).ok();
+        Ok(client)
+    }
+
+    /// Tool handler for Claude Code ACP calls - runs asynchronously.
+    /// Results are delivered via notification channel when complete.
+    async fn tool_claudecode(&self, ctx: &RunContext, args: Value) -> Result<Value> {
+        let task = args["task"]
+            .as_str()
+            .ok_or_else(|| anyhow!("claudecode tool requires 'task' argument"))?;
+
+        tracing::info!(task = %task, "tool_claudecode: starting");
+
+        let client = self.get_claudecode_client().await?;
+        let session_id = client.session_id().await.unwrap_or_default();
+        let session_id_clone = session_id.clone();
+
+        // Get notification sender for async result delivery
+        let notif_tx = self.notification_tx.clone();
+        let target_id = ctx.peer_id.clone();
+        let task_str = task.to_string();
+
+        // Send initial notification
+        if let Some(ref tx) = notif_tx {
+            let _ = tx.send(crate::channel::OutboundMessage {
+                target_id: target_id.clone(),
+                is_group: false,
+                text: "🚀 Claude Code 任务已提交，执行中...".to_string(),
+                reply_to: None,
+                images: vec![],
+            });
+        }
+
+        // Spawn background task - collect events AND send prompt in parallel
+        let notif_tx_bg = notif_tx.clone();
+        let target_id_bg = target_id.clone();
+        tokio::spawn(async move {
+            // Start event collection FIRST (in parallel with send_prompt)
+            let mut event_rx = client.subscribe_events();
+            let events = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+            let events_clone = Arc::clone(&events);
+
+            // Event collection task - runs in background
+            let notif_tx_clone = notif_tx_bg.clone();
+            let target_id_clone = target_id_bg.clone();
+            let event_collector = tokio::spawn(async move {
+                let mut pending = String::new();
+                let mut interval = 0u64;
+                loop {
+                    match event_rx.recv().await {
+                        Ok(event) => {
+                            let event_str = match &event {
+                                crate::acp::client::SessionEvent::ToolCallStarted {
+                                    title, ..
+                                } => {
+                                    format!("🔧 {}", title.as_deref().unwrap_or("tool"))
+                                }
+                                crate::acp::client::SessionEvent::ToolCallCompleted {
+                                    result,
+                                    ..
+                                } => result
+                                    .as_ref()
+                                    .map(|r| {
+                                        if r.len() > 100 {
+                                            format!("✅ {}...", &r[..100])
+                                        } else {
+                                            format!("✅ {}", r)
+                                        }
+                                    })
+                                    .unwrap_or_default(),
+                                crate::acp::client::SessionEvent::ToolCallFailed {
+                                    error, ..
+                                } => {
+                                    format!("❌ {}", error)
+                                }
+                                crate::acp::client::SessionEvent::AgentThoughtChunk {
+                                    content, ..
+                                } => {
+                                    format!("💭 {}", content)
+                                }
+                                _ => String::new(),
+                            };
+
+                            if !event_str.is_empty() {
+                                events_clone.lock().await.push(event_str.clone());
+                                if let Some(ref tx) = notif_tx_clone {
+                                    pending.push_str(&event_str);
+                                    pending.push('\n');
+                                    interval += 1;
+                                    if interval >= 3 || pending.len() > 400 {
+                                        let _ = tx.send(crate::channel::OutboundMessage {
+                                            target_id: target_id_clone.clone(),
+                                            is_group: false,
+                                            text: format!("🔄 Claude Code\n{}", pending.trim()),
+                                            reply_to: None,
+                                            images: vec![],
+                                        });
+                                        pending.clear();
+                                        interval = 0;
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            // Send prompt (runs in parallel with event collection)
+            tracing::info!("tool_claudecode: sending prompt");
+            let send_result = client.send_prompt(&task_str).await;
+
+            // Process the result
+            match send_result {
+                Ok(resp) => {
+                    tracing::info!(
+                        "tool_claudecode: send_prompt completed, stop_reason={:?}",
+                        resp.stop_reason
+                    );
+
+                    let events_text = events.lock().await.join("\n");
+                    let collected = client.get_collected_content().await;
+                    tracing::info!(
+                        "tool_claudecode: events_text len={}, collected len={}",
+                        events_text.len(),
+                        collected.len()
+                    );
+
+                    let output = if !events_text.is_empty() {
+                        events_text
+                    } else if !collected.is_empty() {
+                        collected
+                    } else if let Some(result) = resp.result {
+                        result
+                            .content
+                            .iter()
+                            .filter_map(|b| match b {
+                                crate::acp::types::ContentBlock::Text { text } => {
+                                    Some(text.clone())
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    } else {
+                        "(无输出)".to_string()
+                    };
+
+                    let final_output = if output.len() > 4000 {
+                        format!("{}...\n\n[已截断]", &output[..4000])
+                    } else {
+                        output
+                    };
+
+                    // Send notification to user
+                    if let Some(ref tx) = notif_tx_bg {
+                        let _ = tx.send(crate::channel::OutboundMessage {
+                            target_id: target_id_bg.clone(),
+                            is_group: false,
+                            text: format!("✅ Claude Code 完成\n\n{}", final_output),
+                            reply_to: None,
+                            images: vec![],
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("tool_claudecode: send_prompt failed: {}", e);
+                    if let Some(ref tx) = notif_tx_bg {
+                        let _ = tx.send(crate::channel::OutboundMessage {
+                            target_id: target_id_bg.clone(),
+                            is_group: false,
+                            text: format!("❌ Claude Code 错误\n\n{}", e),
+                            reply_to: None,
+                            images: vec![],
+                        });
+                    }
+                }
+            }
+            // DON'T await event_collector - it runs forever
+        });
+
+        Ok(serde_json::json!({
+            "output": "Claude Code 任务已提交，完成后将推送结果。",
             "status": "submitted",
             "session_id": session_id_clone
         }))
@@ -2113,6 +2412,9 @@ impl AgentRuntime {
             let approx_tokens: usize = messages.iter().map(msg_tokens).sum();
             info!(session = %ctx.session_key, msg_count, approx_tokens, model = %model, "LLM call: context size");
 
+            // Resolve max_tokens with priority: config > built-in defaults > 8192
+            let (provider_name, model_id) =
+                crate::provider::registry::ProviderRegistry::parse_model(&model);
             let configured_max_tokens = {
                 // 1. Agent model config (from handle.config = AgentEntry)
                 let from_agent = self.handle.config.model.as_ref().and_then(|m| m.max_tokens);
@@ -2127,30 +2429,51 @@ impl AgentRuntime {
                     .and_then(|m| m.max_tokens);
 
                 // 3. Provider model definition (from models.providers[].models[])
-                let from_provider = {
-                    let (provider, model_id) =
-                        crate::provider::registry::ProviderRegistry::parse_model(&model);
-                    self.config
-                        .model
-                        .models
-                        .as_ref()
-                        .and_then(|m| m.providers.get(provider))
-                        .and_then(|p| p.models.as_ref())
-                        .and_then(|models| models.iter().find(|m| m.id == model_id))
-                        .and_then(|m| m.max_tokens)
-                        .map(|v| v as u32)
-                };
+                let from_provider = self
+                    .config
+                    .model
+                    .models
+                    .as_ref()
+                    .and_then(|m| m.providers.get(provider_name))
+                    .and_then(|p| p.models.as_ref())
+                    .and_then(|models| models.iter().find(|m| m.id == model_id))
+                    .and_then(|m| m.max_tokens)
+                    .map(|v| v as u32);
 
-                from_agent
-                    .or(from_defaults)
-                    .or(from_provider)
+                from_agent.or(from_defaults).or(from_provider)
             };
+
+            // Use built-in defaults if not configured
+            let max_tokens = crate::provider::model_defaults::resolve_max_tokens(
+                provider_name,
+                model_id,
+                configured_max_tokens,
+            );
+
+            // Log max_tokens resolution for debugging
+            if configured_max_tokens.is_some() {
+                info!(
+                    session = %ctx.session_key,
+                    model = %model,
+                    configured = configured_max_tokens.unwrap(),
+                    effective = max_tokens,
+                    "LLM request max_tokens (from config)"
+                );
+            } else {
+                info!(
+                    session = %ctx.session_key,
+                    model = %model,
+                    effective = max_tokens,
+                    "LLM request max_tokens (using builtin default)"
+                );
+            }
+
             let req = LlmRequest {
                 model: model.to_owned(),
                 messages,
                 tools: tools.clone(),
                 system: Some(system_prompt.to_owned()),
-                max_tokens: configured_max_tokens,
+                max_tokens: Some(max_tokens),
                 temperature: None,
                 thinking_budget,
             };
@@ -2207,22 +2530,12 @@ impl AgentRuntime {
                     StreamEvent::ToolCall { id, name, input } => {
                         if !id.is_empty() && !name.is_empty() {
                             // New tool call with both id and name — start fresh entry.
-                            // For exec, use command content as key so different commands
-                            // don't count as the same repeated call.
-                            let loop_key = if name == "exec" {
-                                let cmd =
-                                    input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                                format!("exec:{cmd}")
-                            } else {
-                                name.clone()
-                            };
-                            // Check for loop — Warning allows execution to continue,
-                            // Critical blocks. The warning message is logged but
-                            // does not stop the tool call (matching OpenClaw behavior).
+                            // Use check_with_params which hashes the full input (OpenClaw-compatible).
+                            // This ensures different arguments count as different calls.
                             if let Some(warning_msg) =
-                                ctx.loop_detector.check(&loop_key).to_result()?
+                                ctx.loop_detector.check_with_params(&name, &input).to_result()?
                             {
-                                tracing::warn!(tool = %loop_key, "{}", warning_msg);
+                                tracing::warn!(tool = %name, params = ?input, "{}", warning_msg);
                             }
                             tool_calls.push((id, name, input));
                         } else if !id.is_empty() && name.is_empty() {
@@ -2547,8 +2860,11 @@ impl AgentRuntime {
                                 ),
                                 vec![img.to_owned()],
                             )
+                        } else if v.is_string() {
+                            (v.as_str().unwrap_or("").to_owned(), vec![])
                         } else {
-                            (v.to_string(), vec![])
+                            // Format structured tool results (exec, read, etc.) for better LLM comprehension
+                            (format_tool_result(&v), vec![])
                         }
                     }
                     Err(e) => {
@@ -2737,6 +3053,7 @@ impl AgentRuntime {
             "gateway" => return self.tool_gateway(args).await,
             "pairing" => return self.tool_pairing(args).await,
             "opencode" => return self.tool_opencode(ctx, args).await,
+            "claudecode" => return self.tool_claudecode(ctx, args).await,
             _ => {}
         }
 
@@ -3781,6 +4098,7 @@ impl AgentRuntime {
             commands: None,
             allowed_commands: None,
             opencode: None,
+            claudecode: None,
         };
 
         spawner.spawn_agent(entry)?;
@@ -6230,6 +6548,17 @@ Example - Large file (SPLIT INTO MULTIPLE CALLS):
             "type": "object",
             "properties": {
                 "task": {"type": "string", "description": "The coding task to execute. Be specific about file paths and always mention creating a project subdirectory for new projects."}
+            },
+            "required": ["task"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "claudecode".to_owned(),
+        description: "Execute coding tasks using Claude Code (official Claude Agent SDK via ACP protocol). Uses Claude's native coding capabilities with full context awareness. IMPORTANT: When creating new projects or files, ALWAYS create a dedicated project directory first. The task will run asynchronously and results will be sent when complete.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "The coding task to execute. Be specific about requirements and file paths."}
             },
             "required": ["task"]
         }),

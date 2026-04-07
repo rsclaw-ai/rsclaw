@@ -283,6 +283,10 @@ pub struct AgentEntry {
     /// rsclaw extension: use OpenCode ACP client instead of LLM
     /// When set, this agent spawns opencode acp subprocess and routes all prompts through it.
     pub opencode: Option<OpenCodeConfig>,
+    /// rsclaw extension: use Claude Code ACP client instead of LLM
+    /// When set, this agent spawns claude-agent-acp subprocess and routes all prompts through it.
+    /// Uses the official Claude Agent SDK via ACP protocol.
+    pub claudecode: Option<ClaudeCodeConfig>,
     /// OpenClaw-specific
     pub agent_dir: Option<String>,
     pub system: Option<String>,
@@ -299,6 +303,22 @@ pub struct OpenCodeConfig {
     /// Workspace directory for opencode (default: ".")
     pub cwd: Option<String>,
     /// Default model ID (e.g., "opencode/big-pickle", "alibaba/qwen3.5-plus")
+    pub model: Option<String>,
+}
+
+/// Claude Code ACP configuration for an agent.
+/// Uses claude-agent-acp (https://github.com/agentclientprotocol/claude-agent-acp)
+/// which wraps the Claude Agent SDK with ACP protocol.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeCodeConfig {
+    /// Path to claude-agent-acp binary (default: "claude-agent-acp")
+    pub command: Option<String>,
+    /// Arguments passed to claude-agent-acp (default: [])
+    pub args: Option<Vec<String>>,
+    /// Workspace directory for claude code (default: agent's workspace)
+    pub cwd: Option<String>,
+    /// Claude model ID (e.g., "claude-sonnet-4-6", "claude-opus-4-6")
     pub model: Option<String>,
 }
 
@@ -1165,6 +1185,9 @@ pub struct CronConfig {
     pub session_retention: Option<Value>,
     pub run_log: Option<RunLogConfig>,
     pub jobs: Option<Vec<CronJobConfig>>,
+    /// Default delivery target for jobs without explicit delivery config.
+    /// Jobs can override this by setting their own `delivery` field.
+    pub default_delivery: Option<CronDelivery>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1173,6 +1196,27 @@ pub struct RunLogConfig {
     pub enabled: Option<bool>,
     pub max_runs: Option<u32>,
     pub retention: Option<String>,
+}
+
+/// Delivery target for cron job notifications (OpenClaw compat).
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CronDelivery {
+    /// Delivery mode: "announce" sends to channel, "none" disables.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Channel to send to: "feishu", "wechat", "telegram", etc.
+    pub channel: Option<String>,
+    /// Target user/chat ID.
+    #[serde(rename = "to")]
+    pub to: Option<String>,
+    /// Thread/topic ID for channels that support it.
+    pub thread_id: Option<String>,
+    /// Account ID for multi-account setups.
+    pub account_id: Option<String>,
+    /// If true, silently ignore delivery failures.
+    #[serde(default)]
+    pub best_effort: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1188,6 +1232,8 @@ pub struct CronJobConfig {
     pub message: String,
     pub session: Option<Value>,
     pub enabled: Option<bool>,
+    /// Delivery target for notifications when job completes.
+    pub delivery: Option<CronDelivery>,
 }
 
 // ---------------------------------------------------------------------------

@@ -5,6 +5,9 @@
 //!
 //! Distinguishes between WARNING (model notified, execution continues)
 //! and CRITICAL (execution blocked), matching OpenClaw behavior.
+//!
+//! Hashes tool name + params (like OpenClaw's hashToolCall) so
+//! different arguments are treated as different calls.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -18,6 +21,64 @@ const DEFAULT_CRITICAL_THRESHOLD: usize = 20;
 /// Built-in per-tool threshold overrides.
 fn builtin_overrides() -> HashMap<String, (usize, usize)> {
     HashMap::new()
+}
+
+/// Hash tool name + params for loop detection (matches OpenClaw's hashToolCall).
+pub fn hash_tool_call(tool_name: &str, params: &serde_json::Value) -> String {
+    let stable = stable_stringify(params);
+    // Use a simple hash (not SHA256) for speed - we only need uniqueness within a session
+    let hash = simple_hash(&stable);
+    format!("{tool_name}:{hash}")
+}
+
+/// Stable JSON stringify with sorted keys (matches OpenClaw's stableStringify).
+fn stable_stringify(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => format!("\"{}\"", escape_json_string(s)),
+        serde_json::Value::Array(arr) => {
+            format!("[{}]", arr.iter().map(stable_stringify).collect::<Vec<_>>().join(","))
+        }
+        serde_json::Value::Object(obj) => {
+            let keys: Vec<_> = obj.keys().collect();
+            let sorted_keys = sort_keys(&keys);
+            let entries: Vec<String> = sorted_keys
+                .iter()
+                .map(|k| {
+                    let v = obj.get(*k).unwrap_or(&serde_json::Value::Null);
+                    format!("\"{}\":{}", escape_json_string(k), stable_stringify(v))
+                })
+                .collect();
+            format!("{{{}}}", entries.join(","))
+        }
+    }
+}
+
+fn escape_json_string(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+fn sort_keys<'a>(keys: &[&'a String]) -> Vec<&'a String> {
+    let mut sorted = keys.to_vec();
+    sorted.sort();
+    sorted
+}
+
+/// Simple hash function for loop detection (fast, in-memory).
+fn simple_hash(s: &str) -> u64 {
+    // FNV-1a hash with wrapping multiplication to avoid overflow
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in s.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 /// Result of a loop detection check.
@@ -67,13 +128,23 @@ impl LoopCheckResult {
     }
 }
 
+/// A record of a tool call in history.
+#[derive(Debug, Clone)]
+pub struct ToolCallRecord {
+    pub tool_name: String,
+    pub args_hash: String,
+    /// Hash of the result (for no-progress detection).
+    pub result_hash: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct LoopDetector {
     window: usize,
     warning_threshold: usize,
     critical_threshold: usize,
     overrides: HashMap<String, (usize, usize)>, // (warning, critical) per-tool
-    history: VecDeque<String>,
+    /// History of tool call records with args_hash and result_hash.
+    history: VecDeque<ToolCallRecord>,
 }
 
 impl LoopDetector {
@@ -135,34 +206,41 @@ impl LoopDetector {
             .unwrap_or((self.warning_threshold, self.critical_threshold))
     }
 
-    /// Record a tool call and check for loops.
+    /// Record a tool call with full params hash (OpenClaw-compatible).
     ///
     /// Returns `LoopCheckResult`:
     /// - `Ok` → proceed normally
     /// - `Warning` → model is notified, execution continues (generic repeat)
     /// - `Critical` → execution blocked (excessive repeats or circuit breaker)
-    pub fn check(&mut self, tool_name: &str) -> LoopCheckResult {
-        self.history.push_back(tool_name.to_owned());
+    pub fn check_with_params(&mut self, tool_name: &str, params: &serde_json::Value) -> LoopCheckResult {
+        let args_hash = hash_tool_call(tool_name, params);
+
+        // Add to history (result_hash will be set later via record_result)
+        self.history.push_back(ToolCallRecord {
+            tool_name: tool_name.to_owned(),
+            args_hash: args_hash.clone(),
+            result_hash: None,
+        });
         if self.history.len() > self.window {
             self.history.pop_front();
         }
 
+        // Count repeats by args_hash (not just tool_name)
         let count = self
             .history
             .iter()
-            .filter(|n| n.as_str() == tool_name)
+            .filter(|r| r.args_hash == args_hash)
             .count();
 
         let (warning_threshold, critical_threshold) = self.thresholds_for(tool_name);
 
-        // Critical threshold — blocks execution (matches OpenClaw globalCircuitBreaker
-        // pattern)
+        // Critical threshold — blocks execution
         if count >= critical_threshold {
             return LoopCheckResult::Critical {
                 tool_name: tool_name.to_owned(),
                 count,
                 message: format!(
-                    "CRITICAL: tool `{tool_name}` called {count} times in the last {} calls. \
+                    "CRITICAL: tool `{tool_name}` called {count} times in the last {} calls with identical arguments. \
                      Session execution blocked to prevent runaway loops.",
                     self.history.len(),
                 ),
@@ -170,7 +248,6 @@ impl LoopDetector {
         }
 
         // Warning threshold — model is notified but execution continues
-        // (matches OpenClaw genericRepeat warn-only behavior)
         if count >= warning_threshold {
             return LoopCheckResult::Warning {
                 tool_name: tool_name.to_owned(),
@@ -185,6 +262,23 @@ impl LoopDetector {
         }
 
         LoopCheckResult::Ok
+    }
+
+    /// Record a tool call and check for loops (legacy API - only uses tool_name).
+    ///
+    /// This is a backwards-compat wrapper that constructs an empty params value.
+    /// Prefer `check_with_params` for proper argument hashing.
+    pub fn check(&mut self, tool_name: &str) -> LoopCheckResult {
+        self.check_with_params(tool_name, &serde_json::Value::Object(serde_json::Map::new()))
+    }
+
+    /// Record the result hash for the most recent tool call.
+    /// Used for no-progress detection (same call, same result = stuck).
+    pub fn record_result(&mut self, result: &serde_json::Value) {
+        if let Some(last) = self.history.back_mut() {
+            let result_str = stable_stringify(result);
+            last.result_hash = Some(format!("{}", simple_hash(&result_str)));
+        }
     }
 
     /// Reset the history (e.g. after a tool successfully produces new output).
@@ -326,5 +420,54 @@ mod tests {
         } else {
             panic!("expected Warning, got {:?}", result);
         }
+    }
+
+    #[test]
+    fn different_params_count_as_different_calls() {
+        let mut d = LoopDetector::with_dual_thresholds(10, 3, 5);
+        let params_a = serde_json::json!({"command": "ls"});
+        let params_b = serde_json::json!({"command": "pwd"});
+
+        // These should be counted separately since params differ
+        assert!(is_ok(&d.check_with_params("exec", &params_a)));
+        assert!(is_ok(&d.check_with_params("exec", &params_b)));
+        assert!(is_ok(&d.check_with_params("exec", &params_a)));
+        // params_a appears 2 times, params_b appears 1 time - no warning
+        assert!(is_ok(&d.check_with_params("exec", &params_b)));
+    }
+
+    #[test]
+    fn same_params_trigger_warning() {
+        let mut d = LoopDetector::with_dual_thresholds(10, 3, 5);
+        let params = serde_json::json!({"command": "ls -la"});
+
+        assert!(is_ok(&d.check_with_params("exec", &params)));
+        assert!(is_ok(&d.check_with_params("exec", &params)));
+        assert!(is_ok(&d.check_with_params("exec", &params))); // 3rd
+        assert!(is_warning(&d.check_with_params("exec", &params))); // 4th = warning
+        assert!(is_critical(&d.check_with_params("exec", &params))); // 5th = critical
+    }
+
+    #[test]
+    fn hash_tool_call_includes_params() {
+        let params_a = serde_json::json!({"command": "ls"});
+        let params_b = serde_json::json!({"command": "pwd"});
+        let hash_a = hash_tool_call("exec", &params_a);
+        let hash_b = hash_tool_call("exec", &params_b);
+        // Different params should produce different hashes
+        assert_ne!(hash_a, hash_b);
+        // Same params should produce same hash
+        let hash_a2 = hash_tool_call("exec", &params_a);
+        assert_eq!(hash_a, hash_a2);
+    }
+
+    #[test]
+    fn stable_stringify_sorts_keys() {
+        let obj1 = serde_json::json!({"b": 2, "a": 1});
+        let obj2 = serde_json::json!({"a": 1, "b": 2});
+        // Different key order should produce same hash
+        let hash1 = simple_hash(&stable_stringify(&obj1));
+        let hash2 = simple_hash(&stable_stringify(&obj2));
+        assert_eq!(hash1, hash2);
     }
 }

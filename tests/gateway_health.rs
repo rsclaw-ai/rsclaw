@@ -38,6 +38,7 @@ fn minimal_config(port: u16) -> RuntimeConfig {
             port,
             mode: GatewayMode::Local,
             bind: BindMode::Loopback,
+            bind_address: None,
             reload: ReloadMode::Hybrid,
             auth_token: None,
             auth_token_configured: false,
@@ -103,8 +104,13 @@ async fn start_server(addr: SocketAddr) {
         ))),
         ws_conns: Arc::new(rsclaw::ws::ConnRegistry::new()),
         feishu: Arc::new(tokio::sync::OnceCell::new()),
+        wecom: Arc::new(tokio::sync::OnceCell::new()),
+        whatsapp: Arc::new(tokio::sync::OnceCell::new()),
+        line: Arc::new(tokio::sync::OnceCell::new()),
+        zalo: Arc::new(tokio::sync::OnceCell::new()),
         started_at: std::time::Instant::now(),
         dm_enforcers: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        custom_webhooks: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     };
 
     // Leak the tempdir so the store stays valid for the lifetime of the server.
@@ -185,8 +191,13 @@ async fn auth_token_gates_non_health_endpoints() {
         ))),
         ws_conns: Arc::new(rsclaw::ws::ConnRegistry::new()),
         feishu: Arc::new(tokio::sync::OnceCell::new()),
+        wecom: Arc::new(tokio::sync::OnceCell::new()),
+        whatsapp: Arc::new(tokio::sync::OnceCell::new()),
+        line: Arc::new(tokio::sync::OnceCell::new()),
+        zalo: Arc::new(tokio::sync::OnceCell::new()),
         started_at: std::time::Instant::now(),
         dm_enforcers: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        custom_webhooks: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     };
     std::mem::forget(data_dir);
     tokio::spawn(async move { serve(state, addr).await.expect("serve") });

@@ -177,6 +177,7 @@ impl AgentRegistry {
                 commands: None,
                 allowed_commands: None,
                 opencode: None,
+                claudecode: None,
                 agent_dir: None,
                 system: None,
             }]
@@ -362,6 +363,7 @@ mod tests {
                 port: 18888,
                 mode: GatewayMode::Local,
                 bind: BindMode::Loopback,
+                bind_address: None,
                 reload: ReloadMode::Hybrid,
                 auth_token: None,
                 allow_tailscale: false,
@@ -421,6 +423,7 @@ mod tests {
             commands: None,
             allowed_commands: None,
             opencode: None,
+            claudecode: None,
             agent_dir: None,
             system: None,
         }
