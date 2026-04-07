@@ -12,19 +12,84 @@ import { useNavigate } from "react-router-dom";
 import { useEffect, useState, useCallback } from "react";
 import { Path } from "../constant";
 import { showConfirm, showToast } from "./ui-lib";
+import { gatewayFetch, wechatQrStart, wechatQrStatus } from "../lib/rsclaw-api";
 
-const GATEWAY_BASE = "http://localhost:18888/api/v1";
+// ── Channel type definitions (aligned with onboarding.tsx ALL_CHANNELS) ──
 
-const CHANNEL_TYPES = [
-  { id: "feishu", name: "Feishu (Lark)" },
-  { id: "wechat", name: "WeChat" },
-  { id: "wecom", name: "WeCom" },
-  { id: "dingtalk", name: "DingTalk" },
-  { id: "telegram", name: "Telegram" },
-  { id: "slack", name: "Slack" },
-  { id: "cli", name: "CLI" },
-  { id: "http", name: "HTTP API" },
+interface CredField {
+  key: string;
+  label: string;
+  type: "text" | "password";
+  placeholder: string;
+}
+
+interface ChannelTypeDef {
+  id: string;
+  icon: string;
+  name: string;
+  hasQr: boolean;
+  credFields: CredField[];
+}
+
+const CHANNEL_TYPES: ChannelTypeDef[] = [
+  { id: "feishu", icon: "\u98DE", name: "Feishu / Lark", hasQr: true, credFields: [
+    { key: "appId", label: "App ID", type: "text", placeholder: "cli_xxx" },
+    { key: "appSecret", label: "App Secret", type: "password", placeholder: "" },
+  ] },
+  { id: "wechat", icon: "\u5FAE", name: "WeChat", hasQr: true, credFields: [] },
+  { id: "wecom", icon: "WC", name: "WeCom", hasQr: false, credFields: [
+    { key: "botId", label: "Bot ID", type: "text", placeholder: "" },
+    { key: "secret", label: "Secret", type: "password", placeholder: "" },
+  ] },
+  { id: "qq", icon: "QQ", name: "QQ Bot", hasQr: false, credFields: [
+    { key: "appId", label: "App ID", type: "text", placeholder: "" },
+    { key: "appSecret", label: "App Secret", type: "password", placeholder: "" },
+  ] },
+  { id: "dingtalk", icon: "DT", name: "DingTalk", hasQr: false, credFields: [
+    { key: "appKey", label: "App Key", type: "text", placeholder: "" },
+    { key: "appSecret", label: "App Secret", type: "password", placeholder: "" },
+  ] },
+  { id: "telegram", icon: "Tg", name: "Telegram", hasQr: false, credFields: [
+    { key: "botToken", label: "Bot Token", type: "password", placeholder: "123456:ABC-DEF..." },
+  ] },
+  { id: "discord", icon: "Dc", name: "Discord", hasQr: false, credFields: [
+    { key: "token", label: "Bot Token", type: "password", placeholder: "" },
+  ] },
+  { id: "slack", icon: "Sl", name: "Slack", hasQr: false, credFields: [
+    { key: "botToken", label: "Bot Token", type: "password", placeholder: "xoxb-..." },
+    { key: "appToken", label: "App Token", type: "password", placeholder: "xapp-..." },
+  ] },
+  { id: "whatsapp", icon: "WA", name: "WhatsApp", hasQr: false, credFields: [
+    { key: "phoneNumberId", label: "Phone Number ID", type: "text", placeholder: "" },
+    { key: "accessToken", label: "Access Token", type: "password", placeholder: "" },
+  ] },
+  { id: "signal", icon: "Sg", name: "Signal", hasQr: false, credFields: [
+    { key: "phone", label: "Phone Number", type: "text", placeholder: "+1234567890" },
+  ] },
+  { id: "line", icon: "Li", name: "LINE", hasQr: false, credFields: [
+    { key: "channelSecret", label: "Channel Secret", type: "password", placeholder: "" },
+    { key: "channelAccessToken", label: "Access Token", type: "password", placeholder: "" },
+  ] },
+  { id: "zalo", icon: "Za", name: "Zalo", hasQr: false, credFields: [
+    { key: "accessToken", label: "Access Token", type: "password", placeholder: "" },
+    { key: "oaSecret", label: "OA Secret", type: "password", placeholder: "" },
+  ] },
+  { id: "matrix", icon: "Mx", name: "Matrix", hasQr: false, credFields: [
+    { key: "homeserver", label: "Homeserver", type: "text", placeholder: "https://matrix.org" },
+    { key: "userId", label: "User ID", type: "text", placeholder: "@bot:matrix.org" },
+    { key: "accessToken", label: "Access Token", type: "password", placeholder: "" },
+  ] },
+  { id: "custom", icon: "\u2699", name: "Custom", hasQr: false, credFields: [
+    { key: "webhookUrl", label: "Webhook URL", type: "text", placeholder: "https://..." },
+    { key: "wsUrl", label: "WebSocket URL", type: "text", placeholder: "wss://..." },
+  ] },
 ];
+
+const CHANNEL_TYPE_MAP: Record<string, ChannelTypeDef> = Object.fromEntries(
+  CHANNEL_TYPES.map((ct) => [ct.id, ct]),
+);
+
+// ── Types ──
 
 interface Channel {
   id: string;
@@ -35,23 +100,7 @@ interface Channel {
   config?: Record<string, string>;
 }
 
-interface ChannelFormData {
-  id: string;
-  type: string;
-  name: string;
-  webhook_url: string;
-  app_id: string;
-  app_secret: string;
-}
-
-const EMPTY_FORM: ChannelFormData = {
-  id: "",
-  type: "feishu",
-  name: "",
-  webhook_url: "",
-  app_id: "",
-  app_secret: "",
-};
+// ── Component ──
 
 export function ChannelConfigPage() {
   const navigate = useNavigate();
@@ -59,13 +108,15 @@ export function ChannelConfigPage() {
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [form, setForm] = useState<ChannelFormData>(EMPTY_FORM);
+  const [formType, setFormType] = useState("feishu");
+  const [formName, setFormName] = useState("");
+  const [formCreds, setFormCreds] = useState<Record<string, string>>({});
+  const [qrUrl, setQrUrl] = useState<string | null>(null);
+  const [qrPolling, setQrPolling] = useState(false);
 
   const fetchChannels = useCallback(async () => {
     try {
-      const res = await fetch(`${GATEWAY_BASE}/channels`, {
-        signal: AbortSignal.timeout(3000),
-      });
+      const res = await gatewayFetch("/api/v1/channels");
       if (!res.ok) throw new Error("Failed to fetch channels");
       const data = await res.json();
       setChannels(data.channels || []);
@@ -80,33 +131,36 @@ export function ChannelConfigPage() {
     fetchChannels();
   }, [fetchChannels]);
 
-  const updateForm = (partial: Partial<ChannelFormData>) => {
-    setForm((prev) => ({ ...prev, ...partial }));
+  const typeDef = CHANNEL_TYPE_MAP[formType] || CHANNEL_TYPES[0];
+
+  const resetForm = () => {
+    setFormName("");
+    setFormType("feishu");
+    setFormCreds({});
+    setQrUrl(null);
+    setQrPolling(false);
   };
 
   const handleAdd = () => {
     setEditingId(null);
-    setForm(EMPTY_FORM);
+    resetForm();
     setShowForm(true);
   };
 
   const handleEdit = (channel: Channel) => {
     setEditingId(channel.id);
-    setForm({
-      id: channel.id,
-      type: channel.type,
-      name: channel.name,
-      webhook_url: channel.config?.webhook_url || "",
-      app_id: channel.config?.app_id || "",
-      app_secret: channel.config?.app_secret || "",
-    });
+    setFormName(channel.name);
+    setFormType(channel.type);
+    setFormCreds(channel.config || {});
+    setQrUrl(null);
+    setQrPolling(false);
     setShowForm(true);
   };
 
   const handleDelete = async (id: string) => {
     if (await showConfirm(`Delete channel "${id}"?`)) {
       try {
-        const res = await fetch(`${GATEWAY_BASE}/channels/${id}`, {
+        const res = await gatewayFetch(`/api/v1/channels/${id}`, {
           method: "DELETE",
         });
         if (!res.ok) throw new Error("Failed to delete channel");
@@ -120,9 +174,8 @@ export function ChannelConfigPage() {
 
   const handleToggle = async (channel: Channel) => {
     try {
-      const res = await fetch(`${GATEWAY_BASE}/channels/${channel.id}`, {
+      const res = await gatewayFetch(`/api/v1/channels/${channel.id}`, {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled: !channel.enabled }),
       });
       if (!res.ok) throw new Error("Failed to toggle channel");
@@ -133,30 +186,25 @@ export function ChannelConfigPage() {
   };
 
   const handleSave = async () => {
-    if (!form.name || !form.type) {
+    if (!formName || !formType) {
       showToast("Name and Type are required");
       return;
     }
 
     const payload = {
-      id: form.id || form.name.toLowerCase().replace(/\s+/g, "-"),
-      type: form.type,
-      name: form.name,
-      config: {
-        webhook_url: form.webhook_url,
-        app_id: form.app_id,
-        app_secret: form.app_secret,
-      },
+      id: editingId || formName.toLowerCase().replace(/\s+/g, "-"),
+      type: formType,
+      name: formName,
+      config: { ...formCreds },
     };
 
     try {
       const method = editingId ? "PUT" : "POST";
       const url = editingId
-        ? `${GATEWAY_BASE}/channels/${editingId}`
-        : `${GATEWAY_BASE}/channels`;
-      const res = await fetch(url, {
+        ? `/api/v1/channels/${editingId}`
+        : "/api/v1/channels";
+      const res = await gatewayFetch(url, {
         method,
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error("Failed to save channel");
@@ -168,11 +216,52 @@ export function ChannelConfigPage() {
     }
   };
 
-  const handleQrScan = (channelType: string) => {
-    showToast(`QR scan for ${channelType} - requires Tauri desktop app`);
+  // ── QR Login (WeChat / Feishu) ──
+
+  const handleQrLogin = async () => {
+    if (formType === "wechat") {
+      try {
+        const data = await wechatQrStart();
+        if (data.qrcode_img_content) {
+          setQrUrl(data.qrcode_img_content);
+          pollWechatQr(data.qrcode);
+        } else {
+          showToast("Failed to get QR code");
+        }
+      } catch {
+        showToast("QR login requires the gateway to be running");
+      }
+    } else if (formType === "feishu") {
+      showToast("Feishu QR login: use `rsclaw channels login feishu` in terminal");
+    }
   };
 
-  const needsQrScan = form.type === "feishu" || form.type === "wechat";
+  const pollWechatQr = async (token: string) => {
+    setQrPolling(true);
+    for (let i = 0; i < 60; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      try {
+        const data = await wechatQrStatus(token);
+        if (data.status === "confirmed") {
+          showToast("WeChat login successful!");
+          setQrUrl(null);
+          setQrPolling(false);
+          fetchChannels();
+          setShowForm(false);
+          return;
+        }
+        if (data.status === "expired") {
+          showToast("QR code expired, please try again");
+          break;
+        }
+      } catch {
+        break;
+      }
+    }
+    setQrPolling(false);
+  };
+
+  // ── Render ──
 
   return (
     <ErrorBoundary>
@@ -222,66 +311,72 @@ export function ChannelConfigPage() {
                 {editingId ? `Edit Channel: ${editingId}` : "New Channel"}
               </div>
               <div className={styles["form-group"]}>
-                <div className={styles["form-label"]}>Channel Name</div>
-                <input
-                  type="text"
-                  placeholder="e.g., My Feishu Bot"
-                  value={form.name}
-                  onChange={(e) => updateForm({ name: e.target.value })}
-                />
-              </div>
-              <div className={styles["form-group"]}>
                 <div className={styles["form-label"]}>Channel Type</div>
                 <select
-                  value={form.type}
-                  onChange={(e) => updateForm({ type: e.target.value })}
+                  value={formType}
+                  onChange={(e) => {
+                    setFormType(e.target.value);
+                    setFormCreds({});
+                    setQrUrl(null);
+                  }}
                 >
                   {CHANNEL_TYPES.map((ct) => (
                     <option key={ct.id} value={ct.id}>
-                      {ct.name}
+                      {ct.icon} {ct.name}
                     </option>
                   ))}
                 </select>
               </div>
               <div className={styles["form-group"]}>
-                <div className={styles["form-label"]}>App ID</div>
+                <div className={styles["form-label"]}>Channel Name</div>
                 <input
                   type="text"
-                  placeholder="Application ID"
-                  value={form.app_id}
-                  onChange={(e) => updateForm({ app_id: e.target.value })}
+                  placeholder={`e.g., My ${typeDef.name} Bot`}
+                  value={formName}
+                  onChange={(e) => setFormName(e.target.value)}
                 />
               </div>
-              <div className={styles["form-group"]}>
-                <div className={styles["form-label"]}>App Secret</div>
-                <input
-                  type="password"
-                  placeholder="Application secret"
-                  value={form.app_secret}
-                  onChange={(e) => updateForm({ app_secret: e.target.value })}
-                />
-              </div>
-              <div className={styles["form-group"]}>
-                <div className={styles["form-label"]}>Webhook URL</div>
-                <input
-                  type="text"
-                  placeholder="https://..."
-                  value={form.webhook_url}
-                  onChange={(e) => updateForm({ webhook_url: e.target.value })}
-                />
-              </div>
-              {needsQrScan && (
+
+              {/* Dynamic credential fields based on channel type */}
+              {typeDef.credFields.map((field) => (
+                <div className={styles["form-group"]} key={field.key}>
+                  <div className={styles["form-label"]}>{field.label}</div>
+                  <input
+                    type={field.type}
+                    placeholder={field.placeholder}
+                    value={formCreds[field.key] || ""}
+                    onChange={(e) =>
+                      setFormCreds((prev) => ({
+                        ...prev,
+                        [field.key]: e.target.value,
+                      }))
+                    }
+                  />
+                </div>
+              ))}
+
+              {/* QR login section for supported channels */}
+              {typeDef.hasQr && (
                 <div className={styles["qr-section"]}>
-                  <div className={styles["qr-placeholder"]}>
-                    QR Code will appear here
-                  </div>
+                  {qrUrl ? (
+                    <img
+                      src={qrUrl}
+                      alt="QR Code"
+                      style={{ width: 200, height: 200, borderRadius: 8 }}
+                    />
+                  ) : (
+                    <div className={styles["qr-placeholder"]}>
+                      QR Code will appear here
+                    </div>
+                  )}
                   <IconButton
-                    text="Scan QR Code"
+                    text={qrPolling ? "Waiting for scan..." : "Scan QR Code"}
                     bordered
-                    onClick={() => handleQrScan(form.type)}
+                    onClick={handleQrLogin}
                   />
                 </div>
               )}
+
               <div className={styles["form-actions"]}>
                 <IconButton
                   icon={<CloseIcon />}
@@ -301,66 +396,76 @@ export function ChannelConfigPage() {
 
           {channels.length > 0 ? (
             <div className={styles["channel-list"]}>
-              {channels.map((channel) => (
-                <div
-                  key={channel.id}
-                  className={`${styles["channel-card"]} ${
-                    !channel.enabled ? styles.disabled : ""
-                  }`}
-                >
-                  <div className={styles["channel-card-header"]}>
-                    <div className={styles["channel-card-title"]}>
-                      <span className={styles["channel-name"]}>
-                        {channel.name}
-                      </span>
-                      <span className={styles["channel-type"]}>
-                        {channel.type}
-                      </span>
-                      <span
-                        className={`${styles["channel-status"]} ${
-                          styles[channel.status] || styles.disconnected
-                        }`}
-                      >
-                        {channel.status}
-                      </span>
-                    </div>
-                    <div className={styles["channel-card-actions"]}>
-                      <div
-                        className={`${styles["toggle-switch"]} ${
-                          channel.enabled ? styles.enabled : ""
-                        }`}
-                        onClick={() => handleToggle(channel)}
-                      >
-                        <div className={styles["toggle-knob"]} />
+              {channels.map((channel) => {
+                const ct = CHANNEL_TYPE_MAP[channel.type];
+                return (
+                  <div
+                    key={channel.id}
+                    className={`${styles["channel-card"]} ${
+                      !channel.enabled ? styles.disabled : ""
+                    }`}
+                  >
+                    <div className={styles["channel-card-header"]}>
+                      <div className={styles["channel-card-title"]}>
+                        <span className={styles["channel-icon"]}>
+                          {ct?.icon || "\u2699"}
+                        </span>
+                        <span className={styles["channel-name"]}>
+                          {channel.name}
+                        </span>
+                        <span className={styles["channel-type"]}>
+                          {ct?.name || channel.type}
+                        </span>
+                        <span
+                          className={`${styles["channel-status"]} ${
+                            styles[channel.status] || styles.disconnected
+                          }`}
+                        >
+                          {channel.status}
+                        </span>
                       </div>
-                      <IconButton
-                        icon={<EditIcon />}
-                        bordered
-                        onClick={() => handleEdit(channel)}
-                      />
-                      <IconButton
-                        icon={<DeleteIcon />}
-                        bordered
-                        onClick={() => handleDelete(channel.id)}
-                      />
-                    </div>
-                  </div>
-                  {channel.config && (
-                    <div className={styles["channel-card-details"]}>
-                      {channel.config.app_id && (
-                        <div className={styles["detail-item"]}>
-                          <span className={styles["detail-label"]}>
-                            App ID:
-                          </span>
-                          <span className={styles["detail-value"]}>
-                            {channel.config.app_id}
-                          </span>
+                      <div className={styles["channel-card-actions"]}>
+                        <div
+                          className={`${styles["toggle-switch"]} ${
+                            channel.enabled ? styles.enabled : ""
+                          }`}
+                          onClick={() => handleToggle(channel)}
+                        >
+                          <div className={styles["toggle-knob"]} />
                         </div>
-                      )}
+                        <IconButton
+                          icon={<EditIcon />}
+                          bordered
+                          onClick={() => handleEdit(channel)}
+                        />
+                        <IconButton
+                          icon={<DeleteIcon />}
+                          bordered
+                          onClick={() => handleDelete(channel.id)}
+                        />
+                      </div>
                     </div>
-                  )}
-                </div>
-              ))}
+                    {channel.config && (
+                      <div className={styles["channel-card-details"]}>
+                        {ct?.credFields
+                          .filter((f) => channel.config?.[f.key])
+                          .map((f) => (
+                            <div className={styles["detail-item"]} key={f.key}>
+                              <span className={styles["detail-label"]}>
+                                {f.label}:
+                              </span>
+                              <span className={styles["detail-value"]}>
+                                {f.type === "password"
+                                  ? "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"
+                                  : channel.config?.[f.key]}
+                              </span>
+                            </div>
+                          ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           ) : (
             !loading && (
