@@ -1201,25 +1201,45 @@ impl Channel for FeishuChannel {
             // Send image attachments: upload to Feishu, then send image message.
             for image_data in &msg.images {
                 use base64::Engine;
-                let (mime, b64) =
+                let (mime, bytes) =
                     if let Some(rest) = image_data.strip_prefix("data:image/png;base64,") {
-                        ("image/png", rest)
+                        match base64::engine::general_purpose::STANDARD.decode(rest) {
+                            Ok(b) if !b.is_empty() => ("image/png", b),
+                            _ => { warn!("feishu: failed to decode base64 image"); continue; }
+                        }
                     } else if let Some(rest) = image_data.strip_prefix("data:image/jpeg;base64,") {
-                        ("image/jpeg", rest)
+                        match base64::engine::general_purpose::STANDARD.decode(rest) {
+                            Ok(b) if !b.is_empty() => ("image/jpeg", b),
+                            _ => { warn!("feishu: failed to decode base64 image"); continue; }
+                        }
                     } else if let Some(rest) = image_data.strip_prefix("data:image/webp;base64,") {
-                        ("image/webp", rest)
+                        match base64::engine::general_purpose::STANDARD.decode(rest) {
+                            Ok(b) if !b.is_empty() => ("image/webp", b),
+                            _ => { warn!("feishu: failed to decode base64 image"); continue; }
+                        }
+                    } else if image_data.starts_with("http://") || image_data.starts_with("https://") {
+                        // URL image — download first
+                        match self.client.get(image_data.as_str()).send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                let ct = resp.headers().get("content-type")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("image/png")
+                                    .to_owned();
+                                let mime = if ct.contains("jpeg") || ct.contains("jpg") { "image/jpeg" }
+                                    else if ct.contains("webp") { "image/webp" }
+                                    else { "image/png" };
+                                match resp.bytes().await {
+                                    Ok(b) if !b.is_empty() => (mime, b.to_vec()),
+                                    _ => { warn!("feishu: empty image download"); continue; }
+                                }
+                            }
+                            Ok(resp) => { warn!(status = %resp.status(), "feishu: image download failed"); continue; }
+                            Err(e) => { warn!(error = %e, "feishu: image download error"); continue; }
+                        }
                     } else {
-                        warn!("feishu: unrecognised image data URI prefix, skipping");
+                        warn!("feishu: unrecognised image data, skipping");
                         continue;
                     };
-
-                let bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
-                    Ok(b) if !b.is_empty() => b,
-                    _ => {
-                        warn!("feishu: failed to decode base64 image, skipping");
-                        continue;
-                    }
-                };
 
                 let filename = if mime == "image/jpeg" {
                     "image.jpg"

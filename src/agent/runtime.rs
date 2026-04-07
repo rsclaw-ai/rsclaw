@@ -4490,7 +4490,7 @@ $bitmap.Dispose()
                 "prompt": prompt,
                 "size": size,
                 "n": 1,
-                "response_format": "url"
+                "response_format": "b64_json"
             }))
             .send()
             .await
@@ -4507,14 +4507,35 @@ $bitmap.Dispose()
             return Err(anyhow!("image: API error: {err_msg}"));
         }
 
-        let url = body["data"][0]["url"].as_str().unwrap_or("").to_owned();
+        // Prefer b64_json (inline base64), fallback to url
+        let image_result = if let Some(b64) = body["data"][0]["b64_json"].as_str() {
+            format!("data:image/png;base64,{b64}")
+        } else if let Some(url) = body["data"][0]["url"].as_str() {
+            // Download the image to get bytes, convert to data URI
+            match reqwest::Client::new().get(url).send().await {
+                Ok(r) if r.status().is_success() => {
+                    use base64::Engine;
+                    match r.bytes().await {
+                        Ok(bytes) => {
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            format!("data:image/png;base64,{b64}")
+                        }
+                        _ => url.to_owned(),
+                    }
+                }
+                _ => url.to_owned(),
+            }
+        } else {
+            String::new()
+        };
+
         let revised = body["data"][0]["revised_prompt"]
             .as_str()
             .unwrap_or("")
             .to_owned();
 
         Ok(json!({
-            "url": url,
+            "url": image_result,
             "revised_prompt": revised,
             "size": size,
             "model": image_model
