@@ -16,7 +16,7 @@ dist/
 # Node / UI
 node_modules/
 .next/
-ui/out/
+/ui/out/
 
 # Runtime
 rsclaw.json5
@@ -30,6 +30,7 @@ workspace/
 
 # Claude
 /CLAUDE.md
+/.claude/settings.local.json
 
 # Sub-agent worktrees
 .worktrees/

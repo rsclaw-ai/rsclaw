@@ -12,7 +12,7 @@ use super::{
     TokenUsage,
 };
 
-pub const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
+pub const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com/v1";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 
@@ -63,7 +63,7 @@ impl LlmProvider for AnthropicProvider {
 
             let resp = self
                 .client
-                .post(format!("{}/v1/messages", self.base_url))
+                .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", ANTHROPIC_VERSION)
                 .header("content-type", "application/json")

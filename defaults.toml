@@ -76,7 +76,7 @@ name       = "anthropic"
 label      = "Anthropic (Claude)"
 env_var    = "ANTHROPIC_API_KEY"
 model      = "anthropic/claude-sonnet-4-6"
-base_url   = "https://api.anthropic.com"
+base_url   = "https://api.anthropic.com/v1"
 needs_key  = true
 
 [[providers]]

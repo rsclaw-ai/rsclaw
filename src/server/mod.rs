@@ -1461,11 +1461,7 @@ fn build_provider_models_request(
         prov_defaults::models_url("ollama", &base_url)
     } else if is_gemini {
         let trimmed = base_url.trim_end_matches('/');
-        if prov_defaults::has_version_suffix(trimmed) {
-            format!("{trimmed}/models?key={}", req.api_key)
-        } else {
-            format!("{trimmed}/v1beta/models?key={}", req.api_key)
-        }
+        format!("{trimmed}/models?key={}", req.api_key)
     } else {
         prov_defaults::models_url(&req.provider, &base_url)
     };

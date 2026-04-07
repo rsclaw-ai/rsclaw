@@ -19,7 +19,7 @@ use std::{collections::HashMap, sync::OnceLock};
 /// `auth_style`: `"bearer"`, `"x-api-key"`, or `"none"`.
 fn builtin_base_url(provider: &str) -> (&'static str, &'static str) {
     match provider {
-        "anthropic"          => ("https://api.anthropic.com",                         "x-api-key"),
+        "anthropic"          => ("https://api.anthropic.com/v1",                       "x-api-key"),
         "openai"             => ("https://api.openai.com/v1",                         "bearer"),
         "deepseek"           => ("https://api.deepseek.com/v1",                       "bearer"),
         "qwen"               => ("https://dashscope.aliyuncs.com/compatible-mode/v1", "bearer"),
@@ -116,18 +116,16 @@ pub fn has_version_suffix(url: &str) -> bool {
         .is_some_and(|seg| seg.starts_with('v') && seg.len() >= 2 && seg[1..2].chars().all(|c| c.is_ascii_digit()))
 }
 
-/// Build the models-list URL for a provider, avoiding double version paths.
+/// Build the models-list URL for a provider.
 ///
 /// - Ollama: `{base}/api/tags`
-/// - Others: `{base}/models` if base already has version, else `{base}/v1/models`
+/// - Others: `{base}/models` (base_url must already include version path)
 pub fn models_url(provider: &str, base_url: &str) -> String {
     let trimmed = base_url.trim_end_matches('/');
     if provider == "ollama" {
         format!("{trimmed}/api/tags")
-    } else if has_version_suffix(trimmed) {
-        format!("{trimmed}/models")
     } else {
-        format!("{trimmed}/v1/models")
+        format!("{trimmed}/models")
     }
 }
 
@@ -142,7 +140,7 @@ mod tests {
     #[test]
     fn builtin_known_providers() {
         let (url, auth) = builtin_base_url("anthropic");
-        assert_eq!(url, "https://api.anthropic.com");
+        assert_eq!(url, "https://api.anthropic.com/v1");
         assert_eq!(auth, "x-api-key");
 
         let (url, _) = builtin_base_url("openai");
@@ -175,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn models_url_no_double_version() {
+    fn models_url_appends_directly() {
         assert_eq!(
             models_url("openai", "https://api.openai.com/v1"),
             "https://api.openai.com/v1/models"
@@ -185,8 +183,8 @@ mod tests {
             "https://open.bigmodel.cn/api/paas/v4/models"
         );
         assert_eq!(
-            models_url("anthropic", "https://api.anthropic.com"),
-            "https://api.anthropic.com/v1/models"
+            models_url("doubao", "https://ark.cn-beijing.volces.com/api/v3"),
+            "https://ark.cn-beijing.volces.com/api/v3/models"
         );
         assert_eq!(
             models_url("custom", "http://macstudio.local/v1"),
@@ -194,7 +192,7 @@ mod tests {
         );
         assert_eq!(
             models_url("custom", "http://macstudio.local"),
-            "http://macstudio.local/v1/models"
+            "http://macstudio.local/models"
         );
         assert_eq!(
             models_url("ollama", "http://localhost:11434"),

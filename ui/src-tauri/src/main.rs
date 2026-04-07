@@ -641,7 +641,7 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
 
     // Resolve base URL: explicit base_url param > provider default
     let default_base = match provider.as_str() {
-        "anthropic"   => "https://api.anthropic.com",
+        "anthropic"   => "https://api.anthropic.com/v1",
         "openai"      => "https://api.openai.com/v1",
         "deepseek"    => "https://api.deepseek.com/v1",
         "qwen"        => "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -664,10 +664,6 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
         .unwrap_or_else(|| default_base.to_owned());
     let effective_base = effective_base.trim_end_matches('/');
 
-    // Check if base URL already has a version suffix (e.g. /v1, /v3, /v4, /v1beta)
-    let has_version = effective_base.rsplit('/').next()
-        .is_some_and(|seg| seg.starts_with('v') && seg.len() >= 2 && seg.as_bytes()[1].is_ascii_digit());
-
     // Determine auth style based on provider or api_type
     let auth_style = match effective_api_type {
         "anthropic" => "x-api-key",
@@ -676,22 +672,15 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
         _ => if api_key.is_empty() { "none" } else { "bearer" },
     };
 
-    // Build models list URL
+    // Build models list URL — base_url must already include version path
     let is_ollama = effective_api_type == "ollama";
     let is_gemini = effective_api_type == "gemini" || provider == "gemini";
     let url = if is_ollama {
         format!("{effective_base}/api/tags")
     } else if is_gemini {
-        // Gemini uses query param auth and already has /v1beta
-        if has_version {
-            format!("{effective_base}/models?key={api_key}")
-        } else {
-            format!("{effective_base}/v1beta/models?key={api_key}")
-        }
-    } else if has_version {
-        format!("{effective_base}/models")
+        format!("{effective_base}/models?key={api_key}")
     } else {
-        format!("{effective_base}/v1/models")
+        format!("{effective_base}/models")
     };
 
     let client = reqwest::Client::builder()

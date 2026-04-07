@@ -14,7 +14,7 @@ use super::{
     TokenUsage,
 };
 
-pub(crate) const OPENAI_API_BASE: &str = "https://api.openai.com";
+pub(crate) const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
 const DEFAULT_MAX_TOKENS: u32 = 65536;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -154,14 +154,7 @@ impl LlmProvider for OpenAiProvider {
                 &body_str,
             );
 
-            let url = if self.base_url.ends_with("/v1") || self.base_url.contains("/v1/") {
-                format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
-            } else {
-                format!(
-                    "{}/v1/chat/completions",
-                    self.base_url.trim_end_matches('/')
-                )
-            };
+            let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
             let mut builder = self
                 .client
                 .post(url)
@@ -449,14 +442,7 @@ impl OpenAiProvider {
             &body_str,
         );
 
-        let url = if self.base_url.ends_with("/v1") || self.base_url.contains("/v1/") {
-            format!("{}/responses", self.base_url.trim_end_matches('/'))
-        } else {
-            format!(
-                "{}/v1/responses",
-                self.base_url.trim_end_matches('/')
-            )
-        };
+        let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
 
         let mut builder = self
             .client
