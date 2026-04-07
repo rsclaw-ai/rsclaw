@@ -3746,6 +3746,40 @@ function TauriConfigPageInner() {
 
         {/* ══ MODELS TAB ══ */}
         {activeTab === "models" && (<div style={{ animation: "fi .15s ease" }}>
+          {/* Default model — most important, show first */}
+          {secHead(zh ? "\u9ED8\u8BA4\u667A\u80FD\u4F53\u6A21\u578B" : "DEFAULT AGENT MODEL")}
+          <div style={{ ...fcard, marginBottom: 20 }}>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u4E3B\u6A21\u578B" : "Primary Model"}</div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.primary</div>
+              </div>
+              <input style={{ ...fInput, minWidth: 300 }} value={getVal("agents.defaults.model.primary", "")} onChange={(e) => updateConfig("agents.defaults.model.primary", e.target.value)} />
+            </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5907\u7528\u6A21\u578B" : "Fallback Models"} <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u9017\u53F7\u5206\u9694)" : "(comma separated)"}</span></div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.fallbacks</div>
+              </div>
+              <input style={{ ...fInput, minWidth: 300 }} placeholder={zh ? "\u5982: qwen/qwen-plus, openai/gpt-4o" : "e.g. qwen/qwen-plus, openai/gpt-4o"} value={(getVal("agents.defaults.model.fallbacks", "") || []).join?.(", ") || getVal("agents.defaults.model.fallbacks", "")} onChange={(e) => {
+                const val = e.target.value;
+                const arr = val.split(",").map((s: string) => s.trim()).filter(Boolean);
+                updateConfig("agents.defaults.model.fallbacks", arr.length > 0 ? arr : undefined);
+              }} />
+            </div>
+            <div style={{ ...fieldRow, borderBottom: "none" }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5DE5\u5177\u96C6" : "Toolset"}</div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.toolset</div>
+              </div>
+              <select style={{ ...fSelect, minWidth: 240 }} value={getVal("agents.defaults.model.toolset", "full")} onChange={(e) => updateConfig("agents.defaults.model.toolset", e.target.value)}>
+                <option value="minimal">minimal {zh ? "\u2014 6 \u4E2A\u6838\u5FC3\u5DE5\u5177" : "-- 6 core tools"}</option>
+                <option value="standard">standard {zh ? "\u2014 12 \u4E2A\u5DE5\u5177" : "-- 12 tools"}</option>
+                <option value="full">full {zh ? "\u2014 \u5168\u90E8\u5DE5\u5177" : "-- all tools"}</option>
+              </select>
+            </div>
+          </div>
+
           {secHead(zh ? "LLM \u63D0\u4F9B\u5546" : "LLM PROVIDERS")}
           <div style={{ fontSize: 11, color: V.t3, marginBottom: 12 }}>{zh ? "\u9009\u4E2D\u63D0\u4F9B\u5546\u586B\u5165 Key\uFF0C\u6D4B\u8BD5\u8FDE\u63A5\u6210\u529F\u540E\u4ECE API \u83B7\u53D6\u53EF\u7528\u6A21\u578B\u5217\u8868\uFF0C\u9009\u62E9\u9ED8\u8BA4\u6A21\u578B\u3002" : "Enter API Key per provider, test connection, then select a default model."}</div>
 
@@ -3930,28 +3964,7 @@ function TauriConfigPageInner() {
             })}
           </div>
 
-          {/* Default model */}
-          {secHead(zh ? "\u9ED8\u8BA4\u667A\u80FD\u4F53\u6A21\u578B" : "DEFAULT AGENT MODEL")}
-          <div style={fcard}>
-            <div style={fieldRow}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u4E3B\u6A21\u578B" : "Primary Model"}</div>
-                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.primary</div>
-              </div>
-              <input style={{ ...fInput, minWidth: 300 }} value={getVal("agents.defaults.model.primary", "")} onChange={(e) => updateConfig("agents.defaults.model.primary", e.target.value)} />
-            </div>
-            <div style={{ ...fieldRow, borderBottom: "none" }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5DE5\u5177\u96C6" : "Toolset"}</div>
-                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.toolset</div>
-              </div>
-              <select style={{ ...fSelect, minWidth: 240 }} value={getVal("agents.defaults.model.toolset", "full")} onChange={(e) => updateConfig("agents.defaults.model.toolset", e.target.value)}>
-                <option value="minimal">minimal {zh ? "\u2014 6 \u4E2A\u6838\u5FC3\u5DE5\u5177" : "-- 6 core tools"}</option>
-                <option value="standard">standard {zh ? "\u2014 12 \u4E2A\u5DE5\u5177" : "-- 12 tools"}</option>
-                <option value="full">full {zh ? "\u2014 \u5168\u90E8\u5DE5\u5177" : "-- all tools"}</option>
-              </select>
-            </div>
-          </div>
+          {/* Default model moved to top of models tab */}
         </div>)}
 
         {/* ══ CHANNELS TAB (multi-account) ══ */}
