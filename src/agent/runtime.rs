@@ -53,6 +53,7 @@ use super::{
     loop_detection::LoopDetector,
     memory::{MemoryDoc, MemoryStore},
     registry::{AgentHandle, AgentMessage, AgentRegistry, AgentReply},
+    tool_call_repair::repair_tool_result_pairing,
     workspace::{
         DEFAULT_MAX_CHARS_PER_FILE, DEFAULT_TOTAL_MAX_CHARS, SessionType, WorkspaceContext,
     },
@@ -2005,7 +2006,12 @@ impl AgentRuntime {
                 "- Use 1. or - for lists.\n",
                 "- Use > for important quotes.\n",
                 "- Do NOT use Markdown tables (|---|). Use \"label: value\" format instead.\n",
-                "- Keep responses concise for chat readability.\n",
+                "\n[Data integrity rules - CRITICAL]\n",
+                "- NEVER truncate or shorten ANY text, strings, numbers, or identifiers.\n",
+                "- Copy ALL values EXACTLY: UUIDs, IDs, IP addresses, paths, URLs, code, data.\n",
+                "- UUIDs: 36 chars (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).\n",
+                "- IP addresses: complete (127.0.0.1 not 7.0.0.1).\n",
+                "- If you see truncated data in context, report it as incomplete.\n",
                 "\n[Tool usage rules]\n",
                 "- For ANY question about real-time data (prices, weather, news, dates, events), you MUST call web_search first. NEVER answer from memory.\n",
                 "- For shell commands, file operations, use exec/read/write tools.\n",
@@ -2375,7 +2381,27 @@ impl AgentRuntime {
                     }
                 }
                 // Strip image data URIs from older messages.
-                strip_old_images(raw)
+                let stripped = strip_old_images(raw);
+                // Repair transcript: ensure all tool_calls have matching tool_results.
+                // This fixes orphaned tool_calls from interrupted sessions.
+                let repair_result = repair_tool_result_pairing(stripped);
+
+                // Persist any synthetic tool results to session storage
+                // so they don't need to be added again on the next turn.
+                if !repair_result.synthetic_messages.is_empty() {
+                    for synthetic in &repair_result.synthetic_messages {
+                        let _ = self.store.db.append_message(
+                            &ctx.session_key,
+                            &serde_json::to_value(synthetic).unwrap_or_default(),
+                        );
+                    }
+                    // Also update in-memory session cache
+                    if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
+                        sess.extend(repair_result.synthetic_messages.clone());
+                    }
+                }
+
+                repair_result.messages
             };
 
             // Resolve thinking budget from agent config or defaults.
@@ -2487,6 +2513,8 @@ impl AgentRuntime {
             let mut stream = self.failover.call(req, &providers).await?;
             let mut text_buf = String::new();
             let mut tool_calls: Vec<(String, String, Value)> = Vec::new();
+            // Track loop detection warnings per tool call id (to inject into result)
+            let mut loop_warnings: std::collections::HashMap<String, String> = std::collections::HashMap::new();
             // Streaming throttle: batch small deltas to reduce channel update rate.
             let mut delta_buf = String::new();
             let mut last_delta_flush = std::time::Instant::now();
@@ -2536,6 +2564,8 @@ impl AgentRuntime {
                                 ctx.loop_detector.check_with_params(&name, &input).to_result()?
                             {
                                 tracing::warn!(tool = %name, params = ?input, "{}", warning_msg);
+                                // Store warning to inject into tool result (so LLM sees it)
+                                loop_warnings.insert(id.clone(), warning_msg);
                             }
                             tool_calls.push((id, name, input));
                         } else if !id.is_empty() && name.is_empty() {
@@ -2850,6 +2880,9 @@ impl AgentRuntime {
 
                 let (result_text, result_images) = match result {
                     Ok(v) => {
+                        // Record result for progress-aware loop detection.
+                        // Same args + different results = making progress, not a loop.
+                        ctx.loop_detector.record_result(&v);
                         // Extract images from tool result (e.g. computer_use screenshot)
                         // to avoid passing large base64 back to LLM.
                         if let Some(img) = v.get("image").and_then(|i| i.as_str()) {
@@ -2869,6 +2902,8 @@ impl AgentRuntime {
                     }
                     Err(e) => {
                         warn!(tool = %tool_name, "tool error: {e:#}");
+                        // Record error result for loop detection (errors count as results too).
+                        ctx.loop_detector.record_result(&serde_json::json!({"error": e.to_string()}));
                         (format!("{{\"error\":\"{}\"}}", e), vec![])
                     }
                 };
@@ -2902,6 +2937,13 @@ impl AgentRuntime {
                     )
                 } else {
                     result_text.clone()
+                };
+
+                // Inject loop detection warning if present (so LLM sees it and can stop)
+                let session_text = if let Some(warning) = loop_warnings.get(&tool_id) {
+                    format!("[LOOP WARNING] {}\n\n{}", warning, session_text)
+                } else {
+                    session_text
                 };
 
                 let tool_msg = Message {
@@ -3948,10 +3990,11 @@ impl AgentRuntime {
         }
 
         // Always run via shell to support pipes, redirects, &&, etc.
-        let (shell, shell_flag) = if cfg!(target_os = "windows") {
-            ("cmd", "/C")
+        let (shell, shell_args) = if cfg!(target_os = "windows") {
+            // PowerShell: better compatibility, supports pipes, redirects, && via -Command
+            ("powershell", vec!["-NoProfile", "-Command"])
         } else {
-            ("sh", "-c")
+            ("sh", vec!["-c"])
         };
 
         let workspace = self
@@ -4029,7 +4072,8 @@ impl AgentRuntime {
 
         tracing::info!(cwd = %workspace.display(), command = %command, "exec: executing");
         let output = tokio::process::Command::new(shell)
-            .args(&[shell_flag, command])
+            .args(&shell_args)
+            .arg(command)
             .current_dir(&workspace)
             .output()
             .await
@@ -4930,7 +4974,17 @@ $synth.Speak('{}')
         match action {
             "list" => {
                 let jobs = read_cron_jobs(&cron_path).await;
-                Ok(json!({"jobs": jobs}))
+                // Add 1-based index to each job for easier reference by LLMs
+                let jobs_with_index: Vec<Value> = jobs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, j)| {
+                        let mut indexed = j.clone();
+                        indexed["_index"] = json!(i + 1);
+                        indexed
+                    })
+                    .collect();
+                Ok(json!({"jobs": jobs_with_index, "hint": "Use index number (#1, #2, etc.) for removal to avoid ID truncation issues"}))
             }
             "add" => {
                 let schedule = args["schedule"]
@@ -4972,18 +5026,32 @@ $synth.Speak('{}')
                 Ok(json!({"added": id, "schedule": schedule, "message": message}))
             }
             "remove" => {
-                let id = args["id"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("cron remove: `id` required"))?;
-
                 let mut jobs = read_cron_jobs(&cron_path).await;
-                let before = jobs.len();
-                jobs.retain(|j| j["id"].as_str() != Some(id));
-                let removed = before - jobs.len();
 
-                write_cron_jobs(&cron_path, &jobs).await?;
+                // Support both `id` and `index` parameters (prefer index for reliability)
+                let removed_job = if let Some(index) = args["index"].as_u64() {
+                    // 1-based index
+                    let idx = index as usize;
+                    if idx == 0 || idx > jobs.len() {
+                        return Err(anyhow!("cron remove: invalid index {} (valid: 1-{})", index, jobs.len()));
+                    }
+                    let job = jobs.remove(idx - 1);
+                    write_cron_jobs(&cron_path, &jobs).await?;
+                    job
+                } else if let Some(id) = args["id"].as_str() {
+                    let before = jobs.len();
+                    jobs.retain(|j| j["id"].as_str() != Some(id));
+                    let removed = before - jobs.len();
+                    if removed == 0 {
+                        return Err(anyhow!("cron remove: job not found with id={}", id));
+                    }
+                    write_cron_jobs(&cron_path, &jobs).await?;
+                    json!({"id": id, "count": removed})
+                } else {
+                    return Err(anyhow!("cron remove: `index` or `id` required (index is preferred)"));
+                };
 
-                Ok(json!({"removed": removed, "id": id}))
+                Ok(json!({"removed": removed_job}))
             }
             other => Err(anyhow!(
                 "cron: unsupported action `{other}` (list, add, remove)"
@@ -6167,13 +6235,33 @@ fn build_system_prompt(
     }
     parts.push(date_line);
 
-    // Tool usage guidance — keep tool call arguments short
+    // Platform information so LLM generates correct shell commands.
+    let platform_info = if cfg!(target_os = "windows") {
+        "Platform: Windows. Shell: PowerShell. \
+         Use PowerShell commands: Get-ChildItem (or dir), Get-Content, Get-Date, Select-Object -Last N (tail). \
+         Pipes and filters work naturally: | Where-Object, | Select-Object, | Sort-Object. \
+         Paths: backslash or forward slash both work. \
+         Examples: Get-Date -Format 'yyyy-MM-dd'; Get-ChildItem | Select-Object -Last 5; Get-Content file.txt."
+    } else if cfg!(target_os = "macos") {
+        "Platform: macOS. Shell: bash/zsh. Standard Unix commands available (ls, cat, grep, tail, date)."
+    } else {
+        "Platform: Linux. Shell: bash/sh. Standard Unix commands available (ls, cat, grep, tail, date)."
+    };
+    parts.push(platform_info.to_string());
+
+    // Tool usage guidance
     parts.push(
         "## Tool Usage Guidelines\n\
-         When using tools, keep arguments concise:\n\
-         - write tool: content must be under 2000 characters per call. Split large files into multiple calls.\n\
-         - Prefer multiple short tool calls over one long call.\n\
-         - For code generation: write one module/function at a time, then iterate.".to_string(),
+         - For code generation: write complete files, one module at a time.\n\
+         - Use edit tool for small changes to existing files.\n\
+         \n\
+         ## Data Integrity (CRITICAL)\n\
+         - NEVER truncate, shorten, or modify any text, strings, identifiers, or values.\n\
+         - Copy ALL content EXACTLY as provided: UUIDs, IDs, API keys, tokens, paths, URLs, code, data.\n\
+         - UUIDs are always 36 characters: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\n\
+         - IP addresses must be complete: 127.0.0.1 not 7.0.0.1\n\
+         - File paths must be complete: /full/path/to/file.ext\n\
+         - If content looks incomplete, note it rather than guessing or modifying.".to_string(),
     );
 
     // Workspace files segment.
@@ -6339,34 +6427,27 @@ fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "write".to_owned(),
-        description: "Write content to a file in the agent workspace. Creates parent directories as needed.
-
-CRITICAL CONTENT LENGTH LIMIT: Each write call MUST keep content under 2500 characters. Calls exceeding this limit will be rejected. For large files, split into multiple calls of 1500-2000 characters each, or use exec with shell redirection.
-
-IMPORTANT: Both 'path' and 'content' parameters are REQUIRED.
-
-Parameters:
-- path: Relative file path within the workspace (e.g., 'output.py', 'src/main.rs')
-- content: The text content to write to the file
-
-Example - Good (under 2500 chars):
-  {\"path\": \"hello.py\", \"content\": \"print('Hello, World!')\"}
-
-Example - Large file (SPLIT INTO MULTIPLE CALLS):
-  Part 1: {\"path\": \"src/main.rs\", \"content\": \"// Part 1: imports + main fn...\"}
-  Part 2: {\"path\": \"src/lib.rs\", \"content\": \"// Part 2: helper functions...\"}".to_owned(),
+        description: "Write content to a file in the agent workspace. Creates parent directories as needed. \
+            Both 'path' and 'content' parameters are required. \
+            Path is relative to workspace root (e.g., 'output.py', 'src/main.rs').".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "path":    {"type": "string", "description": "Relative file path within the workspace (REQUIRED). Example: 'output.py'"},
-                "content": {"type": "string", "description": "File content to write (REQUIRED). STRICT LIMIT: Must be under 2500 characters or the call will fail. Split large files into multiple calls."}
+                "content": {"type": "string", "description": "File content to write (REQUIRED)."}
             },
             "required": ["path", "content"]
         }),
     });
     tools.push(ToolDef {
         name: "exec".to_owned(),
-        description: "Run a shell command. The user has pre-authorized all commands.".to_owned(),
+        description: if cfg!(target_os = "windows") {
+            "Run a shell command on Windows. Shell: PowerShell. Use PowerShell syntax: Get-ChildItem, Get-Content, Get-Date, Where-Object, Select-Object. Example: Get-Date; Get-ChildItem | Select-Object -Last 5".to_owned()
+        } else if cfg!(target_os = "macos") {
+            "Run a shell command on macOS. Shell: bash/zsh. Unix commands available (ls, cat, grep, tail).".to_owned()
+        } else {
+            "Run a shell command on Linux. Shell: bash/sh. Unix commands available (ls, cat, grep, tail).".to_owned()
+        },
         parameters: json!({
             "type": "object",
             "properties": {
@@ -6503,14 +6584,15 @@ Example - Large file (SPLIT INTO MULTIPLE CALLS):
     });
     tools.push(ToolDef {
         name: "cron".to_owned(),
-        description: "List, add, or remove cron jobs.".to_owned(),
+        description: "List, add, or remove cron jobs. For remove, prefer using `index` from the list output instead of `id` to avoid ID truncation issues.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "action":   {"type": "string", "enum": ["list", "add", "remove"], "description": "Action to perform"},
                 "schedule": {"type": "string", "description": "Cron schedule expression (for add)"},
                 "message":  {"type": "string", "description": "Message or task to run (for add)"},
-                "id":       {"type": "string", "description": "Job ID (for remove)"}
+                "index":    {"type": "number", "description": "Job index from list (1-based, for remove - preferred)"},
+                "id":       {"type": "string", "description": "Job ID (for remove - use index instead if possible)"}
             },
             "required": ["action"]
         }),
