@@ -127,7 +127,8 @@
         "resizable": true,
         "title": "RsClaw",
         "hiddenTitle": true,
-        "titleBarStyle": "Overlay"
+        "titleBarStyle": "Overlay",
+        "center": true
       }
     ]
   }

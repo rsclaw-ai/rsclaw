@@ -561,7 +561,7 @@ function ConfigEditorPage() {
       const baseUrl = extractVal(block, "baseUrl") || extractVal(block, "base_url") || "";
       const enabled = extractVal(block, "enabled");
       const apiField = extractVal(block, "api") || extractVal(block, "api_type");
-      const apiType: ApiType | undefined = (apiField === "anthropic" || apiField === "gemini" || apiField === "ollama" || apiField === "openai")
+      const apiType: ApiType | undefined = (apiField === "anthropic" || apiField === "gemini" || apiField === "ollama" || apiField === "openai" || apiField === "openai-responses")
         ? (apiField as ApiType)
         : undefined;
       return {

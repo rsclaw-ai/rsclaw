@@ -644,7 +644,7 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
         "anthropic"   => "https://api.anthropic.com/v1",
         "openai"      => "https://api.openai.com/v1",
         "deepseek"    => "https://api.deepseek.com/v1",
-        "qwen"        => "https://dashscope.aliyuncs.com/api/v1",
+        "qwen"        => "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "doubao"      => "https://ark.cn-beijing.volces.com/api/v3",
         "minimax"     => "https://api.minimax.chat/v1",
         "kimi"        => "https://api.moonshot.cn/v1",
