@@ -1198,7 +1198,7 @@ fn start_channels(
                                 tokio::spawn(async move {
                                     while let Some((text, peer_id, chat_id, is_group, bound, images, file_attachments)) = urx.recv().await {
                                         let process_result = tokio::time::timeout(
-                                            Duration::from_secs(180),
+                                            Duration::from_secs(600),
                                             async {
                                         let handle = if let Some(ref agent_id) = bound {
                                             match w_reg.get(agent_id) {
@@ -1274,7 +1274,7 @@ fn start_channels(
                                             }
                                         ).await;
                                         if process_result.is_err() {
-                                            warn!(user = %w_uid, "telegram: message processing timed out (180s), skipping to next");
+                                            warn!(user = %w_uid, "telegram: message processing timed out (600s), skipping to next");
                                         }
                                     }
                                     debug!(user = %w_uid, "telegram: per-user worker stopped");
@@ -1697,7 +1697,7 @@ fn start_discord_if_configured(
                                         }
                                     ).await;
                                     if process_result.is_err() {
-                                        warn!(user = %w_uid, "discord: message processing timed out (180s), skipping to next");
+                                        warn!(user = %w_uid, "discord: message processing timed out (600s), skipping to next");
                                     }
                                 }
                                 debug!(user = %w_uid, "discord: per-user worker stopped");
@@ -2057,7 +2057,7 @@ fn start_slack_if_configured(
                                         }
                                     ).await;
                                     if process_result.is_err() {
-                                        warn!(user = %w_uid, "slack: message processing timed out (180s), skipping to next");
+                                        warn!(user = %w_uid, "slack: message processing timed out (600s), skipping to next");
                                     }
                                 }
                                 debug!(user = %w_uid, "slack: per-user worker stopped");
@@ -2287,7 +2287,7 @@ fn start_whatsapp_if_configured(
                             tokio::spawn(async move {
                                 while let Some((text, from, images)) = urx.recv().await {
                                     let process_result = tokio::time::timeout(
-                                Duration::from_secs(180),
+                                Duration::from_secs(600),
                                 async {
                             let handle = match w_reg.route("whatsapp") {
                                 Ok(h) => h,
@@ -2346,7 +2346,7 @@ fn start_whatsapp_if_configured(
                                 }
                             ).await;
                                     if process_result.is_err() {
-                                        warn!(user = %w_uid, "whatsapp: message processing timed out (180s), skipping to next");
+                                        warn!(user = %w_uid, "whatsapp: message processing timed out (600s), skipping to next");
                                     }
                                 }
                                 debug!(user = %w_uid, "whatsapp: per-user worker stopped");
@@ -2607,7 +2607,7 @@ fn start_line_if_configured(
                                 while let Some((text, user_id, is_group, images)) = urx.recv().await
                                 {
                                     let process_result = tokio::time::timeout(
-                                    Duration::from_secs(180),
+                                    Duration::from_secs(600),
                                     async {
                                 let handle = match w_reg.route("line") {
                                     Ok(h) => h,
@@ -2670,7 +2670,7 @@ fn start_line_if_configured(
                                     }
                                 ).await;
                                     if process_result.is_err() {
-                                        warn!(user = %w_uid, "line: message processing timed out (180s), skipping to next");
+                                        warn!(user = %w_uid, "line: message processing timed out (600s), skipping to next");
                                     }
                                 }
                                 debug!(user = %w_uid, "line: per-user worker stopped");
@@ -2896,7 +2896,7 @@ fn start_zalo_if_configured(
                             tokio::spawn(async move {
                                 while let Some((text, sender_id, images)) = urx.recv().await {
                                     let process_result = tokio::time::timeout(
-                                    Duration::from_secs(180),
+                                    Duration::from_secs(600),
                                     async {
                                 let handle = match w_reg.route("zalo") {
                                     Ok(h) => h,
@@ -2955,7 +2955,7 @@ fn start_zalo_if_configured(
                                     }
                                 ).await;
                                     if process_result.is_err() {
-                                        warn!(user = %w_uid, "zalo: message processing timed out (180s), skipping to next");
+                                        warn!(user = %w_uid, "zalo: message processing timed out (600s), skipping to next");
                                     }
                                 }
                                 debug!(user = %w_uid, "zalo: per-user worker stopped");
@@ -3200,7 +3200,7 @@ fn start_signal_if_configured(
                         tokio::spawn(async move {
                             while let Some((text, sender, is_group)) = urx.recv().await {
                                 let process_result = tokio::time::timeout(
-                                Duration::from_secs(180),
+                                Duration::from_secs(600),
                                 async {
                             let handle = match w_reg.route("signal") {
                                 Ok(h) => h,
@@ -3266,7 +3266,7 @@ fn start_signal_if_configured(
                                 }
                             ).await;
                                 if process_result.is_err() {
-                                    warn!(user = %w_uid, "signal: message processing timed out (180s), skipping to next");
+                                    warn!(user = %w_uid, "signal: message processing timed out (600s), skipping to next");
                                 }
                             }
                             debug!(user = %w_uid, "signal: per-user worker stopped");
@@ -3441,7 +3441,7 @@ fn spawn_wechat_user_worker(
         debug!(user = %user_id, "wechat: per-user worker started");
         while let Some((text, images, file_attachments)) = rx.recv().await {
             debug!(user = %user_id, text_start = %text.chars().take(30).collect::<String>(), "wechat: worker processing");
-            let process_result = tokio::time::timeout(Duration::from_secs(180), async {
+            let process_result = tokio::time::timeout(Duration::from_secs(600), async {
                 let handle = match reg.get("main").or_else(|_| reg.default_agent()) {
                     Ok(h) => h,
                     Err(e) => {
@@ -3521,7 +3521,7 @@ fn spawn_wechat_user_worker(
             })
             .await;
             if process_result.is_err() {
-                warn!(user = %user_id, "wechat: message processing timed out (180s), skipping to next");
+                warn!(user = %user_id, "wechat: message processing timed out (600s), skipping to next");
             }
         }
         debug!(user = %user_id, "wechat: per-user worker stopped");
@@ -4149,7 +4149,7 @@ fn start_feishu_if_configured(
                                         }
                                     ).await;
                                     if process_result.is_err() {
-                                        warn!(user = %w_uid, "feishu: message processing timed out (180s), skipping to next");
+                                        warn!(user = %w_uid, "feishu: message processing timed out (600s), skipping to next");
                                     }
                                 }
                                 debug!(user = %w_uid, "feishu: per-user worker stopped");
@@ -4545,7 +4545,7 @@ fn start_dingtalk_if_configured(
                                         }
                                     ).await;
                                     if process_result.is_err() {
-                                        warn!(user = %w_uid, "dingtalk: message processing timed out (180s), skipping to next");
+                                        warn!(user = %w_uid, "dingtalk: message processing timed out (600s), skipping to next");
                                     }
                                 }
                                 debug!(user = %w_uid, "dingtalk: per-user worker stopped");
@@ -4915,7 +4915,7 @@ fn start_qq_if_configured(
                                 )) = urx.recv().await
                                 {
                                     let process_result = tokio::time::timeout(
-                                    Duration::from_secs(180),
+                                    Duration::from_secs(600),
                                     async {
                                 let handle = match w_reg.route("qq").or_else(|_| w_reg.default_agent()) {
                                     Ok(h) => h,
@@ -4970,7 +4970,7 @@ fn start_qq_if_configured(
                                     }
                                 ).await;
                                     if process_result.is_err() {
-                                        warn!(user = %w_uid, "qq: message processing timed out (180s), skipping to next");
+                                        warn!(user = %w_uid, "qq: message processing timed out (600s), skipping to next");
                                     }
                                 }
                                 debug!(user = %w_uid, "qq: per-user worker stopped");
@@ -5263,7 +5263,7 @@ fn start_matrix_if_configured(
                                     urx.recv().await
                                 {
                                     let process_result = tokio::time::timeout(
-                                Duration::from_secs(180),
+                                Duration::from_secs(600),
                                 async {
                             let handle = match w_reg.route("matrix").or_else(|_| w_reg.default_agent()) {
                                 Ok(h) => h,
@@ -5330,7 +5330,7 @@ fn start_matrix_if_configured(
                                 }
                             ).await;
                                     if process_result.is_err() {
-                                        warn!(user = %w_uid, "matrix: message processing timed out (180s), skipping to next");
+                                        warn!(user = %w_uid, "matrix: message processing timed out (600s), skipping to next");
                                     }
                                 }
                                 debug!(user = %w_uid, "matrix: per-user worker stopped");
@@ -5593,7 +5593,7 @@ fn start_wecom_if_configured(
                                     urx.recv().await
                                 {
                                     let process_result = tokio::time::timeout(
-                                Duration::from_secs(180),
+                                Duration::from_secs(600),
                                 async {
                             let handle = match w_reg.route("wecom").or_else(|_| w_reg.default_agent()) {
                                 Ok(h) => h,
@@ -5660,7 +5660,7 @@ fn start_wecom_if_configured(
                                 }
                             ).await;
                                     if process_result.is_err() {
-                                        warn!(user = %w_uid, "wecom: message processing timed out (180s), skipping to next");
+                                        warn!(user = %w_uid, "wecom: message processing timed out (600s), skipping to next");
                                     }
                                 }
                                 debug!(user = %w_uid, "wecom: per-user worker stopped");
@@ -6055,7 +6055,7 @@ async fn handle_pending_analysis(
             .await;
         return;
     }
-    match tokio::time::timeout(Duration::from_secs(180), reply_rx).await {
+    match tokio::time::timeout(Duration::from_secs(600), reply_rx).await {
         Ok(Ok(r)) if !r.text.is_empty() || !r.images.is_empty() => {
             let _ = out_tx
                 .send(crate::channel::OutboundMessage {
