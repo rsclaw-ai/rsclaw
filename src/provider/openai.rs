@@ -440,7 +440,11 @@ impl OpenAiProvider {
             "image/png" => "png",
             "image/gif" => "gif",
             "image/webp" => "webp",
-            _ => "png",
+            "video/mp4" => "mp4",
+            "video/quicktime" => "mov",
+            "video/webm" => "webm",
+            "video/x-msvideo" => "avi",
+            _ => "bin",
         };
 
         let image_bytes = base64::engine::general_purpose::STANDARD
@@ -466,7 +470,7 @@ impl OpenAiProvider {
 
         let resp = builder
             .multipart(form)
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(500))
             .send()
             .await
             .context("Files API upload request failed")?;
@@ -1122,10 +1126,12 @@ fn serialize_media_for_responses(url: &str, file_id_map: &HashMap<String, String
             }
             return json!({ "type": "input_image", "file_id": file_id });
         }
-        // Fallback: inline base64
+        // Video fallback: skip (too large for inline, runtime will handle transcription)
         if url.starts_with("data:video/") {
-            return json!({ "type": "input_video", "video_url": url });
+            tracing::warn!("video upload failed, skipping input_video (fallback to transcription)");
+            return json!({ "type": "input_text", "text": "[video attached — audio transcription fallback]" });
         }
+        // Image fallback: inline base64
         return json!({ "type": "input_image", "image_url": url });
     }
 
