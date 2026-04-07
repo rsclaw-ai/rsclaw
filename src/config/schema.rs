@@ -545,7 +545,7 @@ pub struct ProviderConfig {
 pub enum ApiFormat {
     #[serde(rename = "openai-responses")]
     OpenAiResponses,
-    #[serde(rename = "openai-completions")]
+    #[serde(rename = "openai-completions", alias = "openai")]
     OpenAiCompletions,
     Anthropic,
     #[serde(rename = "anthropic-messages")]

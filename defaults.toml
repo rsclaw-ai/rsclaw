@@ -125,6 +125,7 @@ label      = "Custom Provider"
 env_var    = ""
 model      = ""
 base_url   = ""
+api_type   = "openai"
 needs_key  = false
 
 # ──────────────────────────────────────────────────────────────────────────────

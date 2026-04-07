@@ -44,6 +44,12 @@ import {
   CH_ORDER_EN,
   MODELS,
 } from "./onboarding";
+import {
+  type ApiType,
+  API_TYPE_LABELS,
+  API_TYPE_DEFAULT_URLS,
+  API_TYPE_NEEDS_KEY,
+} from "../lib/provider-defaults";
 
 // ── Types ──────────────────────────────────────────────
 interface ChannelInfo {
@@ -480,12 +486,13 @@ function ConfigEditorPage() {
 
   // Parsed config fields - Models
   const [providers, setProviders] = useState<{
-    name: string; key: string; enabled: boolean; apiKey: string; baseUrl: string;
+    name: string; key: string; enabled: boolean; apiKey: string; baseUrl: string; apiType?: ApiType;
   }[]>([
     { name: "Anthropic", key: "anthropic", enabled: false, apiKey: "", baseUrl: "" },
     { name: "OpenAI", key: "openai", enabled: false, apiKey: "", baseUrl: "" },
     { name: "DeepSeek", key: "deepseek", enabled: false, apiKey: "", baseUrl: "" },
     { name: "Ollama", key: "ollama", enabled: true, apiKey: "", baseUrl: "http://localhost:11434" },
+    { name: "Custom Provider", key: "custom", enabled: false, apiKey: "", baseUrl: API_TYPE_DEFAULT_URLS["openai"], apiType: "openai" as ApiType },
   ]);
 
   // Parsed config fields - Channels
@@ -536,9 +543,9 @@ function ConfigEditorPage() {
     if (amt) setAgentMaxTokens(parseInt(amt, 10) || 4096);
 
     // Models - try to detect provider blocks
-    const providerNames = ["anthropic", "openai", "deepseek", "ollama"];
+    const providerNames = ["anthropic", "openai", "deepseek", "ollama", "custom"];
     const displayNames: Record<string, string> = {
-      anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", ollama: "Ollama",
+      anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", ollama: "Ollama", custom: "Custom Provider",
     };
     const newProviders = providerNames.map((pName) => {
       // Look for a block like anthropic: { ... }
@@ -548,12 +555,17 @@ function ConfigEditorPage() {
       const apiKey = extractVal(block, "apiKey") || "";
       const baseUrl = extractVal(block, "baseUrl") || extractVal(block, "base_url") || "";
       const enabled = extractVal(block, "enabled");
+      const apiField = extractVal(block, "api") || extractVal(block, "api_type");
+      const apiType: ApiType = (apiField === "anthropic" || apiField === "gemini" || apiField === "ollama")
+        ? (apiField as ApiType)
+        : "openai";
       return {
         name: displayNames[pName] || pName,
         key: pName,
-        enabled: enabled !== undefined ? enabled === "true" : apiKey.length > 0,
+        enabled: enabled !== undefined ? enabled === "true" : (pName === "custom" ? !!baseUrl : apiKey.length > 0),
         apiKey,
-        baseUrl,
+        baseUrl: baseUrl || (pName === "custom" ? API_TYPE_DEFAULT_URLS[apiType] : ""),
+        ...(pName === "custom" ? { apiType } : {}),
       };
     });
     setProviders(newProviders);
@@ -833,7 +845,11 @@ function ConfigEditorPage() {
 
   const renderModels = () => (
     <div>
-      {providers.map((prov, idx) => (
+      {providers.map((prov, idx) => {
+        const isCustom = prov.key === "custom";
+        const curApiType: ApiType = prov.apiType || "openai";
+        const showKey = !isCustom || API_TYPE_NEEDS_KEY[curApiType];
+        return (
         <div key={prov.key} style={providerCard}>
           <div style={providerHeader}>
             <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
@@ -853,21 +869,43 @@ function ConfigEditorPage() {
               markDirty();
             }} />
           </div>
-          <div style={fieldRow}>
-            <div style={fieldLabel}>API Key</div>
-            <input style={fieldInput} type="password" value={prov.apiKey}
-              placeholder={prov.key === "ollama" ? "(local, no key needed)" : "sk-..."}
-              onChange={(e) => {
-                const next = [...providers];
-                next[idx] = { ...next[idx], apiKey: e.target.value };
-                setProviders(next);
-                markDirty();
-              }} />
-          </div>
+          {isCustom && (
+            <div style={fieldRow}>
+              <div style={fieldLabel}>API Type</div>
+              <select
+                style={{ ...fieldInput, cursor: "pointer" }}
+                value={curApiType}
+                onChange={(e) => {
+                  const at = e.target.value as ApiType;
+                  const next = [...providers];
+                  next[idx] = { ...next[idx], apiType: at, baseUrl: API_TYPE_DEFAULT_URLS[at] };
+                  setProviders(next);
+                  markDirty();
+                }}
+              >
+                {(Object.keys(API_TYPE_LABELS) as ApiType[]).map((at) => (
+                  <option key={at} value={at}>{API_TYPE_LABELS[at]}</option>
+                ))}
+              </select>
+            </div>
+          )}
+          {showKey && (
+            <div style={fieldRow}>
+              <div style={fieldLabel}>API Key</div>
+              <input style={fieldInput} type="password" value={prov.apiKey}
+                placeholder={prov.key === "ollama" ? "(local, no key needed)" : "sk-..."}
+                onChange={(e) => {
+                  const next = [...providers];
+                  next[idx] = { ...next[idx], apiKey: e.target.value };
+                  setProviders(next);
+                  markDirty();
+                }} />
+            </div>
+          )}
           <div style={{ ...fieldRow, borderBottom: "none" }}>
             <div style={fieldLabel}>Base URL</div>
             <input style={fieldInput} value={prov.baseUrl}
-              placeholder="(default)"
+              placeholder={isCustom ? API_TYPE_DEFAULT_URLS[curApiType] : "(default)"}
               onChange={(e) => {
                 const next = [...providers];
                 next[idx] = { ...next[idx], baseUrl: e.target.value };
@@ -876,7 +914,8 @@ function ConfigEditorPage() {
               }} />
           </div>
         </div>
-      ))}
+        );
+      })}
     </div>
   );
 

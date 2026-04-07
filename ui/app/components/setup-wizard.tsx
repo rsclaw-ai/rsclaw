@@ -4,9 +4,15 @@ import styles from "./setup-wizard.module.scss";
 import ReturnIcon from "../icons/return.svg";
 import ConfirmIcon from "../icons/confirm.svg";
 import { useNavigate } from "react-router-dom";
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Path } from "../constant";
 import { showToast } from "./ui-lib";
+import {
+  type ApiType,
+  API_TYPE_LABELS,
+  API_TYPE_DEFAULT_URLS,
+  API_TYPE_NEEDS_KEY,
+} from "../lib/provider-defaults";
 
 const GATEWAY_BASE = "http://localhost:18888/api/v1";
 
@@ -22,6 +28,20 @@ const LANGUAGES = [
   { code: "pt", name: "Português" },
   { code: "ru", name: "Русский" },
 ];
+
+// Map gateway.language config values to LANGUAGES codes
+const CONFIG_LANG_TO_CODE: Record<string, string> = {
+  Chinese: "zh-CN",
+  English: "en",
+  Japanese: "ja",
+  Korean: "ko",
+  Thai: "th",
+  Vietnamese: "vi",
+  French: "fr",
+  German: "de",
+  Spanish: "es",
+  Russian: "ru",
+};
 
 const PROVIDERS = [
   {
@@ -55,6 +75,7 @@ interface WizardConfig {
   provider: string;
   apiKey: string;
   baseUrl: string;
+  apiType: ApiType;
   port: number;
   bindMode: string;
 }
@@ -67,6 +88,7 @@ export function SetupWizardPage() {
     provider: "anthropic",
     apiKey: "",
     baseUrl: "",
+    apiType: "openai",
     port: 18888,
     bindMode: "localhost",
   });
@@ -77,19 +99,72 @@ export function SetupWizardPage() {
     setConfig((prev) => ({ ...prev, ...partial }));
   };
 
+  // On mount: if config already has gateway.language set, skip language selection
+  const langCheckRef = useRef(false);
+  useEffect(() => {
+    if (langCheckRef.current) return;
+    langCheckRef.current = true;
+    (async () => {
+      try {
+        const tauriInvoke = (window as any).__TAURI__?.invoke;
+        let cfgLang: string | undefined;
+        if (tauriInvoke) {
+          const raw: string = await tauriInvoke("read_config_file");
+          const cfg = JSON.parse(raw);
+          cfgLang = cfg?.gateway?.language;
+        } else {
+          const res = await fetch("http://localhost:18888/api/v1/config");
+          if (res.ok) {
+            const cfg = await res.json();
+            cfgLang = cfg?.gateway?.language;
+          }
+        }
+        if (cfgLang && typeof cfgLang === "string" && cfgLang.trim()) {
+          const langCode = CONFIG_LANG_TO_CODE[cfgLang.trim()];
+          if (langCode) {
+            updateConfig({ language: langCode });
+            setStep(1);
+          }
+        }
+      } catch (e) {
+        console.warn("[setup-wizard] language detection failed:", e);
+      }
+    })();
+  }, []);
+
   const handleFinish = async () => {
     try {
+      const providerConfig: Record<string, any> = {};
+      if (config.provider === "custom") {
+        providerConfig.custom = {
+          api: config.apiType,
+          baseUrl: config.baseUrl || API_TYPE_DEFAULT_URLS[config.apiType],
+          ...(config.apiKey ? { apiKey: config.apiKey } : {}),
+          enabled: true,
+        };
+      } else if (config.provider === "ollama") {
+        providerConfig.ollama = {
+          api: "ollama",
+          baseUrl: config.baseUrl || "http://localhost:11434",
+          enabled: true,
+        };
+      } else if (config.apiKey) {
+        providerConfig[config.provider] = { apiKey: config.apiKey, enabled: true };
+      }
+
+      const body = {
+        gateway: {
+          port: config.port,
+          bind: config.bindMode === "localhost" ? "loopback" : "0.0.0.0",
+          language: LANGUAGES.find((l) => l.code === config.language)?.name || config.language,
+        },
+        models: { providers: providerConfig },
+      };
+
       const res = await fetch(`${GATEWAY_BASE}/config`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          language: config.language,
-          provider: config.provider,
-          api_key: config.apiKey,
-          base_url: config.baseUrl,
-          port: config.port,
-          bind_mode: config.bindMode,
-        }),
+        body: JSON.stringify(body),
       });
       if (!res.ok) throw new Error("Failed to save config");
       showToast("Configuration saved successfully");
@@ -140,15 +215,18 @@ export function SetupWizardPage() {
                   className={`${styles["provider-option"]} ${
                     config.provider === provider.id ? styles.selected : ""
                   }`}
-                  onClick={() =>
-                    updateConfig({
-                      provider: provider.id,
-                      baseUrl:
-                        provider.id === "ollama"
-                          ? "http://localhost:11434"
-                          : "",
-                    })
-                  }
+                  onClick={() => {
+                    const updates: Partial<WizardConfig> = { provider: provider.id };
+                    if (provider.id === "ollama") {
+                      updates.baseUrl = "http://localhost:11434";
+                    } else if (provider.id === "custom") {
+                      updates.apiType = "openai";
+                      updates.baseUrl = API_TYPE_DEFAULT_URLS["openai"];
+                    } else {
+                      updates.baseUrl = "";
+                    }
+                    updateConfig(updates);
+                  }}
                 >
                   <div>
                     <div className={styles["provider-name"]}>
@@ -161,15 +239,20 @@ export function SetupWizardPage() {
                 </div>
               ))}
             </div>
-            {selectedProvider && selectedProvider.placeholder && (
+            {config.provider === "custom" && (
               <div className={styles["form-group"]}>
-                <div className={styles["form-label"]}>API Key</div>
-                <input
-                  type="password"
-                  placeholder={selectedProvider.placeholder}
-                  value={config.apiKey}
-                  onChange={(e) => updateConfig({ apiKey: e.target.value })}
-                />
+                <div className={styles["form-label"]}>API Type</div>
+                <select
+                  value={config.apiType}
+                  onChange={(e) => {
+                    const at = e.target.value as ApiType;
+                    updateConfig({ apiType: at, baseUrl: API_TYPE_DEFAULT_URLS[at] });
+                  }}
+                >
+                  {(Object.keys(API_TYPE_LABELS) as ApiType[]).map((at) => (
+                    <option key={at} value={at}>{API_TYPE_LABELS[at]}</option>
+                  ))}
+                </select>
               </div>
             )}
             {config.provider === "custom" && (
@@ -177,9 +260,31 @@ export function SetupWizardPage() {
                 <div className={styles["form-label"]}>Base URL</div>
                 <input
                   type="text"
-                  placeholder="https://api.example.com/v1"
+                  placeholder={API_TYPE_DEFAULT_URLS[config.apiType]}
                   value={config.baseUrl}
                   onChange={(e) => updateConfig({ baseUrl: e.target.value })}
+                />
+              </div>
+            )}
+            {config.provider === "custom" && API_TYPE_NEEDS_KEY[config.apiType] && (
+              <div className={styles["form-group"]}>
+                <div className={styles["form-label"]}>API Key</div>
+                <input
+                  type="password"
+                  placeholder="sk-..."
+                  value={config.apiKey}
+                  onChange={(e) => updateConfig({ apiKey: e.target.value })}
+                />
+              </div>
+            )}
+            {selectedProvider && selectedProvider.placeholder && config.provider !== "custom" && (
+              <div className={styles["form-group"]}>
+                <div className={styles["form-label"]}>API Key</div>
+                <input
+                  type="password"
+                  placeholder={selectedProvider.placeholder}
+                  value={config.apiKey}
+                  onChange={(e) => updateConfig({ apiKey: e.target.value })}
                 />
               </div>
             )}
@@ -241,6 +346,22 @@ export function SetupWizardPage() {
                   {selectedProvider?.name || config.provider}
                 </span>
               </div>
+              {config.provider === "custom" && (
+                <div className={styles["summary-item"]}>
+                  <span className={styles["summary-label"]}>API Type</span>
+                  <span className={styles["summary-value"]}>
+                    {API_TYPE_LABELS[config.apiType]}
+                  </span>
+                </div>
+              )}
+              {config.provider === "custom" && (
+                <div className={styles["summary-item"]}>
+                  <span className={styles["summary-label"]}>Base URL</span>
+                  <span className={styles["summary-value"]}>
+                    {config.baseUrl || API_TYPE_DEFAULT_URLS[config.apiType]}
+                  </span>
+                </div>
+              )}
               <div className={styles["summary-item"]}>
                 <span className={styles["summary-label"]}>API Key</span>
                 <span className={styles["summary-value"]}>

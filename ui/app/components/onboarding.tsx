@@ -17,6 +17,12 @@ import {
 } from "../lib/rsclaw-api";
 import { markSetupComplete } from "../lib/first-launch";
 import { toast } from "../lib/toast";
+import {
+  type ApiType,
+  API_TYPE_LABELS,
+  API_TYPE_DEFAULT_URLS,
+  API_TYPE_NEEDS_KEY,
+} from "../lib/provider-defaults";
 
 // ── i18n translations for the wizard ──
 
@@ -728,6 +734,11 @@ const LANG_TO_CONFIG: Record<WizLang, string> = {
   th: "Thai", vi: "Vietnamese", fr: "French", de: "German",
   es: "Spanish", ru: "Russian",
 };
+
+// Reverse mapping: config value → WizLang
+const CONFIG_TO_LANG: Record<string, WizLang> = Object.fromEntries(
+  Object.entries(LANG_TO_CONFIG).map(([k, v]) => [v, k as WizLang])
+) as Record<string, WizLang>;
 
 function detectWizLang(): WizLang {
   // Check localStorage first
@@ -1483,6 +1494,8 @@ function ensureSpinStyle() {
 interface ProvState {
   selected: boolean;
   apiKey: string;
+  baseUrl: string;
+  apiType?: ApiType;
   testStatus: "idle" | "testing" | "success" | "error";
   testError: string;
   models: ModelDef[] | null;
@@ -1494,7 +1507,9 @@ interface ProvState {
 function makeProvState(selected: boolean, isUrl?: boolean): ProvState {
   return {
     selected,
-    apiKey: isUrl ? "http://localhost:11434/v1" : "",
+    apiKey: "",
+    baseUrl: isUrl ? "http://localhost:11434/v1" : "",
+    apiType: undefined,
     testStatus: "idle",
     testError: "",
     models: null,
@@ -1556,7 +1571,13 @@ export function OnboardingPage() {
   const [provs, setProvs] = useState<Record<string, ProvState>>(() => {
     const m: Record<string, ProvState> = {};
     Object.values(ALL_PROVIDERS).forEach((p) => {
-      m[p.id] = makeProvState(false, p.isUrl);
+      const ps = makeProvState(false, p.isUrl);
+      if (p.id === "custom") {
+        // Custom provider defaults to openai api_type
+        ps.apiType = "openai";
+        ps.baseUrl = API_TYPE_DEFAULT_URLS["openai"];
+      }
+      m[p.id] = ps;
     });
     return m;
   });
@@ -1639,6 +1660,21 @@ export function OnboardingPage() {
     (async () => {
       const tauriInvoke = (window as any).__TAURI__?.invoke;
       if (tauriInvoke) {
+        // Check if config already has gateway.language set (e.g. from `rsclaw setup` CLI)
+        try {
+          const raw: string = await tauriInvoke("read_config_file");
+          const cfg = JSON.parse(raw);
+          const cfgLang: string | undefined = cfg?.gateway?.language;
+          if (cfgLang && typeof cfgLang === "string" && cfgLang.trim()) {
+            const mapped = CONFIG_TO_LANG[cfgLang.trim()];
+            if (mapped) {
+              setWizLang(mapped);
+              setLanguage(cfgLang.trim());
+              try { localStorage.setItem("rsclaw-lang", mapped); } catch {}
+              setStep(1);
+            }
+          }
+        } catch (e) { console.warn("[onboarding] config language detection failed:", e); }
         // rsclaw installed?
         try { const setupDone = await tauriInvoke("check_setup"); setRscReady(setupDone); } catch { setRscReady(false); }
         // version
@@ -1654,6 +1690,23 @@ export function OnboardingPage() {
           }
         } catch {}
       } else {
+        // Browser mode: try reading config from gateway API
+        try {
+          const res = await fetch("http://localhost:18888/api/v1/config");
+          if (res.ok) {
+            const cfg = await res.json();
+            const cfgLang: string | undefined = cfg?.gateway?.language;
+            if (cfgLang && typeof cfgLang === "string" && cfgLang.trim()) {
+              const mapped = CONFIG_TO_LANG[cfgLang.trim()];
+              if (mapped) {
+                setWizLang(mapped);
+                setLanguage(cfgLang.trim());
+                try { localStorage.setItem("rsclaw-lang", mapped); } catch {}
+                setStep(1);
+              }
+            }
+          }
+        } catch (e) { console.warn("[onboarding] config language detection failed:", e); }
         // Browser mode: health check only
         try { await getHealth(); setRscReady(true); } catch { setRscReady(false); }
       }
@@ -1721,9 +1774,36 @@ export function OnboardingPage() {
     });
   };
 
+  const setProvBaseUrl = (id: string, url: string) => {
+    setProvs((prev) => {
+      const p = { ...prev };
+      p[id] = { ...p[id], baseUrl: url, testStatus: "idle", models: null, selectedModel: null, inputState: "", testError: "" };
+      return p;
+    });
+  };
+
+  const setProvApiType = (id: string, apiType: ApiType) => {
+    setProvs((prev) => {
+      const p = { ...prev };
+      p[id] = {
+        ...p[id],
+        apiType,
+        baseUrl: API_TYPE_DEFAULT_URLS[apiType],
+        testStatus: "idle",
+        models: null,
+        selectedModel: null,
+        inputState: "",
+        testError: "",
+      };
+      return p;
+    });
+  };
+
   const testProvider = async (id: string) => {
     const prov = provs[id];
-    if (!prov.apiKey.trim()) {
+    const isCustom = id === "custom";
+    const needsKey = !isCustom || API_TYPE_NEEDS_KEY[prov.apiType || "openai"];
+    if (needsKey && !prov.apiKey.trim()) {
       setProvs((prev) => {
         const p = { ...prev };
         p[id] = { ...p[id], testError: t.enterKey, inputState: "err" };
@@ -1741,7 +1821,10 @@ export function OnboardingPage() {
     try {
       // Test provider API directly (Tauri) or via gateway (browser)
       const provDef = PROVIDERS.find((p) => p.id === id);
-      const baseUrl = provDef?.isUrl ? prov.apiKey : undefined;
+      // For custom provider, use the dedicated baseUrl field; for isUrl providers (ollama), also use baseUrl
+      const baseUrl = id === "custom"
+        ? (prov.baseUrl || API_TYPE_DEFAULT_URLS[prov.apiType || "openai"])
+        : (provDef?.isUrl ? prov.baseUrl : undefined);
       const tauriInvoke = (window as any).__TAURI__?.invoke;
       let result: any;
       let modelIds: string[] = [];
@@ -1918,8 +2001,14 @@ export function OnboardingPage() {
     const providers: Record<string, any> = {};
     for (const [id, ps] of Object.entries(provs)) {
       if (!ps.selected || !ps.selectedModel) continue;
-      if (PROVIDERS.find((p) => p.id === id)?.isUrl) {
-        providers[id] = { api: "ollama", baseUrl: ps.apiKey };
+      if (id === "custom") {
+        const apiType = ps.apiType || "openai";
+        const baseUrl = ps.baseUrl || API_TYPE_DEFAULT_URLS[apiType];
+        const entry: Record<string, any> = { api: apiType, baseUrl };
+        if (ps.apiKey) entry.apiKey = ps.apiKey;
+        providers[id] = entry;
+      } else if (PROVIDERS.find((p) => p.id === id)?.isUrl) {
+        providers[id] = { api: "ollama", baseUrl: ps.baseUrl || ps.apiKey };
       } else if (ps.apiKey) {
         providers[id] = { apiKey: ps.apiKey };
       } else {
@@ -2383,36 +2472,104 @@ export function OnboardingPage() {
                 const pDef = PROVIDERS.find((p) => p.id === activeId);
                 if (!pDef || pDef.sep) return null;
                 const ps = provs[activeId];
+                const isCustom = activeId === "custom";
+                const curApiType: ApiType = ps.apiType || "openai";
+                const needsKey = !isCustom || API_TYPE_NEEDS_KEY[curApiType];
+                const inputFieldStyle = { flex: 1, background: "#1f2126", border: `1px solid ${ps.inputState === "ok" ? "#2dd4a0" : ps.inputState === "err" ? "#d95f5f" : "rgba(255,255,255,0.09)"}`, borderRadius: 7, padding: "7px 10px", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none" } as const;
+                const fieldLabelStyle = { fontSize: 10, color: "#2e2c3a", letterSpacing: 0.4, marginBottom: 5, fontFamily: "'JetBrains Mono', monospace" } as const;
+                const plainInputStyle = { width: "100%", background: "#1f2126", border: "1px solid rgba(255,255,255,0.09)", borderRadius: 7, padding: "7px 10px", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none", boxSizing: "border-box" } as const;
+                const selectStyle = { width: "100%", background: "#1f2126", border: "1px solid rgba(255,255,255,0.09)", borderRadius: 7, padding: "7px 10px", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none", cursor: "pointer" } as const;
                 return (
                   <div style={{ marginTop: 12, background: "#1a1c22", border: "1px solid rgba(255,255,255,0.055)", borderRadius: 10, padding: 16 }}>
-                    <div style={{ fontSize: 10, color: "#2e2c3a", letterSpacing: 0.4, marginBottom: 5, fontFamily: "'JetBrains Mono', monospace" }}>{pDef.keyLabel}</div>
-                    <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
-                      <input
-                        type={pDef.isUrl ? "text" : "password"}
-                        style={{ flex: 1, background: "#1f2126", border: `1px solid ${ps.inputState === "ok" ? "#2dd4a0" : ps.inputState === "err" ? "#d95f5f" : "rgba(255,255,255,0.09)"}`, borderRadius: 7, padding: "7px 10px", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none" }}
-                        value={ps.apiKey}
-                        onChange={(e) => setProvKey(activeId, e.target.value)}
-                        placeholder={pDef.keyPlaceholder}
-                      />
-                      <button
-                        onClick={() => testProvider(activeId)}
-                        disabled={ps.testStatus === "testing"}
-                        style={{ padding: "7px 13px", borderRadius: 7, border: `1px solid ${ps.testStatus === "success" ? "rgba(45,212,160,0.18)" : "rgba(255,255,255,0.09)"}`, background: ps.testStatus === "success" ? "rgba(45,212,160,0.07)" : "#1f2126", color: ps.testStatus === "success" ? "#2dd4a0" : "#9896a4", fontSize: 11, fontWeight: 500, cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0, fontFamily: "inherit" }}
-                      >
-                        {ps.testStatus === "testing" ? (<>{renderSpinner()}{t.testing}</>)
-                          : ps.testStatus === "success" ? t.connected
-                          : t.test}
-                      </button>
-                    </div>
-                    {/* Custom Provider: optional API Key field */}
-                    {activeId === "custom" && (
+                    {/* Custom Provider: api_type dropdown */}
+                    {isCustom && (
                       <div style={{ marginBottom: 10 }}>
-                        <div style={{ fontSize: 10, color: "#2e2c3a", letterSpacing: 0.4, marginBottom: 5, fontFamily: "'JetBrains Mono', monospace" }}>API Key {isZh ? "(\u53EF\u9009)" : "(optional)"}</div>
+                        <div style={fieldLabelStyle}>API Type</div>
+                        <select
+                          style={selectStyle}
+                          value={curApiType}
+                          onChange={(e) => setProvApiType(activeId, e.target.value as ApiType)}
+                        >
+                          {(Object.keys(API_TYPE_LABELS) as ApiType[]).map((at) => (
+                            <option key={at} value={at}>{API_TYPE_LABELS[at]}</option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+                    {/* Custom Provider: Base URL input */}
+                    {isCustom && (
+                      <div style={{ marginBottom: 10 }}>
+                        <div style={fieldLabelStyle}>Base URL</div>
                         <input
-                          type="password"
-                          style={{ width: "100%", background: "#1f2126", border: "1px solid rgba(255,255,255,0.09)", borderRadius: 7, padding: "7px 10px", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none" }}
-                          placeholder="sk-..."
+                          type="text"
+                          style={plainInputStyle}
+                          value={ps.baseUrl || API_TYPE_DEFAULT_URLS[curApiType]}
+                          onChange={(e) => setProvBaseUrl(activeId, e.target.value)}
+                          placeholder={API_TYPE_DEFAULT_URLS[curApiType]}
                         />
+                      </div>
+                    )}
+                    {/* Standard (non-custom) providers: show their key label and input inline with test button */}
+                    {!isCustom && (
+                      <>
+                        <div style={fieldLabelStyle}>{pDef.keyLabel}</div>
+                        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+                          <input
+                            type={pDef.isUrl ? "text" : "password"}
+                            style={inputFieldStyle}
+                            value={pDef.isUrl ? (ps.baseUrl || ps.apiKey) : ps.apiKey}
+                            onChange={(e) => pDef.isUrl ? setProvBaseUrl(activeId, e.target.value) : setProvKey(activeId, e.target.value)}
+                            placeholder={pDef.keyPlaceholder}
+                          />
+                          <button
+                            onClick={() => testProvider(activeId)}
+                            disabled={ps.testStatus === "testing"}
+                            style={{ padding: "7px 13px", borderRadius: 7, border: `1px solid ${ps.testStatus === "success" ? "rgba(45,212,160,0.18)" : "rgba(255,255,255,0.09)"}`, background: ps.testStatus === "success" ? "rgba(45,212,160,0.07)" : "#1f2126", color: ps.testStatus === "success" ? "#2dd4a0" : "#9896a4", fontSize: 11, fontWeight: 500, cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0, fontFamily: "inherit" }}
+                          >
+                            {ps.testStatus === "testing" ? (<>{renderSpinner()}{t.testing}</>)
+                              : ps.testStatus === "success" ? t.connected
+                              : t.test}
+                          </button>
+                        </div>
+                      </>
+                    )}
+                    {/* Custom Provider: API Key field (hidden for ollama) + test button row */}
+                    {isCustom && (
+                      <div style={{ marginBottom: 10 }}>
+                        {needsKey && (
+                          <>
+                            <div style={fieldLabelStyle}>API Key</div>
+                            <div style={{ display: "flex", gap: 8, marginBottom: 0 }}>
+                              <input
+                                type="password"
+                                style={inputFieldStyle}
+                                value={ps.apiKey}
+                                onChange={(e) => setProvKey(activeId, e.target.value)}
+                                placeholder="sk-..."
+                              />
+                              <button
+                                onClick={() => testProvider(activeId)}
+                                disabled={ps.testStatus === "testing"}
+                                style={{ padding: "7px 13px", borderRadius: 7, border: `1px solid ${ps.testStatus === "success" ? "rgba(45,212,160,0.18)" : "rgba(255,255,255,0.09)"}`, background: ps.testStatus === "success" ? "rgba(45,212,160,0.07)" : "#1f2126", color: ps.testStatus === "success" ? "#2dd4a0" : "#9896a4", fontSize: 11, fontWeight: 500, cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0, fontFamily: "inherit" }}
+                              >
+                                {ps.testStatus === "testing" ? (<>{renderSpinner()}{t.testing}</>)
+                                  : ps.testStatus === "success" ? t.connected
+                                  : t.test}
+                              </button>
+                            </div>
+                          </>
+                        )}
+                        {!needsKey && (
+                          <button
+                            onClick={() => testProvider(activeId)}
+                            disabled={ps.testStatus === "testing"}
+                            style={{ padding: "7px 13px", borderRadius: 7, border: `1px solid ${ps.testStatus === "success" ? "rgba(45,212,160,0.18)" : "rgba(255,255,255,0.09)"}`, background: ps.testStatus === "success" ? "rgba(45,212,160,0.07)" : "#1f2126", color: ps.testStatus === "success" ? "#2dd4a0" : "#9896a4", fontSize: 11, fontWeight: 500, cursor: "pointer", whiteSpace: "nowrap", fontFamily: "inherit" }}
+                          >
+                            {ps.testStatus === "testing" ? (<>{renderSpinner()}{t.testing}</>)
+                              : ps.testStatus === "success" ? t.connected
+                              : t.test}
+                          </button>
+                        )}
                       </div>
                     )}
                     {ps.testError && <div style={{ fontSize: 11, color: "#d95f5f", marginBottom: 8 }}>{ps.testError}</div>}
