@@ -1812,7 +1812,11 @@ export function OnboardingPage() {
   const testProvider = async (id: string) => {
     const prov = provs[id];
     const isCustom = id === "custom";
-    const keyRequired = !isCustom || API_TYPE_NEEDS_KEY[prov.apiType || "openai"];
+    const provDef = PROVIDERS.find((p) => p.id === id);
+    const isUrlProvider = !!provDef?.isUrl;
+    const keyRequired = isCustom
+      ? API_TYPE_NEEDS_KEY[prov.apiType || "openai"]
+      : !isUrlProvider;
     if (keyRequired && !prov.apiKey.trim()) {
       setProvs((prev) => {
         const p = { ...prev };
@@ -2749,11 +2753,6 @@ export function OnboardingPage() {
                             </button>
                           )}
                         </div>
-                        {activeId === "feishu" && cs.qrStatus === "idle" && (
-                          <button style={{ padding: "6px 14px", borderRadius: 7, border: `1px solid ${V.bd2}`, background: V.bg4, color: V.t1, fontSize: 11, cursor: "pointer", fontFamily: "inherit" }}>
-                            {t.openFeishuAuth}
-                          </button>
-                        )}
                       </div>
                     )}
 

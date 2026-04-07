@@ -853,6 +853,7 @@ function ConfigEditorPage() {
       {providers.map((prov, idx) => {
         const isCustom = prov.key === "custom";
         const curApiType: ApiType | undefined = prov.apiType;
+        const hideKey = prov.key === "ollama";
         const keyOptional = isCustom && curApiType && !API_TYPE_NEEDS_KEY[curApiType];
         const isZh = getLang() === "cn";
         // Determine configuration status
@@ -909,10 +910,11 @@ function ConfigEditorPage() {
               </select>
             </div>
           )}
+          {!hideKey && (
           <div style={fieldRow}>
               <div style={fieldLabel}>API Key{keyOptional ? <span style={{ color: "#999", fontWeight: 400 }}> (optional)</span> : null}</div>
               <input style={fieldInput} type="password" value={prov.apiKey}
-                placeholder={(prov.key === "ollama" || keyOptional) ? "(optional)" : "sk-..."}
+                placeholder={keyOptional ? "(optional)" : "sk-..."}
                 onChange={(e) => {
                   const next = [...providers];
                   next[idx] = { ...next[idx], apiKey: e.target.value };
@@ -920,6 +922,7 @@ function ConfigEditorPage() {
                   markDirty();
                 }} />
             </div>
+          )}
           {(isCustom || prov.key === "doubao" || prov.key === "ollama") && (
           <div style={{ ...fieldRow, borderBottom: "none" }}>
             <div style={fieldLabel}>API URL</div>
@@ -3782,8 +3785,21 @@ function TauriConfigPageInner() {
                             </div>
                           </div>
                         ) : p.id === "custom" ? (
-                          /* Custom: Base URL + API Key */
+                          /* Custom: API Type + Base URL + API Key */
                           <div style={{ marginBottom: 8 }}>
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>API Type</div>
+                            <select
+                              style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", cursor: "pointer", marginBottom: 8 }}
+                              value={getVal(`models.providers.${p.id}.api`, "openai")}
+                              onChange={(e) => {
+                                updateConfig(`models.providers.${p.id}.api`, e.target.value);
+                                setProvTest((prev) => ({ ...prev, [p.id]: "idle" }));
+                              }}
+                            >
+                              {(Object.keys(API_TYPE_LABELS) as ApiType[]).map((at) => (
+                                <option key={at} value={at}>{API_TYPE_LABELS[at]}</option>
+                              ))}
+                            </select>
                             <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>API URL</div>
                             <input
                               style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", marginBottom: 8 }}
