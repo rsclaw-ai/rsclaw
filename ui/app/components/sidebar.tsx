@@ -574,31 +574,26 @@ export function SideBar(props: { className?: string }) {
       >
         <GatewayStatus narrow={shouldNarrow} />
         {!shouldNarrow && (
-          <div className={styles["sidebar-quick-nav"]}>
-            <button
-              className={styles["sidebar-quick-btn"]}
-              onClick={() => navigate(Path.RsClawPanel + "?tab=status")}
-              title={Locale.RsClawPanel.Sidebar.ServiceTitle}
-            >
-              <span>📡</span>
-              <span>{shouldNarrow ? "" : Locale.RsClawPanel.Sidebar.Service}</span>
-            </button>
-            <button
-              className={styles["sidebar-quick-btn"]}
-              onClick={() => navigate(Path.RsClawPanel + "?tab=config")}
-              title={Locale.RsClawPanel.Sidebar.ConfigTitle}
-            >
-              <span>⚙️</span>
-              <span>{shouldNarrow ? "" : Locale.RsClawPanel.Sidebar.Config}</span>
-            </button>
-            <button
-              className={styles["sidebar-quick-btn"]}
-              onClick={() => navigate(Path.RsClawPanel + "?tab=agents")}
-              title={Locale.RsClawPanel.Sidebar.AgentsTitle}
-            >
-              <span>🤖</span>
-              <span>{shouldNarrow ? "" : Locale.RsClawPanel.Sidebar.Agents}</span>
-            </button>
+          <div className={styles["sidebar-quick-nav"]} style={{ gridTemplateColumns: "1fr 1fr 1fr" }}>
+            {[
+              { tab: "status", icon: "\uD83D\uDCE1", label: Locale.RsClawPanel.Sidebar.Service },
+              { tab: "config", icon: "\u2699\uFE0F", label: Locale.RsClawPanel.Sidebar.Config },
+              { tab: "agents", icon: "\uD83E\uDD16", label: Locale.RsClawPanel.Sidebar.Agents },
+              { tab: "pairing", icon: "\uD83D\uDD10", label: getLang() === "cn" ? "\u914D\u5BF9\u5BA1\u6279" : "Pairing" },
+              { tab: "cron", icon: "\u23F0", label: getLang() === "cn" ? "\u5B9A\u65F6\u4EFB\u52A1" : "Cron" },
+              { tab: "skills", icon: "\uD83D\uDD27", label: getLang() === "cn" ? "\u6280\u80FD\u7BA1\u7406" : "Skills" },
+              { tab: "doctor", icon: "\uD83D\uDEE1\uFE0F", label: getLang() === "cn" ? "\u5B89\u5168\u68C0\u67E5" : "Doctor" },
+            ].map((item) => (
+              <button
+                key={item.tab}
+                className={styles["sidebar-quick-btn"]}
+                onClick={() => navigate(Path.RsClawPanel + "?tab=" + item.tab)}
+                title={item.label}
+              >
+                <span>{item.icon}</span>
+                <span>{item.label}</span>
+              </button>
+            ))}
           </div>
         )}
       </SideBarHeader>

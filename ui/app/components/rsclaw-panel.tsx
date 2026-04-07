@@ -4991,48 +4991,9 @@ export function RsClawPanel() {
           </div>
         </div>
 
-        {/* Body */}
-        <div className={styles["panel-body"]} style={{ flexDirection: "column" }}>
-          {/* Nav Grid — 3 columns */}
-          {(() => {
-            const zh = getLang() === "cn";
-            const navItems: { key: PanelPage; icon: string; label: string; badge?: boolean }[] = [
-              { key: "status", icon: "\uD83D\uDCE1", label: zh ? "\u7F51\u5173" : "Gateway" },
-              { key: "config", icon: "\u2699\uFE0F", label: zh ? "\u914D\u7F6E" : "Config" },
-              { key: "agents", icon: "\uD83E\uDD16", label: zh ? "\u667A\u80FD\u4F53" : "Agents" },
-              { key: "pairing", icon: "\uD83D\uDD10", label: zh ? "\u914D\u5BF9\u5BA1\u6279" : "Pairing", badge: true },
-              { key: "cron", icon: "\u23F0", label: zh ? "\u5B9A\u65F6\u4EFB\u52A1" : "Cron" },
-              { key: "skills", icon: "\uD83D\uDD27", label: zh ? "\u6280\u80FD\u7BA1\u7406" : "Skills" },
-              { key: "doctor", icon: "\uD83D\uDEE1\uFE0F", label: zh ? "\u5B89\u5168\u68C0\u67E5" : "Doctor" },
-            ];
-            const active = (k: PanelPage) => activePage === k;
-            return (
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, padding: "8px 12px 4px" }}>
-                {navItems.map((item) => (
-                  <button
-                    key={item.key}
-                    onClick={() => setActivePage(item.key)}
-                    style={{
-                      display: "flex", flexDirection: "column", alignItems: "center", gap: 4,
-                      padding: "8px 4px", borderRadius: 8, cursor: "pointer", border: `1px solid ${active(item.key) ? "rgba(249,115,22,.2)" : "rgba(255,255,255,.05)"}`,
-                      background: active(item.key) ? "rgba(249,115,22,.1)" : "transparent",
-                      color: active(item.key) ? "#f97316" : "#9896a4",
-                      fontFamily: "inherit", position: "relative", transition: "all .12s",
-                    }}
-                  >
-                    <span style={{ fontSize: 16 }}>{item.icon}</span>
-                    <span style={{ fontSize: 10, fontWeight: 500 }}>{item.label}</span>
-                    {item.badge && gatewayRunning && (
-                      <span style={{ position: "absolute", top: 4, right: 8, width: 6, height: 6, borderRadius: "50%", background: "#f97316" }} />
-                    )}
-                  </button>
-                ))}
-              </div>
-            );
-          })()}
-
-          {/* Content */}
-          <div style={{ flex: 1, overflow: "auto" }}>
+        {/* Body = content only (nav moved to sidebar) */}
+        <div className={styles["panel-body"]}>
+          <div className={styles["rsp-content"]} style={{ flex: 1 }}>
             {activePage === "status" && <StatusPage />}
             {activePage === "config" && <ErrorBoundary>{(window as any).__TAURI__?.invoke ? <TauriConfigPage /> : <ConfigEditorPage />}</ErrorBoundary>}
             {activePage === "agents" && <AgentManagerPage />}
