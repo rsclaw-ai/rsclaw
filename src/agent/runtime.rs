@@ -145,6 +145,8 @@ fn model_supports_vision(model: &str, config: &RuntimeConfig) -> bool {
         || lower.contains("minicpm-v")
         || lower.contains("deepseek-vl")
         || lower.contains("qwen3")
+        || lower.contains("doubao")
+        || lower.contains("seed")      // doubao-seed models
     // Known NON-vision models (deepseek-chat, deepseek-r1, qwen-turbo,
     // moonshot, minimax, etc.) return false by default.
 }

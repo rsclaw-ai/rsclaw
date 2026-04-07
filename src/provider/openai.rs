@@ -5,6 +5,8 @@
 //!   - OpenAI Responses API (`openai-responses`) — newer streaming format
 //!   - Ollama (same completions wire format, custom base_url)
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use futures::{StreamExt, TryStreamExt, future::BoxFuture};
 use serde_json::{Value, json};
@@ -420,9 +422,110 @@ impl OpenAiProvider {
         Ok(Box::pin(event_stream))
     }
 
+    /// Upload a base64 data URI image to the provider's Files API.
+    /// Returns the file_id on success.
+    async fn upload_image_to_files(&self, data_uri: &str) -> Result<String> {
+        use base64::Engine;
+
+        // Parse "data:image/png;base64,{base64_data}"
+        let rest = data_uri
+            .strip_prefix("data:")
+            .ok_or_else(|| anyhow::anyhow!("invalid data URI: missing data: prefix"))?;
+        let (meta, b64_data) = rest
+            .split_once(',')
+            .ok_or_else(|| anyhow::anyhow!("invalid data URI: missing comma"))?;
+        let mime_type = meta.split(';').next().unwrap_or("image/png");
+        let ext = match mime_type {
+            "image/jpeg" | "image/jpg" => "jpg",
+            "image/png" => "png",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            _ => "png",
+        };
+
+        let image_bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64_data)
+            .context("failed to decode base64 image data")?;
+
+        let filename = format!("upload.{ext}");
+        let file_part = reqwest::multipart::Part::bytes(image_bytes)
+            .file_name(filename)
+            .mime_str(mime_type)
+            .context("invalid mime type")?;
+
+        let form = reqwest::multipart::Form::new()
+            .text("purpose", "user_data")
+            .part("file", file_part);
+
+        let url = format!("{}/files", self.base_url.trim_end_matches('/'));
+
+        let mut builder = self.client.post(&url);
+        if let Some(key) = &self.api_key {
+            builder = builder.header("authorization", format!("Bearer {key}"));
+        }
+
+        let resp = builder
+            .multipart(form)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .context("Files API upload request failed")?;
+
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Files API upload error: {body}");
+        }
+
+        let body: Value = resp.json().await.context("Files API: parse response")?;
+        let file_id = body["id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Files API response missing id field: {body}"))?
+            .to_owned();
+
+        tracing::debug!(file_id = %file_id, "uploaded image to Files API");
+        Ok(file_id)
+    }
+
+    /// Scan messages for data: URI images and upload them to the Files API.
+    /// Returns a mapping from data_uri -> file_id for successful uploads.
+    async fn upload_images_for_messages(&self, messages: &[Message]) -> HashMap<String, String> {
+        let mut file_id_map = HashMap::new();
+        let mut data_uris: Vec<String> = Vec::new();
+
+        // Collect all data: URIs from messages
+        for msg in messages {
+            if let MessageContent::Parts(parts) = &msg.content {
+                for part in parts {
+                    if let ContentPart::Image { url } = part {
+                        if url.starts_with("data:") && !data_uris.contains(url) {
+                            data_uris.push(url.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Upload each unique data URI
+        for uri in data_uris {
+            match self.upload_image_to_files(&uri).await {
+                Ok(file_id) => {
+                    file_id_map.insert(uri, file_id);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to upload image to Files API, falling back to base64 inline");
+                }
+            }
+        }
+
+        file_id_map
+    }
+
     /// Stream using the OpenAI Responses API format.
     async fn stream_responses(&self, req: &LlmRequest) -> Result<LlmStream> {
-        let body = build_responses_body(req)?;
+        // Upload data: URI images to Files API before building the request body
+        let file_id_map = self.upload_images_for_messages(&req.messages).await;
+
+        let body = build_responses_body(req, &file_id_map)?;
         let body_str = serde_json::to_string(&body).unwrap_or_default();
         tracing::debug!(
             model = %req.model,
@@ -848,12 +951,12 @@ fn parse_event(data: &str) -> Option<StreamEvent> {
 // Responses API: request body builder
 // ---------------------------------------------------------------------------
 
-fn build_responses_body(req: &LlmRequest) -> Result<Value> {
+fn build_responses_body(req: &LlmRequest, file_id_map: &HashMap<String, String>) -> Result<Value> {
     let input: Vec<Value> = req
         .messages
         .iter()
         .filter(|m| m.role != Role::System)
-        .flat_map(serialize_input_items)
+        .flat_map(|m| serialize_input_items(m, file_id_map))
         .collect();
 
     let mut body = json!({
@@ -905,7 +1008,7 @@ fn build_responses_body(req: &LlmRequest) -> Result<Value> {
 
 /// Serialize a Message into one or more Responses API input items.
 /// Returns Vec because assistant tool calls become separate top-level items.
-fn serialize_input_items(msg: &Message) -> Vec<Value> {
+fn serialize_input_items(msg: &Message, file_id_map: &HashMap<String, String>) -> Vec<Value> {
     let role_str = match msg.role {
         Role::User => "user",
         Role::Assistant => "assistant",
@@ -987,7 +1090,9 @@ fn serialize_input_items(msg: &Message) -> Vec<Value> {
                 .iter()
                 .filter_map(|p| match p {
                     ContentPart::Text { text } => Some(json!({ "type": "input_text", "text": text })),
-                    ContentPart::Image { url } => Some(json!({ "type": "input_image", "image_url": url })),
+                    ContentPart::Image { url } => {
+                        Some(serialize_media_for_responses(url, file_id_map))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -1002,28 +1107,39 @@ fn serialize_input_items(msg: &Message) -> Vec<Value> {
     vec![json!({ "role": role_str, "content": content })]
 }
 
-fn serialize_input_part(part: &ContentPart) -> Value {
-    match part {
-        ContentPart::Text { text } => json!({ "type": "input_text", "text": text }),
-        ContentPart::Image { url } => json!({
-            "type": "input_image",
-            "image_url": url,
-        }),
-        ContentPart::ToolUse { id, name, input } => json!({
-            "type": "function_call",
-            "id":   id,
-            "name": name,
-            "arguments": input.to_string(),
-        }),
-        ContentPart::ToolResult {
-            tool_use_id,
-            content,
-            ..
-        } => json!({
-            "type": "function_call_output",
-            "call_id": tool_use_id,
-            "output": content,
-        }),
+/// Serialize a media URL (image/video) for the Responses API.
+/// - data: URI → file_id reference (if uploaded) or base64 inline fallback
+/// - Video URL (.mp4/.mov/.avi/.webm) → input_video
+/// - Image URL → input_image
+fn serialize_media_for_responses(url: &str, file_id_map: &HashMap<String, String>) -> Value {
+    // data: URI → upload to Files API, reference by file_id
+    if url.starts_with("data:") {
+        if let Some(file_id) = file_id_map.get(url) {
+            // Detect video vs image from mime type in data URI
+            if url.starts_with("data:video/") {
+                return json!({ "type": "input_video", "file_id": file_id });
+            }
+            return json!({ "type": "input_image", "file_id": file_id });
+        }
+        // Fallback: inline base64
+        if url.starts_with("data:video/") {
+            return json!({ "type": "input_video", "video_url": url });
+        }
+        return json!({ "type": "input_image", "image_url": url });
+    }
+
+    // Regular URL → detect type by extension
+    let lower = url.to_lowercase();
+    let path = lower.split('?').next().unwrap_or(&lower);
+    if path.ends_with(".mp4")
+        || path.ends_with(".mov")
+        || path.ends_with(".avi")
+        || path.ends_with(".webm")
+        || path.ends_with(".mkv")
+    {
+        json!({ "type": "input_video", "video_url": url })
+    } else {
+        json!({ "type": "input_image", "image_url": url })
     }
 }
 
