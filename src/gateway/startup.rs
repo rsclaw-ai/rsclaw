@@ -461,7 +461,7 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     if let Some(url) = base_url {
                         Arc::new(OpenAiProvider::ollama(url, key))
                     } else {
-                        Arc::new(OpenAiProvider::ollama("http://localhost:11434/v1", key))
+                        Arc::new(OpenAiProvider::ollama("http://localhost:11434", key))
                     }
                 }
                 (_, &crate::config::schema::ApiFormat::OpenAiResponses) => {
@@ -484,6 +484,7 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                 }
             };
 
+            tracing::info!(name=%name, api=?api_format, "provider registered");
             registry.register(name.clone(), provider);
         }
     }
@@ -626,7 +627,7 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
         registry.register(
             "ollama",
             Arc::new(OpenAiProvider::with_base_url(
-                "http://localhost:11434/v1",
+                "http://localhost:11434",
                 None,
             )),
         );

@@ -123,16 +123,9 @@ impl LlmProvider for OpenAiProvider {
 
     fn stream(&self, req: LlmRequest) -> BoxFuture<'_, Result<LlmStream>> {
         Box::pin(async move {
-            // Ollama + reasoning model -> use native /api/chat with think=false
-            // (thinking disabled by default, TODO: make configurable per agent)
+            // Ollama: always use native /api/chat protocol
             if self.is_ollama {
-                let model_lower = req.model.to_lowercase();
-                if model_lower.contains("qwen3")
-                    || model_lower.contains("qwq")
-                    || model_lower.contains("deepseek-r1")
-                {
-                    return self.stream_ollama_native(&req).await;
-                }
+                return self.stream_ollama_native(&req).await;
             }
 
             if self.mode == OpenAiMode::Responses {
@@ -227,8 +220,8 @@ impl OpenAiProvider {
     /// Use ollama native /api/chat for reasoning models with think=true.
     /// This gives properly formatted content with newlines.
     async fn stream_ollama_native(&self, req: &LlmRequest) -> Result<LlmStream> {
-        // Build ollama native API URL: strip /v1 suffix
-        let base = self.base_url.trim_end_matches('/').trim_end_matches("/v1");
+        // Build ollama native API URL
+        let base = self.base_url.trim_end_matches('/');
         let url = format!("{base}/api/chat");
 
         // Build messages in ollama format (same as OpenAI format)
@@ -863,7 +856,7 @@ fn build_responses_body(req: &LlmRequest) -> Result<Value> {
         .messages
         .iter()
         .filter(|m| m.role != Role::System)
-        .map(serialize_input_message)
+        .flat_map(serialize_input_items)
         .collect();
 
     let mut body = json!({
@@ -913,93 +906,103 @@ fn build_responses_body(req: &LlmRequest) -> Result<Value> {
     Ok(body)
 }
 
-fn serialize_input_message(msg: &Message) -> Value {
+/// Serialize a Message into one or more Responses API input items.
+/// Returns Vec because assistant tool calls become separate top-level items.
+fn serialize_input_items(msg: &Message) -> Vec<Value> {
     let role_str = match msg.role {
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::Tool => "tool",
-        Role::System => "user", // shouldn't happen — filtered out
+        Role::System => "user",
     };
 
-    // Tool role messages: wrap as function_call_output
+    // Tool role messages → function_call_output (top-level item)
+    // Skip items with empty call_id (legacy/corrupt history)
     if msg.role == Role::Tool {
         if let MessageContent::Parts(parts) = &msg.content {
-            for part in parts {
-                if let ContentPart::ToolResult {
-                    tool_use_id,
-                    content,
-                    ..
-                } = part
-                {
-                    return json!({
-                        "type": "function_call_output",
-                        "call_id": tool_use_id,
-                        "output": content,
-                    });
-                }
-            }
-        }
-        let text = match &msg.content {
-            MessageContent::Text(t) => t.clone(),
-            MessageContent::Parts(_) => String::new(),
-        };
-        return json!({
-            "type": "function_call_output",
-            "call_id": "",
-            "output": text,
-        });
-    }
-
-    // Assistant messages: extract function_call items
-    if msg.role == Role::Assistant {
-        if let MessageContent::Parts(parts) = &msg.content {
-            let mut items: Vec<Value> = Vec::new();
-            let mut text_parts = Vec::new();
-            for part in parts {
-                match part {
-                    ContentPart::ToolUse { id, name, input } => {
-                        items.push(json!({
-                            "type": "function_call",
-                            "id": id,
-                            "name": name,
-                            "arguments": input.to_string(),
-                        }));
+            let items: Vec<Value> = parts
+                .iter()
+                .filter_map(|p| {
+                    if let ContentPart::ToolResult { tool_use_id, content, .. } = p {
+                        if tool_use_id.is_empty() { return None; }
+                        Some(json!({ "type": "function_call_output", "call_id": tool_use_id, "output": content }))
+                    } else {
+                        None
                     }
-                    ContentPart::Text { text } => text_parts.push(text.clone()),
-                    _ => {}
-                }
-            }
-            if !items.is_empty() {
-                // Include text content as a message item too
-                if !text_parts.is_empty() {
-                    items.insert(
-                        0,
-                        json!({
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{ "type": "output_text", "text": text_parts.join("") }],
-                        }),
-                    );
-                }
-                // Return items array directly — Responses API uses flat item list
-                return json!({
-                    "role": "assistant",
-                    "content": items,
-                });
-            }
+                })
+                .collect();
+            if !items.is_empty() { return items; }
         }
+        // Skip tool messages without valid call_id — legacy history
+        return vec![];
     }
 
-    // Default: role + content parts
+    // Assistant messages → text as message item + tool calls as separate top-level items
+    if msg.role == Role::Assistant {
+        let mut result: Vec<Value> = Vec::new();
+        let mut text_parts = Vec::new();
+
+        match &msg.content {
+            MessageContent::Text(t) => text_parts.push(t.clone()),
+            MessageContent::Parts(parts) => {
+                for part in parts {
+                    match part {
+                        ContentPart::Text { text } => text_parts.push(text.clone()),
+                        ContentPart::ToolUse { id, name, input } => {
+                            // Skip tool calls with empty id (legacy history)
+                            if !id.is_empty() {
+                                result.push(json!({
+                                    "type": "function_call",
+                                    "call_id": id,
+                                    "name": name,
+                                    "arguments": input.to_string(),
+                                    "status": "completed",
+                                }));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let text = text_parts.join("");
+        // Only emit assistant message if there's actual text or valid tool calls
+        if !text.is_empty() {
+            result.insert(0, json!({
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{ "type": "output_text", "text": text }],
+            }));
+        }
+        if !result.is_empty() {
+            return result;
+        }
+        // Empty assistant message with no valid tool calls — skip (legacy history)
+    }
+
+    // User messages → only text/image parts (no tool parts in content)
     let content = match &msg.content {
         MessageContent::Text(t) => json!([{ "type": "input_text", "text": t }]),
         MessageContent::Parts(parts) => {
-            let serialized: Vec<Value> = parts.iter().map(serialize_input_part).collect();
-            json!(serialized)
+            let serialized: Vec<Value> = parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(json!({ "type": "input_text", "text": text })),
+                    ContentPart::Image { url } => Some(json!({ "type": "input_image", "image_url": url })),
+                    _ => None,
+                })
+                .collect();
+            if serialized.is_empty() {
+                json!([{ "type": "input_text", "text": "" }])
+            } else {
+                json!(serialized)
+            }
         }
     };
 
-    json!({ "role": role_str, "content": content })
+    vec![json!({ "role": role_str, "content": content })]
 }
 
 fn serialize_input_part(part: &ContentPart) -> Value {
