@@ -1744,7 +1744,7 @@ function AgentManagerPage() {
       await fetchAgentList();
       setShowModal(false);
       resetForm();
-      toast.success(getLang() === "cn" ? "\u5DF2\u4FDD\u5B58" : "Saved");
+      toast.success(getLang() === "cn" ? "\u5DF2\u4FDD\u5B58\uFF0C\u9700\u91CD\u542F\u7F51\u5173\u751F\u6548" : "Saved. Restart gateway to take effect.");
     } catch (e) {
       toast.fromError(Locale.RsClawPanel.Agents.SaveFailed, e);
     }
@@ -1768,7 +1768,7 @@ function AgentManagerPage() {
           try { await reloadConfig(); } catch {}
         }
       }
-      toast.success(getLang() === "cn" ? "\u5DF2\u5220\u9664" : "Deleted");
+      toast.success(getLang() === "cn" ? "\u5DF2\u5220\u9664\uFF0C\u9700\u91CD\u542F\u7F51\u5173\u751F\u6548" : "Deleted. Restart gateway to take effect.");
     } catch (e) {
       // Revert optimistic update on failure
       await fetchAgentList();
@@ -3458,7 +3458,7 @@ function TauriConfigPageInner() {
   const handleSelectModel = (provId: string, modelId: string) => {
     setProvSelModel((prev) => ({ ...prev, [provId]: modelId }));
     updateConfig("agents.defaults.model.primary", `${provId}/${modelId}`);
-    toast.success(zh ? `默认模型: ${provId}/${modelId}` : `Default model: ${provId}/${modelId}`);
+    toast.success(zh ? `\u9ED8\u8BA4\u6A21\u578B: ${provId}/${modelId}\uFF0C\u9700\u91CD\u542F\u7F51\u5173\u751F\u6548` : `Default model: ${provId}/${modelId}. Restart gateway to take effect.`);
   };
 
   // ── Chevron SVG ──
