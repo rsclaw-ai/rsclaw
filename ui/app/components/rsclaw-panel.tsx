@@ -3784,11 +3784,11 @@ function TauriConfigPageInner() {
                         ) : p.id === "custom" ? (
                           /* Custom: Base URL + API Key */
                           <div style={{ marginBottom: 8 }}>
-                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>Base URL <span style={{ color: V.t3 }}>{zh ? "(\u4EE5 /v1 \u7ED3\u5C3E)" : "(ending with /v1)"}</span></div>
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>API URL</div>
                             <input
                               style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", marginBottom: 8 }}
                               type="text"
-                              placeholder="https://api.example.com/v1"
+                              placeholder="https://your-api-server.com"
                               value={baseUrl}
                               onChange={(e) => {
                                 updateConfig(`models.providers.${p.id}.baseUrl`, e.target.value);

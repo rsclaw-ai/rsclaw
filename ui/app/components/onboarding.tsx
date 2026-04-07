@@ -1906,8 +1906,9 @@ export function OnboardingPage() {
   );
 
   // ── Channel logic ──
-  // Single-select: only one channel at a time
+  // Single-select: only one channel at a time, auto-start QR on select
   const toggleChannel = (id: string) => {
+    const wasEnabled = chs[id]?.enabled;
     setChs((prev) => {
       const c: Record<string, any> = {};
       for (const [k, v] of Object.entries(prev)) {
@@ -1915,6 +1916,13 @@ export function OnboardingPage() {
       }
       return c;
     });
+    // Auto-start QR login when selecting a channel that supports it
+    if (!wasEnabled) {
+      const chDef = ALL_CHANNELS[id];
+      if (chDef?.hasQr) {
+        setTimeout(() => startChannelQr(id), 300);
+      }
+    }
   };
 
   const setChTab = (chId: string, tab: "qr" | "cred") => {
@@ -2695,8 +2703,7 @@ export function OnboardingPage() {
                 const hasQr = chDef.hasQr;
 
                 return (
-                  <div key={activeId} style={{ marginTop: 12, background: V.bg3, border: `1px solid ${V.bd}`, borderRadius: 10, padding: 16, maxHeight: 220, overflowY: "auto" }}>
-                    <div style={{ fontSize: 12, fontWeight: 600, color: V.t0, marginBottom: 8 }}>{isZh ? chDef.name : chDef.nameEn}</div>
+                  <div key={activeId} style={{ marginTop: 12, background: V.bg3, border: `1px solid ${V.bd}`, borderRadius: 10, padding: 16, maxHeight: 320, overflowY: "auto" }}>
                     {/* QR / Credential tabs for wechat/feishu */}
                     {hasQr && (
                       <div style={{ display: "flex", gap: 0, borderBottom: `1px solid ${V.bd}`, marginBottom: 12, marginLeft: -16, marginRight: -16, paddingLeft: 16, paddingRight: 16 }}>
