@@ -99,36 +99,6 @@ impl ProviderRegistry {
     }
 }
 
-/// Default API base URL for a provider name. Returns `(base_url, auth_style)`.
-///
-/// `auth_style` is one of: `"bearer"`, `"x-api-key"`, `"none"`.
-///
-/// This is the **single source of truth** for provider URLs. Used by:
-///   - `gateway/startup.rs` (runtime provider construction)
-///   - `server/mod.rs` (UI test-provider and list-models endpoints)
-pub fn provider_base_url(provider: &str) -> (&'static str, &'static str) {
-    match provider {
-        "anthropic"   => ("https://api.anthropic.com",                           "x-api-key"),
-        "openai"      => ("https://api.openai.com/v1",                           "bearer"),
-        "deepseek"    => ("https://api.deepseek.com/v1",                         "bearer"),
-        "qwen"        => ("https://dashscope.aliyuncs.com/compatible-mode/v1",   "bearer"),
-        "minimax"     => ("https://api.minimax.chat/v1",                         "bearer"),
-        "kimi"
-        | "moonshot"  => ("https://api.moonshot.cn/v1",                          "bearer"),
-        "zhipu"       => ("https://open.bigmodel.cn/api/paas/v4",               "bearer"),
-        "groq"        => ("https://api.groq.com/openai/v1",                      "bearer"),
-        "grok"
-        | "xai"       => ("https://api.x.ai/v1",                                "bearer"),
-        "gemini"      => ("https://generativelanguage.googleapis.com/v1beta",    "bearer"),
-        "siliconflow" => ("https://api.siliconflow.cn/v1",                       "bearer"),
-        "openrouter"  => ("https://openrouter.ai/api/v1",                        "bearer"),
-        "gaterouter"  => ("https://api.gaterouter.com/v1",                       "bearer"),
-        "stepfun"     => ("https://api.stepfun.com/v1",                          "bearer"),
-        "ollama"      => ("http://localhost:11434",                               "none"),
-        _             => ("",                                                     "bearer"),
-    }
-}
-
 fn infer_provider(model: &str) -> &str {
     if model.starts_with("claude") {
         "anthropic"
