@@ -304,7 +304,22 @@ export function Settings() {
             </Select>
           </ListItem>
 
-          {/* Theme selector removed -- dark only */}
+          <ListItem title={Locale.Settings.Theme}>
+            <Select
+              value={config.theme}
+              onChange={(e) => {
+                updateConfig(
+                  (config) => (config.theme = e.target.value as any as Theme),
+                );
+              }}
+            >
+              {Object.values(Theme).map((v) => (
+                <option value={v} key={v}>
+                  {v}
+                </option>
+              ))}
+            </Select>
+          </ListItem>
 
           <ListItem title={Locale.Settings.Lang.Name}>
             <Select
