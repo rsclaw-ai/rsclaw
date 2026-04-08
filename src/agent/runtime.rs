@@ -4850,7 +4850,14 @@ $bitmap.Dispose()
                 }
             });
 
+        // Resolve User-Agent: provider config → gateway config → default
+        let img_ua = self.config.model.models.as_ref()
+            .and_then(|m| m.providers.get(img_prov))
+            .and_then(|p| p.user_agent.as_deref())
+            .or_else(|| self.config.gateway.user_agent.as_deref())
+            .unwrap_or("claude-code/0.1.0");
         let client = reqwest::Client::builder()
+            .user_agent(img_ua)
             .timeout(std::time::Duration::from_secs(120))
             .build().unwrap_or_default();
 
