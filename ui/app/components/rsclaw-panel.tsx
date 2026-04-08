@@ -240,7 +240,7 @@ function StatusPage() {
           <div className={styles["status-name"]}>{Locale.RsClawPanel.Status.GatewayName}</div>
           <div className={styles["status-addr"]}>
             {health.running
-              ? `rsclaw gateway v${health.version || "?"} · localhost:${health.port || 18888} · ${Locale.RsClawPanel.Status.Uptime} ${health.uptime || "N/A"}`
+              ? `rsclaw gateway ${health.version || "?"} · localhost:${health.port || 18888} · ${Locale.RsClawPanel.Status.Uptime} ${health.uptime || "N/A"}`
               : Locale.RsClawPanel.Status.NotResponding}
           </div>
         </div>
@@ -491,13 +491,15 @@ function ConfigEditorPage() {
 
   // Parsed config fields - Models
   const [providers, setProviders] = useState<{
-    name: string; key: string; enabled: boolean; apiKey: string; baseUrl: string; apiType?: ApiType;
+    name: string; key: string; enabled: boolean; apiKey: string; baseUrl: string; apiType?: ApiType; userAgent?: string;
   }[]>([
     { name: "Doubao (\u8C46\u5305)", key: "doubao", enabled: false, apiKey: "", baseUrl: "" },
     { name: "Qwen (\u5343\u95EE)", key: "qwen", enabled: false, apiKey: "", baseUrl: "" },
     { name: "Anthropic", key: "anthropic", enabled: false, apiKey: "", baseUrl: "" },
     { name: "OpenAI", key: "openai", enabled: false, apiKey: "", baseUrl: "" },
     { name: "DeepSeek", key: "deepseek", enabled: false, apiKey: "", baseUrl: "" },
+    { name: "Kimi", key: "kimi", enabled: false, apiKey: "", baseUrl: "", userAgent: "claude-code/0.1.0" },
+    { name: "CodingPlan", key: "codingplan", enabled: false, apiKey: "", baseUrl: "" },
     { name: "Ollama", key: "ollama", enabled: true, apiKey: "", baseUrl: "http://localhost:11434" },
     { name: "Custom Provider", key: "custom", enabled: false, apiKey: "", baseUrl: "" },
   ]);
@@ -550,9 +552,9 @@ function ConfigEditorPage() {
     if (amt) setAgentMaxTokens(parseInt(amt, 10) || 4096);
 
     // Models - try to detect provider blocks
-    const providerNames = ["doubao", "qwen", "anthropic", "openai", "deepseek", "ollama", "custom"];
+    const providerNames = ["doubao", "qwen", "anthropic", "openai", "deepseek", "kimi", "codingplan", "ollama", "custom"];
     const displayNames: Record<string, string> = {
-      doubao: "Doubao (\u8C46\u5305)", qwen: "Qwen (\u5343\u95EE)", anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", ollama: "Ollama", custom: "Custom Provider",
+      doubao: "Doubao (\u8C46\u5305)", qwen: "Qwen (\u5343\u95EE)", anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", kimi: "Kimi", codingplan: "CodingPlan", ollama: "Ollama", custom: "Custom Provider",
     };
     const newProviders = providerNames.map((pName) => {
       // Look for a block like anthropic: { ... }
@@ -561,18 +563,21 @@ function ConfigEditorPage() {
       const block = blockMatch ? blockMatch[1] : "";
       const apiKey = extractVal(block, "apiKey") || "";
       const baseUrl = extractVal(block, "baseUrl") || extractVal(block, "base_url") || "";
+      const userAgent = extractVal(block, "userAgent") || extractVal(block, "user_agent") || "";
       const enabled = extractVal(block, "enabled");
       const apiField = extractVal(block, "api") || extractVal(block, "api_type");
       const apiType: ApiType | undefined = (apiField === "anthropic" || apiField === "gemini" || apiField === "ollama" || apiField === "openai" || apiField === "openai-responses")
         ? (apiField as ApiType)
         : undefined;
+      const isCustomLike = pName === "custom" || pName === "codingplan";
       return {
         name: displayNames[pName] || pName,
         key: pName,
-        enabled: enabled !== undefined ? enabled === "true" : (pName === "custom" ? !!baseUrl : apiKey.length > 0),
+        enabled: enabled !== undefined ? enabled === "true" : (isCustomLike ? !!baseUrl : apiKey.length > 0),
         apiKey,
         baseUrl: baseUrl || "",
-        ...(pName === "custom" ? { apiType } : {}),
+        userAgent: userAgent || (pName === "kimi" ? "claude-code/0.1.0" : ""),
+        ...(isCustomLike ? { apiType } : {}),
       };
     });
     setProviders(newProviders);
@@ -853,6 +858,7 @@ function ConfigEditorPage() {
   const renderModels = () => (
     <div>
       {providers.map((prov, idx) => {
+        const isCustomLike = prov.key === "custom" || prov.key === "codingplan";
         const isCustom = prov.key === "custom";
         const curApiType: ApiType | undefined = prov.apiType;
         const hideKey = prov.key === "ollama";
@@ -889,7 +895,7 @@ function ConfigEditorPage() {
               markDirty();
             }} />
           </div>
-          {isCustom && (
+          {isCustomLike && (
             <div style={fieldRow}>
               <div style={fieldLabel}>API Type</div>
               <select
@@ -925,12 +931,13 @@ function ConfigEditorPage() {
                 }} />
             </div>
           )}
-          {(isCustom || prov.key === "doubao" || prov.key === "ollama") && (
-          <div style={{ ...fieldRow, borderBottom: "none" }}>
+          {(isCustomLike || prov.key === "doubao" || prov.key === "ollama" || prov.key === "kimi") && (
+          <div style={fieldRow}>
             <div style={fieldLabel}>API URL</div>
             <input style={fieldInput} value={prov.baseUrl}
               placeholder={
-                isCustom ? "https://your-api-server.com" :
+                isCustomLike ? "https://your-api-server.com/v1" :
+                prov.key === "kimi" ? "https://api.moonshot.cn/v1" :
                 prov.key === "doubao" ? "https://ark.cn-beijing.volces.com/api/v3" :
                 prov.key === "ollama" ? "http://localhost:11434" :
                 "(default)"
@@ -938,6 +945,19 @@ function ConfigEditorPage() {
               onChange={(e) => {
                 const next = [...providers];
                 next[idx] = { ...next[idx], baseUrl: e.target.value };
+                setProviders(next);
+                markDirty();
+              }} />
+          </div>
+          )}
+          {(isCustomLike || prov.key === "kimi") && (
+          <div style={{ ...fieldRow, borderBottom: "none" }}>
+            <div style={fieldLabel}>User-Agent</div>
+            <input style={fieldInput} value={prov.userAgent || ""}
+              placeholder="e.g. claude-code/0.1.0"
+              onChange={(e) => {
+                const next = [...providers];
+                next[idx] = { ...next[idx], userAgent: e.target.value };
                 setProviders(next);
                 markDirty();
               }} />

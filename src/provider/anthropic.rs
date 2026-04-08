@@ -44,7 +44,7 @@ impl AnthropicProvider {
         user_agent: Option<String>,
     ) -> Self {
         Self {
-            client: Client::new(),
+            client: super::http_client_with_ua(user_agent.as_deref()),
             api_key: api_key.into(),
             base_url: base_url.into(),
             user_agent,
@@ -69,7 +69,7 @@ impl LlmProvider for AnthropicProvider {
                 .header("content-type", "application/json")
                 .header(
                     "user-agent",
-                    self.user_agent.as_deref().unwrap_or("OpenClaw/1.0"),
+                    self.user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT),
                 )
                 .json(&body)
                 .send()

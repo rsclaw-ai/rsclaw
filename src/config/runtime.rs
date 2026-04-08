@@ -50,6 +50,8 @@ pub struct GatewayRuntime {
     pub channel_health_check_minutes: u32,
     pub channel_stale_event_threshold_minutes: u32,
     pub channel_max_restarts_per_hour: u32,
+    /// Global default User-Agent for LLM provider requests. Provider-level overrides this.
+    pub user_agent: Option<String>,
 }
 
 /// Agent list, per-agent defaults, bindings.  Registry rebuild required on
@@ -179,6 +181,7 @@ impl IntoRuntime for Config {
                     .channel_stale_event_threshold_minutes
                     .unwrap_or(30),
                 channel_max_restarts_per_hour: gw.channel_max_restarts_per_hour.unwrap_or(10),
+                user_agent: gw.user_agent.clone(),
             },
             agents: AgentsRuntime {
                 defaults: agents_cfg.defaults.unwrap_or_default(),

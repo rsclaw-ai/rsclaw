@@ -4511,9 +4511,28 @@ $bitmap.Dispose()
             (st, body)
         } else if is_minimax {
             // Minimax: /v1/image_generation, aspect_ratio instead of size
+            // Supported: "1:1", "16:9", "9:16", "4:3", "3:4", "2:3", "3:2"
             let aspect = if size.contains('x') {
                 let parts: Vec<&str> = size.split('x').collect();
-                if parts.len() == 2 { format!("{}:{}", parts[0].parse::<u32>().unwrap_or(1024) / 1024, parts[1].parse::<u32>().unwrap_or(1024) / 1024).replace("0:0","1:1") } else { "1:1".to_owned() }
+                if parts.len() == 2 {
+                    let w = parts[0].parse::<f32>().unwrap_or(1024.0);
+                    let h = parts[1].parse::<f32>().unwrap_or(1024.0);
+                    let ratio = w / h.max(1.0);
+                    let candidates = [
+                        (1.0_f32,        "1:1"),
+                        (16.0 / 9.0,     "16:9"),
+                        (9.0 / 16.0,     "9:16"),
+                        (4.0 / 3.0,      "4:3"),
+                        (3.0 / 4.0,      "3:4"),
+                        (3.0 / 2.0,      "3:2"),
+                        (2.0 / 3.0,      "2:3"),
+                    ];
+                    candidates.iter()
+                        .min_by(|a, b| (a.0 - ratio).abs().partial_cmp(&(b.0 - ratio).abs()).unwrap())
+                        .map(|c| c.1)
+                        .unwrap_or("1:1")
+                        .to_owned()
+                } else { "1:1".to_owned() }
             } else { "1:1".to_owned() };
             let url = format!("{}/image_generation", img_url.trim_end_matches('/'));
             let resp = client.post(&url)

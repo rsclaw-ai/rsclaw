@@ -776,6 +776,7 @@ export interface ProviderDef {
   sep?: boolean;
   hasBaseUrl?: boolean;
   defaultBaseUrl?: string;
+  defaultUserAgent?: string;
 }
 
 // All providers (unordered lookup table)
@@ -784,7 +785,8 @@ export const ALL_PROVIDERS: Record<string, ProviderDef> = {
   doubao:      { id: "doubao",      name: "Doubao (\u8C46\u5305)", tag: "\u5B57\u8282\u8DF3\u52A8",     tagEn: "ByteDance",         keyLabel: "ARK API Key",         keyPlaceholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", hasBaseUrl: true, defaultBaseUrl: "https://ark.cn-beijing.volces.com/api/v3" },
   minimax:     { id: "minimax",     name: "MiniMax",            tag: "\u56FD\u5185",                  tagEn: "China",             keyLabel: "MiniMax API Key",     keyPlaceholder: "eyJ..." },
   deepseek:    { id: "deepseek",    name: "DeepSeek",           tag: "\u4F4E\u6210\u672C",            tagEn: "Low cost",          keyLabel: "DeepSeek API Key",    keyPlaceholder: "sk-..." },
-  kimi:        { id: "kimi",        name: "Kimi",               tag: "\u56FD\u5185",                  tagEn: "China",             keyLabel: "Kimi API Key",        keyPlaceholder: "sk-..." },
+  kimi:        { id: "kimi",        name: "Kimi",               tag: "\u56FD\u5185",                  tagEn: "China",             keyLabel: "Kimi API Key",        keyPlaceholder: "sk-...", hasBaseUrl: true, defaultBaseUrl: "https://api.moonshot.cn/v1", defaultUserAgent: "claude-code/0.1.0" },
+  codingplan:  { id: "codingplan",  name: "CodingPlan",         tag: "\u7F16\u7A0B\u8BA1\u5212",      tagEn: "Coding Plan",       keyLabel: "API URL",             keyPlaceholder: "https://api.example.com/v1", isUrl: true },
   zhipu:       { id: "zhipu",       name: "Zhipu (GLM)",        tag: "\u56FD\u5185",                  tagEn: "China",             keyLabel: "Zhipu API Key",       keyPlaceholder: "sk-..." },
   ollama:      { id: "ollama",      name: "Ollama (local)",     tag: "\u65E0\u9700 Key",              tagEn: "No Key",            keyLabel: "URL",                 keyPlaceholder: "http://localhost:11434/v1", isUrl: true },
   custom:      { id: "custom",      name: "Custom Provider",    tag: "\u81EA\u5B9A\u4E49",            tagEn: "Custom",            keyLabel: "API URL",             keyPlaceholder: "https://api.example.com/v1", isUrl: true },
@@ -798,8 +800,8 @@ export const ALL_PROVIDERS: Record<string, ProviderDef> = {
   siliconflow: { id: "siliconflow", name: "SiliconFlow",        tag: "\u56FD\u5185\u52A0\u901F",      tagEn: "China accel",       keyLabel: "SiliconFlow Key",     keyPlaceholder: "sk-..." },
 };
 
-export const PROV_ORDER_ZH = ["doubao","qwen","custom","minimax","deepseek","kimi","zhipu","ollama","gaterouter","openrouter","anthropic","openai","gemini","grok","groq","siliconflow"];
-export const PROV_ORDER_EN = ["anthropic","openai","gemini","grok","openrouter","ollama","custom","groq","doubao","qwen","minimax","deepseek","kimi","zhipu","gaterouter","siliconflow"];
+export const PROV_ORDER_ZH = ["doubao","qwen","custom","codingplan","minimax","deepseek","kimi","zhipu","ollama","gaterouter","openrouter","anthropic","openai","gemini","grok","groq","siliconflow"];
+export const PROV_ORDER_EN = ["anthropic","openai","gemini","grok","openrouter","ollama","custom","codingplan","groq","doubao","qwen","minimax","deepseek","kimi","zhipu","gaterouter","siliconflow"];
 
 function getProviders(lang?: string): ProviderDef[] {
   const isZhOrder = (lang || getLang()) === "cn";
@@ -1504,6 +1506,7 @@ interface ProvState {
   apiKey: string;
   baseUrl: string;
   apiType?: ApiType;
+  userAgent: string;
   testStatus: "idle" | "testing" | "success" | "error";
   testError: string;
   models: ModelDef[] | null;
@@ -1512,12 +1515,13 @@ interface ProvState {
   inputState: "" | "ok" | "err";
 }
 
-function makeProvState(selected: boolean, isUrl?: boolean): ProvState {
+function makeProvState(selected: boolean, isUrl?: boolean, defaultUserAgent?: string): ProvState {
   return {
     selected,
     apiKey: "",
     baseUrl: isUrl ? "http://localhost:11434/v1" : "",
     apiType: undefined,
+    userAgent: defaultUserAgent || "",
     testStatus: "idle",
     testError: "",
     models: null,
@@ -1579,7 +1583,7 @@ export function OnboardingPage() {
   const [provs, setProvs] = useState<Record<string, ProvState>>(() => {
     const m: Record<string, ProvState> = {};
     Object.values(ALL_PROVIDERS).forEach((p) => {
-      const ps = makeProvState(false, p.isUrl);
+      const ps = makeProvState(false, p.isUrl, p.defaultUserAgent);
       if (p.id === "custom") {
         // Leave apiType and baseUrl empty - user picks them
         ps.apiType = undefined;
@@ -1789,6 +1793,14 @@ export function OnboardingPage() {
     setProvs((prev) => {
       const p = { ...prev };
       p[id] = { ...p[id], baseUrl: url, testStatus: "idle", models: null, selectedModel: null, inputState: "", testError: "" };
+      return p;
+    });
+  };
+
+  const setProvUserAgent = (id: string, ua: string) => {
+    setProvs((prev) => {
+      const p = { ...prev };
+      p[id] = { ...p[id], userAgent: ua };
       return p;
     });
   };
@@ -2025,17 +2037,20 @@ export function OnboardingPage() {
     const providers: Record<string, any> = {};
     for (const [id, ps] of Object.entries(provs)) {
       if (!ps.selected || !ps.selectedModel) continue;
-      if (id === "custom") {
+      const isCustomLike = id === "custom" || id === "codingplan";
+      if (isCustomLike) {
         const apiType = ps.apiType || "openai";
         const entry: Record<string, any> = { api: apiType };
         if (ps.baseUrl) entry.baseUrl = ps.baseUrl;
         if (ps.apiKey) entry.apiKey = ps.apiKey;
+        if (ps.userAgent) entry.userAgent = ps.userAgent;
         providers[id] = entry;
       } else if (PROVIDERS.find((p) => p.id === id)?.isUrl) {
         providers[id] = { api: "ollama", baseUrl: ps.baseUrl || ps.apiKey };
       } else if (ps.apiKey) {
         const entry: Record<string, any> = { apiKey: ps.apiKey };
         if (ps.baseUrl) entry.baseUrl = ps.baseUrl;
+        if (ps.userAgent) entry.userAgent = ps.userAgent;
         providers[id] = entry;
       } else {
         providers[id] = {};
@@ -2501,17 +2516,18 @@ export function OnboardingPage() {
                 const pDef = PROVIDERS.find((p) => p.id === activeId);
                 if (!pDef || pDef.sep) return null;
                 const ps = provs[activeId];
+                const isCustomLike = activeId === "custom" || activeId === "codingplan";
                 const isCustom = activeId === "custom";
                 const curApiType: ApiType = ps.apiType || "openai";
-                const keyRequired = !isCustom || API_TYPE_NEEDS_KEY[curApiType];
+                const keyRequired = !isCustomLike || API_TYPE_NEEDS_KEY[curApiType];
                 const inputFieldStyle = { flex: 1, background: "#1f2126", border: `1px solid ${ps.inputState === "ok" ? "#2dd4a0" : ps.inputState === "err" ? "#d95f5f" : "rgba(255,255,255,0.09)"}`, borderRadius: 7, padding: "7px 10px", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none" } as const;
                 const fieldLabelStyle = { fontSize: 10, color: "#2e2c3a", letterSpacing: 0.4, marginBottom: 5, fontFamily: "'JetBrains Mono', monospace" } as const;
                 const plainInputStyle = { width: "100%", background: "#1f2126", border: "1px solid rgba(255,255,255,0.09)", borderRadius: 7, padding: "7px 10px", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none", boxSizing: "border-box" } as const;
                 const selectStyle = { width: "100%", background: "#1f2126", border: "1px solid rgba(255,255,255,0.09)", borderRadius: 7, padding: "7px 10px", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none", cursor: "pointer" } as const;
                 return (
                   <div style={{ marginTop: 12, background: "#1a1c22", border: "1px solid rgba(255,255,255,0.055)", borderRadius: 10, padding: 16 }}>
-                    {/* Custom Provider: api_type dropdown */}
-                    {isCustom && (
+                    {/* Custom/CodingPlan: api_type dropdown */}
+                    {isCustomLike && (
                       <div style={{ marginBottom: 10 }}>
                         <div style={fieldLabelStyle}>API Type</div>
                         <select
@@ -2525,8 +2541,8 @@ export function OnboardingPage() {
                         </select>
                       </div>
                     )}
-                    {/* Custom Provider: Base URL input */}
-                    {isCustom && (
+                    {/* Custom/CodingPlan: Base URL input */}
+                    {isCustomLike && (
                       <div style={{ marginBottom: 10 }}>
                         <div style={fieldLabelStyle}>Base URL</div>
                         <input
@@ -2539,7 +2555,7 @@ export function OnboardingPage() {
                       </div>
                     )}
                     {/* Standard (non-custom) providers: show their key label and input inline with test button */}
-                    {!isCustom && (
+                    {!isCustomLike && (
                       <>
                         <div style={fieldLabelStyle}>{pDef.keyLabel}</div>
                         <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
@@ -2572,10 +2588,22 @@ export function OnboardingPage() {
                             />
                           </div>
                         )}
+                        {pDef.defaultUserAgent !== undefined && (
+                          <div style={{ marginBottom: 10 }}>
+                            <div style={fieldLabelStyle}>User-Agent</div>
+                            <input
+                              type="text"
+                              style={plainInputStyle}
+                              value={ps.userAgent}
+                              onChange={(e) => setProvUserAgent(activeId, e.target.value)}
+                              placeholder={pDef.defaultUserAgent || "Mozilla/5.0 (compatible; rsclaw/1.0)"}
+                            />
+                          </div>
+                        )}
                       </>
                     )}
-                    {/* Custom Provider: API Key + test button row */}
-                    {isCustom && (
+                    {/* Custom/CodingPlan: API Key + test button row */}
+                    {isCustomLike && (
                       <div style={{ marginBottom: 10 }}>
                         <div style={fieldLabelStyle}>API Key{!keyRequired && <span style={{ color: "#666", fontWeight: 400 }}> (optional)</span>}</div>
                         <div style={{ display: "flex", gap: 8, marginBottom: 0 }}>
@@ -2596,6 +2624,19 @@ export function OnboardingPage() {
                               : t.test}
                           </button>
                         </div>
+                      </div>
+                    )}
+                    {/* Custom/CodingPlan: User-Agent field */}
+                    {isCustomLike && (
+                      <div style={{ marginBottom: 10 }}>
+                        <div style={fieldLabelStyle}>User-Agent <span style={{ color: "#666", fontWeight: 400 }}>(optional)</span></div>
+                        <input
+                          type="text"
+                          style={plainInputStyle}
+                          value={ps.userAgent}
+                          onChange={(e) => setProvUserAgent(activeId, e.target.value)}
+                          placeholder="e.g. claude-code/0.1.0"
+                        />
                       </div>
                     )}
                     {ps.testError && <div style={{ fontSize: 11, color: "#d95f5f", marginBottom: 8 }}>{ps.testError}</div>}

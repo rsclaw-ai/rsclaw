@@ -31,7 +31,9 @@ use crate::{
     plugin::{MemoryStoreSlot, PluginRegistry, load_plugins},
     provider::{
         LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
-        anthropic::AnthropicProvider, failover::FailoverManager, gemini::GeminiProvider,
+        anthropic::{self as anthropic, AnthropicProvider},
+        failover::FailoverManager,
+        gemini::{self as gemini, GeminiProvider},
         openai::OpenAiProvider,
         registry::ProviderRegistry,
     },
@@ -421,6 +423,10 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                 }
             });
 
+            // Resolve User-Agent: provider > gateway > built-in default.
+            let user_agent = provider_cfg.user_agent.clone()
+                .or_else(|| config.gateway.user_agent.clone());
+
             // Determine API format: explicit `api` field > name-based inference.
             let api_format = provider_cfg.api.clone().unwrap_or_else(|| {
                 use crate::config::schema::ApiFormat;
@@ -439,47 +445,37 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     let key = api_key
                         .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
                         .unwrap_or_default();
-                    if let Some(url) = base_url {
-                        Arc::new(AnthropicProvider::with_base_url(key, url))
-                    } else {
-                        Arc::new(AnthropicProvider::new(key))
-                    }
+                    let url = base_url.unwrap_or_else(|| anthropic::ANTHROPIC_API_BASE.to_owned());
+                    Arc::new(AnthropicProvider::with_user_agent(key, url, user_agent))
                 }
                 ("gemini", _) => {
                     let key = api_key
                         .or_else(|| std::env::var("GEMINI_API_KEY").ok())
                         .unwrap_or_default();
-                    if let Some(url) = base_url {
-                        Arc::new(GeminiProvider::with_base_url(key, url))
-                    } else {
-                        Arc::new(GeminiProvider::new(key))
-                    }
+                    let url = base_url.unwrap_or_else(|| gemini::GEMINI_API_BASE.to_owned());
+                    Arc::new(GeminiProvider::with_user_agent(key, url, user_agent))
                 }
                 (_, &crate::config::schema::ApiFormat::Ollama) => {
                     // Ollama backend: reasoning models use native /api/chat
                     let key = api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok());
-                    if let Some(url) = base_url {
-                        Arc::new(OpenAiProvider::ollama(url, key))
-                    } else {
-                        Arc::new(OpenAiProvider::ollama("http://localhost:11434", key))
-                    }
+                    let url = base_url.unwrap_or_else(|| "http://localhost:11434".to_owned());
+                    Arc::new(OpenAiProvider::ollama_with_ua(url, key, user_agent))
                 }
                 (_, &crate::config::schema::ApiFormat::OpenAiResponses) => {
                     let key = api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok());
-                    if let Some(url) = base_url {
-                        Arc::new(OpenAiProvider::responses(url, key))
-                    } else {
-                        Arc::new(OpenAiProvider::responses(crate::provider::openai::OPENAI_API_BASE, key))
-                    }
+                    let url = base_url.unwrap_or_else(|| crate::provider::openai::OPENAI_API_BASE.to_owned());
+                    Arc::new(OpenAiProvider::responses_with_ua(url, key, user_agent))
                 }
                 _ => {
                     // OpenAI-compatible (covers openai-completions,
                     // llama.cpp, vLLM, SGLang, etc.)
                     let key = api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok());
                     if let Some(url) = base_url {
-                        Arc::new(OpenAiProvider::with_base_url(url, key))
+                        Arc::new(OpenAiProvider::with_user_agent(url, key, user_agent))
                     } else {
-                        Arc::new(OpenAiProvider::new(key.unwrap_or_default()))
+                        Arc::new(OpenAiProvider::with_user_agent(
+                            crate::provider::openai::OPENAI_API_BASE, key, user_agent,
+                        ))
                     }
                 }
             };

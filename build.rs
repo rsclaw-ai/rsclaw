@@ -3,7 +3,7 @@ fn main() {
     // CI overrides these via env vars; local dev gets sensible defaults.
     if std::env::var("RSCLAW_BUILD_VERSION").is_err() {
         let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "dev".to_owned());
-        println!("cargo:rustc-env=RSCLAW_BUILD_VERSION={version}");
+        println!("cargo:rustc-env=RSCLAW_BUILD_VERSION=v{version}");
     }
     if std::env::var("RSCLAW_BUILD_DATE").is_err() {
         // Simple date without external crates

@@ -81,7 +81,7 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
                 crate::config::schema::BindMode::Tailnet => "tailnet",
             };
             let pid = std::process::id();
-            banner(&format!("rsclaw gateway v{VERSION}"));
+            banner(&format!("rsclaw gateway {VERSION}"));
             kv("Port:", &format!("{port} | Bind: {bind}"));
             kv("PID:", &format!("{pid}"));
             println!();
@@ -95,7 +95,7 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
                 return Ok(());
             }
 
-            banner(&format!("rsclaw gateway v{VERSION}"));
+            banner(&format!("rsclaw gateway {VERSION}"));
             // Check if already running
             if let Some(pid) = gateway_read_pid()
                 && process_alive(pid)
@@ -123,7 +123,7 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
             Ok(())
         }
         GatewayCommand::Restart => {
-            banner(&format!("rsclaw gateway v{VERSION}"));
+            banner(&format!("rsclaw gateway {VERSION}"));
             match gateway_signal_stop() {
                 Ok(()) => {
                     println!("  {} Stopping...", dim("[..]"));
@@ -274,7 +274,7 @@ pub fn gateway_signal_stop() -> Result<()> {
 pub fn gateway_print_status() -> Result<()> {
     let port = detect_port();
     let base = config::loader::base_dir();
-    banner(&format!("rsclaw gateway v{VERSION}"));
+    banner(&format!("rsclaw gateway {VERSION}"));
 
     kv("Base dir:", &format!("{}", base.display()));
     kv("Port:", &format!("{port}"));

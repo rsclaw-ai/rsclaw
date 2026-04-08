@@ -98,17 +98,49 @@ impl OpenAiProvider {
         }
     }
 
-    /// Create a provider with custom User-Agent.
+    /// Create a provider with custom User-Agent (OpenAI Chat mode).
     pub fn with_user_agent(
         base_url: impl Into<String>,
         api_key: Option<String>,
         user_agent: Option<String>,
     ) -> Self {
         Self {
-            client: super::http_client(),
+            client: super::http_client_with_ua(user_agent.as_deref()),
             api_key,
             base_url: base_url.into(),
             is_ollama: false,
+            user_agent,
+            mode: OpenAiMode::Chat,
+        }
+    }
+
+    /// Create a Responses-API provider with custom User-Agent.
+    pub fn responses_with_ua(
+        base_url: impl Into<String>,
+        api_key: Option<String>,
+        user_agent: Option<String>,
+    ) -> Self {
+        Self {
+            client: super::http_client_with_ua(user_agent.as_deref()),
+            api_key,
+            base_url: base_url.into(),
+            is_ollama: false,
+            user_agent,
+            mode: OpenAiMode::Responses,
+        }
+    }
+
+    /// Create an Ollama-backed provider with custom User-Agent.
+    pub fn ollama_with_ua(
+        base_url: impl Into<String>,
+        api_key: Option<String>,
+        user_agent: Option<String>,
+    ) -> Self {
+        Self {
+            client: super::http_client_with_ua(user_agent.as_deref()),
+            api_key,
+            base_url: base_url.into(),
+            is_ollama: true,
             user_agent,
             mode: OpenAiMode::Chat,
         }
@@ -834,19 +866,22 @@ pub fn strip_think_tags_pub(text: &str) -> String {
 
 /// Strip `<think>...</think>` tags from content (qwen3.5, QwQ, etc.).
 fn strip_think_tags(text: &str) -> String {
-    // Simple approach: remove <think>...</think> blocks and lone </think> tags
     let mut result = text.to_owned();
-    // Remove complete <think>...</think> blocks
+    // Remove complete <think>...</think> blocks.
+    // Search for </think> strictly AFTER each <think> to avoid matching a lone
+    // </think> that appears earlier in the string (stream-chunk residual).
     while let Some(start) = result.find("<think>") {
-        if let Some(end) = result.find("</think>") {
+        // start + 7 skips past the 7-byte "<think>" tag itself.
+        if let Some(rel_end) = result[start + 7..].find("</think>") {
+            let end = start + 7 + rel_end;
             result = format!("{}{}", &result[..start], &result[end + 8..]);
         } else {
-            // Opening tag without closing -- strip from <think> to end (partial thinking)
+            // Opening tag without closing — strip from <think> to end.
             result = result[..start].to_owned();
             break;
         }
     }
-    // Remove lone </think> (from a previous chunk's <think>)
+    // Remove any residual lone </think> tags.
     result = result.replace("</think>", "");
     result
 }
@@ -1357,7 +1392,7 @@ mod tests {
                 }],
                 ..make_responses_request()
             };
-            let body = build_responses_body(&req).unwrap();
+            let body = build_responses_body(&req, &HashMap::new()).unwrap();
             assert!(body.get("input").is_some(), "should have 'input' field");
             assert!(body.get("messages").is_none(), "should NOT have 'messages' field");
         }
@@ -1368,7 +1403,7 @@ mod tests {
                 system: Some("be helpful".to_owned()),
                 ..make_responses_request()
             };
-            let body = build_responses_body(&req).unwrap();
+            let body = build_responses_body(&req, &HashMap::new()).unwrap();
             assert_eq!(body["instructions"].as_str().unwrap(), "be helpful");
         }
 
@@ -1381,7 +1416,7 @@ mod tests {
                 }],
                 ..make_responses_request()
             };
-            let body = build_responses_body(&req).unwrap();
+            let body = build_responses_body(&req, &HashMap::new()).unwrap();
             let input = body["input"].as_array().unwrap();
             let part_type = input[0]["content"][0]["type"].as_str().unwrap();
             assert_eq!(part_type, "input_text");
@@ -1398,7 +1433,7 @@ mod tests {
                 }],
                 ..make_responses_request()
             };
-            let body = build_responses_body(&req).unwrap();
+            let body = build_responses_body(&req, &HashMap::new()).unwrap();
             let input = body["input"].as_array().unwrap();
             let part = &input[0]["content"][0];
             assert_eq!(part["type"].as_str().unwrap(), "input_image");
@@ -1448,6 +1483,44 @@ mod tests {
             let data = r#"{"choices":[{"delta":{"content":"world"},"finish_reason":null}]}"#;
             let event = parse_responses_event(data, None);
             assert!(matches!(event, Some(StreamEvent::TextDelta(ref t)) if t == "world"));
+        }
+
+        #[test]
+        fn strip_think_normal() {
+            // Normal: think block before answer
+            let text = "<think>reasoning</think>answer text";
+            assert_eq!(strip_think_tags(text), "answer text");
+        }
+
+        #[test]
+        fn strip_think_lone_close_before_open() {
+            // Bug case: lone </think> appears before <think>...</think>
+            // This caused the original code to eat content between them
+            let text = "</think>\nThe IP is 127.0.0.1 port 5432\n<think>extra</think>";
+            let result = strip_think_tags(text);
+            assert!(result.contains("127.0.0.1"), "IP should not be eaten: {result:?}");
+            assert!(result.contains("5432"), "port should not be eaten: {result:?}");
+        }
+
+        #[test]
+        fn strip_think_no_tags() {
+            // No think tags: text unchanged
+            let text = "The answer is 127.0.0.1 and port 5432";
+            assert_eq!(strip_think_tags(text), text);
+        }
+
+        #[test]
+        fn strip_think_unclosed() {
+            // Unclosed <think>: strip from tag to end
+            let text = "prefix <think>partial reasoning";
+            assert_eq!(strip_think_tags(text), "prefix ");
+        }
+
+        #[test]
+        fn strip_think_multiple_blocks() {
+            // Multiple think blocks all removed
+            let text = "<think>a</think>answer<think>b</think> rest";
+            assert_eq!(strip_think_tags(text), "answer rest");
         }
 
         #[test]
