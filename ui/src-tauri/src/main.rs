@@ -908,12 +908,7 @@ fn main() {
             set_auto_start,
             get_auto_start,
         ])
-        .plugin(tauri_plugin_window_state::Builder::default().build())
-        .setup(|app| {
-            // Always center window on startup.
-            if let Some(win) = app.get_window("main") {
-                let _ = win.center();
-            }
+        .setup(|_app| {
             Ok(())
         })
         .build(tauri::generate_context!())
