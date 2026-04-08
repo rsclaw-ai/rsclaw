@@ -3921,8 +3921,49 @@ function TauriConfigPageInner() {
                   <div style={{ maxHeight: isOpen ? 600 : 0, overflow: "hidden", transition: "max-height .28s ease" }}>
                     <div style={{ padding: "0 16px 16px", borderTop: `1px solid ${V.bd}` }}>
                       <div style={{ paddingTop: 14 }}>
-                        {/* Ollama: single Base URL field */}
-                        {p.id === "ollama" ? (
+                        {/* Kimi: API Key + Base URL + User-Agent */}
+                        {p.id === "kimi" ? (
+                          <div style={{ marginBottom: 8 }}>
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>API Key</div>
+                            <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                              <input
+                                style={{ flex: 1, background: V.bg4, border: `1px solid ${testSt === "ok" ? V.green : testSt === "err" ? V.red : V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", transition: "border-color .12s" }}
+                                type="password"
+                                placeholder="sk-..."
+                                value={apiKey}
+                                onChange={(e) => {
+                                  updateConfig(`models.providers.${p.id}.apiKey`, e.target.value);
+                                  setProvTest((prev) => ({ ...prev, [p.id]: "idle" }));
+                                }}
+                              />
+                              <button onClick={() => handleTestProvider(p.id)} disabled={testSt === "testing"}
+                                style={{ padding: "8px 14px", borderRadius: 7, border: `1px solid ${testSt === "ok" ? V.gbrd : testSt === "err" ? V.rbrd : testSt === "testing" ? V.obrd : V.bd2}`, background: testSt === "ok" ? V.glo : V.bg4, color: testSt === "ok" ? V.green : testSt === "err" ? V.red : testSt === "testing" ? V.or : V.t1, fontSize: 11, fontWeight: 500, cursor: testSt === "testing" ? "not-allowed" : "pointer", whiteSpace: "nowrap", flexShrink: 0, display: "flex", alignItems: "center", gap: 5, transition: "all .13s" }}>
+                                {testSt === "testing" ? <><Spinner />{zh ? "获取中" : "Fetching"}</> : testSt === "ok" ? (zh ? "✓ 刷新模型" : "✓ Refresh") : testSt === "err" ? (zh ? "重新获取" : "Retry") : (zh ? "获取模型" : "Get Models")}
+                              </button>
+                            </div>
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>API URL</div>
+                            <input
+                              style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", marginBottom: 8 }}
+                              type="text"
+                              placeholder="https://api.moonshot.cn/v1"
+                              value={baseUrl}
+                              onChange={(e) => {
+                                updateConfig(`models.providers.${p.id}.baseUrl`, e.target.value);
+                                setProvTest((prev) => ({ ...prev, [p.id]: "idle" }));
+                              }}
+                            />
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>User-Agent</div>
+                            <input
+                              style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none" }}
+                              type="text"
+                              placeholder="claude-code/0.1.0"
+                              value={getVal(`models.providers.${p.id}.userAgent`, "")}
+                              onChange={(e) => {
+                                updateConfig(`models.providers.${p.id}.userAgent`, e.target.value);
+                              }}
+                            />
+                          </div>
+                        ) : p.id === "ollama" ? (
                           <div style={{ marginBottom: 8 }}>
                             <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>Base URL</div>
                             <div style={{ display: "flex", gap: 8 }}>

@@ -4855,7 +4855,7 @@ $bitmap.Dispose()
             .and_then(|m| m.providers.get(img_prov))
             .and_then(|p| p.user_agent.as_deref())
             .or_else(|| self.config.gateway.user_agent.as_deref())
-            .unwrap_or("claude-code/0.1.0");
+            .unwrap_or(crate::provider::DEFAULT_USER_AGENT);
         let client = reqwest::Client::builder()
             .user_agent(img_ua)
             .timeout(std::time::Duration::from_secs(120))
