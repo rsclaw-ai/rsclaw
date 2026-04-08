@@ -288,9 +288,9 @@ fn build_feishu_card(text: &str, brand: &str) -> serde_json::Value {
             "header": {
                 "title": {
                     "content": if brand == "lark" {
-                        "\u{1F980}rsclaw.ai | A high-perf multi-agent AI engine"
+                        "\u{1F980}rsclaw.ai | Multi-Agent AI Gateway"
                     } else {
-                        "\u{1F980}rsclaw.ai | \u{8783}\u{87F9}\u{9AD8}\u{6027}\u{80FD}\u{591A}\u{667A}\u{80FD}\u{4F53}\u{5F15}\u{64CE}"
+                        "\u{1F980}rsclaw.ai | \u{591A}\u{667A}\u{80FD}\u{4F53}AI\u{7F51}\u{5173}"
                     },
                     "tag": "plain_text"
                 },
@@ -918,17 +918,14 @@ impl FeishuChannel {
                     .await
                 {
                     Ok(bytes) => {
-                        match transcribe_audio(&self.client, &bytes, "video.mp4", "video/mp4").await
-                        {
-                            Ok(text) => {
-                                info!(chars = text.len(), "feishu: video transcribed");
-                                text
-                            }
-                            Err(_) => crate::i18n::t(
-                                "video_message_received",
-                                crate::i18n::default_lang(),
-                            ),
-                        }
+                        // Send as FileAttachment — runtime decides vision vs transcription
+                        info!(size = bytes.len(), "feishu: video downloaded");
+                        file_attachments.push(crate::agent::registry::FileAttachment {
+                            filename: "video.mp4".to_owned(),
+                            data: bytes,
+                            mime_type: "video/mp4".to_owned(),
+                        });
+                        String::new()
                     }
                     Err(e) => {
                         warn!("feishu: video download failed: {e:#}");
@@ -1204,25 +1201,45 @@ impl Channel for FeishuChannel {
             // Send image attachments: upload to Feishu, then send image message.
             for image_data in &msg.images {
                 use base64::Engine;
-                let (mime, b64) =
+                let (mime, bytes) =
                     if let Some(rest) = image_data.strip_prefix("data:image/png;base64,") {
-                        ("image/png", rest)
+                        match base64::engine::general_purpose::STANDARD.decode(rest) {
+                            Ok(b) if !b.is_empty() => ("image/png", b),
+                            _ => { warn!("feishu: failed to decode base64 image"); continue; }
+                        }
                     } else if let Some(rest) = image_data.strip_prefix("data:image/jpeg;base64,") {
-                        ("image/jpeg", rest)
+                        match base64::engine::general_purpose::STANDARD.decode(rest) {
+                            Ok(b) if !b.is_empty() => ("image/jpeg", b),
+                            _ => { warn!("feishu: failed to decode base64 image"); continue; }
+                        }
                     } else if let Some(rest) = image_data.strip_prefix("data:image/webp;base64,") {
-                        ("image/webp", rest)
+                        match base64::engine::general_purpose::STANDARD.decode(rest) {
+                            Ok(b) if !b.is_empty() => ("image/webp", b),
+                            _ => { warn!("feishu: failed to decode base64 image"); continue; }
+                        }
+                    } else if image_data.starts_with("http://") || image_data.starts_with("https://") {
+                        // URL image — download first
+                        match self.client.get(image_data.as_str()).send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                let ct = resp.headers().get("content-type")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("image/png")
+                                    .to_owned();
+                                let mime = if ct.contains("jpeg") || ct.contains("jpg") { "image/jpeg" }
+                                    else if ct.contains("webp") { "image/webp" }
+                                    else { "image/png" };
+                                match resp.bytes().await {
+                                    Ok(b) if !b.is_empty() => (mime, b.to_vec()),
+                                    _ => { warn!("feishu: empty image download"); continue; }
+                                }
+                            }
+                            Ok(resp) => { warn!(status = %resp.status(), "feishu: image download failed"); continue; }
+                            Err(e) => { warn!(error = %e, "feishu: image download error"); continue; }
+                        }
                     } else {
-                        warn!("feishu: unrecognised image data URI prefix, skipping");
+                        warn!("feishu: unrecognised image data, skipping");
                         continue;
                     };
-
-                let bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
-                    Ok(b) if !b.is_empty() => b,
-                    _ => {
-                        warn!("feishu: failed to decode base64 image, skipping");
-                        continue;
-                    }
-                };
 
                 let filename = if mime == "image/jpeg" {
                     "image.jpg"
@@ -1345,8 +1362,13 @@ impl Channel for FeishuChannel {
 mod tests {
     use super::*;
 
+    fn init_crypto() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
     #[test]
     fn channel_name() {
+        init_crypto();
         let ch = FeishuChannel::new(
             "app_id",
             "app_secret",

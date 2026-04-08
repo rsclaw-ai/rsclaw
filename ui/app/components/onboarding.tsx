@@ -17,6 +17,12 @@ import {
 } from "../lib/rsclaw-api";
 import { markSetupComplete } from "../lib/first-launch";
 import { toast } from "../lib/toast";
+import {
+  type ApiType,
+  API_TYPE_LABELS,
+  API_TYPE_DEFAULT_URLS,
+  API_TYPE_NEEDS_KEY,
+} from "../lib/provider-defaults";
 
 // ── i18n translations for the wizard ──
 
@@ -88,7 +94,7 @@ interface WizText {
 const T: Record<WizLang, WizText> = {
   cn: {
     welcome: "\u5F00\u59CB\u8BBE\u7F6E",
-    subtitle: "\u8783\u87F9\u9AD8\u6027\u80FD\u591A\u667A\u80FD\u4F53AI\u5F15\u64CE \u00B7 Multi-Agent AI Gateway",
+    subtitle: "\u8783\u87F9\u9AD8\u6027\u80FD\u591A\u667A\u80FD\u4F53AI\u7F51\u5173 \u00B7 Multi-Agent AI Gateway",
     step1Title: "\u68C0\u6D4B\u73AF\u5883",
     step1Sub: "\u68C0\u67E5 rsclaw \u662F\u5426\u5DF2\u5B89\u88C5\uFF0C\u4EE5\u53CA\u662F\u5426\u6709 OpenClaw \u6570\u636E\u53EF\u8FC1\u79FB\u3002",
     step2Title: "\u9009\u62E9 LLM \u63D0\u4F9B\u5546",
@@ -103,8 +109,8 @@ const T: Record<WizLang, WizText> = {
     next: "\u4E0B\u4E00\u6B65 \u2192",
     prev: "\u2190 \u4E0A\u4E00\u6B65",
     skip: "\u8DF3\u8FC7\u5411\u5BFC\uFF0C\u624B\u52A8\u914D\u7F6E",
-    test: "\u6D4B\u8BD5\u8FDE\u63A5",
-    testing: "\u8FDE\u63A5\u4E2D",
+    test: "\u83B7\u53D6\u6A21\u578B",
+    testing: "\u83B7\u53D6\u4E2D",
     connected: "\u2713 \u5DF2\u8FDE\u63A5",
     retry: "\u91CD\u65B0\u6D4B\u8BD5",
     launch: "\u542F\u52A8\u7F51\u5173",
@@ -150,7 +156,7 @@ const T: Record<WizLang, WizText> = {
   },
   en: {
     welcome: "Get started",
-    subtitle: "Multi-Agent AI Gateway \u00B7 High-Performance Engine",
+    subtitle: "High-perf Multi-Agent AI Gateway",
     step1Title: "Environment check",
     step1Sub: "Check if rsclaw is installed and if there is OpenClaw data to migrate.",
     step2Title: "Choose LLM provider",
@@ -165,8 +171,8 @@ const T: Record<WizLang, WizText> = {
     next: "Next \u2192",
     prev: "\u2190 Back",
     skip: "Skip wizard, configure manually",
-    test: "Test",
-    testing: "Testing",
+    test: "Get Models",
+    testing: "Fetching",
     connected: "\u2713 OK",
     retry: "Retry",
     launch: "Launch Gateway",
@@ -336,7 +342,7 @@ const T: Record<WizLang, WizText> = {
   },
   de: {
     welcome: "Einrichtung starten",
-    subtitle: "Multi-Agent AI Gateway \u00B7 Hochleistungs-Engine",
+    subtitle: "High-perf Multi-Agent AI Gateway",
     step1Title: "Umgebung pr\u00FCfen",
     step1Sub: "Pr\u00FCft, ob rsclaw installiert ist.",
     step2Title: "LLM-Anbieter w\u00E4hlen",
@@ -729,6 +735,11 @@ const LANG_TO_CONFIG: Record<WizLang, string> = {
   es: "Spanish", ru: "Russian",
 };
 
+// Reverse mapping: config value → WizLang
+const CONFIG_TO_LANG: Record<string, WizLang> = Object.fromEntries(
+  Object.entries(LANG_TO_CONFIG).map(([k, v]) => [v, k as WizLang])
+) as Record<string, WizLang>;
+
 function detectWizLang(): WizLang {
   // Check localStorage first
   try {
@@ -763,14 +774,19 @@ export interface ProviderDef {
   keyPlaceholder: string;
   isUrl?: boolean;
   sep?: boolean;
+  hasBaseUrl?: boolean;
+  defaultBaseUrl?: string;
+  defaultUserAgent?: string;
 }
 
 // All providers (unordered lookup table)
 export const ALL_PROVIDERS: Record<string, ProviderDef> = {
-  qwen:        { id: "qwen",        name: "Qwen",              tag: "\u56FD\u5185\u76F4\u8FDE",       tagEn: "China direct",      keyLabel: "DashScope API Key",   keyPlaceholder: "sk-..." },
+  qwen:        { id: "qwen",        name: "Qwen (\u5343\u95EE)", tag: "\u56FD\u5185\u76F4\u8FDE",      tagEn: "China direct",      keyLabel: "DashScope API Key",   keyPlaceholder: "sk-..." },
+  doubao:      { id: "doubao",      name: "Doubao (\u8C46\u5305)", tag: "\u5B57\u8282\u8DF3\u52A8",     tagEn: "ByteDance",         keyLabel: "ARK API Key",         keyPlaceholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", hasBaseUrl: true, defaultBaseUrl: "https://ark.cn-beijing.volces.com/api/v3" },
   minimax:     { id: "minimax",     name: "MiniMax",            tag: "\u56FD\u5185",                  tagEn: "China",             keyLabel: "MiniMax API Key",     keyPlaceholder: "eyJ..." },
   deepseek:    { id: "deepseek",    name: "DeepSeek",           tag: "\u4F4E\u6210\u672C",            tagEn: "Low cost",          keyLabel: "DeepSeek API Key",    keyPlaceholder: "sk-..." },
-  kimi:        { id: "kimi",        name: "Kimi",               tag: "\u56FD\u5185",                  tagEn: "China",             keyLabel: "Kimi API Key",        keyPlaceholder: "sk-..." },
+  kimi:        { id: "kimi",        name: "Kimi",               tag: "\u56FD\u5185",                  tagEn: "China",             keyLabel: "Kimi API Key",        keyPlaceholder: "sk-...", hasBaseUrl: true, defaultBaseUrl: "https://api.moonshot.cn/v1", defaultUserAgent: "claude-code/0.1.0" },
+  codingplan:  { id: "codingplan",  name: "CodingPlan",         tag: "\u7F16\u7A0B\u8BA1\u5212",      tagEn: "Coding Plan",       keyLabel: "API URL",             keyPlaceholder: "https://api.example.com/v1", isUrl: true },
   zhipu:       { id: "zhipu",       name: "Zhipu (GLM)",        tag: "\u56FD\u5185",                  tagEn: "China",             keyLabel: "Zhipu API Key",       keyPlaceholder: "sk-..." },
   ollama:      { id: "ollama",      name: "Ollama (local)",     tag: "\u65E0\u9700 Key",              tagEn: "No Key",            keyLabel: "URL",                 keyPlaceholder: "http://localhost:11434/v1", isUrl: true },
   custom:      { id: "custom",      name: "Custom Provider",    tag: "\u81EA\u5B9A\u4E49",            tagEn: "Custom",            keyLabel: "API URL",             keyPlaceholder: "https://api.example.com/v1", isUrl: true },
@@ -784,8 +800,8 @@ export const ALL_PROVIDERS: Record<string, ProviderDef> = {
   siliconflow: { id: "siliconflow", name: "SiliconFlow",        tag: "\u56FD\u5185\u52A0\u901F",      tagEn: "China accel",       keyLabel: "SiliconFlow Key",     keyPlaceholder: "sk-..." },
 };
 
-export const PROV_ORDER_ZH = ["qwen","minimax","deepseek","kimi","zhipu","ollama","custom","gaterouter","openrouter","anthropic","openai","gemini","grok","groq","siliconflow"];
-export const PROV_ORDER_EN = ["anthropic","openai","gemini","grok","openrouter","ollama","custom","groq","qwen","minimax","deepseek","kimi","zhipu","gaterouter","siliconflow"];
+export const PROV_ORDER_ZH = ["doubao","qwen","custom","codingplan","minimax","deepseek","kimi","zhipu","ollama","gaterouter","openrouter","anthropic","openai","gemini","grok","groq","siliconflow"];
+export const PROV_ORDER_EN = ["anthropic","openai","gemini","grok","openrouter","ollama","custom","codingplan","groq","doubao","qwen","minimax","deepseek","kimi","zhipu","gaterouter","siliconflow"];
 
 function getProviders(lang?: string): ProviderDef[] {
   const isZhOrder = (lang || getLang()) === "cn";
@@ -802,9 +818,14 @@ interface ModelDef {
 
 export const MODELS: Record<string, ModelDef[]> = {
   qwen: [
-    { id: "qwen-max", tag: "\u63A8\u8350", tagEn: "Recommended", rec: true },
+    { id: "qwen3.6-plus", tag: "\u6700\u65B0", tagEn: "Latest", rec: true },
+    { id: "qwen-max", tag: "\u63A8\u8350", tagEn: "Recommended", rec: false },
     { id: "qwen-plus", tag: "\u5747\u8861", tagEn: "Balanced", rec: false },
     { id: "qwen-turbo", tag: "\u5FEB\u901F", tagEn: "Fast", rec: false },
+  ],
+  doubao: [
+    { id: "doubao-seed-2-0-pro-260215", tag: "\u63A8\u8350", tagEn: "Recommended", rec: true },
+    { id: "doubao-1-5-pro-256k-250115", tag: "\u957F\u6587\u672C", tagEn: "Long context", rec: false },
   ],
   deepseek: [
     { id: "deepseek-chat", tag: "\u901A\u7528", tagEn: "General", rec: true },
@@ -1483,6 +1504,9 @@ function ensureSpinStyle() {
 interface ProvState {
   selected: boolean;
   apiKey: string;
+  baseUrl: string;
+  apiType?: ApiType;
+  userAgent: string;
   testStatus: "idle" | "testing" | "success" | "error";
   testError: string;
   models: ModelDef[] | null;
@@ -1491,10 +1515,13 @@ interface ProvState {
   inputState: "" | "ok" | "err";
 }
 
-function makeProvState(selected: boolean, isUrl?: boolean): ProvState {
+function makeProvState(selected: boolean, isUrl?: boolean, defaultUserAgent?: string): ProvState {
   return {
     selected,
-    apiKey: isUrl ? "http://localhost:11434/v1" : "",
+    apiKey: "",
+    baseUrl: isUrl ? "http://localhost:11434/v1" : "",
+    apiType: undefined,
+    userAgent: defaultUserAgent || "",
     testStatus: "idle",
     testError: "",
     models: null,
@@ -1556,7 +1583,16 @@ export function OnboardingPage() {
   const [provs, setProvs] = useState<Record<string, ProvState>>(() => {
     const m: Record<string, ProvState> = {};
     Object.values(ALL_PROVIDERS).forEach((p) => {
-      m[p.id] = makeProvState(false, p.isUrl);
+      const ps = makeProvState(false, p.isUrl, p.defaultUserAgent);
+      if (p.id === "custom") {
+        // Leave apiType and baseUrl empty - user picks them
+        ps.apiType = undefined;
+        ps.baseUrl = "";
+      } else if (p.hasBaseUrl && p.defaultBaseUrl) {
+        // Pre-fill default URL for providers with editable URL (e.g. doubao)
+        ps.baseUrl = p.defaultBaseUrl;
+      }
+      m[p.id] = ps;
     });
     return m;
   });
@@ -1639,6 +1675,21 @@ export function OnboardingPage() {
     (async () => {
       const tauriInvoke = (window as any).__TAURI__?.invoke;
       if (tauriInvoke) {
+        // Check if config already has gateway.language set (e.g. from `rsclaw setup` CLI)
+        try {
+          const raw: string = await tauriInvoke("read_config_file");
+          const cfg = JSON.parse(raw);
+          const cfgLang: string | undefined = cfg?.gateway?.language;
+          if (cfgLang && typeof cfgLang === "string" && cfgLang.trim()) {
+            const mapped = CONFIG_TO_LANG[cfgLang.trim()];
+            if (mapped) {
+              setWizLang(mapped);
+              setLanguage(cfgLang.trim());
+              try { localStorage.setItem("rsclaw-lang", mapped); } catch {}
+              setStep(1);
+            }
+          }
+        } catch (e) { console.warn("[onboarding] config language detection failed:", e); }
         // rsclaw installed?
         try { const setupDone = await tauriInvoke("check_setup"); setRscReady(setupDone); } catch { setRscReady(false); }
         // version
@@ -1654,6 +1705,23 @@ export function OnboardingPage() {
           }
         } catch {}
       } else {
+        // Browser mode: try reading config from gateway API
+        try {
+          const res = await fetch("http://localhost:18888/api/v1/config");
+          if (res.ok) {
+            const cfg = await res.json();
+            const cfgLang: string | undefined = cfg?.gateway?.language;
+            if (cfgLang && typeof cfgLang === "string" && cfgLang.trim()) {
+              const mapped = CONFIG_TO_LANG[cfgLang.trim()];
+              if (mapped) {
+                setWizLang(mapped);
+                setLanguage(cfgLang.trim());
+                try { localStorage.setItem("rsclaw-lang", mapped); } catch {}
+                setStep(1);
+              }
+            }
+          }
+        } catch (e) { console.warn("[onboarding] config language detection failed:", e); }
         // Browser mode: health check only
         try { await getHealth(); setRscReady(true); } catch { setRscReady(false); }
       }
@@ -1721,9 +1789,48 @@ export function OnboardingPage() {
     });
   };
 
+  const setProvBaseUrl = (id: string, url: string) => {
+    setProvs((prev) => {
+      const p = { ...prev };
+      p[id] = { ...p[id], baseUrl: url, testStatus: "idle", models: null, selectedModel: null, inputState: "", testError: "" };
+      return p;
+    });
+  };
+
+  const setProvUserAgent = (id: string, ua: string) => {
+    setProvs((prev) => {
+      const p = { ...prev };
+      p[id] = { ...p[id], userAgent: ua };
+      return p;
+    });
+  };
+
+  const setProvApiType = (id: string, apiType: ApiType) => {
+    setProvs((prev) => {
+      const p = { ...prev };
+      p[id] = {
+        ...p[id],
+        apiType,
+        baseUrl: "",
+        testStatus: "idle",
+        models: null,
+        selectedModel: null,
+        inputState: "",
+        testError: "",
+      };
+      return p;
+    });
+  };
+
   const testProvider = async (id: string) => {
     const prov = provs[id];
-    if (!prov.apiKey.trim()) {
+    const isCustomLikeTest = id === "custom" || id === "codingplan";
+    const provDef = PROVIDERS.find((p) => p.id === id);
+    const isUrlProvider = !!provDef?.isUrl;
+    const keyRequired = isCustomLikeTest
+      ? API_TYPE_NEEDS_KEY[prov.apiType || "openai"]
+      : !isUrlProvider;
+    if (keyRequired && !prov.apiKey.trim()) {
       setProvs((prev) => {
         const p = { ...prev };
         p[id] = { ...p[id], testError: t.enterKey, inputState: "err" };
@@ -1740,17 +1847,22 @@ export function OnboardingPage() {
 
     try {
       // Test provider API directly (Tauri) or via gateway (browser)
-      const baseUrl = id === "ollama" ? prov.apiKey : undefined;
+      const provDef = PROVIDERS.find((p) => p.id === id);
+      // For custom provider, use the dedicated baseUrl field; for isUrl providers (ollama), also use baseUrl
+      const baseUrl = id === "custom"
+        ? (prov.baseUrl || (prov.apiType ? API_TYPE_DEFAULT_URLS[prov.apiType] : undefined))
+        : ((provDef?.isUrl || provDef?.hasBaseUrl) ? prov.baseUrl : undefined);
       const tauriInvoke = (window as any).__TAURI__?.invoke;
       let result: any;
       let modelIds: string[] = [];
       if (tauriInvoke) {
-        result = await tauriInvoke("test_provider", { provider: id, apiKey: prov.apiKey, baseUrl: baseUrl || null });
+        result = await tauriInvoke("test_provider", { provider: id, apiKey: prov.apiKey, baseUrl: baseUrl || null, apiType: id === "custom" ? (prov.apiType || null) : null });
         modelIds = result.models || [];
       } else {
-        result = await testProviderKey(id, prov.apiKey, baseUrl);
+        const apiTypeParam = id === "custom" ? (prov.apiType || undefined) : undefined;
+        result = await testProviderKey(id, prov.apiKey, baseUrl, apiTypeParam);
         if (result.ok) {
-          const modelResult = await listProviderModels(id, prov.apiKey, baseUrl);
+          const modelResult = await listProviderModels(id, prov.apiKey, baseUrl, apiTypeParam);
           modelIds = modelResult.models || [];
         }
       }
@@ -1811,8 +1923,9 @@ export function OnboardingPage() {
   );
 
   // ── Channel logic ──
-  // Single-select: only one channel at a time
+  // Single-select: only one channel at a time, auto-start QR on select
   const toggleChannel = (id: string) => {
+    const wasEnabled = chs[id]?.enabled;
     setChs((prev) => {
       const c: Record<string, any> = {};
       for (const [k, v] of Object.entries(prev)) {
@@ -1820,6 +1933,13 @@ export function OnboardingPage() {
       }
       return c;
     });
+    // Auto-start QR login when selecting a channel that supports it
+    if (!wasEnabled) {
+      const chDef = ALL_CHANNELS[id];
+      if (chDef?.hasQr) {
+        setTimeout(() => startChannelQr(id), 300);
+      }
+    }
   };
 
   const setChTab = (chId: string, tab: "qr" | "cred") => {
@@ -1917,10 +2037,21 @@ export function OnboardingPage() {
     const providers: Record<string, any> = {};
     for (const [id, ps] of Object.entries(provs)) {
       if (!ps.selected || !ps.selectedModel) continue;
-      if (PROVIDERS.find((p) => p.id === id)?.isUrl) {
-        providers[id] = { api: "ollama", baseUrl: ps.apiKey };
+      const isCustomLike = id === "custom" || id === "codingplan";
+      if (isCustomLike) {
+        const apiType = ps.apiType || "openai";
+        const entry: Record<string, any> = { api: apiType };
+        if (ps.baseUrl) entry.baseUrl = ps.baseUrl;
+        if (ps.apiKey) entry.apiKey = ps.apiKey;
+        if (ps.userAgent) entry.userAgent = ps.userAgent;
+        providers[id] = entry;
+      } else if (PROVIDERS.find((p) => p.id === id)?.isUrl) {
+        providers[id] = { api: "ollama", baseUrl: ps.baseUrl || ps.apiKey };
       } else if (ps.apiKey) {
-        providers[id] = { apiKey: ps.apiKey };
+        const entry: Record<string, any> = { apiKey: ps.apiKey };
+        if (ps.baseUrl) entry.baseUrl = ps.baseUrl;
+        if (ps.userAgent) entry.userAgent = ps.userAgent;
+        providers[id] = entry;
       } else {
         providers[id] = {};
       }
@@ -1984,34 +2115,35 @@ export function OnboardingPage() {
       const userPort = parseInt(port) || 18888;
       setGatewayUrl(`http://localhost:${userPort}`);
 
-      // 1: write config (merge with existing to preserve QR login tokens)
+      // 1: write config — deep merge into existing, never delete existing keys
       update(0, "loading");
       const newConfig = JSON.parse(generateConfig());
       const tauriInvoke = (window as any).__TAURI__?.invoke;
+
+      // Deep merge helper: recursively merge src into dst without deleting dst keys
+      const deepMerge = (dst: any, src: any): any => {
+        if (!src || typeof src !== "object" || Array.isArray(src)) return src;
+        const result = { ...(dst || {}) };
+        for (const [k, v] of Object.entries(src)) {
+          if (v && typeof v === "object" && !Array.isArray(v) && typeof result[k] === "object" && !Array.isArray(result[k])) {
+            result[k] = deepMerge(result[k], v);
+          } else {
+            result[k] = v;
+          }
+        }
+        return result;
+      };
+
       if (tauriInvoke) {
-        try { await tauriInvoke("run_setup"); } catch {} // may fail without tty, ok
-        // Read existing config (may contain botToken from QR login)
+        try { await tauriInvoke("run_setup"); } catch {} // ensure dirs exist
+        // Read existing config — this is the source of truth
         let existing: any = {};
         try {
           const raw: string = await tauriInvoke("read_config_file");
           existing = JSON.parse(raw || "{}");
         } catch {}
-        // Deep merge: preserve auth token, channel credentials from existing config
-        const merged = { ...newConfig };
-        // Preserve gateway.auth from setup-generated config
-        merged.gateway = { ...(existing.gateway || {}), ...(newConfig.gateway || {}) };
-        if (existing.gateway?.auth) {
-          merged.gateway.auth = existing.gateway.auth;
-        }
-        // Merge channels: new channels + existing channels (preserve QR login tokens)
-        const allChannels = { ...(newConfig.channels || {}), ...(existing.channels || {}) };
-        // Overlay new credential values on top of existing
-        for (const [ch, val] of Object.entries(newConfig.channels || {})) {
-          if (allChannels[ch] && Object.keys(val as any).length > 0) {
-            allChannels[ch] = { ...allChannels[ch], ...(val as any) };
-          }
-        }
-        merged.channels = allChannels;
+        // Deep merge: existing config is base, new config overlays on top
+        const merged = deepMerge(existing, newConfig);
         await tauriInvoke("write_config", { content: JSON.stringify(merged, null, 2) });
       } else {
         await saveConfig({ raw: JSON.stringify(newConfig, null, 2) });
@@ -2031,9 +2163,11 @@ export function OnboardingPage() {
       }
       update(0, "ok");
 
-      // 2: start gateway
+      // 2: start gateway (stop any existing one first)
       update(1, "loading");
       if (tauriInvoke) {
+        try { await tauriInvoke("stop_gateway"); } catch {}
+        await new Promise((r) => setTimeout(r, 1000));
         await tauriInvoke("start_gateway");
       }
       await new Promise((r) => setTimeout(r, 2500));
@@ -2149,11 +2283,11 @@ export function OnboardingPage() {
             </div>
             {step === 0 ? (
               <div style={{ fontSize: 11, color: V.t2, textAlign: "center", lineHeight: 1.6, maxWidth: 380 }}>
-                {"\u8783\u87F9\u9AD8\u6027\u80FD\u591A\u667A\u80FD\u4F53AI\u5F15\u64CE \u00B7 Multi-Agent AI Gateway"}
+                {"\u8783\u87F9\u9AD8\u6027\u80FD\u591A\u667A\u80FD\u4F53AI\u7F51\u5173 \u00B7 Multi-Agent AI Gateway"}
               </div>
             ) : (
               <div style={S.logoSub}>
-                {t.subtitle.toUpperCase()}
+                {t.subtitle}
               </div>
             )}
           </div>
@@ -2382,35 +2516,125 @@ export function OnboardingPage() {
                 const pDef = PROVIDERS.find((p) => p.id === activeId);
                 if (!pDef || pDef.sep) return null;
                 const ps = provs[activeId];
+                const isCustomLike = activeId === "custom" || activeId === "codingplan";
+                const curApiType: ApiType = ps.apiType || "openai";
+                const keyRequired = !isCustomLike || API_TYPE_NEEDS_KEY[curApiType];
+                const inputFieldStyle = { flex: 1, background: "#1f2126", border: `1px solid ${ps.inputState === "ok" ? "#2dd4a0" : ps.inputState === "err" ? "#d95f5f" : "rgba(255,255,255,0.09)"}`, borderRadius: 7, padding: "7px 10px", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none" } as const;
+                const fieldLabelStyle = { fontSize: 10, color: "#2e2c3a", letterSpacing: 0.4, marginBottom: 5, fontFamily: "'JetBrains Mono', monospace" } as const;
+                const plainInputStyle = { width: "100%", background: "#1f2126", border: "1px solid rgba(255,255,255,0.09)", borderRadius: 7, padding: "7px 10px", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none", boxSizing: "border-box" } as const;
+                const selectStyle = { width: "100%", background: "#1f2126", border: "1px solid rgba(255,255,255,0.09)", borderRadius: 7, padding: "7px 10px", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none", cursor: "pointer" } as const;
                 return (
                   <div style={{ marginTop: 12, background: "#1a1c22", border: "1px solid rgba(255,255,255,0.055)", borderRadius: 10, padding: 16 }}>
-                    <div style={{ fontSize: 10, color: "#2e2c3a", letterSpacing: 0.4, marginBottom: 5, fontFamily: "'JetBrains Mono', monospace" }}>{pDef.keyLabel}</div>
-                    <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
-                      <input
-                        type={pDef.isUrl ? "text" : "password"}
-                        style={{ flex: 1, background: "#1f2126", border: `1px solid ${ps.inputState === "ok" ? "#2dd4a0" : ps.inputState === "err" ? "#d95f5f" : "rgba(255,255,255,0.09)"}`, borderRadius: 7, padding: "7px 10px", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none" }}
-                        value={ps.apiKey}
-                        onChange={(e) => setProvKey(activeId, e.target.value)}
-                        placeholder={pDef.keyPlaceholder}
-                      />
-                      <button
-                        onClick={() => testProvider(activeId)}
-                        disabled={ps.testStatus === "testing"}
-                        style={{ padding: "7px 13px", borderRadius: 7, border: `1px solid ${ps.testStatus === "success" ? "rgba(45,212,160,0.18)" : "rgba(255,255,255,0.09)"}`, background: ps.testStatus === "success" ? "rgba(45,212,160,0.07)" : "#1f2126", color: ps.testStatus === "success" ? "#2dd4a0" : "#9896a4", fontSize: 11, fontWeight: 500, cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0, fontFamily: "inherit" }}
-                      >
-                        {ps.testStatus === "testing" ? (<>{renderSpinner()}{t.testing}</>)
-                          : ps.testStatus === "success" ? t.connected
-                          : t.test}
-                      </button>
-                    </div>
-                    {/* Custom Provider: optional API Key field */}
-                    {activeId === "custom" && (
+                    {/* Custom/CodingPlan: api_type dropdown */}
+                    {isCustomLike && (
                       <div style={{ marginBottom: 10 }}>
-                        <div style={{ fontSize: 10, color: "#2e2c3a", letterSpacing: 0.4, marginBottom: 5, fontFamily: "'JetBrains Mono', monospace" }}>API Key {isZh ? "(\u53EF\u9009)" : "(optional)"}</div>
+                        <div style={fieldLabelStyle}>API Type</div>
+                        <select
+                          style={selectStyle}
+                          value={curApiType}
+                          onChange={(e) => setProvApiType(activeId, e.target.value as ApiType)}
+                        >
+                          {(Object.keys(API_TYPE_LABELS) as ApiType[]).map((at) => (
+                            <option key={at} value={at}>{API_TYPE_LABELS[at]}</option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+                    {/* Custom/CodingPlan: Base URL input */}
+                    {isCustomLike && (
+                      <div style={{ marginBottom: 10 }}>
+                        <div style={fieldLabelStyle}>Base URL</div>
                         <input
-                          type="password"
-                          style={{ width: "100%", background: "#1f2126", border: "1px solid rgba(255,255,255,0.09)", borderRadius: 7, padding: "7px 10px", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none" }}
-                          placeholder="sk-..."
+                          type="text"
+                          style={plainInputStyle}
+                          value={ps.baseUrl}
+                          onChange={(e) => setProvBaseUrl(activeId, e.target.value)}
+                          placeholder="https://your-api-server.com/v1"
+                        />
+                      </div>
+                    )}
+                    {/* Standard (non-custom) providers: show their key label and input inline with test button */}
+                    {!isCustomLike && (
+                      <>
+                        <div style={fieldLabelStyle}>{pDef.keyLabel}</div>
+                        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+                          <input
+                            type={pDef.isUrl ? "text" : "password"}
+                            style={inputFieldStyle}
+                            value={pDef.isUrl ? (ps.baseUrl || ps.apiKey) : ps.apiKey}
+                            onChange={(e) => pDef.isUrl ? setProvBaseUrl(activeId, e.target.value) : setProvKey(activeId, e.target.value)}
+                            placeholder={pDef.keyPlaceholder}
+                          />
+                          <button
+                            onClick={() => testProvider(activeId)}
+                            disabled={ps.testStatus === "testing"}
+                            style={{ padding: "7px 13px", borderRadius: 7, border: `1px solid ${ps.testStatus === "success" ? "rgba(45,212,160,0.18)" : "rgba(255,255,255,0.09)"}`, background: ps.testStatus === "success" ? "rgba(45,212,160,0.07)" : "#1f2126", color: ps.testStatus === "success" ? "#2dd4a0" : "#9896a4", fontSize: 11, fontWeight: 500, cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0, fontFamily: "inherit" }}
+                          >
+                            {ps.testStatus === "testing" ? (<>{renderSpinner()}{t.testing}</>)
+                              : ps.testStatus === "success" ? t.connected
+                              : t.test}
+                          </button>
+                        </div>
+                        {pDef.hasBaseUrl && (
+                          <div style={{ marginBottom: 10 }}>
+                            <div style={fieldLabelStyle}>API URL</div>
+                            <input
+                              type="text"
+                              style={plainInputStyle}
+                              value={ps.baseUrl}
+                              onChange={(e) => setProvBaseUrl(activeId, e.target.value)}
+                              placeholder={pDef.defaultBaseUrl || "https://..."}
+                            />
+                          </div>
+                        )}
+                        {pDef.defaultUserAgent !== undefined && (
+                          <div style={{ marginBottom: 10 }}>
+                            <div style={fieldLabelStyle}>User-Agent</div>
+                            <input
+                              type="text"
+                              style={plainInputStyle}
+                              value={ps.userAgent}
+                              onChange={(e) => setProvUserAgent(activeId, e.target.value)}
+                              placeholder={pDef.defaultUserAgent || "Mozilla/5.0 (compatible; rsclaw/1.0)"}
+                            />
+                          </div>
+                        )}
+                      </>
+                    )}
+                    {/* Custom/CodingPlan: API Key + test button row */}
+                    {isCustomLike && (
+                      <div style={{ marginBottom: 10 }}>
+                        <div style={fieldLabelStyle}>API Key{!keyRequired && <span style={{ color: "#666", fontWeight: 400 }}> (optional)</span>}</div>
+                        <div style={{ display: "flex", gap: 8, marginBottom: 0 }}>
+                          <input
+                            type="password"
+                            style={inputFieldStyle}
+                            value={ps.apiKey}
+                            onChange={(e) => setProvKey(activeId, e.target.value)}
+                            placeholder={keyRequired ? "sk-..." : "(optional)"}
+                          />
+                          <button
+                            onClick={() => testProvider(activeId)}
+                            disabled={ps.testStatus === "testing"}
+                            style={{ padding: "7px 13px", borderRadius: 7, border: `1px solid ${ps.testStatus === "success" ? "rgba(45,212,160,0.18)" : "rgba(255,255,255,0.09)"}`, background: ps.testStatus === "success" ? "rgba(45,212,160,0.07)" : "#1f2126", color: ps.testStatus === "success" ? "#2dd4a0" : "#9896a4", fontSize: 11, fontWeight: 500, cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0, fontFamily: "inherit" }}
+                          >
+                            {ps.testStatus === "testing" ? (<>{renderSpinner()}{t.testing}</>)
+                              : ps.testStatus === "success" ? t.connected
+                              : t.test}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    {/* Custom/CodingPlan: User-Agent field */}
+                    {isCustomLike && (
+                      <div style={{ marginBottom: 10 }}>
+                        <div style={fieldLabelStyle}>User-Agent <span style={{ color: "#666", fontWeight: 400 }}>(optional)</span></div>
+                        <input
+                          type="text"
+                          style={plainInputStyle}
+                          value={ps.userAgent}
+                          onChange={(e) => setProvUserAgent(activeId, e.target.value)}
+                          placeholder="e.g. claude-code/0.1.0"
                         />
                       </div>
                     )}
@@ -2526,8 +2750,7 @@ export function OnboardingPage() {
                 const hasQr = chDef.hasQr;
 
                 return (
-                  <div key={activeId} style={{ marginTop: 12, background: V.bg3, border: `1px solid ${V.bd}`, borderRadius: 10, padding: 16, maxHeight: 220, overflowY: "auto" }}>
-                    <div style={{ fontSize: 12, fontWeight: 600, color: V.t0, marginBottom: 8 }}>{isZh ? chDef.name : chDef.nameEn}</div>
+                  <div key={activeId} style={{ marginTop: 12, background: V.bg3, border: `1px solid ${V.bd}`, borderRadius: 10, padding: 16, maxHeight: 320, overflowY: "auto" }}>
                     {/* QR / Credential tabs for wechat/feishu */}
                     {hasQr && (
                       <div style={{ display: "flex", gap: 0, borderBottom: `1px solid ${V.bd}`, marginBottom: 12, marginLeft: -16, marginRight: -16, paddingLeft: 16, paddingRight: 16 }}>
@@ -2573,11 +2796,6 @@ export function OnboardingPage() {
                             </button>
                           )}
                         </div>
-                        {activeId === "feishu" && cs.qrStatus === "idle" && (
-                          <button style={{ padding: "6px 14px", borderRadius: 7, border: `1px solid ${V.bd2}`, background: V.bg4, color: V.t1, fontSize: 11, cursor: "pointer", fontFamily: "inherit" }}>
-                            {t.openFeishuAuth}
-                          </button>
-                        )}
                       </div>
                     )}
 

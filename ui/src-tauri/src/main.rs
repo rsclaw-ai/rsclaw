@@ -261,12 +261,31 @@ fn get_gateway_port() -> Result<serde_json::Value, String> {
         _ => "localhost",
     };
     // Read auth token: gateway.auth.token > env var
-    let token = val.pointer("/gateway/auth/token")
+    // If missing, auto-generate one and write it to config.
+    let mut token = val.pointer("/gateway/auth/token")
         .and_then(|v| v.as_str())
         .map(|s| s.to_owned())
         .or_else(|| std::env::var("RSCLAW_AUTH_TOKEN").ok())
         .unwrap_or_default();
-    let token = token.as_str();
+
+    if token.is_empty() {
+        // Generate a random token and write to config
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let pid = std::process::id();
+        let generated = format!("{:016x}{:08x}", ts, pid);
+        let mut cfg: serde_json::Value = json5::from_str(&raw).unwrap_or(serde_json::json!({}));
+        if cfg.get("gateway").is_none() {
+            cfg["gateway"] = serde_json::json!({});
+        }
+        if cfg["gateway"].get("auth").is_none() {
+            cfg["gateway"]["auth"] = serde_json::json!({});
+        }
+        cfg["gateway"]["auth"]["token"] = serde_json::json!(generated);
+        let _ = std::fs::write(&config_path, serde_json::to_string_pretty(&cfg).unwrap_or_default());
+        token = generated;
+    }
+
     Ok(serde_json::json!({
         "url": format!("http://{}:{}", host, port),
         "token": token,
@@ -631,61 +650,107 @@ fn uninstall_skill(name: String) -> Result<String, String> {
 
 /// Test provider API key by calling /v1/models directly (no gateway needed).
 #[tauri::command]
-async fn test_provider(provider: String, api_key: String, base_url: Option<String>) -> Result<serde_json::Value, String> {
-    let (url_base, auth_style) = match provider.as_str() {
-        "anthropic"   => ("https://api.anthropic.com".to_owned(), "x-api-key"),
-        "openai"      => ("https://api.openai.com".to_owned(), "bearer"),
-        "deepseek"    => ("https://api.deepseek.com".to_owned(), "bearer"),
-        "qwen"        => ("https://dashscope.aliyuncs.com/compatible-mode".to_owned(), "bearer"),
-        "minimax"     => ("https://api.minimax.chat".to_owned(), "bearer"),
-        "kimi"        => ("https://api.moonshot.cn".to_owned(), "bearer"),
-        "zhipu"       => ("https://open.bigmodel.cn/api/paas".to_owned(), "bearer"),
-        "groq"        => ("https://api.groq.com/openai".to_owned(), "bearer"),
-        "grok"        => ("https://api.x.ai".to_owned(), "bearer"),
-        "gemini"      => ("https://generativelanguage.googleapis.com".to_owned(), "bearer"),
-        "siliconflow" => ("https://api.siliconflow.cn".to_owned(), "bearer"),
-        "openrouter"  => ("https://openrouter.ai/api".to_owned(), "bearer"),
-        "gaterouter"  => (base_url.clone().unwrap_or_else(|| "https://api.gaterouter.ai/openai".to_owned()), "bearer"),
-        "ollama"      => (base_url.clone().unwrap_or_else(|| "http://localhost:11434".to_owned()).trim_end_matches('/').to_owned(), "none"),
-        "custom"      => (base_url.clone().unwrap_or_else(|| "http://localhost:8080".to_owned()).trim_end_matches('/').to_owned(), if api_key.is_empty() { "none" } else { "bearer" }),
+async fn test_provider(provider: String, api_key: String, base_url: Option<String>, api_type: Option<String>) -> Result<serde_json::Value, String> {
+    // Resolve the effective API type for custom providers
+    let effective_api_type = if provider == "custom" {
+        api_type.as_deref().unwrap_or("openai")
+    } else {
+        provider.as_str()
+    };
+
+    // Resolve base URL: explicit base_url param > provider default
+    let default_base = match provider.as_str() {
+        "anthropic"   => "https://api.anthropic.com/v1",
+        "openai"      => "https://api.openai.com/v1",
+        "deepseek"    => "https://api.deepseek.com/v1",
+        "qwen"        => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "doubao"      => "https://ark.cn-beijing.volces.com/api/v3",
+        "minimax"     => "https://api.minimaxi.com/v1",
+        "kimi"        => "https://api.moonshot.cn/v1",
+        "zhipu"       => "https://open.bigmodel.cn/api/paas/v4",
+        "groq"        => "https://api.groq.com/openai/v1",
+        "grok"        => "https://api.x.ai/v1",
+        "gemini"      => "https://generativelanguage.googleapis.com/v1beta",
+        "siliconflow" => "https://api.siliconflow.cn/v1",
+        "openrouter"  => "https://openrouter.ai/api/v1",
+        "gaterouter"  => "https://api.gaterouter.com/v1",
+        "ollama"      => "http://localhost:11434",
+        "custom"      => "",
         _ => return Ok(serde_json::json!({"ok": false, "error": "unknown provider"})),
     };
-    // Use base_url override if provided (except already handled above)
-    let effective_base = if !matches!(provider.as_str(), "gaterouter"|"ollama"|"custom") {
-        base_url.unwrap_or(url_base)
-    } else { url_base };
-    let url = if provider == "ollama" {
-        format!("{}/api/tags", effective_base)
-    } else {
-        format!("{}/v1/models", effective_base)
+    let effective_base = base_url
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| default_base.to_owned());
+    let effective_base = effective_base.trim_end_matches('/');
+
+    // Determine auth style based on provider or api_type
+    let auth_style = match effective_api_type {
+        "anthropic" => "x-api-key",
+        "gemini"    => "gemini-key",  // query param auth
+        "ollama"    => "none",
+        _ => if api_key.is_empty() { "none" } else { "bearer" },
     };
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build().unwrap_or_default();
+
+    // Minimax doesn't support /models — return built-in list
+    if provider == "minimax" {
+        return Ok(serde_json::json!({
+            "ok": true,
+            "models": ["MiniMax-M2.7","MiniMax-M2.7-highspeed","MiniMax-M2.5","MiniMax-M2.5-highspeed","MiniMax-M2.1","MiniMax-M2.1-highspeed","MiniMax-M2"]
+        }));
+    }
+
+    let is_ollama = effective_api_type == "ollama";
+    let is_gemini = effective_api_type == "gemini" || provider == "gemini";
+
+    let url = if is_ollama {
+        format!("{effective_base}/api/tags")
+    } else if is_gemini {
+        format!("{effective_base}/models?key={api_key}")
+    } else {
+        format!("{effective_base}/models")
+    };
+
     let mut req = client.get(&url);
     match auth_style {
-        "bearer" => { req = req.header("Authorization", format!("Bearer {}", api_key)); }
+        "bearer" => { req = req.header("Authorization", format!("Bearer {api_key}")); }
         "x-api-key" => {
             req = req.header("x-api-key", &api_key);
             req = req.header("anthropic-version", "2023-06-01");
         }
-        _ => {}
+        _ => {} // gemini uses query param, ollama needs no auth
     }
+
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            // Extract model IDs
+            // Extract model IDs — handle different response formats
             let models: Vec<String> = if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
+                // OpenAI format: { data: [{ id: "..." }] }
                 data.iter().filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.to_owned())).collect()
             } else if let Some(models) = body.get("models").and_then(|m| m.as_array()) {
-                models.iter().filter_map(|m| m.get("name").and_then(|v| v.as_str()).map(|s| s.to_owned())).collect()
+                // Ollama / Gemini format: { models: [{ name: "..." }] }
+                models.iter().filter_map(|m| {
+                    m.get("name").or_else(|| m.get("id"))
+                        .and_then(|v| v.as_str())
+                        // Gemini returns "models/gemini-2.5-flash" — strip prefix
+                        .map(|s| s.strip_prefix("models/").unwrap_or(s).to_owned())
+                }).collect()
             } else { vec![] };
             Ok(serde_json::json!({"ok": true, "models": models}))
         }
         Ok(resp) => {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            Ok(serde_json::json!({"ok": false, "error": if status == 401 { "Invalid API key" } else { &body[..body.len().min(200)] }}))
+            let msg = if status == 401 || status == 403 {
+                "Invalid API key".to_owned()
+            } else {
+                body[..body.len().min(200)].to_owned()
+            };
+            Ok(serde_json::json!({"ok": false, "error": msg}))
         }
         Err(e) => Ok(serde_json::json!({"ok": false, "error": e.to_string()})),
     }
@@ -850,25 +915,11 @@ fn main() {
             // mac_dock::install(app.handle());
             Ok(())
         })
-        .on_window_event(|event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event.event() {
-                // Check if gateway is running by testing its pid file
-                let pid_path = dirs::home_dir()
-                    .map(|h| h.join(".rsclaw").join("var").join("run").join("gateway.pid"));
-                let pid_content = pid_path.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
-                let pid_val = pid_content.as_ref().and_then(|s| s.trim().parse::<u32>().ok());
-                let gw_running = pid_val.is_some_and(|pid| is_process_alive(pid));
-
-
-
-                if gw_running {
-                    // Gateway running: minimize to dock, keep backend alive
-                    // Click dock thumbnail to restore
-                    let _ = event.window().minimize();
-                    api.prevent_close();
-                }
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                let _ = stop_gateway();
             }
-        })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        });
 }

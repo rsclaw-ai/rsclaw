@@ -126,8 +126,8 @@ export function useSwitchTheme() {
   const config = useAppConfig();
 
   useEffect(() => {
-    // Force dark theme -- no light/auto support.
-    document.body.classList.remove("light");
+    // Theme fixed to dark — light mode not fully supported yet
+    document.body.classList.remove("light", "dark");
     document.body.classList.add("dark");
 
     const metaDescriptionDark = document.querySelector(

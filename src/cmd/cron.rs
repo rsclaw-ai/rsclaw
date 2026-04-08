@@ -158,7 +158,9 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
                 .and_then(|j| j.iter().find(|j| j.id == id))
                 .ok_or_else(|| anyhow::anyhow!("cron job '{id}' not found"))?;
             let (path, _) = load_config_json()?;
-            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_owned());
+            let editor = std::env::var("EDITOR").unwrap_or_else(|_| {
+                if cfg!(windows) { "notepad".to_owned() } else { "vi".to_owned() }
+            });
             let status = std::process::Command::new(&editor).arg(&path).status()?;
             if !status.success() {
                 anyhow::bail!("editor exited with {status}");

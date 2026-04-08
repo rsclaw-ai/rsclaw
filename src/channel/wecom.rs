@@ -970,8 +970,13 @@ fn guess_mime(filename: &str) -> String {
 mod tests {
     use super::*;
 
+    fn init_crypto() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
     #[test]
     fn channel_name() {
+        init_crypto();
         let ch = WeComChannel::new(
             "bot_123",
             "secret_abc",
@@ -983,6 +988,7 @@ mod tests {
 
     #[test]
     fn default_ws_url() {
+        init_crypto();
         let ch = WeComChannel::new(
             "bot_123",
             "secret_abc",
@@ -994,6 +1000,7 @@ mod tests {
 
     #[test]
     fn custom_ws_url() {
+        init_crypto();
         let ch = WeComChannel::new(
             "bot_123",
             "secret_abc",
@@ -1005,6 +1012,7 @@ mod tests {
 
     #[test]
     fn send_markdown_enqueues() {
+        init_crypto();
         let ch = WeComChannel::new(
             "bot_123",
             "secret_abc",

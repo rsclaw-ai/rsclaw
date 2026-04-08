@@ -101,6 +101,10 @@ pub struct GatewayConfig {
     pub language: Option<String>,
     /// Seconds before sending "Processing..." indicator. 0 = disabled. Default: 10.
     pub processing_timeout: Option<u64>,
+    /// Global default User-Agent for all LLM provider HTTP requests.
+    /// Provider-level user_agent overrides this. Default: "Mozilla/5.0 (compatible; rsclaw/1.0)".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -340,6 +344,8 @@ pub struct AgentCommand {
 pub struct ModelConfig {
     pub primary: Option<String>,
     pub fallbacks: Option<Vec<String>>,
+    /// Text-to-image model, e.g. "doubao/doubao-seedream-5-0-260128".
+    pub image: Option<String>,
     pub image_fallbacks: Option<Vec<String>>,
     pub thinking: Option<ThinkingConfig>,
     /// Whether to send tool definitions to the model. Default: true.
@@ -553,10 +559,9 @@ pub struct ProviderConfig {
     pub api: Option<ApiFormat>,
     pub models: Option<Vec<ModelDef>>,
     pub enabled: Option<bool>,
-    /// Custom User-Agent header for HTTP requests to this provider (rsclaw extension).
-    /// Does not affect OpenClaw config files to maintain compatibility.
-    /// Can be overridden by RSCLAW_<PROVIDER>_USER_AGENT environment variable.
-    #[serde(default, skip_deserializing)]
+    /// Custom User-Agent for HTTP requests to this provider.
+    /// Falls back to gateway.user_agent if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
 }
 
@@ -565,7 +570,7 @@ pub struct ProviderConfig {
 pub enum ApiFormat {
     #[serde(rename = "openai-responses")]
     OpenAiResponses,
-    #[serde(rename = "openai-completions")]
+    #[serde(rename = "openai-completions", alias = "openai")]
     OpenAiCompletions,
     Anthropic,
     #[serde(rename = "anthropic-messages")]

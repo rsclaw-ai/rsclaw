@@ -17,7 +17,7 @@ tokio        = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 
 # Web framework
-axum         = { version = "0.8", features = ["ws"] }
+axum         = { version = "0.8", features = ["ws", "multipart"] }
 
 # HTTP client
 # TLS: use aws-lc-rs instead of ring for better cross-compilation (esp. Windows ARM64)
@@ -88,6 +88,7 @@ aes = "0.8"
 urlencoding = "2"
 silk-rs = "0.2"
 symphonia = { version = "0.5", features = ["mp3", "aac", "ogg", "flac", "wav", "pcm", "vorbis", "isomp4", "mkv"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 opus-decoder = "0.1"
 ogg = "0.9"
 lark-websocket-protobuf = "0.1"
@@ -124,3 +125,4 @@ opt-level = 0
 tokio-test = "0.4"
 tempfile   = "3"
 wiremock = "0.6"
+ctor = "0.4"

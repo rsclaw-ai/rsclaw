@@ -426,8 +426,13 @@ fn slack_process_file(filename: &str, bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn init_crypto() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
     #[test]
     fn channel_name() {
+        init_crypto();
         let ch = SlackChannel::new("xoxb-token", None, None, Arc::new(|_, _, _, _| {}));
         assert_eq!(ch.name(), "slack");
     }

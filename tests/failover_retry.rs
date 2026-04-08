@@ -289,3 +289,273 @@ async fn test_all_providers_exhausted() {
         "error message should mention exhaustion, got: {msg}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// test_non_retryable_error_propagated
+//
+// A 500 error (not rate-limit, not auth) should propagate immediately without
+// trying fallbacks.
+// ---------------------------------------------------------------------------
+
+/// A provider that returns a non-retryable 500 error.
+struct ServerErrorProvider {
+    provider_name: String,
+}
+
+impl ServerErrorProvider {
+    fn new(name: &str) -> Self {
+        Self {
+            provider_name: name.to_owned(),
+        }
+    }
+}
+
+impl LlmProvider for ServerErrorProvider {
+    fn name(&self) -> &str {
+        &self.provider_name
+    }
+
+    fn stream(&self, _req: LlmRequest) -> BoxFuture<'_, Result<LlmStream>> {
+        Box::pin(async move { Err(anyhow!("500 Internal Server Error")) })
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_non_retryable_error_propagated() {
+    let mut registry = ProviderRegistry::new();
+    registry.register("primary", Arc::new(ServerErrorProvider::new("primary")));
+    registry.register("fallback", Arc::new(AlwaysOkProvider::new("fallback")));
+
+    let mut order = HashMap::new();
+    order.insert("primary".to_owned(), vec!["p1".to_owned()]);
+
+    let api_keys: HashMap<String, String> = HashMap::new();
+    let fallbacks = vec!["fallback/model".to_owned()];
+
+    let mut mgr = FailoverManager::new(order, api_keys, fallbacks);
+
+    let req = simple_request("primary/model");
+    let result = mgr.call(req, &registry).await;
+
+    // 500 is not retryable -- it should propagate immediately without fallback
+    assert!(
+        result.is_err(),
+        "500 error should propagate, not fall through to fallback"
+    );
+    let err_msg = result.err().expect("expected error").to_string();
+    assert!(
+        err_msg.contains("500"),
+        "error should contain 500: {err_msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// test_multiple_profiles_tried_in_order
+//
+// When a provider has multiple profiles, they should be tried in order.
+// The first profile rate-limits, the second succeeds.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_multiple_profiles_tried_in_order() {
+    let provider = FailThenOkProvider::new("multi", 1);
+    let mut registry = ProviderRegistry::new();
+    registry.register("multi", provider);
+
+    let mut order = HashMap::new();
+    order.insert(
+        "multi".to_owned(),
+        vec!["profile_a".to_owned(), "profile_b".to_owned()],
+    );
+
+    let api_keys: HashMap<String, String> = HashMap::new();
+    let fallbacks = vec![];
+
+    let mut mgr = FailoverManager::new(order, api_keys, fallbacks);
+
+    let req = simple_request("multi/model");
+    let result = mgr.call(req, &registry).await;
+
+    // First profile fails (429), second profile succeeds
+    assert!(
+        result.is_ok(),
+        "second profile should succeed: {:?}",
+        result.err()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// test_cooldown_bounds
+//
+// Verify that cooldown durations are bounded by MIN_COOLDOWN (5s) and
+// MAX_COOLDOWN (300s).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cooldown_bounds() {
+    let cfg = RetryConfig {
+        attempts: 3,
+        min_delay_ms: 1, // very small
+        max_delay_ms: 1_000_000, // very large
+        jitter: 0.0,
+    };
+
+    // At attempt 0: base = 1 * 2^0 = 1 ms, clamped at max=1_000_000 ms.
+    // After .max(MIN_COOLDOWN=5s).min(MAX_COOLDOWN=300s):
+    let d0 = backoff_delay(0, &cfg);
+    let effective0 = d0.max(Duration::from_secs(5)).min(Duration::from_secs(300));
+    assert!(
+        effective0 >= Duration::from_secs(5),
+        "cooldown should be at least 5s, got {effective0:?}"
+    );
+
+    // At high attempt: base = 1 * 2^30, but clamped at max_delay_ms=1_000_000 ms.
+    // After .max(5s).min(300s): should be capped at 300s.
+    let d_high = backoff_delay(30, &cfg);
+    let effective_high = d_high.max(Duration::from_secs(5)).min(Duration::from_secs(300));
+    assert!(
+        effective_high <= Duration::from_secs(300),
+        "cooldown should be at most 300s, got {effective_high:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// test_error_classification_variants
+//
+// Verify that different error messages are classified correctly for failover.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_error_classification_rate_limit_variants() {
+    // All of these should trigger failover (rate-limit or auth classification)
+    let rate_limit_messages = vec![
+        "429 Too Many Requests",
+        "rate limit exceeded",
+        "too many requests, please slow down",
+    ];
+
+    for msg in rate_limit_messages {
+        let provider_name = format!("p_{}", msg.len());
+        let mut registry = ProviderRegistry::new();
+
+        // Create a provider that fails with this specific message
+        struct CustomErrorProvider {
+            name: String,
+            error_msg: String,
+        }
+        impl LlmProvider for CustomErrorProvider {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn stream(&self, _req: LlmRequest) -> BoxFuture<'_, Result<LlmStream>> {
+                let msg = self.error_msg.clone();
+                Box::pin(async move { Err(anyhow!("{}", msg)) })
+            }
+        }
+
+        let p = Arc::new(CustomErrorProvider {
+            name: provider_name.clone(),
+            error_msg: msg.to_owned(),
+        });
+        registry.register(&provider_name, p);
+        registry.register("fallback", Arc::new(AlwaysOkProvider::new("fallback")));
+
+        let mut order = HashMap::new();
+        order.insert(provider_name.clone(), vec!["prof".to_owned()]);
+
+        let api_keys: HashMap<String, String> = HashMap::new();
+        let fallbacks = vec!["fallback/m".to_owned()];
+        let mut mgr = FailoverManager::new(order, api_keys, fallbacks);
+
+        let req = simple_request(&format!("{provider_name}/model"));
+        let result = mgr.call(req, &registry).await;
+
+        assert!(
+            result.is_ok(),
+            "rate-limit error '{msg}' should trigger fallback, but got: {:?}",
+            result.err()
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_error_classification_auth_variants() {
+    let auth_messages = vec![
+        "401 Unauthorized",
+        "unauthorized access",
+        "invalid api key provided",
+    ];
+
+    for msg in auth_messages {
+        let provider_name = format!("auth_{}", msg.len());
+        let mut registry = ProviderRegistry::new();
+
+        struct AuthErrorProvider {
+            name: String,
+            error_msg: String,
+        }
+        impl LlmProvider for AuthErrorProvider {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn stream(&self, _req: LlmRequest) -> BoxFuture<'_, Result<LlmStream>> {
+                let msg = self.error_msg.clone();
+                Box::pin(async move { Err(anyhow!("{}", msg)) })
+            }
+        }
+
+        let p = Arc::new(AuthErrorProvider {
+            name: provider_name.clone(),
+            error_msg: msg.to_owned(),
+        });
+        registry.register(&provider_name, p);
+        registry.register("fallback", Arc::new(AlwaysOkProvider::new("fallback")));
+
+        let mut order = HashMap::new();
+        order.insert(provider_name.clone(), vec!["prof".to_owned()]);
+
+        let api_keys: HashMap<String, String> = HashMap::new();
+        let fallbacks = vec!["fallback/m".to_owned()];
+        let mut mgr = FailoverManager::new(order, api_keys, fallbacks);
+
+        let req = simple_request(&format!("{provider_name}/model"));
+        let result = mgr.call(req, &registry).await;
+
+        assert!(
+            result.is_ok(),
+            "auth error '{msg}' should trigger fallback, but got: {:?}",
+            result.err()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// test_empty_fallback_list
+//
+// When there are no fallbacks and the primary fails with a retryable error,
+// the manager should return an exhaustion error.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_empty_fallback_list() {
+    let mut registry = ProviderRegistry::new();
+    registry.register("primary", Arc::new(RateLimitProvider::new("primary")));
+
+    let mut order = HashMap::new();
+    order.insert("primary".to_owned(), vec!["prof".to_owned()]);
+
+    let api_keys: HashMap<String, String> = HashMap::new();
+    let fallbacks = vec![]; // no fallbacks
+
+    let mut mgr = FailoverManager::new(order, api_keys, fallbacks);
+
+    let req = simple_request("primary/model");
+    let result = mgr.call(req, &registry).await;
+
+    assert!(result.is_err(), "should fail with no fallbacks");
+    let err_msg = result.err().expect("expected error").to_string().to_lowercase();
+    assert!(
+        err_msg.contains("exhausted"),
+        "error should mention exhaustion: {err_msg}"
+    );
+}

@@ -123,7 +123,7 @@ pub async fn root_or_ws_handler(
 pub async fn root_handler() -> impl IntoResponse {
     axum::response::Html(format!(
         "<html><body>\
-        <h2>rsclaw gateway v{}</h2>\
+        <h2>rsclaw gateway {}</h2>\
         <p>WebSocket endpoint. Connect with a compatible client.</p>\
         <p><a href=\"/api/v1/health\">Health</a></p>\
         </body></html>",

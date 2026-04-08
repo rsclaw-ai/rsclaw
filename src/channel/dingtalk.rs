@@ -1068,8 +1068,13 @@ async fn dingtalk_extract_audio_and_transcribe(
 mod tests {
     use super::*;
 
+    fn init_crypto() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
     #[test]
     fn channel_name() {
+        init_crypto();
         let ch = DingTalkChannel::new(
             "key",
             "secret",

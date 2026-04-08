@@ -304,7 +304,7 @@ export function Settings() {
             </Select>
           </ListItem>
 
-          {/* Theme selector removed -- dark only */}
+          {/* Theme switcher hidden: panel only supports dark mode */}
 
           <ListItem title={Locale.Settings.Lang.Name}>
             <Select

@@ -911,12 +911,12 @@ const cn = {
 
     SubTitle: "螃蟹高性能多智能体AI网关",
     Sidebar: {
-      Service: "网关",
+      Service: "网关状态",
       ServiceTitle: "网关状态",
-      Config: "配置",
-      ConfigTitle: "配置",
-      Agents: "智能体",
-      AgentsTitle: "智能体管理",
+      Config: "配置管理",
+      ConfigTitle: "配置管理",
+      Agents: "多智能体",
+      AgentsTitle: "多智能体管理",
     },
 
     Nav: {

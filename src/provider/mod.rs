@@ -5,6 +5,7 @@
 //! 429/auth retries with exponential back-off.
 
 pub mod anthropic;
+pub mod defaults;
 pub mod failover;
 pub mod gemini;
 pub mod model_defaults;
@@ -16,12 +17,17 @@ use std::pin::Pin;
 use anyhow::Result;
 
 /// Default User-Agent for all LLM provider HTTP requests.
-const USER_AGENT: &str = concat!("rsclaw/", env!("RSCLAW_BUILD_DATE"));
+pub(crate) const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (compatible; rsclaw/1.0)";
 
 /// Build a `reqwest::Client` with the shared User-Agent header.
 pub(crate) fn http_client() -> reqwest::Client {
+    http_client_with_ua(None)
+}
+
+/// Build a `reqwest::Client` with a custom or default User-Agent.
+pub(crate) fn http_client_with_ua(user_agent: Option<&str>) -> reqwest::Client {
     reqwest::Client::builder()
-        .user_agent(USER_AGENT)
+        .user_agent(user_agent.unwrap_or(DEFAULT_USER_AGENT))
         .build()
         .expect("failed to build HTTP client")
 }

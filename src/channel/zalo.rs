@@ -500,14 +500,20 @@ async fn zalo_extract_audio_and_transcribe(
 mod tests {
     use super::*;
 
+    fn init_crypto() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
     #[test]
     fn channel_name() {
+        init_crypto();
         let ch = ZaloChannel::new("token", Arc::new(|_, _, _| {}));
         assert_eq!(ch.name(), "zalo");
     }
 
     #[test]
     fn handle_webhook_dispatches_text() {
+        init_crypto();
         use std::sync::Mutex;
         let received: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(vec![]));
         let rx = Arc::clone(&received);

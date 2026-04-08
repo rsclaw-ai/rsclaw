@@ -1,5 +1,8 @@
 //! Shared test helpers for integration tests.
 
+pub mod mock_channel;
+pub mod mock_provider;
+
 use std::{net::SocketAddr, sync::Arc};
 
 use rsclaw::{

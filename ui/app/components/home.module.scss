@@ -434,14 +434,14 @@
 
 /* Quick nav buttons */
 .sidebar-quick-nav {
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
   gap: 4px;
   margin-top: 6px;
   margin-bottom: 16px;
 }
 
 .sidebar-quick-btn {
-  flex: 1;
   display: flex;
   flex-direction: column;
   align-items: center;

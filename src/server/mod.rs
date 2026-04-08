@@ -20,6 +20,11 @@
 //!   POST   /hooks/:path                     webhook ingress (see hooks module)
 //!   POST   /v1/chat/completions             OpenAI-compatible chat endpoint
 //!   GET    /v1/models                       OpenAI-compatible models list
+//!   POST   /v1/files                        upload a file (multipart)
+//!   GET    /v1/files                        list uploaded files
+//!   GET    /v1/files/:id                    retrieve file metadata
+//!   GET    /v1/files/:id/content            download file content
+//!   DELETE /v1/files/:id                    delete a file
 //!   GET    /ws                              WebSocket gateway protocol
 //! (OpenClaw WS)
 
@@ -35,6 +40,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
+    extract::Multipart,
     routing::{get, patch, post},
 };
 use futures::{Stream, StreamExt as _};
@@ -204,6 +210,10 @@ pub fn build_router(state: AppState) -> Router {
         // OpenAI-compatible endpoints — allow any OpenAI API client to connect.
         .route("/v1/chat/completions", post(openai_chat_completions))
         .route("/v1/models", get(openai_list_models))
+        // OpenAI Files API — file upload/management for doubao and other providers.
+        .route("/v1/files", post(upload_file).get(list_files))
+        .route("/v1/files/{file_id}", get(get_file_meta).delete(delete_file))
+        .route("/v1/files/{file_id}/content", get(get_file_content))
         // WebSocket gateway — auth is handled inside the WS handshake.
         // OpenClaw WebUI connects on "/" (root), "/ws", or "/gateway-ws".
         .route("/ws", get(crate::ws::ws_handler))
@@ -1409,45 +1419,63 @@ struct TestProviderRequest {
     provider: String,
     api_key: String,
     base_url: Option<String>,
+    api_type: Option<String>,
 }
 
-/// POST /api/v1/providers/test - validate an API key against a provider
-async fn test_provider(Json(req): Json<TestProviderRequest>) -> Response {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .unwrap_or_default();
+/// Resolve URL and build an authenticated request for provider model listing.
+/// Shared logic between test_provider and list_provider_models.
+fn build_provider_models_request(
+    client: &reqwest::Client,
+    req: &TestProviderRequest,
+) -> Result<reqwest::RequestBuilder, String> {
+    use crate::provider::defaults as prov_defaults;
 
-    // Resolve provider API base URL and auth.
-    // Most providers use OpenAI-compatible /v1/models with Bearer token.
-    let (base_url, auth_style) = match req.provider.as_str() {
-        "anthropic"   => ("https://api.anthropic.com".to_owned(), "x-api-key"),
-        "openai"      => ("https://api.openai.com".to_owned(), "bearer"),
-        "deepseek"    => ("https://api.deepseek.com".to_owned(), "bearer"),
-        "qwen"        => ("https://dashscope.aliyuncs.com/compatible-mode".to_owned(), "bearer"),
-        "minimax"     => ("https://api.minimax.chat".to_owned(), "bearer"),
-        "kimi"        => ("https://api.moonshot.cn".to_owned(), "bearer"),
-        "zhipu"       => ("https://open.bigmodel.cn/api/paas".to_owned(), "bearer"),
-        "groq"        => ("https://api.groq.com/openai".to_owned(), "bearer"),
-        "grok"        => ("https://api.x.ai".to_owned(), "bearer"),
-        "gemini"      => ("https://generativelanguage.googleapis.com".to_owned(), "bearer"),
-        "siliconflow" => ("https://api.siliconflow.cn".to_owned(), "bearer"),
-        "openrouter"  => ("https://openrouter.ai/api".to_owned(), "bearer"),
-        "gaterouter"  => (req.base_url.clone().unwrap_or_else(|| "https://api.gaterouter.com".to_owned()), "bearer"),
-        "ollama" => {
-            let base = req.base_url.as_deref().unwrap_or("http://localhost:11434");
-            (base.trim_end_matches('/').to_owned(), "none")
-        }
-        "custom" => {
-            let base = req.base_url.as_deref().unwrap_or("http://localhost:8080");
-            (base.trim_end_matches('/').to_owned(), if req.api_key.is_empty() { "none" } else { "bearer" })
-        }
-        _ => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "unknown provider"}))).into_response();
-        }
+    // For custom providers, resolve auth/URL based on api_type
+    let effective_type = if req.provider == "custom" {
+        req.api_type.as_deref().unwrap_or("openai")
+    } else {
+        req.provider.as_str()
     };
 
-    let url = format!("{}/v1/models", base_url);
+    let (default_url, default_auth) = prov_defaults::resolve_base_url(&req.provider);
+
+    // Resolve base URL
+    let base_url = if let Some(ref explicit) = req.base_url {
+        if !explicit.is_empty() { explicit.trim_end_matches('/').to_owned() }
+        else if !default_url.is_empty() { default_url }
+        else { return Err("no base URL provided".to_owned()); }
+    } else if !default_url.is_empty() {
+        default_url
+    } else {
+        return Err("unknown provider".to_owned());
+    };
+
+    // Determine auth style — custom provider uses api_type, others use provider default
+    let auth_style = if req.provider == "custom" {
+        match effective_type {
+            "anthropic" => "x-api-key",
+            "gemini" => "gemini-key",
+            "ollama" => "none",
+            _ => if req.api_key.is_empty() { "none" } else { "bearer" },
+        }
+    } else if effective_type == "gemini" {
+        "gemini-key"
+    } else {
+        default_auth
+    };
+
+    // Build models URL — Gemini needs ?key= query param
+    let is_ollama = effective_type == "ollama";
+    let is_gemini = effective_type == "gemini";
+    let url = if is_ollama {
+        prov_defaults::models_url("ollama", &base_url)
+    } else if is_gemini {
+        let trimmed = base_url.trim_end_matches('/');
+        format!("{trimmed}/models?key={}", req.api_key)
+    } else {
+        prov_defaults::models_url(&req.provider, &base_url)
+    };
+
     let mut request = client.get(&url);
     match auth_style {
         "bearer" => { request = request.header("Authorization", format!("Bearer {}", req.api_key)); }
@@ -1455,8 +1483,49 @@ async fn test_provider(Json(req): Json<TestProviderRequest>) -> Response {
             request = request.header("x-api-key", &req.api_key);
             request = request.header("anthropic-version", "2023-06-01");
         }
-        _ => {} // no auth (ollama)
+        _ => {} // "none" or "gemini-key" (already in URL)
     }
+
+    Ok(request)
+}
+
+/// Extract model IDs from different provider response formats.
+fn extract_model_ids(body: &serde_json::Value) -> Vec<String> {
+    if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
+        // OpenAI/Anthropic format: { data: [{ id: "..." }] }
+        data.iter()
+            .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.to_owned()))
+            .collect()
+    } else if let Some(models) = body.get("models").and_then(|m| m.as_array()) {
+        // Ollama / Gemini format: { models: [{ name: "..." }] }
+        models.iter()
+            .filter_map(|m| {
+                m.get("name").or_else(|| m.get("id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.strip_prefix("models/").unwrap_or(s).to_owned())
+            })
+            .collect()
+    } else {
+        vec![]
+    }
+}
+
+/// POST /api/v1/providers/test - validate an API key against a provider
+async fn test_provider(Json(req): Json<TestProviderRequest>) -> Response {
+    // Minimax doesn't support /models — return built-in list
+    if req.provider == "minimax" {
+        return Json(serde_json::json!({"ok": true, "status": 200})).into_response();
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_default();
+
+    let request = match build_provider_models_request(&client, &req) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+    };
 
     match request.send().await {
         Ok(resp) if resp.status().is_success() => {
@@ -1468,7 +1537,7 @@ async fn test_provider(Json(req): Json<TestProviderRequest>) -> Response {
             (StatusCode::OK, Json(serde_json::json!({
                 "ok": false,
                 "status": status,
-                "error": if status == 401 { "Invalid API key" } else { "Request failed" },
+                "error": if status == 401 || status == 403 { "Invalid API key" } else { "Request failed" },
                 "detail": body.chars().take(200).collect::<String>(),
             }))).into_response()
         }
@@ -1483,69 +1552,25 @@ async fn test_provider(Json(req): Json<TestProviderRequest>) -> Response {
 
 /// POST /api/v1/providers/models - list models from a provider
 async fn list_provider_models(Json(req): Json<TestProviderRequest>) -> Response {
+    // Minimax doesn't support /models — return built-in list
+    if req.provider == "minimax" {
+        return Json(serde_json::json!({"models": ["MiniMax-M2.7","MiniMax-M2.7-highspeed","MiniMax-M2.5","MiniMax-M2.5-highspeed","MiniMax-M2.1","MiniMax-M2.1-highspeed","MiniMax-M2"]})).into_response();
+    }
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .unwrap_or_default();
 
-    // Reuse same provider URL resolution as test_provider.
-    let (base_url, auth_style) = match req.provider.as_str() {
-        "anthropic"   => ("https://api.anthropic.com".to_owned(), "x-api-key"),
-        "openai"      => ("https://api.openai.com".to_owned(), "bearer"),
-        "deepseek"    => ("https://api.deepseek.com".to_owned(), "bearer"),
-        "qwen"        => ("https://dashscope.aliyuncs.com/compatible-mode".to_owned(), "bearer"),
-        "minimax"     => ("https://api.minimax.chat".to_owned(), "bearer"),
-        "kimi"        => ("https://api.moonshot.cn".to_owned(), "bearer"),
-        "zhipu"       => ("https://open.bigmodel.cn/api/paas".to_owned(), "bearer"),
-        "groq"        => ("https://api.groq.com/openai".to_owned(), "bearer"),
-        "grok"        => ("https://api.x.ai".to_owned(), "bearer"),
-        "gemini"      => ("https://generativelanguage.googleapis.com".to_owned(), "bearer"),
-        "siliconflow" => ("https://api.siliconflow.cn".to_owned(), "bearer"),
-        "openrouter"  => ("https://openrouter.ai/api".to_owned(), "bearer"),
-        "gaterouter"  => (req.base_url.clone().unwrap_or_else(|| "https://api.gaterouter.com".to_owned()), "bearer"),
-        "ollama" => {
-            let base = req.base_url.as_deref().unwrap_or("http://localhost:11434");
-            (base.trim_end_matches('/').to_owned(), "none")
-        }
-        "custom" => {
-            let base = req.base_url.as_deref().unwrap_or("http://localhost:8080");
-            (base.trim_end_matches('/').to_owned(), if req.api_key.is_empty() { "none" } else { "bearer" })
-        }
-        _ => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "unknown provider"}))).into_response();
-        }
+    let request = match build_provider_models_request(&client, &req) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"models": [], "error": e}))).into_response(),
     };
-
-    // Ollama uses /api/tags, everything else uses /v1/models
-    let url = if req.provider == "ollama" {
-        format!("{}/api/tags", base_url)
-    } else {
-        format!("{}/v1/models", base_url)
-    };
-
-    let mut request = client.get(&url);
-    match auth_style {
-        "bearer" => { request = request.header("Authorization", format!("Bearer {}", req.api_key)); }
-        "x-api-key" => {
-            request = request.header("x-api-key", &req.api_key);
-            request = request.header("anthropic-version", "2023-06-01");
-        }
-        _ => {}
-    }
 
     match request.send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            // Normalize: extract model IDs from different API formats
-            let models: Vec<String> = if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
-                // OpenAI/Anthropic format: { data: [{ id: "..." }] }
-                data.iter().filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.to_owned())).collect()
-            } else if let Some(models) = body.get("models").and_then(|m| m.as_array()) {
-                // Ollama format: { models: [{ name: "..." }] }
-                models.iter().filter_map(|m| m.get("name").and_then(|v| v.as_str()).map(|s| s.to_owned())).collect()
-            } else {
-                vec![]
-            };
+            let models = extract_model_ids(&body);
             Json(serde_json::json!({"models": models})).into_response()
         }
         Ok(resp) => {
@@ -1881,4 +1906,329 @@ async fn write_workspace_file(
             Json(serde_json::json!({"error": e.to_string()})),
         ).into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI Files API
+// ---------------------------------------------------------------------------
+
+/// Maximum file upload size (100 MB). TODO: make configurable via gateway.max_upload_size.
+const MAX_UPLOAD_SIZE: usize = 100 * 1024 * 1024;
+
+/// Validate a file_id to prevent path traversal attacks.
+fn validate_file_id(file_id: &str) -> Result<(), Response> {
+    if !file_id.starts_with("file-") || file_id.contains('/') || file_id.contains('\\') || file_id.contains("..") {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid file_id"}))).into_response());
+    }
+    Ok(())
+}
+
+/// Directory where uploaded files are stored.
+fn files_dir() -> std::path::PathBuf {
+    dirs_next::home_dir()
+        .unwrap_or_default()
+        .join(".rsclaw/var/data/files")
+}
+
+/// File metadata stored alongside each uploaded file.
+#[derive(Debug, Serialize, Deserialize)]
+struct FileObject {
+    id: String,
+    object: String,
+    bytes: u64,
+    created_at: u64,
+    filename: String,
+    purpose: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+}
+
+/// Generate a unique file ID: `file-{timestamp_hex}{random_hex}`.
+fn generate_file_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let rnd: u32 = rand::random();
+    format!("file-{ts:x}{rnd:08x}")
+}
+
+/// Read metadata JSON for a file ID.
+fn read_file_meta_from_disk(file_id: &str) -> Option<FileObject> {
+    let dir = files_dir();
+    let meta_path = dir.join(format!("{file_id}.meta.json"));
+    let data = std::fs::read_to_string(&meta_path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+/// Derive Content-Type from file extension.
+fn content_type_for(filename: &str) -> &'static str {
+    match filename.rsplit('.').next().map(|e| e.to_ascii_lowercase()).as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("pdf") => "application/pdf",
+        Some("txt") => "text/plain",
+        Some("json") => "application/json",
+        Some("csv") => "text/csv",
+        Some("mp3") => "audio/mpeg",
+        Some("mp4") => "video/mp4",
+        Some("wav") => "audio/wav",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Build the content URL for a file.
+async fn file_content_url(state: &AppState, file_id: &str) -> String {
+    let port = state.live.gateway.read().await.port;
+    format!("http://localhost:{port}/v1/files/{file_id}/content")
+}
+
+/// POST /v1/files — upload a file via multipart/form-data.
+async fn upload_file(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let dir = files_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("cannot create files dir: {e}")})),
+        )
+            .into_response();
+    }
+
+    let mut file_data: Option<(String, Vec<u8>)> = None; // (filename, bytes)
+    let mut purpose = String::from("assistants");
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "file" => {
+                let filename = field
+                    .file_name()
+                    .unwrap_or("upload")
+                    .to_string();
+                match field.bytes().await {
+                    Ok(b) => file_data = Some((filename, b.to_vec())),
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"error": format!("failed to read file: {e}")})),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            "purpose" => {
+                if let Ok(b) = field.bytes().await {
+                    purpose = String::from_utf8_lossy(&b).to_string();
+                }
+            }
+            _ => { /* ignore unknown fields */ }
+        }
+    }
+
+    let Some((filename, data)) = file_data else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "missing 'file' field in multipart form"})),
+        )
+            .into_response();
+    };
+
+    // Max upload size: 100 MB (gateway.max_upload_size TODO).
+    if data.len() > MAX_UPLOAD_SIZE {
+        return (StatusCode::PAYLOAD_TOO_LARGE, Json(serde_json::json!({
+            "error": "file too large, max 100MB"
+        }))).into_response();
+    }
+
+    let file_id = generate_file_id();
+    let stored_name = format!("{file_id}_{filename}");
+    let file_path = dir.join(&stored_name);
+
+    if let Err(e) = std::fs::write(&file_path, &data) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to write file: {e}")})),
+        )
+            .into_response();
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let url = file_content_url(&state, &file_id).await;
+
+    let meta = FileObject {
+        id: file_id.clone(),
+        object: "file".to_string(),
+        bytes: data.len() as u64,
+        created_at: now,
+        filename: filename.clone(),
+        purpose,
+        url: Some(url),
+    };
+
+    let meta_json = serde_json::to_string_pretty(&meta).unwrap_or_default();
+    let meta_path = dir.join(format!("{file_id}.meta.json"));
+    if let Err(e) = std::fs::write(&meta_path, &meta_json) {
+        // Clean up the data file on metadata write failure.
+        let _ = std::fs::remove_file(&file_path);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to write metadata: {e}")})),
+        )
+            .into_response();
+    }
+
+    info!(file_id = %meta.id, filename = %meta.filename, bytes = meta.bytes, "file uploaded");
+    Json(serde_json::json!(meta)).into_response()
+}
+
+/// GET /v1/files — list all uploaded files.
+async fn list_files(State(state): State<AppState>) -> impl IntoResponse {
+    let dir = files_dir();
+    let mut files: Vec<serde_json::Value> = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".meta.json"))
+            {
+                if let Ok(data) = std::fs::read_to_string(&path) {
+                    if let Ok(mut obj) = serde_json::from_str::<serde_json::Value>(&data) {
+                        // Refresh the URL in case the port changed.
+                        if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
+                            let url = file_content_url(&state, id).await;
+                            obj["url"] = serde_json::Value::String(url);
+                        }
+                        files.push(obj);
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by created_at descending (newest first).
+    files.sort_by(|a, b| {
+        let ta = a.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+        let tb = b.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+        tb.cmp(&ta)
+    });
+
+    Json(serde_json::json!({
+        "object": "list",
+        "data": files,
+    }))
+}
+
+/// GET /v1/files/{file_id} — retrieve file metadata.
+async fn get_file_meta(
+    State(state): State<AppState>,
+    Path(file_id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = validate_file_id(&file_id) { return e; }
+    match read_file_meta_from_disk(&file_id) {
+        Some(mut meta) => {
+            meta.url = Some(file_content_url(&state, &file_id).await);
+            Json(serde_json::json!(meta)).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("file {file_id} not found")})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /v1/files/{file_id}/content — download file content.
+async fn get_file_content(Path(file_id): Path<String>) -> impl IntoResponse {
+    if let Err(e) = validate_file_id(&file_id) { return e; }
+    let dir = files_dir();
+
+    // Find the data file matching this file_id prefix.
+    let data_file = std::fs::read_dir(&dir)
+        .ok()
+        .and_then(|entries| {
+            entries.flatten().find(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(&format!("{file_id}_")) && !name.ends_with(".meta.json")
+            })
+        })
+        .map(|e| e.path());
+
+    let Some(path) = data_file else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("file {file_id} not found")})),
+        )
+            .into_response();
+    };
+
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    let ct = content_type_for(filename);
+
+    match std::fs::read(&path) {
+        Ok(data) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, ct.parse().unwrap());
+            (headers, data).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to read file: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /v1/files/{file_id} — delete a file.
+async fn delete_file(Path(file_id): Path<String>) -> impl IntoResponse {
+    if let Err(e) = validate_file_id(&file_id) { return e.into_response(); }
+    let dir = files_dir();
+
+    // Remove the metadata file.
+    let meta_path = dir.join(format!("{file_id}.meta.json"));
+    let meta_existed = meta_path.exists();
+    let _ = std::fs::remove_file(&meta_path);
+
+    // Remove the data file.
+    let data_removed = std::fs::read_dir(&dir)
+        .ok()
+        .and_then(|entries| {
+            entries.flatten().find(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(&format!("{file_id}_")) && !name.ends_with(".meta.json")
+            })
+        })
+        .map(|e| {
+            let _ = std::fs::remove_file(e.path());
+            true
+        })
+        .unwrap_or(false);
+
+    if meta_existed || data_removed {
+        info!(file_id = %file_id, "file deleted");
+    }
+
+    Json(serde_json::json!({
+        "id": file_id,
+        "object": "file",
+        "deleted": true,
+    })).into_response()
 }

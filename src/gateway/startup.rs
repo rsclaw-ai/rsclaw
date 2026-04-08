@@ -33,8 +33,11 @@ use crate::{
     plugin::{MemoryStoreSlot, PluginRegistry, load_plugins},
     provider::{
         LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
-        anthropic::AnthropicProvider, failover::FailoverManager, gemini::GeminiProvider,
-        openai::OpenAiProvider, registry::ProviderRegistry,
+        anthropic::{self as anthropic, AnthropicProvider},
+        failover::FailoverManager,
+        gemini::{self as gemini, GeminiProvider},
+        openai::OpenAiProvider,
+        registry::ProviderRegistry,
     },
     server::{AppState, serve},
     skill::{SkillRegistry, load_skills},
@@ -322,9 +325,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // All channels registered - now wrap for sharing with cron runner
     let channel_manager = Arc::new(channel_manager);
 
-    // Start cron runner (if configured and enabled).
+    // Start cron runner (if configured).
+    // Default: enabled when jobs are present, unless explicitly disabled.
     if let Some(ref cron_cfg) = config.ops.cron
-        && cron_cfg.enabled.unwrap_or(false)
+        && cron_cfg.enabled.unwrap_or(true)
     {
         let jobs = config
             .ops
@@ -472,12 +476,19 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                 }
             });
 
+            // Resolve User-Agent: provider > gateway > built-in default.
+            let user_agent = provider_cfg
+                .user_agent
+                .clone()
+                .or_else(|| config.gateway.user_agent.clone());
+
             // Determine API format: explicit `api` field > name-based inference.
             let api_format = provider_cfg.api.clone().unwrap_or_else(|| {
                 use crate::config::schema::ApiFormat;
                 match name.as_str() {
                     "anthropic" => ApiFormat::Anthropic,
                     "gemini" => ApiFormat::Gemini,
+                    "doubao" | "bytedance" => ApiFormat::OpenAiResponses,
                     _ => ApiFormat::OpenAiCompletions,
                 }
             });
@@ -489,43 +500,45 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     let key = api_key
                         .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
                         .unwrap_or_default();
-                    if let Some(url) = base_url {
-                        Arc::new(AnthropicProvider::with_base_url(key, url))
-                    } else {
-                        Arc::new(AnthropicProvider::new(key))
-                    }
+                    let url = base_url.unwrap_or_else(|| anthropic::ANTHROPIC_API_BASE.to_owned());
+                    Arc::new(AnthropicProvider::with_user_agent(key, url, user_agent))
                 }
                 ("gemini", _) => {
                     let key = api_key
                         .or_else(|| std::env::var("GEMINI_API_KEY").ok())
                         .unwrap_or_default();
-                    if let Some(url) = base_url {
-                        Arc::new(GeminiProvider::with_base_url(key, url))
-                    } else {
-                        Arc::new(GeminiProvider::new(key))
-                    }
+                    let url = base_url.unwrap_or_else(|| gemini::GEMINI_API_BASE.to_owned());
+                    Arc::new(GeminiProvider::with_user_agent(key, url, user_agent))
                 }
                 (_, &crate::config::schema::ApiFormat::Ollama) => {
                     // Ollama backend: reasoning models use native /api/chat
                     let key = api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok());
-                    if let Some(url) = base_url {
-                        Arc::new(OpenAiProvider::ollama(url, key))
-                    } else {
-                        Arc::new(OpenAiProvider::ollama("http://localhost:11434/v1", key))
-                    }
+                    let url = base_url.unwrap_or_else(|| "http://localhost:11434".to_owned());
+                    Arc::new(OpenAiProvider::ollama_with_ua(url, key, user_agent))
+                }
+                (_, &crate::config::schema::ApiFormat::OpenAiResponses) => {
+                    let key = api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok());
+                    let url = base_url
+                        .unwrap_or_else(|| crate::provider::openai::OPENAI_API_BASE.to_owned());
+                    Arc::new(OpenAiProvider::responses_with_ua(url, key, user_agent))
                 }
                 _ => {
-                    // OpenAI-compatible (covers openai-completions, openai-responses,
+                    // OpenAI-compatible (covers openai-completions,
                     // llama.cpp, vLLM, SGLang, etc.)
                     let key = api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok());
                     if let Some(url) = base_url {
-                        Arc::new(OpenAiProvider::with_base_url(url, key))
+                        Arc::new(OpenAiProvider::with_user_agent(url, key, user_agent))
                     } else {
-                        Arc::new(OpenAiProvider::new(key.unwrap_or_default()))
+                        Arc::new(OpenAiProvider::with_user_agent(
+                            crate::provider::openai::OPENAI_API_BASE,
+                            key,
+                            user_agent,
+                        ))
                     }
                 }
             };
 
+            tracing::info!(name=%name, api=?api_format, "provider registered");
             registry.register(name.clone(), provider);
         }
     }
@@ -608,19 +621,9 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
             "https://api.baichuan-ai.com/v1",
             "BAICHUAN_API_KEY",
         ),
-        ("minimax", "https://api.minimax.chat/v1", "MINIMAX_API_KEY"),
+        ("minimax", "https://api.minimaxi.com/v1", "MINIMAX_API_KEY"),
         ("stepfun", "https://api.stepfun.com/v1", "STEPFUN_API_KEY"),
         ("lingyi", "https://api.lingyiwanwu.com/v1", "LINGYI_API_KEY"),
-        (
-            "doubao",
-            "https://ark.cn-beijing.volces.com/api/v3",
-            "DOUBAO_API_KEY",
-        ),
-        (
-            "bytedance",
-            "https://ark.cn-beijing.volces.com/api/v3",
-            "DOUBAO_API_KEY",
-        ), // alias for doubao
         (
             "baidu",
             "https://qianfan.baidubce.com/v2",
@@ -649,12 +652,36 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
         }
     }
 
+    // Doubao / ByteDance — uses OpenAI Responses API format.
+    if !registry.names().contains(&"doubao") {
+        if let Ok(key) = std::env::var("ARK_API_KEY").or_else(|_| std::env::var("DOUBAO_API_KEY")) {
+            registry.register(
+                "doubao",
+                Arc::new(OpenAiProvider::responses(
+                    "https://ark.cn-beijing.volces.com/api/v3",
+                    Some(key),
+                )),
+            );
+        }
+    }
+    if !registry.names().contains(&"bytedance") {
+        if let Ok(key) = std::env::var("ARK_API_KEY").or_else(|_| std::env::var("DOUBAO_API_KEY")) {
+            registry.register(
+                "bytedance",
+                Arc::new(OpenAiProvider::responses(
+                    "https://ark.cn-beijing.volces.com/api/v3",
+                    Some(key),
+                )),
+            );
+        }
+    }
+
     // Ollama (no API key needed).
     if !registry.names().contains(&"ollama") {
         registry.register(
             "ollama",
             Arc::new(OpenAiProvider::with_base_url(
-                "http://localhost:11434/v1",
+                "http://localhost:11434",
                 None,
             )),
         );
@@ -1245,7 +1272,7 @@ fn start_channels(
                                 tokio::spawn(async move {
                                     while let Some((text, peer_id, chat_id, is_group, bound, images, file_attachments)) = urx.recv().await {
                                         let process_result = tokio::time::timeout(
-                                            Duration::from_secs(180),
+                                            Duration::from_secs(600),
                                             async {
                                         let handle = if let Some(ref agent_id) = bound {
                                             match w_reg.get(agent_id) {
@@ -1322,7 +1349,7 @@ fn start_channels(
                                             }
                                         ).await;
                                         if process_result.is_err() {
-                                            warn!(user = %w_uid, "telegram: message processing timed out (180s), skipping to next");
+                                            warn!(user = %w_uid, "telegram: message processing timed out (600s), skipping to next");
                                         }
                                     }
                                     debug!(user = %w_uid, "telegram: per-user worker stopped");
@@ -1770,7 +1797,7 @@ fn start_discord_if_configured(
                                         }
                                     ).await;
                                     if process_result.is_err() {
-                                        warn!(user = %w_uid, "discord: message processing timed out (180s), skipping to next");
+                                        warn!(user = %w_uid, "discord: message processing timed out (600s), skipping to next");
                                     }
                                 }
                                 debug!(user = %w_uid, "discord: per-user worker stopped");
@@ -2143,7 +2170,7 @@ fn start_slack_if_configured(
                                         }
                                     ).await;
                                     if process_result.is_err() {
-                                        warn!(user = %w_uid, "slack: message processing timed out (180s), skipping to next");
+                                        warn!(user = %w_uid, "slack: message processing timed out (600s), skipping to next");
                                     }
                                 }
                                 debug!(user = %w_uid, "slack: per-user worker stopped");
@@ -2385,7 +2412,7 @@ fn start_whatsapp_if_configured(
                             tokio::spawn(async move {
                                 while let Some((text, from, images)) = urx.recv().await {
                                     let process_result = tokio::time::timeout(
-                                Duration::from_secs(180),
+                                Duration::from_secs(600),
                                 async {
                             let handle = match w_reg.route("whatsapp") {
                                 Ok(h) => h,
@@ -2445,7 +2472,7 @@ fn start_whatsapp_if_configured(
                                 }
                             ).await;
                                     if process_result.is_err() {
-                                        warn!(user = %w_uid, "whatsapp: message processing timed out (180s), skipping to next");
+                                        warn!(user = %w_uid, "whatsapp: message processing timed out (600s), skipping to next");
                                     }
                                 }
                                 debug!(user = %w_uid, "whatsapp: per-user worker stopped");
@@ -2712,7 +2739,7 @@ fn start_line_if_configured(
                                 while let Some((text, user_id, is_group, images)) = urx.recv().await
                                 {
                                     let process_result = tokio::time::timeout(
-                                    Duration::from_secs(180),
+                                    Duration::from_secs(600),
                                     async {
                                 let handle = match w_reg.route("line") {
                                     Ok(h) => h,
@@ -2776,7 +2803,7 @@ fn start_line_if_configured(
                                     }
                                 ).await;
                                     if process_result.is_err() {
-                                        warn!(user = %w_uid, "line: message processing timed out (180s), skipping to next");
+                                        warn!(user = %w_uid, "line: message processing timed out (600s), skipping to next");
                                     }
                                 }
                                 debug!(user = %w_uid, "line: per-user worker stopped");
@@ -3008,7 +3035,7 @@ fn start_zalo_if_configured(
                             tokio::spawn(async move {
                                 while let Some((text, sender_id, images)) = urx.recv().await {
                                     let process_result = tokio::time::timeout(
-                                    Duration::from_secs(180),
+                                    Duration::from_secs(600),
                                     async {
                                 let handle = match w_reg.route("zalo") {
                                     Ok(h) => h,
@@ -3068,7 +3095,7 @@ fn start_zalo_if_configured(
                                     }
                                 ).await;
                                     if process_result.is_err() {
-                                        warn!(user = %w_uid, "zalo: message processing timed out (180s), skipping to next");
+                                        warn!(user = %w_uid, "zalo: message processing timed out (600s), skipping to next");
                                     }
                                 }
                                 debug!(user = %w_uid, "zalo: per-user worker stopped");
@@ -3319,7 +3346,7 @@ fn start_signal_if_configured(
                         tokio::spawn(async move {
                             while let Some((text, sender, is_group)) = urx.recv().await {
                                 let process_result = tokio::time::timeout(
-                                Duration::from_secs(180),
+                                Duration::from_secs(600),
                                 async {
                             let handle = match w_reg.route("signal") {
                                 Ok(h) => h,
@@ -3386,7 +3413,7 @@ fn start_signal_if_configured(
                                 }
                             ).await;
                                 if process_result.is_err() {
-                                    warn!(user = %w_uid, "signal: message processing timed out (180s), skipping to next");
+                                    warn!(user = %w_uid, "signal: message processing timed out (600s), skipping to next");
                                 }
                             }
                             debug!(user = %w_uid, "signal: per-user worker stopped");
@@ -3562,7 +3589,7 @@ fn spawn_wechat_user_worker(
         debug!(user = %user_id, "wechat: per-user worker started");
         while let Some((text, images, file_attachments)) = rx.recv().await {
             debug!(user = %user_id, text_start = %text.chars().take(30).collect::<String>(), "wechat: worker processing");
-            let process_result = tokio::time::timeout(Duration::from_secs(180), async {
+            let process_result = tokio::time::timeout(Duration::from_secs(600), async {
                 let handle = match reg.get("main").or_else(|_| reg.default_agent()) {
                     Ok(h) => h,
                     Err(e) => {
@@ -3643,7 +3670,7 @@ fn spawn_wechat_user_worker(
             })
             .await;
             if process_result.is_err() {
-                warn!(user = %user_id, "wechat: message processing timed out (180s), skipping to next");
+                warn!(user = %user_id, "wechat: message processing timed out (600s), skipping to next");
             }
         }
         debug!(user = %user_id, "wechat: per-user worker stopped");
@@ -4283,7 +4310,7 @@ fn start_feishu_if_configured(
                                         }
                                     ).await;
                                     if process_result.is_err() {
-                                        warn!(user = %w_uid, "feishu: message processing timed out (180s), skipping to next");
+                                        warn!(user = %w_uid, "feishu: message processing timed out (600s), skipping to next");
                                     }
                                 }
                                 debug!(user = %w_uid, "feishu: per-user worker stopped");
@@ -4686,7 +4713,7 @@ fn start_dingtalk_if_configured(
                                         }
                                     ).await;
                                     if process_result.is_err() {
-                                        warn!(user = %w_uid, "dingtalk: message processing timed out (180s), skipping to next");
+                                        warn!(user = %w_uid, "dingtalk: message processing timed out (600s), skipping to next");
                                     }
                                 }
                                 debug!(user = %w_uid, "dingtalk: per-user worker stopped");
@@ -5065,7 +5092,7 @@ fn start_qq_if_configured(
                                 )) = urx.recv().await
                                 {
                                     let process_result = tokio::time::timeout(
-                                    Duration::from_secs(180),
+                                    Duration::from_secs(600),
                                     async {
                                 let handle = match w_reg.route("qq").or_else(|_| w_reg.default_agent()) {
                                     Ok(h) => h,
@@ -5121,7 +5148,7 @@ fn start_qq_if_configured(
                                     }
                                 ).await;
                                     if process_result.is_err() {
-                                        warn!(user = %w_uid, "qq: message processing timed out (180s), skipping to next");
+                                        warn!(user = %w_uid, "qq: message processing timed out (600s), skipping to next");
                                     }
                                 }
                                 debug!(user = %w_uid, "qq: per-user worker stopped");
@@ -5420,7 +5447,7 @@ fn start_matrix_if_configured(
                                     urx.recv().await
                                 {
                                     let process_result = tokio::time::timeout(
-                                Duration::from_secs(180),
+                                Duration::from_secs(600),
                                 async {
                             let handle = match w_reg.route("matrix").or_else(|_| w_reg.default_agent()) {
                                 Ok(h) => h,
@@ -5488,7 +5515,7 @@ fn start_matrix_if_configured(
                                 }
                             ).await;
                                     if process_result.is_err() {
-                                        warn!(user = %w_uid, "matrix: message processing timed out (180s), skipping to next");
+                                        warn!(user = %w_uid, "matrix: message processing timed out (600s), skipping to next");
                                     }
                                 }
                                 debug!(user = %w_uid, "matrix: per-user worker stopped");
@@ -5756,7 +5783,7 @@ fn start_wecom_if_configured(
                                     urx.recv().await
                                 {
                                     let process_result = tokio::time::timeout(
-                                Duration::from_secs(180),
+                                Duration::from_secs(600),
                                 async {
                             let handle = match w_reg.route("wecom").or_else(|_| w_reg.default_agent()) {
                                 Ok(h) => h,
@@ -5824,7 +5851,7 @@ fn start_wecom_if_configured(
                                 }
                             ).await;
                                     if process_result.is_err() {
-                                        warn!(user = %w_uid, "wecom: message processing timed out (180s), skipping to next");
+                                        warn!(user = %w_uid, "wecom: message processing timed out (600s), skipping to next");
                                     }
                                 }
                                 debug!(user = %w_uid, "wecom: per-user worker stopped");
@@ -6223,7 +6250,7 @@ async fn handle_pending_analysis(
             .await;
         return;
     }
-    match tokio::time::timeout(Duration::from_secs(180), reply_rx).await {
+    match tokio::time::timeout(Duration::from_secs(600), reply_rx).await {
         Ok(Ok(r)) if !r.text.is_empty() || !r.images.is_empty() => {
             let _ = out_tx
                 .send(crate::channel::OutboundMessage {

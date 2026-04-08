@@ -146,6 +146,8 @@ fn model_supports_vision(model: &str, config: &RuntimeConfig) -> bool {
         || lower.contains("minicpm-v")
         || lower.contains("deepseek-vl")
         || lower.contains("qwen3")
+        || lower.contains("doubao")
+        || lower.contains("seed")      // doubao-seed models
     // Known NON-vision models (deepseek-chat, deepseek-r1, qwen-turbo,
     // moonshot, minimax, etc.) return false by default.
 }
@@ -1712,8 +1714,42 @@ impl AgentRuntime {
         }
 
         // ---------------------------------------------------------------
-        // File attachment: auto-detect video/audio for direct transcription
+        // File attachment: auto-detect video/audio for direct transcription.
+        // For doubao (Responses API): convert video FileAttachments to
+        // ImageAttachments so they go through Files API → input_video.
+        // This is unified here so all channels benefit without changes.
         // ---------------------------------------------------------------
+        let cur_model = self.resolve_model_name();
+        let is_doubao = cur_model.to_lowercase().contains("doubao") || cur_model.to_lowercase().contains("seed");
+        let mut files = files;
+        let mut images = images;
+        let mut text_override: Option<String> = None;
+        if is_doubao {
+            let mut remaining = Vec::new();
+            for f in files {
+                if crate::channel::is_video_attachment(&f.mime_type, &f.filename) {
+                    // NOTE: During base64 encoding, both f.data and the b64 string
+                    // (~133% of original) coexist in memory. The 100 MB upload limit
+                    // (MAX_UPLOAD_SIZE) bounds the worst case to ~233 MB peak.
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&f.data);
+                    let mime = if f.mime_type.is_empty() { "video/mp4" } else { &f.mime_type };
+                    let data_uri = format!("data:{mime};base64,{b64}");
+                    images.push(super::registry::ImageAttachment {
+                        data: data_uri,
+                        mime_type: mime.to_owned(),
+                    });
+                    if text.is_empty() && text_override.is_none() {
+                        text_override = Some(crate::i18n::t("describe_video", crate::i18n::default_lang()));
+                    }
+                    info!(size = f.data.len(), "video FileAttachment → ImageAttachment for vision");
+                } else {
+                    remaining.push(f);
+                }
+            }
+            files = remaining;
+        }
+        let text = text_override.as_deref().unwrap_or(text);
         let (media_files, regular_files): (Vec<_>, Vec<_>) = files.into_iter().partition(|f| {
             crate::channel::is_video_attachment(&f.mime_type, &f.filename)
                 || crate::channel::is_audio_attachment(&f.mime_type, &f.filename)
@@ -2138,9 +2174,14 @@ impl AgentRuntime {
             vec![]
         };
         // Compress images before sending to LLM to save tokens.
+        // Skip compression for video attachments — they go to Files API directly.
         let compressed_images: Vec<_> = images
             .iter()
             .filter_map(|img| {
+                if img.mime_type.starts_with("video/") {
+                    // Pass video through without compression
+                    return Some(img.clone());
+                }
                 compress_image_for_llm(&img.data).map(|data| super::registry::ImageAttachment {
                     data,
                     mime_type: "image/jpeg".to_owned(),
@@ -2910,14 +2951,16 @@ impl AgentRuntime {
                         // Record result for progress-aware loop detection.
                         // Same args + different results = making progress, not a loop.
                         ctx.loop_detector.record_result(&v);
-                        // Extract images from tool result (e.g. computer_use screenshot)
-                        // to avoid passing large base64 back to LLM.
-                        if let Some(img) = v.get("image").and_then(|i| i.as_str()) {
-                            let desc = v.get("action").and_then(|a| a.as_str()).unwrap_or("tool");
+                        // Extract images from tool result to avoid passing large
+                        // base64 back to LLM. Check "image" (screenshot) and "url" (image gen).
+                        let img_data = v.get("image").and_then(|i| i.as_str())
+                            .or_else(|| v.get("url").and_then(|u| u.as_str()).filter(|u| u.starts_with("data:image/")));
+                        if let Some(img) = img_data {
+                            let desc = v.get("revised_prompt").and_then(|p| p.as_str())
+                                .or_else(|| v.get("action").and_then(|a| a.as_str()))
+                                .unwrap_or("image generated");
                             (
-                                format!(
-                                    "{{\"action\":\"{desc}\",\"status\":\"image sent to user\"}}"
-                                ),
+                                format!("{{\"status\":\"image sent to user\",\"description\":\"{desc}\"}}"),
                                 vec![img.to_owned()],
                             )
                         } else if v.is_string() {
@@ -4086,8 +4129,9 @@ impl AgentRuntime {
                 workspace.clone()
             };
             for token in command.split_whitespace() {
-                if token.starts_with('/') || token.contains("..") {
-                    let resolved = if token.starts_with('/') {
+                let is_abs = std::path::Path::new(token).is_absolute();
+                if is_abs || token.contains("..") {
+                    let resolved = if is_abs {
                         std::path::PathBuf::from(token)
                     } else {
                         workspace.join(token)
@@ -4156,6 +4200,7 @@ impl AgentRuntime {
             model: Some(ModelConfig {
                 primary: Some(model),
                 fallbacks: None,
+                image: None,
                 image_fallbacks: None,
                 thinking: None,
                 tools_enabled: None,
@@ -4764,47 +4809,196 @@ $bitmap.Dispose()
         let prompt = args["prompt"]
             .as_str()
             .ok_or_else(|| anyhow!("image: `prompt` required"))?;
-        let size = args["size"].as_str().unwrap_or("1024x1024");
 
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .map_err(|_| anyhow!("image: OPENAI_API_KEY not set — cannot generate images"))?;
+        // Check user-configured image model: agents.defaults.model.image
+        let user_image_model = self.handle.config.model.as_ref()
+            .and_then(|m| m.image.as_deref())
+            .or_else(|| self.config.agents.defaults.model.as_ref().and_then(|m| m.image.as_deref()))
+            .map(|s| s.to_owned());
 
-        let client = reqwest::Client::new();
-        let resp = client
-            .post("https://api.openai.com/v1/images/generations")
-            .header("Authorization", format!("Bearer {api_key}"))
-            .json(&json!({
-                "model": "dall-e-3",
-                "prompt": prompt,
-                "size": size,
-                "n": 1,
-                "response_format": "url"
-            }))
-            .send()
-            .await
-            .map_err(|e| anyhow!("image: request failed: {e}"))?;
+        // Resolve provider — from image model config or current chat model
+        let resolve_model = user_image_model.clone().unwrap_or_else(|| self.resolve_model_name());
+        let (prov_name, user_model_id) = {
+            crate::provider::registry::ProviderRegistry::parse_model(&resolve_model)
+        };
+        let (base_url, auth_style) = crate::provider::defaults::resolve_base_url(prov_name);
 
-        let status = resp.status();
-        let body: Value = resp
-            .json()
-            .await
-            .map_err(|e| anyhow!("image: failed to parse response: {e}"))?;
+        let default_size = match prov_name {
+            "doubao" | "bytedance" => "2048x2048",
+            _ => "1024x1024",
+        };
+        let size = args["size"].as_str().unwrap_or(default_size);
 
-        if !status.is_success() {
-            let err_msg = body["error"]["message"].as_str().unwrap_or("unknown error");
+        // Also check provider config for api_key and base_url overrides
+        let cfg_key = self.config.model.models.as_ref()
+            .and_then(|m| m.providers.get(prov_name))
+            .and_then(|p| p.api_key.as_ref())
+            .and_then(|k| k.as_plain().map(str::to_owned));
+        let cfg_url = self.config.model.models.as_ref()
+            .and_then(|m| m.providers.get(prov_name))
+            .and_then(|p| p.base_url.clone());
+
+        // Providers with image generation support
+        let image_providers = ["doubao", "bytedance", "openai", "qwen", "minimax"];
+        let (img_url, img_key, img_prov) = if image_providers.contains(&prov_name) {
+            let url = cfg_url.unwrap_or(base_url);
+            let key = cfg_key
+                .or_else(|| std::env::var(format!("{}_API_KEY", prov_name.to_uppercase())).ok())
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+            (url, key, prov_name)
+        } else {
+            // Current provider doesn't support images — try doubao, qwen, openai
+            let fallback = [("doubao", "ARK_API_KEY"), ("qwen", "DASHSCOPE_API_KEY"), ("minimax", "MINIMAX_API_KEY"), ("openai", "OPENAI_API_KEY")];
+            let mut found = None;
+            for (fb_prov, fb_env) in fallback {
+                let fb_cfg = self.config.model.models.as_ref()
+                    .and_then(|m| m.providers.get(fb_prov));
+                let fb_key = fb_cfg.and_then(|p| p.api_key.as_ref()).and_then(|k| k.as_plain().map(str::to_owned))
+                    .or_else(|| std::env::var(fb_env).ok());
+                if let Some(key) = fb_key {
+                    let fb_url = fb_cfg.and_then(|p| p.base_url.clone())
+                        .unwrap_or_else(|| crate::provider::defaults::resolve_base_url(fb_prov).0);
+                    found = Some((fb_url, Some(key), fb_prov));
+                    break;
+                }
+            }
+            found.unwrap_or_else(|| (cfg_url.unwrap_or(base_url), None, prov_name))
+        };
+        let Some(api_key) = img_key else {
+            return Ok(json!({
+                "error": "AI image generation requires doubao, qwen, or openai provider with API key. No image-capable provider configured."
+            }));
+        };
+
+        let image_model = args["model"].as_str()
+            .or_else(|| if !user_model_id.is_empty() { Some(user_model_id) } else { None })
+            .unwrap_or_else(|| {
+                match img_prov {
+                    "doubao" | "bytedance" => "doubao-seedream-5-0-260128",
+                    "openai" => "dall-e-3",
+                    "qwen" => "qwen-image-2.0-pro",
+                    "minimax" => "image-01",
+                    _ => "dall-e-3",
+                }
+            });
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build().unwrap_or_default();
+
+        // Qwen uses a different API format
+        let is_qwen = img_prov == "qwen";
+        let is_minimax = img_prov == "minimax";
+        let (resp_status, resp_body) = if is_qwen {
+            let qwen_size = size.replace('x', "*");
+            let resp = client
+                .post("https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation")
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(&json!({
+                    "model": image_model,
+                    "input": { "messages": [{ "role": "user", "content": [{ "text": prompt }] }] },
+                    "parameters": { "size": qwen_size, "n": 1, "watermark": false }
+                }))
+                .send().await
+                .map_err(|e| anyhow!("image: request failed: {e}"))?;
+            let st = resp.status();
+            let body: Value = resp.json().await.map_err(|e| anyhow!("image: parse error: {e}"))?;
+            (st, body)
+        } else if is_minimax {
+            // Minimax: /v1/image_generation, aspect_ratio instead of size
+            // Supported: "1:1", "16:9", "9:16", "4:3", "3:4", "2:3", "3:2"
+            let aspect = if size.contains('x') {
+                let parts: Vec<&str> = size.split('x').collect();
+                if parts.len() == 2 {
+                    let w = parts[0].parse::<f32>().unwrap_or(1024.0);
+                    let h = parts[1].parse::<f32>().unwrap_or(1024.0);
+                    let ratio = w / h.max(1.0);
+                    let candidates = [
+                        (1.0_f32,        "1:1"),
+                        (16.0 / 9.0,     "16:9"),
+                        (9.0 / 16.0,     "9:16"),
+                        (4.0 / 3.0,      "4:3"),
+                        (3.0 / 4.0,      "3:4"),
+                        (3.0 / 2.0,      "3:2"),
+                        (2.0 / 3.0,      "2:3"),
+                    ];
+                    candidates.iter()
+                        .min_by(|a, b| (a.0 - ratio).abs().partial_cmp(&(b.0 - ratio).abs()).unwrap())
+                        .map(|c| c.1)
+                        .unwrap_or("1:1")
+                        .to_owned()
+                } else { "1:1".to_owned() }
+            } else { "1:1".to_owned() };
+            let url = format!("{}/image_generation", img_url.trim_end_matches('/'));
+            let resp = client.post(&url)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(&json!({ "model": image_model, "prompt": prompt, "aspect_ratio": aspect, "response_format": "url" }))
+                .send().await
+                .map_err(|e| anyhow!("image: request failed: {e}"))?;
+            let st = resp.status();
+            let body: Value = resp.json().await.map_err(|e| anyhow!("image: parse error: {e}"))?;
+            (st, body)
+        } else {
+            let url = format!("{}/images/generations", img_url.trim_end_matches('/'));
+            let resp = client.post(&url)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(&json!({ "model": image_model, "prompt": prompt, "size": size, "n": 1, "response_format": "url" }))
+                .send().await
+                .map_err(|e| anyhow!("image: request failed: {e}"))?;
+            let st = resp.status();
+            let body: Value = resp.json().await.map_err(|e| anyhow!("image: parse error: {e}"))?;
+            (st, body)
+        };
+
+        if !resp_status.is_success() {
+            let err_msg = resp_body["error"]["message"].as_str()
+                .or_else(|| resp_body["message"].as_str())
+                .unwrap_or("unknown error");
             return Err(anyhow!("image: API error: {err_msg}"));
         }
 
-        let url = body["data"][0]["url"].as_str().unwrap_or("").to_owned();
-        let revised = body["data"][0]["revised_prompt"]
-            .as_str()
+        // Extract image URL/base64 — different response formats per provider
+        let img_url_str = if is_qwen {
+            resp_body.pointer("/output/choices/0/message/content/0/image")
+                .and_then(|v| v.as_str())
+        } else if is_minimax {
+            // minimax: data.image_base64[0] (base64) or data.image_urls[0] (url)
+            resp_body.pointer("/data/image_urls/0").and_then(|v| v.as_str())
+                .or_else(|| resp_body.pointer("/data/image_base64/0").and_then(|v| v.as_str()))
+        } else {
+            resp_body.pointer("/data/0/url").and_then(|v| v.as_str())
+        };
+
+        let Some(img_url_str) = img_url_str else {
+            return Err(anyhow!("image: no image URL in response"));
+        };
+
+        // Download image and convert to data URI
+        use base64::Engine;
+        let image_result = match reqwest::Client::new().get(img_url_str).timeout(std::time::Duration::from_secs(60)).send().await {
+            Ok(r) if r.status().is_success() => {
+                match r.bytes().await {
+                    Ok(bytes) => {
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        format!("data:image/png;base64,{b64}")
+                    }
+                    Err(e) => return Err(anyhow!("image: download failed: {e}")),
+                }
+            }
+            Ok(r) => return Err(anyhow!("image: download returned {}", r.status())),
+            Err(e) => return Err(anyhow!("image: download error: {e}")),
+        };
+
+        let revised = resp_body.pointer("/data/0/revised_prompt")
+            .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_owned();
 
         Ok(json!({
-            "url": url,
+            "url": image_result,
             "revised_prompt": revised,
-            "size": size
+            "size": size,
+            "model": image_model
         }))
     }
 
@@ -6791,7 +6985,7 @@ fn build_tool_list(
 /// 3. Block sensitive filenames
 /// 4. Scan ALL file content for dangerous commands (not just scripts)
 /// Compress an image for LLM: resize to max 1024px and convert to JPEG.
-/// Uses ffmpeg/sips (no extra crate dependency).
+/// Uses the `image` crate (pure Rust, cross-platform — no ffmpeg/sips needed).
 /// Returns data URI or None if compression fails.
 fn compress_image_for_llm(data_uri: &str) -> Option<String> {
     let b64 = data_uri
@@ -6809,67 +7003,29 @@ fn compress_image_for_llm(data_uri: &str) -> Option<String> {
         return Some(data_uri.to_owned());
     }
 
-    let tmp_in = std::env::temp_dir().join(format!("rsclaw_img_in_{}.png", uuid::Uuid::new_v4()));
-    let tmp_out = std::env::temp_dir().join(format!("rsclaw_img_out_{}.jpg", uuid::Uuid::new_v4()));
-    std::fs::write(&tmp_in, &bytes).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?;
 
-    // Try ffmpeg first (cross-platform)
-    let ok = std::process::Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-i",
-            tmp_in.to_str()?,
-            "-vf",
-            "scale='min(1024,iw)':'min(1024,ih)':force_original_aspect_ratio=decrease",
-            "-q:v",
-            "5", // JPEG quality (~85%)
-            tmp_out.to_str()?,
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    // Fallback: macOS sips
-    #[cfg(target_os = "macos")]
-    let ok = if !ok {
-        let _ = std::fs::copy(&tmp_in, &tmp_out);
-        std::process::Command::new("sips")
-            .args([
-                "--resampleWidth",
-                "1024",
-                "--setProperty",
-                "formatOptions",
-                "85",
-                tmp_out.to_str()?,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+    // Resize so neither dimension exceeds 1024px, preserving aspect ratio.
+    const MAX_DIM: u32 = 1024;
+    let (w, h) = (img.width(), img.height());
+    let img = if w > MAX_DIM || h > MAX_DIM {
+        img.resize(MAX_DIM, MAX_DIM, image::imageops::FilterType::Lanczos3)
     } else {
-        ok
+        img
     };
 
-    let result = if ok && tmp_out.exists() {
-        let compressed = std::fs::read(&tmp_out).ok()?;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&compressed);
-        tracing::debug!(
-            original = bytes.len(),
-            compressed = compressed.len(),
-            "image compressed for LLM"
-        );
-        Some(format!("data:image/jpeg;base64,{b64}"))
-    } else {
-        // Compression failed, return original
-        Some(data_uri.to_owned())
-    };
+    // Encode to JPEG quality 85.
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::Jpeg).ok()?;
+    let compressed = buf.into_inner();
 
-    let _ = std::fs::remove_file(&tmp_in);
-    let _ = std::fs::remove_file(&tmp_out);
-    result
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&compressed);
+    tracing::debug!(
+        original = bytes.len(),
+        compressed = compressed.len(),
+        "image compressed for LLM"
+    );
+    Some(format!("data:image/jpeg;base64,{b64}"))
 }
 
 /// Maximum characters to send from file content to LLM.

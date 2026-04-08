@@ -25,3 +25,12 @@ pub mod sys;
 pub mod ws;
 
 pub use sys::MemoryTier;
+
+/// Ensure the rustls TLS crypto provider is installed for all lib tests.
+/// This runs once before any test in the crate, preventing "No provider set"
+/// panics when tests that construct `reqwest::Client` run in parallel.
+#[cfg(test)]
+#[ctor::ctor]
+fn init_test_crypto() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}

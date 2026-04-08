@@ -44,6 +44,12 @@ import {
   CH_ORDER_EN,
   MODELS,
 } from "./onboarding";
+import {
+  type ApiType,
+  API_TYPE_LABELS,
+  API_TYPE_DEFAULT_URLS,
+  API_TYPE_NEEDS_KEY,
+} from "../lib/provider-defaults";
 
 // ── Types ──────────────────────────────────────────────
 interface ChannelInfo {
@@ -61,6 +67,7 @@ interface AgentInfo {
   status: string;
   toolset?: string[];
   channels?: string[];
+  maxTokens?: number;
 }
 
 interface GatewayHealth {
@@ -233,7 +240,7 @@ function StatusPage() {
           <div className={styles["status-name"]}>{Locale.RsClawPanel.Status.GatewayName}</div>
           <div className={styles["status-addr"]}>
             {health.running
-              ? `localhost:${health.port || 18888} · ${Locale.RsClawPanel.Status.Uptime} ${health.uptime || "N/A"}`
+              ? `rsclaw gateway ${health.version || "?"} · localhost:${health.port || 18888} · ${Locale.RsClawPanel.Status.Uptime} ${health.uptime || "N/A"}`
               : Locale.RsClawPanel.Status.NotResponding}
           </div>
         </div>
@@ -397,6 +404,10 @@ function StatusPage() {
                     <div className={styles["gw-modal-stat-val"]} style={{ color: "#2dd4a0" }}>{Locale.RsClawPanel.Running}</div>
                   </div>
                   <div className={styles["gw-modal-stat"]}>
+                    <div className={styles["gw-modal-stat-label"]}>{"Version"}</div>
+                    <div className={styles["gw-modal-stat-val"]} style={{ color: "#6b6877" }}>v{health.version || "unknown"}</div>
+                  </div>
+                  <div className={styles["gw-modal-stat"]}>
                     <div className={styles["gw-modal-stat-label"]}>{Locale.RsClawPanel.Status.ChannelCount}</div>
                     <div className={styles["gw-modal-stat-val"]} style={{ color: "#f0a500" }}>
                       {channels.filter(c => c.status === "connected").length} {Locale.RsClawPanel.Status.Unit}
@@ -476,16 +487,21 @@ function ConfigEditorPage() {
   const [processingTimeout, setProcessingTimeout] = useState(120);
   const [authToken, setAuthToken] = useState("");
   const [agentModel, setAgentModel] = useState("");
-  const [agentMaxTokens, setAgentMaxTokens] = useState(4096);
+  const [agentMaxTokens, setAgentMaxTokens] = useState(0);
 
   // Parsed config fields - Models
   const [providers, setProviders] = useState<{
-    name: string; key: string; enabled: boolean; apiKey: string; baseUrl: string;
+    name: string; key: string; enabled: boolean; apiKey: string; baseUrl: string; apiType?: ApiType; userAgent?: string;
   }[]>([
+    { name: "Doubao (\u8C46\u5305)", key: "doubao", enabled: false, apiKey: "", baseUrl: "" },
+    { name: "Qwen (\u5343\u95EE)", key: "qwen", enabled: false, apiKey: "", baseUrl: "" },
     { name: "Anthropic", key: "anthropic", enabled: false, apiKey: "", baseUrl: "" },
     { name: "OpenAI", key: "openai", enabled: false, apiKey: "", baseUrl: "" },
     { name: "DeepSeek", key: "deepseek", enabled: false, apiKey: "", baseUrl: "" },
+    { name: "Kimi", key: "kimi", enabled: false, apiKey: "", baseUrl: "", userAgent: "claude-code/0.1.0" },
+    { name: "CodingPlan", key: "codingplan", enabled: false, apiKey: "", baseUrl: "" },
     { name: "Ollama", key: "ollama", enabled: true, apiKey: "", baseUrl: "http://localhost:11434" },
+    { name: "Custom Provider", key: "custom", enabled: false, apiKey: "", baseUrl: "" },
   ]);
 
   // Parsed config fields - Channels
@@ -536,9 +552,9 @@ function ConfigEditorPage() {
     if (amt) setAgentMaxTokens(parseInt(amt, 10) || 4096);
 
     // Models - try to detect provider blocks
-    const providerNames = ["anthropic", "openai", "deepseek", "ollama"];
+    const providerNames = ["doubao", "qwen", "anthropic", "openai", "deepseek", "kimi", "codingplan", "ollama", "custom"];
     const displayNames: Record<string, string> = {
-      anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", ollama: "Ollama",
+      doubao: "Doubao (\u8C46\u5305)", qwen: "Qwen (\u5343\u95EE)", anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", kimi: "Kimi", codingplan: "CodingPlan", ollama: "Ollama", custom: "Custom Provider",
     };
     const newProviders = providerNames.map((pName) => {
       // Look for a block like anthropic: { ... }
@@ -547,13 +563,21 @@ function ConfigEditorPage() {
       const block = blockMatch ? blockMatch[1] : "";
       const apiKey = extractVal(block, "apiKey") || "";
       const baseUrl = extractVal(block, "baseUrl") || extractVal(block, "base_url") || "";
+      const userAgent = extractVal(block, "userAgent") || extractVal(block, "user_agent") || "";
       const enabled = extractVal(block, "enabled");
+      const apiField = extractVal(block, "api") || extractVal(block, "api_type");
+      const apiType: ApiType | undefined = (apiField === "anthropic" || apiField === "gemini" || apiField === "ollama" || apiField === "openai" || apiField === "openai-responses")
+        ? (apiField as ApiType)
+        : undefined;
+      const isCustomLike = pName === "custom" || pName === "codingplan";
       return {
         name: displayNames[pName] || pName,
         key: pName,
-        enabled: enabled !== undefined ? enabled === "true" : apiKey.length > 0,
+        enabled: enabled !== undefined ? enabled === "true" : (isCustomLike ? !!baseUrl : apiKey.length > 0),
         apiKey,
-        baseUrl,
+        baseUrl: baseUrl || "",
+        userAgent: userAgent || (pName === "kimi" ? "claude-code/0.1.0" : ""),
+        ...(isCustomLike ? { apiType } : {}),
       };
     });
     setProviders(newProviders);
@@ -650,14 +674,44 @@ function ConfigEditorPage() {
   }, []);
 
   const buildRawFromFields = useCallback(() => {
-    let raw = rawConfig;
-    raw = applyFieldToRaw(raw, "port", port);
-    raw = applyFieldToRaw(raw, "bind", bind);
-    raw = applyFieldToRaw(raw, "language", language);
-    raw = applyFieldToRaw(raw, "processingTimeout", processingTimeout);
-    if (authToken) raw = applyFieldToRaw(raw, "authToken", authToken);
-    return raw;
-  }, [rawConfig, port, bind, language, processingTimeout, authToken, applyFieldToRaw]);
+    // Parse existing config, overlay structured fields, re-serialize.
+    let cfg: any = {};
+    try { cfg = JSON.parse(rawConfig); } catch { cfg = {}; }
+
+    // Gateway fields
+    if (!cfg.gateway) cfg.gateway = {};
+    cfg.gateway.port = port;
+    cfg.gateway.bind = bind;
+    cfg.gateway.language = language;
+    cfg.gateway.processingTimeout = processingTimeout;
+    if (authToken) {
+      if (!cfg.gateway.auth) cfg.gateway.auth = {};
+      cfg.gateway.auth.token = authToken;
+    }
+
+    // Providers
+    if (!cfg.models) cfg.models = {};
+    if (!cfg.models.providers) cfg.models.providers = {};
+    for (const prov of providers) {
+      const isCustomLike = prov.key === "custom" || prov.key === "codingplan";
+      if (!prov.enabled) {
+        // Remove disabled provider
+        delete cfg.models.providers[prov.key];
+        continue;
+      }
+      const entry: any = cfg.models.providers[prov.key] || {};
+      if (prov.apiKey) entry.apiKey = prov.apiKey;
+      else delete entry.apiKey;
+      if (prov.baseUrl) entry.baseUrl = prov.baseUrl;
+      else if (isCustomLike || prov.key === "ollama") delete entry.baseUrl;
+      if (isCustomLike && prov.apiType) entry.api = prov.apiType;
+      if (prov.userAgent) entry.userAgent = prov.userAgent;
+      else delete entry.userAgent;
+      cfg.models.providers[prov.key] = entry;
+    }
+
+    return JSON.stringify(cfg, null, 2);
+  }, [rawConfig, port, bind, language, processingTimeout, authToken, providers]);
 
   const handleSave = async () => {
     setSaving(true);
@@ -745,8 +799,8 @@ function ConfigEditorPage() {
   };
   const statusPill = (status: string): React.CSSProperties => ({
     padding: "2px 10px", borderRadius: "10px", fontSize: "11px", fontWeight: 500,
-    background: status === "configured" ? "rgba(240,165,0,0.12)" : "rgba(0,0,0,0.06)",
-    color: status === "configured" ? "#f0a500" : "#999",
+    background: status === "configured" ? "rgba(45,212,160,0.12)" : status === "pending" ? "rgba(240,165,0,0.12)" : "rgba(0,0,0,0.06)",
+    color: status === "configured" ? "#2dd4a0" : status === "pending" ? "#f0a500" : "#999",
   });
   const sliderContainer: React.CSSProperties = {
     display: "flex", alignItems: "center", gap: "10px", width: "220px",
@@ -822,10 +876,10 @@ function ConfigEditorPage() {
         </div>
         <div style={{ ...fieldRow, borderBottom: "none" }}>
           <div>
-            <div style={fieldLabel}>Max Tokens</div>
+            <div style={fieldLabel}>Max Tokens <span style={{ color: "#666", fontWeight: 400 }}>(0 = auto)</span></div>
           </div>
           <input style={fieldInput} type="number" value={agentMaxTokens}
-            onChange={(e) => { setAgentMaxTokens(parseInt(e.target.value, 10) || 4096); markDirty(); }} />
+            onChange={(e) => { setAgentMaxTokens(parseInt(e.target.value, 10) || 0); markDirty(); }} />
         </div>
       </div>
     </div>
@@ -833,17 +887,34 @@ function ConfigEditorPage() {
 
   const renderModels = () => (
     <div>
-      {providers.map((prov, idx) => (
+      {providers.map((prov, idx) => {
+        const isCustomLike = prov.key === "custom" || prov.key === "codingplan";
+        const curApiType: ApiType | undefined = prov.apiType;
+        const hideKey = prov.key === "ollama";
+        const keyOptional = isCustomLike && curApiType && !API_TYPE_NEEDS_KEY[curApiType];
+        const isZh = getLang() === "cn";
+        // Determine configuration status
+        const hasCredentials = prov.apiKey.length > 0 || (["ollama", "custom", "codingplan"].includes(prov.key) && prov.baseUrl.length > 0);
+        const badgeLabel = prov.enabled
+          ? (hasCredentials ? (isZh ? "已配置" : "Configured") : (isZh ? "待配置" : "Pending"))
+          : (isZh ? "关闭" : "OFF");
+        const badgeBg = prov.enabled
+          ? (hasCredentials ? "rgba(45,212,160,0.12)" : "rgba(240,165,0,0.12)")
+          : "rgba(0,0,0,0.06)";
+        const badgeColor = prov.enabled
+          ? (hasCredentials ? "#2dd4a0" : "#f0a500")
+          : "#999";
+        return (
         <div key={prov.key} style={providerCard}>
           <div style={providerHeader}>
             <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
               <span style={providerName}>{prov.name}</span>
               <span style={{
                 padding: "2px 8px", borderRadius: "8px", fontSize: "11px",
-                background: prov.enabled ? "rgba(240,165,0,0.12)" : "rgba(0,0,0,0.06)",
-                color: prov.enabled ? "#f0a500" : "#999",
+                background: badgeBg,
+                color: badgeColor,
               }}>
-                {prov.enabled ? "ON" : "OFF"}
+                {badgeLabel}
               </span>
             </div>
             <Toggle on={prov.enabled} onToggle={() => {
@@ -853,21 +924,53 @@ function ConfigEditorPage() {
               markDirty();
             }} />
           </div>
+          {isCustomLike && (
+            <div style={fieldRow}>
+              <div style={fieldLabel}>API Type</div>
+              <select
+                style={{ ...fieldInput, cursor: "pointer" }}
+                value={curApiType || ""}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  if (!val) return;
+                  const at = val as ApiType;
+                  const next = [...providers];
+                  next[idx] = { ...next[idx], apiType: at, baseUrl: "" };
+                  setProviders(next);
+                  markDirty();
+                }}
+              >
+                {!curApiType && <option value="">-- Select --</option>}
+                {(Object.keys(API_TYPE_LABELS) as ApiType[]).map((at) => (
+                  <option key={at} value={at}>{API_TYPE_LABELS[at]}</option>
+                ))}
+              </select>
+            </div>
+          )}
+          {!hideKey && (
           <div style={fieldRow}>
-            <div style={fieldLabel}>API Key</div>
-            <input style={fieldInput} type="password" value={prov.apiKey}
-              placeholder={prov.key === "ollama" ? "(local, no key needed)" : "sk-..."}
-              onChange={(e) => {
-                const next = [...providers];
-                next[idx] = { ...next[idx], apiKey: e.target.value };
-                setProviders(next);
-                markDirty();
-              }} />
-          </div>
-          <div style={{ ...fieldRow, borderBottom: "none" }}>
-            <div style={fieldLabel}>Base URL</div>
+              <div style={fieldLabel}>API Key{keyOptional ? <span style={{ color: "#999", fontWeight: 400 }}> (optional)</span> : null}</div>
+              <input style={fieldInput} type="password" value={prov.apiKey}
+                placeholder={keyOptional ? "(optional)" : "sk-..."}
+                onChange={(e) => {
+                  const next = [...providers];
+                  next[idx] = { ...next[idx], apiKey: e.target.value };
+                  setProviders(next);
+                  markDirty();
+                }} />
+            </div>
+          )}
+          {(isCustomLike || prov.key === "doubao" || prov.key === "ollama" || prov.key === "kimi") && (
+          <div style={fieldRow}>
+            <div style={fieldLabel}>API URL</div>
             <input style={fieldInput} value={prov.baseUrl}
-              placeholder="(default)"
+              placeholder={
+                isCustomLike ? "https://your-api-server.com/v1" :
+                prov.key === "kimi" ? "https://api.moonshot.cn/v1" :
+                prov.key === "doubao" ? "https://ark.cn-beijing.volces.com/api/v3" :
+                prov.key === "ollama" ? "http://localhost:11434" :
+                "(default)"
+              }
               onChange={(e) => {
                 const next = [...providers];
                 next[idx] = { ...next[idx], baseUrl: e.target.value };
@@ -875,8 +978,23 @@ function ConfigEditorPage() {
                 markDirty();
               }} />
           </div>
+          )}
+          {(isCustomLike || prov.key === "kimi") && (
+          <div style={{ ...fieldRow, borderBottom: "none" }}>
+            <div style={fieldLabel}>User-Agent</div>
+            <input style={fieldInput} value={prov.userAgent || ""}
+              placeholder="e.g. claude-code/0.1.0"
+              onChange={(e) => {
+                const next = [...providers];
+                next[idx] = { ...next[idx], userAgent: e.target.value };
+                setProviders(next);
+                markDirty();
+              }} />
+          </div>
+          )}
         </div>
-      ))}
+        );
+      })}
     </div>
   );
 
@@ -1034,8 +1152,10 @@ function ConfigEditorPage() {
                     {cc.enabled && Object.values(cc.fields).some(Boolean) ? chDef.id + " \u00B7 " + cc.dmPolicy : (zh ? "\u672A\u914D\u7F6E" : "Not configured")}
                   </div>
                 </div>
-                <span style={statusPill(cc.enabled ? "configured" : "disabled")}>
-                  {cc.enabled ? "connected" : (zh ? "\u672A\u542F\u7528" : "disabled")}
+                <span style={statusPill(cc.enabled ? (Object.values(cc.fields).some(Boolean) ? "configured" : "pending") : "disabled")}>
+                  {cc.enabled
+                    ? (Object.values(cc.fields).some(Boolean) ? (zh ? "\u5DF2\u914D\u7F6E" : "Configured") : (zh ? "\u5F85\u914D\u7F6E" : "Pending"))
+                    : (zh ? "\u672A\u542F\u7528" : "disabled")}
                 </span>
                 <div onClick={(e) => e.stopPropagation()}>
                   <Toggle on={cc.enabled} onToggle={() => toggleChannelEnabled(chDef.id)} />
@@ -1533,6 +1653,7 @@ function AgentManagerPage() {
   const [newModel, setNewModel] = useState("");
   const [newChannels, setNewChannels] = useState<string[]>([]);
   const [newToolset, setNewToolset] = useState("full");
+  const [newMaxTokens, setNewMaxTokens] = useState(0);
   const [newSystem, setNewSystem] = useState("");
   const [idError, setIdError] = useState("");
   const [channelAccounts, setChannelAccounts] = useState<Record<string, string[]>>({});
@@ -1563,7 +1684,7 @@ function AgentManagerPage() {
       const list = (cfg.agents?.list || []).map((a: any) => {
         const rawModel = a.model;
         const modelStr = typeof rawModel === "string" ? rawModel : rawModel?.primary || "";
-        return { ...a, model: modelStr, status: a.status || "idle" };
+        return { ...a, model: modelStr, status: a.status || "idle", maxTokens: rawModel?.maxTokens || a.maxTokens || 0 };
       });
       setAgentList(list);
     } catch {}
@@ -1633,7 +1754,7 @@ function AgentManagerPage() {
       id: newId.trim(),
       name: newName || undefined,
       avatar: newAvatar || undefined,
-      model: newModel ? { primary: newModel, toolset: newToolset } : undefined,
+      model: newModel ? { primary: newModel, toolset: newToolset, ...(newMaxTokens > 0 ? { maxTokens: newMaxTokens } : {}) } : (newMaxTokens > 0 ? { maxTokens: newMaxTokens } : undefined),
       channels: newChannels.length > 0 ? newChannels : [],
     };
     try {
@@ -1672,7 +1793,7 @@ function AgentManagerPage() {
       await fetchAgentList();
       setShowModal(false);
       resetForm();
-      toast.success(getLang() === "cn" ? "\u5DF2\u4FDD\u5B58" : "Saved");
+      toast.success(getLang() === "cn" ? "\u5DF2\u4FDD\u5B58\uFF0C\u9700\u91CD\u542F\u7F51\u5173\u751F\u6548" : "Saved. Restart gateway to take effect.");
     } catch (e) {
       toast.fromError(Locale.RsClawPanel.Agents.SaveFailed, e);
     }
@@ -1696,7 +1817,7 @@ function AgentManagerPage() {
           try { await reloadConfig(); } catch {}
         }
       }
-      toast.success(getLang() === "cn" ? "\u5DF2\u5220\u9664" : "Deleted");
+      toast.success(getLang() === "cn" ? "\u5DF2\u5220\u9664\uFF0C\u9700\u91CD\u542F\u7F51\u5173\u751F\u6548" : "Deleted. Restart gateway to take effect.");
     } catch (e) {
       // Revert optimistic update on failure
       await fetchAgentList();
@@ -1732,6 +1853,7 @@ function AgentManagerPage() {
     setNewModel(agent.model || "");
     setNewChannels(agent.channels || []);
     setNewToolset(agent.toolset?.[0] || "full");
+    setNewMaxTokens(agent.maxTokens || 0);
     setNewSystem("");
     setSelectedProvider("");
     setProviderModels([]);
@@ -1785,6 +1907,7 @@ function AgentManagerPage() {
     setNewModel("");
     setNewChannels([]);
     setNewToolset("full");
+    setNewMaxTokens(0);
     setNewSystem("");
     setIdError("");
     setSelectedProvider("");
@@ -1820,10 +1943,10 @@ function AgentManagerPage() {
           </div>
         </div>
         <button
-          className={`${styles["btn"]} ${styles["primary"]}`}
           onClick={openAddModal}
+          style={{ padding: "8px 16px", borderRadius: 9, border: "none", background: "#f97316", color: "#fff", fontSize: 12, fontWeight: 700, boxShadow: "0 2px 8px rgba(249,115,22,.28)", cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}
         >
-          {Locale.RsClawPanel.Agents.NewAgent}
+          + {Locale.RsClawPanel.Agents.NewAgent}
         </button>
       </div>
 
@@ -2170,6 +2293,19 @@ function AgentManagerPage() {
               </div>
             </div>
 
+            {/* Max Tokens */}
+            <div className={styles["cfg-f"]}>
+              <div className={styles["cfg-lbl"]}>Max Tokens <span style={{ color: "#666", fontWeight: 400 }}>(0 = auto)</span></div>
+              <input
+                className={styles["cfg-input"]}
+                type="number"
+                value={newMaxTokens}
+                onChange={(e) => setNewMaxTokens(parseInt(e.target.value) || 0)}
+                placeholder="0"
+                style={{ maxWidth: 120 }}
+              />
+            </div>
+
             <div className={styles["modal-actions"]}>
               <button
                 className={styles["btn"]}
@@ -2178,9 +2314,9 @@ function AgentManagerPage() {
                 {Locale.RsClawPanel.Agents.Cancel}
               </button>
               <button
-                className={`${styles["btn"]} ${styles["primary"]}`}
                 onClick={handleSaveAgent}
                 disabled={!newId.trim() || !!idError}
+                style={{ padding: "8px 20px", borderRadius: 9, border: "none", background: "#f97316", color: "#fff", fontSize: 12, fontWeight: 700, cursor: !newId.trim() || !!idError ? "not-allowed" : "pointer", opacity: !newId.trim() || !!idError ? 0.5 : 1 }}
               >
                 {editAgent ? Locale.RsClawPanel.Agents.Update : Locale.RsClawPanel.Agents.Create}
               </button>
@@ -3328,20 +3464,20 @@ function TauriConfigPageInner() {
   const handleTestProvider = async (provId: string) => {
     const apiKey = getVal(`models.providers.${provId}.apiKey`, "");
     const baseUrl = getVal(`models.providers.${provId}.baseUrl`, "");
-    if (!apiKey && !ALL_PROVIDERS[provId]?.isUrl) {
+    const apiType = provId === "custom" ? (getVal(`models.providers.${provId}.api`, "") || getVal(`models.providers.${provId}.api_type`, "")) : undefined;
+    if (!apiKey && provId !== "ollama" && !(provId === "custom" && apiType === "ollama")) {
       toast.error(zh ? "请先填写 API Key" : "Enter API Key first");
       return;
     }
     setProvTest((prev) => ({ ...prev, [provId]: "testing" }));
     setProvErr((prev) => ({ ...prev, [provId]: "" }));
     try {
-      // Test directly via Tauri (no gateway needed) or fallback to gateway API
       const tauriInvoke = (window as any).__TAURI__?.invoke;
       let res: any;
       if (tauriInvoke) {
-        res = await tauriInvoke("test_provider", { provider: provId, apiKey, baseUrl: baseUrl || null });
+        res = await tauriInvoke("test_provider", { provider: provId, apiKey, baseUrl: baseUrl || null, apiType: apiType || null });
       } else {
-        res = await testProviderKey(provId, apiKey, baseUrl || undefined);
+        res = await testProviderKey(provId, apiKey, baseUrl || undefined, apiType || undefined);
       }
       if (res.ok || res.success) {
         // Must have models to be considered connected
@@ -3371,7 +3507,7 @@ function TauriConfigPageInner() {
   const handleSelectModel = (provId: string, modelId: string) => {
     setProvSelModel((prev) => ({ ...prev, [provId]: modelId }));
     updateConfig("agents.defaults.model.primary", `${provId}/${modelId}`);
-    toast.success(zh ? `默认模型: ${provId}/${modelId}` : `Default model: ${provId}/${modelId}`);
+    toast.success(zh ? `\u9ED8\u8BA4\u6A21\u578B: ${provId}/${modelId}\uFF0C\u9700\u91CD\u542F\u7F51\u5173\u751F\u6548` : `Default model: ${provId}/${modelId}. Restart gateway to take effect.`);
   };
 
   // ── Chevron SVG ──
@@ -3640,18 +3776,66 @@ function TauriConfigPageInner() {
               </div>
               <input style={{ ...fInput, minWidth: 100 }} type="number" value={getVal("agents.defaults.compaction.keepRecentPairs", 5)} onChange={(e) => updateConfig("agents.defaults.compaction.keepRecentPairs", parseInt(e.target.value) || 5)} />
             </div>
-            <div style={{ ...fieldRow, borderBottom: "none" }}>
+            <div style={fieldRow}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u8BF7\u6C42\u8D85\u65F6" : "Timeout"}</div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.timeoutSeconds ({zh ? "\u79D2" : "sec"})</div>
               </div>
               <input style={{ ...fInput, minWidth: 100 }} type="number" value={getVal("agents.defaults.timeoutSeconds", 600)} onChange={(e) => updateConfig("agents.defaults.timeoutSeconds", parseInt(e.target.value) || 600)} />
             </div>
+            <div style={{ ...fieldRow, borderBottom: "none" }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>Max Tokens <span style={{ color: V.t3, fontWeight: 400 }}>(0 = auto)</span></div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.maxTokens</div>
+              </div>
+              <input style={{ ...fInput, minWidth: 100 }} type="number" value={getVal("agents.defaults.model.maxTokens", 0)} onChange={(e) => updateConfig("agents.defaults.model.maxTokens", parseInt(e.target.value) || 0)} />
+            </div>
           </div>
         </div>)}
 
         {/* ══ MODELS TAB ══ */}
         {activeTab === "models" && (<div style={{ animation: "fi .15s ease" }}>
+          {/* Default model — most important, show first */}
+          {secHead(zh ? "\u9ED8\u8BA4\u667A\u80FD\u4F53\u6A21\u578B" : "DEFAULT AGENT MODEL")}
+          <div style={{ ...fcard, marginBottom: 20 }}>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u4E3B\u6A21\u578B" : "Primary Model"}</div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.primary</div>
+              </div>
+              <input style={{ ...fInput, minWidth: 300 }} value={getVal("agents.defaults.model.primary", "")} onChange={(e) => updateConfig("agents.defaults.model.primary", e.target.value)} />
+            </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u6587\u751F\u56FE\u6A21\u578B" : "Image Model"} <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u7A7A=\u81EA\u52A8)" : "(empty=auto)"}</span></div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.image</div>
+              </div>
+              <input style={{ ...fInput, minWidth: 300 }} placeholder={zh ? "\u5982: doubao/doubao-seedream-5-0-260128" : "e.g. doubao/doubao-seedream-5-0-260128"} value={getVal("agents.defaults.model.image", "")} onChange={(e) => updateConfig("agents.defaults.model.image", e.target.value)} />
+            </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5907\u7528\u6A21\u578B" : "Fallback Models"} <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u9017\u53F7\u5206\u9694)" : "(comma separated)"}</span></div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.fallbacks</div>
+              </div>
+              <input style={{ ...fInput, minWidth: 300 }} placeholder={zh ? "\u5982: qwen/qwen-plus, openai/gpt-4o" : "e.g. qwen/qwen-plus, openai/gpt-4o"} value={(getVal("agents.defaults.model.fallbacks", "") || []).join?.(", ") || getVal("agents.defaults.model.fallbacks", "")} onChange={(e) => {
+                const val = e.target.value;
+                const arr = val.split(",").map((s: string) => s.trim()).filter(Boolean);
+                updateConfig("agents.defaults.model.fallbacks", arr.length > 0 ? arr : undefined);
+              }} />
+            </div>
+            <div style={{ ...fieldRow, borderBottom: "none" }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5DE5\u5177\u96C6" : "Toolset"}</div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.toolset</div>
+              </div>
+              <select style={{ ...fSelect, minWidth: 240 }} value={getVal("agents.defaults.model.toolset", "full")} onChange={(e) => updateConfig("agents.defaults.model.toolset", e.target.value)}>
+                <option value="minimal">minimal {zh ? "\u2014 6 \u4E2A\u6838\u5FC3\u5DE5\u5177" : "-- 6 core tools"}</option>
+                <option value="standard">standard {zh ? "\u2014 12 \u4E2A\u5DE5\u5177" : "-- 12 tools"}</option>
+                <option value="full">full {zh ? "\u2014 \u5168\u90E8\u5DE5\u5177" : "-- all tools"}</option>
+              </select>
+            </div>
+          </div>
+
           {secHead(zh ? "LLM \u63D0\u4F9B\u5546" : "LLM PROVIDERS")}
           <div style={{ fontSize: 11, color: V.t3, marginBottom: 12 }}>{zh ? "\u9009\u4E2D\u63D0\u4F9B\u5546\u586B\u5165 Key\uFF0C\u6D4B\u8BD5\u8FDE\u63A5\u6210\u529F\u540E\u4ECE API \u83B7\u53D6\u53EF\u7528\u6A21\u578B\u5217\u8868\uFF0C\u9009\u62E9\u9ED8\u8BA4\u6A21\u578B\u3002" : "Enter API Key per provider, test connection, then select a default model."}</div>
 
@@ -3711,18 +3895,31 @@ function TauriConfigPageInner() {
                               />
                               <button onClick={() => handleTestProvider(p.id)} disabled={testSt === "testing"}
                                 style={{ padding: "8px 14px", borderRadius: 7, border: `1px solid ${testSt === "ok" ? V.gbrd : testSt === "err" ? V.rbrd : testSt === "testing" ? V.obrd : V.bd2}`, background: testSt === "ok" ? V.glo : V.bg4, color: testSt === "ok" ? V.green : testSt === "err" ? V.red : testSt === "testing" ? V.or : V.t1, fontSize: 11, fontWeight: 500, cursor: testSt === "testing" ? "not-allowed" : "pointer", whiteSpace: "nowrap", flexShrink: 0, display: "flex", alignItems: "center", gap: 5, transition: "all .13s" }}>
-                                {testSt === "testing" ? <><Spinner />{zh ? "\u8FDE\u63A5\u4E2D" : "Testing"}</> : testSt === "ok" ? (zh ? "\u2713 \u5DF2\u8FDE\u63A5" : "\u2713 Connected") : testSt === "err" ? (zh ? "\u91CD\u65B0\u6D4B\u8BD5" : "Retry") : (zh ? "\u6D4B\u8BD5\u8FDE\u63A5" : "Test")}
+                                {testSt === "testing" ? <><Spinner />{zh ? "\u83B7\u53D6\u4E2D" : "Fetching"}</> : testSt === "ok" ? (zh ? "\u2713 \u5237\u65B0\u6A21\u578B" : "\u2713 Refresh") : testSt === "err" ? (zh ? "\u91CD\u65B0\u83B7\u53D6" : "Retry") : (zh ? "\u83B7\u53D6\u6A21\u578B" : "Get Models")}
                               </button>
                             </div>
                           </div>
                         ) : p.id === "custom" ? (
-                          /* Custom: Base URL + API Key */
+                          /* Custom: API Type + Base URL + API Key */
                           <div style={{ marginBottom: 8 }}>
-                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>Base URL <span style={{ color: V.t3 }}>{zh ? "(\u4EE5 /v1 \u7ED3\u5C3E)" : "(ending with /v1)"}</span></div>
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>API Type</div>
+                            <select
+                              style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", cursor: "pointer", marginBottom: 8 }}
+                              value={getVal(`models.providers.${p.id}.api`, "openai")}
+                              onChange={(e) => {
+                                updateConfig(`models.providers.${p.id}.api`, e.target.value);
+                                setProvTest((prev) => ({ ...prev, [p.id]: "idle" }));
+                              }}
+                            >
+                              {(Object.keys(API_TYPE_LABELS) as ApiType[]).map((at) => (
+                                <option key={at} value={at}>{API_TYPE_LABELS[at]}</option>
+                              ))}
+                            </select>
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>API URL</div>
                             <input
                               style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", marginBottom: 8 }}
                               type="text"
-                              placeholder="https://api.example.com/v1"
+                              placeholder="https://your-api-server.com"
                               value={baseUrl}
                               onChange={(e) => {
                                 updateConfig(`models.providers.${p.id}.baseUrl`, e.target.value);
@@ -3743,13 +3940,28 @@ function TauriConfigPageInner() {
                               />
                               <button onClick={() => handleTestProvider(p.id)} disabled={testSt === "testing"}
                                 style={{ padding: "8px 14px", borderRadius: 7, border: `1px solid ${testSt === "ok" ? V.gbrd : testSt === "err" ? V.rbrd : testSt === "testing" ? V.obrd : V.bd2}`, background: testSt === "ok" ? V.glo : V.bg4, color: testSt === "ok" ? V.green : testSt === "err" ? V.red : testSt === "testing" ? V.or : V.t1, fontSize: 11, fontWeight: 500, cursor: testSt === "testing" ? "not-allowed" : "pointer", whiteSpace: "nowrap", flexShrink: 0, display: "flex", alignItems: "center", gap: 5, transition: "all .13s" }}>
-                                {testSt === "testing" ? <><Spinner />{zh ? "\u8FDE\u63A5\u4E2D" : "Testing"}</> : testSt === "ok" ? (zh ? "\u2713 \u5DF2\u8FDE\u63A5" : "\u2713 Connected") : testSt === "err" ? (zh ? "\u91CD\u65B0\u6D4B\u8BD5" : "Retry") : (zh ? "\u6D4B\u8BD5\u8FDE\u63A5" : "Test")}
+                                {testSt === "testing" ? <><Spinner />{zh ? "\u83B7\u53D6\u4E2D" : "Fetching"}</> : testSt === "ok" ? (zh ? "\u2713 \u5237\u65B0\u6A21\u578B" : "\u2713 Refresh") : testSt === "err" ? (zh ? "\u91CD\u65B0\u83B7\u53D6" : "Retry") : (zh ? "\u83B7\u53D6\u6A21\u578B" : "Get Models")}
                               </button>
                             </div>
                           </div>
                         ) : (
-                          /* Standard providers: API Key field */
+                          /* Standard providers: API Key + optional Base URL */
                           <div style={{ marginBottom: 8 }}>
+                            {p.id === "doubao" && (
+                              <>
+                                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>API URL</div>
+                                <input
+                                  style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", marginBottom: 8 }}
+                                  type="text"
+                                  placeholder="https://ark.cn-beijing.volces.com/api/v3"
+                                  value={baseUrl}
+                                  onChange={(e) => {
+                                    updateConfig(`models.providers.${p.id}.baseUrl`, e.target.value);
+                                    setProvTest((prev) => ({ ...prev, [p.id]: "idle" }));
+                                  }}
+                                />
+                              </>
+                            )}
                             <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>{p.keyLabel}</div>
                             <div style={{ display: "flex", gap: 8 }}>
                               <input
@@ -3764,7 +3976,7 @@ function TauriConfigPageInner() {
                               />
                               <button onClick={() => handleTestProvider(p.id)} disabled={testSt === "testing"}
                                 style={{ padding: "8px 14px", borderRadius: 7, border: `1px solid ${testSt === "ok" ? V.gbrd : testSt === "err" ? V.rbrd : testSt === "testing" ? V.obrd : V.bd2}`, background: testSt === "ok" ? V.glo : V.bg4, color: testSt === "ok" ? V.green : testSt === "err" ? V.red : testSt === "testing" ? V.or : V.t1, fontSize: 11, fontWeight: 500, cursor: testSt === "testing" ? "not-allowed" : "pointer", whiteSpace: "nowrap", flexShrink: 0, display: "flex", alignItems: "center", gap: 5, transition: "all .13s" }}>
-                                {testSt === "testing" ? <><Spinner />{zh ? "\u8FDE\u63A5\u4E2D" : "Testing"}</> : testSt === "ok" ? (zh ? "\u2713 \u5DF2\u8FDE\u63A5" : "\u2713 Connected") : testSt === "err" ? (zh ? "\u91CD\u65B0\u6D4B\u8BD5" : "Retry") : (zh ? "\u6D4B\u8BD5\u8FDE\u63A5" : "Test")}
+                                {testSt === "testing" ? <><Spinner />{zh ? "\u83B7\u53D6\u4E2D" : "Fetching"}</> : testSt === "ok" ? (zh ? "\u2713 \u5237\u65B0\u6A21\u578B" : "\u2713 Refresh") : testSt === "err" ? (zh ? "\u91CD\u65B0\u83B7\u53D6" : "Retry") : (zh ? "\u83B7\u53D6\u6A21\u578B" : "Get Models")}
                               </button>
                             </div>
                           </div>
@@ -3808,28 +4020,7 @@ function TauriConfigPageInner() {
             })}
           </div>
 
-          {/* Default model */}
-          {secHead(zh ? "\u9ED8\u8BA4\u667A\u80FD\u4F53\u6A21\u578B" : "DEFAULT AGENT MODEL")}
-          <div style={fcard}>
-            <div style={fieldRow}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u4E3B\u6A21\u578B" : "Primary Model"}</div>
-                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.primary</div>
-              </div>
-              <input style={{ ...fInput, minWidth: 300 }} value={getVal("agents.defaults.model.primary", "")} onChange={(e) => updateConfig("agents.defaults.model.primary", e.target.value)} />
-            </div>
-            <div style={{ ...fieldRow, borderBottom: "none" }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5DE5\u5177\u96C6" : "Toolset"}</div>
-                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.toolset</div>
-              </div>
-              <select style={{ ...fSelect, minWidth: 240 }} value={getVal("agents.defaults.model.toolset", "full")} onChange={(e) => updateConfig("agents.defaults.model.toolset", e.target.value)}>
-                <option value="minimal">minimal {zh ? "\u2014 6 \u4E2A\u6838\u5FC3\u5DE5\u5177" : "-- 6 core tools"}</option>
-                <option value="standard">standard {zh ? "\u2014 12 \u4E2A\u5DE5\u5177" : "-- 12 tools"}</option>
-                <option value="full">full {zh ? "\u2014 \u5168\u90E8\u5DE5\u5177" : "-- all tools"}</option>
-              </select>
-            </div>
-          </div>
+          {/* Default model moved to top of models tab */}
         </div>)}
 
         {/* ══ CHANNELS TAB (multi-account) ══ */}
@@ -4908,72 +5099,9 @@ export function RsClawPanel() {
           </div>
         </div>
 
-        {/* Body = nav + content */}
+        {/* Body = content only (nav moved to sidebar) */}
         <div className={styles["panel-body"]}>
-          {/* Sub Navigation */}
-          <div className={styles["rsp-nav"]}>
-            <div className={styles["rsp-section"]}>{Locale.RsClawPanel.Nav.Status}</div>
-            <button
-              className={`${styles["rsp-item"]} ${activePage === "status" ? styles["active"] : ""}`}
-              onClick={() => setActivePage("status")}
-            >
-              <span className={styles["rsp-item-icon"]}>&#x1F4E1;</span>
-              {Locale.RsClawPanel.Nav.GatewayStatus}
-            </button>
-
-            <div className={styles["rsp-section"]}>{Locale.RsClawPanel.Nav.Config}</div>
-            <button
-              className={`${styles["rsp-item"]} ${activePage === "config" ? styles["active"] : ""}`}
-              onClick={() => setActivePage("config")}
-            >
-              <span className={styles["rsp-item-icon"]}>&#x2699;&#xFE0F;</span>
-              {Locale.RsClawPanel.Nav.ConfigEditor}
-            </button>
-            <button
-              className={`${styles["rsp-item"]} ${activePage === "pairing" ? styles["active"] : ""}`}
-              onClick={() => setActivePage("pairing")}
-            >
-              <span className={styles["rsp-item-icon"]}>&#x1F510;</span>
-              {getLang() === "cn" ? "\u914D\u5BF9\u5BA1\u6279" : "Pairing Approval"}
-            </button>
-
-            <div className={styles["rsp-section"]}>{getLang() === "cn" ? "\u667A\u80FD\u4F53" : "Agents"}</div>
-            <button
-              className={`${styles["rsp-item"]} ${activePage === "agents" ? styles["active"] : ""}`}
-              onClick={() => setActivePage("agents")}
-            >
-              <span className={styles["rsp-item-icon"]}>&#x1F916;</span>
-              {Locale.RsClawPanel.Nav.AgentManager}
-            </button>
-            <button
-              className={`${styles["rsp-item"]} ${activePage === "cron" ? styles["active"] : ""}`}
-              onClick={() => setActivePage("cron")}
-            >
-              <span className={styles["rsp-item-icon"]}>&#x23F0;</span>
-              {getLang() === "cn" ? "\u5B9A\u65F6\u4EFB\u52A1" : "Cron Tasks"}
-            </button>
-
-            <div className={styles["rsp-section"]}>{getLang() === "cn" ? "\u6269\u5C55" : "Extensions"}</div>
-            <button
-              className={`${styles["rsp-item"]} ${activePage === "skills" ? styles["active"] : ""}`}
-              onClick={() => setActivePage("skills")}
-            >
-              <span className={styles["rsp-item-icon"]}>&#x1F527;</span>
-              {getLang() === "cn" ? "\u6280\u80FD\u7BA1\u7406" : "Skills"}
-            </button>
-
-            <div className={styles["rsp-section"]}>{getLang() === "cn" ? "\u7CFB\u7EDF" : "System"}</div>
-            <button
-              className={`${styles["rsp-item"]} ${activePage === "doctor" ? styles["active"] : ""}`}
-              onClick={() => setActivePage("doctor")}
-            >
-              <span className={styles["rsp-item-icon"]}>&#x1F6E1;&#xFE0F;</span>
-              {Locale.RsClawPanel.Doctor.PageTitle}
-            </button>
-          </div>
-
-          {/* Content */}
-          <div className={styles["rsp-content"]}>
+          <div className={styles["rsp-content"]} style={{ flex: 1 }}>
             {activePage === "status" && <StatusPage />}
             {activePage === "config" && <ErrorBoundary>{(window as any).__TAURI__?.invoke ? <TauriConfigPage /> : <ConfigEditorPage />}</ErrorBoundary>}
             {activePage === "agents" && <AgentManagerPage />}

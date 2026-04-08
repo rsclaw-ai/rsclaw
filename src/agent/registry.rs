@@ -372,6 +372,7 @@ mod tests {
                 channel_max_restarts_per_hour: 10,
                 auth_token_configured: false,
                 auth_token_is_plaintext: false,
+                user_agent: None,
             },
             agents: AgentsRuntime {
                 defaults: Default::default(),
