@@ -17,7 +17,7 @@ use std::pin::Pin;
 use anyhow::Result;
 
 /// Default User-Agent for all LLM provider HTTP requests.
-pub(crate) const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (compatible; rsclaw/1.0)";
+pub(crate) const DEFAULT_USER_AGENT: &str = "claude-code/0.1.0";
 
 /// Build a `reqwest::Client` with the shared User-Agent header.
 pub(crate) fn http_client() -> reqwest::Client {
