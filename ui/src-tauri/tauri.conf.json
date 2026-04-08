@@ -9,7 +9,7 @@
   },
   "package": {
     "productName": "RsClaw",
-    "version": "26.4.6"
+    "version": "26.4.7"
   },
   "tauri": {
     "allowlist": {
