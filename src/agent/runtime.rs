@@ -3806,6 +3806,7 @@ impl AgentRuntime {
             model: Some(ModelConfig {
                 primary: Some(model),
                 fallbacks: None,
+                image: None,
                 image_fallbacks: None,
                 thinking: None,
                 tools_enabled: None,
@@ -4414,9 +4415,17 @@ $bitmap.Dispose()
             .as_str()
             .ok_or_else(|| anyhow!("image: `prompt` required"))?;
 
-        // Resolve image generation endpoint from current model's provider
-        let model = self.resolve_model_name();
-        let (prov_name, _) = crate::provider::registry::ProviderRegistry::parse_model(&model);
+        // Check user-configured image model: agents.defaults.model.image
+        let user_image_model = self.handle.config.model.as_ref()
+            .and_then(|m| m.image.as_deref())
+            .or_else(|| self.config.agents.defaults.model.as_ref().and_then(|m| m.image.as_deref()))
+            .map(|s| s.to_owned());
+
+        // Resolve provider — from image model config or current chat model
+        let resolve_model = user_image_model.clone().unwrap_or_else(|| self.resolve_model_name());
+        let (prov_name, user_model_id) = {
+            crate::provider::registry::ProviderRegistry::parse_model(&resolve_model)
+        };
         let (base_url, auth_style) = crate::provider::defaults::resolve_base_url(prov_name);
 
         let default_size = match prov_name {
@@ -4435,7 +4444,7 @@ $bitmap.Dispose()
             .and_then(|p| p.base_url.clone());
 
         // Providers with image generation support
-        let image_providers = ["doubao", "bytedance", "openai", "qwen"];
+        let image_providers = ["doubao", "bytedance", "openai", "qwen", "minimax"];
         let (img_url, img_key, img_prov) = if image_providers.contains(&prov_name) {
             let url = cfg_url.unwrap_or(base_url);
             let key = cfg_key
@@ -4444,7 +4453,7 @@ $bitmap.Dispose()
             (url, key, prov_name)
         } else {
             // Current provider doesn't support images — try doubao, qwen, openai
-            let fallback = [("doubao", "ARK_API_KEY"), ("qwen", "DASHSCOPE_API_KEY"), ("openai", "OPENAI_API_KEY")];
+            let fallback = [("doubao", "ARK_API_KEY"), ("qwen", "DASHSCOPE_API_KEY"), ("minimax", "MINIMAX_API_KEY"), ("openai", "OPENAI_API_KEY")];
             let mut found = None;
             for (fb_prov, fb_env) in fallback {
                 let fb_cfg = self.config.model.models.as_ref()
@@ -4466,14 +4475,17 @@ $bitmap.Dispose()
             }));
         };
 
-        let image_model = args["model"].as_str().unwrap_or_else(|| {
-            match img_prov {
-                "doubao" | "bytedance" => "doubao-seedream-5-0-260128",
-                "openai" => "dall-e-3",
-                "qwen" => "qwen-image-2.0-pro",
-                _ => "dall-e-3",
-            }
-        });
+        let image_model = args["model"].as_str()
+            .or_else(|| if !user_model_id.is_empty() { Some(user_model_id) } else { None })
+            .unwrap_or_else(|| {
+                match img_prov {
+                    "doubao" | "bytedance" => "doubao-seedream-5-0-260128",
+                    "openai" => "dall-e-3",
+                    "qwen" => "qwen-image-2.0-pro",
+                    "minimax" => "image-01",
+                    _ => "dall-e-3",
+                }
+            });
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
@@ -4481,6 +4493,7 @@ $bitmap.Dispose()
 
         // Qwen uses a different API format
         let is_qwen = img_prov == "qwen";
+        let is_minimax = img_prov == "minimax";
         let (resp_status, resp_body) = if is_qwen {
             let qwen_size = size.replace('x', "*");
             let resp = client
@@ -4496,11 +4509,25 @@ $bitmap.Dispose()
             let st = resp.status();
             let body: Value = resp.json().await.map_err(|e| anyhow!("image: parse error: {e}"))?;
             (st, body)
+        } else if is_minimax {
+            // Minimax: /v1/image_generation, aspect_ratio instead of size
+            let aspect = if size.contains('x') {
+                let parts: Vec<&str> = size.split('x').collect();
+                if parts.len() == 2 { format!("{}:{}", parts[0].parse::<u32>().unwrap_or(1024) / 1024, parts[1].parse::<u32>().unwrap_or(1024) / 1024).replace("0:0","1:1") } else { "1:1".to_owned() }
+            } else { "1:1".to_owned() };
+            let url = format!("{}/image_generation", img_url.trim_end_matches('/'));
+            let resp = client.post(&url)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(&json!({ "model": image_model, "prompt": prompt, "aspect_ratio": aspect, "response_format": "url" }))
+                .send().await
+                .map_err(|e| anyhow!("image: request failed: {e}"))?;
+            let st = resp.status();
+            let body: Value = resp.json().await.map_err(|e| anyhow!("image: parse error: {e}"))?;
+            (st, body)
         } else {
             let url = format!("{}/images/generations", img_url.trim_end_matches('/'));
-            let mut builder = client.post(&url);
-            builder = builder.header("Authorization", format!("Bearer {api_key}"));
-            let resp = builder
+            let resp = client.post(&url)
+                .header("Authorization", format!("Bearer {api_key}"))
                 .json(&json!({ "model": image_model, "prompt": prompt, "size": size, "n": 1, "response_format": "url" }))
                 .send().await
                 .map_err(|e| anyhow!("image: request failed: {e}"))?;
@@ -4516,10 +4543,14 @@ $bitmap.Dispose()
             return Err(anyhow!("image: API error: {err_msg}"));
         }
 
-        // Extract image URL — different paths for qwen vs openai format
+        // Extract image URL/base64 — different response formats per provider
         let img_url_str = if is_qwen {
             resp_body.pointer("/output/choices/0/message/content/0/image")
                 .and_then(|v| v.as_str())
+        } else if is_minimax {
+            // minimax: data.image_base64[0] (base64) or data.image_urls[0] (url)
+            resp_body.pointer("/data/image_urls/0").and_then(|v| v.as_str())
+                .or_else(|| resp_body.pointer("/data/image_base64/0").and_then(|v| v.as_str()))
         } else {
             resp_body.pointer("/data/0/url").and_then(|v| v.as_str())
         };

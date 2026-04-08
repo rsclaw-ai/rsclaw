@@ -3758,6 +3758,13 @@ function TauriConfigPageInner() {
             </div>
             <div style={fieldRow}>
               <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u6587\u751F\u56FE\u6A21\u578B" : "Image Model"} <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u7A7A=\u81EA\u52A8)" : "(empty=auto)"}</span></div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.image</div>
+              </div>
+              <input style={{ ...fInput, minWidth: 300 }} placeholder={zh ? "\u5982: doubao/doubao-seedream-5-0-260128" : "e.g. doubao/doubao-seedream-5-0-260128"} value={getVal("agents.defaults.model.image", "")} onChange={(e) => updateConfig("agents.defaults.model.image", e.target.value)} />
+            </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5907\u7528\u6A21\u578B" : "Fallback Models"} <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u9017\u53F7\u5206\u9694)" : "(comma separated)"}</span></div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.fallbacks</div>
               </div>

@@ -320,6 +320,8 @@ pub struct AgentCommand {
 pub struct ModelConfig {
     pub primary: Option<String>,
     pub fallbacks: Option<Vec<String>>,
+    /// Text-to-image model, e.g. "doubao/doubao-seedream-5-0-260128".
+    pub image: Option<String>,
     pub image_fallbacks: Option<Vec<String>>,
     pub thinking: Option<ThinkingConfig>,
     /// Whether to send tool definitions to the model. Default: true.
