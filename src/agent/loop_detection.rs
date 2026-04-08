@@ -473,11 +473,11 @@ mod tests {
         let mut d = LoopDetector::with_dual_thresholds(10, 3, 5);
         let params = serde_json::json!({"command": "ls -la"});
 
-        assert!(is_ok(&d.check_with_params("exec", &params)));
-        assert!(is_ok(&d.check_with_params("exec", &params)));
-        assert!(is_ok(&d.check_with_params("exec", &params))); // 3rd
-        assert!(is_warning(&d.check_with_params("exec", &params))); // 4th = warning
-        assert!(is_critical(&d.check_with_params("exec", &params))); // 5th = critical
+        assert!(is_ok(&d.check_with_params("exec", &params)));       // count=1
+        assert!(is_ok(&d.check_with_params("exec", &params)));       // count=2
+        assert!(is_warning(&d.check_with_params("exec", &params)));  // count=3 >= warn(3)
+        assert!(is_warning(&d.check_with_params("exec", &params)));  // count=4
+        assert!(is_critical(&d.check_with_params("exec", &params))); // count=5 >= crit(5)
     }
 
     #[test]
@@ -539,28 +539,30 @@ mod tests {
         let mut d = LoopDetector::with_dual_thresholds(10, 3, 5);
         let params = serde_json::json!({"command": "ls"});
 
-        // Call 1-4: same params, same result = stuck
-        assert!(is_ok(&d.check_with_params("exec", &params)));
+        // Call 1-2: same params, same result = stuck
+        assert!(is_ok(&d.check_with_params("exec", &params)));       // count=1
         d.record_result(&serde_json::json!({"stdout": "same_output"}));
 
-        assert!(is_ok(&d.check_with_params("exec", &params)));
+        assert!(is_ok(&d.check_with_params("exec", &params)));       // count=2
         d.record_result(&serde_json::json!({"stdout": "same_output"}));
 
-        assert!(is_ok(&d.check_with_params("exec", &params)));
-        d.record_result(&serde_json::json!({"stdout": "same_output"}));
-
-        // Call 4: same args + same results = warning
+        // Call 3: count=3 >= warn(3) = warning
         assert!(is_warning(&d.check_with_params("exec", &params)));
         d.record_result(&serde_json::json!({"stdout": "same_output"}));
 
-        // Call 5: critical
+        // Call 4: still warning
+        assert!(is_warning(&d.check_with_params("exec", &params)));
+        d.record_result(&serde_json::json!({"stdout": "same_output"}));
+
+        // Call 5: count=5 >= crit(5) = critical
         assert!(is_critical(&d.check_with_params("exec", &params)));
     }
 
     #[test]
     fn mixed_results_progres_detection() {
         // Some same results, some different = still considered progress.
-        let mut d = LoopDetector::with_dual_thresholds(10, 3, 5);
+        // Use warn=4, crit=6 to allow enough calls before progress kicks in.
+        let mut d = LoopDetector::with_dual_thresholds(10, 4, 6);
         let params = serde_json::json!({"command": "ls"});
 
         // Call 1: initial
@@ -598,9 +600,9 @@ mod tests {
         // Don't call record_result
 
         // Another call (previous still has result_hash=None)
-        assert!(is_ok(&d.check_with_params("exec", &params)));
-        assert!(is_ok(&d.check_with_params("exec", &params)));
-        assert!(is_warning(&d.check_with_params("exec", &params))); // 4th = warning
-        assert!(is_critical(&d.check_with_params("exec", &params))); // 5th = critical
+        assert!(is_ok(&d.check_with_params("exec", &params)));       // count=2
+        assert!(is_warning(&d.check_with_params("exec", &params)));  // count=3 >= warn(3)
+        assert!(is_warning(&d.check_with_params("exec", &params)));  // count=4
+        assert!(is_critical(&d.check_with_params("exec", &params))); // count=5 >= crit(5)
     }
 }
