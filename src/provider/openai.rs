@@ -31,9 +31,6 @@ pub struct OpenAiProvider {
     base_url: String,
     /// When true, reasoning models use ollama native /api/chat with think=true.
     is_ollama: bool,
-    /// Custom User-Agent header.
-    #[allow(dead_code)]
-    user_agent: Option<String>,
     /// API mode: Chat Completions or Responses.
     mode: OpenAiMode,
 }
@@ -45,7 +42,6 @@ impl OpenAiProvider {
             api_key: Some(api_key.into()),
             base_url: OPENAI_API_BASE.to_owned(),
             is_ollama: false,
-            user_agent: None,
             mode: OpenAiMode::Chat,
         }
     }
@@ -57,7 +53,6 @@ impl OpenAiProvider {
             api_key,
             base_url: base_url.into(),
             is_ollama: false,
-            user_agent: None,
             mode: OpenAiMode::Chat,
         }
     }
@@ -69,7 +64,6 @@ impl OpenAiProvider {
             api_key,
             base_url: base_url.into(),
             is_ollama: false,
-            user_agent: None,
             mode: OpenAiMode::Chat,
         }
     }
@@ -81,7 +75,6 @@ impl OpenAiProvider {
             api_key,
             base_url: base_url.into(),
             is_ollama: false,
-            user_agent: None,
             mode: OpenAiMode::Responses,
         }
     }
@@ -94,7 +87,6 @@ impl OpenAiProvider {
             api_key,
             base_url: base_url.into(),
             is_ollama: true,
-            user_agent: None,
             mode: OpenAiMode::Chat,
         }
     }
@@ -110,7 +102,6 @@ impl OpenAiProvider {
             api_key,
             base_url: base_url.into(),
             is_ollama: false,
-            user_agent,
             mode: OpenAiMode::Chat,
         }
     }
@@ -126,7 +117,6 @@ impl OpenAiProvider {
             api_key,
             base_url: base_url.into(),
             is_ollama: false,
-            user_agent,
             mode: OpenAiMode::Responses,
         }
     }
@@ -142,7 +132,6 @@ impl OpenAiProvider {
             api_key,
             base_url: base_url.into(),
             is_ollama: true,
-            user_agent,
             mode: OpenAiMode::Chat,
         }
     }

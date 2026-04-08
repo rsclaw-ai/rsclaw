@@ -121,7 +121,7 @@ pub fn get_model_defaults(provider: &str, model_id: &str) -> Option<ModelDefault
                     max_tokens: 8192,
                     context_window: 64_000,
                 })
-            } else if model_lower.contains("qwq") || model_lower.contains("qwen") && model_lower.contains("reasoning") {
+            } else if model_lower.contains("qwq") || (model_lower.contains("qwen") && model_lower.contains("reasoning")) {
                 Some(ModelDefaults {
                     max_tokens: 32768,
                     context_window: 131_072,
