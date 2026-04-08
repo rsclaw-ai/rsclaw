@@ -39,6 +39,23 @@ const FEISHU_DOMAIN: &str = "https://open.feishu.cn";
 /// Token refresh margin (seconds before expiry to trigger refresh).
 const TOKEN_REFRESH_MARGIN: u64 = 300;
 
+/// Determine the receive_id_type based on target_id format.
+/// - `ou_xxx` → open_id (user)
+/// - `oc_xxx` → chat_id (group)
+/// - `on_xxx` → open_id (department)
+/// - other → chat_id (default)
+fn get_receive_id_type(target_id: &str) -> &'static str {
+    if target_id.starts_with("ou_") {
+        "open_id"
+    } else if target_id.starts_with("oc_") {
+        "chat_id"
+    } else if target_id.starts_with("on_") {
+        "open_id"
+    } else {
+        "chat_id"
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Feishu API response types
 // ---------------------------------------------------------------------------
@@ -449,17 +466,18 @@ impl FeishuChannel {
     // Send message
     // -----------------------------------------------------------------------
 
-    /// Send a single text chunk to a chat as a card with markdown.
-    async fn send_text_chunk(&self, chat_id: &str, text: &str) -> Result<()> {
+    /// Send a single text chunk to a target as a card with markdown.
+    async fn send_text_chunk(&self, target_id: &str, text: &str) -> Result<()> {
         let token = self.get_token().await?;
-        let url = format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base(),);
+        let receive_id_type = get_receive_id_type(target_id);
+        let url = format!("{}/im/v1/messages?receive_id_type={receive_id_type}", self.api_base(),);
 
         let card_payload = build_feishu_card(text, &self.brand);
         let card_str =
             serde_json::to_string(&card_payload["card"]).context("feishu: serialize card")?;
 
         let body = json!({
-            "receive_id": chat_id,
+            "receive_id": target_id,
             "msg_type": "interactive",
             "content": card_str,
         });
@@ -1301,8 +1319,9 @@ impl Channel for FeishuChannel {
                 };
 
                 // Send image message using image_key.
+                let receive_id_type = get_receive_id_type(&msg.target_id);
                 let send_url =
-                    format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base());
+                    format!("{}/im/v1/messages?receive_id_type={receive_id_type}", self.api_base());
                 let token2 = match self.get_token().await {
                     Ok(t) => t,
                     Err(e) => {
@@ -1539,7 +1558,8 @@ impl FeishuNotifier {
 
     async fn send_text(&self, text: &str) -> Result<()> {
         let token = self.get_token().await?;
-        let url = format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base());
+        let receive_id_type = get_receive_id_type(&self.target_chat_id);
+        let url = format!("{}/im/v1/messages?receive_id_type={receive_id_type}", self.api_base());
 
         let card_payload = build_feishu_card(text, &self.brand);
         let card_str =

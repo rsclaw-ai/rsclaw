@@ -97,6 +97,8 @@ pub struct AppState {
             std::collections::HashMap<String, Arc<crate::channel::custom::CustomWebhookChannel>>,
         >,
     >,
+    /// Broadcast channel to notify CronRunner to reload jobs from file.
+    pub cron_reload: broadcast::Sender<()>,
 }
 
 // AgentEvent is defined in crate::events to avoid circular deps with agent.

@@ -1,6 +1,5 @@
 use anyhow::Result;
 
-use super::config_json::{load_config_json, set_nested_value};
 use super::style::*;
 use crate::{cli::CronCommand, config};
 
@@ -8,37 +7,32 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
     match sub {
         CronCommand::List | CronCommand::Status => {
             banner(&format!("rsclaw cron v{}", env!("RSCLAW_BUILD_VERSION")));
-            let config = config::load()?;
-            let jobs = config
-                .ops
-                .cron
-                .as_ref()
-                .and_then(|c| c.jobs.as_deref())
-                .unwrap_or(&[]);
+            let jobs = crate::cron::load_cron_jobs();
             if jobs.is_empty() {
                 warn_msg("no cron jobs configured");
             } else {
                 println!(
-                    "  {:<14} {:<10} {:<14} {}",
+                    "  {:<36} {:<10} {:<14} {}",
                     bold("ID"),
                     bold("STATUS"),
                     bold("AGENT"),
                     bold("SCHEDULE")
                 );
-                for j in jobs {
-                    let enabled = j.enabled.unwrap_or(true);
-                    let agent = j.agent_id.as_deref().unwrap_or("(default)");
+                for j in &jobs {
+                    let enabled = j.enabled;
+                    let agent = if j.agent_id.is_empty() { "(default)" } else { &j.agent_id };
                     let status = if enabled {
                         green("enabled")
                     } else {
                         red("disabled")
                     };
+                    let schedule = j.cron_expr();
                     println!(
-                        "  {:<14} {:<10} {:<14} {}",
+                        "  {:<36} {:<10} {:<14} {}",
                         cyan(&j.id),
                         status,
                         agent,
-                        dim(&j.schedule)
+                        dim(schedule)
                     );
                 }
             }
@@ -47,19 +41,14 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
             // Manual trigger: POST to gateway API if running.
             let config = config::load()?;
             let port = config.gateway.port;
-            let jobs = config
-                .ops
-                .cron
-                .as_ref()
-                .and_then(|c| c.jobs.as_deref())
-                .unwrap_or(&[]);
+            let jobs = crate::cron::load_cron_jobs();
             let job = jobs
                 .iter()
                 .find(|j| j.id == id)
-                .ok_or_else(|| anyhow::anyhow!("cron job '{id}' not found in config"))?;
+                .ok_or_else(|| anyhow::anyhow!("cron job '{id}' not found"))?;
             let url = format!("http://127.0.0.1:{port}/api/v1/message");
             let body = serde_json::json!({
-                "text": job.message,
+                "text": job.effective_message(),
                 "agent_id": job.agent_id,
                 "session_key": format!("cron:{id}:manual"),
             });
@@ -109,39 +98,30 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
         }
         CronCommand::Add(args) => {
             validate_cron_schedule(&args.schedule)?;
-            let (path, mut val) = load_config_json()?;
 
-            // Auto-enable cron system when adding first job
-            // (startup.rs requires cron.enabled=true to start the scheduler)
-            if val
-                .pointer("/cron/enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
-                // Already enabled, no action needed
-            } else {
-                set_nested_value(&mut val, "cron.enabled", serde_json::json!(true))?;
-            }
+            let mut jobs = crate::cron::load_cron_jobs();
+            let id = format!("job-{}", jobs.len() + 1);
 
-            let count = val
-                .pointer("/cron/jobs")
-                .and_then(|v| v.as_array())
-                .map_or(0, |a| a.len());
-            let id = format!("job-{}", count + 1);
-            let mut job = serde_json::json!({
-                "id": id,
-                "schedule": args.schedule,
-                "message": args.message,
-            });
-            if let Some(agent) = args.agent {
-                job["agentId"] = agent.into();
-            }
-            if let Some(arr) = val.pointer_mut("/cron/jobs").and_then(|v| v.as_array_mut()) {
-                arr.push(job);
-            } else {
-                set_nested_value(&mut val, "cron.jobs", serde_json::json!([job]))?;
-            }
-            std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
+            let job = crate::cron::CronJob {
+                id: id.clone(),
+                name: None,
+                agent_id: args.agent.clone().unwrap_or_else(|| "main".to_string()),
+                session_key: None,
+                enabled: true,
+                schedule: crate::cron::CronSchedule::Flat(args.schedule.clone()),
+                payload: None,
+                message: Some(args.message.clone()),
+                delivery: None,
+                session_target: None,
+                wake_mode: None,
+                state: Some(crate::cron::CronJobState::default()),
+                created_at_ms: Some(chrono::Utc::now().timestamp_millis() as u64),
+                updated_at_ms: None,
+            };
+
+            jobs.push(job);
+            crate::cron::save_cron_jobs(&jobs)?;
+
             ok(&format!(
                 "added cron job '{}' ({})",
                 cyan(&id),
@@ -149,35 +129,32 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
             ));
         }
         CronCommand::Edit { id } => {
-            let config = config::load()?;
-            config
-                .ops
-                .cron
-                .as_ref()
-                .and_then(|c| c.jobs.as_deref())
-                .and_then(|j| j.iter().find(|j| j.id == id))
+            let jobs = crate::cron::load_cron_jobs();
+            jobs.iter()
+                .find(|j| j.id == id)
                 .ok_or_else(|| anyhow::anyhow!("cron job '{id}' not found"))?;
-            let (path, _) = load_config_json()?;
+
+            // Open the jobs.json file in editor
+            let jobs_file = config::loader::base_dir().join("cron").join("jobs.json");
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| {
                 if cfg!(windows) { "notepad".to_owned() } else { "vi".to_owned() }
             });
-            let status = std::process::Command::new(&editor).arg(&path).status()?;
+            let status = std::process::Command::new(&editor).arg(&jobs_file).status()?;
             if !status.success() {
                 anyhow::bail!("editor exited with {status}");
             }
+            ok(&format!("edited cron jobs file"));
         }
-        CronCommand::Enable { id } => cron_set_enabled(id, true)?,
-        CronCommand::Disable { id } => cron_set_enabled(id, false)?,
+        CronCommand::Enable { id } => cron_set_enabled(&id, true)?,
+        CronCommand::Disable { id } => cron_set_enabled(&id, false)?,
         CronCommand::Rm { id } => {
-            let (path, mut val) = load_config_json()?;
-            if let Some(jobs) = val.pointer_mut("/cron/jobs").and_then(|j| j.as_array_mut()) {
-                let before = jobs.len();
-                jobs.retain(|j| j["id"].as_str() != Some(&id));
-                if jobs.len() == before {
-                    anyhow::bail!("cron job '{id}' not found");
-                }
+            let mut jobs = crate::cron::load_cron_jobs();
+            let before = jobs.len();
+            jobs.retain(|j| j.id != id);
+            if jobs.len() == before {
+                anyhow::bail!("cron job '{id}' not found");
             }
-            std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
+            crate::cron::save_cron_jobs(&jobs)?;
             ok(&format!("removed cron job '{}'", cyan(&id)));
         }
     }
@@ -270,28 +247,25 @@ fn validate_cron_part(part: &str, min: u32, max: u32) -> Result<()> {
 
 // ---------------------------------------------------------------------------
 
-pub fn cron_set_enabled(id: String, enabled: bool) -> Result<()> {
-    let (path, mut val) = load_config_json()?;
-    let jobs = val
-        .pointer_mut("/cron/jobs")
-        .ok_or_else(|| anyhow::anyhow!("no cron.jobs in config"))?;
-    if let Some(arr) = jobs.as_array_mut() {
-        let mut found = false;
-        for job in arr.iter_mut() {
-            if job["id"].as_str() == Some(&id) {
-                job["enabled"] = serde_json::Value::Bool(enabled);
-                found = true;
-            }
-        }
-        if !found {
-            anyhow::bail!("cron job '{id}' not found");
+pub fn cron_set_enabled(id: &str, enabled: bool) -> Result<()> {
+    let mut jobs = crate::cron::load_cron_jobs();
+    let mut found = false;
+    for job in &mut jobs {
+        if job.id == id {
+            job.enabled = enabled;
+            job.updated_at_ms = Some(chrono::Utc::now().timestamp_millis() as u64);
+            found = true;
+            break;
         }
     }
-    std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
+    if !found {
+        anyhow::bail!("cron job '{id}' not found");
+    }
+    crate::cron::save_cron_jobs(&jobs)?;
     if enabled {
-        ok(&format!("cron job '{}' enabled", cyan(&id)));
+        ok(&format!("cron job '{}' enabled", cyan(id)));
     } else {
-        ok(&format!("cron job '{}' disabled", cyan(&id)));
+        ok(&format!("cron job '{}' disabled", cyan(id)));
     }
     Ok(())
 }

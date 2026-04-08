@@ -195,6 +195,9 @@ pub async fn cron_add(ctx: MethodCtx) -> MethodResult {
     crate::cron::save_cron_jobs(&jobs)
         .map_err(|e| ErrorShape::internal(format!("failed to save cron job: {}", e)))?;
 
+    // Notify CronRunner to reload jobs from file
+    let _ = ctx.state.cron_reload.send(());
+
     Ok(serde_json::json!({ "id": id, "schedule": schedule }))
 }
 
@@ -218,6 +221,9 @@ pub async fn cron_remove(ctx: MethodCtx) -> MethodResult {
 
     crate::cron::save_cron_jobs(&jobs)
         .map_err(|e| ErrorShape::internal(format!("failed to save cron job: {}", e)))?;
+
+    // Notify CronRunner to reload jobs from file
+    let _ = ctx.state.cron_reload.send(());
 
     Ok(serde_json::json!({ "removed": id }))
 }
@@ -512,38 +518,44 @@ pub async fn cron_update(ctx: MethodCtx) -> MethodResult {
         .as_str()
         .ok_or_else(|| ErrorShape::bad_request("missing id"))?;
 
-    let (path, mut val) = crate::cmd::config_json::load_config_json()
-        .map_err(|e| ErrorShape::internal(e.to_string()))?;
-
-    let jobs = val
-        .pointer_mut("/cron/jobs")
-        .and_then(|j| j.as_array_mut())
-        .ok_or_else(|| ErrorShape::not_found(format!("cron job '{id}' not found")))?;
+    // Load jobs from the openclaw-compatible jobs.json file
+    let mut jobs = crate::cron::load_cron_jobs();
 
     let job = jobs
         .iter_mut()
-        .find(|j| j["id"].as_str() == Some(id))
+        .find(|j| j.id == id)
         .ok_or_else(|| ErrorShape::not_found(format!("cron job '{id}' not found")))?;
 
     // Patch allowed fields.
     if let Some(schedule) = params.get("schedule").and_then(|v| v.as_str()) {
-        job["schedule"] = schedule.into();
+        job.schedule = crate::cron::CronSchedule::Flat(schedule.to_string());
     }
     if let Some(message) = params.get("message").and_then(|v| v.as_str()) {
-        job["message"] = message.into();
+        job.message = Some(message.to_string());
+        // Also clear payload if message is set directly
+        job.payload = None;
+    }
+    if let Some(payload_text) = params.get("payloadText").and_then(|v| v.as_str()) {
+        job.payload = Some(crate::cron::CronPayload::Text(payload_text.to_string()));
+        job.message = None;
     }
     if let Some(agent_id) = params.get("agentId").and_then(|v| v.as_str()) {
-        job["agentId"] = agent_id.into();
+        job.agent_id = agent_id.to_string();
     }
     if let Some(enabled) = params.get("enabled").and_then(|v| v.as_bool()) {
-        job["enabled"] = enabled.into();
+        job.enabled = enabled;
+    }
+    if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
+        job.name = Some(name.to_string());
     }
 
-    std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&val).map_err(|e| ErrorShape::internal(e.to_string()))?,
-    )
-    .map_err(|e| ErrorShape::internal(e.to_string()))?;
+    job.updated_at_ms = Some(chrono::Utc::now().timestamp_millis() as u64);
+
+    crate::cron::save_cron_jobs(&jobs)
+        .map_err(|e| ErrorShape::internal(format!("failed to save cron job: {}", e)))?;
+
+    // Notify CronRunner to reload jobs from file
+    let _ = ctx.state.cron_reload.send(());
 
     Ok(serde_json::json!({ "updated": id }))
 }

@@ -24,7 +24,7 @@ use crate::{
         runtime::RuntimeConfig,
         schema::{BindMode, DmScope},
     },
-    cron::{CronJob, CronRunner},
+    cron::CronRunner,
     gateway::{
         LiveConfig,
         hot_reload::{ConfigChange, FileWatcher},
@@ -325,8 +325,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // All channels registered - now wrap for sharing with cron runner
     let channel_manager = Arc::new(channel_manager);
 
-    // Start cron runner — jobs loaded from file, config provides global settings only.
-    // Priority: base_dir/cron.json5 > base_dir/cron/jobs.json (legacy, auto-migrated)
+    // Create cron reload broadcast channel (used to notify CronRunner of new jobs)
+    let (cron_reload_tx, _cron_reload_rx) = tokio::sync::broadcast::channel::<()>(16);
+
+    // Start cron runner — jobs loaded from base_dir/cron/jobs.json
     {
         let cron_cfg = config.ops.cron.clone().unwrap_or_else(|| {
             crate::config::schema::CronConfig {
@@ -339,35 +341,24 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             }
         });
         let cron_enabled = cron_cfg.enabled.unwrap_or(true);
-        // Openclaw-compatible cron path: respects OPENCLAW_STATE_DIR env var
-        let openclaw_home = if let Some(state_dir) = std::env::var_os("OPENCLAW_STATE_DIR") {
-            PathBuf::from(state_dir)
-        } else {
-            dirs_next::home_dir().unwrap_or_default().join(".openclaw")
-        };
-        let cron_file = openclaw_home.join("cron").join("jobs.json");
 
-        let mut jobs: Vec<CronJob> = Vec::new();
-        if cron_file.is_file() {
-            if let Ok(raw) = std::fs::read_to_string(&cron_file) {
-                let parsed: Result<serde_json::Value, _> = json5::from_str(&raw)
-                    .or_else(|_| serde_json::from_str(&raw));
-                if let Ok(file_data) = parsed {
-                    if let Some(arr) = file_data.get("jobs").and_then(|v| v.as_array()) {
-                        for item in arr {
-                            if let Ok(job) = serde_json::from_value::<CronJob>(item.clone()) {
-                                jobs.push(job);
-                            }
-                        }
-                        info!(file = %cron_file.display(), count = arr.len(), "loaded cron jobs");
-                    }
-                }
-            }
+        // Load jobs from base_dir/cron/jobs.json (unified with API)
+        let jobs = crate::cron::load_cron_jobs();
+        if !jobs.is_empty() {
+            info!(count = jobs.len(), "loaded cron jobs");
         }
-        if cron_enabled && !jobs.is_empty() {
-            // Use openclaw-compatible data dir for cron run logs
-            let cron_data_dir = openclaw_home.join("var").join("data");
-            let runner = CronRunner::new(&cron_cfg, jobs, Arc::clone(&registry), Arc::clone(&channel_manager), cron_data_dir);
+
+        if cron_enabled {
+            // Use base_dir for cron run logs
+            let cron_data_dir = base_dir.join("var").join("data");
+            let runner = CronRunner::new(
+                &cron_cfg,
+                jobs,
+                Arc::clone(&registry),
+                Arc::clone(&channel_manager),
+                cron_data_dir,
+                cron_reload_tx.clone(),
+            );
             tokio::spawn(async move {
                 if let Err(e) = runner.run().await {
                     error!("cron runner error: {e:#}");
@@ -393,6 +384,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         started_at: std::time::Instant::now(),
         dm_enforcers: Arc::clone(&dm_enforcers),
         custom_webhooks: Arc::clone(&custom_webhooks),
+        cron_reload: cron_reload_tx,
     };
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
 
@@ -1513,6 +1505,7 @@ fn start_channels(
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
+        manager,
     );
     start_dingtalk_if_configured(
         config,
@@ -4007,6 +4000,7 @@ fn start_feishu_if_configured(
     channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
+    manager: &mut crate::channel::ChannelManager,
 ) {
     let fs_cfg = config.channel.channels.feishu.as_ref();
     if let Some(cfg) = fs_cfg {
@@ -4401,6 +4395,9 @@ fn start_feishu_if_configured(
 
         // First account fills the webhook slot for backward compatibility.
         let _ = feishu_slot.set(Arc::clone(&fs));
+
+        // Register feishu channel in ChannelManager for notification routing.
+        let _ = manager.register(Arc::clone(&fs) as Arc<dyn Channel>);
 
         let fs_send = Arc::clone(&fs);
         tokio::spawn(async move {

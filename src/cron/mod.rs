@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{broadcast, Semaphore};
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
@@ -252,6 +252,7 @@ pub struct CronRunner {
     store_path: PathBuf,
     semaphore: Arc<Semaphore>,
     default_delivery: Option<CronDelivery>,
+    reload_tx: broadcast::Sender<()>,
 }
 
 impl CronRunner {
@@ -261,6 +262,7 @@ impl CronRunner {
         agents: Arc<AgentRegistry>,
         channels: Arc<ChannelManager>,
         data_dir: PathBuf,
+        reload_tx: broadcast::Sender<()>,
     ) -> Self {
         let run_log_dir = data_dir.join("cron");
         let store_path = data_dir.join("cron_store.json");
@@ -273,6 +275,7 @@ impl CronRunner {
             store_path,
             semaphore: Arc::new(Semaphore::new(4)),
             default_delivery: config.default_delivery.clone(),
+            reload_tx,
         }
     }
 
@@ -330,10 +333,11 @@ impl CronRunner {
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let running_clone = Arc::clone(&running);
         let semaphore = Arc::clone(&self.semaphore);
+        let mut reload_rx = self.reload_tx.subscribe();
 
         let runner = self.clone();
         let timer_handle = tokio::spawn(async move {
-            runner.timer_loop(jobs, running_clone, semaphore).await;
+            runner.timer_loop(jobs, running_clone, semaphore, reload_rx).await;
         });
 
         tokio::signal::ctrl_c().await?;
@@ -353,6 +357,7 @@ impl CronRunner {
         mut jobs: Vec<CronJob>,
         running: Arc<std::sync::atomic::AtomicBool>,
         semaphore: Arc<Semaphore>,
+        mut reload_rx: broadcast::Receiver<()>,
     ) {
         loop {
             if !running.load(std::sync::atomic::Ordering::SeqCst) {
@@ -368,26 +373,55 @@ impl CronRunner {
                 .filter_map(|j| j.state.as_ref().and_then(|s| s.next_run_at_ms))
                 .min();
 
-            let Some(next_wake) = next_wake else {
-                // No jobs — wait max interval and re-check
-                debug!("cron: no jobs scheduled, waiting {}ms", MAX_TIMER_DELAY_MS);
-                sleep(Duration::from_millis(MAX_TIMER_DELAY_MS)).await;
-                continue;
+            let delay_ms = match next_wake {
+                Some(next_wake) => {
+                    let delay = next_wake.saturating_sub(now_ms);
+                    if delay == 0 {
+                        MIN_REFIRE_GAP_MS
+                    } else {
+                        delay.min(MAX_TIMER_DELAY_MS)
+                    }
+                }
+                None => {
+                    // No jobs — wait max interval and re-check
+                    debug!("cron: no jobs scheduled, waiting {}ms", MAX_TIMER_DELAY_MS);
+                    MAX_TIMER_DELAY_MS
+                }
             };
 
-            let delay = next_wake.saturating_sub(now_ms);
-            let delay_ms = if delay == 0 {
-                // Due now — prevent tight loop with MIN_REFIRE_GAP
-                MIN_REFIRE_GAP_MS
-            } else {
-                delay.min(MAX_TIMER_DELAY_MS)
+            // Use tokio::select! to wait for either timer or reload signal
+            let reload_triggered = tokio::select! {
+                _ = sleep(Duration::from_millis(delay_ms)) => {
+                    false
+                }
+                result = reload_rx.recv() => {
+                    match result {
+                        Ok(()) => true,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            // Channel closed, exit loop
+                            return;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            // Lagged, but still reload
+                            true
+                        }
+                    }
+                }
             };
-
-            debug!(next_wake, delay_ms, "cron: sleeping until next job");
-            sleep(Duration::from_millis(delay_ms)).await;
 
             if !running.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
+            }
+
+            if reload_triggered {
+                // Reload jobs from file
+                let new_jobs = load_cron_jobs();
+                jobs = self.merge_jobs(&jobs, new_jobs);
+                if let Err(e) = self.save_store(&jobs).await {
+                    warn!(err = %e, "cron: failed to save store after reload");
+                }
+                info!(count = jobs.len(), "cron jobs reloaded");
+                continue;
             }
 
             let now_ms = current_timestamp_ms();
@@ -453,17 +487,36 @@ impl CronRunner {
                     let duration_ms = current_timestamp_ms() - start_time;
                     drop(permit);
 
-                    match &result {
-                        Ok(output) => {
-                            if let Err(e) =
-                                send_delivery(&channels, &job, &default_delivery, output).await
-                            {
-                                warn!(job_id = %job.id, %e, "delivery failed");
-                            }
+                    // Build delivery message with execution summary
+                    let delivery_text = match &result {
+                        Ok(output) if !output.trim().is_empty() => {
+                            // Agent returned output, use it directly
+                            output.clone()
+                        }
+                        Ok(_) => {
+                            // Success but no output - send summary
+                            let job_name = job.name.as_deref().unwrap_or(&job.id);
+                            format!(
+                                "✅ 定时任务执行完成\n\n**任务**: {}\n**耗时**: {}秒",
+                                job_name,
+                                duration_ms / 1000
+                            )
                         }
                         Err(e) => {
-                            error!(job_id = %job.id, %e, "cron job failed");
+                            // Error - send error notification
+                            let job_name = job.name.as_deref().unwrap_or(&job.id);
+                            format!(
+                                "❌ 定时任务执行失败\n\n**任务**: {}\n**错误**: {}",
+                                job_name,
+                                e
+                            )
                         }
+                    };
+
+                    if let Err(e) =
+                        send_delivery(&channels, &job, &default_delivery, &delivery_text).await
+                    {
+                        warn!(job_id = %job.id, %e, "delivery failed");
                     }
 
                     let entry = build_run_log_entry(
@@ -539,6 +592,41 @@ impl CronRunner {
         result.map(|_| ())
     }
 
+    /// Merge old jobs (with their state) with new jobs from file.
+    /// Preserves running state and error counts for existing jobs.
+    fn merge_jobs(&self, old_jobs: &[CronJob], new_jobs: Vec<CronJob>) -> Vec<CronJob> {
+        let now_ms = current_timestamp_ms();
+        let mut result = Vec::with_capacity(new_jobs.len());
+
+        for mut new_job in new_jobs {
+            // Try to find existing job by ID and preserve its state
+            if let Some(old_job) = old_jobs.iter().find(|j| j.id == new_job.id) {
+                // Preserve state from old job
+                new_job.state = old_job.state.clone();
+            } else {
+                // New job - initialize state
+                if new_job.state.is_none() {
+                    new_job.state = Some(CronJobState {
+                        consecutive_errors: 0,
+                        ..Default::default()
+                    });
+                }
+            }
+
+            // Ensure next_run_at_ms is set
+            let cron_expr = new_job.cron_expr().to_string();
+            if let Some(ref mut state) = new_job.state {
+                if state.next_run_at_ms.is_none() {
+                    state.next_run_at_ms = compute_next_run(&cron_expr, now_ms);
+                }
+            }
+
+            result.push(new_job);
+        }
+
+        result
+    }
+
     async fn save_store(&self, jobs: &[CronJob]) -> Result<()> {
         let store = CronStore {
             version: 1,
@@ -562,6 +650,7 @@ impl Clone for CronRunner {
             store_path: self.store_path.clone(),
             semaphore: Arc::clone(&self.semaphore),
             default_delivery: self.default_delivery.clone(),
+            reload_tx: self.reload_tx.clone(),
         }
     }
 }
@@ -696,10 +785,17 @@ async fn send_delivery(
     output_text: &str,
 ) -> Result<()> {
     let delivery = match &job.delivery {
-        Some(d) => d,
+        Some(d) => {
+            debug!(job_id = %job.id, "cron: using job-level delivery");
+            d
+        }
         None => match default_delivery {
-            Some(d) => d,
+            Some(d) => {
+                debug!(job_id = %job.id, mode = ?d.mode, channel = ?d.channel, to = ?d.to, "cron: using default_delivery");
+                d
+            }
             None => {
+                debug!(job_id = %job.id, "cron: no delivery configured, skipping notification");
                 return Ok(());
             }
         },
@@ -707,28 +803,44 @@ async fn send_delivery(
 
     let mode = delivery.mode.as_deref().unwrap_or("none");
     if mode == "none" {
+        debug!(job_id = %job.id, "cron: delivery mode is 'none', skipping");
         return Ok(());
     }
 
     let channel_name = match &delivery.channel {
         Some(c) => c,
-        None => return Ok(()),
+        None => {
+            warn!(job_id = %job.id, "cron: delivery channel not specified");
+            return Ok(());
+        }
     };
 
     let to = match &delivery.to {
         Some(t) => t,
-        None => return Ok(()),
+        None => {
+            warn!(job_id = %job.id, "cron: delivery target 'to' not specified");
+            return Ok(());
+        }
     };
 
     let text = output_text.trim();
-    if text.is_empty() {
+    // Note: empty text is now handled by the caller which generates a summary
+    // We only skip if both text is empty AND this is the original behavior
+    // (no default_delivery configured)
+    if text.is_empty() && default_delivery.is_none() && job.delivery.is_none() {
+        debug!(job_id = %job.id, "cron: output text is empty and no delivery configured");
         return Ok(());
     }
 
     let channel = match channels.get(channel_name) {
         Some(ch) => ch,
-        None => return Ok(()),
+        None => {
+            warn!(job_id = %job.id, channel = %channel_name, "cron: channel not found in ChannelManager");
+            return Ok(());
+        }
     };
+
+    info!(job_id = %job.id, channel = %channel_name, to = %to, text_len = text.len(), "cron: sending delivery");
 
     let msg = OutboundMessage {
         target_id: to.clone(),
@@ -741,7 +853,7 @@ async fn send_delivery(
 
     match channel.send(msg).await {
         Ok(()) => {
-            info!(job_id = %job.id, channel = %channel_name, to = %to, "cron delivery sent");
+            info!(job_id = %job.id, channel = %channel_name, to = %to, "cron delivery sent successfully");
             Ok(())
         }
         Err(e) => {
@@ -818,18 +930,11 @@ pub async fn read_jobs_from_file(cron_dir: PathBuf) -> Result<Vec<CronJob>> {
 // Cron store file helpers (used by gateway API)
 // ---------------------------------------------------------------------------
 
-/// Returns the cron store file path (openclaw-compatible).
-/// Respects OPENCLAW_STATE_DIR env var (same as openclaw).
+/// Returns the cron store file path.
+/// Respects RSCLAW_BASE_DIR env var (same as other rsclaw data).
 fn resolve_cron_store_path() -> PathBuf {
-    let cron_dir = if let Some(state_dir) = std::env::var_os("OPENCLAW_STATE_DIR") {
-        tracing::debug!("cron store: using OPENCLAW_STATE_DIR={}", state_dir.to_string_lossy());
-        PathBuf::from(state_dir)
-    } else {
-        let home = dirs_next::home_dir().unwrap_or_default();
-        tracing::debug!("cron store: OPENCLAW_STATE_DIR not set, using home={}", home.display());
-        home.join(".openclaw")
-    };
-    cron_dir.join("cron").join("jobs.json")
+    let base = crate::config::loader::base_dir();
+    base.join("cron").join("jobs.json")
 }
 
 /// Load cron jobs from the cron store file (openclaw-compatible path).
