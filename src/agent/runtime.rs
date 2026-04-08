@@ -4792,8 +4792,7 @@ $bitmap.Dispose()
         let (base_url, auth_style) = crate::provider::defaults::resolve_base_url(prov_name);
 
         let default_size = match prov_name {
-            "doubao" | "bytedance" => "2048x2048",
-            _ => "1024x1024",
+            _ => "2048x2048",
         };
         let size = args["size"].as_str().unwrap_or(default_size);
 
