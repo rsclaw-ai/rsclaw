@@ -816,7 +816,8 @@ interface ModelDef {
 
 export const MODELS: Record<string, ModelDef[]> = {
   qwen: [
-    { id: "qwen-max", tag: "\u63A8\u8350", tagEn: "Recommended", rec: true },
+    { id: "qwen3.6-plus", tag: "\u6700\u65B0", tagEn: "Latest", rec: true },
+    { id: "qwen-max", tag: "\u63A8\u8350", tagEn: "Recommended", rec: false },
     { id: "qwen-plus", tag: "\u5747\u8861", tagEn: "Balanced", rec: false },
     { id: "qwen-turbo", tag: "\u5FEB\u901F", tagEn: "Fast", rec: false },
   ],

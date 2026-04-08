@@ -695,6 +695,14 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
         .timeout(std::time::Duration::from_secs(15))
         .build().unwrap_or_default();
 
+    // Minimax doesn't support /models — return built-in list
+    if provider == "minimax" {
+        return Ok(serde_json::json!({
+            "ok": true,
+            "models": ["MiniMax-M2.7","MiniMax-M2.7-highspeed","MiniMax-M2.5","MiniMax-M2.5-highspeed","MiniMax-M2.1","MiniMax-M2.1-highspeed","MiniMax-M2"]
+        }));
+    }
+
     let is_ollama = effective_api_type == "ollama";
     let is_gemini = effective_api_type == "gemini" || provider == "gemini";
 

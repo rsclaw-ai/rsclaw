@@ -1512,6 +1512,11 @@ fn extract_model_ids(body: &serde_json::Value) -> Vec<String> {
 
 /// POST /api/v1/providers/test - validate an API key against a provider
 async fn test_provider(Json(req): Json<TestProviderRequest>) -> Response {
+    // Minimax doesn't support /models — return built-in list
+    if req.provider == "minimax" {
+        return Json(serde_json::json!({"ok": true, "status": 200})).into_response();
+    }
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -1547,6 +1552,11 @@ async fn test_provider(Json(req): Json<TestProviderRequest>) -> Response {
 
 /// POST /api/v1/providers/models - list models from a provider
 async fn list_provider_models(Json(req): Json<TestProviderRequest>) -> Response {
+    // Minimax doesn't support /models — return built-in list
+    if req.provider == "minimax" {
+        return Json(serde_json::json!({"models": ["MiniMax-M2.7","MiniMax-M2.7-highspeed","MiniMax-M2.5","MiniMax-M2.5-highspeed","MiniMax-M2.1","MiniMax-M2.1-highspeed","MiniMax-M2"]})).into_response();
+    }
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
