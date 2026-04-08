@@ -452,7 +452,10 @@ impl FeishuChannel {
     /// Send a single text chunk to a chat as a card with markdown.
     async fn send_text_chunk(&self, chat_id: &str, text: &str) -> Result<()> {
         let token = self.get_token().await?;
-        let url = format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base(),);
+        let id_type = if chat_id.starts_with("ou_") { "open_id" }
+            else if chat_id.starts_with("on_") { "union_id" }
+            else { "chat_id" };
+        let url = format!("{}/im/v1/messages?receive_id_type={id_type}", self.api_base());
 
         let card_payload = build_feishu_card(text, &self.brand);
         let card_str =
