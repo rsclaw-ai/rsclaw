@@ -5155,8 +5155,8 @@ export function RsClawPanel() {
   return (
     <ErrorBoundary>
       <div className={styles["rsclaw-panel-page"]}>
-        {/* Header */}
-        <div className={styles["panel-header"]}>
+        {/* Header — also serves as Tauri drag region */}
+        <div className={styles["panel-header"]} data-tauri-drag-region>
           <div className={styles["panel-title"]}>{Locale.RsClawPanel.Title}</div>
           <div className={styles["panel-header-right"]}>
             <button

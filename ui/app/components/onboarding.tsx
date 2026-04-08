@@ -2259,6 +2259,8 @@ export function OnboardingPage() {
 
   return (
     <div style={S.page}>
+      {/* Drag region for Tauri title bar overlay */}
+      <div data-tauri-drag-region style={{ position: "fixed", top: 0, left: 0, right: 0, height: 32, zIndex: 201, WebkitAppRegion: "drag" } as any} />
       <div style={S.window}>
       {/* Progress bar - hidden on welcome screen */}
       {step > 0 && (
