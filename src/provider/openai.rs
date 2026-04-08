@@ -17,6 +17,7 @@ use super::{
 };
 
 pub(crate) const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
+#[allow(dead_code)]
 const DEFAULT_MAX_TOKENS: u32 = 65536;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -892,6 +893,7 @@ async fn parse_sse_chunk_with_buffer(
 // SSE parser (OpenAI chat completions format) - legacy without buffering
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 fn parse_sse_chunk(chunk: Result<bytes::Bytes>) -> Vec<Result<StreamEvent>> {
     let bytes = match chunk {
         Ok(b) => b,

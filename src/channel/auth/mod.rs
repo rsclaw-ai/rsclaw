@@ -15,7 +15,7 @@ pub mod feishu_auth;
 
 use anyhow::{Context, Result};
 use qrcode::QrCode;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Display a URL as a QR code in the terminal.
 ///

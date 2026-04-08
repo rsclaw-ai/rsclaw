@@ -99,9 +99,10 @@ pub fn resolve_openai_key() -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Decode WeChat SILK v3 audio to 16-bit 16kHz mono WAV.
+#[allow(unexpected_cfgs)]
 fn decode_silk_to_wav(silk_bytes: &[u8]) -> Result<Vec<u8>> {
     // Strip WeChat \x02 prefix if present
-    let raw = if silk_bytes.first() == Some(&0x02) {
+    let _raw = if silk_bytes.first() == Some(&0x02) {
         &silk_bytes[1..]
     } else {
         silk_bytes

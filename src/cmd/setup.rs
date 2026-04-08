@@ -135,6 +135,7 @@ pub const DEFAULT_CONFIG: &str = r#"// rsclaw configuration (JSON5)
 // ---------------------------------------------------------------------------
 
 /// Recursively copy a directory tree (files only, skips symlinks).
+#[allow(dead_code)]
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -310,6 +311,8 @@ struct ProviderDef {
     model: String,
     #[serde(default)]
     base_url: String,
+    #[serde(default)]
+    user_agent: String,
     #[serde(default)]
     needs_key: bool,
 }
@@ -786,9 +789,16 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                         StepResult::Back => { wiz_step = STEP_PROVIDER; }
                         StepResult::Cancel => { println!("  {}", crate::i18n::t("cli_setup_cancelled", lang)); return Ok(()); }
                     }
-                } else if provider.name == "custom" {
+                } else if provider.name == "custom" || provider.name == "codingplan" {
                     let default_url = if base_url.is_empty() { "https://api.example.com".to_string() } else { base_url.clone() };
                     match input_step("  API base URL", default_url) {
+                        StepResult::Next(val) => { base_url = val; wiz_step = STEP_API_KEY; }
+                        StepResult::Back => { wiz_step = STEP_PROVIDER; }
+                        StepResult::Cancel => { println!("  {}", crate::i18n::t("cli_setup_cancelled", lang)); return Ok(()); }
+                    }
+                } else if provider.name == "kimi" {
+                    let default_url = if base_url.is_empty() { provider.base_url.to_string() } else { base_url.clone() };
+                    match input_step("  Kimi API URL", default_url) {
                         StepResult::Next(val) => { base_url = val; wiz_step = STEP_API_KEY; }
                         StepResult::Back => { wiz_step = STEP_PROVIDER; }
                         StepResult::Cancel => { println!("  {}", crate::i18n::t("cli_setup_cancelled", lang)); return Ok(()); }
@@ -1029,6 +1039,10 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
             prov_obj.insert("apiKey".into(), serde_json::from_str(&api_key_entry).unwrap_or_else(|_| json!(api_key_entry)));
             if !effective_base_url.is_empty() {
                 prov_obj.insert("baseUrl".into(), json!(effective_base_url));
+            }
+            // Write user_agent for providers that need it
+            if !provider.user_agent.is_empty() {
+                prov_obj.insert("userAgent".into(), json!(provider.user_agent));
             }
         }
     }

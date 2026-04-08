@@ -16,7 +16,7 @@ use crate::{
         AgentMessage, AgentRegistry, AgentReply, AgentRuntime, AgentSpawner, LiveStatus,
         MemoryStore, PendingAnalysis,
     },
-    channel::{Channel, ChannelManager, OutboundMessage, cli::CliChannel, telegram::TelegramChannel},
+    channel::{Channel, OutboundMessage, cli::CliChannel, telegram::TelegramChannel},
     config::{
         self,
         runtime::RuntimeConfig,
@@ -1092,7 +1092,7 @@ fn start_channels(
             .unwrap_or(crate::config::schema::GroupPolicy::Allowlist);
         let group_allow_from: Vec<String> =
             tg_cfg.base.group_allow_from.clone().unwrap_or_default();
-        let mut allow_from: Vec<String> = tg_cfg.base.allow_from.clone().unwrap_or_default();
+        let allow_from: Vec<String> = tg_cfg.base.allow_from.clone().unwrap_or_default();
 
         let enforcer = Arc::new(
             crate::channel::DmPolicyEnforcer::new(dm_policy.clone(), allow_from)
@@ -3479,7 +3479,7 @@ fn spawn_wechat_user_worker(
         while let Some((text, images, file_attachments)) = rx.recv().await {
             debug!(user = %user_id, text_start = %text.chars().take(30).collect::<String>(), "wechat: worker processing");
             let process_result = tokio::time::timeout(Duration::from_secs(600), async {
-                let handle = match reg.get("main").or_else(|_| reg.default_agent()) {
+                let handle = match reg.route_account("wechat", Some("default")).or_else(|_| reg.default_agent()) {
                     Ok(h) => h,
                     Err(e) => {
                         error!("wechat route error: {e:#}");
@@ -5430,7 +5430,7 @@ fn start_matrix_if_configured(
         );
 
         let matrix = Arc::new({
-            let mut ch = crate::channel::matrix::MatrixChannel::new(
+            let ch = crate::channel::matrix::MatrixChannel::new(
                 homeserver,
                 access_token,
                 user_id,

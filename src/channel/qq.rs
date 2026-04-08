@@ -722,7 +722,7 @@ impl Channel for QQBotChannel {
                     }
                 };
 
-                let filename = if mime == "image/jpeg" { "image.jpg" } else { "image.png" };
+                let _filename = if mime == "image/jpeg" { "image.jpg" } else { "image.png" };
 
                 // QQ Bot API: two-step image send:
                 // 1. POST /v2/users|groups/{id}/files -> get file_info
@@ -842,6 +842,7 @@ impl Channel for QQBotChannel {
 // Helpers
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 fn is_text_file(name: &str) -> bool {
     let exts = [
         ".txt", ".md", ".csv", ".json", ".toml", ".yaml", ".yml", ".xml", ".html", ".rs", ".py",
@@ -851,6 +852,7 @@ fn is_text_file(name: &str) -> bool {
 }
 
 /// Extract audio track from video bytes via ffmpeg, then transcribe.
+#[allow(dead_code)]
 async fn extract_audio_and_transcribe(client: &Client, video_bytes: &[u8]) -> Result<String> {
     let tmp_dir = std::env::temp_dir();
     let video_path = tmp_dir.join(format!("rsclaw_video_{}.mp4", uuid::Uuid::new_v4()));

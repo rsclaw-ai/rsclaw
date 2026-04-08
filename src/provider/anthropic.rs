@@ -237,7 +237,7 @@ fn parse_sse_chunk(chunk: Result<bytes::Bytes>) -> Vec<Result<StreamEvent>> {
     let mut events = Vec::new();
 
     for line in text.lines() {
-        if let Some(data) = line.strip_prefix("data: ") {
+        if let Some(data) = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:")) {
             if data == "[DONE]" {
                 continue;
             }
@@ -263,8 +263,8 @@ fn parse_event(data: &str) -> Option<StreamEvent> {
                     Some(StreamEvent::TextDelta(text))
                 }
                 "thinking_delta" => {
-                    // Thinking block delta — discard for now (not surfaced to user).
-                    None
+                    let text = v["delta"]["thinking"].as_str().unwrap_or("").to_owned();
+                    if text.is_empty() { None } else { Some(StreamEvent::ReasoningDelta(text)) }
                 }
                 "input_json_delta" => {
                     // Tool input streaming — accumulation is handled by the agent loop.

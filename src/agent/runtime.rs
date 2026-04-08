@@ -99,10 +99,12 @@ enum PendingStage {
     /// File processed, waiting for token confirmation.
     TokenConfirm {
         extracted_text: String,
+        #[allow(dead_code)]
         estimated_tokens: usize,
     },
 }
 
+#[allow(dead_code)]
 struct PendingFile {
     filename: String,
     path: std::path::PathBuf,
@@ -382,7 +384,7 @@ impl AgentRuntime {
             // Event collection task - runs in background
             let notif_tx_clone = notif_tx_bg.clone();
             let target_id_clone = target_id_bg.clone();
-            let event_collector = tokio::spawn(async move {
+            let _event_collector = tokio::spawn(async move {
                 let mut pending = String::new();
                 let mut interval = 0u64;
                 loop {
@@ -680,7 +682,7 @@ impl AgentRuntime {
             // Event collection task - runs in background
             let notif_tx_clone = notif_tx_bg.clone();
             let target_id_clone = target_id_bg.clone();
-            let event_collector = tokio::spawn(async move {
+            let _event_collector = tokio::spawn(async move {
                 let mut pending = String::new();
                 let mut interval = 0u64;
                 loop {
@@ -966,7 +968,7 @@ impl AgentRuntime {
             status.text_preview.clear();
         }
 
-        let agent_cfg = &self.handle.config;
+        let _agent_cfg = &self.handle.config;
 
         // Resolve language for user-facing channel messages.
         let i18n_lang = self
@@ -1666,7 +1668,6 @@ impl AgentRuntime {
                     pending_analysis: None,
                 });
             }
-            _ => {}
         }
 
         let agent_cfg = &self.handle.config;
@@ -2553,6 +2554,7 @@ impl AgentRuntime {
             let providers = Arc::clone(&self.providers);
             let mut stream = self.failover.call(req, &providers).await?;
             let mut text_buf = String::new();
+            let mut reasoning_buf = String::new();
             let mut tool_calls: Vec<(String, String, Value)> = Vec::new();
             // Track loop detection warnings per tool call id (to inject into result)
             let mut loop_warnings: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -2595,7 +2597,12 @@ impl AgentRuntime {
                             last_delta_flush = now;
                         }
                     }
-                    StreamEvent::ReasoningDelta(_) => {}
+                    StreamEvent::ReasoningDelta(delta) => {
+                        reasoning_buf.push_str(&delta);
+                        if reasoning_buf.len() <= 50 {
+                            tracing::debug!(reasoning_len = reasoning_buf.len(), "agent_loop: got reasoning delta");
+                        }
+                    }
                     StreamEvent::ToolCall { id, name, input } => {
                         if !id.is_empty() && !name.is_empty() {
                             // New tool call with both id and name — start fresh entry.
@@ -2682,6 +2689,15 @@ impl AgentRuntime {
             // empty post-strip result as a silent no-op rather than an error.
             let pre_strip_len = text_buf.trim().len();
             text_buf = crate::provider::openai::strip_think_tags_pub(&text_buf);
+
+            // Reasoning models (e.g. kimi-for-coding) may return only reasoning_content
+            // with empty content. Use reasoning as the reply text to avoid saving an
+            // empty assistant message (which some APIs reject on the next turn).
+            tracing::info!(text_len = text_buf.len(), reasoning_len = reasoning_buf.len(), "agent_loop: post-stream buffers");
+            if text_buf.trim().is_empty() && !reasoning_buf.trim().is_empty() {
+                tracing::info!(reasoning_len = reasoning_buf.len(), "agent_loop: using reasoning as reply text");
+                text_buf = reasoning_buf.clone();
+            }
 
             // Finalize streaming tool calls: parse accumulated argument strings.
             for (_id, _name, input) in &mut tool_calls {
@@ -4789,7 +4805,7 @@ $bitmap.Dispose()
         let (prov_name, user_model_id) = {
             crate::provider::registry::ProviderRegistry::parse_model(&resolve_model)
         };
-        let (base_url, auth_style) = crate::provider::defaults::resolve_base_url(prov_name);
+        let (base_url, _auth_style) = crate::provider::defaults::resolve_base_url(prov_name);
 
         let default_size = match prov_name {
             _ => "2048x2048",
@@ -4965,6 +4981,7 @@ $bitmap.Dispose()
         // Gemini returns inline base64 directly, others return URLs
         if is_gemini {
             // Gemini: candidates[0].content.parts[] — find the inlineData part
+            #[allow(unused_imports)]
             use base64::Engine;
             let parts = resp_body.pointer("/candidates/0/content/parts")
                 .and_then(|v| v.as_array());
