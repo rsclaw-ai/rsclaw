@@ -1507,7 +1507,6 @@ fn start_channels(
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
-        manager,
     );
     start_dingtalk_if_configured(
         config,
@@ -4009,7 +4008,6 @@ fn start_feishu_if_configured(
     channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
-    manager: &mut crate::channel::ChannelManager,
 ) {
     let fs_cfg = config.channel.channels.feishu.as_ref();
     if let Some(cfg) = fs_cfg {
@@ -4405,9 +4403,6 @@ fn start_feishu_if_configured(
         // First account fills the webhook slot for backward compatibility.
         let _ = feishu_slot.set(Arc::clone(&fs));
         let _ = manager.register(Arc::clone(&fs) as Arc<dyn crate::channel::Channel>);
-
-        // Register feishu channel in ChannelManager for notification routing.
-        let _ = manager.register(Arc::clone(&fs) as Arc<dyn Channel>);
 
         let fs_send = Arc::clone(&fs);
         tokio::spawn(async move {

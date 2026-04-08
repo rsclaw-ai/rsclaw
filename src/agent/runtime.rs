@@ -4929,7 +4929,7 @@ $bitmap.Dispose()
             }));
         };
 
-let image_model = args["model"].as_str()
+        let image_model = args["model"].as_str()
             .or_else(|| if !user_model_id.is_empty() { Some(user_model_id) } else { None })
             .unwrap_or_else(|| match img_prov {
                 "doubao" | "bytedance" => "doubao-seedream-5-0-260128",
@@ -4937,12 +4937,6 @@ let image_model = args["model"].as_str()
                 "qwen" => "qwen-image-2.0-pro",
                 "minimax" => "image-01",
                 "gemini" => "gemini-3-pro-image-preview",
-                _ => "dall-e-3",
-            });
-                "doubao" | "bytedance" => "doubao-seedream-5-0-260128",
-                "openai" => "dall-e-3",
-                "qwen" => "qwen-image-2.0-pro",
-                "minimax" => "image-01",
                 _ => "dall-e-3",
             });
 
