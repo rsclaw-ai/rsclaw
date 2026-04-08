@@ -1429,12 +1429,14 @@ fn start_channels(
     start_wechat_personal_if_configured(
         config,
         Arc::clone(&registry),
+        manager,
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
     );
     start_feishu_if_configured(
         config,
         Arc::clone(&registry),
+        manager,
         Arc::clone(&feishu_slot),
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
@@ -1442,24 +1444,28 @@ fn start_channels(
     start_dingtalk_if_configured(
         config,
         Arc::clone(&registry),
+        manager,
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
     );
     start_qq_if_configured(
         config,
         Arc::clone(&registry),
+        manager,
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
     );
     start_matrix_if_configured(
         config,
         Arc::clone(&registry),
+        manager,
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
     );
     start_wecom_if_configured(
         config,
         Arc::clone(&registry),
+        manager,
         wecom_slot,
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
@@ -3562,6 +3568,7 @@ fn spawn_wechat_user_worker(
 fn start_wechat_personal_if_configured(
     config: &RuntimeConfig,
     registry: Arc<AgentRegistry>,
+    manager: &mut crate::channel::ChannelManager,
     dm_enforcers: Arc<
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
@@ -3822,6 +3829,7 @@ fn start_wechat_personal_if_configured(
                 ch
             }
         });
+        let _ = manager.register(Arc::clone(&wc) as Arc<dyn crate::channel::Channel>);
         let wc_send = Arc::clone(&wc);
 
         tokio::spawn(async move {
@@ -3853,6 +3861,7 @@ fn start_wechat_personal_if_configured(
 fn start_feishu_if_configured(
     config: &RuntimeConfig,
     registry: Arc<AgentRegistry>,
+    manager: &mut crate::channel::ChannelManager,
     feishu_slot: Arc<tokio::sync::OnceCell<Arc<crate::channel::feishu::FeishuChannel>>>,
     dm_enforcers: Arc<
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
@@ -4248,6 +4257,7 @@ fn start_feishu_if_configured(
 
         // First account fills the webhook slot for backward compatibility.
         let _ = feishu_slot.set(Arc::clone(&fs));
+        let _ = manager.register(Arc::clone(&fs) as Arc<dyn crate::channel::Channel>);
 
         let fs_send = Arc::clone(&fs);
         tokio::spawn(async move {
@@ -4275,6 +4285,7 @@ fn start_feishu_if_configured(
 fn start_dingtalk_if_configured(
     config: &RuntimeConfig,
     registry: Arc<AgentRegistry>,
+    manager: &mut crate::channel::ChannelManager,
     dm_enforcers: Arc<
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
@@ -4643,6 +4654,7 @@ fn start_dingtalk_if_configured(
             dt_cfg.oapi_base.clone(),
             on_message,
         ));
+        let _ = manager.register(Arc::clone(&dt) as Arc<dyn crate::channel::Channel>);
         let dt_send = Arc::clone(&dt);
 
         tokio::spawn(async move {
@@ -4745,6 +4757,7 @@ async fn spawn_mcp_servers(config: &RuntimeConfig, registry: Arc<crate::mcp::Mcp
 fn start_qq_if_configured(
     config: &RuntimeConfig,
     registry: Arc<AgentRegistry>,
+    manager: &mut crate::channel::ChannelManager,
     dm_enforcers: Arc<
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
@@ -5069,6 +5082,7 @@ fn start_qq_if_configured(
             qq_token_url.clone(),
         ));
 
+        let _ = manager.register(Arc::clone(&qq) as Arc<dyn crate::channel::Channel>);
         let qq_send = Arc::clone(&qq);
         tokio::spawn(async move {
             while let Some(msg) = out_rx.recv().await {
@@ -5091,6 +5105,7 @@ fn start_qq_if_configured(
 fn start_matrix_if_configured(
     config: &RuntimeConfig,
     registry: Arc<AgentRegistry>,
+    manager: &mut crate::channel::ChannelManager,
     dm_enforcers: Arc<
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
@@ -5437,6 +5452,7 @@ fn start_matrix_if_configured(
             ch
         });
 
+        let _ = manager.register(Arc::clone(&matrix) as Arc<dyn crate::channel::Channel>);
         let matrix_send = Arc::clone(&matrix);
         tokio::spawn(async move {
             while let Some(msg) = out_rx.recv().await {
@@ -5459,6 +5475,7 @@ fn start_matrix_if_configured(
 fn start_wecom_if_configured(
     config: &RuntimeConfig,
     registry: Arc<AgentRegistry>,
+    manager: &mut crate::channel::ChannelManager,
     wecom_slot: Arc<tokio::sync::OnceCell<Arc<crate::channel::wecom::WeComChannel>>>,
     dm_enforcers: Arc<
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
@@ -5747,6 +5764,7 @@ fn start_wecom_if_configured(
 
         let wecom = Arc::new(WeComChannel::new(bot_id, secret, ws_url, on_message));
 
+        let _ = manager.register(Arc::clone(&wecom) as Arc<dyn crate::channel::Channel>);
         let wecom_send = Arc::clone(&wecom);
         tokio::spawn(async move {
             while let Some(msg) = out_rx.recv().await {
