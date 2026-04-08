@@ -3828,11 +3828,12 @@ function TauriConfigPageInner() {
               </div>
               <div style={{ position: "relative", minWidth: 300 }}>
                 <input
+                  id="img-model-input"
                   style={{ ...fInput, width: "100%" }}
                   placeholder={zh ? "\u70B9\u51FB\u9009\u62E9\u6216\u8F93\u5165\u6A21\u578B" : "Select or type a model"}
                   value={getVal("agents.defaults.model.image", "")}
                   onFocus={() => setImgDropOpen(true)}
-                  onBlur={() => setTimeout(() => setImgDropOpen(false), 150)}
+                  onBlur={() => setTimeout(() => setImgDropOpen(false), 180)}
                   onChange={(e) => updateConfig("agents.defaults.model.image", e.target.value)}
                 />
                 {imgDropOpen && (() => {
@@ -3845,8 +3846,10 @@ function TauriConfigPageInner() {
                     { label: "gemini/nano-banana-2", value: "gemini/gemini-3.1-flash-image-preview" },
                   ];
                   const curVal = getVal("agents.defaults.model.image", "");
-                  return (
-                    <div style={{ position: "absolute", top: "100%", left: 0, right: 0, marginTop: 4, background: V.bg3, border: `1px solid ${V.bd2}`, borderRadius: 8, overflow: "hidden", zIndex: 50, boxShadow: "0 8px 24px rgba(0,0,0,.4)" }}>
+                  const el = document.getElementById("img-model-input");
+                  const rect = el?.getBoundingClientRect();
+                  return rect ? (
+                    <div style={{ position: "fixed", top: rect.bottom + 4, left: rect.left, width: rect.width, background: V.bg3, border: `1px solid ${V.bd2}`, borderRadius: 8, overflow: "hidden", zIndex: 9999, boxShadow: "0 8px 24px rgba(0,0,0,.5)" }}>
                       {IMAGE_MODELS.map((m) => (
                         <div
                           key={m.value}
@@ -3859,7 +3862,7 @@ function TauriConfigPageInner() {
                         </div>
                       ))}
                     </div>
-                  );
+                  ) : null;
                 })()}
               </div>
             </div>
