@@ -909,10 +909,12 @@ fn main() {
             get_auto_start,
         ])
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        .setup(|_app| {
-            // NOTE: mac_dock::install disabled temporarily for debugging close behavior
-            // #[cfg(target_os = "macos")]
-            // mac_dock::install(app.handle());
+        .setup(|app| {
+            // Center window on startup (override window-state plugin's restored position
+            // which may be wrong on different screen sizes / dock positions).
+            if let Some(win) = app.get_window("main") {
+                let _ = win.center();
+            }
             Ok(())
         })
         .build(tauri::generate_context!())
