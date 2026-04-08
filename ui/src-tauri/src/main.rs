@@ -910,10 +910,15 @@ fn main() {
         ])
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .setup(|app| {
-            // Center window on startup (override window-state plugin's restored position
-            // which may be wrong on different screen sizes / dock positions).
-            if let Some(win) = app.get_window("main") {
-                let _ = win.center();
+            // Center window only on first launch (no saved state yet).
+            // After that, tauri_plugin_window_state restores the user's last position.
+            let state_path = app.path_resolver().app_data_dir()
+                .map(|d| d.join(".window-state"));
+            let has_saved_state = state_path.as_ref().is_some_and(|p| p.exists());
+            if !has_saved_state {
+                if let Some(win) = app.get_window("main") {
+                    let _ = win.center();
+                }
             }
             Ok(())
         })
