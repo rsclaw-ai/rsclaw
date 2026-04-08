@@ -223,17 +223,17 @@ pub fn base_dir() -> PathBuf {
 
 /// Gateway PID file path: `$base_dir/var/run/gateway.pid`
 pub fn pid_file() -> PathBuf {
-    base_dir().join("var/run/gateway.pid")
+    base_dir().join("var").join("run").join("gateway.pid")
 }
 
 /// Gateway log file path: `$base_dir/var/logs/gateway.log`
 pub fn log_file() -> PathBuf {
-    base_dir().join("var/logs/gateway.log")
+    base_dir().join("var").join("logs").join("gateway.log")
 }
 
 /// Cache directory: `$base_dir/var/cache/`
 pub fn cache_dir() -> PathBuf {
-    base_dir().join("var/cache")
+    base_dir().join("var").join("cache")
 }
 
 /// Load defaults.toml: prefer external file at `$base_dir/defaults.toml`,

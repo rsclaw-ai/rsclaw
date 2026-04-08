@@ -67,6 +67,10 @@ fn config_with_echo_agent(port: u16) -> RuntimeConfig {
                 opencode: None,
                 agent_dir: None,
                 system: None,
+                commands: None,
+                allowed_commands: None,
+                opencode: None,
+                claudecode: None,
             }],
             bindings: vec![],
             external: vec![],
@@ -144,9 +148,9 @@ async fn start_echo_server(addr: SocketAddr) {
         whatsapp: Arc::new(tokio::sync::OnceCell::new()),
         line: Arc::new(tokio::sync::OnceCell::new()),
         zalo: Arc::new(tokio::sync::OnceCell::new()),
-        custom_webhooks: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         started_at: std::time::Instant::now(),
         dm_enforcers: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        custom_webhooks: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     };
 
     // Leak the tempdir so the store stays valid for the server's lifetime.

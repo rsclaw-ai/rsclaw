@@ -32,6 +32,7 @@ pub struct OpenAiProvider {
     /// When true, reasoning models use ollama native /api/chat with think=true.
     is_ollama: bool,
     /// Custom User-Agent header.
+    #[allow(dead_code)]
     user_agent: Option<String>,
     /// API mode: Chat Completions or Responses.
     mode: OpenAiMode,
@@ -157,6 +158,13 @@ impl LlmProvider for OpenAiProvider {
 
     fn stream(&self, req: LlmRequest) -> BoxFuture<'_, Result<LlmStream>> {
         Box::pin(async move {
+            tracing::info!(
+                model = %req.model,
+                max_tokens = ?req.max_tokens,
+                thinking_budget = ?req.thinking_budget,
+                "openai: preparing LLM request"
+            );
+
             // Ollama: always use native /api/chat protocol
             if self.is_ollama {
                 return self.stream_ollama_native(&req).await;
@@ -241,9 +249,20 @@ impl LlmProvider for OpenAiProvider {
             }
 
             let byte_stream = resp.bytes_stream();
+
+            // SSE parser with line buffer to handle chunks that split lines.
+            // This is critical for correctness: SSE data can be split across
+            // multiple chunks, and we must buffer incomplete lines.
+            let line_buffer = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
             let event_stream = byte_stream
                 .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
-                .flat_map(|chunk| futures::stream::iter(parse_sse_chunk(chunk)));
+                .then(move |chunk| {
+                    let line_buffer = line_buffer.clone();
+                    async move {
+                        parse_sse_chunk_with_buffer(chunk, &line_buffer).await
+                    }
+                })
+                .flat_map(|events| futures::stream::iter(events));
 
             let stream: LlmStream = Box::pin(event_stream);
             Ok(stream)
@@ -822,7 +841,66 @@ fn serialize_part(part: &ContentPart) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// SSE parser (OpenAI chat completions format)
+// SSE parser with line buffering (handles chunks that split lines)
+// ---------------------------------------------------------------------------
+
+/// Parse SSE chunk with line buffering.
+/// SSE data lines can be split across multiple chunks, causing JSON parsing
+/// failures if we process each chunk independently. This function buffers
+/// incomplete lines until they are complete.
+async fn parse_sse_chunk_with_buffer(
+    chunk: Result<bytes::Bytes>,
+    line_buffer: &tokio::sync::Mutex<String>,
+) -> Vec<Result<StreamEvent>> {
+    let bytes = match chunk {
+        Ok(b) => b,
+        Err(e) => return vec![Err(e)],
+    };
+
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(t) => t,
+        Err(e) => return vec![Err(anyhow::anyhow!("UTF-8 error: {e}"))],
+    };
+
+    // Lock the buffer and append the new text
+    let mut buffer = line_buffer.lock().await;
+    buffer.push_str(text);
+
+    let mut events = Vec::new();
+
+    // Find the last complete line (ending with newline)
+    // Process complete lines and keep incomplete portion in buffer
+    if let Some(last_newline_pos) = buffer.rfind('\n') {
+        // Extract complete portion (up to and including the last newline)
+        let complete_portion = buffer[..last_newline_pos].to_owned();
+
+        // Keep incomplete portion (after the last newline) in buffer
+        let incomplete_portion = buffer[last_newline_pos + 1..].to_owned();
+        buffer.clear();
+        buffer.push_str(&incomplete_portion);
+
+        // Process complete lines
+        for line in complete_portion.lines() {
+            if let Some(data) = line.strip_prefix("data: ") {
+                if data == "[DONE]" {
+                    events.push(Ok(StreamEvent::Done { usage: None }));
+                    continue;
+                }
+                if let Some(event) = parse_event(data) {
+                    events.push(Ok(event));
+                } else {
+                    tracing::debug!(data, "openai: unparsed SSE data");
+                }
+            }
+        }
+    }
+    // If no newline found, buffer contains incomplete line - wait for more data
+
+    events
+}
+
+// ---------------------------------------------------------------------------
+// SSE parser (OpenAI chat completions format) - legacy without buffering
 // ---------------------------------------------------------------------------
 
 fn parse_sse_chunk(chunk: Result<bytes::Bytes>) -> Vec<Result<StreamEvent>> {
@@ -1530,6 +1608,71 @@ mod tests {
             assert_eq!(events.len(), 2);
             assert!(matches!(&events[0], Ok(StreamEvent::TextDelta(t)) if t == "hi"));
             assert!(matches!(&events[1], Ok(StreamEvent::Done { .. })));
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_line_buffer_handles_split_lines() {
+        // Test that SSE data split across chunks is correctly reassembled
+        let buffer = tokio::sync::Mutex::new(String::new());
+
+        let chunk1 = Ok(bytes::Bytes::from(
+            r#"data: {"choices":[{"delta":{"content":"he"#,
+        ));
+        let events1 = parse_sse_chunk_with_buffer(chunk1, &buffer).await;
+        assert!(events1.is_empty(), "Expected no events from incomplete chunk, got {:?}", events1);
+
+        {
+            let buf = buffer.lock().await;
+            assert!(buf.contains("he"), "Buffer should contain 'he', got: {}", *buf);
+        }
+
+        let chunk2 = Ok(bytes::Bytes::from("l\"}}]}\n"));
+        let events2 = parse_sse_chunk_with_buffer(chunk2, &buffer).await;
+        assert_eq!(events2.len(), 1, "Expected 1 event, got {:?}", events2);
+        match &events2[0] {
+            Ok(StreamEvent::TextDelta(text)) => assert_eq!(text, "hel"),
+            other => panic!("Expected TextDelta, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_line_buffer_handles_multiple_lines() {
+        let buffer = tokio::sync::Mutex::new(String::new());
+
+        let chunk = Ok(bytes::Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n",
+        ));
+        let events = parse_sse_chunk_with_buffer(chunk, &buffer).await;
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            Ok(StreamEvent::TextDelta(text)) => assert_eq!(text, "hello"),
+            other => panic!("Expected TextDelta, got {:?}", other),
+        }
+        match &events[1] {
+            Ok(StreamEvent::TextDelta(text)) => assert_eq!(text, " world"),
+            other => panic!("Expected TextDelta, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_line_buffer_handles_trailing_incomplete_line() {
+        let buffer = tokio::sync::Mutex::new(String::new());
+
+        let chunk1 = Ok(bytes::Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\"incom",
+        ));
+        let events1 = parse_sse_chunk_with_buffer(chunk1, &buffer).await;
+        assert_eq!(events1.len(), 1);
+
+        let chunk2 = Ok(bytes::Bytes::from("plete\"}}]}\n"));
+        let events2 = parse_sse_chunk_with_buffer(chunk2, &buffer).await;
+        assert_eq!(events2.len(), 1);
+        match &events2[0] {
+            Ok(StreamEvent::TextDelta(text)) => assert_eq!(text, "incomplete"),
+            other => panic!("Expected TextDelta, got {:?}", other),
         }
     }
 }

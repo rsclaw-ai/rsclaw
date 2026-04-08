@@ -16,7 +16,7 @@ use crate::{
         AgentMessage, AgentRegistry, AgentReply, AgentRuntime, AgentSpawner, LiveStatus,
         MemoryStore, PendingAnalysis,
     },
-    channel::{Channel, OutboundMessage, cli::CliChannel, telegram::TelegramChannel},
+    channel::{Channel, ChannelManager, OutboundMessage, cli::CliChannel, telegram::TelegramChannel},
     config::{
         self,
         runtime::RuntimeConfig,
@@ -201,30 +201,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Arc::clone(&store.db),
     );
 
-    // 9. Start cron runner (if configured and enabled).
-    if let Some(ref cron_cfg) = config.ops.cron
-        && cron_cfg.enabled.unwrap_or(false)
-    {
-        let jobs = config
-            .ops
-            .cron
-            .as_ref()
-            .and_then(|c| c.jobs.as_ref())
-            .map(|jobs| jobs.iter().map(CronJob::from).collect::<Vec<_>>())
-            .unwrap_or_default();
-
-        if !jobs.is_empty() {
-            let runner = CronRunner::new(cron_cfg, jobs, Arc::clone(&registry), data_dir.clone());
-            tokio::spawn(async move {
-                if let Err(e) = runner.run().await {
-                    error!("cron runner error: {e:#}");
-                }
-            });
-            info!("cron runner started");
-        }
-    }
-
-    // 10. Start heartbeat schedulers for agents that have heartbeat configured.
+    // 9. Start heartbeat schedulers for agents that have heartbeat configured.
     spawn_heartbeat_tasks(&config, Arc::clone(&registry));
 
     // 11. Build LiveConfig for hot-reloadable per-domain access.
@@ -301,6 +278,32 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         &mut channel_manager,
         Arc::clone(&custom_webhooks),
     );
+
+    // All channels registered - now wrap for sharing with cron runner
+    let channel_manager = Arc::new(channel_manager);
+
+    // Start cron runner (if configured and enabled).
+    if let Some(ref cron_cfg) = config.ops.cron
+        && cron_cfg.enabled.unwrap_or(false)
+    {
+        let jobs = config
+            .ops
+            .cron
+            .as_ref()
+            .and_then(|c| c.jobs.as_ref())
+            .map(|jobs| jobs.iter().map(CronJob::from).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        if !jobs.is_empty() {
+            let runner = CronRunner::new(cron_cfg, jobs, Arc::clone(&registry), Arc::clone(&channel_manager), data_dir.clone());
+            tokio::spawn(async move {
+                if let Err(e) = runner.run().await {
+                    error!("cron runner error: {e:#}");
+                }
+            });
+            info!("cron runner started");
+        }
+    }
 
     let state = AppState {
         config: Arc::clone(&config),

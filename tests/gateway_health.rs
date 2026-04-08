@@ -108,9 +108,9 @@ async fn start_server(addr: SocketAddr) {
         whatsapp: Arc::new(tokio::sync::OnceCell::new()),
         line: Arc::new(tokio::sync::OnceCell::new()),
         zalo: Arc::new(tokio::sync::OnceCell::new()),
-        custom_webhooks: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         started_at: std::time::Instant::now(),
         dm_enforcers: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        custom_webhooks: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     };
 
     // Leak the tempdir so the store stays valid for the lifetime of the server.
@@ -195,9 +195,9 @@ async fn auth_token_gates_non_health_endpoints() {
         whatsapp: Arc::new(tokio::sync::OnceCell::new()),
         line: Arc::new(tokio::sync::OnceCell::new()),
         zalo: Arc::new(tokio::sync::OnceCell::new()),
-        custom_webhooks: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         started_at: std::time::Instant::now(),
         dm_enforcers: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        custom_webhooks: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     };
     std::mem::forget(data_dir);
     tokio::spawn(async move { serve(state, addr).await.expect("serve") });

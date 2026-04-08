@@ -8,6 +8,7 @@ pub mod anthropic;
 pub mod defaults;
 pub mod failover;
 pub mod gemini;
+pub mod model_defaults;
 pub mod openai;
 pub mod registry;
 

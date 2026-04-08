@@ -457,7 +457,34 @@ impl AcpClient {
         handler: Arc<dyn AcpCallbackHandler>,
         notification_manager: Arc<Mutex<NotificationManager>>,
     ) -> Result<Self> {
-        let command_owned = command.to_string();
+        // First, check if the command exists (for better error messages)
+        let command_path = which::which(command)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| command.to_string());
+
+        // Try to spawn the process first to catch errors early
+        let test_child = std::process::Command::new(&command_path)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+
+        match test_child {
+            Ok(mut child) => {
+                // Process started successfully, kill it and spawn the real one
+                let _ = child.kill();
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to spawn ACP subprocess '{}': {}. Please ensure the command exists and is executable.",
+                    command_path,
+                    e
+                ));
+            }
+        }
+
+        let command_owned = command_path.clone();
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
 
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
@@ -471,7 +498,7 @@ impl AcpClient {
         let event_tx_clone = event_tx.clone();
 
         tokio::spawn(async move {
-            run_subprocess(
+            let _ = run_subprocess(
                 &command_owned,
                 &args_owned,
                 cmd_rx,
@@ -479,12 +506,11 @@ impl AcpClient {
                 handler_clone,
                 event_tx_clone,
                 notification_manager_clone,
-            )
-            .await;
+            ).await;
         });
 
-        // Brief startup delay
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Brief startup delay to allow subprocess to initialize
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         Ok(Self {
             cmd_tx: Arc::new(Mutex::new(Some(cmd_tx_clone))),
@@ -1038,31 +1064,18 @@ async fn run_subprocess(
     handler: Arc<dyn AcpCallbackHandler>,
     event_tx: broadcast::Sender<SessionEvent>,
     notification_manager: Arc<Mutex<NotificationManager>>,
-) {
-    let mut child = match Command::new(command)
+) -> Result<()> {
+    let mut child = Command::new(command)
         .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("Failed to spawn ACP subprocess: {}", e);
-            return;
-        }
-    };
+        .with_context(|| format!("Failed to spawn ACP subprocess: {} {:?}", command, args))?;
 
-    let mut stdin = match child.stdin.take() {
-        Some(s) => s,
-        None => return,
-    };
-
-    let stdout = match child.stdout.take() {
-        Some(s) => s,
-        None => return,
-    };
+    let mut stdin = child.stdin.take().context("Failed to get stdin")?;
+    let stdout = child.stdout.take().context("Failed to get stdout")?;
     let mut reader = BufReader::new(stdout);
 
     tracing::info!("ACP subprocess started: {} {:?}", command, args);
@@ -1094,25 +1107,26 @@ async fn run_subprocess(
                         tracing::debug!("ACP request sent: {}", request);
 
                         // Read response and notifications until we get the matching response
-                        let mut line_buf = String::new();
+                        let mut line_buf = Vec::new(); // Use byte buffer to handle non-UTF8
 
                         // Read until we get the response for this request (no timeout - can take very long!)
                         loop {
                             line_buf.clear();
                             tokio::select! {
-                                result = reader.read_line(&mut line_buf) => {
+                                result = reader.read_until(b'\n', &mut line_buf) => {
                                     match result {
                                         Ok(0) => {
                                             let _ = response_tx.send(Err(anyhow::anyhow!("EOF"))).await;
                                             break;
                                         }
                                         Ok(_) => {
-                                            let line = line_buf.trim();
+                                            // Convert to string, replacing invalid UTF-8 sequences
+                                            let line = String::from_utf8_lossy(&line_buf).trim().to_string();
                                             if line.is_empty() {
                                                 continue;
                                             }
 
-                                            if let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) {
+                                            if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
                                                 let method_field = msg.get("method").and_then(|m| m.as_str());
 
                                                 // Log all incoming messages with method field at INFO level
@@ -1171,6 +1185,8 @@ async fn run_subprocess(
             _ = tokio::time::sleep(Duration::from_millis(10)) => {}
         }
     }
+
+    Ok(())
 }
 
 /// Handle session/update notification

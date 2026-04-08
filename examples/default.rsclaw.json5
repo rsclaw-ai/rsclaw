@@ -35,6 +35,80 @@
       //   baseUrl: "http://localhost:11434/v1",
       //   apiKey: "ollama",
       // },
+
+      // === 国产大模型配置示例 ===
+      // DeepSeek (https://platform.deepseek.com)
+      // deepseek: {
+      //   baseUrl: "https://api.deepseek.com/v1",
+      //   apiKey: "${DEEPSEEK_API_KEY}",
+      //   models: [
+      //     { id: "deepseek-chat", maxTokens: 8192, contextWindow: 64000 },
+      //     { id: "deepseek-reasoner", maxTokens: 8192, contextWindow: 64000 },
+      //   ],
+      // },
+
+      // 阿里云通义千问 (https://dashscope.console.aliyun.com)
+      // qwen: {
+      //   baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      //   apiKey: "${DASHSCOPE_API_KEY}",
+      //   models: [
+      //     { id: "qwen-turbo", maxTokens: 6144, contextWindow: 131072 },
+      //     { id: "qwen-plus", maxTokens: 6144, contextWindow: 131072 },
+      //     { id: "qwen-max", maxTokens: 6144, contextWindow: 32768 },
+      //     { id: "qwen-long", maxTokens: 6144, contextWindow: 1048576 },
+      //   ],
+      // },
+
+      // 月之暗面 Kimi (https://platform.moonshot.cn)
+      // kimi: {
+      //   baseUrl: "https://api.moonshot.cn/v1",
+      //   apiKey: "${MOONSHOT_API_KEY}",
+      //   models: [
+      //     { id: "moonshot-v1-8k", maxTokens: 4096, contextWindow: 8192 },
+      //     { id: "moonshot-v1-32k", maxTokens: 4096, contextWindow: 32768 },
+      //     { id: "moonshot-v1-128k", maxTokens: 4096, contextWindow: 131072 },
+      //   ],
+      // },
+
+      // 智谱 GLM (https://open.bigmodel.cn)
+      // zhipu: {
+      //   baseUrl: "https://open.bigmodel.cn/api/paas/v4",
+      //   apiKey: "${ZHIPU_API_KEY}",
+      //   models: [
+      //     { id: "glm-4", maxTokens: 4096, contextWindow: 131072 },
+      //     { id: "glm-4-flash", maxTokens: 4096, contextWindow: 131072 },
+      //   ],
+      // },
+
+      // 零一万物 (https://platform.lingyiwanwu.com)
+      // yi: {
+      //   baseUrl: "https://api.lingyiwanwu.com/v1",
+      //   apiKey: "${YI_API_KEY}",
+      //   models: [
+      //     { id: "yi-lightning", maxTokens: 4096, contextWindow: 16384 },
+      //   ],
+      // },
+
+      // MiniMax (https://www.minimaxi.com)
+      // minimax: {
+      //   baseUrl: "https://api.minimax.chat/v1",
+      //   apiKey: "${MINIMAX_API_KEY}",
+      //   models: [
+      //     { id: "abab6.5s-chat", maxTokens: 2048, contextWindow: 245000 },
+      //   ],
+      // },
+
+      // SiliconFlow 硅基流动 (https://cloud.siliconflow.cn)
+      // siliconflow: {
+      //   baseUrl: "https://api.siliconflow.cn/v1",
+      //   apiKey: "${SILICONFLOW_API_KEY}",
+      //   models: [
+      //     { id: "deepseek-ai/DeepSeek-V3", maxTokens: 8192, contextWindow: 64000 },
+      //     { id: "Qwen/Qwen2.5-72B-Instruct", maxTokens: 8192, contextWindow: 131072 },
+      //   ],
+      // },
+
+      // 自定义 OpenAI 兼容 API
       // custom: {
       //   api: "openai-completions",
       //   baseUrl: "https://api.example.com/v1",

@@ -92,6 +92,7 @@ fn runtime_with_agent(agent_id: &str) -> RuntimeConfig {
                 allowed_commands: None,
                 commands: None,
                 opencode: None,
+                claudecode: None,
             }],
             bindings: vec![],
             external: vec![],

@@ -263,6 +263,7 @@ mod tests {
                 commands: None,
                 allowed_commands: None,
                 opencode: None,
+                claudecode: None,
                 agent_dir: None,
                 system: None,
             })

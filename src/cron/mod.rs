@@ -17,11 +17,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncWriteExt as _, sync::Semaphore};
 use tokio_cron_scheduler::{Job, JobScheduler};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     agent::{AgentMessage, AgentRegistry},
-    config::schema::{CronConfig, CronJobConfig},
+    channel::{ChannelManager, OutboundMessage},
+    config::schema::{CronConfig, CronDelivery, CronJobConfig},
 };
 
 // ---------------------------------------------------------------------------
@@ -129,6 +130,9 @@ pub struct CronJob {
     /// Plain message field (rsclaw native, takes precedence if payload is absent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Delivery target for notifications when job completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<CronDelivery>,
     // -- OpenClaw compat fields --
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_target: Option<String>,
@@ -192,6 +196,7 @@ impl From<&CronJobConfig> for CronJob {
             schedule,
             payload: None,
             message: Some(cfg.message.clone()),
+            delivery: cfg.delivery.clone(),
             session_target: None,
             wake_mode: None,
             state: None,
@@ -224,10 +229,12 @@ pub struct RunLogEntry {
 pub struct CronRunner {
     jobs: Vec<CronJob>,
     agents: Arc<AgentRegistry>,
+    channels: Arc<ChannelManager>,
     run_log_dir: PathBuf,
     #[allow(dead_code)]
     max_concurrent: usize,
     semaphore: Arc<Semaphore>,
+    default_delivery: Option<CronDelivery>,
 }
 
 impl CronRunner {
@@ -235,6 +242,7 @@ impl CronRunner {
         config: &CronConfig,
         jobs: Vec<CronJob>,
         agents: Arc<AgentRegistry>,
+        channels: Arc<ChannelManager>,
         data_dir: PathBuf,
     ) -> Self {
         let max_concurrent = config.max_concurrent_runs.unwrap_or(4) as usize;
@@ -243,9 +251,11 @@ impl CronRunner {
         Self {
             jobs,
             agents,
+            channels,
             run_log_dir,
             max_concurrent,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            default_delivery: config.default_delivery.clone(),
         }
     }
 
@@ -271,8 +281,10 @@ impl CronRunner {
 
             let job_clone = cron_job.clone();
             let agents = Arc::clone(&self.agents);
+            let channels = Arc::clone(&self.channels);
             let run_log_dir = self.run_log_dir.clone();
             let sem = Arc::clone(&self.semaphore);
+            let default_delivery = self.default_delivery.clone();
 
             let tokio_job = if let Some(tz_str) = cron_job.timezone() {
                 // Timezone-aware scheduling.
@@ -282,18 +294,28 @@ impl CronRunner {
                 Job::new_async_tz(schedule.as_str(), tz, move |_uuid, _scheduler| {
                     let job = job_clone.clone();
                     let agents = Arc::clone(&agents);
+                    let channels = Arc::clone(&channels);
                     let run_log_dir = run_log_dir.clone();
                     let sem = Arc::clone(&sem);
+                    let default_delivery = default_delivery.clone();
                     Box::pin(async move {
                         let Ok(_permit) = sem.acquire().await else {
                             return;
                         };
                         info!(job_id = %job.id, "cron job triggered");
                         let result = run_cron_job(&job, &agents).await;
-                        if let Err(ref e) = result {
-                            error!(job_id = %job.id, %e, "cron job failed");
+                        match &result {
+                            Ok(output) => {
+                                // Send delivery notification if configured
+                                if let Err(e) = send_delivery(&channels, &job, &default_delivery, output).await {
+                                    warn!(job_id = %job.id, %e, "delivery failed");
+                                }
+                            }
+                            Err(e) => {
+                                error!(job_id = %job.id, %e, "cron job failed");
+                            }
                         }
-                        let entry = build_run_log_entry(&job, result.is_ok(), result.err());
+                        let entry = build_run_log_entry(&job, result.is_ok(), result.as_ref().err().map(|e| anyhow::anyhow!("{e}")));
                         let _ = write_run_log(&run_log_dir, &job.id, entry).await;
                     })
                 })
@@ -308,18 +330,28 @@ impl CronRunner {
                 Job::new_async(schedule.as_str(), move |_uuid, _scheduler| {
                     let job = job_clone.clone();
                     let agents = Arc::clone(&agents);
+                    let channels = Arc::clone(&channels);
                     let run_log_dir = run_log_dir.clone();
                     let sem = Arc::clone(&sem);
+                    let default_delivery = default_delivery.clone();
                     Box::pin(async move {
                         let Ok(_permit) = sem.acquire().await else {
                             return;
                         };
                         info!(job_id = %job.id, "cron job triggered");
                         let result = run_cron_job(&job, &agents).await;
-                        if let Err(ref e) = result {
-                            error!(job_id = %job.id, %e, "cron job failed");
+                        match &result {
+                            Ok(output) => {
+                                // Send delivery notification if configured
+                                if let Err(e) = send_delivery(&channels, &job, &default_delivery, output).await {
+                                    warn!(job_id = %job.id, %e, "delivery failed");
+                                }
+                            }
+                            Err(e) => {
+                                error!(job_id = %job.id, %e, "cron job failed");
+                            }
                         }
-                        let entry = build_run_log_entry(&job, result.is_ok(), result.err());
+                        let entry = build_run_log_entry(&job, result.is_ok(), result.as_ref().err().map(|e| anyhow::anyhow!("{e}")));
                         let _ = write_run_log(&run_log_dir, &job.id, entry).await;
                     })
                 })
@@ -371,6 +403,12 @@ impl CronRunner {
         let _permit = self.semaphore.acquire().await?;
         let result = run_cron_job(job, &self.agents).await;
         let success = result.is_ok();
+        if let Ok(output) = &result {
+            // Send delivery notification if configured
+            if let Err(e) = send_delivery(&self.channels, job, &self.default_delivery, output).await {
+                warn!(job_id = %job.id, %e, "delivery failed");
+            }
+        }
         // Re-create an equivalent error for the log entry (result is consumed by `?`
         // below).
         let log_err = if success {
@@ -380,7 +418,7 @@ impl CronRunner {
         };
         let entry = build_run_log_entry(job, success, log_err);
         write_run_log(&self.run_log_dir, &job.id, entry).await?;
-        result
+        result.map(|_| ())
     }
 }
 
@@ -399,7 +437,7 @@ fn to_six_field(expr: &str) -> String {
     }
 }
 
-async fn run_cron_job(job: &CronJob, agents: &AgentRegistry) -> Result<()> {
+async fn run_cron_job(job: &CronJob, agents: &AgentRegistry) -> Result<String> {
     let session_key = job
         .session_key
         .clone()
@@ -432,10 +470,105 @@ async fn run_cron_job(job: &CronJob, agents: &AgentRegistry) -> Result<()> {
 
     if reply.is_empty {
         debug!(job_id = %job.id, "cron job returned no output");
+        Ok(String::new())
     } else {
         info!(job_id = %job.id, len = reply.text.len(), "cron job completed");
+        Ok(reply.text)
     }
-    Ok(())
+}
+
+/// Send delivery notification for a completed cron job.
+/// Uses job.delivery if present, otherwise falls back to default_delivery from config.
+async fn send_delivery(
+    channels: &ChannelManager,
+    job: &CronJob,
+    default_delivery: &Option<CronDelivery>,
+    output_text: &str,
+) -> Result<()> {
+    // Use job-specific delivery if present, otherwise fall back to default
+    let delivery = match &job.delivery {
+        Some(d) => d,
+        None => match default_delivery {
+            Some(d) => d,
+            None => {
+                info!(job_id = %job.id, name = ?job.name, "cron job completed but no delivery configured (job or default) - notification not sent");
+                return Ok(());
+            }
+        },
+    };
+
+    // Check if delivery is enabled
+    let mode = delivery.mode.as_deref().unwrap_or("none");
+    if mode == "none" {
+        info!(job_id = %job.id, mode = %mode, "delivery disabled, skipping notification");
+        return Ok(());
+    }
+
+    let channel_name = match &delivery.channel {
+        Some(c) => c,
+        None => {
+            warn!(job_id = %job.id, "delivery configured but no channel specified");
+            return Ok(());
+        }
+    };
+
+    let to = match &delivery.to {
+        Some(t) => t,
+        None => {
+            warn!(job_id = %job.id, "delivery configured but no 'to' specified");
+            return Ok(());
+        }
+    };
+
+    // Skip empty output
+    let text = output_text.trim();
+    if text.is_empty() {
+        info!(job_id = %job.id, "skipping delivery for empty output");
+        return Ok(());
+    }
+
+    // Get the channel from manager
+    let channel = match channels.get(channel_name) {
+        Some(ch) => ch,
+        None => {
+            warn!(job_id = %job.id, channel = %channel_name, "channel not found for delivery");
+            return Ok(());
+        }
+    };
+
+    // Build outbound message
+    let msg = OutboundMessage {
+        target_id: to.clone(),
+        is_group: false, // Cron delivery typically targets a specific user/chat
+        text: text.to_owned(),
+        reply_to: delivery.thread_id.clone(),
+        images: vec![],
+    };
+
+    // Send the message through the channel
+    info!(
+        job_id = %job.id,
+        channel = %channel_name,
+        to = %to,
+        thread_id = ?delivery.thread_id,
+        text_len = text.len(),
+        "[CRON DELIVERY] Sending notification"
+    );
+
+    match channel.send(msg).await {
+        Ok(()) => {
+            info!(job_id = %job.id, channel = %channel_name, to = %to, "[CRON DELIVERY] Notification sent successfully");
+            Ok(())
+        }
+        Err(e) => {
+            if delivery.best_effort.unwrap_or(false) {
+                warn!(job_id = %job.id, channel = %channel_name, to = %to, error = %e, "[CRON DELIVERY] Send failed (best_effort=true, ignoring)");
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 fn build_run_log_entry(job: &CronJob, success: bool, error: Option<anyhow::Error>) -> RunLogEntry {
