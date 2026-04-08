@@ -282,8 +282,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // All channels registered - now wrap for sharing with cron runner
     let channel_manager = Arc::new(channel_manager);
 
-    // Start cron runner (if configured or jobs.json exists).
-    // Sources: 1) config cron.jobs  2) data_dir/cron/jobs.json (OpenClaw compat)
+    // Start cron runner — jobs loaded from file, config provides global settings only.
+    // Priority: base_dir/cron.json5 > base_dir/cron/jobs.json (legacy, auto-migrated)
     {
         let cron_cfg = config.ops.cron.clone().unwrap_or_else(|| {
             crate::config::schema::CronConfig {
@@ -296,27 +296,32 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             }
         });
         let cron_enabled = cron_cfg.enabled.unwrap_or(true);
-        // Jobs from config
-        let mut jobs: Vec<CronJob> = cron_cfg
-            .jobs
-            .as_ref()
-            .map(|j| j.iter().map(CronJob::from).collect())
-            .unwrap_or_default();
-        // Also load from cron/jobs.json file (OpenClaw compat)
-        let jobs_file = base_dir.join("cron/jobs.json");
-        if jobs_file.is_file() {
-            if let Ok(raw) = std::fs::read_to_string(&jobs_file) {
-                if let Ok(file_data) = serde_json::from_str::<serde_json::Value>(&raw) {
+        let cron_file = base_dir.join("cron.json5");
+        let legacy_file = base_dir.join("cron/jobs.json");
+
+        // Auto-migrate: if legacy file exists but new file doesn't, copy it over
+        if !cron_file.exists() && legacy_file.is_file() {
+            if let Ok(raw) = std::fs::read_to_string(&legacy_file) {
+                if std::fs::write(&cron_file, &raw).is_ok() {
+                    info!("migrated cron/jobs.json → cron.json5");
+                }
+            }
+        }
+
+        let mut jobs: Vec<CronJob> = Vec::new();
+        let source = if cron_file.is_file() { &cron_file } else { &legacy_file };
+        if source.is_file() {
+            if let Ok(raw) = std::fs::read_to_string(source) {
+                let parsed: Result<serde_json::Value, _> = json5::from_str(&raw)
+                    .or_else(|_| serde_json::from_str(&raw));
+                if let Ok(file_data) = parsed {
                     if let Some(arr) = file_data.get("jobs").and_then(|v| v.as_array()) {
                         for item in arr {
                             if let Ok(job) = serde_json::from_value::<CronJob>(item.clone()) {
-                                // Skip duplicates (config takes priority)
-                                if !jobs.iter().any(|j| j.id == job.id) {
-                                    jobs.push(job);
-                                }
+                                jobs.push(job);
                             }
                         }
-                        info!(file = %jobs_file.display(), count = arr.len(), "loaded cron jobs from file");
+                        info!(file = %source.display(), count = arr.len(), "loaded cron jobs");
                     }
                 }
             }
