@@ -282,9 +282,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // All channels registered - now wrap for sharing with cron runner
     let channel_manager = Arc::new(channel_manager);
 
-    // Start cron runner (if configured and enabled).
+    // Start cron runner (if configured).
+    // Default: enabled when jobs are present, unless explicitly disabled.
     if let Some(ref cron_cfg) = config.ops.cron
-        && cron_cfg.enabled.unwrap_or(false)
+        && cron_cfg.enabled.unwrap_or(true)
     {
         let jobs = config
             .ops
