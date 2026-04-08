@@ -3251,6 +3251,7 @@ function TauriConfigPageInner() {
   const [provErr, setProvErr] = useState<Record<string, string>>({});
   const [provModels, setProvModels] = useState<Record<string, { id: string; tag: string }[]>>({});
   const [provSelModel, setProvSelModel] = useState<Record<string, string>>({});
+  const [imgDropOpen, setImgDropOpen] = useState(false);
 
   // Channel state: open cards, login tab per channel, open accounts, account tab
   const [openChs, setOpenChs] = useState<Set<string>>(new Set());
@@ -3811,13 +3812,6 @@ function TauriConfigPageInner() {
             </div>
             <div style={fieldRow}>
               <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u6587\u751F\u56FE\u6A21\u578B" : "Image Model"} <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u7A7A=\u81EA\u52A8)" : "(empty=auto)"}</span></div>
-                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.image</div>
-              </div>
-              <input style={{ ...fInput, minWidth: 300 }} placeholder={zh ? "\u5982: doubao/doubao-seedream-5-0-260128" : "e.g. doubao/doubao-seedream-5-0-260128"} value={getVal("agents.defaults.model.image", "")} onChange={(e) => updateConfig("agents.defaults.model.image", e.target.value)} />
-            </div>
-            <div style={fieldRow}>
-              <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5907\u7528\u6A21\u578B" : "Fallback Models"} <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u9017\u53F7\u5206\u9694)" : "(comma separated)"}</span></div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.fallbacks</div>
               </div>
@@ -3826,6 +3820,48 @@ function TauriConfigPageInner() {
                 const arr = val.split(",").map((s: string) => s.trim()).filter(Boolean);
                 updateConfig("agents.defaults.model.fallbacks", arr.length > 0 ? arr : undefined);
               }} />
+            </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u751F\u56FE\u6A21\u578B" : "Image Model"} <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u7A7A=\u81EA\u52A8)" : "(empty=auto)"}</span></div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.image</div>
+              </div>
+              <div style={{ position: "relative", minWidth: 300 }}>
+                <input
+                  style={{ ...fInput, width: "100%" }}
+                  placeholder={zh ? "\u70B9\u51FB\u9009\u62E9\u6216\u8F93\u5165\u6A21\u578B" : "Select or type a model"}
+                  value={getVal("agents.defaults.model.image", "")}
+                  onFocus={() => setImgDropOpen(true)}
+                  onBlur={() => setTimeout(() => setImgDropOpen(false), 150)}
+                  onChange={(e) => updateConfig("agents.defaults.model.image", e.target.value)}
+                />
+                {imgDropOpen && (() => {
+                  const IMAGE_MODELS = [
+                    "minimax/image-01",
+                    "qwen/qwen-image-2.0-pro",
+                    "qwen/wan2.6-t2i",
+                    "doubao/doubao-seedream-5-0-260128",
+                    "gemini/nano-banana-pro",
+                    "gemini/nano-banana-2",
+                  ];
+                  const curVal = getVal("agents.defaults.model.image", "");
+                  return (
+                    <div style={{ position: "absolute", top: "100%", left: 0, right: 0, marginTop: 4, background: V.bg3, border: `1px solid ${V.bd2}`, borderRadius: 8, overflow: "hidden", zIndex: 50, boxShadow: "0 8px 24px rgba(0,0,0,.4)" }}>
+                      {IMAGE_MODELS.map((m) => (
+                        <div
+                          key={m}
+                          onMouseDown={(e) => { e.preventDefault(); updateConfig("agents.defaults.model.image", m); setImgDropOpen(false); }}
+                          style={{ padding: "8px 12px", fontSize: 12, fontFamily: V.mono, color: curVal === m ? V.or : V.t1, cursor: "pointer", borderBottom: `1px solid ${V.bd}`, background: curVal === m ? V.olo : "transparent" }}
+                          onMouseEnter={(e) => (e.currentTarget.style.background = curVal === m ? V.olo : V.bg4)}
+                          onMouseLeave={(e) => (e.currentTarget.style.background = curVal === m ? V.olo : "transparent")}
+                        >
+                          {m}
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })()}
+              </div>
             </div>
             <div style={{ ...fieldRow, borderBottom: "none" }}>
               <div style={{ flex: 1 }}>
