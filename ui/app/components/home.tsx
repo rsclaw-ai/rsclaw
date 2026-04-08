@@ -126,11 +126,9 @@ export function useSwitchTheme() {
   const config = useAppConfig();
 
   useEffect(() => {
-    const theme = config.theme;
-    const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-    const isDark = theme === "dark" || (theme === "auto" && prefersDark);
+    // Theme fixed to dark — light mode not fully supported yet
     document.body.classList.remove("light", "dark");
-    document.body.classList.add(isDark ? "dark" : "light");
+    document.body.classList.add("dark");
 
     const metaDescriptionDark = document.querySelector(
       'meta[name="theme-color"][media*="dark"]',

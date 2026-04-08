@@ -1,17 +1,17 @@
 @import "../styles/animation.scss";
 
-// Design system variables — resolved from CSS custom properties for theme support
-$bg0: var(--panel-bg0);
-$bg1: var(--panel-bg1);
-$bg2: var(--panel-bg2);
-$bg3: var(--panel-bg3);
-$bg4: var(--panel-bg4);
-$border: var(--panel-border);
-$border2: var(--panel-border2);
-$border3: var(--panel-border3);
-$t0: var(--panel-t0);
-$t1: var(--panel-t1);
-$t2: var(--panel-t2);
+// Design system variables
+$bg0: #0f0f10;
+$bg1: #161618;
+$bg2: #1e1e21;
+$bg3: #26262b;
+$bg4: #2e2e34;
+$border: rgba(255, 255, 255, 0.07);
+$border2: rgba(255, 255, 255, 0.12);
+$border3: rgba(255, 255, 255, 0.16);
+$t0: #f0eff2;
+$t1: #a8a6b2;
+$t2: #6b6877;
 $accent: #f97316;
 $accent2: #fb923c;
 $alo: rgba(249, 115, 22, 0.10);

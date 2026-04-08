@@ -20,19 +20,6 @@
 
   /* stroke */
   --border-in-light: 1px solid rgb(222, 222, 222);
-
-  /* rsclaw panel */
-  --panel-bg0: #f5f5f7;
-  --panel-bg1: #ffffff;
-  --panel-bg2: #f2f2f4;
-  --panel-bg3: #e8e8eb;
-  --panel-bg4: #dcdce0;
-  --panel-border: rgba(0, 0, 0, 0.08);
-  --panel-border2: rgba(0, 0, 0, 0.12);
-  --panel-border3: rgba(0, 0, 0, 0.16);
-  --panel-t0: #1a1a1a;
-  --panel-t1: #52525e;
-  --panel-t2: #89889a;
 }
 
 @mixin dark {
@@ -51,19 +38,6 @@
   --border-in-light: 1px solid rgba(255, 255, 255, 0.07);
 
   --theme-color: var(--gray);
-
-  /* rsclaw panel */
-  --panel-bg0: #0f0f10;
-  --panel-bg1: #161618;
-  --panel-bg2: #1e1e21;
-  --panel-bg3: #26262b;
-  --panel-bg4: #2e2e34;
-  --panel-border: rgba(255, 255, 255, 0.07);
-  --panel-border2: rgba(255, 255, 255, 0.12);
-  --panel-border3: rgba(255, 255, 255, 0.16);
-  --panel-t0: #f0eff2;
-  --panel-t1: #a8a6b2;
-  --panel-t2: #6b6877;
 
   div:not(.no-dark) > svg {
     filter: invert(0.5);
