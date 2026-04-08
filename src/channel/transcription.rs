@@ -394,6 +394,8 @@ fn find_whisper_model() -> Option<String> {
         for dir in &[
             "/opt/homebrew/share/whisper-cpp/models",
             "/usr/local/share/whisper-cpp/models",
+            "C:\\ProgramData\\whisper-cpp\\models",
+            "C:\\whisper-cpp\\models",
         ] {
             let path = format!("{dir}/ggml-{m}.bin");
             if std::path::Path::new(&path).exists() {
@@ -410,6 +412,10 @@ fn find_whisper_model() -> Option<String> {
         "/opt/homebrew/share/whisper-cpp",
         "/usr/local/share/whisper-cpp/models",
         "/usr/local/share/whisper-cpp",
+        "C:\\ProgramData\\whisper-cpp\\models",
+        "C:\\ProgramData\\whisper-cpp",
+        "C:\\whisper-cpp\\models",
+        "C:\\whisper-cpp",
     ] {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {

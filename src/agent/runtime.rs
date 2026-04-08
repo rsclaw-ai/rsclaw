@@ -4095,8 +4095,9 @@ impl AgentRuntime {
                 workspace.clone()
             };
             for token in command.split_whitespace() {
-                if token.starts_with('/') || token.contains("..") {
-                    let resolved = if token.starts_with('/') {
+                let is_abs = std::path::Path::new(token).is_absolute();
+                if is_abs || token.contains("..") {
+                    let resolved = if is_abs {
                         std::path::PathBuf::from(token)
                     } else {
                         workspace.join(token)
