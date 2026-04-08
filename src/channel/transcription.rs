@@ -371,13 +371,8 @@ async fn transcribe_openai(
 /// Find whisper binary: `whisper-cli`, `whisper`, or `whisper.cpp`
 fn which_whisper() -> Option<String> {
     for name in &["whisper-cli", "whisper", "whisper-cpp", "main"] {
-        if let Ok(output) = std::process::Command::new("which").arg(name).output()
-            && output.status.success()
-        {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if !path.is_empty() {
-                return Some(path);
-            }
+        if let Ok(path) = which::which(name) {
+            return Some(path.to_string_lossy().to_string());
         }
     }
     None
@@ -391,12 +386,17 @@ fn find_whisper_model() -> Option<String> {
             return Some(m);
         }
         // Try as a model name in common locations
-        for dir in &[
+        #[cfg(not(windows))]
+        const MODEL_DIRS: &[&str] = &[
             "/opt/homebrew/share/whisper-cpp/models",
             "/usr/local/share/whisper-cpp/models",
+        ];
+        #[cfg(windows)]
+        const MODEL_DIRS: &[&str] = &[
             "C:\\ProgramData\\whisper-cpp\\models",
             "C:\\whisper-cpp\\models",
-        ] {
+        ];
+        for dir in MODEL_DIRS {
             let path = format!("{dir}/ggml-{m}.bin");
             if std::path::Path::new(&path).exists() {
                 return Some(path);
@@ -407,16 +407,21 @@ fn find_whisper_model() -> Option<String> {
     }
 
     // Search common model locations
-    for dir in &[
+    #[cfg(not(windows))]
+    const SEARCH_DIRS: &[&str] = &[
         "/opt/homebrew/share/whisper-cpp/models",
         "/opt/homebrew/share/whisper-cpp",
         "/usr/local/share/whisper-cpp/models",
         "/usr/local/share/whisper-cpp",
+    ];
+    #[cfg(windows)]
+    const SEARCH_DIRS: &[&str] = &[
         "C:\\ProgramData\\whisper-cpp\\models",
         "C:\\ProgramData\\whisper-cpp",
         "C:\\whisper-cpp\\models",
         "C:\\whisper-cpp",
-    ] {
+    ];
+    for dir in SEARCH_DIRS {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();

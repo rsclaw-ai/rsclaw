@@ -6195,19 +6195,9 @@ fn detect_chrome() -> Option<String> {
         }
     }
 
-    let which_cmd = if cfg!(target_os = "windows") {
-        "where"
-    } else {
-        "which"
-    };
     for name in &["google-chrome", "chromium", "chromium-browser", "chrome"] {
-        if let Ok(output) = std::process::Command::new(which_cmd).arg(name).output() {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                if !path.is_empty() {
-                    return Some(path);
-                }
-            }
+        if let Ok(path) = which::which(name) {
+            return Some(path.to_string_lossy().to_string());
         }
     }
     None

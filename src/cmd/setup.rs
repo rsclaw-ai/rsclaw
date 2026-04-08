@@ -204,28 +204,47 @@ fn select_language() -> Result<&'static str> {
 /// Detect LAN IP addresses (non-loopback, non-link-local IPv4).
 fn detect_lan_ips() -> Vec<String> {
     let mut ips = Vec::new();
-    if let Ok(output) = std::process::Command::new("ifconfig").output() {
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("inet ") {
-                let ip = rest.split_whitespace().next().unwrap_or("");
-                if !ip.starts_with("127.") && !ip.starts_with("169.254.") && !ip.is_empty() {
-                    ips.push(ip.to_owned());
+
+    if cfg!(windows) {
+        // Windows: parse ipconfig output
+        if let Ok(output) = std::process::Command::new("ipconfig").output() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                let trimmed = line.trim();
+                // Match "IPv4 Address. . . . . . . . . . . : 192.168.x.x"
+                if let Some(pos) = trimmed.find(": ") {
+                    let ip = trimmed[pos + 2..].trim();
+                    if ip.contains('.') && !ip.starts_with("127.") && !ip.starts_with("169.254.") {
+                        ips.push(ip.to_owned());
+                    }
                 }
             }
         }
-    }
-    // Fallback for Linux: ip addr
-    if ips.is_empty() {
-        if let Ok(output) = std::process::Command::new("ip").args(["addr", "show"]).output() {
+    } else {
+        // macOS: ifconfig
+        if let Ok(output) = std::process::Command::new("ifconfig").output() {
             let text = String::from_utf8_lossy(&output.stdout);
             for line in text.lines() {
                 let trimmed = line.trim();
                 if let Some(rest) = trimmed.strip_prefix("inet ") {
-                    let ip = rest.split('/').next().unwrap_or("");
+                    let ip = rest.split_whitespace().next().unwrap_or("");
                     if !ip.starts_with("127.") && !ip.starts_with("169.254.") && !ip.is_empty() {
                         ips.push(ip.to_owned());
+                    }
+                }
+            }
+        }
+        // Fallback for Linux: ip addr
+        if ips.is_empty() {
+            if let Ok(output) = std::process::Command::new("ip").args(["addr", "show"]).output() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if let Some(rest) = trimmed.strip_prefix("inet ") {
+                        let ip = rest.split('/').next().unwrap_or("");
+                        if !ip.starts_with("127.") && !ip.starts_with("169.254.") && !ip.is_empty() {
+                            ips.push(ip.to_owned());
+                        }
                     }
                 }
             }
