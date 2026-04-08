@@ -6776,12 +6776,12 @@ fn build_tool_list(
 
     tools.push(ToolDef {
         name: "image".to_owned(),
-        description: "Generate an image from a text description using an AI image model.".to_owned(),
+        description: "Generate an image from a text description using an AI image model. Pass the user's original description as-is (preserve their language, do not translate).".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "prompt": {"type": "string", "description": "Text description of the image to generate"},
-                "size":   {"type": "string", "description": "Image size (default: 1024x1024)", "default": "1024x1024"}
+                "prompt": {"type": "string", "description": "Image description. IMPORTANT: use the user's original language and wording, do not translate to English."},
+                "size":   {"type": "string", "description": "Image size, e.g. 2048x2048", "default": "2048x2048"}
             },
             "required": ["prompt"]
         }),
