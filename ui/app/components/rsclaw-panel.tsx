@@ -3836,26 +3836,26 @@ function TauriConfigPageInner() {
                   onChange={(e) => updateConfig("agents.defaults.model.image", e.target.value)}
                 />
                 {imgDropOpen && (() => {
-                  const IMAGE_MODELS = [
-                    "minimax/image-01",
-                    "qwen/qwen-image-2.0-pro",
-                    "qwen/wan2.6-t2i",
-                    "doubao/doubao-seedream-5-0-260128",
-                    "gemini/nano-banana-pro",
-                    "gemini/nano-banana-2",
+                  const IMAGE_MODELS: { label: string; value: string }[] = [
+                    { label: "minimax/image-01", value: "minimax/image-01" },
+                    { label: "qwen/qwen-image-2.0-pro", value: "qwen/qwen-image-2.0-pro" },
+                    { label: "qwen/wan2.6-t2i", value: "qwen/wan2.6-t2i" },
+                    { label: "doubao/doubao-seedream-5-0-260128", value: "doubao/doubao-seedream-5-0-260128" },
+                    { label: "gemini/nano-banana-pro", value: "gemini/gemini-3-pro-image-preview" },
+                    { label: "gemini/nano-banana-2", value: "gemini/gemini-3.1-flash-image-preview" },
                   ];
                   const curVal = getVal("agents.defaults.model.image", "");
                   return (
                     <div style={{ position: "absolute", top: "100%", left: 0, right: 0, marginTop: 4, background: V.bg3, border: `1px solid ${V.bd2}`, borderRadius: 8, overflow: "hidden", zIndex: 50, boxShadow: "0 8px 24px rgba(0,0,0,.4)" }}>
                       {IMAGE_MODELS.map((m) => (
                         <div
-                          key={m}
-                          onMouseDown={(e) => { e.preventDefault(); updateConfig("agents.defaults.model.image", m); setImgDropOpen(false); }}
-                          style={{ padding: "8px 12px", fontSize: 12, fontFamily: V.mono, color: curVal === m ? V.or : V.t1, cursor: "pointer", borderBottom: `1px solid ${V.bd}`, background: curVal === m ? V.olo : "transparent" }}
-                          onMouseEnter={(e) => (e.currentTarget.style.background = curVal === m ? V.olo : V.bg4)}
-                          onMouseLeave={(e) => (e.currentTarget.style.background = curVal === m ? V.olo : "transparent")}
+                          key={m.value}
+                          onMouseDown={(e) => { e.preventDefault(); updateConfig("agents.defaults.model.image", m.value); setImgDropOpen(false); }}
+                          style={{ padding: "8px 12px", fontSize: 12, fontFamily: V.mono, color: curVal === m.value ? V.or : V.t1, cursor: "pointer", borderBottom: `1px solid ${V.bd}`, background: curVal === m.value ? V.olo : "transparent" }}
+                          onMouseEnter={(e) => (e.currentTarget.style.background = curVal === m.value ? V.olo : V.bg4)}
+                          onMouseLeave={(e) => (e.currentTarget.style.background = curVal === m.value ? V.olo : "transparent")}
                         >
-                          {m}
+                          {m.label}{m.label !== m.value && <span style={{ color: V.t3, fontSize: 10, marginLeft: 6 }}>→ {m.value}</span>}
                         </div>
                       ))}
                     </div>
