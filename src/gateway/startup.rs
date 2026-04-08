@@ -282,21 +282,47 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // All channels registered - now wrap for sharing with cron runner
     let channel_manager = Arc::new(channel_manager);
 
-    // Start cron runner (if configured).
-    // Default: enabled when jobs are present, unless explicitly disabled.
-    if let Some(ref cron_cfg) = config.ops.cron
-        && cron_cfg.enabled.unwrap_or(true)
+    // Start cron runner (if configured or jobs.json exists).
+    // Sources: 1) config cron.jobs  2) data_dir/cron/jobs.json (OpenClaw compat)
     {
-        let jobs = config
-            .ops
-            .cron
+        let cron_cfg = config.ops.cron.clone().unwrap_or_else(|| {
+            crate::config::schema::CronConfig {
+                enabled: Some(true),
+                max_concurrent_runs: None,
+                session_retention: None,
+                run_log: None,
+                jobs: None,
+                default_delivery: None,
+            }
+        });
+        let cron_enabled = cron_cfg.enabled.unwrap_or(true);
+        // Jobs from config
+        let mut jobs: Vec<CronJob> = cron_cfg
+            .jobs
             .as_ref()
-            .and_then(|c| c.jobs.as_ref())
-            .map(|jobs| jobs.iter().map(CronJob::from).collect::<Vec<_>>())
+            .map(|j| j.iter().map(CronJob::from).collect())
             .unwrap_or_default();
-
-        if !jobs.is_empty() {
-            let runner = CronRunner::new(cron_cfg, jobs, Arc::clone(&registry), Arc::clone(&channel_manager), data_dir.clone());
+        // Also load from cron/jobs.json file (OpenClaw compat)
+        let jobs_file = base_dir.join("cron/jobs.json");
+        if jobs_file.is_file() {
+            if let Ok(raw) = std::fs::read_to_string(&jobs_file) {
+                if let Ok(file_data) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(arr) = file_data.get("jobs").and_then(|v| v.as_array()) {
+                        for item in arr {
+                            if let Ok(job) = serde_json::from_value::<CronJob>(item.clone()) {
+                                // Skip duplicates (config takes priority)
+                                if !jobs.iter().any(|j| j.id == job.id) {
+                                    jobs.push(job);
+                                }
+                            }
+                        }
+                        info!(file = %jobs_file.display(), count = arr.len(), "loaded cron jobs from file");
+                    }
+                }
+            }
+        }
+        if cron_enabled && !jobs.is_empty() {
+            let runner = CronRunner::new(&cron_cfg, jobs, Arc::clone(&registry), Arc::clone(&channel_manager), data_dir.clone());
             tokio::spawn(async move {
                 if let Err(e) = runner.run().await {
                     error!("cron runner error: {e:#}");
