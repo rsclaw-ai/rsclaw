@@ -88,6 +88,7 @@ aes = "0.8"
 urlencoding = "2"
 silk-rs = "0.2"
 symphonia = { version = "0.5", features = ["mp3", "aac", "ogg", "flac", "wav", "pcm", "vorbis", "isomp4", "mkv"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 opus-decoder = "0.1"
 ogg = "0.9"
 lark-websocket-protobuf = "0.1"

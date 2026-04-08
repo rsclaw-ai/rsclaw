@@ -6952,7 +6952,7 @@ fn build_tool_list(
 /// 3. Block sensitive filenames
 /// 4. Scan ALL file content for dangerous commands (not just scripts)
 /// Compress an image for LLM: resize to max 1024px and convert to JPEG.
-/// Uses ffmpeg/sips (no extra crate dependency).
+/// Uses the `image` crate (pure Rust, cross-platform — no ffmpeg/sips needed).
 /// Returns data URI or None if compression fails.
 fn compress_image_for_llm(data_uri: &str) -> Option<String> {
     let b64 = data_uri
@@ -6970,67 +6970,29 @@ fn compress_image_for_llm(data_uri: &str) -> Option<String> {
         return Some(data_uri.to_owned());
     }
 
-    let tmp_in = std::env::temp_dir().join(format!("rsclaw_img_in_{}.png", uuid::Uuid::new_v4()));
-    let tmp_out = std::env::temp_dir().join(format!("rsclaw_img_out_{}.jpg", uuid::Uuid::new_v4()));
-    std::fs::write(&tmp_in, &bytes).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?;
 
-    // Try ffmpeg first (cross-platform)
-    let ok = std::process::Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-i",
-            tmp_in.to_str()?,
-            "-vf",
-            "scale='min(1024,iw)':'min(1024,ih)':force_original_aspect_ratio=decrease",
-            "-q:v",
-            "5", // JPEG quality (~85%)
-            tmp_out.to_str()?,
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    // Fallback: macOS sips
-    #[cfg(target_os = "macos")]
-    let ok = if !ok {
-        let _ = std::fs::copy(&tmp_in, &tmp_out);
-        std::process::Command::new("sips")
-            .args([
-                "--resampleWidth",
-                "1024",
-                "--setProperty",
-                "formatOptions",
-                "85",
-                tmp_out.to_str()?,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+    // Resize so neither dimension exceeds 1024px, preserving aspect ratio.
+    const MAX_DIM: u32 = 1024;
+    let (w, h) = (img.width(), img.height());
+    let img = if w > MAX_DIM || h > MAX_DIM {
+        img.resize(MAX_DIM, MAX_DIM, image::imageops::FilterType::Lanczos3)
     } else {
-        ok
+        img
     };
 
-    let result = if ok && tmp_out.exists() {
-        let compressed = std::fs::read(&tmp_out).ok()?;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&compressed);
-        tracing::debug!(
-            original = bytes.len(),
-            compressed = compressed.len(),
-            "image compressed for LLM"
-        );
-        Some(format!("data:image/jpeg;base64,{b64}"))
-    } else {
-        // Compression failed, return original
-        Some(data_uri.to_owned())
-    };
+    // Encode to JPEG quality 85.
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::Jpeg).ok()?;
+    let compressed = buf.into_inner();
 
-    let _ = std::fs::remove_file(&tmp_in);
-    let _ = std::fs::remove_file(&tmp_out);
-    result
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&compressed);
+    tracing::debug!(
+        original = bytes.len(),
+        compressed = compressed.len(),
+        "image compressed for LLM"
+    );
+    Some(format!("data:image/jpeg;base64,{b64}"))
 }
 
 /// Maximum characters to send from file content to LLM.
