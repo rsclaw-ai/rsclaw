@@ -674,14 +674,44 @@ function ConfigEditorPage() {
   }, []);
 
   const buildRawFromFields = useCallback(() => {
-    let raw = rawConfig;
-    raw = applyFieldToRaw(raw, "port", port);
-    raw = applyFieldToRaw(raw, "bind", bind);
-    raw = applyFieldToRaw(raw, "language", language);
-    raw = applyFieldToRaw(raw, "processingTimeout", processingTimeout);
-    if (authToken) raw = applyFieldToRaw(raw, "authToken", authToken);
-    return raw;
-  }, [rawConfig, port, bind, language, processingTimeout, authToken, applyFieldToRaw]);
+    // Parse existing config, overlay structured fields, re-serialize.
+    let cfg: any = {};
+    try { cfg = JSON.parse(rawConfig); } catch { cfg = {}; }
+
+    // Gateway fields
+    if (!cfg.gateway) cfg.gateway = {};
+    cfg.gateway.port = port;
+    cfg.gateway.bind = bind;
+    cfg.gateway.language = language;
+    cfg.gateway.processingTimeout = processingTimeout;
+    if (authToken) {
+      if (!cfg.gateway.auth) cfg.gateway.auth = {};
+      cfg.gateway.auth.token = authToken;
+    }
+
+    // Providers
+    if (!cfg.models) cfg.models = {};
+    if (!cfg.models.providers) cfg.models.providers = {};
+    for (const prov of providers) {
+      const isCustomLike = prov.key === "custom" || prov.key === "codingplan";
+      if (!prov.enabled) {
+        // Remove disabled provider
+        delete cfg.models.providers[prov.key];
+        continue;
+      }
+      const entry: any = cfg.models.providers[prov.key] || {};
+      if (prov.apiKey) entry.apiKey = prov.apiKey;
+      else delete entry.apiKey;
+      if (prov.baseUrl) entry.baseUrl = prov.baseUrl;
+      else if (isCustomLike || prov.key === "ollama") delete entry.baseUrl;
+      if (isCustomLike && prov.apiType) entry.api = prov.apiType;
+      if (prov.userAgent) entry.userAgent = prov.userAgent;
+      else delete entry.userAgent;
+      cfg.models.providers[prov.key] = entry;
+    }
+
+    return JSON.stringify(cfg, null, 2);
+  }, [rawConfig, port, bind, language, processingTimeout, authToken, providers]);
 
   const handleSave = async () => {
     setSaving(true);
