@@ -45,6 +45,7 @@ label      = "Kimi"
 env_var    = "MOONSHOT_API_KEY"
 model      = "kimi/kimi-k2.5"
 base_url   = "https://api.moonshot.cn/v1"
+user_agent = "claude-code/0.1.0"
 needs_key  = true
 
 [[providers]]
@@ -125,6 +126,16 @@ label      = "Ollama (local)"
 env_var    = ""
 model      = "ollama/llama3.3"
 base_url   = "http://127.0.0.1:11434"
+needs_key  = false
+
+[[providers]]
+name       = "codingplan"
+label      = "CodingPlan (编码计划)"
+env_var    = ""
+model      = ""
+base_url   = ""
+api_type   = "openai"
+user_agent = "claude-code/0.1.0"
 needs_key  = false
 
 [[providers]]

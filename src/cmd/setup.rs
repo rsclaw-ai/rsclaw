@@ -135,6 +135,7 @@ pub const DEFAULT_CONFIG: &str = r#"// rsclaw configuration (JSON5)
 // ---------------------------------------------------------------------------
 
 /// Recursively copy a directory tree (files only, skips symlinks).
+#[allow(dead_code)]
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -204,28 +205,47 @@ fn select_language() -> Result<&'static str> {
 /// Detect LAN IP addresses (non-loopback, non-link-local IPv4).
 fn detect_lan_ips() -> Vec<String> {
     let mut ips = Vec::new();
-    if let Ok(output) = std::process::Command::new("ifconfig").output() {
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("inet ") {
-                let ip = rest.split_whitespace().next().unwrap_or("");
-                if !ip.starts_with("127.") && !ip.starts_with("169.254.") && !ip.is_empty() {
-                    ips.push(ip.to_owned());
+
+    if cfg!(windows) {
+        // Windows: parse ipconfig output
+        if let Ok(output) = std::process::Command::new("ipconfig").output() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                let trimmed = line.trim();
+                // Match "IPv4 Address. . . . . . . . . . . : 192.168.x.x"
+                if let Some(pos) = trimmed.find(": ") {
+                    let ip = trimmed[pos + 2..].trim();
+                    if ip.contains('.') && !ip.starts_with("127.") && !ip.starts_with("169.254.") {
+                        ips.push(ip.to_owned());
+                    }
                 }
             }
         }
-    }
-    // Fallback for Linux: ip addr
-    if ips.is_empty() {
-        if let Ok(output) = std::process::Command::new("ip").args(["addr", "show"]).output() {
+    } else {
+        // macOS: ifconfig
+        if let Ok(output) = std::process::Command::new("ifconfig").output() {
             let text = String::from_utf8_lossy(&output.stdout);
             for line in text.lines() {
                 let trimmed = line.trim();
                 if let Some(rest) = trimmed.strip_prefix("inet ") {
-                    let ip = rest.split('/').next().unwrap_or("");
+                    let ip = rest.split_whitespace().next().unwrap_or("");
                     if !ip.starts_with("127.") && !ip.starts_with("169.254.") && !ip.is_empty() {
                         ips.push(ip.to_owned());
+                    }
+                }
+            }
+        }
+        // Fallback for Linux: ip addr
+        if ips.is_empty() {
+            if let Ok(output) = std::process::Command::new("ip").args(["addr", "show"]).output() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if let Some(rest) = trimmed.strip_prefix("inet ") {
+                        let ip = rest.split('/').next().unwrap_or("");
+                        if !ip.starts_with("127.") && !ip.starts_with("169.254.") && !ip.is_empty() {
+                            ips.push(ip.to_owned());
+                        }
                     }
                 }
             }
@@ -291,6 +311,8 @@ struct ProviderDef {
     model: String,
     #[serde(default)]
     base_url: String,
+    #[serde(default)]
+    user_agent: String,
     #[serde(default)]
     needs_key: bool,
 }
@@ -767,9 +789,16 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                         StepResult::Back => { wiz_step = STEP_PROVIDER; }
                         StepResult::Cancel => { println!("  {}", crate::i18n::t("cli_setup_cancelled", lang)); return Ok(()); }
                     }
-                } else if provider.name == "custom" {
+                } else if provider.name == "custom" || provider.name == "codingplan" {
                     let default_url = if base_url.is_empty() { "https://api.example.com".to_string() } else { base_url.clone() };
                     match input_step("  API base URL", default_url) {
+                        StepResult::Next(val) => { base_url = val; wiz_step = STEP_API_KEY; }
+                        StepResult::Back => { wiz_step = STEP_PROVIDER; }
+                        StepResult::Cancel => { println!("  {}", crate::i18n::t("cli_setup_cancelled", lang)); return Ok(()); }
+                    }
+                } else if provider.name == "kimi" {
+                    let default_url = if base_url.is_empty() { provider.base_url.to_string() } else { base_url.clone() };
+                    match input_step("  Kimi API URL", default_url) {
                         StepResult::Next(val) => { base_url = val; wiz_step = STEP_API_KEY; }
                         StepResult::Back => { wiz_step = STEP_PROVIDER; }
                         StepResult::Cancel => { println!("  {}", crate::i18n::t("cli_setup_cancelled", lang)); return Ok(()); }
@@ -1010,6 +1039,10 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
             prov_obj.insert("apiKey".into(), serde_json::from_str(&api_key_entry).unwrap_or_else(|_| json!(api_key_entry)));
             if !effective_base_url.is_empty() {
                 prov_obj.insert("baseUrl".into(), json!(effective_base_url));
+            }
+            // Write user_agent for providers that need it
+            if !provider.user_agent.is_empty() {
+                prov_obj.insert("userAgent".into(), json!(provider.user_agent));
             }
         }
     }

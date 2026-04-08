@@ -123,7 +123,7 @@ impl AgentSpawner {
                     extra_tools,
                     images,
                     files,
-                    chat_id,
+                    chat_id: _,
                 } = msg;
                 let result = runtime
                     .run_turn(

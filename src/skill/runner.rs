@@ -241,6 +241,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn run_echo_tool() {
         // Skip test if `echo` is not available (unlikely but safe).
         if which::which("echo").is_err() {

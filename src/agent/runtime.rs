@@ -99,10 +99,12 @@ enum PendingStage {
     /// File processed, waiting for token confirmation.
     TokenConfirm {
         extracted_text: String,
+        #[allow(dead_code)]
         estimated_tokens: usize,
     },
 }
 
+#[allow(dead_code)]
 struct PendingFile {
     filename: String,
     path: std::path::PathBuf,
@@ -387,7 +389,7 @@ impl AgentRuntime {
             let notif_tx_clone = notif_tx_bg.clone();
             let target_id_clone = target_id_bg.clone();
             let channel_clone = channel_bg.clone();
-            let event_collector = tokio::spawn(async move {
+            let _event_collector = tokio::spawn(async move {
                 let mut pending = String::new();
                 let mut interval = 0u64;
                 loop {
@@ -706,7 +708,7 @@ impl AgentRuntime {
             let notif_tx_clone = notif_tx_bg.clone();
             let target_id_clone = target_id_bg.clone();
             let channel_clone = channel_bg.clone();
-            let event_collector = tokio::spawn(async move {
+            let _event_collector = tokio::spawn(async move {
                 let mut pending = String::new();
                 let mut interval = 0u64;
                 loop {
@@ -996,7 +998,7 @@ impl AgentRuntime {
             status.text_preview.clear();
         }
 
-        let agent_cfg = &self.handle.config;
+        let _agent_cfg = &self.handle.config;
 
         // Resolve language for user-facing channel messages.
         let i18n_lang = self
@@ -1696,7 +1698,6 @@ impl AgentRuntime {
                     pending_analysis: None,
                 });
             }
-            _ => {}
         }
 
         let agent_cfg = &self.handle.config;
@@ -2588,6 +2589,7 @@ impl AgentRuntime {
             let providers = Arc::clone(&self.providers);
             let mut stream = self.failover.call(req, &providers).await?;
             let mut text_buf = String::new();
+            let mut reasoning_buf = String::new();
             let mut tool_calls: Vec<(String, String, Value)> = Vec::new();
             // Track loop detection warnings per tool call id (to inject into result)
             let mut loop_warnings: std::collections::HashMap<String, String> =
@@ -2631,7 +2633,12 @@ impl AgentRuntime {
                             last_delta_flush = now;
                         }
                     }
-                    StreamEvent::ReasoningDelta(_) => {}
+                    StreamEvent::ReasoningDelta(delta) => {
+                        reasoning_buf.push_str(&delta);
+                        if reasoning_buf.len() <= 50 {
+                            tracing::debug!(reasoning_len = reasoning_buf.len(), "agent_loop: got reasoning delta");
+                        }
+                    }
                     StreamEvent::ToolCall { id, name, input } => {
                         if !id.is_empty() && !name.is_empty() {
                             // New tool call with both id and name — start fresh entry.
@@ -2720,6 +2727,15 @@ impl AgentRuntime {
             // empty post-strip result as a silent no-op rather than an error.
             let pre_strip_len = text_buf.trim().len();
             text_buf = crate::provider::openai::strip_think_tags_pub(&text_buf);
+
+            // Reasoning models (e.g. kimi-for-coding) may return only reasoning_content
+            // with empty content. Use reasoning as the reply text to avoid saving an
+            // empty assistant message (which some APIs reject on the next turn).
+            tracing::info!(text_len = text_buf.len(), reasoning_len = reasoning_buf.len(), "agent_loop: post-stream buffers");
+            if text_buf.trim().is_empty() && !reasoning_buf.trim().is_empty() {
+                tracing::info!(reasoning_len = reasoning_buf.len(), "agent_loop: using reasoning as reply text");
+                text_buf = reasoning_buf.clone();
+            }
 
             // Finalize streaming tool calls: parse accumulated argument strings.
             for (_id, _name, input) in &mut tool_calls {
@@ -4846,12 +4862,11 @@ $bitmap.Dispose()
             .map(|s| s.to_owned());
 
         // Resolve provider — from image model config or current chat model
-        let resolve_model = user_image_model
-            .clone()
-            .unwrap_or_else(|| self.resolve_model_name());
-        let (prov_name, user_model_id) =
-            { crate::provider::registry::ProviderRegistry::parse_model(&resolve_model) };
-        let (base_url, auth_style) = crate::provider::defaults::resolve_base_url(prov_name);
+        let resolve_model = user_image_model.clone().unwrap_or_else(|| self.resolve_model_name());
+        let (prov_name, user_model_id) = {
+            crate::provider::registry::ProviderRegistry::parse_model(&resolve_model)
+        };
+        let (base_url, _auth_style) = crate::provider::defaults::resolve_base_url(prov_name);
 
         let default_size = match prov_name {
             _ => "2048x2048",
@@ -4876,7 +4891,7 @@ $bitmap.Dispose()
             .and_then(|p| p.base_url.clone());
 
         // Providers with image generation support
-        let image_providers = ["doubao", "bytedance", "openai", "qwen", "minimax"];
+        let image_providers = ["doubao", "bytedance", "openai", "qwen", "minimax", "gemini"];
         let (img_url, img_key, img_prov) = if image_providers.contains(&prov_name) {
             let url = cfg_url.unwrap_or(base_url);
             let key = cfg_key
@@ -4885,12 +4900,7 @@ $bitmap.Dispose()
             (url, key, prov_name)
         } else {
             // Current provider doesn't support images — try doubao, qwen, openai
-            let fallback = [
-                ("doubao", "ARK_API_KEY"),
-                ("qwen", "DASHSCOPE_API_KEY"),
-                ("minimax", "MINIMAX_API_KEY"),
-                ("openai", "OPENAI_API_KEY"),
-            ];
+            let fallback = [("doubao", "ARK_API_KEY"), ("qwen", "DASHSCOPE_API_KEY"), ("minimax", "MINIMAX_API_KEY"), ("gemini", "GEMINI_API_KEY"), ("openai", "OPENAI_API_KEY")];
             let mut found = None;
             for (fb_prov, fb_env) in fallback {
                 let fb_cfg = self
@@ -4915,20 +4925,20 @@ $bitmap.Dispose()
         };
         let Some(api_key) = img_key else {
             return Ok(json!({
-                "error": "AI image generation requires doubao, qwen, or openai provider with API key. No image-capable provider configured."
+                "error": "AI image generation requires doubao, qwen, minimax, gemini, or openai provider with API key. No image-capable provider configured."
             }));
         };
 
-        let image_model = args["model"]
-            .as_str()
-            .or_else(|| {
-                if !user_model_id.is_empty() {
-                    Some(user_model_id)
-                } else {
-                    None
-                }
-            })
+let image_model = args["model"].as_str()
+            .or_else(|| if !user_model_id.is_empty() { Some(user_model_id) } else { None })
             .unwrap_or_else(|| match img_prov {
+                "doubao" | "bytedance" => "doubao-seedream-5-0-260128",
+                "openai" => "dall-e-3",
+                "qwen" => "qwen-image-2.0-pro",
+                "minimax" => "image-01",
+                "gemini" => "gemini-3-pro-image-preview",
+                _ => "dall-e-3",
+            });
                 "doubao" | "bytedance" => "doubao-seedream-5-0-260128",
                 "openai" => "dall-e-3",
                 "qwen" => "qwen-image-2.0-pro",
@@ -4936,14 +4946,24 @@ $bitmap.Dispose()
                 _ => "dall-e-3",
             });
 
+        // Resolve User-Agent: provider config → gateway config → default
+        let img_ua = self.config.model.models.as_ref()
+            .and_then(|m| m.providers.get(img_prov))
+            .and_then(|p| p.user_agent.as_deref())
+            .or_else(|| self.config.gateway.user_agent.as_deref())
+            .unwrap_or(crate::provider::DEFAULT_USER_AGENT);
         let client = reqwest::Client::builder()
+            .user_agent(img_ua)
             .timeout(std::time::Duration::from_secs(120))
             .build()
             .unwrap_or_default();
 
-        // Qwen uses a different API format
+        tracing::info!(provider = img_prov, model = image_model, size = size, ua = img_ua, "tool_image: generating");
+
+        // Provider-specific API formats
         let is_qwen = img_prov == "qwen";
         let is_minimax = img_prov == "minimax";
+        let is_gemini = img_prov == "gemini";
         let (resp_status, resp_body) = if is_qwen {
             let qwen_size = size.replace('x', "*");
             let resp = client
@@ -5009,6 +5029,32 @@ $bitmap.Dispose()
                 .await
                 .map_err(|e| anyhow!("image: parse error: {e}"))?;
             (st, body)
+        } else if is_gemini {
+            // Gemini: generateContent with responseModalities: ["IMAGE"]
+            // Map size to aspect ratio for Gemini
+            let aspect = if size.contains('x') {
+                let parts: Vec<&str> = size.split('x').collect();
+                if parts.len() == 2 {
+                    let w = parts[0].parse::<u32>().unwrap_or(2048);
+                    let h = parts[1].parse::<u32>().unwrap_or(2048);
+                    if w == h { "1:1" } else if w > h { "16:9" } else { "9:16" }
+                } else { "1:1" }
+            } else { "1:1" };
+            let gemini_base = img_url.trim_end_matches('/');
+            let url = format!("{gemini_base}/models/{image_model}:generateContent?key={api_key}");
+            let resp = client.post(&url)
+                .json(&json!({
+                    "contents": [{ "parts": [{ "text": prompt }] }],
+                    "generationConfig": {
+                        "responseModalities": ["TEXT", "IMAGE"],
+                        "imageConfig": { "aspectRatio": aspect }
+                    }
+                }))
+                .send().await
+                .map_err(|e| anyhow!("image: gemini request failed: {e}"))?;
+            let st = resp.status();
+            let body: Value = resp.json().await.map_err(|e| anyhow!("image: gemini parse error: {e}"))?;
+            (st, body)
         } else {
             let url = format!("{}/images/generations", img_url.trim_end_matches('/'));
             let resp = client.post(&url)
@@ -5033,20 +5079,38 @@ $bitmap.Dispose()
         }
 
         // Extract image URL/base64 — different response formats per provider
+        // Gemini returns inline base64 directly, others return URLs
+        if is_gemini {
+            // Gemini: candidates[0].content.parts[] — find the inlineData part
+            #[allow(unused_imports)]
+            use base64::Engine;
+            let parts = resp_body.pointer("/candidates/0/content/parts")
+                .and_then(|v| v.as_array());
+            if let Some(parts) = parts {
+                for part in parts {
+                    if let Some(inline) = part.get("inlineData") {
+                        let mime = inline.get("mimeType").and_then(|v| v.as_str()).unwrap_or("image/png");
+                        if let Some(b64_data) = inline.get("data").and_then(|v| v.as_str()) {
+                            let data_uri = format!("data:{mime};base64,{b64_data}");
+                            return Ok(json!({
+                                "url": data_uri,
+                                "revised_prompt": prompt
+                            }));
+                        }
+                    }
+                }
+            }
+            return Err(anyhow!("image: no image data in Gemini response"));
+        }
+
         let img_url_str = if is_qwen {
             resp_body
                 .pointer("/output/choices/0/message/content/0/image")
                 .and_then(|v| v.as_str())
         } else if is_minimax {
             // minimax: data.image_base64[0] (base64) or data.image_urls[0] (url)
-            resp_body
-                .pointer("/data/image_urls/0")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    resp_body
-                        .pointer("/data/image_base64/0")
-                        .and_then(|v| v.as_str())
-                })
+            resp_body.pointer("/data/image_urls/0").and_then(|v| v.as_str())
+                .or_else(|| resp_body.pointer("/data/image_base64/0").and_then(|v| v.as_str()))
         } else {
             resp_body.pointer("/data/0/url").and_then(|v| v.as_str())
         };
@@ -6277,19 +6341,9 @@ fn detect_chrome() -> Option<String> {
         }
     }
 
-    let which_cmd = if cfg!(target_os = "windows") {
-        "where"
-    } else {
-        "which"
-    };
     for name in &["google-chrome", "chromium", "chromium-browser", "chrome"] {
-        if let Ok(output) = std::process::Command::new(which_cmd).arg(name).output() {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                if !path.is_empty() {
-                    return Some(path);
-                }
-            }
+        if let Ok(path) = which::which(name) {
+            return Some(path.to_string_lossy().to_string());
         }
     }
     None
@@ -6855,12 +6909,12 @@ fn build_tool_list(
 
     tools.push(ToolDef {
         name: "image".to_owned(),
-        description: "Generate an image from a text description using an AI image model.".to_owned(),
+        description: "Generate an image from a text description using an AI image model. Pass the user's original description as-is (preserve their language, do not translate).".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "prompt": {"type": "string", "description": "Text description of the image to generate"},
-                "size":   {"type": "string", "description": "Image size (default: 1024x1024)", "default": "1024x1024"}
+                "prompt": {"type": "string", "description": "Image description. IMPORTANT: use the user's original language and wording, do not translate to English."},
+                "size":   {"type": "string", "description": "Image size, e.g. 2048x2048", "default": "2048x2048"}
             },
             "required": ["prompt"]
         }),

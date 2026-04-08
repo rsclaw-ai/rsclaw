@@ -3251,6 +3251,7 @@ function TauriConfigPageInner() {
   const [provErr, setProvErr] = useState<Record<string, string>>({});
   const [provModels, setProvModels] = useState<Record<string, { id: string; tag: string }[]>>({});
   const [provSelModel, setProvSelModel] = useState<Record<string, string>>({});
+  const [imgDropOpen, setImgDropOpen] = useState(false);
 
   // Channel state: open cards, login tab per channel, open accounts, account tab
   const [openChs, setOpenChs] = useState<Set<string>>(new Set());
@@ -3811,13 +3812,6 @@ function TauriConfigPageInner() {
             </div>
             <div style={fieldRow}>
               <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u6587\u751F\u56FE\u6A21\u578B" : "Image Model"} <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u7A7A=\u81EA\u52A8)" : "(empty=auto)"}</span></div>
-                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.image</div>
-              </div>
-              <input style={{ ...fInput, minWidth: 300 }} placeholder={zh ? "\u5982: doubao/doubao-seedream-5-0-260128" : "e.g. doubao/doubao-seedream-5-0-260128"} value={getVal("agents.defaults.model.image", "")} onChange={(e) => updateConfig("agents.defaults.model.image", e.target.value)} />
-            </div>
-            <div style={fieldRow}>
-              <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5907\u7528\u6A21\u578B" : "Fallback Models"} <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u9017\u53F7\u5206\u9694)" : "(comma separated)"}</span></div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.fallbacks</div>
               </div>
@@ -3826,6 +3820,51 @@ function TauriConfigPageInner() {
                 const arr = val.split(",").map((s: string) => s.trim()).filter(Boolean);
                 updateConfig("agents.defaults.model.fallbacks", arr.length > 0 ? arr : undefined);
               }} />
+            </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u751F\u56FE\u6A21\u578B" : "Image Model"} <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u7A7A=\u81EA\u52A8)" : "(empty=auto)"}</span></div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.image</div>
+              </div>
+              <div style={{ position: "relative", minWidth: 300 }}>
+                <input
+                  id="img-model-input"
+                  style={{ ...fInput, width: "100%" }}
+                  placeholder={zh ? "\u70B9\u51FB\u9009\u62E9\u6216\u8F93\u5165\u6A21\u578B" : "Select or type a model"}
+                  value={getVal("agents.defaults.model.image", "")}
+                  onFocus={() => setImgDropOpen(true)}
+                  onBlur={() => setTimeout(() => setImgDropOpen(false), 180)}
+                  onChange={(e) => updateConfig("agents.defaults.model.image", e.target.value)}
+                />
+                {imgDropOpen && (() => {
+                  const IMAGE_MODELS: { label: string; value: string }[] = [
+                    { label: "minimax/image-01", value: "minimax/image-01" },
+                    { label: "qwen/qwen-image-2.0-pro", value: "qwen/qwen-image-2.0-pro" },
+                    { label: "qwen/wan2.6-t2i", value: "qwen/wan2.6-t2i" },
+                    { label: "doubao/doubao-seedream-5-0-260128", value: "doubao/doubao-seedream-5-0-260128" },
+                    { label: "gemini/nano-banana-pro", value: "gemini/gemini-3-pro-image-preview" },
+                    { label: "gemini/nano-banana-2", value: "gemini/gemini-3.1-flash-image-preview" },
+                  ];
+                  const curVal = getVal("agents.defaults.model.image", "");
+                  const el = document.getElementById("img-model-input");
+                  const rect = el?.getBoundingClientRect();
+                  return rect ? (
+                    <div style={{ position: "fixed", top: rect.bottom + 4, left: rect.left, width: rect.width, background: V.bg3, border: `1px solid ${V.bd2}`, borderRadius: 8, overflow: "hidden", zIndex: 9999, boxShadow: "0 8px 24px rgba(0,0,0,.5)" }}>
+                      {IMAGE_MODELS.map((m) => (
+                        <div
+                          key={m.value}
+                          onMouseDown={(e) => { e.preventDefault(); updateConfig("agents.defaults.model.image", m.value); setImgDropOpen(false); }}
+                          style={{ padding: "8px 12px", fontSize: 12, fontFamily: V.mono, color: curVal === m.value ? V.or : V.t1, cursor: "pointer", borderBottom: `1px solid ${V.bd}`, background: curVal === m.value ? V.olo : "transparent" }}
+                          onMouseEnter={(e) => (e.currentTarget.style.background = curVal === m.value ? V.olo : V.bg4)}
+                          onMouseLeave={(e) => (e.currentTarget.style.background = curVal === m.value ? V.olo : "transparent")}
+                        >
+                          {m.label}{m.label !== m.value && <span style={{ color: V.t3, fontSize: 10, marginLeft: 6 }}>→ {m.value}</span>}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null;
+                })()}
+              </div>
             </div>
             <div style={{ ...fieldRow, borderBottom: "none" }}>
               <div style={{ flex: 1 }}>
@@ -3882,8 +3921,49 @@ function TauriConfigPageInner() {
                   <div style={{ maxHeight: isOpen ? 600 : 0, overflow: "hidden", transition: "max-height .28s ease" }}>
                     <div style={{ padding: "0 16px 16px", borderTop: `1px solid ${V.bd}` }}>
                       <div style={{ paddingTop: 14 }}>
-                        {/* Ollama: single Base URL field */}
-                        {p.id === "ollama" ? (
+                        {/* Kimi: API Key + Base URL + User-Agent */}
+                        {p.id === "kimi" ? (
+                          <div style={{ marginBottom: 8 }}>
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>API Key</div>
+                            <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                              <input
+                                style={{ flex: 1, background: V.bg4, border: `1px solid ${testSt === "ok" ? V.green : testSt === "err" ? V.red : V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", transition: "border-color .12s" }}
+                                type="password"
+                                placeholder="sk-..."
+                                value={apiKey}
+                                onChange={(e) => {
+                                  updateConfig(`models.providers.${p.id}.apiKey`, e.target.value);
+                                  setProvTest((prev) => ({ ...prev, [p.id]: "idle" }));
+                                }}
+                              />
+                              <button onClick={() => handleTestProvider(p.id)} disabled={testSt === "testing"}
+                                style={{ padding: "8px 14px", borderRadius: 7, border: `1px solid ${testSt === "ok" ? V.gbrd : testSt === "err" ? V.rbrd : testSt === "testing" ? V.obrd : V.bd2}`, background: testSt === "ok" ? V.glo : V.bg4, color: testSt === "ok" ? V.green : testSt === "err" ? V.red : testSt === "testing" ? V.or : V.t1, fontSize: 11, fontWeight: 500, cursor: testSt === "testing" ? "not-allowed" : "pointer", whiteSpace: "nowrap", flexShrink: 0, display: "flex", alignItems: "center", gap: 5, transition: "all .13s" }}>
+                                {testSt === "testing" ? <><Spinner />{zh ? "获取中" : "Fetching"}</> : testSt === "ok" ? (zh ? "✓ 刷新模型" : "✓ Refresh") : testSt === "err" ? (zh ? "重新获取" : "Retry") : (zh ? "获取模型" : "Get Models")}
+                              </button>
+                            </div>
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>API URL</div>
+                            <input
+                              style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", marginBottom: 8 }}
+                              type="text"
+                              placeholder="https://api.moonshot.cn/v1"
+                              value={baseUrl}
+                              onChange={(e) => {
+                                updateConfig(`models.providers.${p.id}.baseUrl`, e.target.value);
+                                setProvTest((prev) => ({ ...prev, [p.id]: "idle" }));
+                              }}
+                            />
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>User-Agent</div>
+                            <input
+                              style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none" }}
+                              type="text"
+                              placeholder="claude-code/0.1.0"
+                              value={getVal(`models.providers.${p.id}.userAgent`, "")}
+                              onChange={(e) => {
+                                updateConfig(`models.providers.${p.id}.userAgent`, e.target.value);
+                              }}
+                            />
+                          </div>
+                        ) : p.id === "ollama" ? (
                           <div style={{ marginBottom: 8 }}>
                             <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>Base URL</div>
                             <div style={{ display: "flex", gap: 8 }}>
