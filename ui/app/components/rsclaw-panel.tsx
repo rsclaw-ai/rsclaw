@@ -3943,6 +3943,71 @@ function TauriConfigPageInner() {
                                 {testSt === "testing" ? <><Spinner />{zh ? "\u83B7\u53D6\u4E2D" : "Fetching"}</> : testSt === "ok" ? (zh ? "\u2713 \u5237\u65B0\u6A21\u578B" : "\u2713 Refresh") : testSt === "err" ? (zh ? "\u91CD\u65B0\u83B7\u53D6" : "Retry") : (zh ? "\u83B7\u53D6\u6A21\u578B" : "Get Models")}
                               </button>
                             </div>
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6, marginTop: 8 }}>User-Agent <span style={{ color: V.t3 }}>{zh ? "(可选)" : "(optional)"}</span></div>
+                            <input
+                              style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none" }}
+                              type="text"
+                              placeholder="e.g. claude-code/0.1.0"
+                              value={getVal(`models.providers.${p.id}.userAgent`, "")}
+                              onChange={(e) => {
+                                updateConfig(`models.providers.${p.id}.userAgent`, e.target.value);
+                              }}
+                            />
+                          </div>
+                        ) : p.id === "codingplan" ? (
+                          /* CodingPlan: same as Custom — API Type + Base URL + API Key + User-Agent */
+                          <div style={{ marginBottom: 8 }}>
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>API Type</div>
+                            <select
+                              style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", cursor: "pointer", marginBottom: 8 }}
+                              value={getVal(`models.providers.${p.id}.api`, "openai")}
+                              onChange={(e) => {
+                                updateConfig(`models.providers.${p.id}.api`, e.target.value);
+                                setProvTest((prev) => ({ ...prev, [p.id]: "idle" }));
+                              }}
+                            >
+                              {(Object.keys(API_TYPE_LABELS) as ApiType[]).map((at) => (
+                                <option key={at} value={at}>{API_TYPE_LABELS[at]}</option>
+                              ))}
+                            </select>
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>API URL</div>
+                            <input
+                              style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", marginBottom: 8 }}
+                              type="text"
+                              placeholder="https://your-api-server.com"
+                              value={baseUrl}
+                              onChange={(e) => {
+                                updateConfig(`models.providers.${p.id}.baseUrl`, e.target.value);
+                                setProvTest((prev) => ({ ...prev, [p.id]: "idle" }));
+                              }}
+                            />
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>API Key <span style={{ color: V.t3 }}>{zh ? "(可选)" : "(optional)"}</span></div>
+                            <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                              <input
+                                style={{ flex: 1, background: V.bg4, border: `1px solid ${testSt === "ok" ? V.green : testSt === "err" ? V.red : V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", transition: "border-color .12s" }}
+                                type="password"
+                                placeholder="sk-..."
+                                value={apiKey}
+                                onChange={(e) => {
+                                  updateConfig(`models.providers.${p.id}.apiKey`, e.target.value);
+                                  setProvTest((prev) => ({ ...prev, [p.id]: "idle" }));
+                                }}
+                              />
+                              <button onClick={() => handleTestProvider(p.id)} disabled={testSt === "testing"}
+                                style={{ padding: "8px 14px", borderRadius: 7, border: `1px solid ${testSt === "ok" ? V.gbrd : testSt === "err" ? V.rbrd : testSt === "testing" ? V.obrd : V.bd2}`, background: testSt === "ok" ? V.glo : V.bg4, color: testSt === "ok" ? V.green : testSt === "err" ? V.red : testSt === "testing" ? V.or : V.t1, fontSize: 11, fontWeight: 500, cursor: testSt === "testing" ? "not-allowed" : "pointer", whiteSpace: "nowrap", flexShrink: 0, display: "flex", alignItems: "center", gap: 5, transition: "all .13s" }}>
+                                {testSt === "testing" ? <><Spinner />{zh ? "获取中" : "Fetching"}</> : testSt === "ok" ? (zh ? "✓ 刷新模型" : "✓ Refresh") : testSt === "err" ? (zh ? "重新获取" : "Retry") : (zh ? "获取模型" : "Get Models")}
+                              </button>
+                            </div>
+                            <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>User-Agent <span style={{ color: V.t3 }}>{zh ? "(可选)" : "(optional)"}</span></div>
+                            <input
+                              style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none" }}
+                              type="text"
+                              placeholder="e.g. claude-code/0.1.0"
+                              value={getVal(`models.providers.${p.id}.userAgent`, "")}
+                              onChange={(e) => {
+                                updateConfig(`models.providers.${p.id}.userAgent`, e.target.value);
+                              }}
+                            />
                           </div>
                         ) : (
                           /* Standard providers: API Key + optional Base URL */
