@@ -326,18 +326,15 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let channel_manager = Arc::new(channel_manager);
 
     // Start cron runner (if configured).
-    // Default: enabled when jobs are present, unless explicitly disabled.
     if let Some(ref cron_cfg) = config.ops.cron
         && cron_cfg.enabled.unwrap_or(true)
     {
-        let jobs = config
-            .ops
-            .cron
-            .as_ref()
-            .and_then(|c| c.jobs.as_ref())
-            .map(|jobs| jobs.iter().map(CronJob::from).collect::<Vec<_>>())
+        let cron_base_dir = crate::config::loader::base_dir().join("cron");
+        let jobs = crate::cron::read_jobs_from_file(cron_base_dir)
+            .await
             .unwrap_or_default();
 
+        debug!(jobs_len = jobs.len(), "cron jobs prepared");
         if !jobs.is_empty() {
             let runner = CronRunner::new(
                 cron_cfg,

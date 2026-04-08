@@ -147,7 +147,7 @@ fn model_supports_vision(model: &str, config: &RuntimeConfig) -> bool {
         || lower.contains("deepseek-vl")
         || lower.contains("qwen3")
         || lower.contains("doubao")
-        || lower.contains("seed")      // doubao-seed models
+        || lower.contains("seed") // doubao-seed models
     // Known NON-vision models (deepseek-chat, deepseek-r1, qwen-turbo,
     // moonshot, minimax, etc.) return false by default.
 }
@@ -1720,7 +1720,8 @@ impl AgentRuntime {
         // This is unified here so all channels benefit without changes.
         // ---------------------------------------------------------------
         let cur_model = self.resolve_model_name();
-        let is_doubao = cur_model.to_lowercase().contains("doubao") || cur_model.to_lowercase().contains("seed");
+        let is_doubao = cur_model.to_lowercase().contains("doubao")
+            || cur_model.to_lowercase().contains("seed");
         let mut files = files;
         let mut images = images;
         let mut text_override: Option<String> = None;
@@ -1733,16 +1734,26 @@ impl AgentRuntime {
                     // (MAX_UPLOAD_SIZE) bounds the worst case to ~233 MB peak.
                     use base64::Engine;
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&f.data);
-                    let mime = if f.mime_type.is_empty() { "video/mp4" } else { &f.mime_type };
+                    let mime = if f.mime_type.is_empty() {
+                        "video/mp4"
+                    } else {
+                        &f.mime_type
+                    };
                     let data_uri = format!("data:{mime};base64,{b64}");
                     images.push(super::registry::ImageAttachment {
                         data: data_uri,
                         mime_type: mime.to_owned(),
                     });
                     if text.is_empty() && text_override.is_none() {
-                        text_override = Some(crate::i18n::t("describe_video", crate::i18n::default_lang()));
+                        text_override = Some(crate::i18n::t(
+                            "describe_video",
+                            crate::i18n::default_lang(),
+                        ));
                     }
-                    info!(size = f.data.len(), "video FileAttachment → ImageAttachment for vision");
+                    info!(
+                        size = f.data.len(),
+                        "video FileAttachment → ImageAttachment for vision"
+                    );
                 } else {
                     remaining.push(f);
                 }
@@ -2953,14 +2964,21 @@ impl AgentRuntime {
                         ctx.loop_detector.record_result(&v);
                         // Extract images from tool result to avoid passing large
                         // base64 back to LLM. Check "image" (screenshot) and "url" (image gen).
-                        let img_data = v.get("image").and_then(|i| i.as_str())
-                            .or_else(|| v.get("url").and_then(|u| u.as_str()).filter(|u| u.starts_with("data:image/")));
+                        let img_data = v.get("image").and_then(|i| i.as_str()).or_else(|| {
+                            v.get("url")
+                                .and_then(|u| u.as_str())
+                                .filter(|u| u.starts_with("data:image/"))
+                        });
                         if let Some(img) = img_data {
-                            let desc = v.get("revised_prompt").and_then(|p| p.as_str())
+                            let desc = v
+                                .get("revised_prompt")
+                                .and_then(|p| p.as_str())
                                 .or_else(|| v.get("action").and_then(|a| a.as_str()))
                                 .unwrap_or("image generated");
                             (
-                                format!("{{\"status\":\"image sent to user\",\"description\":\"{desc}\"}}"),
+                                format!(
+                                    "{{\"status\":\"image sent to user\",\"description\":\"{desc}\"}}"
+                                ),
                                 vec![img.to_owned()],
                             )
                         } else if v.is_string() {
@@ -4811,16 +4829,28 @@ $bitmap.Dispose()
             .ok_or_else(|| anyhow!("image: `prompt` required"))?;
 
         // Check user-configured image model: agents.defaults.model.image
-        let user_image_model = self.handle.config.model.as_ref()
+        let user_image_model = self
+            .handle
+            .config
+            .model
+            .as_ref()
             .and_then(|m| m.image.as_deref())
-            .or_else(|| self.config.agents.defaults.model.as_ref().and_then(|m| m.image.as_deref()))
+            .or_else(|| {
+                self.config
+                    .agents
+                    .defaults
+                    .model
+                    .as_ref()
+                    .and_then(|m| m.image.as_deref())
+            })
             .map(|s| s.to_owned());
 
         // Resolve provider — from image model config or current chat model
-        let resolve_model = user_image_model.clone().unwrap_or_else(|| self.resolve_model_name());
-        let (prov_name, user_model_id) = {
-            crate::provider::registry::ProviderRegistry::parse_model(&resolve_model)
-        };
+        let resolve_model = user_image_model
+            .clone()
+            .unwrap_or_else(|| self.resolve_model_name());
+        let (prov_name, user_model_id) =
+            { crate::provider::registry::ProviderRegistry::parse_model(&resolve_model) };
         let (base_url, auth_style) = crate::provider::defaults::resolve_base_url(prov_name);
 
         let default_size = match prov_name {
@@ -4830,11 +4860,19 @@ $bitmap.Dispose()
         let size = args["size"].as_str().unwrap_or(default_size);
 
         // Also check provider config for api_key and base_url overrides
-        let cfg_key = self.config.model.models.as_ref()
+        let cfg_key = self
+            .config
+            .model
+            .models
+            .as_ref()
             .and_then(|m| m.providers.get(prov_name))
             .and_then(|p| p.api_key.as_ref())
             .and_then(|k| k.as_plain().map(str::to_owned));
-        let cfg_url = self.config.model.models.as_ref()
+        let cfg_url = self
+            .config
+            .model
+            .models
+            .as_ref()
             .and_then(|m| m.providers.get(prov_name))
             .and_then(|p| p.base_url.clone());
 
@@ -4848,15 +4886,27 @@ $bitmap.Dispose()
             (url, key, prov_name)
         } else {
             // Current provider doesn't support images — try doubao, qwen, openai
-            let fallback = [("doubao", "ARK_API_KEY"), ("qwen", "DASHSCOPE_API_KEY"), ("minimax", "MINIMAX_API_KEY"), ("openai", "OPENAI_API_KEY")];
+            let fallback = [
+                ("doubao", "ARK_API_KEY"),
+                ("qwen", "DASHSCOPE_API_KEY"),
+                ("minimax", "MINIMAX_API_KEY"),
+                ("openai", "OPENAI_API_KEY"),
+            ];
             let mut found = None;
             for (fb_prov, fb_env) in fallback {
-                let fb_cfg = self.config.model.models.as_ref()
+                let fb_cfg = self
+                    .config
+                    .model
+                    .models
+                    .as_ref()
                     .and_then(|m| m.providers.get(fb_prov));
-                let fb_key = fb_cfg.and_then(|p| p.api_key.as_ref()).and_then(|k| k.as_plain().map(str::to_owned))
+                let fb_key = fb_cfg
+                    .and_then(|p| p.api_key.as_ref())
+                    .and_then(|k| k.as_plain().map(str::to_owned))
                     .or_else(|| std::env::var(fb_env).ok());
                 if let Some(key) = fb_key {
-                    let fb_url = fb_cfg.and_then(|p| p.base_url.clone())
+                    let fb_url = fb_cfg
+                        .and_then(|p| p.base_url.clone())
                         .unwrap_or_else(|| crate::provider::defaults::resolve_base_url(fb_prov).0);
                     found = Some((fb_url, Some(key), fb_prov));
                     break;
@@ -4870,21 +4920,27 @@ $bitmap.Dispose()
             }));
         };
 
-        let image_model = args["model"].as_str()
-            .or_else(|| if !user_model_id.is_empty() { Some(user_model_id) } else { None })
-            .unwrap_or_else(|| {
-                match img_prov {
-                    "doubao" | "bytedance" => "doubao-seedream-5-0-260128",
-                    "openai" => "dall-e-3",
-                    "qwen" => "qwen-image-2.0-pro",
-                    "minimax" => "image-01",
-                    _ => "dall-e-3",
+        let image_model = args["model"]
+            .as_str()
+            .or_else(|| {
+                if !user_model_id.is_empty() {
+                    Some(user_model_id)
+                } else {
+                    None
                 }
+            })
+            .unwrap_or_else(|| match img_prov {
+                "doubao" | "bytedance" => "doubao-seedream-5-0-260128",
+                "openai" => "dall-e-3",
+                "qwen" => "qwen-image-2.0-pro",
+                "minimax" => "image-01",
+                _ => "dall-e-3",
             });
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
-            .build().unwrap_or_default();
+            .build()
+            .unwrap_or_default();
 
         // Qwen uses a different API format
         let is_qwen = img_prov == "qwen";
@@ -4902,7 +4958,10 @@ $bitmap.Dispose()
                 .send().await
                 .map_err(|e| anyhow!("image: request failed: {e}"))?;
             let st = resp.status();
-            let body: Value = resp.json().await.map_err(|e| anyhow!("image: parse error: {e}"))?;
+            let body: Value = resp
+                .json()
+                .await
+                .map_err(|e| anyhow!("image: parse error: {e}"))?;
             (st, body)
         } else if is_minimax {
             // Minimax: /v1/image_generation, aspect_ratio instead of size
@@ -4914,21 +4973,31 @@ $bitmap.Dispose()
                     let h = parts[1].parse::<f32>().unwrap_or(1024.0);
                     let ratio = w / h.max(1.0);
                     let candidates = [
-                        (1.0_f32,        "1:1"),
-                        (16.0 / 9.0,     "16:9"),
-                        (9.0 / 16.0,     "9:16"),
-                        (4.0 / 3.0,      "4:3"),
-                        (3.0 / 4.0,      "3:4"),
-                        (3.0 / 2.0,      "3:2"),
-                        (2.0 / 3.0,      "2:3"),
+                        (1.0_f32, "1:1"),
+                        (16.0 / 9.0, "16:9"),
+                        (9.0 / 16.0, "9:16"),
+                        (4.0 / 3.0, "4:3"),
+                        (3.0 / 4.0, "3:4"),
+                        (3.0 / 2.0, "3:2"),
+                        (2.0 / 3.0, "2:3"),
                     ];
-                    candidates.iter()
-                        .min_by(|a, b| (a.0 - ratio).abs().partial_cmp(&(b.0 - ratio).abs()).unwrap())
+                    candidates
+                        .iter()
+                        .min_by(|a, b| {
+                            (a.0 - ratio)
+                                .abs()
+                                .partial_cmp(&(b.0 - ratio).abs())
+                                .unwrap()
+                        })
                         .map(|c| c.1)
                         .unwrap_or("1:1")
                         .to_owned()
-                } else { "1:1".to_owned() }
-            } else { "1:1".to_owned() };
+                } else {
+                    "1:1".to_owned()
+                }
+            } else {
+                "1:1".to_owned()
+            };
             let url = format!("{}/image_generation", img_url.trim_end_matches('/'));
             let resp = client.post(&url)
                 .header("Authorization", format!("Bearer {api_key}"))
@@ -4936,7 +5005,10 @@ $bitmap.Dispose()
                 .send().await
                 .map_err(|e| anyhow!("image: request failed: {e}"))?;
             let st = resp.status();
-            let body: Value = resp.json().await.map_err(|e| anyhow!("image: parse error: {e}"))?;
+            let body: Value = resp
+                .json()
+                .await
+                .map_err(|e| anyhow!("image: parse error: {e}"))?;
             (st, body)
         } else {
             let url = format!("{}/images/generations", img_url.trim_end_matches('/'));
@@ -4946,12 +5018,16 @@ $bitmap.Dispose()
                 .send().await
                 .map_err(|e| anyhow!("image: request failed: {e}"))?;
             let st = resp.status();
-            let body: Value = resp.json().await.map_err(|e| anyhow!("image: parse error: {e}"))?;
+            let body: Value = resp
+                .json()
+                .await
+                .map_err(|e| anyhow!("image: parse error: {e}"))?;
             (st, body)
         };
 
         if !resp_status.is_success() {
-            let err_msg = resp_body["error"]["message"].as_str()
+            let err_msg = resp_body["error"]["message"]
+                .as_str()
                 .or_else(|| resp_body["message"].as_str())
                 .unwrap_or("unknown error");
             return Err(anyhow!("image: API error: {err_msg}"));
@@ -4959,12 +5035,19 @@ $bitmap.Dispose()
 
         // Extract image URL/base64 — different response formats per provider
         let img_url_str = if is_qwen {
-            resp_body.pointer("/output/choices/0/message/content/0/image")
+            resp_body
+                .pointer("/output/choices/0/message/content/0/image")
                 .and_then(|v| v.as_str())
         } else if is_minimax {
             // minimax: data.image_base64[0] (base64) or data.image_urls[0] (url)
-            resp_body.pointer("/data/image_urls/0").and_then(|v| v.as_str())
-                .or_else(|| resp_body.pointer("/data/image_base64/0").and_then(|v| v.as_str()))
+            resp_body
+                .pointer("/data/image_urls/0")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    resp_body
+                        .pointer("/data/image_base64/0")
+                        .and_then(|v| v.as_str())
+                })
         } else {
             resp_body.pointer("/data/0/url").and_then(|v| v.as_str())
         };
@@ -4975,21 +5058,25 @@ $bitmap.Dispose()
 
         // Download image and convert to data URI
         use base64::Engine;
-        let image_result = match reqwest::Client::new().get(img_url_str).timeout(std::time::Duration::from_secs(60)).send().await {
-            Ok(r) if r.status().is_success() => {
-                match r.bytes().await {
-                    Ok(bytes) => {
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                        format!("data:image/png;base64,{b64}")
-                    }
-                    Err(e) => return Err(anyhow!("image: download failed: {e}")),
+        let image_result = match reqwest::Client::new()
+            .get(img_url_str)
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => match r.bytes().await {
+                Ok(bytes) => {
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    format!("data:image/png;base64,{b64}")
                 }
-            }
+                Err(e) => return Err(anyhow!("image: download failed: {e}")),
+            },
             Ok(r) => return Err(anyhow!("image: download returned {}", r.status())),
             Err(e) => return Err(anyhow!("image: download error: {e}")),
         };
 
-        let revised = resp_body.pointer("/data/0/revised_prompt")
+        let revised = resp_body
+            .pointer("/data/0/revised_prompt")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_owned();

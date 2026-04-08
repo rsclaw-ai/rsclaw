@@ -288,9 +288,9 @@ impl CronRunner {
 
             let tokio_job = if let Some(tz_str) = cron_job.timezone() {
                 // Timezone-aware scheduling.
-                let tz: chrono_tz::Tz = tz_str
-                    .parse()
-                    .with_context(|| format!("invalid timezone `{tz_str}` for job `{}`", cron_job.id))?;
+                let tz: chrono_tz::Tz = tz_str.parse().with_context(|| {
+                    format!("invalid timezone `{tz_str}` for job `{}`", cron_job.id)
+                })?;
                 Job::new_async_tz(schedule.as_str(), tz, move |_uuid, _scheduler| {
                     let job = job_clone.clone();
                     let agents = Arc::clone(&agents);
@@ -307,7 +307,9 @@ impl CronRunner {
                         match &result {
                             Ok(output) => {
                                 // Send delivery notification if configured
-                                if let Err(e) = send_delivery(&channels, &job, &default_delivery, output).await {
+                                if let Err(e) =
+                                    send_delivery(&channels, &job, &default_delivery, output).await
+                                {
                                     warn!(job_id = %job.id, %e, "delivery failed");
                                 }
                             }
@@ -315,7 +317,11 @@ impl CronRunner {
                                 error!(job_id = %job.id, %e, "cron job failed");
                             }
                         }
-                        let entry = build_run_log_entry(&job, result.is_ok(), result.as_ref().err().map(|e| anyhow::anyhow!("{e}")));
+                        let entry = build_run_log_entry(
+                            &job,
+                            result.is_ok(),
+                            result.as_ref().err().map(|e| anyhow::anyhow!("{e}")),
+                        );
                         let _ = write_run_log(&run_log_dir, &job.id, entry).await;
                     })
                 })
@@ -343,7 +349,9 @@ impl CronRunner {
                         match &result {
                             Ok(output) => {
                                 // Send delivery notification if configured
-                                if let Err(e) = send_delivery(&channels, &job, &default_delivery, output).await {
+                                if let Err(e) =
+                                    send_delivery(&channels, &job, &default_delivery, output).await
+                                {
                                     warn!(job_id = %job.id, %e, "delivery failed");
                                 }
                             }
@@ -351,7 +359,11 @@ impl CronRunner {
                                 error!(job_id = %job.id, %e, "cron job failed");
                             }
                         }
-                        let entry = build_run_log_entry(&job, result.is_ok(), result.as_ref().err().map(|e| anyhow::anyhow!("{e}")));
+                        let entry = build_run_log_entry(
+                            &job,
+                            result.is_ok(),
+                            result.as_ref().err().map(|e| anyhow::anyhow!("{e}")),
+                        );
                         let _ = write_run_log(&run_log_dir, &job.id, entry).await;
                     })
                 })
@@ -405,7 +417,8 @@ impl CronRunner {
         let success = result.is_ok();
         if let Ok(output) = &result {
             // Send delivery notification if configured
-            if let Err(e) = send_delivery(&self.channels, job, &self.default_delivery, output).await {
+            if let Err(e) = send_delivery(&self.channels, job, &self.default_delivery, output).await
+            {
                 warn!(job_id = %job.id, %e, "delivery failed");
             }
         }
@@ -435,6 +448,33 @@ fn to_six_field(expr: &str) -> String {
     } else {
         format!("0 {expr}")
     }
+}
+
+pub async fn read_jobs_from_file(cron_dir: PathBuf) -> Result<Vec<CronJob>> {
+    let jobs_path = cron_dir.join("jobs.json");
+    let data = tokio::fs::read_to_string(&jobs_path)
+        .await
+        .unwrap_or_else(|_| "[]".to_owned());
+
+    let wrapper: serde_json::Value =
+        serde_json::from_str(&data).unwrap_or_else(|_| serde_json::Value::Array(vec![]));
+
+    let jobs_array = if let Some(arr) = wrapper.get("jobs").and_then(|v| v.as_array()) {
+        arr.clone()
+    } else if wrapper.is_array() {
+        wrapper.as_array().cloned().unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    let mut jobs: Vec<CronJob> = jobs_array
+        .iter()
+        .filter_map(|v| serde_json::from_value(v.clone()).ok())
+        .collect();
+
+    jobs.sort_by_key(|j| j.created_at_ms.unwrap_or(0));
+
+    Ok(jobs)
 }
 
 async fn run_cron_job(job: &CronJob, agents: &AgentRegistry) -> Result<String> {
