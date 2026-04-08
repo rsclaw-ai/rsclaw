@@ -411,7 +411,7 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     "deepseek"    => Some("https://api.deepseek.com/v1".to_owned()),
                     "kimi" | "moonshot" => Some("https://api.moonshot.cn/v1".to_owned()),
                     "zhipu"       => Some("https://open.bigmodel.cn/api/paas/v4".to_owned()),
-                    "minimax"     => Some("https://api.minimax.chat/v1".to_owned()),
+                    "minimax"     => Some("https://api.minimaxi.com/v1".to_owned()),
                     "siliconflow" => Some("https://api.siliconflow.cn/v1".to_owned()),
                     "groq"        => Some("https://api.groq.com/openai/v1".to_owned()),
                     "openrouter"  => Some("https://openrouter.ai/api/v1".to_owned()),
@@ -563,7 +563,7 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
             "https://api.baichuan-ai.com/v1",
             "BAICHUAN_API_KEY",
         ),
-        ("minimax", "https://api.minimax.chat/v1", "MINIMAX_API_KEY"),
+        ("minimax", "https://api.minimaxi.com/v1", "MINIMAX_API_KEY"),
         ("stepfun", "https://api.stepfun.com/v1", "STEPFUN_API_KEY"),
         ("lingyi", "https://api.lingyiwanwu.com/v1", "LINGYI_API_KEY"),
         (

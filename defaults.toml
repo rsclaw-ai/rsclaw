@@ -28,7 +28,7 @@ name       = "minimax"
 label      = "MiniMax"
 env_var    = "MINIMAX_API_KEY"
 model      = "minimax/MiniMax-M2.5"
-base_url   = "https://api.minimax.chat/v1"
+base_url   = "https://api.minimaxi.com/v1"
 needs_key  = true
 
 [[providers]]

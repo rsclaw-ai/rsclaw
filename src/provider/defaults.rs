@@ -24,7 +24,7 @@ fn builtin_base_url(provider: &str) -> (&'static str, &'static str) {
         "deepseek"           => ("https://api.deepseek.com/v1",                       "bearer"),
         "qwen"               => ("https://dashscope.aliyuncs.com/compatible-mode/v1",             "bearer"),
         "doubao"             => ("https://ark.cn-beijing.volces.com/api/v3",          "bearer"),
-        "minimax"            => ("https://api.minimax.chat/v1",                       "bearer"),
+        "minimax"            => ("https://api.minimaxi.com/v1",                       "bearer"),
         "kimi" | "moonshot"  => ("https://api.moonshot.cn/v1",                        "bearer"),
         "zhipu"              => ("https://open.bigmodel.cn/api/paas/v4",              "bearer"),
         "groq"               => ("https://api.groq.com/openai/v1",                    "bearer"),

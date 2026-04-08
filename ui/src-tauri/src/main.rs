@@ -665,7 +665,7 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
         "deepseek"    => "https://api.deepseek.com/v1",
         "qwen"        => "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "doubao"      => "https://ark.cn-beijing.volces.com/api/v3",
-        "minimax"     => "https://api.minimax.chat/v1",
+        "minimax"     => "https://api.minimaxi.com/v1",
         "kimi"        => "https://api.moonshot.cn/v1",
         "zhipu"       => "https://open.bigmodel.cn/api/paas/v4",
         "groq"        => "https://api.groq.com/openai/v1",
