@@ -4434,8 +4434,8 @@ $bitmap.Dispose()
             .and_then(|m| m.providers.get(prov_name))
             .and_then(|p| p.base_url.clone());
 
-        // Providers with standard OpenAI images API
-        let image_providers = ["doubao", "bytedance", "openai"];
+        // Providers with image generation support
+        let image_providers = ["doubao", "bytedance", "openai", "qwen"];
         let (img_url, img_key, img_prov) = if image_providers.contains(&prov_name) {
             let url = cfg_url.unwrap_or(base_url);
             let key = cfg_key
@@ -4443,8 +4443,8 @@ $bitmap.Dispose()
                 .or_else(|| std::env::var("OPENAI_API_KEY").ok());
             (url, key, prov_name)
         } else {
-            // Current provider doesn't support images API — try doubao then openai
-            let fallback = [("doubao", "ARK_API_KEY"), ("openai", "OPENAI_API_KEY")];
+            // Current provider doesn't support images — try doubao, qwen, openai
+            let fallback = [("doubao", "ARK_API_KEY"), ("qwen", "DASHSCOPE_API_KEY"), ("openai", "OPENAI_API_KEY")];
             let mut found = None;
             for (fb_prov, fb_env) in fallback {
                 let fb_cfg = self.config.model.models.as_ref()
@@ -4462,75 +4462,90 @@ $bitmap.Dispose()
         };
         let Some(api_key) = img_key else {
             return Ok(json!({
-                "error": format!("AI image generation requires doubao or openai provider with API key configured. Current provider '{prov_name}' does not support image generation.")
+                "error": "AI image generation requires doubao, qwen, or openai provider with API key. No image-capable provider configured."
             }));
         };
 
-        let url = format!("{}/images/generations", img_url.trim_end_matches('/'));
         let image_model = args["model"].as_str().unwrap_or_else(|| {
             match img_prov {
                 "doubao" | "bytedance" => "doubao-seedream-5-0-260128",
                 "openai" => "dall-e-3",
+                "qwen" => "qwen-image-2.0-pro",
                 _ => "dall-e-3",
             }
         });
 
-        let client = reqwest::Client::new();
-        let mut builder = client.post(&url);
-        match auth_style {
-            "x-api-key" => {
-                builder = builder.header("x-api-key", &api_key);
-            }
-            _ => {
-                builder = builder.header("Authorization", format!("Bearer {api_key}"));
-            }
-        }
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build().unwrap_or_default();
 
-        let resp = builder
-            .json(&json!({
-                "model": image_model,
-                "prompt": prompt,
-                "size": size,
-                "n": 1,
-                "response_format": "url"
-            }))
-            .send()
-            .await
-            .map_err(|e| anyhow!("image: request failed: {e}"))?;
+        // Qwen uses a different API format
+        let is_qwen = img_prov == "qwen";
+        let (resp_status, resp_body) = if is_qwen {
+            let qwen_size = size.replace('x', "*");
+            let resp = client
+                .post("https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation")
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(&json!({
+                    "model": image_model,
+                    "input": { "messages": [{ "role": "user", "content": [{ "text": prompt }] }] },
+                    "parameters": { "size": qwen_size, "n": 1, "watermark": false }
+                }))
+                .send().await
+                .map_err(|e| anyhow!("image: request failed: {e}"))?;
+            let st = resp.status();
+            let body: Value = resp.json().await.map_err(|e| anyhow!("image: parse error: {e}"))?;
+            (st, body)
+        } else {
+            let url = format!("{}/images/generations", img_url.trim_end_matches('/'));
+            let mut builder = client.post(&url);
+            builder = builder.header("Authorization", format!("Bearer {api_key}"));
+            let resp = builder
+                .json(&json!({ "model": image_model, "prompt": prompt, "size": size, "n": 1, "response_format": "url" }))
+                .send().await
+                .map_err(|e| anyhow!("image: request failed: {e}"))?;
+            let st = resp.status();
+            let body: Value = resp.json().await.map_err(|e| anyhow!("image: parse error: {e}"))?;
+            (st, body)
+        };
 
-        let status = resp.status();
-        let body: Value = resp
-            .json()
-            .await
-            .map_err(|e| anyhow!("image: failed to parse response: {e}"))?;
-
-        if !status.is_success() {
-            let err_msg = body["error"]["message"].as_str().unwrap_or("unknown error");
+        if !resp_status.is_success() {
+            let err_msg = resp_body["error"]["message"].as_str()
+                .or_else(|| resp_body["message"].as_str())
+                .unwrap_or("unknown error");
             return Err(anyhow!("image: API error: {err_msg}"));
         }
 
-        // Get URL then download image bytes and convert to data URI
-        let image_result = if let Some(img_url) = body["data"][0]["url"].as_str() {
-            use base64::Engine;
-            match reqwest::Client::new().get(img_url).timeout(std::time::Duration::from_secs(60)).send().await {
-                Ok(r) if r.status().is_success() => {
-                    match r.bytes().await {
-                        Ok(bytes) => {
-                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                            format!("data:image/png;base64,{b64}")
-                        }
-                        Err(e) => return Err(anyhow!("image: download failed: {e}")),
-                    }
-                }
-                Ok(r) => return Err(anyhow!("image: download returned {}", r.status())),
-                Err(e) => return Err(anyhow!("image: download error: {e}")),
-            }
+        // Extract image URL — different paths for qwen vs openai format
+        let img_url_str = if is_qwen {
+            resp_body.pointer("/output/choices/0/message/content/0/image")
+                .and_then(|v| v.as_str())
         } else {
-            return Err(anyhow!("image: no URL in response"));
+            resp_body.pointer("/data/0/url").and_then(|v| v.as_str())
         };
 
-        let revised = body["data"][0]["revised_prompt"]
-            .as_str()
+        let Some(img_url_str) = img_url_str else {
+            return Err(anyhow!("image: no image URL in response"));
+        };
+
+        // Download image and convert to data URI
+        use base64::Engine;
+        let image_result = match reqwest::Client::new().get(img_url_str).timeout(std::time::Duration::from_secs(60)).send().await {
+            Ok(r) if r.status().is_success() => {
+                match r.bytes().await {
+                    Ok(bytes) => {
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        format!("data:image/png;base64,{b64}")
+                    }
+                    Err(e) => return Err(anyhow!("image: download failed: {e}")),
+                }
+            }
+            Ok(r) => return Err(anyhow!("image: download returned {}", r.status())),
+            Err(e) => return Err(anyhow!("image: download error: {e}")),
+        };
+
+        let revised = resp_body.pointer("/data/0/revised_prompt")
+            .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_owned();
 
