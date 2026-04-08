@@ -60,7 +60,7 @@ name       = "gaterouter"
 label      = "GateRouter"
 env_var    = "GATEROUTER_API_KEY"
 model      = "gaterouter/auto"
-base_url   = "https://api.gaterouter.com/v1"
+base_url   = "https://api.gaterouter.ai/openai/v1"
 needs_key  = true
 
 [[providers]]

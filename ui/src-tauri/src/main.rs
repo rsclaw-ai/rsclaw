@@ -651,8 +651,9 @@ fn uninstall_skill(name: String) -> Result<String, String> {
 /// Test provider API key by calling /v1/models directly (no gateway needed).
 #[tauri::command]
 async fn test_provider(provider: String, api_key: String, base_url: Option<String>, api_type: Option<String>) -> Result<serde_json::Value, String> {
-    // Resolve the effective API type for custom providers
-    let effective_api_type = if provider == "custom" {
+    // Resolve the effective API type for custom/codingplan providers
+    let is_custom_like = provider == "custom" || provider == "codingplan";
+    let effective_api_type = if is_custom_like {
         api_type.as_deref().unwrap_or("openai")
     } else {
         provider.as_str()
@@ -673,9 +674,9 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
         "gemini"      => "https://generativelanguage.googleapis.com/v1beta",
         "siliconflow" => "https://api.siliconflow.cn/v1",
         "openrouter"  => "https://openrouter.ai/api/v1",
-        "gaterouter"  => "https://api.gaterouter.com/v1",
+        "gaterouter"  => "https://api.gaterouter.ai/openai/v1",
         "ollama"      => "http://localhost:11434",
-        "custom"      => "",
+        "custom" | "codingplan" => "",
         _ => return Ok(serde_json::json!({"ok": false, "error": "unknown provider"})),
     };
     let effective_base = base_url

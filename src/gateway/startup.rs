@@ -421,7 +421,7 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     "siliconflow" => Some("https://api.siliconflow.cn/v1".to_owned()),
                     "groq"        => Some("https://api.groq.com/openai/v1".to_owned()),
                     "openrouter"  => Some("https://openrouter.ai/api/v1".to_owned()),
-                    "gaterouter"  => Some("https://api.gaterouter.com/v1".to_owned()),
+                    "gaterouter"  => Some("https://api.gaterouter.ai/openai/v1".to_owned()),
                     "grok" | "xai" => Some("https://api.x.ai/v1".to_owned()),
                     _ => None,
                 }
@@ -573,7 +573,7 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
         ),
         (
             "gaterouter",
-            "https://api.gaterouter.com/v1",
+            "https://api.gaterouter.ai/openai/v1",
             "GATEROUTER_API_KEY",
         ),
         (
