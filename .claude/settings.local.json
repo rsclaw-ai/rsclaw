@@ -41,7 +41,21 @@
       "Bash(curl -s \"https://api.github.com/repos/rsclaw-ai/rsclaw/commits/main\")",
       "Bash(git fetch:*)",
       "Bash(C:/Users/Administrator/.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/cargo.exe check:*)",
-      "Bash(/c/Users/Administrator/.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/cargo.exe build:*)"
+      "Bash(/c/Users/Administrator/.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/cargo.exe build:*)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(where cargo:*)",
+      "Bash(/c/Users/Administrator/.cargo/bin/cargo check:*)",
+      "Bash(cmd /c \"cargo check 2>&1\")",
+      "Bash(cmd:*)",
+      "Bash(powershell.exe -Command \"cargo check\")",
+      "Bash(powershell.exe -Command \"cargo check 2>&1\")",
+      "Bash(powershell.exe -Command \"cargo tree -p tokio-cron-scheduler 2>&1\")",
+      "Bash(powershell.exe -Command \"sleep 30; cargo check 2>&1\")",
+      "Bash(ls -la J:/mickeylan/ai/rsclaw/cron_*.txt)",
+      "Bash(grep -n \"cat.*\\\\\\\\\\\\.\" defaults.toml)",
+      "Bash(grep -r \"K:\\\\\\\\\\\\\\\\openclaw\\\\|K:/openclaw\" src/)",
+      "Bash(reg query:*)"
     ]
   }
 }

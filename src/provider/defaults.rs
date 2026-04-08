@@ -32,7 +32,7 @@ fn builtin_base_url(provider: &str) -> (&'static str, &'static str) {
         "gemini"             => ("https://generativelanguage.googleapis.com/v1beta",  "bearer"),
         "siliconflow"        => ("https://api.siliconflow.cn/v1",                     "bearer"),
         "openrouter"         => ("https://openrouter.ai/api/v1",                      "bearer"),
-        "gaterouter"         => ("https://api.gaterouter.com/v1",                     "bearer"),
+        "gaterouter"         => ("https://api.gaterouter.ai/openai/v1",               "bearer"),
         "stepfun"            => ("https://api.stepfun.com/v1",                        "bearer"),
         "cerebras"           => ("https://api.cerebras.ai/v1",                        "bearer"),
         "cohere"             => ("https://api.cohere.com/v2",                         "bearer"),

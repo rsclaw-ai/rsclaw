@@ -3,7 +3,7 @@
 //! Wires together: config, store, providers, agent runtimes, channels,
 //! cron scheduler, and HTTP server into a running gateway.
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use futures::StreamExt as _;
@@ -325,24 +325,49 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // All channels registered - now wrap for sharing with cron runner
     let channel_manager = Arc::new(channel_manager);
 
-    // Start cron runner (if configured).
-    if let Some(ref cron_cfg) = config.ops.cron
-        && cron_cfg.enabled.unwrap_or(true)
+    // Start cron runner — jobs loaded from file, config provides global settings only.
+    // Priority: base_dir/cron.json5 > base_dir/cron/jobs.json (legacy, auto-migrated)
     {
-        let cron_base_dir = crate::config::loader::base_dir().join("cron");
-        let jobs = crate::cron::read_jobs_from_file(cron_base_dir)
-            .await
-            .unwrap_or_default();
+        let cron_cfg = config.ops.cron.clone().unwrap_or_else(|| {
+            crate::config::schema::CronConfig {
+                enabled: Some(true),
+                max_concurrent_runs: None,
+                session_retention: None,
+                run_log: None,
+                jobs: None,
+                default_delivery: None,
+            }
+        });
+        let cron_enabled = cron_cfg.enabled.unwrap_or(true);
+        // Openclaw-compatible cron path: respects OPENCLAW_STATE_DIR env var
+        let openclaw_home = if let Some(state_dir) = std::env::var_os("OPENCLAW_STATE_DIR") {
+            PathBuf::from(state_dir)
+        } else {
+            dirs_next::home_dir().unwrap_or_default().join(".openclaw")
+        };
+        let cron_file = openclaw_home.join("cron").join("jobs.json");
 
-        debug!(jobs_len = jobs.len(), "cron jobs prepared");
-        if !jobs.is_empty() {
-            let runner = CronRunner::new(
-                cron_cfg,
-                jobs,
-                Arc::clone(&registry),
-                Arc::clone(&channel_manager),
-                data_dir.clone(),
-            );
+        let mut jobs: Vec<CronJob> = Vec::new();
+        if cron_file.is_file() {
+            if let Ok(raw) = std::fs::read_to_string(&cron_file) {
+                let parsed: Result<serde_json::Value, _> = json5::from_str(&raw)
+                    .or_else(|_| serde_json::from_str(&raw));
+                if let Ok(file_data) = parsed {
+                    if let Some(arr) = file_data.get("jobs").and_then(|v| v.as_array()) {
+                        for item in arr {
+                            if let Ok(job) = serde_json::from_value::<CronJob>(item.clone()) {
+                                jobs.push(job);
+                            }
+                        }
+                        info!(file = %cron_file.display(), count = arr.len(), "loaded cron jobs");
+                    }
+                }
+            }
+        }
+        if cron_enabled && !jobs.is_empty() {
+            // Use openclaw-compatible data dir for cron run logs
+            let cron_data_dir = openclaw_home.join("var").join("data");
+            let runner = CronRunner::new(&cron_cfg, jobs, Arc::clone(&registry), Arc::clone(&channel_manager), cron_data_dir);
             tokio::spawn(async move {
                 if let Err(e) = runner.run().await {
                     error!("cron runner error: {e:#}");
@@ -465,9 +490,9 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     "zhipu" => Some("https://open.bigmodel.cn/api/paas/v4".to_owned()),
                     "minimax" => Some("https://api.minimax.chat/v1".to_owned()),
                     "siliconflow" => Some("https://api.siliconflow.cn/v1".to_owned()),
-                    "groq" => Some("https://api.groq.com/openai/v1".to_owned()),
-                    "openrouter" => Some("https://openrouter.ai/api/v1".to_owned()),
-                    "gaterouter" => Some("https://api.gaterouter.com/v1".to_owned()),
+                    "groq"        => Some("https://api.groq.com/openai/v1".to_owned()),
+                    "openrouter"  => Some("https://openrouter.ai/api/v1".to_owned()),
+                    "gaterouter"  => Some("https://api.gaterouter.ai/openai/v1".to_owned()),
                     "grok" | "xai" => Some("https://api.x.ai/v1".to_owned()),
                     _ => None,
                 }
@@ -628,7 +653,7 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
         ),
         (
             "gaterouter",
-            "https://api.gaterouter.com/v1",
+            "https://api.gaterouter.ai/openai/v1",
             "GATEROUTER_API_KEY",
         ),
         (

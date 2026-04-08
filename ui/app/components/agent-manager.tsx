@@ -47,6 +47,7 @@ export function AgentManagerPage() {
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState<AgentFormData>(EMPTY_FORM);
+  const [saving, setSaving] = useState(false);
 
   const fetchAgents = useCallback(async () => {
     try {
@@ -105,10 +106,12 @@ export function AgentManagerPage() {
   };
 
   const handleSave = async () => {
+    if (saving) return;
     if (!form.id || !form.model) {
       showToast("ID and Model are required");
       return;
     }
+    setSaving(true);
 
     const payload = {
       id: form.id,
@@ -140,6 +143,8 @@ export function AgentManagerPage() {
       fetchAgents();
     } catch {
       showToast("Failed to save agent. Is the gateway running?");
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -249,8 +254,9 @@ export function AgentManagerPage() {
                 />
                 <IconButton
                   icon={<ConfirmIcon />}
-                  text="Save"
+                  text={saving ? "Saving..." : "Save"}
                   bordered
+                  disabled={saving}
                   onClick={handleSave}
                 />
               </div>

@@ -2,6 +2,7 @@ use crate::ws::{
     dispatch::{MethodCtx, MethodResult},
     types::ErrorShape,
 };
+use std::path::PathBuf;
 
 pub async fn health(ctx: MethodCtx) -> MethodResult {
     let uptime = ctx.state.started_at.elapsed();
@@ -130,28 +131,22 @@ pub async fn config_get(ctx: MethodCtx) -> MethodResult {
 }
 
 pub async fn cron_list(_ctx: MethodCtx) -> MethodResult {
-    let config = crate::config::load().map_err(|e| ErrorShape::internal(e.to_string()))?;
-    let jobs = config
-        .ops
-        .cron
-        .as_ref()
-        .and_then(|c| c.jobs.as_deref())
-        .unwrap_or(&[]);
+    let jobs = crate::cron::load_cron_jobs();
     let list: Vec<serde_json::Value> = jobs
         .iter()
         .map(|j| {
             let mut v = serde_json::json!({
                 "id": j.id,
                 "schedule": j.schedule,
-                "enabled": j.enabled.unwrap_or(true),
+                "enabled": j.enabled,
                 "agentId": j.agent_id,
-                "message": j.message,
+                "message": j.effective_message(),
             });
             if let Some(ref name) = j.name {
                 v["name"] = name.clone().into();
             }
-            if let Some(ref tz) = j.tz {
-                v["tz"] = tz.clone().into();
+            if let Some(tz) = j.timezone() {
+                v["tz"] = serde_json::json!(tz);
             }
             v
         })
@@ -172,33 +167,33 @@ pub async fn cron_add(ctx: MethodCtx) -> MethodResult {
         .as_str()
         .ok_or_else(|| ErrorShape::bad_request("missing message"))?;
     let agent_id = params["agentId"].as_str();
+    let name = params["name"].as_str();
 
-    let (path, mut val) = crate::cmd::config_json::load_config_json()
-        .map_err(|e| ErrorShape::internal(e.to_string()))?;
-    let count = val
-        .pointer("/cron/jobs")
-        .and_then(|v| v.as_array())
-        .map_or(0, |a| a.len());
+    let mut jobs = crate::cron::load_cron_jobs();
+    let count = jobs.len();
     let id = format!("job-{}", count + 1);
-    let mut job = serde_json::json!({
-        "id": id,
-        "schedule": schedule,
-        "message": message,
-    });
-    if let Some(agent) = agent_id {
-        job["agentId"] = agent.into();
-    }
-    if let Some(arr) = val.pointer_mut("/cron/jobs").and_then(|v| v.as_array_mut()) {
-        arr.push(job);
-    } else {
-        crate::cmd::config_json::set_nested_value(&mut val, "cron.jobs", serde_json::json!([job]))
-            .map_err(|e| ErrorShape::internal(e.to_string()))?;
-    }
-    std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&val).map_err(|e| ErrorShape::internal(e.to_string()))?,
-    )
-    .map_err(|e| ErrorShape::internal(e.to_string()))?;
+
+    let job = crate::cron::CronJob {
+        id: id.clone(),
+        name: name.map(String::from),
+        agent_id: agent_id.unwrap_or("default").to_string(),
+        session_key: None,
+        enabled: true,
+        schedule: crate::cron::CronSchedule::Flat(schedule.to_string()),
+        payload: None,
+        message: Some(message.to_string()),
+        delivery: None,
+        session_target: None,
+        wake_mode: None,
+        state: Some(crate::cron::CronJobState::default()),
+        created_at_ms: Some(chrono::Utc::now().timestamp_millis() as u64),
+        updated_at_ms: None,
+    };
+
+    jobs.push(job);
+
+    crate::cron::save_cron_jobs(&jobs)
+        .map_err(|e| ErrorShape::internal(format!("failed to save cron job: {}", e)))?;
 
     Ok(serde_json::json!({ "id": id, "schedule": schedule }))
 }
@@ -213,22 +208,16 @@ pub async fn cron_remove(ctx: MethodCtx) -> MethodResult {
         .as_str()
         .ok_or_else(|| ErrorShape::bad_request("missing id"))?;
 
-    let (path, mut val) = crate::cmd::config_json::load_config_json()
-        .map_err(|e| ErrorShape::internal(e.to_string()))?;
-    if let Some(jobs) = val.pointer_mut("/cron/jobs").and_then(|j| j.as_array_mut()) {
-        let before = jobs.len();
-        jobs.retain(|j| j["id"].as_str() != Some(id));
-        if jobs.len() == before {
-            return Err(ErrorShape::not_found(format!("cron job '{id}' not found")));
-        }
-    } else {
+    let mut jobs = crate::cron::load_cron_jobs();
+    let before = jobs.len();
+    jobs.retain(|j| j.id != id);
+
+    if jobs.len() == before {
         return Err(ErrorShape::not_found(format!("cron job '{id}' not found")));
     }
-    std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&val).map_err(|e| ErrorShape::internal(e.to_string()))?,
-    )
-    .map_err(|e| ErrorShape::internal(e.to_string()))?;
+
+    crate::cron::save_cron_jobs(&jobs)
+        .map_err(|e| ErrorShape::internal(format!("failed to save cron job: {}", e)))?;
 
     Ok(serde_json::json!({ "removed": id }))
 }
@@ -365,7 +354,12 @@ pub async fn cron_runs(ctx: MethodCtx) -> MethodResult {
         .and_then(|v| v.as_u64())
         .unwrap_or(50) as usize;
 
-    let data_dir = crate::config::loader::base_dir().join("var/data/cron");
+    // Openclaw-compatible path for cron run logs (respects OPENCLAW_STATE_DIR).
+    let data_dir = if let Some(state_dir) = std::env::var_os("OPENCLAW_STATE_DIR") {
+        PathBuf::from(state_dir)
+    } else {
+        dirs_next::home_dir().unwrap_or_default().join(".openclaw")
+    }.join("var/data/cron");
     let mut runs: Vec<crate::cron::RunLogEntry> = Vec::new();
 
     if data_dir.exists() {

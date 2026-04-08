@@ -4854,8 +4854,7 @@ $bitmap.Dispose()
         let (base_url, auth_style) = crate::provider::defaults::resolve_base_url(prov_name);
 
         let default_size = match prov_name {
-            "doubao" | "bytedance" => "2048x2048",
-            _ => "1024x1024",
+            _ => "2048x2048",
         };
         let size = args["size"].as_str().unwrap_or(default_size);
 
@@ -5280,9 +5279,17 @@ $synth.Speak('{}')
             .as_str()
             .ok_or_else(|| anyhow!("cron: `action` required"))?;
 
-        // Cron config stored as JSON file in base dir (profile-aware).
-        let cron_dir = crate::config::loader::base_dir().join("cron");
-        let cron_path = cron_dir.join("jobs.json");
+        // Cron config stored at openclaw-compatible path.
+        // Respects OPENCLAW_STATE_DIR env var (same as openclaw).
+        let cron_dir = if let Some(state_dir) = std::env::var_os("OPENCLAW_STATE_DIR") {
+            tracing::debug!("tool_cron: OPENCLAW_STATE_DIR={}", state_dir.to_string_lossy());
+            std::path::PathBuf::from(state_dir)
+        } else {
+            let home = dirs_next::home_dir().unwrap_or_default();
+            tracing::debug!("tool_cron: OPENCLAW_STATE_DIR not set, home={}", home.display());
+            home.join(".openclaw")
+        };
+        let cron_path = cron_dir.join("cron").join("jobs.json");
 
         match action {
             "list" => {
@@ -6571,7 +6578,8 @@ fn build_system_prompt(
     parts.push(
         "## Tool Usage Guidelines\n\
          - For code generation: write complete files, one module at a time.\n\
-         - Use edit tool for small changes to existing files."
+         - Use edit tool for small changes to existing files.\n\
+         - For cron jobs: use the `cron` tool (action=list/add/remove). The `cron` tool is a first-class tool — always use it instead of trying to invoke a `cron` shell command."
             .to_string(),
     );
 
