@@ -355,6 +355,7 @@ impl AgentRuntime {
         // Get notification sender for async result delivery
         let notif_tx = self.notification_tx.clone();
         let target_id = ctx.peer_id.clone();
+        let channel_name = ctx.channel.clone();
         let task_str = task.to_string();
 
         // Send initial notification
@@ -365,13 +366,16 @@ impl AgentRuntime {
                 text: "🚀 OpenCode 任务已提交，执行中...".to_string(),
                 reply_to: None,
                 images: vec![],
+                channel: Some(channel_name.clone()),
             });
         }
 
         // Spawn background task - collect events AND send prompt in parallel
         let notif_tx_bg = notif_tx.clone();
         let target_id_bg = target_id.clone();
+        let channel_bg = channel_name.clone();
         tokio::spawn(async move {
+            tracing::info!("tool_opencode: background task started");
             // Start event collection FIRST (in parallel with send_prompt)
             let mut event_rx = client.subscribe_events();
             let events = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
@@ -380,6 +384,7 @@ impl AgentRuntime {
             // Event collection task - runs in background
             let notif_tx_clone = notif_tx_bg.clone();
             let target_id_clone = target_id_bg.clone();
+            let channel_clone = channel_bg.clone();
             let event_collector = tokio::spawn(async move {
                 let mut pending = String::new();
                 let mut interval = 0u64;
@@ -426,6 +431,7 @@ impl AgentRuntime {
                                             text: format!("🔄 OpenCode\n{}", pending.trim()),
                                             reply_to: None,
                                             images: vec![],
+                                            channel: Some(channel_clone.clone()),
                                         });
                                         pending.clear();
                                         interval = 0;
@@ -489,14 +495,28 @@ impl AgentRuntime {
                     };
 
                     // If we got here, it means we have results - send notification to user
+                    tracing::info!(
+                        "tool_opencode: sending completion notification, output_len={}",
+                        final_output.len()
+                    );
                     if let Some(ref tx) = notif_tx_bg {
-                        let _ = tx.send(crate::channel::OutboundMessage {
+                        match tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
                             text: format!("✅ OpenCode 完成\n\n{}", final_output),
                             reply_to: None,
                             images: vec![],
-                        });
+                            channel: Some(channel_bg.clone()),
+                        }) {
+                            Ok(_) => {
+                                tracing::info!("tool_opencode: notification sent successfully")
+                            }
+                            Err(e) => {
+                                tracing::error!("tool_opencode: failed to send notification: {}", e)
+                            }
+                        }
+                    } else {
+                        tracing::warn!("tool_opencode: no notification channel available");
                     }
                 }
                 Err(e) => {
@@ -508,10 +528,12 @@ impl AgentRuntime {
                             text: format!("❌ OpenCode 错误\n\n{}", e),
                             reply_to: None,
                             images: vec![],
+                            channel: Some(channel_bg.clone()),
                         });
                     }
                 }
             }
+            tracing::info!("tool_opencode: background task finished");
             // IMPORTANT: DON'T await event_collector - it runs forever waiting
             // for more events The collected events are already in
             // `events` variable
@@ -653,6 +675,7 @@ impl AgentRuntime {
         // Get notification sender for async result delivery
         let notif_tx = self.notification_tx.clone();
         let target_id = ctx.peer_id.clone();
+        let channel_name = ctx.channel.clone();
         let task_str = task.to_string();
 
         // Send initial notification
@@ -663,12 +686,14 @@ impl AgentRuntime {
                 text: "🚀 Claude Code 任务已提交，执行中...".to_string(),
                 reply_to: None,
                 images: vec![],
+                channel: Some(channel_name.clone()),
             });
         }
 
         // Spawn background task - collect events AND send prompt in parallel
         let notif_tx_bg = notif_tx.clone();
         let target_id_bg = target_id.clone();
+        let channel_bg = channel_name.clone();
         tokio::spawn(async move {
             // Start event collection FIRST (in parallel with send_prompt)
             let mut event_rx = client.subscribe_events();
@@ -678,6 +703,7 @@ impl AgentRuntime {
             // Event collection task - runs in background
             let notif_tx_clone = notif_tx_bg.clone();
             let target_id_clone = target_id_bg.clone();
+            let channel_clone = channel_bg.clone();
             let event_collector = tokio::spawn(async move {
                 let mut pending = String::new();
                 let mut interval = 0u64;
@@ -709,7 +735,8 @@ impl AgentRuntime {
                                     format!("❌ {}", error)
                                 }
                                 crate::acp::client::SessionEvent::AgentThoughtChunk {
-                                    content, ..
+                                    content,
+                                    ..
                                 } => {
                                     format!("💭 {}", content)
                                 }
@@ -729,6 +756,7 @@ impl AgentRuntime {
                                             text: format!("🔄 Claude Code\n{}", pending.trim()),
                                             reply_to: None,
                                             images: vec![],
+                                            channel: Some(channel_clone.clone()),
                                         });
                                         pending.clear();
                                         interval = 0;
@@ -795,6 +823,7 @@ impl AgentRuntime {
                             text: format!("✅ Claude Code 完成\n\n{}", final_output),
                             reply_to: None,
                             images: vec![],
+                            channel: Some(channel_bg.clone()),
                         });
                     }
                 }
@@ -807,6 +836,7 @@ impl AgentRuntime {
                             text: format!("❌ Claude Code 错误\n\n{}", e),
                             reply_to: None,
                             images: vec![],
+                            channel: Some(channel_bg.clone()),
                         });
                     }
                 }
@@ -2006,12 +2036,6 @@ impl AgentRuntime {
                 "- Use 1. or - for lists.\n",
                 "- Use > for important quotes.\n",
                 "- Do NOT use Markdown tables (|---|). Use \"label: value\" format instead.\n",
-                "\n[Data integrity rules - CRITICAL]\n",
-                "- NEVER truncate or shorten ANY text, strings, numbers, or identifiers.\n",
-                "- Copy ALL values EXACTLY: UUIDs, IDs, IP addresses, paths, URLs, code, data.\n",
-                "- UUIDs: 36 chars (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).\n",
-                "- IP addresses: complete (127.0.0.1 not 7.0.0.1).\n",
-                "- If you see truncated data in context, report it as incomplete.\n",
                 "\n[Tool usage rules]\n",
                 "- For ANY question about real-time data (prices, weather, news, dates, events), you MUST call web_search first. NEVER answer from memory.\n",
                 "- For shell commands, file operations, use exec/read/write tools.\n",
@@ -2514,7 +2538,8 @@ impl AgentRuntime {
             let mut text_buf = String::new();
             let mut tool_calls: Vec<(String, String, Value)> = Vec::new();
             // Track loop detection warnings per tool call id (to inject into result)
-            let mut loop_warnings: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            let mut loop_warnings: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             // Streaming throttle: batch small deltas to reduce channel update rate.
             let mut delta_buf = String::new();
             let mut last_delta_flush = std::time::Instant::now();
@@ -2560,8 +2585,10 @@ impl AgentRuntime {
                             // New tool call with both id and name — start fresh entry.
                             // Use check_with_params which hashes the full input (OpenClaw-compatible).
                             // This ensures different arguments count as different calls.
-                            if let Some(warning_msg) =
-                                ctx.loop_detector.check_with_params(&name, &input).to_result()?
+                            if let Some(warning_msg) = ctx
+                                .loop_detector
+                                .check_with_params(&name, &input)
+                                .to_result()?
                             {
                                 tracing::warn!(tool = %name, params = ?input, "{}", warning_msg);
                                 // Store warning to inject into tool result (so LLM sees it)
@@ -2903,7 +2930,8 @@ impl AgentRuntime {
                     Err(e) => {
                         warn!(tool = %tool_name, "tool error: {e:#}");
                         // Record error result for loop detection (errors count as results too).
-                        ctx.loop_detector.record_result(&serde_json::json!({"error": e.to_string()}));
+                        ctx.loop_detector
+                            .record_result(&serde_json::json!({"error": e.to_string()}));
                         (format!("{{\"error\":\"{}\"}}", e), vec![])
                     }
                 };
@@ -3313,7 +3341,11 @@ impl AgentRuntime {
             std::path::PathBuf::from(&ws_str)
         };
         let memory_path = ws.join("MEMORY.md");
-        let entry = format!("\n## {}\n{}\n", chrono::Local::now().format("%Y-%m-%d %H:%M"), text);
+        let entry = format!(
+            "\n## {}\n{}\n",
+            chrono::Local::now().format("%Y-%m-%d %H:%M"),
+            text
+        );
         if let Err(e) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -3347,7 +3379,8 @@ impl AgentRuntime {
     }
 
     async fn tool_read(&self, args: Value) -> Result<Value> {
-        let path = args["path"].as_str()
+        let path = args["path"]
+            .as_str()
             .or_else(|| args["file_path"].as_str())
             .or_else(|| args["filename"].as_str())
             .or_else(|| args["file"].as_str())
@@ -3445,7 +3478,8 @@ impl AgentRuntime {
         }
 
         // Handle various parameter names LLMs might use.
-        let path = args["path"].as_str()
+        let path = args["path"]
+            .as_str()
             .or_else(|| args["file_path"].as_str())
             .or_else(|| args["filename"].as_str())
             .or_else(|| args["file"].as_str())
@@ -4081,7 +4115,7 @@ impl AgentRuntime {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::info!(cwd = %workspace.display(), command = %command, exit_code = ?output.status.code(), stdout_len = stdout.len(), stderr_len = stderr.len(), "exec: done");
+        tracing::info!(cwd = %workspace.display(), command = %command, exit_code = ?output.status.code(), stdout = %stdout, stderr = %stderr, "exec: done");
 
         Ok(json!({
             "exit_code": output.status.code(),
@@ -4114,13 +4148,11 @@ impl AgentRuntime {
         let entry = AgentEntry {
             id: id.clone(),
             default: Some(false),
-            workspace: Some(
-                crate::config::loader::path_to_forward_slash(
-                    &dirs_next::home_dir()
-                        .unwrap_or_default()
-                        .join(format!(".rsclaw/workspace/{id}")),
-                ),
-            ),
+            workspace: Some(crate::config::loader::path_to_forward_slash(
+                &dirs_next::home_dir()
+                    .unwrap_or_default()
+                    .join(format!(".rsclaw/workspace/{id}")),
+            )),
             model: Some(ModelConfig {
                 primary: Some(model),
                 fallbacks: None,
@@ -4984,7 +5016,9 @@ $synth.Speak('{}')
                         indexed
                     })
                     .collect();
-                Ok(json!({"jobs": jobs_with_index, "hint": "Use index number (#1, #2, etc.) for removal to avoid ID truncation issues"}))
+                Ok(
+                    json!({"jobs": jobs_with_index, "hint": "Use index number (#1, #2, etc.) for removal to avoid ID truncation issues"}),
+                )
             }
             "add" => {
                 let schedule = args["schedule"]
@@ -5033,7 +5067,11 @@ $synth.Speak('{}')
                     // 1-based index
                     let idx = index as usize;
                     if idx == 0 || idx > jobs.len() {
-                        return Err(anyhow!("cron remove: invalid index {} (valid: 1-{})", index, jobs.len()));
+                        return Err(anyhow!(
+                            "cron remove: invalid index {} (valid: 1-{})",
+                            index,
+                            jobs.len()
+                        ));
                     }
                     let job = jobs.remove(idx - 1);
                     write_cron_jobs(&cron_path, &jobs).await?;
@@ -5048,7 +5086,9 @@ $synth.Speak('{}')
                     write_cron_jobs(&cron_path, &jobs).await?;
                     json!({"id": id, "count": removed})
                 } else {
-                    return Err(anyhow!("cron remove: `index` or `id` required (index is preferred)"));
+                    return Err(anyhow!(
+                        "cron remove: `index` or `id` required (index is preferred)"
+                    ));
                 };
 
                 Ok(json!({"removed": removed_job}))
@@ -5058,7 +5098,6 @@ $synth.Speak('{}')
             )),
         }
     }
-
 }
 
 /// Read cron jobs from the OpenClaw-compatible jobs.json file.
@@ -5252,7 +5291,12 @@ impl AgentRuntime {
         let port = self.config.gateway.port;
         let client = reqwest::Client::new();
         let base = format!("http://127.0.0.1:{port}/api/v1");
-        let auth_token = self.config.gateway.auth_token.as_deref().unwrap_or_default();
+        let auth_token = self
+            .config
+            .gateway
+            .auth_token
+            .as_deref()
+            .unwrap_or_default();
 
         let auth_header = if auth_token.is_empty() {
             String::new()
@@ -5987,14 +6031,7 @@ fn toolset_allowed_names(
     toolset: &str,
     custom_tools: Option<&Vec<String>>,
 ) -> Option<std::collections::HashSet<String>> {
-    const MINIMAL: &[&str] = &[
-        "exec",
-        "read",
-        "write",
-        "web_search",
-        "web_fetch",
-        "memory",
-    ];
+    const MINIMAL: &[&str] = &["exec", "read", "write", "web_search", "web_fetch", "memory"];
     const STANDARD: &[&str] = &[
         "exec",
         "read",
@@ -6253,15 +6290,8 @@ fn build_system_prompt(
     parts.push(
         "## Tool Usage Guidelines\n\
          - For code generation: write complete files, one module at a time.\n\
-         - Use edit tool for small changes to existing files.\n\
-         \n\
-         ## Data Integrity (CRITICAL)\n\
-         - NEVER truncate, shorten, or modify any text, strings, identifiers, or values.\n\
-         - Copy ALL content EXACTLY as provided: UUIDs, IDs, API keys, tokens, paths, URLs, code, data.\n\
-         - UUIDs are always 36 characters: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\n\
-         - IP addresses must be complete: 127.0.0.1 not 7.0.0.1\n\
-         - File paths must be complete: /full/path/to/file.ext\n\
-         - If content looks incomplete, note it rather than guessing or modifying.".to_string(),
+         - Use edit tool for small changes to existing files."
+            .to_string(),
     );
 
     // Workspace files segment.
@@ -6700,7 +6730,10 @@ fn build_tool_list(
     }
 
     // External remote agent A2A tools (remote gateways).
-    tracing::debug!(count = external_agents.len(), "build_tool_list: external agents");
+    tracing::debug!(
+        count = external_agents.len(),
+        "build_tool_list: external agents"
+    );
     for ext in external_agents {
         if ext.id == caller_id {
             continue;

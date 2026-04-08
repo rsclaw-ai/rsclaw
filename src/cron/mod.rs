@@ -543,6 +543,7 @@ async fn send_delivery(
         text: text.to_owned(),
         reply_to: delivery.thread_id.clone(),
         images: vec![],
+        channel: Some(channel_name.to_owned()),
     };
 
     // Send the message through the channel

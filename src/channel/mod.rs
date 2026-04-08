@@ -62,7 +62,7 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 /// A reply message ready to be sent to a channel.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OutboundMessage {
     /// Destination peer/group ID.
     pub target_id: String,
@@ -74,6 +74,9 @@ pub struct OutboundMessage {
     pub reply_to: Option<String>,
     /// Image attachments (base64 data URIs).
     pub images: Vec<String>,
+    /// Channel name to use for sending (e.g., "feishu", "telegram").
+    /// Used by background tasks (opencode, claudecode) to route notifications.
+    pub channel: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

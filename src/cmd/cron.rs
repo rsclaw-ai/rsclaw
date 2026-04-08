@@ -90,18 +90,18 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
                 for line in content.lines().rev().take(20) {
                     if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
                         let success = entry["success"].as_bool().unwrap_or(false);
-                        let status = if success {
-                            green("ok")
-                        } else {
-                            red("fail")
-                        };
+                        let status = if success { green("ok") } else { red("fail") };
                         let ts = entry["startedAt"].as_str().unwrap_or("?");
                         let error = entry["error"].as_str().unwrap_or("");
                         println!(
                             "  [{}] {} {}",
                             dim(ts),
                             status,
-                            if error.is_empty() { String::new() } else { red(error) }
+                            if error.is_empty() {
+                                String::new()
+                            } else {
+                                red(error)
+                            }
                         );
                     }
                 }
@@ -110,6 +110,19 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
         CronCommand::Add(args) => {
             validate_cron_schedule(&args.schedule)?;
             let (path, mut val) = load_config_json()?;
+
+            // Auto-enable cron system when adding first job
+            // (startup.rs requires cron.enabled=true to start the scheduler)
+            if val
+                .pointer("/cron/enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                // Already enabled, no action needed
+            } else {
+                set_nested_value(&mut val, "cron.enabled", serde_json::json!(true))?;
+            }
+
             let count = val
                 .pointer("/cron/jobs")
                 .and_then(|v| v.as_array())
@@ -129,7 +142,11 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
                 set_nested_value(&mut val, "cron.jobs", serde_json::json!([job]))?;
             }
             std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
-            ok(&format!("added cron job '{}' ({})", cyan(&id), dim(&args.schedule)));
+            ok(&format!(
+                "added cron job '{}' ({})",
+                cyan(&id),
+                dim(&args.schedule)
+            ));
         }
         CronCommand::Edit { id } => {
             let config = config::load()?;
