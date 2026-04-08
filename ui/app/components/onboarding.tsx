@@ -1824,10 +1824,10 @@ export function OnboardingPage() {
 
   const testProvider = async (id: string) => {
     const prov = provs[id];
-    const isCustom = id === "custom";
+    const isCustomLikeTest = id === "custom" || id === "codingplan";
     const provDef = PROVIDERS.find((p) => p.id === id);
     const isUrlProvider = !!provDef?.isUrl;
-    const keyRequired = isCustom
+    const keyRequired = isCustomLikeTest
       ? API_TYPE_NEEDS_KEY[prov.apiType || "openai"]
       : !isUrlProvider;
     if (keyRequired && !prov.apiKey.trim()) {
@@ -2517,7 +2517,6 @@ export function OnboardingPage() {
                 if (!pDef || pDef.sep) return null;
                 const ps = provs[activeId];
                 const isCustomLike = activeId === "custom" || activeId === "codingplan";
-                const isCustom = activeId === "custom";
                 const curApiType: ApiType = ps.apiType || "openai";
                 const keyRequired = !isCustomLike || API_TYPE_NEEDS_KEY[curApiType];
                 const inputFieldStyle = { flex: 1, background: "#1f2126", border: `1px solid ${ps.inputState === "ok" ? "#2dd4a0" : ps.inputState === "err" ? "#d95f5f" : "rgba(255,255,255,0.09)"}`, borderRadius: 7, padding: "7px 10px", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none" } as const;

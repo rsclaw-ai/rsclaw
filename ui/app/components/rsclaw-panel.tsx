@@ -859,13 +859,12 @@ function ConfigEditorPage() {
     <div>
       {providers.map((prov, idx) => {
         const isCustomLike = prov.key === "custom" || prov.key === "codingplan";
-        const isCustom = prov.key === "custom";
         const curApiType: ApiType | undefined = prov.apiType;
         const hideKey = prov.key === "ollama";
-        const keyOptional = isCustom && curApiType && !API_TYPE_NEEDS_KEY[curApiType];
+        const keyOptional = isCustomLike && curApiType && !API_TYPE_NEEDS_KEY[curApiType];
         const isZh = getLang() === "cn";
         // Determine configuration status
-        const hasCredentials = prov.apiKey.length > 0 || (["ollama", "custom"].includes(prov.key) && prov.baseUrl.length > 0);
+        const hasCredentials = prov.apiKey.length > 0 || (["ollama", "custom", "codingplan"].includes(prov.key) && prov.baseUrl.length > 0);
         const badgeLabel = prov.enabled
           ? (hasCredentials ? (isZh ? "已配置" : "Configured") : (isZh ? "待配置" : "Pending"))
           : (isZh ? "关闭" : "OFF");
