@@ -3839,7 +3839,7 @@ function TauriConfigPageInner() {
                               />
                               <button onClick={() => handleTestProvider(p.id)} disabled={testSt === "testing"}
                                 style={{ padding: "8px 14px", borderRadius: 7, border: `1px solid ${testSt === "ok" ? V.gbrd : testSt === "err" ? V.rbrd : testSt === "testing" ? V.obrd : V.bd2}`, background: testSt === "ok" ? V.glo : V.bg4, color: testSt === "ok" ? V.green : testSt === "err" ? V.red : testSt === "testing" ? V.or : V.t1, fontSize: 11, fontWeight: 500, cursor: testSt === "testing" ? "not-allowed" : "pointer", whiteSpace: "nowrap", flexShrink: 0, display: "flex", alignItems: "center", gap: 5, transition: "all .13s" }}>
-                                {testSt === "testing" ? <><Spinner />{zh ? "\u8FDE\u63A5\u4E2D" : "Testing"}</> : testSt === "ok" ? (zh ? "\u2713 \u5DF2\u8FDE\u63A5" : "\u2713 Connected") : testSt === "err" ? (zh ? "\u91CD\u65B0\u6D4B\u8BD5" : "Retry") : (zh ? "\u6D4B\u8BD5\u8FDE\u63A5" : "Test")}
+                                {testSt === "testing" ? <><Spinner />{zh ? "\u83B7\u53D6\u4E2D" : "Fetching"}</> : testSt === "ok" ? (zh ? "\u2713 \u5237\u65B0\u6A21\u578B" : "\u2713 Refresh") : testSt === "err" ? (zh ? "\u91CD\u65B0\u83B7\u53D6" : "Retry") : (zh ? "\u83B7\u53D6\u6A21\u578B" : "Get Models")}
                               </button>
                             </div>
                           </div>
@@ -3884,7 +3884,7 @@ function TauriConfigPageInner() {
                               />
                               <button onClick={() => handleTestProvider(p.id)} disabled={testSt === "testing"}
                                 style={{ padding: "8px 14px", borderRadius: 7, border: `1px solid ${testSt === "ok" ? V.gbrd : testSt === "err" ? V.rbrd : testSt === "testing" ? V.obrd : V.bd2}`, background: testSt === "ok" ? V.glo : V.bg4, color: testSt === "ok" ? V.green : testSt === "err" ? V.red : testSt === "testing" ? V.or : V.t1, fontSize: 11, fontWeight: 500, cursor: testSt === "testing" ? "not-allowed" : "pointer", whiteSpace: "nowrap", flexShrink: 0, display: "flex", alignItems: "center", gap: 5, transition: "all .13s" }}>
-                                {testSt === "testing" ? <><Spinner />{zh ? "\u8FDE\u63A5\u4E2D" : "Testing"}</> : testSt === "ok" ? (zh ? "\u2713 \u5DF2\u8FDE\u63A5" : "\u2713 Connected") : testSt === "err" ? (zh ? "\u91CD\u65B0\u6D4B\u8BD5" : "Retry") : (zh ? "\u6D4B\u8BD5\u8FDE\u63A5" : "Test")}
+                                {testSt === "testing" ? <><Spinner />{zh ? "\u83B7\u53D6\u4E2D" : "Fetching"}</> : testSt === "ok" ? (zh ? "\u2713 \u5237\u65B0\u6A21\u578B" : "\u2713 Refresh") : testSt === "err" ? (zh ? "\u91CD\u65B0\u83B7\u53D6" : "Retry") : (zh ? "\u83B7\u53D6\u6A21\u578B" : "Get Models")}
                               </button>
                             </div>
                           </div>
@@ -3920,7 +3920,7 @@ function TauriConfigPageInner() {
                               />
                               <button onClick={() => handleTestProvider(p.id)} disabled={testSt === "testing"}
                                 style={{ padding: "8px 14px", borderRadius: 7, border: `1px solid ${testSt === "ok" ? V.gbrd : testSt === "err" ? V.rbrd : testSt === "testing" ? V.obrd : V.bd2}`, background: testSt === "ok" ? V.glo : V.bg4, color: testSt === "ok" ? V.green : testSt === "err" ? V.red : testSt === "testing" ? V.or : V.t1, fontSize: 11, fontWeight: 500, cursor: testSt === "testing" ? "not-allowed" : "pointer", whiteSpace: "nowrap", flexShrink: 0, display: "flex", alignItems: "center", gap: 5, transition: "all .13s" }}>
-                                {testSt === "testing" ? <><Spinner />{zh ? "\u8FDE\u63A5\u4E2D" : "Testing"}</> : testSt === "ok" ? (zh ? "\u2713 \u5DF2\u8FDE\u63A5" : "\u2713 Connected") : testSt === "err" ? (zh ? "\u91CD\u65B0\u6D4B\u8BD5" : "Retry") : (zh ? "\u6D4B\u8BD5\u8FDE\u63A5" : "Test")}
+                                {testSt === "testing" ? <><Spinner />{zh ? "\u83B7\u53D6\u4E2D" : "Fetching"}</> : testSt === "ok" ? (zh ? "\u2713 \u5237\u65B0\u6A21\u578B" : "\u2713 Refresh") : testSt === "err" ? (zh ? "\u91CD\u65B0\u83B7\u53D6" : "Retry") : (zh ? "\u83B7\u53D6\u6A21\u578B" : "Get Models")}
                               </button>
                             </div>
                           </div>
