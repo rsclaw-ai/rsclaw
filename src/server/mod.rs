@@ -1430,14 +1430,22 @@ fn build_provider_models_request(
 ) -> Result<reqwest::RequestBuilder, String> {
     use crate::provider::defaults as prov_defaults;
 
-    // For custom providers, resolve auth/URL based on api_type
-    let effective_type = if req.provider == "custom" {
+    // For custom/codingplan providers, resolve auth/URL based on api_type
+    let is_custom_like = req.provider == "custom" || req.provider == "codingplan";
+    let effective_type = if is_custom_like {
         req.api_type.as_deref().unwrap_or("openai")
     } else {
         req.provider.as_str()
     };
 
-    let (default_url, default_auth) = prov_defaults::resolve_base_url(&req.provider);
+    let (default_url, default_auth) = if is_custom_like {
+        // custom/codingplan: no default URL, auth based on api_type
+        let at = req.api_type.as_deref().unwrap_or("openai");
+        let (url, auth) = prov_defaults::resolve_base_url(at);
+        (url, auth)
+    } else {
+        prov_defaults::resolve_base_url(&req.provider)
+    };
 
     // Resolve base URL
     let base_url = if let Some(ref explicit) = req.base_url {
@@ -1450,8 +1458,8 @@ fn build_provider_models_request(
         return Err("unknown provider".to_owned());
     };
 
-    // Determine auth style — custom provider uses api_type, others use provider default
-    let auth_style = if req.provider == "custom" {
+    // Determine auth style — custom/codingplan provider uses api_type, others use provider default
+    let auth_style = if is_custom_like {
         match effective_type {
             "anthropic" => "x-api-key",
             "gemini" => "gemini-key",

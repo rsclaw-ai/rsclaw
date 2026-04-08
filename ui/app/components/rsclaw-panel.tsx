@@ -3464,8 +3464,9 @@ function TauriConfigPageInner() {
   const handleTestProvider = async (provId: string) => {
     const apiKey = getVal(`models.providers.${provId}.apiKey`, "");
     const baseUrl = getVal(`models.providers.${provId}.baseUrl`, "");
-    const apiType = provId === "custom" ? (getVal(`models.providers.${provId}.api`, "") || getVal(`models.providers.${provId}.api_type`, "")) : undefined;
-    if (!apiKey && provId !== "ollama" && !(provId === "custom" && apiType === "ollama")) {
+    const isCustomLike = provId === "custom" || provId === "codingplan";
+    const apiType = isCustomLike ? (getVal(`models.providers.${provId}.api`, "") || getVal(`models.providers.${provId}.api_type`, "")) : undefined;
+    if (!apiKey && provId !== "ollama" && !(isCustomLike && (apiType === "ollama" || baseUrl))) {
       toast.error(zh ? "请先填写 API Key" : "Enter API Key first");
       return;
     }
@@ -3477,7 +3478,10 @@ function TauriConfigPageInner() {
       if (tauriInvoke) {
         res = await tauriInvoke("test_provider", { provider: provId, apiKey, baseUrl: baseUrl || null, apiType: apiType || null });
       } else {
-        res = await testProviderKey(provId, apiKey, baseUrl || undefined, apiType || undefined);
+        // Use listProviderModels which both validates connection and returns models
+        res = await listProviderModels(provId, apiKey, baseUrl || undefined, apiType || undefined);
+        // Normalize: listProviderModels returns {models:[...]} on success
+        if (res.models && res.models.length > 0) res.ok = true;
       }
       if (res.ok || res.success) {
         // Must have models to be considered connected
