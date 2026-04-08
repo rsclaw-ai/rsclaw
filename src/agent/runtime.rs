@@ -4861,6 +4861,8 @@ $bitmap.Dispose()
             .timeout(std::time::Duration::from_secs(120))
             .build().unwrap_or_default();
 
+        tracing::info!(provider = img_prov, model = image_model, size = size, ua = img_ua, "tool_image: generating");
+
         // Provider-specific API formats
         let is_qwen = img_prov == "qwen";
         let is_minimax = img_prov == "minimax";
