@@ -517,7 +517,33 @@ fn save_cron_jobs(content: String) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(&path, &content).map_err(|e| e.to_string())
+    std::fs::write(&path, &content).map_err(|e| e.to_string())?;
+
+    // Notify running gateway to reload cron jobs
+    let port = get_gateway_port_number();
+    let url = format!("http://127.0.0.1:{port}/api/v1/cron/reload");
+    if let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        let _ = client.post(&url).send();
+    }
+
+    Ok(())
+}
+
+/// Get gateway port number (default 18888)
+fn get_gateway_port_number() -> u64 {
+    let home = dirs::home_dir().unwrap_or_default();
+    let config_path = home.join(".rsclaw").join("rsclaw.json5");
+    if !config_path.exists() {
+        return 18888;
+    }
+    let raw = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let val: serde_json::Value = json5::from_str(&raw).unwrap_or(serde_json::json!({}));
+    val.pointer("/gateway/port")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(18888)
 }
 
 /// Read cron jobs from ~/.rsclaw/cron/jobs.json

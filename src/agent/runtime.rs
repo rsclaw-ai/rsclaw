@@ -5403,6 +5403,18 @@ $synth.Speak('{}')
                 jobs.push(job);
                 write_cron_jobs(&cron_path, &jobs).await?;
 
+                // Notify gateway to reload cron jobs
+                let port = self.config.gateway.port;
+                let client = reqwest::Client::new();
+                if let Err(e) = client
+                    .post(format!("http://127.0.0.1:{port}/api/v1/cron/reload"))
+                    .timeout(Duration::from_secs(3))
+                    .send()
+                    .await
+                {
+                    debug!(err = %e, "cron add: failed to notify gateway reload");
+                }
+
                 Ok(json!({"added": id, "schedule": schedule, "message": message}))
             }
             "remove" => {
@@ -5436,6 +5448,18 @@ $synth.Speak('{}')
                         "cron remove: `index` or `id` required (index is preferred)"
                     ));
                 };
+
+                // Notify gateway to reload cron jobs
+                let port = self.config.gateway.port;
+                let client = reqwest::Client::new();
+                if let Err(e) = client
+                    .post(format!("http://127.0.0.1:{port}/api/v1/cron/reload"))
+                    .timeout(Duration::from_secs(3))
+                    .send()
+                    .await
+                {
+                    debug!(err = %e, "cron remove: failed to notify gateway reload");
+                }
 
                 Ok(json!({"removed": removed_job}))
             }

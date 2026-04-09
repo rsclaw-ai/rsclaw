@@ -123,6 +123,20 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
             jobs.push(job);
             crate::cron::save_cron_jobs(&jobs)?;
 
+            // Notify the running gateway to reload cron jobs
+            if let Ok(config) = config::load() {
+                let port = config.gateway.port;
+                let url = format!("http://127.0.0.1:{port}/api/v1/cron/reload");
+                if let Ok(client) = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(3))
+                    .build()
+                {
+                    if let Err(e) = client.post(&url).send() {
+                        warn!("failed to notify gateway of cron reload: {e}");
+                    }
+                }
+            }
+
             ok(&format!(
                 "added cron job '{}' ({})",
                 cyan(&id),
@@ -156,6 +170,21 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
                 anyhow::bail!("cron job '{id}' not found");
             }
             crate::cron::save_cron_jobs(&jobs)?;
+
+            // Notify the running gateway to reload cron jobs
+            if let Ok(config) = config::load() {
+                let port = config.gateway.port;
+                let url = format!("http://127.0.0.1:{port}/api/v1/cron/reload");
+                if let Ok(client) = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(3))
+                    .build()
+                {
+                    if let Err(e) = client.post(&url).send() {
+                        warn!("failed to notify gateway of cron reload: {e}");
+                    }
+                }
+            }
+
             ok(&format!("removed cron job '{}'", cyan(&id)));
         }
     }

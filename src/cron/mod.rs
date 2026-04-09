@@ -44,6 +44,22 @@ const MAX_CONSECUTIVE_ERRORS: u32 = 5;
 /// After this many ms without completing, a running job is considered stale.
 const STUCK_RUN_MS: u64 = 2 * 60 * 60 * 1000; // 2 hours
 
+/// Exponential backoff delays (ms) indexed by consecutive error count.
+/// After the last entry the delay stays constant.
+const ERROR_BACKOFF_MS: [u64; 5] = [
+    30_000,    // 1st error  →  30 seconds
+    60_000,    // 2nd error  →  1 minute
+    300_000,   // 3rd error  →  5 minutes
+    900_000,   // 4th error  →  15 minutes
+    3_600_000, // 5th+ error →  60 minutes
+];
+
+/// Get backoff delay for consecutive error count.
+fn error_backoff_ms(consecutive_errors: u32) -> u64 {
+    let idx = (consecutive_errors.saturating_sub(1) as usize).min(ERROR_BACKOFF_MS.len() - 1);
+    ERROR_BACKOFF_MS[idx]
+}
+
 // ---------------------------------------------------------------------------
 // CronJob — serialisable description of a single scheduled task
 // ---------------------------------------------------------------------------
@@ -561,6 +577,7 @@ impl CronRunner {
                 let handle = tokio::spawn(async move {
                     let start_time = current_timestamp_ms();
                     let job_started_at = started_at;
+                    let prev_consecutive_errors = job.state.as_ref().map(|s| s.consecutive_errors).unwrap_or(0);
                     info!(job_id = %job.id, "cron job triggered");
 
                     let result = run_cron_job(&job, &agents).await;
@@ -583,13 +600,36 @@ impl CronRunner {
                             )
                         }
                         Err(e) => {
-                            // Error - send error notification
+                            // Error - send error notification with consecutive failure count and backoff
                             let job_name = job.name.as_deref().unwrap_or(&job.id);
-                            format!(
-                                "❌ 定时任务执行失败\n\n**任务**: {}\n**错误**: {}",
-                                job_name,
-                                e
-                            )
+                            let consecutive = prev_consecutive_errors + 1;
+                            let backoff = error_backoff_ms(consecutive);
+                            let will_disable = consecutive >= MAX_CONSECUTIVE_ERRORS;
+
+                            let backoff_text = if backoff < 60_000 {
+                                format!("{}秒", backoff / 1000)
+                            } else if backoff < 3_600_000 {
+                                format!("{}分钟", backoff / 60_000)
+                            } else {
+                                format!("{}小时", backoff / 3_600_000)
+                            };
+
+                            if will_disable {
+                                format!(
+                                    "❌ 定时任务执行失败\n\n**任务**: {}\n**连续失败**: {} 次\n**错误**: {}\n\n⚠️ 任务已被自动禁用，请检查配置后手动启用。",
+                                    job_name,
+                                    consecutive,
+                                    e
+                                )
+                            } else {
+                                format!(
+                                    "❌ 定时任务执行失败\n\n**任务**: {}\n**连续失败**: {} 次\n**下次重试**: {}后\n**错误**: {}",
+                                    job_name,
+                                    consecutive,
+                                    backoff_text,
+                                    e
+                                )
+                            }
                         }
                     };
 
@@ -606,7 +646,8 @@ impl CronRunner {
                     );
                     let _ = write_run_log(&run_log_dir, &job.id, entry).await;
 
-                    (job.id, result.is_ok(), duration_ms, job_started_at)
+                    let error_msg = result.as_ref().err().map(|e| e.to_string());
+                    (job.id, result.is_ok(), duration_ms, job_started_at, error_msg)
                 });
 
                 handles.push(handle);
@@ -614,27 +655,52 @@ impl CronRunner {
 
             // Wait for all jobs to complete and update state
             for handle in handles {
-                if let Ok((job_id, success, duration_ms, started_at)) = handle.await {
+                if let Ok((job_id, success, duration_ms, started_at, error_msg)) = handle.await {
                     if let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) {
                         if let Some(state) = job.state.as_mut() {
                             state.running_at_ms = None;
                             state.last_run_at_ms = Some(current_timestamp_ms());
                             state.last_duration_ms = Some(duration_ms);
 
-                            // Compute next_run_at_ms AFTER job completion using the actual start time
-                            // This prevents interval-based jobs from firing early
                             let completion_time = started_at + duration_ms;
-                            state.next_run_at_ms = job.schedule.compute_next_run(completion_time);
 
                             if success {
                                 state.consecutive_errors = 0;
                                 state.last_run_status = Some("ok".to_string());
                                 state.last_status = Some("ok".to_string());
                                 state.last_error = None;
+                                // Compute next run normally
+                                state.next_run_at_ms = job.schedule.compute_next_run(completion_time);
                             } else {
                                 state.consecutive_errors += 1;
                                 state.last_run_status = Some("error".to_string());
                                 state.last_status = Some("error".to_string());
+                                state.last_error = error_msg;
+
+                                // Apply exponential backoff for errored jobs
+                                let backoff = error_backoff_ms(state.consecutive_errors);
+                                let backoff_next = completion_time + backoff;
+                                let normal_next = job.schedule.compute_next_run(completion_time);
+                                // Use whichever is later: the natural next run or the backoff delay
+                                state.next_run_at_ms = Some(normal_next.map(|n| n.max(backoff_next)).unwrap_or(backoff_next));
+
+                                info!(
+                                    job_id = %job.id,
+                                    consecutive_errors = state.consecutive_errors,
+                                    backoff_ms = backoff,
+                                    next_run_at_ms = state.next_run_at_ms,
+                                    "cron: applying error backoff"
+                                );
+
+                                // Auto-disable after max consecutive errors
+                                if state.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                                    warn!(
+                                        job_id = %job.id,
+                                        consecutive_errors = state.consecutive_errors,
+                                        "cron: disabling job after repeated failures"
+                                    );
+                                    job.enabled = false;
+                                }
                             }
                         }
                     }
@@ -658,15 +724,35 @@ impl CronRunner {
 
         info!(job_id = %job.id, "manually triggering cron job");
         let _permit = self.semaphore.acquire().await?;
+        let prev_consecutive_errors = job.state.as_ref().map(|s| s.consecutive_errors).unwrap_or(0);
         let result = run_cron_job(job, &self.agents).await;
         let success = result.is_ok();
-        if let Ok(output) = &result {
-            if let Err(e) =
-                send_delivery(&self.channels, job, &self.default_delivery, output).await
-            {
-                warn!(job_id = %job.id, %e, "delivery failed");
+
+        // Build delivery message with execution summary
+        let delivery_text = match &result {
+            Ok(output) if !output.trim().is_empty() => output.clone(),
+            Ok(_) => {
+                let job_name = job.name.as_deref().unwrap_or(&job.id);
+                format!("✅ 定时任务执行完成\n\n**任务**: {}", job_name)
             }
+            Err(e) => {
+                let job_name = job.name.as_deref().unwrap_or(&job.id);
+                let consecutive = prev_consecutive_errors + 1;
+                // Manual trigger: show error but don't mention auto-disable
+                // (manual triggers don't count toward auto-disable threshold)
+                format!(
+                    "❌ 定时任务执行失败\n\n**任务**: {}\n**连续失败**: {} 次\n**错误**: {}",
+                    job_name, consecutive, e
+                )
+            }
+        };
+
+        if let Err(e) =
+            send_delivery(&self.channels, job, &self.default_delivery, &delivery_text).await
+        {
+            warn!(job_id = %job.id, %e, "delivery failed");
         }
+
         let log_err = if success {
             None
         } else {
