@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Semaphore};
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     agent::{AgentMessage, AgentRegistry},
@@ -93,8 +93,11 @@ impl CronSchedule {
     /// For interval schedules (every): uses anchor + n*everyMs.
     pub fn compute_next_run(&self, from_ms: u64) -> Option<u64> {
         match self {
-            CronSchedule::Flat(expr) | CronSchedule::Nested { expr, .. } => {
-                crate::cron::compute_next_run_from_expr(expr, from_ms)
+            CronSchedule::Flat(expr) => {
+                crate::cron::compute_next_run_from_expr(expr, from_ms, None)
+            }
+            CronSchedule::Nested { expr, tz, .. } => {
+                crate::cron::compute_next_run_from_expr(expr, from_ms, tz.as_deref())
             }
             CronSchedule::Every { every_ms, anchor_ms } => {
                 let every_ms = every_ms.unwrap_or(0);
@@ -350,9 +353,12 @@ impl CronRunner {
                 }
             }
 
-            // Compute next_run_at_ms if not set
-            if state.next_run_at_ms.is_none() {
+            // Compute next_run_at_ms if not set OR if the stored value is in the past
+            // (may have been computed with the old buggy algorithm that ignored timezone)
+            if state.next_run_at_ms.is_none() || state.next_run_at_ms.is_some_and(|t| t <= now_ms) {
+                let old_ts = state.next_run_at_ms;
                 state.next_run_at_ms = job.schedule.compute_next_run(now_ms);
+                info!(job_id = %job.id, old = ?old_ts, new = ?state.next_run_at_ms, "cron: recomputed next_run_at_ms");
             }
         }
 
@@ -413,6 +419,12 @@ impl CronRunner {
                 .filter_map(|j| j.state.as_ref().and_then(|s| s.next_run_at_ms))
                 .min();
 
+            // DEBUG: log next_wake to diagnose early firing
+            debug!(next_wake = next_wake.unwrap_or(0), now_ms, "cron: timer tick");
+            if next_wake.map(|t| t <= now_ms).unwrap_or(false) {
+                warn!(next_wake = next_wake.unwrap_or(0), now_ms, "cron: next_wake is in the past!");
+            }
+
             let delay_ms = match next_wake {
                 Some(next_wake) => {
                     let delay = next_wake.saturating_sub(now_ms);
@@ -455,16 +467,16 @@ impl CronRunner {
 
             if reload_triggered {
                 // Reload jobs from file
+                let old_count = jobs.len();
                 let new_jobs = load_cron_jobs();
-                jobs = self.merge_jobs(&jobs, new_jobs);
+                let file_count = new_jobs.len();
+                jobs = self.merge_jobs(&jobs, new_jobs, now_ms);
                 if let Err(e) = self.save_store(&jobs).await {
                     warn!(err = %e, "cron: failed to save store after reload");
                 }
-                info!(count = jobs.len(), "cron jobs reloaded");
+                info!(old_count, new_count = jobs.len(), file_count, "cron jobs reloaded");
                 continue;
             }
-
-            let now_ms = current_timestamp_ms();
 
             // Collect jobs that are due and not already running
             let due: Vec<_> = jobs
@@ -488,7 +500,7 @@ impl CronRunner {
                 continue;
             }
 
-            debug!(count = due.len(), "cron: {} jobs due", due.len());
+            info!(count = due.len(), "cron: {} jobs due", due.len());
 
             // Execute due jobs with concurrency limit
             let mut handles = Vec::new();
@@ -504,11 +516,12 @@ impl CronRunner {
                     continue;
                 };
 
-                // Mark as running and compute next run
+                // Mark as running
                 let started_at = current_timestamp_ms();
                 if let Some(state) = job.state.as_mut() {
                     state.running_at_ms = Some(started_at);
-                    state.next_run_at_ms = job.schedule.compute_next_run(started_at);
+                    // Don't compute next_run_at_ms here; compute it AFTER the job finishes
+                    // using the completion time, so interval-based jobs don't fire early
                 }
 
                 let permit = permit.unwrap();
@@ -520,6 +533,7 @@ impl CronRunner {
 
                 let handle = tokio::spawn(async move {
                     let start_time = current_timestamp_ms();
+                    let job_started_at = started_at;
                     info!(job_id = %job.id, "cron job triggered");
 
                     let result = run_cron_job(&job, &agents).await;
@@ -565,7 +579,7 @@ impl CronRunner {
                     );
                     let _ = write_run_log(&run_log_dir, &job.id, entry).await;
 
-                    (job.id, result.is_ok(), duration_ms)
+                    (job.id, result.is_ok(), duration_ms, job_started_at)
                 });
 
                 handles.push(handle);
@@ -573,12 +587,17 @@ impl CronRunner {
 
             // Wait for all jobs to complete and update state
             for handle in handles {
-                if let Ok((job_id, success, duration_ms)) = handle.await {
+                if let Ok((job_id, success, duration_ms, started_at)) = handle.await {
                     if let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) {
                         if let Some(state) = job.state.as_mut() {
                             state.running_at_ms = None;
                             state.last_run_at_ms = Some(current_timestamp_ms());
                             state.last_duration_ms = Some(duration_ms);
+
+                            // Compute next_run_at_ms AFTER job completion using the actual start time
+                            // This prevents interval-based jobs from firing early
+                            let completion_time = started_at + duration_ms;
+                            state.next_run_at_ms = job.schedule.compute_next_run(completion_time);
 
                             if success {
                                 state.consecutive_errors = 0;
@@ -633,8 +652,9 @@ impl CronRunner {
 
     /// Merge old jobs (with their state) with new jobs from file.
     /// Preserves running state and error counts for existing jobs.
-    fn merge_jobs(&self, old_jobs: &[CronJob], new_jobs: Vec<CronJob>) -> Vec<CronJob> {
-        let now_ms = current_timestamp_ms();
+    /// Jobs in old_jobs but NOT in new_jobs are dropped (deleted from file).
+    /// Takes `now_ms` from the caller (timer_loop) to avoid redundant calls.
+    fn merge_jobs(&self, old_jobs: &[CronJob], new_jobs: Vec<CronJob>, now_ms: u64) -> Vec<CronJob> {
         let mut result = Vec::with_capacity(new_jobs.len());
 
         for mut new_job in new_jobs {
@@ -727,7 +747,9 @@ fn field_matches(field: &str, value: u32) -> bool {
 
 /// Compute the next UTC timestamp (ms) when a cron expression should fire,
 /// starting from `from_ms`. Returns None if parsing fails.
-fn compute_next_run_from_expr(cron_expr: &str, from_ms: u64) -> Option<u64> {
+/// If `tz` is Some, the cron expression is evaluated in that timezone.
+/// Otherwise, UTC is used.
+fn compute_next_run_from_expr(cron_expr: &str, from_ms: u64, tz: Option<&str>) -> Option<u64> {
     let fields: Vec<&str> = cron_expr.split_whitespace().collect();
     if fields.len() != 5 {
         warn!(expr = %cron_expr, "cron: expression must have exactly 5 fields");
@@ -737,17 +759,28 @@ fn compute_next_run_from_expr(cron_expr: &str, from_ms: u64) -> Option<u64> {
         return None;
     };
 
-    // Parse from_ms as UTC NaiveDateTime
-    let from = match chrono::DateTime::from_timestamp_millis(from_ms as i64) {
-        Some(dt) => dt.naive_utc(),
+    // Parse from_ms as UTC DateTime
+    let utc_dt = match chrono::DateTime::from_timestamp_millis(from_ms as i64) {
+        Some(dt) => dt,
         None => return None,
     };
 
-    // Current minute boundary (we trigger at the start of the minute)
-    let mut cand = from.with_second(0).unwrap().with_nanosecond(0).unwrap();
+    // Determine timezone
+    let tz_opt: Option<chrono_tz::Tz> = tz.and_then(|tz_str| tz_str.parse().ok());
+
+    // Search in local time, always using a timezone-aware DateTime
+    // (UTC if no timezone specified, so we still use DateTime<chrono_tz::Tz> with UTC)
+    let tz_for_search: chrono_tz::Tz = match tz_opt {
+        Some(tz) => tz,
+        None => chrono_tz::UTC,
+    };
+
+    // Current minute in the target timezone
+    let local_now = utc_dt.with_timezone(&tz_for_search);
+    let mut cand = local_now.with_second(0).unwrap().with_nanosecond(0).unwrap();
     cand += chrono::Duration::minutes(1);
 
-    // Search up to 1 year ahead
+    // Search up to 1 year ahead (in local time)
     let max_cand = cand + chrono::Duration::days(366);
 
     while cand < max_cand {
@@ -757,7 +790,9 @@ fn compute_next_run_from_expr(cron_expr: &str, from_ms: u64) -> Option<u64> {
             && field_matches(hr_f, cand.hour())
             && field_matches(min_f, cand.minute())
         {
-            return Some(cand.and_utc().timestamp_millis() as u64);
+            // Convert the matched local time to UTC
+            let utc_cand = cand.with_timezone(&chrono::Utc);
+            return Some(utc_cand.timestamp_millis() as u64);
         }
         cand += chrono::Duration::minutes(1);
     }
@@ -1023,23 +1058,23 @@ pub fn load_cron_jobs() -> Vec<CronJob> {
 }
 
 /// Save cron jobs to the cron store file (openclaw-compatible path).
-pub fn save_cron_jobs(jobs: &[CronJob]) -> std::io::Result<()> {
+pub fn save_cron_jobs(jobs: &[CronJob]) -> anyhow::Result<()> {
     let cron_file = resolve_cron_store_path();
+    debug!(path = %cron_file.display(), "cron: saving jobs to file");
 
     let store = serde_json::json!({
         "version": 1,
         "jobs": jobs,
     });
 
-    let json = serde_json::to_string_pretty(&store).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-    })?;
+    let json = serde_json::to_string_pretty(&store)
+        .context("failed to serialize cron jobs to JSON")?;
 
     // Ensure directory exists
     if let Some(parent) = cron_file.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent).context("failed to create cron directory")?;
     }
 
-    std::fs::write(&cron_file, json)?;
+    std::fs::write(&cron_file, json).context("failed to write cron jobs file")?;
     Ok(())
 }

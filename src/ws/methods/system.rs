@@ -2,6 +2,7 @@ use crate::ws::{
     dispatch::{MethodCtx, MethodResult},
     types::ErrorShape,
 };
+use tracing::warn;
 use std::path::PathBuf;
 
 pub async fn health(ctx: MethodCtx) -> MethodResult {
@@ -196,7 +197,9 @@ pub async fn cron_add(ctx: MethodCtx) -> MethodResult {
         .map_err(|e| ErrorShape::internal(format!("failed to save cron job: {}", e)))?;
 
     // Notify CronRunner to reload jobs from file
-    let _ = ctx.state.cron_reload.send(());
+    if let Err(e) = ctx.state.cron_reload.send(()) {
+        warn!(err = %e, "cron: failed to send reload signal");
+    }
 
     Ok(serde_json::json!({ "id": id, "schedule": schedule }))
 }
@@ -223,7 +226,9 @@ pub async fn cron_remove(ctx: MethodCtx) -> MethodResult {
         .map_err(|e| ErrorShape::internal(format!("failed to save cron job: {}", e)))?;
 
     // Notify CronRunner to reload jobs from file
-    let _ = ctx.state.cron_reload.send(());
+    if let Err(e) = ctx.state.cron_reload.send(()) {
+        warn!(err = %e, "cron: failed to send reload signal");
+    }
 
     Ok(serde_json::json!({ "removed": id }))
 }
@@ -555,7 +560,9 @@ pub async fn cron_update(ctx: MethodCtx) -> MethodResult {
         .map_err(|e| ErrorShape::internal(format!("failed to save cron job: {}", e)))?;
 
     // Notify CronRunner to reload jobs from file
-    let _ = ctx.state.cron_reload.send(());
+    if let Err(e) = ctx.state.cron_reload.send(()) {
+        warn!(err = %e, "cron: failed to send reload signal");
+    }
 
     Ok(serde_json::json!({ "updated": id }))
 }
