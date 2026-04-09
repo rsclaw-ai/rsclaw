@@ -1,4 +1,5 @@
 use anyhow::Result;
+use tracing::warn;
 
 use super::style::*;
 use crate::{cli::CronCommand, config};
@@ -262,6 +263,21 @@ pub fn cron_set_enabled(id: &str, enabled: bool) -> Result<()> {
         anyhow::bail!("cron job '{id}' not found");
     }
     crate::cron::save_cron_jobs(&jobs)?;
+
+    // Notify the running gateway to reload cron jobs
+    if let Ok(config) = config::load() {
+        let port = config.gateway.port;
+        let url = format!("http://127.0.0.1:{port}/api/v1/cron/reload");
+        if let Ok(client) = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+        {
+            if let Err(e) = client.post(&url).send() {
+                warn!("failed to notify gateway of cron reload: {e}");
+            }
+        }
+    }
+
     if enabled {
         ok(&format!("cron job '{}' enabled", cyan(id)));
     } else {

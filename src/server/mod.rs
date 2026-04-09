@@ -179,6 +179,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/status", get(status))
         .route("/config/reload", post(config_reload))
         .route("/config", get(get_config).put(save_config))
+        .route("/cron/reload", post(cron_reload))
         .route("/channels/pair", post(channels_pair))
         .route("/channels/unpair", post(channels_unpair))
         .route("/channels/pairings", get(list_pairings))
@@ -688,6 +689,17 @@ async fn config_reload(State(_state): State<AppState>) -> impl IntoResponse {
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn cron_reload(State(state): State<AppState>) -> impl IntoResponse {
+    match state.cron_reload.send(()) {
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"reloaded": true}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("cron reload error: {}", e)})),
         )
             .into_response(),
     }

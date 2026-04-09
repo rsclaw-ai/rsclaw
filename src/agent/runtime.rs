@@ -5439,8 +5439,110 @@ $synth.Speak('{}')
 
                 Ok(json!({"removed": removed_job}))
             }
+            "enable" | "disable" => {
+                let enabled = action == "enable";
+                let mut jobs = read_cron_jobs(&cron_path).await;
+
+                let idx = if let Some(index) = args["index"].as_u64() {
+                    let idx = index as usize;
+                    if idx == 0 || idx > jobs.len() {
+                        return Err(anyhow!(
+                            "cron {}: invalid index {} (valid: 1-{})",
+                            action, index, jobs.len()
+                        ));
+                    }
+                    idx - 1
+                } else if let Some(id) = args["id"].as_str() {
+                    match jobs.iter().position(|j| j["id"].as_str() == Some(id)) {
+                        Some(pos) => pos,
+                        None => return Err(anyhow!("cron {}: job not found with id={}", action, id)),
+                    }
+                } else {
+                    return Err(anyhow!(
+                        "cron {}: `index` or `id` required (index is preferred)",
+                        action
+                    ));
+                };
+
+                let id = jobs[idx]["id"].as_str().unwrap_or("?").to_string();
+                jobs[idx]["enabled"] = json!(enabled);
+                jobs[idx]["updatedAtMs"] = json!(Utc::now().timestamp_millis() as u64);
+                write_cron_jobs(&cron_path, &jobs).await?;
+
+                // Notify gateway to reload cron jobs
+                let port = self.config.gateway.port;
+                let client = reqwest::Client::new();
+                if let Err(e) = client
+                    .post(format!("http://127.0.0.1:{port}/api/v1/cron/reload"))
+                    .timeout(Duration::from_secs(3))
+                    .send()
+                    .await
+                {
+                    debug!(err = %e, "cron {}: failed to notify gateway reload", action);
+                }
+
+                Ok(json!({action: id}))
+            }
+            "edit" => {
+                let mut jobs = read_cron_jobs(&cron_path).await;
+
+                let idx = if let Some(index) = args["index"].as_u64() {
+                    let idx = index as usize;
+                    if idx == 0 || idx > jobs.len() {
+                        return Err(anyhow!(
+                            "cron edit: invalid index {} (valid: 1-{})",
+                            index, jobs.len()
+                        ));
+                    }
+                    idx - 1
+                } else if let Some(id) = args["id"].as_str() {
+                    match jobs.iter().position(|j| j["id"].as_str() == Some(id)) {
+                        Some(pos) => pos,
+                        None => return Err(anyhow!("cron edit: job not found with id={}", id)),
+                    }
+                } else {
+                    return Err(anyhow!(
+                        "cron edit: `index` or `id` required (index is preferred)"
+                    ));
+                };
+
+                let id = jobs[idx]["id"].as_str().unwrap_or("?").to_string();
+                if let Some(schedule) = args["schedule"].as_str() {
+                    let tz = args["tz"].as_str();
+                    if let Some(tz_val) = tz {
+                        jobs[idx]["schedule"] = json!({"kind": "cron", "expr": schedule, "tz": tz_val});
+                    } else {
+                        jobs[idx]["schedule"] = json!({"kind": "cron", "expr": schedule});
+                    }
+                }
+                if let Some(message) = args["message"].as_str() {
+                    jobs[idx]["payload"] = json!({"kind": "systemEvent", "text": message});
+                }
+                if let Some(name) = args["name"].as_str() {
+                    jobs[idx]["name"] = json!(name);
+                }
+                if let Some(agent_id) = args["agentId"].as_str().or(args["agent_id"].as_str()) {
+                    jobs[idx]["agentId"] = json!(agent_id);
+                }
+                jobs[idx]["updatedAtMs"] = json!(Utc::now().timestamp_millis() as u64);
+                write_cron_jobs(&cron_path, &jobs).await?;
+
+                // Notify gateway to reload cron jobs
+                let port = self.config.gateway.port;
+                let client = reqwest::Client::new();
+                if let Err(e) = client
+                    .post(format!("http://127.0.0.1:{port}/api/v1/cron/reload"))
+                    .timeout(Duration::from_secs(3))
+                    .send()
+                    .await
+                {
+                    debug!(err = %e, "cron edit: failed to notify gateway reload");
+                }
+
+                Ok(json!({"edited": id}))
+            }
             other => Err(anyhow!(
-                "cron: unsupported action `{other}` (list, add, remove)"
+                "cron: unsupported action `{other}` (list, add, edit, remove, enable, disable)"
             )),
         }
     }
@@ -6951,15 +7053,18 @@ fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "cron".to_owned(),
-        description: "List, add, or remove cron jobs. For remove, prefer using `index` from the list output instead of `id` to avoid ID truncation issues.".to_owned(),
+        description: "List, add, edit, remove, enable or disable cron jobs. For edit/remove/enable/disable, prefer using `index` from the list output instead of `id` to avoid ID truncation issues.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "action":   {"type": "string", "enum": ["list", "add", "remove"], "description": "Action to perform"},
-                "schedule": {"type": "string", "description": "Cron schedule expression (for add)"},
-                "message":  {"type": "string", "description": "Message or task to run (for add)"},
-                "index":    {"type": "number", "description": "Job index from list (1-based, for remove - preferred)"},
-                "id":       {"type": "string", "description": "Job ID (for remove - use index instead if possible)"}
+                "action":   {"type": "string", "enum": ["list", "add", "edit", "remove", "enable", "disable"], "description": "Action to perform"},
+                "schedule": {"type": "string", "description": "Cron schedule expression (for add, edit)"},
+                "message":  {"type": "string", "description": "Message or task to run (for add, edit)"},
+                "index":    {"type": "number", "description": "Job index from list (1-based, for edit/remove/enable/disable - preferred)"},
+                "id":       {"type": "string", "description": "Job ID (for edit/remove/enable/disable - use index instead if possible)"},
+                "name":     {"type": "string", "description": "Job name (for add, edit)"},
+                "tz":       {"type": "string", "description": "Timezone e.g. Asia/Shanghai (for add, edit)"},
+                "agentId":  {"type": "string", "description": "Agent ID to run the job (for add, edit, default: main)"}
             },
             "required": ["action"]
         }),
