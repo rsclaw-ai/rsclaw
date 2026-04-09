@@ -468,9 +468,25 @@ impl CronRunner {
             if reload_triggered {
                 // Reload jobs from file
                 let old_count = jobs.len();
-                let new_jobs = load_cron_jobs();
+                let new_jobs = crate::cron::load_cron_jobs();
                 let file_count = new_jobs.len();
+
+                // Debug: check if disabled job is in new_jobs
+                let disabled_in_file: Vec<_> = new_jobs.iter()
+                    .filter(|j| !j.enabled)
+                    .map(|j| (&j.id, j.enabled))
+                    .collect();
+                info!(old_count, new_count = new_jobs.len(), file_count, disabled=?disabled_in_file, "cron: reload triggered, reloading from file");
+
                 jobs = self.merge_jobs(&jobs, new_jobs, now_ms);
+
+                // Debug: check enabled state after merge
+                let disabled_after_merge: Vec<_> = jobs.iter()
+                    .filter(|j| !j.enabled)
+                    .map(|j| (&j.id, j.enabled))
+                    .collect();
+                info!(after_merge_count = jobs.len(), disabled=?disabled_after_merge, "cron: merge complete");
+
                 if let Err(e) = self.save_store(&jobs).await {
                     warn!(err = %e, "cron: failed to save store after reload");
                 }
@@ -495,6 +511,17 @@ impl CronRunner {
                 })
                 .map(|j| j.id.clone())
                 .collect();
+
+            // Debug: log enabled state of all jobs that are due but shouldn't fire
+            if !due.is_empty() {
+                let disabled_due: Vec<_> = jobs.iter()
+                    .filter(|j| !j.enabled && j.state.as_ref().and_then(|s| s.next_run_at_ms).map(|t| t <= now_ms).unwrap_or(false))
+                    .map(|j| j.id.clone())
+                    .collect();
+                if !disabled_due.is_empty() {
+                    warn!(job_ids = ?disabled_due, "cron: these jobs are due but disabled!");
+                }
+            }
 
             if due.is_empty() {
                 continue;
@@ -733,16 +760,46 @@ fn field_matches(field: &str, value: u32) -> bool {
     if field.contains(',') {
         return field.split(',').any(|part| field_matches(part.trim(), value));
     }
-    // Handle range: "9-15" means 9 through 15 inclusive
+    // Handle range: "9-15" means 9 through 15 exclusive (start <= value < end)
+    // This matches openclaw's interpretation where "9-11" means 9,10 only (not 11:59)
+    // and "13-15" means 13,14 only (not 15:59)
     if field.contains('-') {
         let parts: Vec<&str> = field.split('-').collect();
         if parts.len() == 2 {
             if let (Ok(start), Ok(end)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-                return value >= start && value <= end;
+                return value >= start && value < end;
             }
         }
     }
     field.parse::<u32>().map(|v| v == value).unwrap_or(false)
+}
+
+/// Check if a dow value matches a dow field.
+/// Dow ranges use INCLUSIVE end (e.g., "1-5" = 1,2,3,4,5, where 1=Sunday).
+/// This differs from hour/dom ranges which use exclusive end.
+fn dow_matches(field: &str, dow: u32) -> bool {
+    if field == "*" {
+        return true;
+    }
+    if let Some(step) = field.strip_prefix("*/") {
+        if let Ok(n) = step.parse::<u32>() {
+            return n > 0 && dow % n == 0;
+        }
+    }
+    // Handle comma-separated lists
+    if field.contains(',') {
+        return field.split(',').any(|part| dow_matches(part.trim(), dow));
+    }
+    // Dow ranges: inclusive on end (e.g., "1-5" means 1 through 5 inclusive)
+    if field.contains('-') {
+        let parts: Vec<&str> = field.split('-').collect();
+        if parts.len() == 2 {
+            if let (Ok(start), Ok(end)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                return dow >= start && dow <= end;
+            }
+        }
+    }
+    field.parse::<u32>().map(|v| v == dow).unwrap_or(false)
 }
 
 /// Compute the next UTC timestamp (ms) when a cron expression should fire,
@@ -784,14 +841,23 @@ fn compute_next_run_from_expr(cron_expr: &str, from_ms: u64, tz: Option<&str>) -
     let max_cand = cand + chrono::Duration::days(366);
 
     while cand < max_cand {
-        if field_matches(mon_f, cand.month())
-            && field_matches(dom_f, cand.day())
-            && field_matches(dow_f, (cand.weekday().num_days_from_sunday() % 7) + 1)
-            && field_matches(hr_f, cand.hour())
-            && field_matches(min_f, cand.minute())
-        {
+        // Use naive date's weekday to get the weekday in local time (not UTC)
+        // chrono: Monday=0, Tuesday=1, ..., Sunday=6
+        // openclaw: Monday=1, Tuesday=2, ..., Sunday=7
+        // chrono: Sunday=0, Monday=1, ..., Saturday=6
+        // openclaw dow: Sunday=1, Monday=2, ..., Saturday=7
+        // chrono weekday IS compatible with openclaw dow (both use Sunday=0/1 as the anchor)
+        let dow = cand.date_naive().weekday().num_days_from_sunday();
+        let m = field_matches(mon_f, cand.month());
+        let d = field_matches(dom_f, cand.day());
+        let w = dow_matches(dow_f, dow);
+        let h = field_matches(hr_f, cand.hour());
+        let mi = field_matches(min_f, cand.minute());
+        debug!(expr=%cron_expr, dow, "searching: {} m={} d={} w={} h={} mi={}", cand.date_naive(), m, d, w, h, mi);
+        if m && d && w && h && mi {
             // Convert the matched local time to UTC
             let utc_cand = cand.with_timezone(&chrono::Utc);
+            debug!(expr=%cron_expr, "MATCH: {} (UTC: {})", cand, utc_cand);
             return Some(utc_cand.timestamp_millis() as u64);
         }
         cand += chrono::Duration::minutes(1);
