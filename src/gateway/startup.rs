@@ -342,15 +342,20 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         });
         let cron_enabled = cron_cfg.enabled.unwrap_or(true);
 
-        // Load jobs from base_dir/cron/jobs.json (unified with API)
+        // Load jobs from openclaw-compatible path
+        let cron_file = crate::cron::resolve_cron_store_path();
         let jobs = crate::cron::load_cron_jobs();
         if !jobs.is_empty() {
-            info!(count = jobs.len(), "loaded cron jobs");
+            info!(file = %cron_file.display(), count = jobs.len(), "loaded cron jobs");
         }
 
         if cron_enabled {
-            // Use base_dir for cron run logs
-            let cron_data_dir = base_dir.join("var").join("data");
+            // Use openclaw-compatible path for cron run logs (respects OPENCLAW_STATE_DIR)
+            let cron_data_dir = if let Some(state_dir) = std::env::var_os("OPENCLAW_STATE_DIR") {
+                PathBuf::from(state_dir)
+            } else {
+                dirs_next::home_dir().unwrap_or_default().join(".openclaw")
+            }.join("var").join("data");
             let runner = CronRunner::new(
                 &cron_cfg,
                 jobs,

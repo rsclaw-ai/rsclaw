@@ -62,6 +62,13 @@ pub enum CronSchedule {
         #[serde(default)]
         tz: Option<String>,
     },
+    /// Interval-based schedule: { kind: "every", everyMs: 259200000, anchorMs: ... } (OpenClaw compat).
+    Every {
+        #[serde(default, alias = "everyMs")]
+        every_ms: Option<u64>,
+        #[serde(default, alias = "anchorMs")]
+        anchor_ms: Option<u64>,
+    },
 }
 
 impl CronSchedule {
@@ -69,6 +76,7 @@ impl CronSchedule {
         match self {
             CronSchedule::Flat(s) => s,
             CronSchedule::Nested { expr, .. } => expr,
+            CronSchedule::Every { .. } => "every",
         }
     }
 
@@ -76,6 +84,33 @@ impl CronSchedule {
         match self {
             CronSchedule::Flat(_) => None,
             CronSchedule::Nested { tz, .. } => tz.as_deref(),
+            CronSchedule::Every { .. } => None,
+        }
+    }
+
+    /// Compute the next run timestamp (ms) from the given `from_ms`.
+    /// For cron schedules: searches forward up to 1 year.
+    /// For interval schedules (every): uses anchor + n*everyMs.
+    pub fn compute_next_run(&self, from_ms: u64) -> Option<u64> {
+        match self {
+            CronSchedule::Flat(expr) | CronSchedule::Nested { expr, .. } => {
+                crate::cron::compute_next_run_from_expr(expr, from_ms)
+            }
+            CronSchedule::Every { every_ms, anchor_ms } => {
+                let every_ms = every_ms.unwrap_or(0);
+                if every_ms == 0 {
+                    return None;
+                }
+                let anchor = anchor_ms.unwrap_or(from_ms);
+                // Find smallest n where anchor + n * every_ms > from_ms
+                if anchor > from_ms {
+                    Some(anchor)
+                } else {
+                    let elapsed = from_ms - anchor;
+                    let n = (elapsed / every_ms) + 1;
+                    Some(anchor + n * every_ms)
+                }
+            }
         }
     }
 }
@@ -83,11 +118,17 @@ impl CronSchedule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CronPayload {
+    /// Plain text message.
     Text(String),
+    /// Structured payload (OpenClaw compat): { kind: "agentTurn", message: "...", timeoutSeconds: 1800 }
     Structured {
-        #[serde(default)]
+        #[serde(default, alias = "kind")]
         kind: Option<String>,
-        text: String,
+        /// Message text - serializes as "message" for openclaw compat, accepts "text" too
+        #[serde(alias = "text", rename = "message", default)]
+        text: Option<String>,
+        #[serde(default, alias = "timeoutSeconds")]
+        timeout_seconds: Option<u64>,
     },
 }
 
@@ -95,7 +136,7 @@ impl CronPayload {
     pub fn text(&self) -> &str {
         match self {
             CronPayload::Text(s) => s,
-            CronPayload::Structured { text, .. } => text,
+            CronPayload::Structured { text, .. } => text.as_deref().unwrap_or(""),
         }
     }
 }
@@ -299,7 +340,6 @@ impl CronRunner {
                 });
             }
 
-            let cron_expr = job.cron_expr().to_string();
             let state = job.state.as_mut().unwrap();
 
             // Clear stale running marker
@@ -312,7 +352,7 @@ impl CronRunner {
 
             // Compute next_run_at_ms if not set
             if state.next_run_at_ms.is_none() {
-                state.next_run_at_ms = compute_next_run(&cron_expr, now_ms);
+                state.next_run_at_ms = job.schedule.compute_next_run(now_ms);
             }
         }
 
@@ -466,10 +506,9 @@ impl CronRunner {
 
                 // Mark as running and compute next run
                 let started_at = current_timestamp_ms();
-                let cron_expr = job.cron_expr().to_string();
                 if let Some(state) = job.state.as_mut() {
                     state.running_at_ms = Some(started_at);
-                    state.next_run_at_ms = compute_next_run(&cron_expr, started_at);
+                    state.next_run_at_ms = job.schedule.compute_next_run(started_at);
                 }
 
                 let permit = permit.unwrap();
@@ -614,10 +653,9 @@ impl CronRunner {
             }
 
             // Ensure next_run_at_ms is set
-            let cron_expr = new_job.cron_expr().to_string();
             if let Some(ref mut state) = new_job.state {
                 if state.next_run_at_ms.is_none() {
-                    state.next_run_at_ms = compute_next_run(&cron_expr, now_ms);
+                    state.next_run_at_ms = new_job.schedule.compute_next_run(now_ms);
                 }
             }
 
@@ -689,7 +727,7 @@ fn field_matches(field: &str, value: u32) -> bool {
 
 /// Compute the next UTC timestamp (ms) when a cron expression should fire,
 /// starting from `from_ms`. Returns None if parsing fails.
-fn compute_next_run(cron_expr: &str, from_ms: u64) -> Option<u64> {
+fn compute_next_run_from_expr(cron_expr: &str, from_ms: u64) -> Option<u64> {
     let fields: Vec<&str> = cron_expr.split_whitespace().collect();
     if fields.len() != 5 {
         warn!(expr = %cron_expr, "cron: expression must have exactly 5 fields");
@@ -785,11 +823,11 @@ async fn send_delivery(
     output_text: &str,
 ) -> Result<()> {
     let delivery = match &job.delivery {
-        Some(d) => {
+        Some(d) if d.channel.is_some() && d.to.is_some() => {
             debug!(job_id = %job.id, "cron: using job-level delivery");
             d
         }
-        None => match default_delivery {
+        Some(_) | None => match default_delivery {
             Some(d) => {
                 debug!(job_id = %job.id, mode = ?d.mode, channel = ?d.channel, to = ?d.to, "cron: using default_delivery");
                 d
@@ -932,9 +970,13 @@ pub async fn read_jobs_from_file(cron_dir: PathBuf) -> Result<Vec<CronJob>> {
 
 /// Returns the cron store file path.
 /// Respects RSCLAW_BASE_DIR env var (same as other rsclaw data).
-fn resolve_cron_store_path() -> PathBuf {
-    let base = crate::config::loader::base_dir();
-    base.join("cron").join("jobs.json")
+pub fn resolve_cron_store_path() -> PathBuf {
+    let cron_dir = if let Some(state_dir) = std::env::var_os("OPENCLAW_STATE_DIR") {
+        PathBuf::from(state_dir)
+    } else {
+        dirs_next::home_dir().unwrap_or_default().join(".openclaw")
+    };
+    cron_dir.join("cron").join("jobs.json")
 }
 
 /// Load cron jobs from the cron store file (openclaw-compatible path).
@@ -961,10 +1003,23 @@ pub fn load_cron_jobs() -> Vec<CronJob> {
         Vec::new()
     };
 
-    jobs_array
+    let total = jobs_array.len();
+    let jobs: Vec<CronJob> = jobs_array
         .iter()
-        .filter_map(|v| serde_json::from_value(v.clone()).ok())
-        .collect()
+        .filter_map(|v| match serde_json::from_value::<CronJob>(v.clone()) {
+            Ok(job) => Some(job),
+            Err(e) => {
+                warn!(err = %e, job_json = %serde_json::to_string_pretty(&v).unwrap_or_default(), "failed to parse cron job");
+                None
+            }
+        })
+        .collect();
+    let loaded = jobs.len();
+    if loaded < total {
+        warn!(file = %source.display(), total, loaded, "some cron jobs failed to parse");
+    }
+
+    jobs
 }
 
 /// Save cron jobs to the cron store file (openclaw-compatible path).
