@@ -848,13 +848,17 @@ async fn parse_sse_chunk_with_buffer(
     };
 
     let text = match std::str::from_utf8(&bytes) {
-        Ok(t) => t,
-        Err(e) => return vec![Err(anyhow::anyhow!("UTF-8 error: {e}"))],
+        Ok(t) => std::borrow::Cow::Borrowed(t),
+        Err(e) => {
+            // Log and replace invalid bytes with U+FFFD so the stream continues.
+            tracing::warn!("openai: UTF-8 decode error at byte {}, replacing with �: {}", e.valid_up_to(), e);
+            std::borrow::Cow::Owned(String::from_utf8_lossy(&bytes).into_owned())
+        }
     };
 
     // Lock the buffer and append the new text
     let mut buffer = line_buffer.lock().await;
-    buffer.push_str(text);
+    buffer.push_str(&text);
 
     let mut events = Vec::new();
 

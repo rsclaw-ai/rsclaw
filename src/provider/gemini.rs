@@ -220,9 +220,12 @@ fn parse_sse_chunk(chunk: Result<bytes::Bytes>) -> Vec<Result<StreamEvent>> {
         Err(e) => return vec![Err(e)],
     };
 
-    let text = match std::str::from_utf8(&bytes) {
-        Ok(t) => t,
-        Err(e) => return vec![Err(anyhow::anyhow!("UTF-8 decode error: {e}"))],
+    let text: String = match std::str::from_utf8(&bytes) {
+        Ok(t) => t.to_owned(),
+        Err(e) => {
+            tracing::warn!("gemini: UTF-8 decode error at byte {}, replacing with �: {}", e.valid_up_to(), e);
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
     };
 
     let mut events = Vec::new();
