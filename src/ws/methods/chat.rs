@@ -1,3 +1,5 @@
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
 use crate::{
     agent::AgentMessage,
     ws::{
@@ -204,6 +206,15 @@ pub async fn chat_abort(ctx: MethodCtx) -> MethodResult {
         .and_then(|p| p.get("sessionKey"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
+
+    // Set abort flag for the session on all agents.
+    for agent in ctx.state.agents.all() {
+        let mut flags = agent.abort_flags.write().await;
+        let flag = flags
+            .entry(sk.to_string())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)));
+        flag.store(true, Ordering::SeqCst);
+    }
 
     Ok(serde_json::json!({
         "aborted": true,

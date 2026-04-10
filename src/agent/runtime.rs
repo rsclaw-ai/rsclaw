@@ -13,7 +13,7 @@
 //!   9. Auto-Recall (inject relevant memories) + Auto-Capture (store user
 //!      message)
 
-use std::{sync::Arc, time::Duration};
+use std::{sync::Arc, sync::atomic::{AtomicBool, Ordering}, time::Duration};
 
 use anyhow::{Result, anyhow, bail};
 use chrono::Utc;
@@ -80,6 +80,30 @@ const NO_REPLY_TOKEN: &str = "NO_REPLY";
 const DEFAULT_MAX_FILE_SIZE: usize = 50_000_000;
 /// Default max text chars before token confirmation.
 const DEFAULT_MAX_TEXT_CHARS: usize = 50_000;
+
+/// RAII guard that clears the abort flag for a session when dropped.
+struct AbortFlagGuard {
+    flag: Arc<AtomicBool>,
+    handle: Arc<AgentHandle>,
+    session_key: String,
+}
+
+impl Drop for AbortFlagGuard {
+    fn drop(&mut self) {
+        // Try to clear the flag. We use blocking_remove since we may be in async
+        // context but need to modify the HashMap.
+        let flag_value = self.flag.load(Ordering::SeqCst);
+        if flag_value {
+            // Clone the session_key and handle for the blocking call
+            let sk = self.session_key.clone();
+            let handle = Arc::clone(&self.handle);
+            // Clear the flag from the HashMap. We use try_write to avoid blocking.
+            if let Ok(mut flags) = handle.abort_flags.try_write() {
+                flags.remove(&sk);
+            }
+        }
+    }
+}
 
 /// Read-only commands that are always allowed for any agent (regardless of
 /// allowedCommands).
@@ -2247,6 +2271,33 @@ impl AgentRuntime {
             .timeout_seconds
             .unwrap_or(DEFAULT_TIMEOUT_SECONDS as u32) as u64;
 
+        // Get or create abort flag for this session.
+        let abort_flag: Arc<AtomicBool> = {
+            let mut flags = self.handle.abort_flags.write().await;
+            Arc::clone(flags.entry(session_key.to_string()).or_insert_with(|| {
+                Arc::new(AtomicBool::new(false))
+            }))
+        };
+
+        // RAII guard: clears abort flag when turn exits (normal or error).
+        let _guard = AbortFlagGuard {
+            flag: Arc::clone(&abort_flag),
+            handle: Arc::clone(&self.handle),
+            session_key: session_key.to_string(),
+        };
+
+        // Check if abort was requested before starting.
+        if abort_flag.load(Ordering::SeqCst) {
+            abort_flag.store(false, Ordering::SeqCst);
+            return Ok(AgentReply {
+                text: "[aborted]".to_string(),
+                is_empty: false,
+                tool_calls: None,
+                images: vec![],
+                pending_analysis: None,
+            });
+        }
+
         let mut ctx = RunContext {
             agent_id: self.handle.id.clone(),
             session_key: session_key.to_owned(),
@@ -2291,7 +2342,7 @@ impl AgentRuntime {
 
         let reply = time::timeout(
             Duration::from_secs(timeout_secs),
-            self.agent_loop(&mut ctx, &model, &system_prompt, tools, extra_tools),
+            self.agent_loop(&mut ctx, &model, &system_prompt, tools, extra_tools, abort_flag.clone()),
         )
         .await
         .map_err(|_| {
@@ -2404,6 +2455,7 @@ impl AgentRuntime {
         system_prompt: &str,
         tools: Vec<ToolDef>,
         extra_tools: Vec<ToolDef>,
+        abort_flag: Arc<AtomicBool>,
     ) -> Result<AgentReply> {
         let pruning_cfg = self.config.agents.defaults.context_pruning.clone();
 
@@ -2600,6 +2652,11 @@ impl AgentRuntime {
             let mut last_delta_flush = std::time::Instant::now();
 
             while let Some(event) = stream.next().await {
+                // Check abort flag.
+                if abort_flag.load(Ordering::SeqCst) {
+                    abort_flag.store(false, Ordering::SeqCst);
+                    return Err(anyhow!("turn aborted"));
+                }
                 match event? {
                     StreamEvent::TextDelta(delta) => {
                         text_buf.push_str(&delta);
