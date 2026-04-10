@@ -911,12 +911,20 @@ fn compute_next_run_from_expr(cron_expr: &str, from_ms: u64, tz: Option<&str>) -
     // Determine timezone
     let tz_opt: Option<chrono_tz::Tz> = tz.and_then(|tz_str| tz_str.parse().ok());
 
-    // Search in local time, always using a timezone-aware DateTime
-    // (UTC if no timezone specified, so we still use DateTime<chrono_tz::Tz> with UTC)
-    let tz_for_search: chrono_tz::Tz = match tz_opt {
-        Some(tz) => tz,
-        None => chrono_tz::UTC,
-    };
+    // Search in local time, always using a timezone-aware DateTime.
+    // When no timezone is specified, use the system's local timezone (not UTC).
+    fn system_tz() -> chrono_tz::Tz {
+        // Try TZ env var first (works on Linux/macOS with IANA names like "Asia/Shanghai")
+        if let Ok(tz_name) = std::env::var("TZ") {
+            if let Ok(tz) = tz_name.parse() {
+                return tz;
+            }
+        }
+        // Fall back to UTC
+        chrono_tz::UTC
+    }
+
+    let tz_for_search: chrono_tz::Tz = tz_opt.unwrap_or_else(system_tz);
 
     // Current minute in the target timezone
     let local_now = utc_dt.with_timezone(&tz_for_search);
