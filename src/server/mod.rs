@@ -252,7 +252,7 @@ async fn auth_middleware(
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    // Health, agent card discovery, and WS endpoints are always open
+    // Health, agent card discovery, WS, and internal reload endpoints are always open
     // (WS performs its own handshake-level auth).
     let path = request.uri().path();
     if path == "/"
@@ -261,6 +261,7 @@ async fn auth_middleware(
         || path == "/ws"
         || path == "/gateway-ws"
         || path.starts_with("/hooks/")
+        || path == "/api/v1/cron/reload"
     {
         return next.run(request).await;
     }

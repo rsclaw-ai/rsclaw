@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Semaphore};
@@ -1012,7 +1012,30 @@ async fn run_cron_job(job: &CronJob, agents: &AgentRegistry) -> Result<String> {
 
     let reply = tokio::time::timeout(Duration::from_secs(300), reply_rx)
         .await
-        .context("cron job timed out after 300s")?
+        .map_err(|_| {
+            // When timeout fires, capture what the agent was doing for better error reporting.
+            let agent_status = handle
+                .live_status
+                .try_read()
+                .map(|s| {
+                    let task = if s.current_task.is_empty() {
+                        "none".to_string()
+                    } else {
+                        s.current_task.chars().take(100).collect::<String>()
+                    };
+                    let tools = if s.tool_history.is_empty() {
+                        "none".to_string()
+                    } else {
+                        s.tool_history.join(", ")
+                    };
+                    format!(
+                        " (state: {}, task: \"{}\", tools called: [{}])",
+                        s.state, task, tools
+                    )
+                })
+                .unwrap_or_default();
+            anyhow!("cron job timed out after 300s{}", agent_status)
+        })?
         .context("agent dropped reply channel")?;
 
     if reply.is_empty {

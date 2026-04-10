@@ -55,7 +55,29 @@
       "Bash(ls -la J:/mickeylan/ai/rsclaw/cron_*.txt)",
       "Bash(grep -n \"cat.*\\\\\\\\\\\\.\" defaults.toml)",
       "Bash(grep -r \"K:\\\\\\\\\\\\\\\\openclaw\\\\|K:/openclaw\" src/)",
-      "Bash(reg query:*)"
+      "Bash(reg query:*)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(ls:*)",
+      "Bash(env -i PATH=/c/Users/Administrator/.cargo/bin:__TRACKED_VAR__ /c/Users/Administrator/.cargo/bin/cargo.exe check)",
+      "Bash(declare -f cargo 2)",
+      "Bash(/c/Users/Administrator/.cargo/bin/cargo.exe --version)",
+      "Bash(powershell -Command \"cd J:\\\\mickeylan\\\\ai\\\\rsclaw; cargo check 2>&1\")",
+      "Bash(powershell -Command \"cd J:\\\\mickickeylan\\\\ai\\\\rsclaw; cargo check 2>&1\")",
+      "Bash(echo \"Exit: $?\")",
+      "Bash(cargo +stable check)",
+      "Bash(git -C J:/mickeylan/ai/rsclaw show main:src/cron/mod.rs)",
+      "Read(//c/Users/Administrator/.ssh/**)",
+      "Read(//c/Users/Administrator/**)",
+      "Read(//c/Users/Administrator/.config/git/**)",
+      "Bash(git config:*)",
+      "Bash(ssh -T git@github.com)",
+      "Bash(ssh-add -l)",
+      "Bash(gh auth:*)",
+      "Bash(powershell.exe -Command \"cd J:\\\\\\\\mickeylan\\\\\\\\ai\\\\\\\\rsclaw; git push -u origin agent-parallel 2>&1\")",
+      "Bash(ssh-keygen -t ed25519 -C \"mickeylan@rsclaw\" -f ~/.ssh/id_ed25519 -N \"\")",
+      "Bash(cargo +1.91 check)",
+      "Bash(RUSTUP_TOOLCHAIN=1.91-x86_64-pc-windows-msvc cargo check)",
+      "Bash(RUSTUP_TOOLCHAIN=1.91-x86_64-pc-windows-msvc /c/Users/Administrator/.cargo/bin/cargo check:*)"
     ]
   }
 }

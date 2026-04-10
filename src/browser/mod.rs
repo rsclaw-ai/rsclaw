@@ -232,24 +232,44 @@ impl ChromeProcess {
 
 impl Drop for ChromeProcess {
     fn drop(&mut self) {
-        // Try to kill the Chrome process and wait for it to exit.
+        // Kill the Chrome process and wait for it to exit.
         // On Windows, start_kill() sends a termination signal but the process
-        // may not exit immediately. We poll try_wait() to ensure it's gone.
-        let killed = self.child.start_kill().is_ok();
-        if killed {
-            // Poll for exit with a short timeout to avoid leaving zombies
-            let mut attempts = 0;
-            while attempts < 20 {
-                match self.child.try_wait() {
-                    Ok(Some(_)) => break,    // Process exited
-                    Ok(None) => {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        attempts += 1;
+        // may not exit immediately. Chrome also spawns sub-processes (renderer,
+        // gpu, etc.) that need to be cleaned up. We use taskkill on Windows to
+        // kill the entire process tree, and a longer poll loop on other platforms.
+
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(pid) = self.child.id() {
+                // Use taskkill to kill the entire process tree on Windows.
+                // /T = kill process and all child processes, /F = force kill.
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/T", "/F", "/PID", &pid.to_string()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let killed = self.child.start_kill().is_ok();
+            if killed {
+                // Poll for exit with a longer timeout to avoid leaving zombies
+                let mut attempts = 0;
+                while attempts < 100 {
+                    match self.child.try_wait() {
+                        Ok(Some(_)) => break,    // Process exited
+                        Ok(None) => {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            attempts += 1;
+                        }
+                        Err(_) => break,          // Can't query, assume dead
                     }
-                    Err(_) => break,          // Can't query, assume dead
                 }
             }
         }
+
         ACTIVE_INSTANCES.fetch_sub(1, Ordering::Relaxed);
         debug!("Chrome instance dropped, active={}", ACTIVE_INSTANCES.load(Ordering::Relaxed));
     }

@@ -197,7 +197,8 @@ pub struct AgentRuntime {
     /// MCP server registry — None when no MCP servers are configured.
     pub mcp: Option<Arc<crate::mcp::McpRegistry>>,
     /// CDP browser session -- lazy-initialized on first web_browser tool call.
-    browser: Arc<tokio::sync::OnceCell<Mutex<crate::browser::BrowserSession>>>,
+    /// Stored as Option so it can be dropped (killing Chrome) when idle expires.
+    browser: Arc<tokio::sync::Mutex<Option<crate::browser::BrowserSession>>>,
     /// In-memory session cache: session_key -> conversation history.
     sessions: std::collections::HashMap<String, Vec<Message>>,
     /// Per-session compaction state: (last_compaction_time,
@@ -270,7 +271,7 @@ impl AgentRuntime {
             plugins,
             mcp,
             live_status,
-            browser: Arc::new(tokio::sync::OnceCell::new()),
+            browser: Arc::new(tokio::sync::Mutex::new(None)),
             sessions: std::collections::HashMap::new(),
             compaction_state: std::collections::HashMap::new(),
             pending_files: std::collections::HashMap::new(),
@@ -4697,9 +4698,22 @@ impl AgentRuntime {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("web_browser: `action` required"))?;
 
-        let session = self
-            .browser
-            .get_or_try_init(|| async {
+        // Get or init browser session. On each call we check if the existing
+        // session has been idle for too long -- if so, drop it (ChromeProcess::Drop
+        // kills the Chrome process) and reinitialize.
+        {
+            let mut guard = self.browser.lock().await;
+
+            // Check if existing session is idle-expired; if so, drop it.
+            if let Some(ref session) = *guard {
+                if session.is_idle_expired() {
+                    info!("Chrome idle timeout expired, closing session");
+                    *guard = None;
+                }
+            }
+
+            // If no session, initialize one.
+            if guard.is_none() {
                 // Check Chrome availability
                 let chrome_path = self.config.ext.tools.as_ref()
                     .and_then(|t| t.web_browser.as_ref())
@@ -4713,12 +4727,13 @@ impl AgentRuntime {
                 crate::browser::can_launch_chrome()?;
 
                 let bs = crate::browser::BrowserSession::start(&chrome_path).await?;
-                Ok::<_, anyhow::Error>(Mutex::new(bs))
-            })
-            .await?;
+                *guard = Some(bs);
+            }
+        }
 
-        let mut browser = session.lock().await;
-        browser.execute(action, &args).await
+        // Now lock again for execute -- guard is dropped, avoiding borrow issues.
+        let mut browser = self.browser.lock().await;
+        browser.as_mut().unwrap().execute(action, &args).await
     }
 
     async fn tool_computer_use(&self, args: Value) -> Result<Value> {
