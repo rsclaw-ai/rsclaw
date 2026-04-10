@@ -4275,13 +4275,34 @@ impl AgentRuntime {
         }
 
         tracing::info!(cwd = %workspace.display(), command = %command, "exec: executing");
-        let output = tokio::process::Command::new(shell)
-            .args(&shell_args)
-            .arg(command)
-            .current_dir(&workspace)
-            .output()
-            .await
-            .map_err(|e| anyhow!("exec `{command}`: {e}"))?;
+
+        // Timeout for exec commands (default 1800s = 30 min, matching openclaw).
+        let timeout_secs = self
+            .config
+            .ext
+            .tools
+            .as_ref()
+            .and_then(|t| t.exec.as_ref())
+            .and_then(|e| e.timeout_seconds)
+            .unwrap_or(1800);
+
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            tokio::process::Command::new(shell)
+                .args(&shell_args)
+                .arg(command)
+                .current_dir(&workspace)
+                .output()
+        )
+        .await
+        .map_err(|_| {
+            tracing::warn!(command = %command, timeout_secs, "exec: timed out");
+            anyhow!(
+                "Command timed out after {} seconds. If this command is expected to take longer, re-run with a higher timeout via config.",
+                timeout_secs
+            )
+        })?
+        .map_err(|e| anyhow!("exec `{command}`: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);

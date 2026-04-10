@@ -995,9 +995,28 @@ async fn run_cron_job(job: &CronJob, agents: &AgentRegistry) -> Result<String> {
         .get(&job.agent_id)
         .with_context(|| format!("agent not found: {}", job.agent_id))?;
 
+    // Allow configurable timeout via payload.timeout_seconds, default 300s
+    let timeout_secs = job
+        .payload
+        .as_ref()
+        .and_then(|p| match p {
+            CronPayload::Structured { timeout_seconds, .. } => timeout_seconds,
+            CronPayload::Text(_) => None,
+        })
+        .unwrap_or(300);
+
+    // Register abort flag for this session before dispatching
+    let abort_flag = {
+        let mut flags = handle.abort_flags.write().await;
+        flags
+            .entry(session_key.clone())
+            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .clone()
+    };
+
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let msg = AgentMessage {
-        session_key,
+        session_key: session_key.clone(),
         text: job.effective_message().to_owned(),
         channel: "cron".to_string(),
         peer_id: format!("cron:{}", job.id),
@@ -1010,10 +1029,13 @@ async fn run_cron_job(job: &CronJob, agents: &AgentRegistry) -> Result<String> {
 
     handle.tx.send(msg).await.context("agent inbox closed")?;
 
-    let reply = tokio::time::timeout(Duration::from_secs(300), reply_rx)
+    let reply = tokio::time::timeout(Duration::from_secs(timeout_secs), reply_rx)
         .await
         .map_err(|_| {
-            // When timeout fires, capture what the agent was doing for better error reporting.
+            // Timeout fired: abort the agent execution and capture status for error reporting.
+            abort_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            warn!(job_id = %job.id, session = %session_key, "cron: timeout fired, aborting agent");
+
             let agent_status = handle
                 .live_status
                 .try_read()
@@ -1034,9 +1056,12 @@ async fn run_cron_job(job: &CronJob, agents: &AgentRegistry) -> Result<String> {
                     )
                 })
                 .unwrap_or_default();
-            anyhow!("cron job timed out after 300s{}", agent_status)
+            anyhow!("cron job timed out after {}s{}", timeout_secs, agent_status)
         })?
         .context("agent dropped reply channel")?;
+
+    // Clear abort flag after successful completion
+    abort_flag.store(false, std::sync::atomic::Ordering::SeqCst);
 
     if reply.is_empty {
         debug!(job_id = %job.id, "cron job returned no output");
