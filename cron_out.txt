@@ -1,0 +1,35 @@
+[2m2026-04-08T06:05:12.841523Z[0m [33m WARN[0m [2mrsclaw::config::validator[0m[2m:[0m gateway.auth.token is set as a plaintext string in the config file. This is a security risk — use a SecretRef instead, e.g.: { source: "env", id: "RSCLAW_AUTH_TOKEN" }. See agents.md §23 for details.
+
+    [31m.       .[0m
+    [31m \     /[0m        [1m ____  ____   ____ _        _  __        __[0m
+    [31m( )---( )[0m       [1m|  _ \/ ___| / ___| |      / \ \ \      / /[0m
+    [31m / . . \[0m        [1m| |_) \___ \| |   | |     / _ \ \ \ /\ / /[0m
+    [31m| \___/ |[0m       [1m|  _ < ___) | |___| |___ / ___ \ \ V  V /[0m
+    [31m \_____/[0m        [1m|_| \_\____/ \____|_____/_/   \_\ \_/\_/[0m
+    [31m/       \[0m
+    [31m(       )[0m       [2m-- rsclaw gateway v2026.4.4 --[0m
+
+    [2m[[0m [1mcore[0m [2m][0m
+    [2m>[0m engine:   rsclaw gateway v2026.4.4 [2m(Rust 2024 Edition)[0m
+    [2m>[0m platform: x86_64 on windows
+    [2m>[0m compat:   OpenClaw drop-in replacement
+
+    [2m--------------------------------------------------------[0m
+
+  [2mPort:[0m  18804 | Bind: 0.0.0.0
+  [2mPID:[0m   2074308
+
+[2m2026-04-08T06:05:13.008138Z[0m [32m INFO[0m [2mrsclaw::store[0m[2m:[0m store opened [3mdb_size[0m[2m=[0m"C:\\Users\\Administrator\\.rsclaw\\var/data\\redb" [3msearch_size[0m[2m=[0m"C:\\Users\\Administrator\\.rsclaw\\var/data\\search" [3mtier[0m[2m=[0mHigh
+[2m2026-04-08T06:05:13.008531Z[0m [32m INFO[0m [2mtantivy::directory::file_watcher[0m[2m:[0m Meta file "\\\\?\\C:\\Users\\Administrator\\.rsclaw\\var\\data\\search\\meta.json" was modified
+[2m2026-04-08T06:05:13.008750Z[0m [32m INFO[0m [2mrsclaw::gateway::startup[0m[2m:[0m store opened at C:\Users\Administrator\.rsclaw\var/data
+[2m2026-04-08T06:05:13.010221Z[0m [32m INFO[0m [2mrsclaw::gateway::startup[0m[2m:[0m provider registered [3mname[0m[2m=[0mminimax [3mapi[0m[2m=[0mAnthropic
+[2m2026-04-08T06:05:13.010626Z[0m [32m INFO[0m [2mrsclaw::gateway::startup[0m[2m:[0m provider registered [3mname[0m[2m=[0mcustom-coding-dashscope-aliyuncs-com [3mapi[0m[2m=[0mOpenAiCompletions
+[2m2026-04-08T06:05:13.011053Z[0m [32m INFO[0m [2mrsclaw::gateway::startup[0m[2m:[0m 3 provider(s) registered
+[2m2026-04-08T06:05:13.011630Z[0m [32m INFO[0m [2mrsclaw::gateway::startup[0m[2m:[0m 0 skill(s) loaded
+[2m2026-04-08T06:05:13.011947Z[0m [32m INFO[0m [2mrsclaw::gateway::startup[0m[2m:[0m 1 agent(s) registered
+[2m2026-04-08T06:05:13.012547Z[0m [33m WARN[0m [2mrsclaw::agent::memory[0m[2m:[0m model dir C:\Users\Administrator\.rsclaw\models/bge-small-en not found, using FNV fallback (semantic search disabled)
+[2m2026-04-08T06:05:13.193788Z[0m [32m INFO[0m [2mhnsw_rs::hnsw[0m[2m:[0m Hnsw max_nb_connection 16
+[2m2026-04-08T06:05:13.194279Z[0m [32m INFO[0m [2mhnsw_rs::hnsw[0m[2m:[0m Hnsw nb elements 1443
+[2m2026-04-08T06:05:13.194573Z[0m [32m INFO[0m [2mhnsw_rs::hnsw[0m[2m:[0m Hnsw ef_construction 200
+[2m2026-04-08T06:05:13.194823Z[0m [32m INFO[0m [2mhnsw_rs::hnsw[0m[2m:[0m Hnsw distance "anndists::dist::distances::DistCosine"
+[2m2026-04-08T06:05:13.195229Z[0m [32m INFO[0m [2mhnsw_rs::hnsw[0m[2m:[0m Hnsw extend candidates false

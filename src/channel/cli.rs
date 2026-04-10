@@ -90,6 +90,7 @@ mod tests {
                 text: "hello from test".to_owned(),
                 reply_to: None,
                 images: vec![],
+                channel: None,
             })
             .await;
         assert!(result.is_ok());

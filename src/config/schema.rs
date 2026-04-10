@@ -1291,6 +1291,9 @@ pub struct UploadConfig {
 pub struct ExecToolConfig {
     /// Enable exec safety rules (default: false for openclaw compat).
     pub safety: Option<bool>,
+    /// Timeout for exec commands in seconds (default: 1800 = 30 minutes).
+    /// Matches openclaw's defaultTimeoutSec.
+    pub timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

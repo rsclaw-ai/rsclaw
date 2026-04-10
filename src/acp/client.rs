@@ -965,7 +965,7 @@ impl AcpClient {
             "params": params
         }))?;
 
-        tracing::debug!(method, id, request = %request, "ACP sending request");
+        tracing::info!(method, id, request = %request, "ACP sending request");
 
         tx.send(SubprocessCmd::SendRequest {
             request,
@@ -1009,7 +1009,7 @@ impl AcpClient {
             "params": params
         }))?;
 
-        tracing::debug!(method, id, request = %request, "ACP sending request (no timeout)");
+        tracing::info!(method, id, request = %request, "ACP sending request (no timeout)");
 
         tx.send(SubprocessCmd::SendRequest {
             request,
@@ -1135,7 +1135,7 @@ async fn run_subprocess(
                                                 if let Some(method) = method_field {
                                                     tracing::info!("ACP incoming method: {} | msg: {}", method, line);
                                                 } else if msg.get("id").is_some() {
-                                                    tracing::debug!("ACP response: {}", line);
+                                                    tracing::info!("ACP response: {}", line);
                                                 } else {
                                                     tracing::debug!("ACP message: {}", line);
                                                 }

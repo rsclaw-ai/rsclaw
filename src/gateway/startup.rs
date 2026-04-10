@@ -3,7 +3,7 @@
 //! Wires together: config, store, providers, agent runtimes, channels,
 //! cron scheduler, and HTTP server into a running gateway.
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use futures::StreamExt as _;
@@ -16,13 +16,15 @@ use crate::{
         AgentMessage, AgentRegistry, AgentReply, AgentRuntime, AgentSpawner, LiveStatus,
         MemoryStore, PendingAnalysis,
     },
-    channel::{Channel, OutboundMessage, cli::CliChannel, telegram::TelegramChannel},
+channel::{
+        Channel, ChannelManager, OutboundMessage, cli::CliChannel, telegram::TelegramChannel,
+    },
     config::{
         self,
         runtime::RuntimeConfig,
         schema::{BindMode, DmScope},
     },
-    cron::{CronJob, CronRunner},
+    cron::CronRunner,
     gateway::{
         LiveConfig,
         hot_reload::{ConfigChange, FileWatcher},
@@ -144,6 +146,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let mcp_registry = Arc::new(crate::mcp::McpRegistry::new());
     spawn_mcp_servers(&config, Arc::clone(&mcp_registry)).await;
 
+    // Create notification broadcast channel for routing OutboundMessages from
+    // ACP tools (OpenCode, ClaudeCode) back to the correct channel.
+    let (notification_tx, notification_rx) =
+        broadcast::channel::<crate::channel::OutboundMessage>(64);
+
     spawn_agent_tasks(
         receivers,
         Arc::clone(&registry),
@@ -156,6 +163,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Some(Arc::clone(&spawner)),
         Some(Arc::clone(&plugins)),
         Some(Arc::clone(&mcp_registry)),
+        Some(notification_tx.clone()),
     );
 
     // Set i18n default language from gateway config.
@@ -188,6 +196,12 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let dm_enforcers: Arc<
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+    // Channel sender registry for notification routing.
+    let channel_senders: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
+    > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
     start_channels(
         &config,
         Arc::clone(&registry),
@@ -199,7 +213,36 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Arc::clone(&zalo_slot),
         Arc::clone(&dm_enforcers),
         Arc::clone(&store.db),
+        Arc::clone(&channel_senders),
     );
+
+    // Spawn notification router task — routes OutboundMessages from ACP tools
+    // (OpenCode, ClaudeCode) to the correct channel based on msg.channel.
+    {
+        let senders = Arc::clone(&channel_senders);
+        let mut rx = notification_rx;
+        tokio::spawn(async move {
+            info!("notification router started");
+            while let Ok(msg) = rx.recv().await {
+                if let Some(ref ch_name) = msg.channel {
+                    // Get sender BEFORE any await — drop guard immediately after cloning sender
+                    let tx = {
+                        let senders_guard = senders.read().unwrap();
+                        senders_guard.get(ch_name).cloned()
+                    };
+                    if let Some(tx) = tx {
+                        info!(channel = %ch_name, target_id = %msg.target_id, "routing notification");
+                        let _ = tx.send(msg.clone()).await;
+                    } else {
+                        warn!(channel = %ch_name, "no channel sender registered for notification");
+                    }
+                } else {
+                    warn!("notification message has no channel field, cannot route");
+                }
+            }
+            info!("notification router ended");
+        });
+    }
 
     // 9. Start heartbeat schedulers for agents that have heartbeat configured.
     spawn_heartbeat_tasks(&config, Arc::clone(&registry));
@@ -282,8 +325,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // All channels registered - now wrap for sharing with cron runner
     let channel_manager = Arc::new(channel_manager);
 
-    // Start cron runner — jobs loaded from file, config provides global settings only.
-    // Priority: base_dir/cron.json5 > base_dir/cron/jobs.json (legacy, auto-migrated)
+    // Create cron reload broadcast channel (used to notify CronRunner of new jobs)
+    let (cron_reload_tx, _cron_reload_rx) = tokio::sync::broadcast::channel::<()>(16);
+
+    // Start cron runner — jobs loaded from base_dir/cron/jobs.json
     {
         let cron_cfg = config.ops.cron.clone().unwrap_or_else(|| {
             crate::config::schema::CronConfig {
@@ -296,38 +341,29 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             }
         });
         let cron_enabled = cron_cfg.enabled.unwrap_or(true);
-        let cron_file = base_dir.join("cron.json5");
-        let legacy_file = base_dir.join("cron/jobs.json");
 
-        // Auto-migrate: if legacy file exists but new file doesn't, copy it over
-        if !cron_file.exists() && legacy_file.is_file() {
-            if let Ok(raw) = std::fs::read_to_string(&legacy_file) {
-                if std::fs::write(&cron_file, &raw).is_ok() {
-                    info!("migrated cron/jobs.json → cron.json5");
-                }
-            }
+        // Load jobs from openclaw-compatible path
+        let cron_file = crate::cron::resolve_cron_store_path();
+        let jobs = crate::cron::load_cron_jobs();
+        if !jobs.is_empty() {
+            info!(file = %cron_file.display(), count = jobs.len(), "loaded cron jobs");
         }
 
-        let mut jobs: Vec<CronJob> = Vec::new();
-        let source = if cron_file.is_file() { &cron_file } else { &legacy_file };
-        if source.is_file() {
-            if let Ok(raw) = std::fs::read_to_string(source) {
-                let parsed: Result<serde_json::Value, _> = json5::from_str(&raw)
-                    .or_else(|_| serde_json::from_str(&raw));
-                if let Ok(file_data) = parsed {
-                    if let Some(arr) = file_data.get("jobs").and_then(|v| v.as_array()) {
-                        for item in arr {
-                            if let Ok(job) = serde_json::from_value::<CronJob>(item.clone()) {
-                                jobs.push(job);
-                            }
-                        }
-                        info!(file = %source.display(), count = arr.len(), "loaded cron jobs");
-                    }
-                }
-            }
-        }
-        if cron_enabled && !jobs.is_empty() {
-            let runner = CronRunner::new(&cron_cfg, jobs, Arc::clone(&registry), Arc::clone(&channel_manager), data_dir.clone());
+        if cron_enabled {
+            // Use openclaw-compatible path for cron run logs (respects OPENCLAW_STATE_DIR)
+            let cron_data_dir = if let Some(state_dir) = std::env::var_os("OPENCLAW_STATE_DIR") {
+                PathBuf::from(state_dir)
+            } else {
+                dirs_next::home_dir().unwrap_or_default().join(".openclaw")
+            }.join("var").join("data");
+            let runner = CronRunner::new(
+                &cron_cfg,
+                jobs,
+                Arc::clone(&registry),
+                Arc::clone(&channel_manager),
+                cron_data_dir,
+                cron_reload_tx.clone(),
+            );
             tokio::spawn(async move {
                 if let Err(e) = runner.run().await {
                     error!("cron runner error: {e:#}");
@@ -353,6 +389,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         started_at: std::time::Instant::now(),
         dm_enforcers: Arc::clone(&dm_enforcers),
         custom_webhooks: Arc::clone(&custom_webhooks),
+        cron_reload: cron_reload_tx,
     };
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
 
@@ -444,11 +481,11 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
             let base_url = provider_cfg.base_url.clone().or_else(|| {
                 // Fall back to well-known base URLs for named providers.
                 match name.as_str() {
-                    "qwen"        => Some("https://dashscope.aliyuncs.com/compatible-mode/v1".to_owned()),
-                    "deepseek"    => Some("https://api.deepseek.com/v1".to_owned()),
+                    "qwen" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1".to_owned()),
+                    "deepseek" => Some("https://api.deepseek.com/v1".to_owned()),
                     "kimi" | "moonshot" => Some("https://api.moonshot.cn/v1".to_owned()),
-                    "zhipu"       => Some("https://open.bigmodel.cn/api/paas/v4".to_owned()),
-                    "minimax"     => Some("https://api.minimaxi.com/v1".to_owned()),
+                    "zhipu" => Some("https://open.bigmodel.cn/api/paas/v4".to_owned()),
+                    "minimax" => Some("https://api.minimax.chat/v1".to_owned()),
                     "siliconflow" => Some("https://api.siliconflow.cn/v1".to_owned()),
                     "groq"        => Some("https://api.groq.com/openai/v1".to_owned()),
                     "openrouter"  => Some("https://openrouter.ai/api/v1".to_owned()),
@@ -459,7 +496,9 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
             });
 
             // Resolve User-Agent: provider > gateway > built-in default.
-            let user_agent = provider_cfg.user_agent.clone()
+            let user_agent = provider_cfg
+                .user_agent
+                .clone()
                 .or_else(|| config.gateway.user_agent.clone());
 
             // Determine API format: explicit `api` field > name-based inference.
@@ -498,7 +537,8 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                 }
                 (_, &crate::config::schema::ApiFormat::OpenAiResponses) => {
                     let key = api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok());
-                    let url = base_url.unwrap_or_else(|| crate::provider::openai::OPENAI_API_BASE.to_owned());
+                    let url = base_url
+                        .unwrap_or_else(|| crate::provider::openai::OPENAI_API_BASE.to_owned());
                     Arc::new(OpenAiProvider::responses_with_ua(url, key, user_agent))
                 }
                 _ => {
@@ -509,7 +549,9 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                         Arc::new(OpenAiProvider::with_user_agent(url, key, user_agent))
                     } else {
                         Arc::new(OpenAiProvider::with_user_agent(
-                            crate::provider::openai::OPENAI_API_BASE, key, user_agent,
+                            crate::provider::openai::OPENAI_API_BASE,
+                            key,
+                            user_agent,
                         ))
                     }
                 }
@@ -541,7 +583,11 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
     let compat_providers = [
         // --- International ---
         ("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY"),
-        ("deepseek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY"),
+        (
+            "deepseek",
+            "https://api.deepseek.com/v1",
+            "DEEPSEEK_API_KEY",
+        ),
         ("mistral", "https://api.mistral.ai/v1", "MISTRAL_API_KEY"),
         (
             "together",
@@ -627,9 +673,7 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
 
     // Doubao / ByteDance — uses OpenAI Responses API format.
     if !registry.names().contains(&"doubao") {
-        if let Ok(key) = std::env::var("ARK_API_KEY")
-            .or_else(|_| std::env::var("DOUBAO_API_KEY"))
-        {
+        if let Ok(key) = std::env::var("ARK_API_KEY").or_else(|_| std::env::var("DOUBAO_API_KEY")) {
             registry.register(
                 "doubao",
                 Arc::new(OpenAiProvider::responses(
@@ -640,9 +684,7 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
         }
     }
     if !registry.names().contains(&"bytedance") {
-        if let Ok(key) = std::env::var("ARK_API_KEY")
-            .or_else(|_| std::env::var("DOUBAO_API_KEY"))
-        {
+        if let Ok(key) = std::env::var("ARK_API_KEY").or_else(|_| std::env::var("DOUBAO_API_KEY")) {
             registry.register(
                 "bytedance",
                 Arc::new(OpenAiProvider::responses(
@@ -703,6 +745,7 @@ fn spawn_agent_tasks(
     spawner: Option<Arc<AgentSpawner>>,
     plugins: Option<Arc<crate::plugin::PluginRegistry>>,
     mcp: Option<Arc<crate::mcp::McpRegistry>>,
+    notification_tx: Option<broadcast::Sender<crate::channel::OutboundMessage>>,
 ) {
     for (agent_id, mut rx) in receivers {
         let handle = match registry.get(&agent_id) {
@@ -742,7 +785,7 @@ fn spawn_agent_tasks(
             spawner.clone(),
             plugins.clone(),
             mcp.clone(),
-            None,
+            notification_tx.clone(),
         );
 
         tokio::spawn(async move {
@@ -843,6 +886,7 @@ async fn send_processing(
             text,
             reply_to: None,
             images: vec![],
+            channel: None,
         }),
     )
     .await;
@@ -962,12 +1006,21 @@ fn start_channels(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
+    channel_senders: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
+    >,
 ) {
     // CLI channel — always started in local mode.
     {
         let reg = Arc::clone(&registry);
         let cfg_arc = Arc::new(config.clone());
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
+
+        // Register CLI channel sender for notification routing.
+        {
+            let mut senders = channel_senders.write().unwrap();
+            senders.insert("cli".to_string(), out_tx.clone());
+        }
 
         let on_message = Arc::new(move |peer_id: String, text: String| {
             let reg = Arc::clone(&reg);
@@ -1014,6 +1067,7 @@ fn start_channels(
                                 text: reply.text,
                                 reply_to: None,
                                 images: reply.images,
+                                channel: None,
                             })
                             .await;
                     }
@@ -1125,6 +1179,12 @@ fn start_channels(
             let ga = Arc::new(group_allow_from.clone());
             let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
+            // Register Telegram channel sender for notification routing.
+            {
+                let mut senders = channel_senders.write().unwrap();
+                senders.insert(format!("telegram/{}", acct_name), out_tx.clone());
+            }
+
             // Per-user inbound queue: serializes messages so each user's messages
             // are processed one at a time, preventing reply channel drops.
             type TgItem = (
@@ -1191,6 +1251,7 @@ fn start_channels(
                                             text: crate::i18n::t_fmt("pairing_required", crate::i18n::default_lang(), &[("code", &code)]),
                                             reply_to: None,
                                             images: vec![],
+            channel: None,
                                         })
                                         .await;
                                     return;
@@ -1203,6 +1264,7 @@ fn start_channels(
                                             text: crate::i18n::t("pairing_queue_full", crate::i18n::default_lang()).to_owned(),
                                             reply_to: None,
                                             images: vec![],
+            channel: None,
                                         })
                                         .await;
                                     return;
@@ -1292,6 +1354,7 @@ fn start_channels(
                                                         text: r.text,
                                                         reply_to: None,
                                                         images: r.images,
+                                                        channel: None,
                                                     })
                                                     .await;
                                             }
@@ -1347,6 +1410,7 @@ fn start_channels(
                                         text: format!("[/btw] {}", reply_text),
                                         reply_to: None,
                                         images: vec![],
+            channel: None,
                                     }).await;
                                 }
                             });
@@ -1387,6 +1451,7 @@ fn start_channels(
         manager,
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
+        Arc::clone(&channel_senders),
     );
     start_slack_if_configured(
         config,
@@ -1394,6 +1459,7 @@ fn start_channels(
         manager,
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
+        Arc::clone(&channel_senders),
     );
     start_whatsapp_if_configured(
         config,
@@ -1402,6 +1468,7 @@ fn start_channels(
         whatsapp_slot,
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
+        Arc::clone(&channel_senders),
     );
     start_line_if_configured(
         config,
@@ -1410,6 +1477,7 @@ fn start_channels(
         line_slot,
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
+        Arc::clone(&channel_senders),
     );
     start_zalo_if_configured(
         config,
@@ -1418,6 +1486,7 @@ fn start_channels(
         zalo_slot,
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
+        Arc::clone(&channel_senders),
     );
     start_signal_if_configured(
         config,
@@ -1425,6 +1494,7 @@ fn start_channels(
         manager,
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
+        Arc::clone(&channel_senders),
     );
     start_wechat_personal_if_configured(
         config,
@@ -1432,6 +1502,7 @@ fn start_channels(
         manager,
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
+        Arc::clone(&channel_senders),
     );
     start_feishu_if_configured(
         config,
@@ -1440,6 +1511,7 @@ fn start_channels(
         Arc::clone(&feishu_slot),
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
+        Arc::clone(&channel_senders),
     );
     start_dingtalk_if_configured(
         config,
@@ -1447,6 +1519,7 @@ fn start_channels(
         manager,
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
+        Arc::clone(&channel_senders),
     );
     start_qq_if_configured(
         config,
@@ -1454,6 +1527,7 @@ fn start_channels(
         manager,
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
+        Arc::clone(&channel_senders),
     );
     start_matrix_if_configured(
         config,
@@ -1461,6 +1535,7 @@ fn start_channels(
         manager,
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
+        Arc::clone(&channel_senders),
     );
     start_wecom_if_configured(
         config,
@@ -1469,6 +1544,7 @@ fn start_channels(
         wecom_slot,
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
+        Arc::clone(&channel_senders),
     );
 }
 
@@ -1480,6 +1556,9 @@ fn start_discord_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
+    channel_senders: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
+    >,
 ) {
     use crate::channel::discord::DiscordChannel;
 
@@ -1547,6 +1626,12 @@ fn start_discord_if_configured(
         let ga = Arc::new(group_allow_from.clone());
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
+        // Register Discord channel sender for notification routing.
+        {
+            let mut senders = channel_senders.write().unwrap();
+            senders.insert(format!("discord/{}", acct_name), out_tx.clone());
+        }
+
         // Find binding for this account.
         let bound_agent = config
             .agents
@@ -1613,6 +1698,7 @@ fn start_discord_if_configured(
                                         ),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -1629,6 +1715,7 @@ fn start_discord_if_configured(
                                         .to_owned(),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -1721,6 +1808,7 @@ fn start_discord_if_configured(
                                                     text: r.text,
                                                     reply_to: None,
                                                     images: r.images,
+                                                    channel: None,
                                                 })
                                                 .await;
                                         }
@@ -1771,6 +1859,7 @@ fn start_discord_if_configured(
                                         text: format!("[/btw] {}", reply_text),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                             }
@@ -1819,6 +1908,9 @@ fn start_slack_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
+    channel_senders: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
+    >,
 ) {
     use crate::channel::slack::SlackChannel;
 
@@ -1907,6 +1999,12 @@ fn start_slack_if_configured(
         let ga = Arc::new(group_allow_from.clone());
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
+        // Register Slack channel sender for notification routing.
+        {
+            let mut senders = channel_senders.write().unwrap();
+            senders.insert(format!("slack/{}", acct_name), out_tx.clone());
+        }
+
         // Find binding for this account.
         let bound_agent = config
             .agents
@@ -1973,6 +2071,7 @@ fn start_slack_if_configured(
                                         ),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -1989,6 +2088,7 @@ fn start_slack_if_configured(
                                         .to_owned(),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -2081,6 +2181,7 @@ fn start_slack_if_configured(
                                                     text: r.text,
                                                     reply_to: None,
                                                     images: r.images,
+                                                    channel: None,
                                                 })
                                                 .await;
                                         }
@@ -2131,6 +2232,7 @@ fn start_slack_if_configured(
                                         text: format!("[/btw] {}", reply_text),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                             }
@@ -2176,6 +2278,9 @@ fn start_whatsapp_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
+    channel_senders: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
+    >,
 ) {
     use crate::channel::whatsapp::WhatsAppChannel;
 
@@ -2244,6 +2349,12 @@ fn start_whatsapp_if_configured(
         let cfg_arc = Arc::new(config.clone());
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
+        // Register WhatsApp channel sender for notification routing.
+        {
+            let mut senders = channel_senders.write().unwrap();
+            senders.insert(format!("whatsapp/{}", acct_name), out_tx.clone());
+        }
+
         // Per-user inbound queue for WhatsApp.
         type WaItem = (String, String, Vec<crate::agent::registry::ImageAttachment>);
         let wa_user_queues: Arc<
@@ -2281,6 +2392,7 @@ fn start_whatsapp_if_configured(
                                         ),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -2297,6 +2409,7 @@ fn start_whatsapp_if_configured(
                                         .to_owned(),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -2370,6 +2483,7 @@ fn start_whatsapp_if_configured(
                                             text: r.text,
                                             reply_to: None,
                                             images: r.images,
+                                            channel: None,
                                         })
                                         .await;
                                 }
@@ -2420,6 +2534,7 @@ fn start_whatsapp_if_configured(
                                         text: format!("[/btw] {}", reply_text),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                             }
@@ -2467,6 +2582,9 @@ fn start_line_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
+    channel_senders: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
+    >,
 ) {
     use crate::channel::line::LineChannel;
 
@@ -2600,6 +2718,7 @@ fn start_line_if_configured(
                                         ),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -2616,6 +2735,7 @@ fn start_line_if_configured(
                                         .to_owned(),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -2694,6 +2814,7 @@ fn start_line_if_configured(
                                                 text: r.text,
                                                 reply_to: None,
                                                 images: r.images,
+                                                channel: None,
                                             })
                                             .await;
                                     }
@@ -2744,6 +2865,7 @@ fn start_line_if_configured(
                                         text: format!("[/btw] {}", reply_text),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                             }
@@ -2790,6 +2912,9 @@ fn start_zalo_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
+    channel_senders: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
+    >,
 ) {
     use crate::channel::zalo::ZaloChannel;
 
@@ -2890,6 +3015,7 @@ fn start_zalo_if_configured(
                                         ),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -2906,6 +3032,7 @@ fn start_zalo_if_configured(
                                         .to_owned(),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -2979,6 +3106,7 @@ fn start_zalo_if_configured(
                                                 text: r.text,
                                                 reply_to: None,
                                                 images: r.images,
+                                                channel: None,
                                             })
                                             .await;
                                     }
@@ -3029,6 +3157,7 @@ fn start_zalo_if_configured(
                                         text: format!("[/btw] {}", reply_text),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                             }
@@ -3074,6 +3203,9 @@ fn start_signal_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
+    channel_senders: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
+    >,
 ) {
     use crate::channel::signal::SignalChannel;
 
@@ -3194,6 +3326,7 @@ fn start_signal_if_configured(
                                     ),
                                     reply_to: None,
                                     images: vec![],
+                                    channel: None,
                                 })
                                 .await;
                             return;
@@ -3210,6 +3343,7 @@ fn start_signal_if_configured(
                                     .to_owned(),
                                     reply_to: None,
                                     images: vec![],
+                                    channel: None,
                                 })
                                 .await;
                             return;
@@ -3290,6 +3424,7 @@ fn start_signal_if_configured(
                                             text: r.text,
                                             reply_to: None,
                                             images: r.images,
+                                            channel: None,
                                         })
                                         .await;
                                 }
@@ -3336,6 +3471,7 @@ fn start_signal_if_configured(
                                     text: format!("[/btw] {}", reply_text),
                                     reply_to: None,
                                     images: vec![],
+                                    channel: None,
                                 })
                                 .await;
                         }
@@ -3533,6 +3669,7 @@ fn spawn_wechat_user_worker(
                                     text: r.text,
                                     reply_to: None,
                                     images: r.images,
+                                    channel: None,
                                 })
                                 .await
                             {
@@ -3573,6 +3710,9 @@ fn start_wechat_personal_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
+    channel_senders: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
+    >,
 ) {
     // Check if wechat channel is enabled in config
     let enabled = config
@@ -3724,6 +3864,7 @@ fn start_wechat_personal_if_configured(
                                         ),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -3740,6 +3881,7 @@ fn start_wechat_personal_if_configured(
                                         .to_owned(),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -3807,6 +3949,7 @@ fn start_wechat_personal_if_configured(
                                         text: format!("[/btw] {}", reply_text),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                             }
@@ -3867,6 +4010,9 @@ fn start_feishu_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
+    channel_senders: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
+    >,
 ) {
     let fs_cfg = config.channel.channels.feishu.as_ref();
     if let Some(cfg) = fs_cfg {
@@ -4057,6 +4203,7 @@ fn start_feishu_if_configured(
                                         ),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -4073,6 +4220,7 @@ fn start_feishu_if_configured(
                                         .to_owned(),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -4174,6 +4322,7 @@ fn start_feishu_if_configured(
                                                         text: r.text,
                                                         reply_to: None,
                                                         images: r.images,
+                                                        channel: None,
                                                     })
                                                     .await;
                                             }
@@ -4226,6 +4375,7 @@ fn start_feishu_if_configured(
                                         text: format!("[/btw] {}", reply_text),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                             }
@@ -4290,6 +4440,9 @@ fn start_dingtalk_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
+    channel_senders: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
+    >,
 ) {
     let Some(dt_cfg) = &config.channel.channels.dingtalk else {
         return;
@@ -4456,6 +4609,7 @@ fn start_dingtalk_if_configured(
                                         ),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -4472,6 +4626,7 @@ fn start_dingtalk_if_configured(
                                         .to_owned(),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -4572,6 +4727,7 @@ fn start_dingtalk_if_configured(
                                                         text: r.text,
                                                         reply_to: None,
                                                         images: r.images,
+                                                        channel: None,
                                                     })
                                                     .await;
                                             }
@@ -4626,6 +4782,7 @@ fn start_dingtalk_if_configured(
                                         text: format!("[/btw] {}", reply_text),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                             }
@@ -4686,7 +4843,10 @@ fn resolve_bind_addr(config: &RuntimeConfig) -> SocketAddr {
         if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
             return SocketAddr::new(ip, port);
         }
-        tracing::warn!(addr = addr.as_str(), "invalid bind_address, falling back to bind mode");
+        tracing::warn!(
+            addr = addr.as_str(),
+            "invalid bind_address, falling back to bind mode"
+        );
     }
     match config.gateway.bind {
         BindMode::Auto | BindMode::Lan => SocketAddr::from(([0, 0, 0, 0], port)),
@@ -4762,6 +4922,9 @@ fn start_qq_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
+    channel_senders: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
+    >,
 ) {
     let Some(qq_cfg) = &config.channel.channels.qq else {
         return;
@@ -4907,6 +5070,7 @@ fn start_qq_if_configured(
                                         ),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -4923,6 +5087,7 @@ fn start_qq_if_configured(
                                         .to_owned(),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -5000,6 +5165,7 @@ fn start_qq_if_configured(
                                                 text: r.text,
                                                 reply_to: Some(msg_id),
                                                 images: r.images,
+                                                channel: None,
                                             })
                                             .await;
                                         if let Some(analysis) = pending {
@@ -5051,6 +5217,7 @@ fn start_qq_if_configured(
                                         text: format!("[/btw] {}", reply_text),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                             }
@@ -5110,6 +5277,9 @@ fn start_matrix_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
+    channel_senders: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
+    >,
 ) {
     let Some(matrix_cfg) = &config.channel.channels.matrix else {
         return;
@@ -5264,6 +5434,7 @@ fn start_matrix_if_configured(
                                         ),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -5280,6 +5451,7 @@ fn start_matrix_if_configured(
                                         .to_owned(),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -5362,6 +5534,7 @@ fn start_matrix_if_configured(
                                             text: r.text,
                                             reply_to: None,
                                             images: r.images,
+                                            channel: None,
                                         }).await;
                                     }
                                     if let Some(analysis) = pending {
@@ -5414,6 +5587,7 @@ fn start_matrix_if_configured(
                                         text: format!("[/btw] {}", reply_text),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                             }
@@ -5481,6 +5655,9 @@ fn start_wecom_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
+    channel_senders: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
+    >,
 ) {
     use crate::channel::wecom::WeComChannel;
 
@@ -5607,6 +5784,7 @@ fn start_wecom_if_configured(
                                         text: msg,
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                                 return;
@@ -5695,6 +5873,7 @@ fn start_wecom_if_configured(
                                             text: r.text,
                                             reply_to: None,
                                             images: r.images,
+                                            channel: None,
                                         })
                                         .await;
                                 }
@@ -5747,6 +5926,7 @@ fn start_wecom_if_configured(
                                         text: format!("[/btw] {}", reply_text),
                                         reply_to: None,
                                         images: vec![],
+                                        channel: None,
                                     })
                                     .await;
                             }
@@ -5909,6 +6089,7 @@ fn start_custom_webhook(
                             text: r.text,
                             reply_to: None,
                             images: r.images,
+                            channel: None,
                         })
                         .await;
                 }
@@ -6019,6 +6200,7 @@ fn start_custom_websocket(
                             text: r.text,
                             reply_to: None,
                             images: r.images,
+                            channel: None,
                         })
                         .await;
                 }
@@ -6100,6 +6282,7 @@ async fn handle_pending_analysis(
                 text: crate::i18n::t("analysis_failed", i18n_lang),
                 reply_to: None,
                 images: vec![],
+                channel: None,
             })
             .await;
         return;
@@ -6113,6 +6296,7 @@ async fn handle_pending_analysis(
                     text: r.text,
                     reply_to: None,
                     images: r.images,
+                    channel: None,
                 })
                 .await;
         }
@@ -6125,6 +6309,7 @@ async fn handle_pending_analysis(
                     text: crate::i18n::t("analysis_failed", i18n_lang),
                     reply_to: None,
                     images: vec![],
+                    channel: None,
                 })
                 .await;
         }
@@ -6136,6 +6321,7 @@ async fn handle_pending_analysis(
                     text: crate::i18n::t("analysis_timeout", i18n_lang),
                     reply_to: None,
                     images: vec![],
+                    channel: None,
                 })
                 .await;
         }

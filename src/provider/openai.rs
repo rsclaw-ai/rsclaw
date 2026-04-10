@@ -203,7 +203,7 @@ impl LlmProvider for OpenAiProvider {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_owned();
-            tracing::debug!(
+            tracing::info!(
                 %status,
                 content_type = %content_type,
                 "openai: response received"
@@ -218,7 +218,7 @@ impl LlmProvider for OpenAiProvider {
             if !content_type.contains("text/event-stream") && content_type.contains("json") {
                 let body: serde_json::Value =
                     resp.json().await.context("OpenAI: parse JSON response")?;
-                tracing::debug!(body = %body.to_string().chars().take(300).collect::<String>(), "openai: non-streaming JSON response");
+                tracing::info!(body = %body.to_string().chars().take(500).collect::<String>(), "openai: non-streaming JSON response");
                 // Extract text from non-streaming response
                 let text = body
                     .pointer("/choices/0/message/content")
@@ -848,13 +848,17 @@ async fn parse_sse_chunk_with_buffer(
     };
 
     let text = match std::str::from_utf8(&bytes) {
-        Ok(t) => t,
-        Err(e) => return vec![Err(anyhow::anyhow!("UTF-8 error: {e}"))],
+        Ok(t) => std::borrow::Cow::Borrowed(t),
+        Err(e) => {
+            // Log and replace invalid bytes with U+FFFD so the stream continues.
+            tracing::warn!("openai: UTF-8 decode error at byte {}, replacing with �: {}", e.valid_up_to(), e);
+            std::borrow::Cow::Owned(String::from_utf8_lossy(&bytes).into_owned())
+        }
     };
 
     // Lock the buffer and append the new text
     let mut buffer = line_buffer.lock().await;
-    buffer.push_str(text);
+    buffer.push_str(&text);
 
     let mut events = Vec::new();
 
@@ -879,7 +883,7 @@ async fn parse_sse_chunk_with_buffer(
                 if let Some(event) = parse_event(data) {
                     events.push(Ok(event));
                 } else {
-                    tracing::debug!(data, "openai: unparsed SSE data");
+                    tracing::warn!(data, "openai: unparsed SSE data");
                 }
             }
         }
@@ -919,7 +923,7 @@ fn parse_sse_chunk(chunk: Result<bytes::Bytes>) -> Vec<Result<StreamEvent>> {
         }
     }
     if !has_data_line && !text.trim().is_empty() {
-        tracing::debug!(
+        tracing::warn!(
             raw = &text[..text.len().min(500)],
             "openai: non-SSE chunk received"
         );
@@ -956,7 +960,13 @@ fn strip_think_tags(text: &str) -> String {
 }
 
 fn parse_event(data: &str) -> Option<StreamEvent> {
-    let v: Value = serde_json::from_str(data).ok()?;
+    let v: Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(data, error = %e, "openai: failed to parse SSE JSON");
+            return None;
+        }
+    };
 
     // Check for error response embedded in SSE stream
     if let Some(err) = v.get("error") {
@@ -964,8 +974,21 @@ fn parse_event(data: &str) -> Option<StreamEvent> {
         return Some(StreamEvent::Error(msg.to_owned()));
     }
 
-    let choices = v["choices"].as_array()?;
-    let choice = choices.first()?;
+    let choices = match v["choices"].as_array() {
+        Some(c) => c,
+        None => {
+            // Log when choices is missing or not an array
+            tracing::warn!(data, "openai: SSE response missing choices array");
+            return None;
+        }
+    };
+    let choice = match choices.first() {
+        Some(c) => c,
+        None => {
+            tracing::warn!(data, "openai: SSE response has empty choices array");
+            return None;
+        }
+    };
     let delta = &choice["delta"];
 
     // Tool call

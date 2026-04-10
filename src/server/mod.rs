@@ -97,6 +97,8 @@ pub struct AppState {
             std::collections::HashMap<String, Arc<crate::channel::custom::CustomWebhookChannel>>,
         >,
     >,
+    /// Broadcast channel to notify CronRunner to reload jobs from file.
+    pub cron_reload: broadcast::Sender<()>,
 }
 
 // AgentEvent is defined in crate::events to avoid circular deps with agent.
@@ -177,6 +179,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/status", get(status))
         .route("/config/reload", post(config_reload))
         .route("/config", get(get_config).put(save_config))
+        .route("/cron/reload", post(cron_reload))
         .route("/channels/pair", post(channels_pair))
         .route("/channels/unpair", post(channels_unpair))
         .route("/channels/pairings", get(list_pairings))
@@ -249,7 +252,7 @@ async fn auth_middleware(
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    // Health, agent card discovery, and WS endpoints are always open
+    // Health, agent card discovery, WS, and internal reload endpoints are always open
     // (WS performs its own handshake-level auth).
     let path = request.uri().path();
     if path == "/"
@@ -258,6 +261,7 @@ async fn auth_middleware(
         || path == "/ws"
         || path == "/gateway-ws"
         || path.starts_with("/hooks/")
+        || path == "/api/v1/cron/reload"
     {
         return next.run(request).await;
     }
@@ -686,6 +690,17 @@ async fn config_reload(State(_state): State<AppState>) -> impl IntoResponse {
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn cron_reload(State(state): State<AppState>) -> impl IntoResponse {
+    match state.cron_reload.send(()) {
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"reloaded": true}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("cron reload error: {}", e)})),
         )
             .into_response(),
     }

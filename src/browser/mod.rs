@@ -193,7 +193,11 @@ impl ChromeProcess {
             Err(anyhow!("Chrome exited without printing DevTools URL"))
         })
         .await
-        .map_err(|_| anyhow!("timed out waiting for Chrome DevTools URL"))??;
+        .map_err(|e| {
+            // Chrome launched but didn't give us a WebSocket URL — kill it.
+            let _ = child.start_kill();
+            anyhow!("timed out waiting for Chrome DevTools URL: {}", e)
+        })??;
 
         debug!(ws_url = %ws_url, "Chrome DevTools URL discovered");
         ACTIVE_INSTANCES.fetch_add(1, Ordering::Relaxed);
@@ -228,7 +232,44 @@ impl ChromeProcess {
 
 impl Drop for ChromeProcess {
     fn drop(&mut self) {
-        let _ = self.child.start_kill();
+        // Kill the Chrome process and wait for it to exit.
+        // On Windows, start_kill() sends a termination signal but the process
+        // may not exit immediately. Chrome also spawns sub-processes (renderer,
+        // gpu, etc.) that need to be cleaned up. We use taskkill on Windows to
+        // kill the entire process tree, and a longer poll loop on other platforms.
+
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(pid) = self.child.id() {
+                // Use taskkill to kill the entire process tree on Windows.
+                // /T = kill process and all child processes, /F = force kill.
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/T", "/F", "/PID", &pid.to_string()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let killed = self.child.start_kill().is_ok();
+            if killed {
+                // Poll for exit with a longer timeout to avoid leaving zombies
+                let mut attempts = 0;
+                while attempts < 100 {
+                    match self.child.try_wait() {
+                        Ok(Some(_)) => break,    // Process exited
+                        Ok(None) => {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            attempts += 1;
+                        }
+                        Err(_) => break,          // Can't query, assume dead
+                    }
+                }
+            }
+        }
+
         ACTIVE_INSTANCES.fetch_sub(1, Ordering::Relaxed);
         debug!("Chrome instance dropped, active={}", ACTIVE_INSTANCES.load(Ordering::Relaxed));
     }
@@ -486,7 +527,7 @@ impl BrowserSession {
 
         self.touch_activity();
 
-        match action {
+        let result = match action {
             "open" | "navigate" => self.cmd_open(args).await,
             "snapshot" => self.cmd_snapshot().await,
             "click" => self.cmd_click(args).await,
@@ -507,7 +548,16 @@ impl BrowserSession {
             "evaluate" => self.cmd_evaluate(args).await,
             "cookies" => self.cmd_cookies(args).await,
             other => Err(anyhow!("web_browser: unsupported action `{other}`")),
+        };
+
+        // If the command failed, Chrome might be in a bad state (crashed or CDP connection
+        // broken). Restart it so the next call gets a fresh session.
+        if result.is_err() && self.is_alive() {
+            warn!("CDP command failed, restarting Chrome to recover");
+            let _ = self.restart().await;
         }
+
+        result
     }
 
     // -- Command implementations ------------------------------------------------
