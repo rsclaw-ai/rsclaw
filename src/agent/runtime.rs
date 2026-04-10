@@ -2941,6 +2941,40 @@ impl AgentRuntime {
 
             // Execute each tool and push results.
             for (tool_id, tool_name, tool_input) in tool_calls {
+                // Skip tools with parse errors — do not execute, return error directly.
+                // This prevents infinite retry loops when model output gets truncated.
+                if let Some(parse_error) = tool_input.get("_parse_error").and_then(|v| v.as_str()) {
+                    let is_truncated = parse_error.starts_with("truncated:");
+                    let err_msg = if is_truncated {
+                        "Your tool call was truncated. Try a shorter message or split into multiple steps."
+                    } else {
+                        "Your tool call contained malformed JSON. Please try again."
+                    };
+                    warn!(tool = %tool_name, "skipping tool with parse error: {}", parse_error);
+                    // Record for loop detection so error doesn't count as a "different result"
+                    ctx.loop_detector.record_result(&serde_json::json!({"error": err_msg}));
+
+                    // Directly return error to session without executing the tool
+                    let tool_msg = Message {
+                        role: Role::Tool,
+                        content: MessageContent::Parts(vec![
+                            crate::provider::ContentPart::ToolResult {
+                                tool_use_id: tool_id.clone(),
+                                content: format!(r#"{{"error":"{}"}}"#, err_msg),
+                                is_error: Some(true),
+                            },
+                        ]),
+                    };
+                    let _ = self.store.db.append_message(
+                        &ctx.session_key,
+                        &serde_json::to_value(&tool_msg).unwrap_or_default(),
+                    );
+                    if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
+                        sess.push(tool_msg);
+                    }
+                    continue;
+                }
+
                 debug!(tool = %tool_name, "dispatching tool call");
 
                 // Update live status: tool call starting.
