@@ -633,11 +633,24 @@ impl CronRunner {
                         }
                     };
 
-                    if let Err(e) =
-                        send_delivery(&channels, &job, &default_delivery, &delivery_text).await
-                    {
-                        warn!(job_id = %job.id, %e, "delivery failed");
-                    }
+                    // Spawn delivery as a detached task so it doesn't block.
+                    // The result is logged but we don't wait for it.
+                    let delivery_channels = Arc::clone(&channels);
+                    let delivery_job = job.clone();
+                    let delivery_text = delivery_text;
+                    let delivery_default = default_delivery.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = send_delivery(
+                            &delivery_channels,
+                            &delivery_job,
+                            &delivery_default,
+                            &delivery_text,
+                        )
+                        .await
+                        {
+                            warn!(job_id = %delivery_job.id, %e, "delivery failed");
+                        }
+                    });
 
                     let entry = build_run_log_entry(
                         &job,
