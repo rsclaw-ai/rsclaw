@@ -10,11 +10,13 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use rsclaw::{
     agent::{AgentRegistry, AgentReply},
+    channel::ChannelManager,
     config::{
         runtime::{AgentsRuntime, RuntimeConfig},
         schema::{AgentEntry, CronConfig, CronJobConfig},
     },
     cron::{CronJob, CronRunner},
+    MemoryTier,
 };
 use serde_json::Value;
 
@@ -35,6 +37,7 @@ fn make_job(id: &str, schedule: &str, agent_id: &str, enabled: bool) -> CronJob 
         payload: None,
         message: Some(format!("ping from {id}")),
         session_target: None,
+        delivery: None,
         wake_mode: None,
         state: None,
         created_at_ms: None,
@@ -50,6 +53,7 @@ fn minimal_cron_config() -> CronConfig {
         session_retention: None,
         run_log: None,
         jobs: None,
+        default_delivery: None,
     }
 }
 
@@ -74,6 +78,7 @@ fn runtime_with_agent(agent_id: &str) -> RuntimeConfig {
             channel_health_check_minutes: 5,
             channel_stale_event_threshold_minutes: 30,
             channel_max_restarts_per_hour: 10,
+            user_agent: None,
         },
         agents: AgentsRuntime {
             defaults: Default::default(),
@@ -163,6 +168,7 @@ async fn test_cron_job_runs() {
         &minimal_cron_config(),
         vec![job],
         Arc::new(registry),
+        Arc::new(ChannelManager::new(MemoryTier::Standard)),
         data_dir.path().to_owned(),
     );
 
@@ -208,6 +214,7 @@ async fn test_cron_enable_disable() {
         &minimal_cron_config(),
         vec![job_on, job_off],
         Arc::new(registry),
+        Arc::new(ChannelManager::new(MemoryTier::Standard)),
         data_dir.path().to_owned(),
     );
 
@@ -253,6 +260,7 @@ async fn test_cron_invalid_agent() {
         &minimal_cron_config(),
         vec![job],
         Arc::new(registry),
+        Arc::new(ChannelManager::new(MemoryTier::Standard)),
         data_dir.path().to_owned(),
     );
 
@@ -303,6 +311,7 @@ async fn test_cron_trigger_unknown_job_returns_error() {
         &minimal_cron_config(),
         vec![], // no jobs registered
         Arc::new(registry),
+        Arc::new(ChannelManager::new(MemoryTier::Standard)),
         data_dir.path().to_owned(),
     );
 

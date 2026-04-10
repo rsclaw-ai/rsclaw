@@ -379,12 +379,12 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             if let Ok(release) = resp.json::<serde_json::Value>().await {
                 let latest_raw = release["tag_name"]
                     .as_str()
-                    .unwrap_or("")
-                    .trim_start_matches('v');
+                    .unwrap_or("");
                 let current_raw = env!("RSCLAW_BUILD_VERSION");
                 // Extract bare version: "2026.4.1 (abc123)" -> "2026.4.1",
                 // "2026.4.1-beta" -> "2026.4.1".
                 fn strip_ver(s: &str) -> &str {
+                    let s = s.trim_start_matches('v');
                     let s = s.split_once(' ').map(|(v, _)| v).unwrap_or(s);
                     s.split_once('-').map(|(v, _)| v).unwrap_or(s)
                 }

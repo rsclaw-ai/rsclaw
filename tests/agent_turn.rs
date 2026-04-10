@@ -49,6 +49,7 @@ fn config_with_echo_agent(port: u16) -> RuntimeConfig {
             channel_health_check_minutes: 5,
             channel_stale_event_threshold_minutes: 30,
             channel_max_restarts_per_hour: 10,
+            user_agent: None,
         },
         agents: AgentsRuntime {
             defaults: Default::default(),
@@ -104,6 +105,7 @@ fn config_with_echo_agent(port: u16) -> RuntimeConfig {
 
 /// Start a server where every agent inbox is handled by an echo task.
 async fn start_echo_server(addr: SocketAddr) {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let config = Arc::new(config_with_echo_agent(addr.port()));
     let live = Arc::new(LiveConfig::new((*config).clone()));
 

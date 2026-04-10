@@ -73,11 +73,15 @@ impl ProviderRegistry {
     /// provider (preferring custom > ollama > first).
     pub fn resolve_model<'a>(&'a self, model: &'a str) -> (&'a str, &'a str) {
         // Check model alias table first: full model key -> provider name.
-        // Preserve the original model key as model_id so the target provider
-        // receives it intact (e.g. "minimax/minimax-m2.1" stays as-is).
+        // If the model key starts with "<alias_provider>/", strip that prefix
+        // before sending to the provider (direct APIs like minimax/openai
+        // don't accept "provider/model" format, only aggregators like
+        // OpenRouter do). Preserve case of the remaining model id.
         if let Some(alias_provider) = self.model_aliases.get(model) {
             if self.providers.contains_key(alias_provider.as_str()) {
-                return (alias_provider.as_str(), model);
+                let prefix = format!("{}/", alias_provider);
+                let model_id = model.strip_prefix(&prefix).unwrap_or(model);
+                return (alias_provider.as_str(), model_id);
             }
         }
         let (provider, model_id) = Self::parse_model(model);

@@ -28,6 +28,8 @@ pub(crate) fn http_client() -> reqwest::Client {
 pub(crate) fn http_client_with_ua(user_agent: Option<&str>) -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(user_agent.unwrap_or(DEFAULT_USER_AGENT))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .pool_idle_timeout(std::time::Duration::from_secs(60))
         .build()
         .expect("failed to build HTTP client")
 }

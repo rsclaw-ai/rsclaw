@@ -238,6 +238,23 @@ fn fix_incomplete_json(incomplete: &str) -> String {
         return trimmed.to_string();
     }
 
+    // Fix missing value before closing brace/bracket, e.g. "key":} or "key":,
+    // The regex-free approach: scan for `:}`, `:,`, or trailing `:` patterns.
+    let mut fixed = trimmed.to_string();
+    // Replace `":}` with `":null}` and `":,` with `":null,`
+    while fixed.contains("\":}") || fixed.contains("\":,") || fixed.contains("\": }") || fixed.contains("\": ,") {
+        fixed = fixed
+            .replace("\":}", "\":null}")
+            .replace("\":,", "\":null,")
+            .replace("\": }", "\": null}")
+            .replace("\": ,", "\": null,");
+    }
+    // Also handle numeric/bool key (rare but possible): ,}
+    fixed = fixed.replace(",}", "}");
+    if serde_json::from_str::<Value>(&fixed).is_ok() {
+        return fixed;
+    }
+
     // If it ends with a complete value, add closing brace
     let last_char = trimmed.chars().last().unwrap_or(' ');
     if last_char == '"'
@@ -478,6 +495,18 @@ mod tests {
         assert!(result.is_some());
         let repair = result.unwrap();
         assert_eq!(repair.kind, RepairKind::Repaired);
+    }
+
+    #[test]
+    fn test_try_extract_missing_value_before_brace() {
+        // Model sends "top_k":} with no value — should repair to "top_k":null
+        let raw = r#"{"action":"search","query":"所有记忆","top_k":}"#;
+        let result = try_extract_usable_args(raw);
+        assert!(result.is_some());
+        let repair = result.unwrap();
+        assert_eq!(repair.args["action"], "search");
+        assert_eq!(repair.args["query"], "所有记忆");
+        assert!(repair.args["top_k"].is_null());
     }
 
     // ---------------------------------------------------------------------------

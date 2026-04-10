@@ -47,6 +47,7 @@ fn minimal_config(port: u16) -> RuntimeConfig {
             channel_health_check_minutes: 5,
             channel_stale_event_threshold_minutes: 30,
             channel_max_restarts_per_hour: 10,
+            user_agent: None,
         },
         agents: AgentsRuntime {
             defaults: Default::default(),
@@ -85,6 +86,7 @@ fn minimal_config(port: u16) -> RuntimeConfig {
 }
 
 async fn start_server(addr: SocketAddr) {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let config = Arc::new(minimal_config(addr.port()));
     let live = Arc::new(LiveConfig::new((*config).clone()));
 

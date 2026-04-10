@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use anyhow::Result;
 
 use super::style::*;
@@ -30,6 +32,38 @@ pub async fn cmd_sessions(sub: SessionsCommand) -> Result<()> {
                 for s in &sessions {
                     item("-", &cyan(s));
                 }
+            }
+        }
+        SessionsCommand::Export(args) => {
+            let sessions = store.db.list_sessions()?;
+            let target_sessions: Vec<String> = if let Some(ref key) = args.session {
+                sessions.into_iter().filter(|s| s == key).collect()
+            } else {
+                sessions.into_iter().take(args.limit).collect()
+            };
+
+            let mut writer: Box<dyn std::io::Write> = if let Some(ref path) = args.output {
+                Box::new(std::io::BufWriter::new(std::fs::File::create(path)?))
+            } else {
+                Box::new(std::io::stdout().lock())
+            };
+
+            let mut total = 0usize;
+            for session_key in &target_sessions {
+                let messages = store.db.load_messages(session_key)?;
+                if messages.is_empty() {
+                    continue;
+                }
+                let record = serde_json::json!({
+                    "session": session_key,
+                    "messages": messages,
+                });
+                writeln!(writer, "{}", serde_json::to_string(&record)?)?;
+                total += 1;
+            }
+
+            if args.output.is_some() {
+                eprintln!("exported {} session(s)", total);
             }
         }
         SessionsCommand::Cleanup(args) => {

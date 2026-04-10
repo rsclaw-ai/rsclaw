@@ -4,6 +4,8 @@ use clap::{Args, Subcommand};
 pub enum SessionsCommand {
     List(SessionsListArgs),
     Cleanup(CleanupArgs),
+    /// Export session messages as JSONL for fine-tuning / calibration.
+    Export(ExportArgs),
 }
 
 #[derive(Args, Debug)]
@@ -36,4 +38,17 @@ pub struct CleanupArgs {
     pub enforce: bool,
     #[arg(long)]
     pub active_key: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ExportArgs {
+    /// Export a specific session key. If omitted, exports all sessions.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// Output file path (default: stdout).
+    #[arg(long, short)]
+    pub output: Option<String>,
+    /// Maximum number of sessions to export.
+    #[arg(long, default_value = "500")]
+    pub limit: usize,
 }
