@@ -54,6 +54,7 @@ async fn send_text_posts_to_channel_messages() {
         text: "Hello, Discord!".to_owned(),
         reply_to: None,
         images: vec![],
+    ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -82,6 +83,7 @@ async fn send_chunked_2000() {
         text: long_text,
         reply_to: None,
         images: vec![],
+    ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -114,6 +116,7 @@ async fn send_image_uploads_multipart() {
         text: "Image test".to_owned(),
         reply_to: None,
         images: vec![data_uri],
+    ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -136,6 +139,7 @@ async fn http_error_returns_err() {
         text: "Hello".to_owned(),
         reply_to: None,
         images: vec![],
+    ..Default::default()
     };
 
     let result = ch.send(msg).await;
@@ -164,6 +168,7 @@ async fn auth_header_includes_bot_prefix() {
         text: "Auth check".to_owned(),
         reply_to: None,
         images: vec![],
+    ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed with Bot auth header");

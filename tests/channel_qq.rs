@@ -85,6 +85,7 @@ async fn send_group_message() {
         text: "Hello, QQ group!".to_owned(),
         reply_to: Some("orig_msg_id".to_owned()),
         images: vec![],
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -111,6 +112,7 @@ async fn send_c2c_message() {
         text: "Hello, QQ user!".to_owned(),
         reply_to: Some("orig_msg_id".to_owned()),
         images: vec![],
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -147,6 +149,7 @@ async fn token_refresh_happens_automatically() {
         text: "Token test".to_owned(),
         reply_to: Some("mid".to_owned()),
         images: vec![],
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -173,6 +176,7 @@ async fn send_guild_message() {
         text: "Hello, guild channel!".to_owned(),
         reply_to: Some("orig_mid".to_owned()),
         images: vec![],
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -198,6 +202,7 @@ async fn send_fails_on_http_error() {
         text: "Should fail".to_owned(),
         reply_to: Some("mid".to_owned()),
         images: vec![],
+        ..Default::default()
     };
 
     let result = ch.send(msg).await;

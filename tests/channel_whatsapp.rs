@@ -59,6 +59,7 @@ async fn send_text_posts_to_messages_endpoint() {
         text: "Hello, WhatsApp!".to_owned(),
         reply_to: None,
         images: vec![],
+    ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -87,6 +88,7 @@ async fn send_chunked_4000() {
         text: long_text,
         reply_to: None,
         images: vec![],
+    ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -129,6 +131,7 @@ async fn send_image_uploads_then_sends() {
         text: "Check this image".to_owned(),
         reply_to: None,
         images: vec![data_uri],
+    ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -196,6 +199,7 @@ async fn http_error_returns_err() {
         text: "Hello".to_owned(),
         reply_to: None,
         images: vec![],
+    ..Default::default()
     };
 
     let result = ch.send(msg).await;

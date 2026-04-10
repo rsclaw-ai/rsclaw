@@ -65,6 +65,7 @@ fn test_msg() -> OutboundMessage {
         text: "hello".to_owned(),
         reply_to: None,
         images: vec![],
+        ..Default::default()
     }
 }
 

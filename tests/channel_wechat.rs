@@ -72,6 +72,7 @@ async fn send_text_via_mock() {
             text: "Hello WeChat".to_owned(),
             reply_to: None,
             images: vec![],
+        ..Default::default()
         })
         .await;
 
@@ -108,6 +109,7 @@ async fn send_chunked_message() {
             text: long_text,
             reply_to: None,
             images: vec![],
+        ..Default::default()
         })
         .await;
 

@@ -112,6 +112,7 @@ pub async fn start_server(addr: SocketAddr) {
         started_at: std::time::Instant::now(),
         dm_enforcers: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         custom_webhooks: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        cron_reload: broadcast::channel(1).0,
     };
 
     // Leak tempdir — store must stay live for the lifetime of the server task.

@@ -92,6 +92,7 @@ async fn send_text_puts_room_message() {
             text: "Hello Matrix".to_owned(),
             reply_to: None,
             images: vec![],
+        ..Default::default()
         })
         .await;
 
@@ -125,6 +126,7 @@ async fn send_chunked_10000() {
             text: long_text,
             reply_to: None,
             images: vec![],
+        ..Default::default()
         })
         .await;
 

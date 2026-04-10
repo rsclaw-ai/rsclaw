@@ -34,6 +34,7 @@ async fn send_text_ok() {
             text: "integration test output".to_owned(),
             reply_to: None,
             images: vec![],
+            ..Default::default()
         })
         .await;
     assert!(result.is_ok(), "send should not error: {:?}", result.err());
@@ -51,6 +52,7 @@ async fn send_ignores_images() {
             text: "text with image".to_owned(),
             reply_to: None,
             images: vec!["data:image/png;base64,iVBOR...".to_owned()],
+        ..Default::default()
         })
         .await;
     assert!(result.is_ok(), "send with images should not error: {:?}", result.err());
@@ -67,6 +69,7 @@ async fn send_with_reply_to() {
             text: "replying".to_owned(),
             reply_to: Some("prev_msg_id".to_owned()),
             images: vec![],
+            ..Default::default()
         })
         .await;
     assert!(result.is_ok());
@@ -83,6 +86,7 @@ async fn send_empty_text() {
             text: String::new(),
             reply_to: None,
             images: vec![],
+            ..Default::default()
         })
         .await;
     assert!(result.is_ok());

@@ -113,6 +113,7 @@ async fn start_server(addr: SocketAddr) {
         started_at: std::time::Instant::now(),
         dm_enforcers: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         custom_webhooks: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        cron_reload: broadcast::channel(1).0,
     };
 
     // Leak the tempdir so the store stays valid for the lifetime of the server.
@@ -200,6 +201,7 @@ async fn auth_token_gates_non_health_endpoints() {
         started_at: std::time::Instant::now(),
         dm_enforcers: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         custom_webhooks: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        cron_reload: broadcast::channel(1).0,
     };
     std::mem::forget(data_dir);
     tokio::spawn(async move { serve(state, addr).await.expect("serve") });
