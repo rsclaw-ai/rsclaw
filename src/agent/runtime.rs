@@ -3922,7 +3922,7 @@ impl AgentRuntime {
 
         // Helper: render messages as plain text transcript.
         //
-        // Total output is capped (default 64K chars ≈ 16K tokens) to avoid blowing
+        // Total output is capped (default 16K tokens) to avoid blowing
         // up the compact LLM's context window.
         //
         // Strategy: two-pass budget allocation.
@@ -3933,9 +3933,9 @@ impl AgentRuntime {
         //           detail until budget is exhausted. This ensures the most
         //           recent (and typically most relevant) context is preserved.
         let msgs_to_text = |msgs: &[Message]| -> String {
-            // Default ~16K tokens input for compact LLM. User can override via
-            // compaction.maxTranscriptChars in config.
-            let max_total_chars: usize = cfg.max_transcript_chars.unwrap_or(64_000);
+            // Default 16K tokens input for compact LLM. User can override via
+            // compaction.maxTranscriptTokens in config.
+            let max_total_tokens: usize = cfg.max_transcript_tokens.unwrap_or(16_000);
 
             // Render a single message. `detail` controls verbosity:
             //   2 = full (tool args + results)
@@ -3980,56 +3980,58 @@ impl AgentRuntime {
 
             // Pass 1: full detail, check if within budget.
             let full: Vec<String> = msgs.iter().map(|m| render_msg(m, 2)).collect();
-            let total: usize = full.iter().map(|s| s.len() + 1).sum(); // +1 for \n
-            if total <= max_total_chars {
+            let full_tokens: Vec<usize> = full.iter().map(|s| estimate_tokens(s)).collect();
+            let total: usize = full_tokens.iter().sum();
+            if total <= max_total_tokens {
                 return full.join("\n");
             }
 
             // Pass 2: allocate budget from newest to oldest.
-            // Reuse Pass 1 sizes for detail=2 to avoid re-rendering.
+            // Reuse Pass 1 token counts for detail=2 to avoid re-rendering.
             let n = msgs.len();
-            let full_sizes: Vec<usize> = full.iter().map(|s| s.len() + 1).collect();
             let mut detail_levels = vec![0u8; n];
             let mut budget_used = 0usize;
 
             for i in (0..n).rev() {
-                // Try full first (reuse cached size), then medium/minimal.
-                if budget_used + full_sizes[i] <= max_total_chars {
+                // Try full first (reuse cached token count), then medium/minimal.
+                if budget_used + full_tokens[i] <= max_total_tokens {
                     detail_levels[i] = 2;
-                    budget_used += full_sizes[i];
+                    budget_used += full_tokens[i];
                 } else {
                     // Try medium → minimal
                     let m = &msgs[i];
                     for &d in &[1u8, 0] {
                         let rendered = render_msg(m, d);
-                        let cost = rendered.len() + 1;
-                        if budget_used + cost <= max_total_chars || d == 0 {
+                        let cost = estimate_tokens(&rendered);
+                        if budget_used + cost <= max_total_tokens || d == 0 {
                             detail_levels[i] = d;
-                            budget_used += cost.min(max_total_chars.saturating_sub(budget_used));
+                            budget_used += cost.min(max_total_tokens.saturating_sub(budget_used));
                             break;
                         }
                     }
                 }
-                if budget_used >= max_total_chars {
+                if budget_used >= max_total_tokens {
                     break; // remaining older messages stay at detail=0 (default)
                 }
             }
 
             // Final render in order. Reuse Pass 1 results for detail=2.
-            let mut result = String::with_capacity(max_total_chars);
+            let mut result = String::new();
+            let mut tokens_used = 0usize;
             for (i, m) in msgs.iter().enumerate() {
                 let line = if detail_levels[i] == 2 {
                     full[i].clone()
                 } else {
                     render_msg(m, detail_levels[i])
                 };
-                if result.len() + line.len() + 1 > max_total_chars {
-                    // UTF-8 safe: don't append partial line
+                let line_tokens = estimate_tokens(&line);
+                if tokens_used + line_tokens > max_total_tokens {
                     result.push_str("\n...[context truncated]");
                     break;
                 }
                 result.push_str(&line);
                 result.push('\n');
+                tokens_used += line_tokens;
             }
             result
         };

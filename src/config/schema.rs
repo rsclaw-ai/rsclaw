@@ -482,10 +482,10 @@ pub struct CompactionConfig {
     /// When true, extract key facts from compacted history and store them
     /// in long-term memory (default true).
     pub extract_facts: Option<bool>,
-    /// Maximum character count for the transcript text fed to the compact LLM.
+    /// Maximum token budget for the transcript text fed to the compact LLM.
     /// Higher values preserve more tool call/result detail but require a
-    /// compact model with sufficient context window. Default: 64000 (~16K tokens).
-    pub max_transcript_chars: Option<usize>,
+    /// compact model with sufficient context window. Default: 16000 tokens.
+    pub max_transcript_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
