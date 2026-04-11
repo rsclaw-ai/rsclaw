@@ -667,6 +667,11 @@ impl AcpClient {
         model: Option<&str>,
         mcp_servers: Option<Vec<McpServerConfig>>,
     ) -> Result<NewSessionResponse> {
+        tracing::info!(
+            cwd = %cwd,
+            model = ?model,
+            "create_session: called with params"
+        );
         let mut params = serde_json::json!({
             "cwd": cwd,
             "mcpServers": mcp_servers.unwrap_or_default()
@@ -674,7 +679,9 @@ impl AcpClient {
 
         if let Some(m) = model {
             params["modelId"] = serde_json::json!(m);
-            tracing::info!(model = %m, "Adding modelId to session/new request");
+            tracing::info!(model = %m, params = ?params, "Adding modelId to session/new request");
+        } else {
+            tracing::warn!("create_session: no model provided, will use agent default");
         }
 
         let resp = self.rpc(methods::SESSION_NEW, params).await?;

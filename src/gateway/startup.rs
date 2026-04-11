@@ -4123,6 +4123,14 @@ fn start_feishu_if_configured(
         let ga = Arc::new(group_allow_from.clone());
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
+        // Register channel sender for notification routing (ACP tools like OpenCode, ClaudeCode)
+        {
+            let mut senders = channel_senders.write().unwrap();
+            // Register both "feishu" (for legacy/simple routing) and "feishu/{account}" (for multi-account)
+            senders.insert("feishu".to_string(), out_tx.clone());
+            senders.insert(format!("feishu/{}", acct_name), out_tx.clone());
+        }
+
         // Find binding for this account to determine which agent handles it.
         let bound_agent = config
             .agents

@@ -354,8 +354,14 @@ impl AgentRuntime {
             .initialize("rsclaw", env!("RSCLAW_BUILD_VERSION"))
             .await?;
 
-        // Create session with default model
-        let model = std::env::var("OPENCODE_MODEL").ok();
+        // Create session with model from config or environment
+        let model = self
+            .handle
+            .config
+            .opencode
+            .as_ref()
+            .and_then(|c| c.model.clone())
+            .or_else(|| std::env::var("OPENCODE_MODEL").ok());
         let session_resp = client.create_session(&cwd, model.as_deref(), None).await?;
 
         tracing::info!(
@@ -377,14 +383,32 @@ impl AgentRuntime {
 
         tracing::info!(task = %task, "tool_opencode: starting");
 
-        let client = self.get_opencode_client().await?;
-        let session_id = client.session_id().await.unwrap_or_default();
-        let session_id_clone = session_id.clone();
-
-        // Get notification sender for async result delivery
+        // Get notification sender early for error reporting
         let notif_tx = self.notification_tx.clone();
         let target_id = ctx.peer_id.clone();
         let channel_name = ctx.channel.clone();
+
+        // Try to get client, send error notification if failed
+        let client = match self.get_opencode_client().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("tool_opencode: get_client failed: {}", e);
+                if let Some(ref tx) = notif_tx {
+                    let _ = tx.send(crate::channel::OutboundMessage {
+                        target_id: target_id.clone(),
+                        is_group: false,
+                        text: format!("❌ OpenCode 启动失败\n\n{}", e),
+                        reply_to: None,
+                        images: vec![],
+                        channel: Some(channel_name.clone()),
+                    });
+                }
+                return Err(e);
+            }
+        };
+        let session_id = client.session_id().await.unwrap_or_default();
+        let session_id_clone = session_id.clone();
+
         let task_str = task.to_string();
 
         // Send initial notification
@@ -676,13 +700,21 @@ impl AgentRuntime {
             .claudecode
             .as_ref()
             .and_then(|c| c.model.clone())
-            .or_else(|| std::env::var("CLAUDE_MODEL").ok());
+            .or_else(|| std::env::var("CLAUDE_MODEL").ok())
+            .or_else(|| std::env::var("ANTHROPIC_MODEL").ok());
+        eprintln!("[ClaudeCode] model resolution: model={:?}, claudecode_config={:?}", model, self.handle.config.claudecode);
         let session_resp = client.create_session(&cwd, model.as_deref(), None).await?;
 
         tracing::info!(
             session_id = %session_resp.session_id,
             "Claude Code session created"
         );
+
+        // Set model explicitly after session creation (modelId in session/new doesn't switch model)
+        if let Some(ref m) = model {
+            tracing::info!(model = %m, "Claude Code: setting model after session creation");
+            client.set_model(m).await?;
+        }
 
         self.claudecode_client.set(client.clone()).ok();
         Ok(client)
@@ -697,14 +729,32 @@ impl AgentRuntime {
 
         tracing::info!(task = %task, "tool_claudecode: starting");
 
-        let client = self.get_claudecode_client().await?;
-        let session_id = client.session_id().await.unwrap_or_default();
-        let session_id_clone = session_id.clone();
-
-        // Get notification sender for async result delivery
+        // Get notification sender early for error reporting
         let notif_tx = self.notification_tx.clone();
         let target_id = ctx.peer_id.clone();
         let channel_name = ctx.channel.clone();
+
+        // Try to get client, send error notification if failed
+        let client = match self.get_claudecode_client().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("tool_claudecode: get_client failed: {}", e);
+                if let Some(ref tx) = notif_tx {
+                    let _ = tx.send(crate::channel::OutboundMessage {
+                        target_id: target_id.clone(),
+                        is_group: false,
+                        text: format!("❌ Claude Code 启动失败\n\n{}", e),
+                        reply_to: None,
+                        images: vec![],
+                        channel: Some(channel_name.clone()),
+                    });
+                }
+                return Err(e);
+            }
+        };
+        let session_id = client.session_id().await.unwrap_or_default();
+        let session_id_clone = session_id.clone();
+
         let task_str = task.to_string();
 
         // Send initial notification
