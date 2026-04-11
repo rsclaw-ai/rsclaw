@@ -110,7 +110,9 @@ impl AcpCallbackHandler for DefaultAcpHandler {
                     kind = ?opt.kind,
                     "handle_request_permission: auto-approving"
                 );
-                return RequestPermissionOutcome::Selected(opt.option_id);
+                return RequestPermissionOutcome::Selected {
+                    option_id: opt.option_id,
+                };
             }
             // Also approve if option_id contains "allow" or "accept" (fallback for non-standard formats)
             if opt.option_id.contains("allow") || opt.option_id.contains("accept") {
@@ -118,7 +120,9 @@ impl AcpCallbackHandler for DefaultAcpHandler {
                     option_id = %opt.option_id,
                     "handle_request_permission: auto-approving by option_id pattern"
                 );
-                return RequestPermissionOutcome::Selected(opt.option_id);
+                return RequestPermissionOutcome::Selected {
+                    option_id: opt.option_id,
+                };
             }
         }
         tracing::warn!("handle_request_permission: no matching allow option found, cancelling");
@@ -243,7 +247,9 @@ impl AcpCallbackHandler for DefaultAcpHandlerWithTerminal {
                     kind = ?opt.kind,
                     "handle_request_permission: auto-approving"
                 );
-                return RequestPermissionOutcome::Selected(opt.option_id);
+                return RequestPermissionOutcome::Selected {
+                    option_id: opt.option_id,
+                };
             }
             // Also approve if option_id contains "allow" or "accept" (fallback for non-standard formats)
             if opt.option_id.contains("allow") || opt.option_id.contains("accept") {
@@ -251,7 +257,9 @@ impl AcpCallbackHandler for DefaultAcpHandlerWithTerminal {
                     option_id = %opt.option_id,
                     "handle_request_permission: auto-approving by option_id pattern"
                 );
-                return RequestPermissionOutcome::Selected(opt.option_id);
+                return RequestPermissionOutcome::Selected {
+                    option_id: opt.option_id,
+                };
             }
         }
         tracing::warn!("handle_request_permission: no matching allow option found, cancelling");

@@ -365,14 +365,30 @@ pub struct PermissionOption {
     pub label: Option<String>,
 }
 
+/// Outcome of a permission request - discriminated union
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(tag = "outcome", rename_all = "camelCase")]
 pub enum RequestPermissionOutcome {
-    #[serde(rename = "selected")]
-    Selected(String),
+    Selected {
+        #[serde(rename = "optionId")]
+        option_id: String,
+    },
     Cancelled,
 }
 
+impl RequestPermissionOutcome {
+    pub fn selected(option_id: impl Into<String>) -> Self {
+        RequestPermissionOutcome::Selected {
+            option_id: option_id.into(),
+        }
+    }
+
+    pub fn cancelled() -> Self {
+        RequestPermissionOutcome::Cancelled
+    }
+}
+
+/// Response to a permission request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestPermissionResponse {
