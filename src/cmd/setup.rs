@@ -738,10 +738,14 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
     let mut bind_mode = ec.bind_idx;
     let mut channel_configs: Vec<(String, Vec<(String, String)>)> = Vec::new();
     let mut custom_bind: Option<String> = None;
+    let mut api_type = String::from("openai"); // API protocol type for custom/codingplan
+    let mut user_agent = String::new();         // custom User-Agent header
 
     const STEP_AGENT: usize = 0;
     const STEP_PROVIDER: usize = 1;
+    const STEP_API_TYPE: usize = 10;  // API protocol selection (custom/codingplan only)
     const STEP_BASE_URL: usize = 2;
+    const STEP_USER_AGENT: usize = 11; // User-Agent header (custom/codingplan only)
     const STEP_API_KEY: usize = 3;
     const STEP_MODEL: usize = 4;
     const STEP_PORT: usize = 5;
@@ -768,8 +772,58 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                 header(&crate::i18n::t("cli_step_model_provider", lang));
                 let choose_prov = crate::i18n::t("cli_choose_provider", lang);
                 match select_step(&format!("  {choose_prov}"), &provider_labels, provider_idx) {
-                    StepResult::Next(idx) => { provider_idx = idx; wiz_step = STEP_BASE_URL; }
+                    StepResult::Next(idx) => {
+                        provider_idx = idx;
+                        let prov = &defs.providers[idx];
+                        if prov.name == "custom" || prov.name == "codingplan" {
+                            wiz_step = STEP_API_TYPE;
+                        } else {
+                            wiz_step = STEP_BASE_URL;
+                        }
+                    }
                     StepResult::Back => { wiz_step = STEP_AGENT; }
+                    StepResult::Cancel => { println!("  {}", crate::i18n::t("cli_setup_cancelled", lang)); return Ok(()); }
+                }
+            }
+            STEP_API_TYPE => {
+                // API protocol selection for custom/codingplan providers.
+                let api_labels = &[
+                    "OpenAI Chat (default)",
+                    "OpenAI Responses",
+                    "Anthropic",
+                    "Google Gemini",
+                    "Ollama",
+                ];
+                let api_values = &["openai", "openai-responses", "anthropic", "gemini", "ollama"];
+                let current_idx = api_values.iter().position(|v| *v == api_type).unwrap_or(0);
+                match select_step("  API Protocol", api_labels, current_idx) {
+                    StepResult::Next(idx) => {
+                        api_type = api_values[idx].to_string();
+                        // Auto-fill base URL from API type default
+                        let default_urls: &[(&str, &str)] = &[
+                            ("openai", "https://api.openai.com/v1"),
+                            ("openai-responses", "https://api.openai.com/v1"),
+                            ("anthropic", "https://api.anthropic.com/v1"),
+                            ("gemini", "https://generativelanguage.googleapis.com/v1beta"),
+                            ("ollama", "http://localhost:11434"),
+                        ];
+                        if base_url.is_empty() {
+                            if let Some((_, url)) = default_urls.iter().find(|(k, _)| *k == api_type) {
+                                base_url = url.to_string();
+                            }
+                        }
+                        wiz_step = STEP_BASE_URL;
+                    }
+                    StepResult::Back => { wiz_step = STEP_PROVIDER; }
+                    StepResult::Cancel => { println!("  {}", crate::i18n::t("cli_setup_cancelled", lang)); return Ok(()); }
+                }
+            }
+            STEP_USER_AGENT => {
+                // User-Agent header for custom/codingplan providers.
+                let default_ua = if user_agent.is_empty() { "rsclaw/1.0".to_string() } else { user_agent.clone() };
+                match input_step("  User-Agent header (blank for default)", default_ua) {
+                    StepResult::Next(val) => { user_agent = val; wiz_step = STEP_API_KEY; }
+                    StepResult::Back => { wiz_step = STEP_BASE_URL; }
                     StepResult::Cancel => { println!("  {}", crate::i18n::t("cli_setup_cancelled", lang)); return Ok(()); }
                 }
             }
@@ -784,8 +838,8 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                 } else if provider.name == "custom" || provider.name == "codingplan" {
                     let default_url = if base_url.is_empty() { "https://api.example.com".to_string() } else { base_url.clone() };
                     match input_step("  API base URL", default_url) {
-                        StepResult::Next(val) => { base_url = val; wiz_step = STEP_API_KEY; }
-                        StepResult::Back => { wiz_step = STEP_PROVIDER; }
+                        StepResult::Next(val) => { base_url = val; wiz_step = STEP_USER_AGENT; }
+                        StepResult::Back => { wiz_step = STEP_API_TYPE; }
                         StepResult::Cancel => { println!("  {}", crate::i18n::t("cli_setup_cancelled", lang)); return Ok(()); }
                     }
                 } else if provider.name == "kimi" {
@@ -1032,8 +1086,14 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
             if !effective_base_url.is_empty() {
                 prov_obj.insert("baseUrl".into(), json!(effective_base_url));
             }
-            // Write user_agent for providers that need it
-            if !provider.user_agent.is_empty() {
+            // Write api type for custom/codingplan providers
+            if (provider.name == "custom" || provider.name == "codingplan") && !api_type.is_empty() {
+                prov_obj.insert("api".into(), json!(api_type));
+            }
+            // Write user_agent (from wizard input or provider default)
+            if !user_agent.is_empty() {
+                prov_obj.insert("userAgent".into(), json!(user_agent));
+            } else if !provider.user_agent.is_empty() {
                 prov_obj.insert("userAgent".into(), json!(provider.user_agent));
             }
         }
@@ -1473,8 +1533,8 @@ async fn configure_model(
             StepResult::Next(u) => new_base_url = u,
             StepResult::Back | StepResult::Cancel => return Ok(()),
         }
-    } else if provider.name == "custom" {
-        let current = get_nested_value(val, "models.providers.custom.baseUrl")
+    } else if provider.name == "custom" || provider.name == "codingplan" {
+        let current = get_nested_value(val, &format!("models.providers.{}.baseUrl", provider.name))
             .and_then(|v| v.as_str().map(|s| s.to_owned()))
             .unwrap_or_else(|| "https://api.example.com".to_string());
         match input_step("  API base URL", current) {
@@ -1493,8 +1553,40 @@ async fn configure_model(
         new_base_url = provider.base_url.to_string();
     }
 
+    // API type + User-Agent for custom/codingplan providers
+    let mut new_api_type = String::new();
+    let mut new_user_agent = String::new();
+    if provider.name == "custom" || provider.name == "codingplan" {
+        // API protocol selection
+        let api_labels = &[
+            "OpenAI Chat (default)",
+            "OpenAI Responses",
+            "Anthropic",
+            "Google Gemini",
+            "Ollama",
+        ];
+        let api_values = &["openai", "openai-responses", "anthropic", "gemini", "ollama"];
+        let current_api = get_nested_value(val, &format!("models.providers.{}.api", provider.name))
+            .and_then(|v| v.as_str().map(|s| s.to_owned()))
+            .unwrap_or_else(|| "openai".to_string());
+        let current_idx = api_values.iter().position(|v| *v == current_api).unwrap_or(0);
+        match select_step("  API Protocol", api_labels, current_idx) {
+            StepResult::Next(idx) => { new_api_type = api_values[idx].to_string(); }
+            StepResult::Back | StepResult::Cancel => return Ok(()),
+        }
+
+        // User-Agent header
+        let current_ua = get_nested_value(val, &format!("models.providers.{}.userAgent", provider.name))
+            .and_then(|v| v.as_str().map(|s| s.to_owned()))
+            .unwrap_or_else(|| "rsclaw/1.0".to_string());
+        match input_step("  User-Agent header", current_ua) {
+            StepResult::Next(ua) => { new_user_agent = ua; }
+            StepResult::Back | StepResult::Cancel => return Ok(()),
+        }
+    }
+
     // API key confirm + input
-    if provider.needs_key || provider.name == "custom" {
+    if provider.needs_key || provider.name == "custom" || provider.name == "codingplan" {
         let api_key_path = format!("models.providers.{}.apiKey", provider.name);
         let current_key_display = get_nested_value(val, &api_key_path)
             .and_then(|v| v.as_str().map(|s| s.to_owned()))
@@ -1597,6 +1689,18 @@ async fn configure_model(
         ensure_json_path(val, &["models", "providers"]);
         ensure_json_path(val, &["models", "providers", &provider.name]);
         set_nested_value(val, &url_path, serde_json::json!(new_base_url))?;
+    }
+
+    // Write api type and user_agent for custom/codingplan
+    if !new_api_type.is_empty() {
+        let api_path = format!("models.providers.{}.api", provider.name);
+        ensure_json_path(val, &["models", "providers", &provider.name]);
+        set_nested_value(val, &api_path, serde_json::json!(new_api_type))?;
+    }
+    if !new_user_agent.is_empty() {
+        let ua_path = format!("models.providers.{}.userAgent", provider.name);
+        ensure_json_path(val, &["models", "providers", &provider.name]);
+        set_nested_value(val, &ua_path, serde_json::json!(new_user_agent))?;
     }
 
     // Ensure model has provider/ prefix
