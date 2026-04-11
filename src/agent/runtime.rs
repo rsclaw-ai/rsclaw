@@ -2047,11 +2047,15 @@ impl AgentRuntime {
             // 3. Fuse with Reciprocal Rank Fusion (k=60), return top final_k.
             let results = rrf_fuse(vec_hits, bm25_hits, recall_final_k);
             if !results.is_empty() {
+                let now_ts = chrono::Utc::now().timestamp();
                 let mem_block = format!(
                     "<relevant-memories>\n{}\n</relevant-memories>",
                     results
                         .iter()
-                        .map(|d| format!("- [{}] {}", d.kind, d.display_text()))
+                        .map(|d| {
+                            let age = memory_age_label(now_ts, d.created_at);
+                            format!("- [{}] {} ({})", d.kind, d.display_text(), age)
+                        })
                         .collect::<Vec<_>>()
                         .join("\n")
                 );
@@ -2109,6 +2113,12 @@ impl AgentRuntime {
                 "- Use 1. or - for lists.\n",
                 "- Use > for important quotes.\n",
                 "- Do NOT use Markdown tables (|---|). Use \"label: value\" format instead.\n",
+                "\n[Data integrity rules - CRITICAL]\n",
+                "- NEVER truncate or shorten ANY text, strings, numbers, or identifiers.\n",
+                "- Copy ALL values EXACTLY: UUIDs, IDs, IP addresses, paths, URLs, code, data.\n",
+                "- UUIDs: 36 chars (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).\n",
+                "- IP addresses: complete (127.0.0.1 not 7.0.0.1).\n",
+                "- If you see truncated data in context, report it as incomplete.\n",
                 "\n[Tool usage rules]\n",
                 "- For ANY question about real-time data (prices, weather, news, dates, events), you MUST call web_search first. NEVER answer from memory.\n",
                 "- For shell commands, file operations, use exec/read/write tools.\n",
@@ -2568,6 +2578,26 @@ impl AgentRuntime {
             let approx_tokens: usize = messages.iter().map(msg_tokens).sum();
             info!(session = %ctx.session_key, msg_count, approx_tokens, model = %model, "LLM call: context size");
 
+            // Context usage awareness: inject hint when usage is high.
+            // This goes into the system prompt so the LLM can self-adjust
+            // (shorter outputs, avoid re-reading files, etc.).
+            let effective_system = if approx_tokens > 0 && context_tokens > 0 {
+                let usage_pct = (approx_tokens * 100) / context_tokens;
+                if usage_pct >= 90 {
+                    format!("{system_prompt}\n\n[Context usage: {usage_pct}% — CRITICAL. \
+                        Keep responses very concise. Do not re-read files already in context. \
+                        Suggest user start a new session if task is complete.]")
+                } else if usage_pct >= 70 {
+                    format!("{system_prompt}\n\n[Context usage: {usage_pct}%. \
+                        Optimize: keep tool outputs short (use offset/limit for reads, \
+                        pipe to head/tail for commands). Avoid re-reading files already in context.]")
+                } else {
+                    system_prompt.to_owned()
+                }
+            } else {
+                system_prompt.to_owned()
+            };
+
             // Resolve max_tokens with priority: config > built-in defaults > 8192
             let (provider_name, model_id) =
                 crate::provider::registry::ProviderRegistry::parse_model(&model);
@@ -2628,7 +2658,7 @@ impl AgentRuntime {
                 model: model.to_owned(),
                 messages,
                 tools: tools.clone(),
-                system: Some(system_prompt.to_owned()),
+                system: Some(effective_system.clone()),
                 max_tokens: Some(max_tokens),
                 temperature: None,
                 thinking_budget,
@@ -3810,26 +3840,195 @@ impl AgentRuntime {
         };
         let extract_facts = cfg.extract_facts.unwrap_or(true);
 
-        // Helper: render messages as plain text transcript.
-        let msgs_to_text = |msgs: &[Message]| -> String {
-            msgs.iter()
-                .map(|m| {
-                    let role = format!("{:?}", m.role).to_lowercase();
-                    let body = match &m.content {
-                        MessageContent::Text(t) => t.clone(),
-                        MessageContent::Parts(parts) => parts
-                            .iter()
-                            .filter_map(|p| match p {
-                                ContentPart::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" "),
+        // Helper: truncate to N chars (UTF-8 safe, early exit).
+        fn truncate_chars(s: &str, max: usize) -> String {
+            match s.char_indices().nth(max) {
+                None => s.to_owned(),
+                Some((byte_idx, _)) => {
+                    let mut t = s[..byte_idx].to_owned();
+                    t.push_str("...[truncated]");
+                    t
+                }
+            }
+        }
+
+        // Helper: smart-truncate tool_call args — keep metadata, trim large content.
+        //
+        // Limits by field type:
+        //   - "content", "old_string", "new_string": bulk code/text → 300 chars
+        //   - "command": shell commands with URLs → 500 chars
+        //   - all other fields: kept intact (paths, actions, schedules, etc.)
+        //   - total serialized output capped at 2000 chars
+        fn compact_tool_args(_tool_name: &str, input: &Value) -> String {
+            const BULK_FIELDS: &[&str] = &["content", "old_string", "new_string"];
+            const MAX_BULK_CHARS: usize = 300;
+            const MAX_CMD_CHARS: usize = 500;
+            const MAX_TOTAL_CHARS: usize = 2000;
+
+            if let Some(obj) = input.as_object() {
+                let needs_truncation = obj.iter().any(|(k, v)| {
+                    let limit = if BULK_FIELDS.contains(&k.as_str()) {
+                        MAX_BULK_CHARS
+                    } else if k == "command" {
+                        MAX_CMD_CHARS
+                    } else {
+                        return false; // non-bulk fields: never truncate
                     };
-                    format!("{role}: {body}")
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+                    v.as_str()
+                        .map(|s| s.char_indices().nth(limit).is_some())
+                        .unwrap_or(false)
+                });
+
+                if needs_truncation {
+                    let mut compact = serde_json::Map::new();
+                    for (k, v) in obj {
+                        let limit = if BULK_FIELDS.contains(&k.as_str()) {
+                            Some(MAX_BULK_CHARS)
+                        } else if k == "command" {
+                            Some(MAX_CMD_CHARS)
+                        } else {
+                            None
+                        };
+                        if let (Some(limit), Some(s)) = (limit, v.as_str()) {
+                            compact.insert(
+                                k.clone(),
+                                Value::String(truncate_chars(s, limit)),
+                            );
+                        } else {
+                            compact.insert(k.clone(), v.clone());
+                        }
+                    }
+                    let serialized = serde_json::to_string(&Value::Object(compact))
+                        .unwrap_or_default();
+                    return if serialized.char_indices().nth(MAX_TOTAL_CHARS).is_some() {
+                        truncate_chars(&serialized, MAX_TOTAL_CHARS)
+                    } else {
+                        serialized
+                    };
+                }
+            }
+
+            // Small args or non-object: serialize as-is with safety net
+            let full = serde_json::to_string(input).unwrap_or_default();
+            if full.char_indices().nth(MAX_TOTAL_CHARS).is_some() {
+                truncate_chars(&full, MAX_TOTAL_CHARS)
+            } else {
+                full
+            }
+        }
+
+        // Helper: render messages as plain text transcript.
+        //
+        // Total output is capped (default 64K chars ≈ 16K tokens) to avoid blowing
+        // up the compact LLM's context window.
+        //
+        // Strategy: two-pass budget allocation.
+        //   Pass 1: render all messages at full detail, measure sizes.
+        //   Pass 2 (if over budget): render at reduced detail, allocating
+        //           budget from newest to oldest. Recent messages get full
+        //           detail first; older messages get progressively reduced
+        //           detail until budget is exhausted. This ensures the most
+        //           recent (and typically most relevant) context is preserved.
+        let msgs_to_text = |msgs: &[Message]| -> String {
+            // Default ~16K tokens input for compact LLM. User can override via
+            // compaction.maxTranscriptChars in config.
+            let max_total_chars: usize = cfg.max_transcript_chars.unwrap_or(64_000);
+
+            // Render a single message. `detail` controls verbosity:
+            //   2 = full (tool args + results)
+            //   1 = medium (tool names + truncated args, no results)
+            //   0 = minimal (tool names only, text truncated)
+            let render_msg = |m: &Message, detail: u8| -> String {
+                let role = format!("{:?}", m.role).to_lowercase();
+                let body = match &m.content {
+                    MessageContent::Text(t) => {
+                        if detail == 0 { truncate_chars(t, 200) } else { t.clone() }
+                    }
+                    MessageContent::Parts(parts) => parts
+                        .iter()
+                        .filter_map(|p| match p {
+                            ContentPart::Text { text } => Some(
+                                if detail == 0 { truncate_chars(text, 200) } else { text.clone() }
+                            ),
+                            ContentPart::ToolUse { name, input, .. } => match detail {
+                                2 => Some(format!("[tool_call: {name}({})]",
+                                    compact_tool_args(name, input))),
+                                1 => Some(format!("[tool_call: {name}({})]",
+                                    truncate_chars(
+                                        &serde_json::to_string(input).unwrap_or_default(), 100))),
+                                _ => Some(format!("[tool_call: {name}]")),
+                            },
+                            ContentPart::ToolResult { tool_use_id: _, content, .. } => match detail {
+                                2 => Some(format!("[tool_result: {}]",
+                                    truncate_chars(content, 800))),
+                                1 => Some(format!("[tool_result: {}]",
+                                    truncate_chars(content, 150))),
+                                _ => None, // drop results at minimal detail
+                            },
+                            ContentPart::Image { .. } => Some("[image]".to_owned()),
+                            #[allow(unreachable_patterns)]
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                };
+                format!("{role}: {body}")
+            };
+
+            // Pass 1: full detail, check if within budget.
+            let full: Vec<String> = msgs.iter().map(|m| render_msg(m, 2)).collect();
+            let total: usize = full.iter().map(|s| s.len() + 1).sum(); // +1 for \n
+            if total <= max_total_chars {
+                return full.join("\n");
+            }
+
+            // Pass 2: allocate budget from newest to oldest.
+            // Reuse Pass 1 sizes for detail=2 to avoid re-rendering.
+            let n = msgs.len();
+            let full_sizes: Vec<usize> = full.iter().map(|s| s.len() + 1).collect();
+            let mut detail_levels = vec![0u8; n];
+            let mut budget_used = 0usize;
+
+            for i in (0..n).rev() {
+                // Try full first (reuse cached size), then medium/minimal.
+                if budget_used + full_sizes[i] <= max_total_chars {
+                    detail_levels[i] = 2;
+                    budget_used += full_sizes[i];
+                } else {
+                    // Try medium → minimal
+                    let m = &msgs[i];
+                    for &d in &[1u8, 0] {
+                        let rendered = render_msg(m, d);
+                        let cost = rendered.len() + 1;
+                        if budget_used + cost <= max_total_chars || d == 0 {
+                            detail_levels[i] = d;
+                            budget_used += cost.min(max_total_chars.saturating_sub(budget_used));
+                            break;
+                        }
+                    }
+                }
+                if budget_used >= max_total_chars {
+                    break; // remaining older messages stay at detail=0 (default)
+                }
+            }
+
+            // Final render in order. Reuse Pass 1 results for detail=2.
+            let mut result = String::with_capacity(max_total_chars);
+            for (i, m) in msgs.iter().enumerate() {
+                let line = if detail_levels[i] == 2 {
+                    full[i].clone()
+                } else {
+                    render_msg(m, detail_levels[i])
+                };
+                if result.len() + line.len() + 1 > max_total_chars {
+                    // UTF-8 safe: don't append partial line
+                    result.push_str("\n...[context truncated]");
+                    break;
+                }
+                result.push_str(&line);
+                result.push('\n');
+            }
+            result
         };
 
         // Split messages into (old_portion, recent_portion) for layered mode.
@@ -3981,16 +4180,26 @@ impl AgentRuntime {
             messages: vec![Message {
                 role: Role::User,
                 content: MessageContent::Text(format!(
-                    "Summarise the following conversation history concisely. \
-                     Preserve all important facts, decisions, file paths, IDs, \
-                     and context needed to continue the conversation:\n\n{history}"
+                    "Summarize the following conversation into these sections:\n\n\
+                     1. **Task & Intent**: What the user wants to accomplish\n\
+                     2. **Key Data**: Exact values that MUST be preserved verbatim \
+                        (file paths, URLs, cron expressions, config values, IDs, \
+                        variable names, port numbers, credentials)\n\
+                     3. **Actions Taken**: Tool calls and their outcomes — what was \
+                        created, modified, or deleted\n\
+                     4. **Current State**: Where things stand now\n\
+                     5. **Pending Work**: Unfinished tasks or planned next steps\n\n\
+                     CRITICAL: In section 2 (Key Data), copy values character-for-character. \
+                     Do NOT paraphrase cron expressions, file paths, or IDs.\n\n\
+                     ---\n\n{history}"
                 )),
             }],
-            tools: vec![],
+            tools: vec![], // no tools — compact must only produce text
             system: Some(
-                "You are a conversation summarizer. Produce a dense, accurate summary.".to_owned(),
+                "You are a conversation summarizer. Produce a dense, accurate, \
+                 structured summary. NEVER call tools. Text output only.".to_owned(),
             ),
-            max_tokens: Some(1024), // keep summary concise
+            max_tokens: Some(2048), // structured output needs more room
             temperature: None,
             thinking_budget: None,
         };
@@ -4306,7 +4515,7 @@ impl AgentRuntime {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::info!(cwd = %workspace.display(), command = %command, exit_code = ?output.status.code(), stdout = %stdout, stderr = %stderr, "exec: done");
+        tracing::info!(cwd = %workspace.display(), command = %command, exit_code = ?output.status.code(), stdout_len = stdout.len(), stderr_len = stderr.len(), "exec: done");
 
         Ok(json!({
             "exit_code": output.status.code(),
@@ -6909,6 +7118,28 @@ fn build_system_prompt(
     }
 
     parts.join("\n\n")
+}
+
+// ---------------------------------------------------------------------------
+// Memory age label — human-readable relative time for staleness awareness
+// ---------------------------------------------------------------------------
+
+/// Return a relative time label for memory recall.
+/// LLMs can't do date arithmetic, so we use relative descriptions.
+fn memory_age_label(now_ts: i64, created_at: i64) -> String {
+    let age_secs = (now_ts - created_at).max(0);
+    let days = age_secs / 86400;
+    match days {
+        0 => "today".to_owned(),
+        1 => "yesterday".to_owned(),
+        2..=6 => format!("{days} days ago"),
+        7..=13 => "~1 week ago".to_owned(),
+        14..=29 => format!("{} weeks ago", days / 7),
+        30..=59 => "~1 month ago — may be outdated, verify before using".to_owned(),
+        60..=364 => format!("{} months ago — may be outdated, verify before using", days / 30),
+        365..=729 => "~1 year ago — likely outdated, verify before using".to_owned(),
+        _ => format!("~{} years ago — likely outdated, verify before using", days / 365),
+    }
 }
 
 // ---------------------------------------------------------------------------
