@@ -118,6 +118,11 @@ fn default_config(lang: &str) -> String {
     }},
   }},
   agents: {{
+    defaults: {{
+      contextTokens: 64000,       // max context window tokens (adjust for your model)
+      stripThinkTags: false,      // strip <think> tags from output (enable if model leaks them)
+      // thinking: {{ budget: 0 }}, // set budget > 0 to enable model thinking/reasoning
+    }},
     list: [
       {{
         id: "main",

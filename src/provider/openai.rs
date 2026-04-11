@@ -681,15 +681,10 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
             body["thinking_budget"] = json!(budget);
         }
         _ => {
-            // Disable by default for models that auto-enable thinking (Qwen3, DeepSeek-R1).
-            if req.model.to_lowercase().starts_with("qwen")
-                || req.model.to_lowercase().contains("deepseek-r1")
-            {
-                body["enable_thinking"] = json!(false);
-                // llama.cpp ignores enable_thinking but supports chat_template_kwargs
-                // to control thinking at the template level.
-                body["chat_template_kwargs"] = json!({"enable_thinking": false});
-            }
+            // Disable thinking for all models by default.
+            // DashScope/official APIs use enable_thinking, llama.cpp uses chat_template_kwargs.
+            body["enable_thinking"] = json!(false);
+            body["chat_template_kwargs"] = json!({"enable_thinking": false});
         }
     }
 
