@@ -686,6 +686,9 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
                 || req.model.to_lowercase().contains("deepseek-r1")
             {
                 body["enable_thinking"] = json!(false);
+                // llama.cpp ignores enable_thinking but supports chat_template_kwargs
+                // to control thinking at the template level.
+                body["chat_template_kwargs"] = json!({"enable_thinking": false});
             }
         }
     }
