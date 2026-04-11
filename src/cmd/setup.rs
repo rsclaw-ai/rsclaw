@@ -817,7 +817,10 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
             }
             STEP_USER_AGENT => {
                 // User-Agent header for custom/codingplan providers.
-                let default_ua = if user_agent.is_empty() { "rsclaw/1.0".to_string() } else { user_agent.clone() };
+                let provider = &defs.providers[provider_idx];
+                let default_ua = if user_agent.is_empty() {
+                    if provider.user_agent.is_empty() { crate::provider::DEFAULT_USER_AGENT.to_string() } else { provider.user_agent.clone() }
+                } else { user_agent.clone() };
                 match input_step("  User-Agent header (blank for default)", default_ua) {
                     StepResult::Next(val) => { user_agent = val; wiz_step = STEP_API_KEY; }
                     StepResult::Back => { wiz_step = STEP_BASE_URL; }
@@ -1574,7 +1577,7 @@ async fn configure_model(
         // User-Agent header
         let current_ua = get_nested_value(val, &format!("models.providers.{}.userAgent", provider.name))
             .and_then(|v| v.as_str().map(|s| s.to_owned()))
-            .unwrap_or_else(|| "rsclaw/1.0".to_string());
+            .unwrap_or_else(|| if provider.user_agent.is_empty() { crate::provider::DEFAULT_USER_AGENT.to_string() } else { provider.user_agent.clone() });
         match input_step("  User-Agent header", current_ua) {
             StepResult::Next(ua) => { new_user_agent = ua; }
             StepResult::Back | StepResult::Cancel => return Ok(()),
