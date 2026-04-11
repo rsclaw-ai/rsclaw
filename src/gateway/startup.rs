@@ -4125,7 +4125,7 @@ fn start_feishu_if_configured(
 
         // Register channel sender for notification routing (ACP tools like OpenCode, ClaudeCode)
         {
-            let mut senders = channel_senders.write().unwrap();
+            let mut senders = _channel_senders.write().unwrap();
             // Register both "feishu" (for legacy/simple routing) and "feishu/{account}" (for multi-account)
             senders.insert("feishu".to_string(), out_tx.clone());
             senders.insert(format!("feishu/{}", acct_name), out_tx.clone());
