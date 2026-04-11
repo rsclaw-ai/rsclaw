@@ -679,6 +679,7 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
         Some(budget) if budget > 0 => {
             body["enable_thinking"] = json!(true);
             body["thinking_budget"] = json!(budget);
+            body["chat_template_kwargs"] = json!({"enable_thinking": true});
         }
         _ => {
             // Disable thinking for all models by default.
