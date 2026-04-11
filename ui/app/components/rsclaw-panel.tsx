@@ -188,14 +188,17 @@ function StatusPage() {
         if (action === "stop") {
           const { setUserStopped } = await import("./sidebar");
           setUserStopped(true);
+          tauriInvoke("set_gateway_user_stopped", { stopped: true }).catch(() => {});
           await tauriInvoke("stop_gateway");
         } else if (action === "restart") {
+          tauriInvoke("set_gateway_user_stopped", { stopped: false }).catch(() => {});
           await tauriInvoke("stop_gateway");
           await new Promise((r) => setTimeout(r, 1500));
           await tauriInvoke("start_gateway");
         } else if (action === "start") {
           const { setUserStopped } = await import("./sidebar");
           setUserStopped(false);
+          tauriInvoke("set_gateway_user_stopped", { stopped: false }).catch(() => {});
           await tauriInvoke("start_gateway");
         }
       } else {
@@ -3815,10 +3818,15 @@ function TauriConfigPageInner() {
             </div>
             <div style={{ ...fieldRow, borderBottom: "none" }}>
               <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "思考预算" : "Thinking Budget"} <span style={{ color: V.t3, fontWeight: 400 }}>(0 = {zh ? "禁用" : "disabled"})</span></div>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "深度思考" : "Deep Thinking"}</div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.thinking.budget</div>
               </div>
-              <input style={{ ...fInput, minWidth: 100 }} type="number" value={getVal("agents.defaults.thinking.budget", 0)} onChange={(e) => updateConfig("agents.defaults.thinking.budget", parseInt(e.target.value) || 0)} />
+              <select style={{ ...fSelect, minWidth: 200 }} value={String(getVal("agents.defaults.thinking.budget", 0))} onChange={(e) => updateConfig("agents.defaults.thinking.budget", parseInt(e.target.value))}>
+                <option value="0">{zh ? "禁用" : "Disabled"}</option>
+                <option value="4096">{zh ? "轻度 (4K tokens)" : "Light (4K tokens)"}</option>
+                <option value="16384">{zh ? "中度 (16K tokens)" : "Medium (16K tokens)"}</option>
+                <option value="32768">{zh ? "深度 (32K tokens)" : "Deep (32K tokens)"}</option>
+              </select>
             </div>
           </div>
         </div>)}

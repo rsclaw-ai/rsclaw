@@ -1054,17 +1054,25 @@ fn main() {
                         let _ = window.set_focus();
                     }
                 }
-                // Window close → hide to tray + hide from dock
+                // Window close:
+                // - Gateway stopped by user → quit app
+                // - Gateway running → hide to tray
                 tauri::RunEvent::WindowEvent {
                     event: tauri::WindowEvent::CloseRequested { api, .. },
                     ..
                 } => {
-                    api.prevent_close();
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        let _ = window.hide();
+                    if GATEWAY_USER_STOPPED.load(Ordering::Relaxed) {
+                        // Gateway already stopped — let the window close (app will exit)
+                        stop_gateway_sync();
+                    } else {
+                        // Gateway running — hide to tray instead of quitting
+                        api.prevent_close();
+                        if let Some(window) = app_handle.get_webview_window("main") {
+                            let _ = window.hide();
+                        }
+                        #[cfg(target_os = "macos")]
+                        set_dock_visible(false);
                     }
-                    #[cfg(target_os = "macos")]
-                    set_dock_visible(false);
                 }
                 _ => {}
             }
