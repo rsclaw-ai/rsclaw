@@ -81,7 +81,7 @@ impl AgentSpawner {
                 crate::agent::runtime::LiveStatus::default(),
             )),
             providers: Arc::clone(&self.providers),
-            abort_flags: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            abort_flags: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         });
 
         self.registry.insert_handle(Arc::clone(&handle));

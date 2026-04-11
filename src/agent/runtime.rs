@@ -90,16 +90,18 @@ struct AbortFlagGuard {
 
 impl Drop for AbortFlagGuard {
     fn drop(&mut self) {
-        // Try to clear the flag. We use blocking_remove since we may be in async
-        // context but need to modify the HashMap.
-        let flag_value = self.flag.load(Ordering::SeqCst);
-        if flag_value {
-            // Clone the session_key and handle for the blocking call
-            let sk = self.session_key.clone();
-            let handle = Arc::clone(&self.handle);
-            // Clear the flag from the HashMap. We use try_write to avoid blocking.
-            if let Ok(mut flags) = handle.abort_flags.try_write() {
-                flags.remove(&sk);
+        // Always remove the entry — prevents leaking abort_flags entries for
+        // sessions that complete normally (flag_value=false). Uses std::sync::RwLock
+        // so .write() is safe in Drop (no .await needed).
+        match self.handle.abort_flags.write() {
+            Ok(mut flags) => {
+                flags.remove(&self.session_key);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session = %self.session_key,
+                    "AbortFlagGuard: failed to clean up abort flag: {e}"
+                );
             }
         }
     }
@@ -2283,7 +2285,8 @@ impl AgentRuntime {
 
         // Get or create abort flag for this session.
         let abort_flag: Arc<AtomicBool> = {
-            let mut flags = self.handle.abort_flags.write().await;
+            let mut flags = self.handle.abort_flags.write()
+                .expect("abort_flags lock poisoned");
             Arc::clone(flags.entry(session_key.to_string()).or_insert_with(|| {
                 Arc::new(AtomicBool::new(false))
             }))

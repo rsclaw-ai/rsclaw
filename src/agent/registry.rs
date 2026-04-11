@@ -41,7 +41,8 @@ pub struct AgentHandle {
     /// Provider registry for direct LLM calls (used by /btw bypass).
     pub providers: Arc<crate::provider::registry::ProviderRegistry>,
     /// Per-session abort flags: session_key -> atomic abort flag.
-    pub abort_flags: Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,
+    /// Uses std::sync::RwLock (not tokio) so it can be accessed in Drop impls.
+    pub abort_flags: Arc<std::sync::RwLock<HashMap<String, Arc<AtomicBool>>>>,
 }
 
 /// An image attachment sent by the user.
@@ -215,7 +216,7 @@ impl AgentRegistry {
                         RwLock::new(crate::agent::runtime::LiveStatus::default()),
                     ),
                     providers: Arc::clone(&providers),
-                    abort_flags: Arc::new(RwLock::new(HashMap::new())),
+                    abort_flags: Arc::new(std::sync::RwLock::new(HashMap::new())),
                 });
                 inner.agents.insert(entry.id.clone(), handle);
                 receivers.insert(entry.id.clone(), rx);

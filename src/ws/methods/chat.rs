@@ -209,11 +209,12 @@ pub async fn chat_abort(ctx: MethodCtx) -> MethodResult {
 
     // Set abort flag for the session on all agents.
     for agent in ctx.state.agents.all() {
-        let mut flags = agent.abort_flags.write().await;
-        let flag = flags
-            .entry(sk.to_string())
-            .or_insert_with(|| Arc::new(AtomicBool::new(false)));
-        flag.store(true, Ordering::SeqCst);
+        if let Ok(mut flags) = agent.abort_flags.write() {
+            let flag = flags
+                .entry(sk.to_string())
+                .or_insert_with(|| Arc::new(AtomicBool::new(false)));
+            flag.store(true, Ordering::SeqCst);
+        }
     }
 
     Ok(serde_json::json!({

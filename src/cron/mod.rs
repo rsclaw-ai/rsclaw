@@ -1007,7 +1007,8 @@ async fn run_cron_job(job: &CronJob, agents: &AgentRegistry) -> Result<String> {
 
     // Register abort flag for this session before dispatching
     let abort_flag = {
-        let mut flags = handle.abort_flags.write().await;
+        let mut flags = handle.abort_flags.write()
+            .expect("abort_flags lock poisoned");
         flags
             .entry(session_key.clone())
             .or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
