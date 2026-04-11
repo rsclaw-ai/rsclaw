@@ -202,7 +202,13 @@ fn select_language() -> Result<&'static str> {
         .default(0) // Chinese as default
         .interact_opt()?;
 
-    let idx = selection.unwrap_or(0);
+    let idx = match selection {
+        Some(i) => i,
+        None => {
+            println!("\n  Setup cancelled.");
+            std::process::exit(0);
+        }
+    };
     let lang = codes[idx];
     crate::i18n::set_default_lang(lang);
     Ok(lang)
