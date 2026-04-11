@@ -1649,15 +1649,21 @@ async fn handle_agent_request(
         };
 
         let response_str = serde_json::to_string(&response).unwrap_or_default();
+        tracing::info!("ACP response to agent: {}", response_str);
+
         let mut combined = response_str.as_bytes().to_vec();
         combined.push(b'\n');
 
         // Use blocking write since we're in async context
         use tokio::io::AsyncWriteExt;
-        let _ = stdin.write_all(&combined).await;
-        let _ = stdin.flush().await;
+        if let Err(e) = stdin.write_all(&combined).await {
+            tracing::error!("ACP response write failed: {}", e);
+        }
+        if let Err(e) = stdin.flush().await {
+            tracing::error!("ACP response flush failed: {}", e);
+        }
 
-        tracing::debug!("ACP response sent: {}", response_str);
+        tracing::info!("ACP response sent successfully for method {}", method);
     }
 
     true
