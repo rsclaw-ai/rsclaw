@@ -100,35 +100,41 @@ fn confirm_step(prompt: &str, default: bool) -> StepResult<bool> {
     }
 }
 
-pub const DEFAULT_CONFIG: &str = r#"// rsclaw configuration (JSON5)
+fn default_config(lang: &str) -> String {
+    let lang_name = lang_code_to_name(lang);
+    format!(
+        r#"// rsclaw configuration (JSON5)
 // Docs: https://github.com/rsclaw-ai/rsclaw
-{
-  gateway: {
+{{
+  gateway: {{
     port: 18888,
     bind: "loopback",
-  },
-  models: {
-    providers: {
-      anthropic: { apiKey: "${ANTHROPIC_API_KEY}" },
-      // openai: { apiKey: "${OPENAI_API_KEY}" },
-    },
-  },
-  agents: {
+    language: "{lang_name}",
+  }},
+  models: {{
+    providers: {{
+      anthropic: {{ apiKey: "${{ANTHROPIC_API_KEY}}" }},
+      // openai: {{ apiKey: "${{OPENAI_API_KEY}}" }},
+    }},
+  }},
+  agents: {{
     list: [
-      {
+      {{
         id: "main",
         default: true,
         // workspace defaults to $base_dir/workspace
-        model: { primary: "anthropic/claude-sonnet-4-6" },
-      },
+        model: {{ primary: "anthropic/claude-sonnet-4-6" }},
+      }},
     ],
-  },
-  // channels: {
-  //   telegram: { botToken: "${TELEGRAM_BOT_TOKEN}" },
-  //   discord: { token: "${DISCORD_BOT_TOKEN}" },
-  // },
+  }},
+  // channels: {{
+  //   telegram: {{ botToken: "${{TELEGRAM_BOT_TOKEN}}" }},
+  //   discord: {{ token: "${{DISCORD_BOT_TOKEN}}" }},
+  // }},
+}}
+"#
+    )
 }
-"#;
 
 // ---------------------------------------------------------------------------
 // Styled output helpers
@@ -639,7 +645,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
             if let Some(parent) = p.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&p, DEFAULT_CONFIG)?;
+            std::fs::write(&p, default_config(lang))?;
             step("+", &format!("{}", p.display()));
         } else {
             step("=", &format!("{} (exists)", p.display()));
@@ -672,23 +678,8 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         );
     }
 
-    // Write gateway.language to config so `rsclaw onboard` skips language selection.
-    // Config is JSON5 — parse with json5 crate, write back as formatted JSON.
-    {
-        let lang_name = lang_code_to_name(lang);
-        if let Ok(raw) = std::fs::read_to_string(&config_path) {
-            if let Ok(mut val) = json5::from_str::<serde_json::Value>(&raw) {
-                val.as_object_mut()
-                    .and_then(|o| o.entry("gateway").or_insert(json!({})).as_object_mut())
-                    .map(|g| g.insert("language".to_owned(), json!(lang_name)));
-                let _ = std::fs::write(
-                    &config_path,
-                    serde_json::to_string_pretty(&val).unwrap_or(raw),
-                );
-                step("+", &crate::i18n::t_fmt("cli_gateway_language_set", lang, &[("lang", lang_name)]));
-            }
-        }
-    }
+    // Language is already written into the config template via default_config(lang).
+    step("+", &crate::i18n::t_fmt("cli_gateway_language_set", lang, &[("lang", lang_code_to_name(lang))]));
 
     let lang_final = crate::i18n::default_lang();
     done(&crate::i18n::t("cli_setup_complete", lang_final));
