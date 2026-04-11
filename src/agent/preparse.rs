@@ -191,6 +191,7 @@ impl PreParseEngine {
         });
 
         // --- Session ---
+        add_direct(&mut commands, r"(?i)^/abort$", |_| "__ABORT__".into());
         add_direct(&mut commands, r"(?i)^/clear$", |_| "__CLEAR__".into());
         add_direct(&mut commands, r"(?i)^/reset$", |_| "__RESET__".into());
         add_direct(&mut commands, r"(?i)^/history(?:\s+(\d+))?$", |caps| {

@@ -14,9 +14,9 @@ use std::collections::{HashMap, VecDeque};
 /// Default sliding-window size.
 const DEFAULT_WINDOW: usize = 25;
 /// Default warning threshold — generic loops trigger warning at this count.
-const DEFAULT_WARNING_THRESHOLD: usize = 10;
+const DEFAULT_WARNING_THRESHOLD: usize = 5;
 /// Default critical threshold — loops at this count are blocked.
-const DEFAULT_CRITICAL_THRESHOLD: usize = 20;
+const DEFAULT_CRITICAL_THRESHOLD: usize = 10;
 
 /// Built-in per-tool threshold overrides.
 fn builtin_overrides() -> HashMap<String, (usize, usize)> {
@@ -379,15 +379,15 @@ mod tests {
     }
 
     #[test]
-    fn default_has_warning_at_10_critical_at_20() {
+    fn default_has_warning_at_5_critical_at_10() {
         let mut d = LoopDetector::default();
-        // 10th call hits warning threshold
-        for i in 0..9 {
+        // 5th call hits warning threshold
+        for i in 0..4 {
             assert!(is_ok(&d.check("exec")), "call {} should be ok", i + 1);
         }
-        assert!(is_warning(&d.check("exec")), "10th call should be warning");
-        // 20th call hits critical threshold
-        for i in 10..19 {
+        assert!(is_warning(&d.check("exec")), "5th call should be warning");
+        // 10th call hits critical threshold
+        for i in 5..9 {
             assert!(
                 is_warning(&d.check("exec")),
                 "call {} should be warning",
@@ -396,7 +396,7 @@ mod tests {
         }
         assert!(
             is_critical(&d.check("exec")),
-            "20th call should be critical"
+            "10th call should be critical"
         );
     }
 

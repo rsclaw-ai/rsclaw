@@ -92,17 +92,40 @@ impl AcpCallbackHandler for DefaultAcpHandler {
         _tool_call_id: &str,
         options: Vec<PermissionOption>,
     ) -> RequestPermissionOutcome {
-        // Auto-approve the first "accept" option
+        // Log all options for debugging
+        tracing::debug!(
+            options = ?options.iter().map(|o| (&o.option_id, &o.kind)).collect::<Vec<_>>(),
+            "handle_request_permission: received options"
+        );
+
+        // Auto-approve any non-reject option (more lenient for different agent implementations)
         for opt in options {
+            // Match any "allow" type option
             if matches!(
                 opt.kind,
                 PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways
             ) {
+                tracing::info!(
+                    option_id = %opt.option_id,
+                    kind = ?opt.kind,
+                    "handle_request_permission: auto-approving"
+                );
+                return RequestPermissionOutcome::Selected {
+                    option_id: opt.option_id,
+                };
+            }
+            // Also approve if option_id contains "allow" or "accept" (fallback for non-standard formats)
+            if opt.option_id.contains("allow") || opt.option_id.contains("accept") {
+                tracing::info!(
+                    option_id = %opt.option_id,
+                    "handle_request_permission: auto-approving by option_id pattern"
+                );
                 return RequestPermissionOutcome::Selected {
                     option_id: opt.option_id,
                 };
             }
         }
+        tracing::warn!("handle_request_permission: no matching allow option found, cancelling");
         RequestPermissionOutcome::Cancelled
     }
 
@@ -206,16 +229,40 @@ impl AcpCallbackHandler for DefaultAcpHandlerWithTerminal {
         _tool_call_id: &str,
         options: Vec<PermissionOption>,
     ) -> RequestPermissionOutcome {
+        // Log all options for debugging
+        tracing::debug!(
+            options = ?options.iter().map(|o| (&o.option_id, &o.kind)).collect::<Vec<_>>(),
+            "handle_request_permission: received options"
+        );
+
+        // Auto-approve any non-reject option (more lenient for different agent implementations)
         for opt in options {
+            // Match any "allow" type option
             if matches!(
                 opt.kind,
                 PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways
             ) {
+                tracing::info!(
+                    option_id = %opt.option_id,
+                    kind = ?opt.kind,
+                    "handle_request_permission: auto-approving"
+                );
+                return RequestPermissionOutcome::Selected {
+                    option_id: opt.option_id,
+                };
+            }
+            // Also approve if option_id contains "allow" or "accept" (fallback for non-standard formats)
+            if opt.option_id.contains("allow") || opt.option_id.contains("accept") {
+                tracing::info!(
+                    option_id = %opt.option_id,
+                    "handle_request_permission: auto-approving by option_id pattern"
+                );
                 return RequestPermissionOutcome::Selected {
                     option_id: opt.option_id,
                 };
             }
         }
+        tracing::warn!("handle_request_permission: no matching allow option found, cancelling");
         RequestPermissionOutcome::Cancelled
     }
 
@@ -667,6 +714,11 @@ impl AcpClient {
         model: Option<&str>,
         mcp_servers: Option<Vec<McpServerConfig>>,
     ) -> Result<NewSessionResponse> {
+        tracing::info!(
+            cwd = %cwd,
+            model = ?model,
+            "create_session: called with params"
+        );
         let mut params = serde_json::json!({
             "cwd": cwd,
             "mcpServers": mcp_servers.unwrap_or_default()
@@ -674,7 +726,9 @@ impl AcpClient {
 
         if let Some(m) = model {
             params["modelId"] = serde_json::json!(m);
-            tracing::info!(model = %m, "Adding modelId to session/new request");
+            tracing::info!(model = %m, params = ?params, "Adding modelId to session/new request");
+        } else {
+            tracing::warn!("create_session: no model provided, will use agent default");
         }
 
         let resp = self.rpc(methods::SESSION_NEW, params).await?;
@@ -1595,15 +1649,21 @@ async fn handle_agent_request(
         };
 
         let response_str = serde_json::to_string(&response).unwrap_or_default();
+        tracing::info!("ACP response to agent: {}", response_str);
+
         let mut combined = response_str.as_bytes().to_vec();
         combined.push(b'\n');
 
         // Use blocking write since we're in async context
         use tokio::io::AsyncWriteExt;
-        let _ = stdin.write_all(&combined).await;
-        let _ = stdin.flush().await;
+        if let Err(e) = stdin.write_all(&combined).await {
+            tracing::error!("ACP response write failed: {}", e);
+        }
+        if let Err(e) = stdin.flush().await {
+            tracing::error!("ACP response flush failed: {}", e);
+        }
 
-        tracing::debug!("ACP response sent: {}", response_str);
+        tracing::info!("ACP response sent successfully for method {}", method);
     }
 
     true
