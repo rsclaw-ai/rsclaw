@@ -2488,7 +2488,7 @@ impl AgentRuntime {
                     .as_ref()
                     .and_then(|m| m.context_tokens)
             })
-            .unwrap_or(128_000) as usize;
+            .unwrap_or(64_000) as usize;
 
         let mut tool_images: Vec<String> = Vec::new();
 
