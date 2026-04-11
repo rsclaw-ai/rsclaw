@@ -799,19 +799,6 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                 match select_step("  API Protocol", api_labels, current_idx) {
                     StepResult::Next(idx) => {
                         api_type = api_values[idx].to_string();
-                        // Auto-fill base URL from API type default
-                        let default_urls: &[(&str, &str)] = &[
-                            ("openai", "https://api.openai.com/v1"),
-                            ("openai-responses", "https://api.openai.com/v1"),
-                            ("anthropic", "https://api.anthropic.com/v1"),
-                            ("gemini", "https://generativelanguage.googleapis.com/v1beta"),
-                            ("ollama", "http://localhost:11434"),
-                        ];
-                        if base_url.is_empty() {
-                            if let Some((_, url)) = default_urls.iter().find(|(k, _)| *k == api_type) {
-                                base_url = url.to_string();
-                            }
-                        }
                         wiz_step = STEP_BASE_URL;
                     }
                     StepResult::Back => { wiz_step = STEP_PROVIDER; }
@@ -836,8 +823,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                         StepResult::Cancel => { println!("  {}", crate::i18n::t("cli_setup_cancelled", lang)); return Ok(()); }
                     }
                 } else if provider.name == "custom" || provider.name == "codingplan" {
-                    let default_url = if base_url.is_empty() { "https://api.example.com".to_string() } else { base_url.clone() };
-                    match input_step("  API base URL", default_url) {
+                    match input_step("  API base URL", base_url.clone()) {
                         StepResult::Next(val) => { base_url = val; wiz_step = STEP_USER_AGENT; }
                         StepResult::Back => { wiz_step = STEP_API_TYPE; }
                         StepResult::Cancel => { println!("  {}", crate::i18n::t("cli_setup_cancelled", lang)); return Ok(()); }
