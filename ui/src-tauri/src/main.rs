@@ -1045,8 +1045,8 @@ fn main() {
         .run(|app_handle, event| {
             match event {
                 // macOS: clicking dock icon restores hidden window (native v2 support)
+                #[cfg(target_os = "macos")]
                 tauri::RunEvent::Reopen { .. } => {
-                    #[cfg(target_os = "macos")]
                     set_dock_visible(true);
                     if let Some(window) = app_handle.get_webview_window("main") {
                         let _ = window.show();
