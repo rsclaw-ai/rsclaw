@@ -8041,42 +8041,41 @@ fn apply_context_budget_trim(
     }
 
     let reply_reserve = (context_tokens / 5).max(2000);
-    let system_tokens = system_prompt.len() / 4;
+    let sys_tokens = estimate_tokens(system_prompt);
     // Estimate tool definitions size from JSON serialization.
     let tools_tokens = serde_json::to_string(tools)
-        .map(|s| s.len() / 4)
+        .map(|s| estimate_tokens(&s))
         .unwrap_or(0);
 
-    let history_budget_tokens = context_tokens
+    let history_budget = context_tokens
         .saturating_sub(reply_reserve)
-        .saturating_sub(system_tokens)
+        .saturating_sub(sys_tokens)
         .saturating_sub(tools_tokens);
-    let history_budget_chars = history_budget_tokens * 4;
 
-    let total_chars: usize = messages.iter().map(msg_chars).sum();
-    if total_chars <= history_budget_chars {
+    let total_tokens: usize = messages.iter().map(msg_tokens).sum();
+    if total_tokens <= history_budget {
         return;
     }
 
     // Trim from the front, keeping at least the last 6 messages.
     let min_keep = 6;
     let max_removable = messages.len().saturating_sub(min_keep);
-    let mut removed_chars: usize = 0;
+    let mut removed_tokens: usize = 0;
 
     let mut remove_count = 0;
     for i in 0..max_removable {
-        if total_chars - removed_chars <= history_budget_chars {
+        if total_tokens - removed_tokens <= history_budget {
             break;
         }
-        removed_chars += msg_chars(&messages[i]);
+        removed_tokens += msg_tokens(&messages[i]);
         remove_count += 1;
     }
 
     if remove_count > 0 {
         tracing::debug!(
             context_tokens,
-            history_budget_chars,
-            total_chars,
+            history_budget,
+            total_tokens,
             removed = remove_count,
             "context budget trim: removed {remove_count} oldest messages"
         );

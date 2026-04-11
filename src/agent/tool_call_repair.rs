@@ -239,17 +239,13 @@ fn fix_incomplete_json(incomplete: &str) -> String {
     }
 
     // Fix missing value before closing brace/bracket, e.g. "key":} or "key":,
-    // The regex-free approach: scan for `:}`, `:,`, or trailing `:` patterns.
-    let mut fixed = trimmed.to_string();
-    // Replace `":}` with `":null}` and `":,` with `":null,`
-    while fixed.contains("\":}") || fixed.contains("\":,") || fixed.contains("\": }") || fixed.contains("\": ,") {
-        fixed = fixed
-            .replace("\":}", "\":null}")
-            .replace("\":,", "\":null,")
-            .replace("\": }", "\": null}")
-            .replace("\": ,", "\": null,");
-    }
-    // Also handle numeric/bool key (rare but possible): ,}
+    // Single-pass replace (global replace handles all occurrences at once).
+    let mut fixed = trimmed
+        .replace("\":}", "\":null}")
+        .replace("\":,", "\":null,")
+        .replace("\": }", "\": null}")
+        .replace("\": ,", "\": null,");
+    // Also handle trailing comma before close brace: ,}
     fixed = fixed.replace(",}", "}");
     if serde_json::from_str::<Value>(&fixed).is_ok() {
         return fixed;

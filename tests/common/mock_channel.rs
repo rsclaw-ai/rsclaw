@@ -1,5 +1,7 @@
 //! Shared channel mock tools for integration tests.
 
+#![allow(dead_code, unused_imports)]
+
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

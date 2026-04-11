@@ -12,7 +12,7 @@ fn init_tls() {
 }
 
 use rsclaw::provider::{
-    LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
+    LlmProvider, LlmRequest, Message, MessageContent, Role,
     openai::{OpenAiProvider, strip_think_tags_pub},
 };
 use wiremock::matchers::{method, path};

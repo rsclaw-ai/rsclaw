@@ -519,15 +519,17 @@ fn save_cron_jobs(content: String) -> Result<(), String> {
     }
     std::fs::write(&path, &content).map_err(|e| e.to_string())?;
 
-    // Notify running gateway to reload cron jobs
+    // Notify running gateway to reload cron jobs (non-blocking).
     let port = get_gateway_port_number();
     let url = format!("http://127.0.0.1:{port}/api/v1/cron/reload");
-    if let Ok(client) = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-    {
-        let _ = client.post(&url).send();
-    }
+    std::thread::spawn(move || {
+        if let Ok(client) = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+        {
+            let _ = client.post(&url).send();
+        }
+    });
 
     Ok(())
 }

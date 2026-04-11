@@ -1,5 +1,7 @@
 //! Shared test helpers for integration tests.
 
+#![allow(dead_code, unused_imports)]
+
 pub mod mock_channel;
 pub mod mock_provider;
 

@@ -17,7 +17,7 @@ use crate::{
         MemoryStore, PendingAnalysis,
     },
 channel::{
-        Channel, ChannelManager, OutboundMessage, cli::CliChannel, telegram::TelegramChannel,
+        Channel, OutboundMessage, cli::CliChannel, telegram::TelegramChannel,
     },
     config::{
         self,
@@ -2582,7 +2582,7 @@ fn start_line_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
-    channel_senders: Arc<
+    _channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
 ) {
@@ -2912,7 +2912,7 @@ fn start_zalo_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
-    channel_senders: Arc<
+    _channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
 ) {
@@ -3203,7 +3203,7 @@ fn start_signal_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
-    channel_senders: Arc<
+    _channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
 ) {
@@ -3710,7 +3710,7 @@ fn start_wechat_personal_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
-    channel_senders: Arc<
+    _channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
 ) {
@@ -4010,7 +4010,7 @@ fn start_feishu_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
-    channel_senders: Arc<
+    _channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
 ) {
@@ -4440,7 +4440,7 @@ fn start_dingtalk_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
-    channel_senders: Arc<
+    _channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
 ) {
@@ -4922,7 +4922,7 @@ fn start_qq_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
-    channel_senders: Arc<
+    _channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
 ) {
@@ -5277,7 +5277,7 @@ fn start_matrix_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
-    channel_senders: Arc<
+    _channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
 ) {
@@ -5655,7 +5655,7 @@ fn start_wecom_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
-    channel_senders: Arc<
+    _channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
 ) {

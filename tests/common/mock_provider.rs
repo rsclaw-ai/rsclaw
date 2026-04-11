@@ -1,5 +1,7 @@
 //! Shared SSE/JSONL mock builders for wiremock-based provider tests.
 
+#![allow(dead_code, unused_imports)]
+
 use anyhow::Result;
 use futures::StreamExt;
 use rsclaw::provider::{LlmStream, StreamEvent, TokenUsage};

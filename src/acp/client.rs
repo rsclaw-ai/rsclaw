@@ -1619,7 +1619,7 @@ mod tests {
 
     #[test]
     fn test_default_handler_permission() {
-        let handler = DefaultAcpHandler;
+        let _handler = DefaultAcpHandler;
         let options = vec![
             PermissionOption {
                 option_id: "deny".to_string(),

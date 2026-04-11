@@ -395,7 +395,7 @@ impl CronRunner {
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let running_clone = Arc::clone(&running);
         let semaphore = Arc::clone(&self.semaphore);
-        let mut reload_rx = self.reload_tx.subscribe();
+        let reload_rx = self.reload_tx.subscribe();
 
         let runner = self.clone();
         let timer_handle = tokio::spawn(async move {
