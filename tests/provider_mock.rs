@@ -69,6 +69,7 @@ fn llm_request_fields_are_accessible() {
         system: Some("You are helpful.".to_owned()),
         max_tokens: Some(1024),
         temperature: Some(0.5),
+        frequency_penalty: None,
         thinking_budget: None,
     };
 
@@ -89,6 +90,7 @@ fn llm_request_defaults_are_none() {
         system: None,
         max_tokens: None,
         temperature: None,
+        frequency_penalty: None,
         thinking_budget: None,
     };
 
@@ -210,6 +212,7 @@ fn llm_request_with_tools() {
         system: None,
         max_tokens: None,
         temperature: None,
+        frequency_penalty: None,
         thinking_budget: None,
     };
     assert_eq!(req.tools.len(), 2);
@@ -226,6 +229,7 @@ fn llm_request_with_thinking_budget() {
         system: None,
         max_tokens: None,
         temperature: None,
+        frequency_penalty: None,
         thinking_budget: Some(10000),
     };
     assert_eq!(req.thinking_budget, Some(10000));
@@ -243,6 +247,7 @@ fn llm_request_clone_independence() {
         system: Some("system prompt".to_owned()),
         max_tokens: Some(100),
         temperature: Some(0.5),
+        frequency_penalty: None,
         thinking_budget: Some(5000),
     };
 
