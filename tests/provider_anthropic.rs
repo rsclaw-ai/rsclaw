@@ -34,6 +34,7 @@ fn simple_request(model: &str) -> LlmRequest {
         system: None,
         max_tokens: Some(1024),
         temperature: None,
+        frequency_penalty: None,
         thinking_budget: None,
     }
 }
@@ -270,6 +271,7 @@ async fn request_body_maps_messages() {
         system: Some("Be precise".to_owned()),
         max_tokens: Some(512),
         temperature: Some(0.3),
+        frequency_penalty: None,
         thinking_budget: None,
     };
 

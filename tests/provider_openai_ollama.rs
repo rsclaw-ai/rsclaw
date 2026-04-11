@@ -33,6 +33,7 @@ fn simple_request(model: &str) -> LlmRequest {
         system: None,
         max_tokens: Some(1024),
         temperature: None,
+        frequency_penalty: None,
         thinking_budget: None,
     }
 }
