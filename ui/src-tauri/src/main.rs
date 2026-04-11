@@ -519,15 +519,17 @@ fn save_cron_jobs(content: String) -> Result<(), String> {
     }
     std::fs::write(&path, &content).map_err(|e| e.to_string())?;
 
-    // Notify running gateway to reload cron jobs (non-blocking).
+    // Notify running gateway to reload cron jobs (non-blocking, no deps).
     let port = get_gateway_port_number();
-    let url = format!("http://127.0.0.1:{port}/api/v1/cron/reload");
     std::thread::spawn(move || {
-        if let Ok(client) = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(3))
-            .build()
-        {
-            let _ = client.post(&url).send();
+        use std::io::Write;
+        if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
+            &format!("127.0.0.1:{port}").parse().unwrap(),
+            std::time::Duration::from_secs(3),
+        ) {
+            let _ = stream.write_all(
+                b"POST /api/v1/cron/reload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
+            );
         }
     });
 
@@ -891,8 +893,14 @@ fn handle_tray_event(app: &tauri::AppHandle, event: SystemTrayEvent) {
                 }
             }
             "quit" => {
-                // Stop gateway (rsclaw-cli) before quitting
-                let _ = stop_gateway();
+                // Stop gateway (rsclaw-cli) before quitting.
+                // Log result for debugging; wait for stop to complete.
+                match stop_gateway() {
+                    Ok(msg) => eprintln!("[tray quit] gateway stopped: {msg}"),
+                    Err(e) => eprintln!("[tray quit] gateway stop failed: {e}"),
+                }
+                // Give gateway a moment to shut down
+                std::thread::sleep(std::time::Duration::from_millis(500));
                 std::process::exit(0);
             }
             _ => {}
@@ -937,14 +945,31 @@ fn main() {
             set_auto_start,
             get_auto_start,
         ])
-        .setup(|_app| {
+        .on_window_event(|event| {
+            // Closing the window minimizes to tray instead of quitting.
+            // The gateway service keeps running. User must right-click
+            // tray → Quit to fully exit and stop the gateway.
+            match event.event() {
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    eprintln!("[window] CloseRequested — hiding to tray");
+                    api.prevent_close();
+                    let window = event.window();
+                    let _ = window.hide();
+                }
+                _ => {}
+            }
+        })
+        .setup(|app| {
+            // macOS: handle dock icon click to restore hidden window
+            #[cfg(target_os = "macos")]
+            mac_dock::install(app.handle());
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app_handle, event| {
-            if let tauri::RunEvent::Exit = event {
-                let _ = stop_gateway();
-            }
+        .run(|_app_handle, _event| {
+            // Do NOT stop gateway on RunEvent::Exit — the tray "Quit"
+            // handler already calls stop_gateway() before exit(0).
+            // macOS dock click is handled by mac_dock::install() above.
         });
 }
