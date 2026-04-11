@@ -457,8 +457,13 @@ impl AgentRuntime {
                                 } => result
                                     .as_ref()
                                     .map(|r| {
-                                        if r.len() > 100 {
-                                            format!("✅ {}...", &r[..100])
+                                        if r.chars().count() > 100 {
+                                            let cutoff = r
+                                                .char_indices()
+                                                .nth(100)
+                                                .map(|(i, _)| i)
+                                                .unwrap_or(r.len());
+                                            format!("✅ {}...", &r[..cutoff])
                                         } else {
                                             format!("✅ {}", r)
                                         }
@@ -536,9 +541,14 @@ impl AgentRuntime {
                     };
 
                     let summary = if !result_content.is_empty() {
-                        // Show result, truncated if too long
-                        let truncated = if result_content.len() > 2000 {
-                            format!("{}...\n\n[已截断]", &result_content[..2000])
+                        // Show result, truncated if too long (character-safe truncation)
+                        let truncated = if result_content.chars().count() > 2000 {
+                            let cutoff = result_content
+                                .char_indices()
+                                .nth(2000)
+                                .map(|(i, _)| i)
+                                .unwrap_or(result_content.len());
+                            format!("{}...\n\n[已截断]", &result_content[..cutoff])
                         } else {
                             result_content
                         };
@@ -806,8 +816,13 @@ impl AgentRuntime {
                                 } => result
                                     .as_ref()
                                     .map(|r| {
-                                        if r.len() > 100 {
-                                            format!("✅ {}...", &r[..100])
+                                        if r.chars().count() > 100 {
+                                            let cutoff = r
+                                                .char_indices()
+                                                .nth(100)
+                                                .map(|(i, _)| i)
+                                                .unwrap_or(r.len());
+                                            format!("✅ {}...", &r[..cutoff])
                                         } else {
                                             format!("✅ {}", r)
                                         }
@@ -881,9 +896,14 @@ impl AgentRuntime {
                     };
 
                     let summary = if !result_content.is_empty() {
-                        // Show result, truncated if too long
-                        let truncated = if result_content.len() > 2000 {
-                            format!("{}...\n\n[已截断]", &result_content[..2000])
+                        // Show result, truncated if too long (character-safe truncation)
+                        let truncated = if result_content.chars().count() > 2000 {
+                            let cutoff = result_content
+                                .char_indices()
+                                .nth(2000)
+                                .map(|(i, _)| i)
+                                .unwrap_or(result_content.len());
+                            format!("{}...\n\n[已截断]", &result_content[..cutoff])
                         } else {
                             result_content
                         };
