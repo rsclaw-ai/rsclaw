@@ -1436,6 +1436,7 @@ mod tests {
             system: None,
             max_tokens: None,
             temperature: None,
+            frequency_penalty: None,
             thinking_budget: None,
         }
     }
@@ -1476,6 +1477,7 @@ mod tests {
                 system: None,
                 max_tokens: None,
                 temperature: None,
+                frequency_penalty: None,
                 thinking_budget: None,
             }
         }
