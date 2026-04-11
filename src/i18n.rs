@@ -495,6 +495,12 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "fr" => "Configuration annulée.",
         "de" => "Einrichtung abgebrochen.",
     );
+    msg!("cli_confirm_setup",
+        "en" => "Proceed with setup?",
+        "zh" => "继续执行初始化？",
+        "fr" => "Continuer la configuration ?",
+        "de" => "Mit der Einrichtung fortfahren?",
+    );
     msg!("cli_step_agent",
         "en" => "1. Agent",
         "zh" => "1. 智能体",

@@ -597,7 +597,11 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         let migration_prompt = crate::i18n::t("cli_migration_mode", lang);
         match select_step(&migration_prompt, &options, 0) {
             StepResult::Next(0) => Some(crate::migrate::MigrateMode::Import),
-            _ => Some(crate::migrate::MigrateMode::New),
+            StepResult::Next(_) => Some(crate::migrate::MigrateMode::New),
+            StepResult::Back | StepResult::Cancel => {
+                println!("  {}", crate::i18n::t("cli_setup_cancelled", crate::i18n::default_lang()));
+                return Ok(());
+            }
         }
     } else {
         None
