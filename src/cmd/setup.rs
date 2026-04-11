@@ -1532,7 +1532,7 @@ async fn configure_model(
     } else if provider.name == "custom" || provider.name == "codingplan" {
         let current = get_nested_value(val, &format!("models.providers.{}.baseUrl", provider.name))
             .and_then(|v| v.as_str().map(|s| s.to_owned()))
-            .unwrap_or_else(|| "https://api.example.com".to_string());
+            .unwrap_or_default();
         match input_step("  API base URL", current) {
             StepResult::Next(u) => new_base_url = u,
             StepResult::Back | StepResult::Cancel => return Ok(()),
