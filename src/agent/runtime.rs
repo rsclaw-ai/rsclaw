@@ -71,9 +71,12 @@ use crate::{
 };
 
 /// Agent-level timeout for a single turn (seconds).
-/// OpenClaw default is 48 hours (172800s) — matches for complex code
-/// generation.
-const DEFAULT_TIMEOUT_SECONDS: u64 = 172_800;
+/// Reduced from OpenClaw's 48h default to 30min for better UX.
+/// Can be overridden via `agents.defaults.timeout_seconds`.
+const DEFAULT_TIMEOUT_SECONDS: u64 = 1800;
+/// Max consecutive tool parse errors before aborting the turn.
+/// Prevents infinite retry loops when model output gets corrupted.
+const MAX_PARSE_ERRORS: usize = 10;
 /// Token string that suppresses any reply to the channel.
 const NO_REPLY_TOKEN: &str = "NO_REPLY";
 /// Default max file size before first confirmation (bytes): 50 MB.
@@ -109,7 +112,7 @@ impl Drop for AbortFlagGuard {
 /// allowedCommands).
 const READONLY_COMMANDS: &[&str] = &[
     "/help", "/version", "/status", "/health", "/uptime", "/models", "/ctx", "/btw", "/clear",
-    "/history", "/cron",
+    "/history", "/cron", "/abort",
 ];
 
 // ---------------------------------------------------------------------------
@@ -193,6 +196,8 @@ pub struct RunContext {
     pub has_images: bool,
     /// The full user message with image data (for LLM, not persisted).
     pub user_msg_with_images: Option<Message>,
+    /// Count of consecutive tool parse errors in this turn.
+    pub parse_error_count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -1363,6 +1368,17 @@ impl AgentRuntime {
                         self.sessions.remove(session_key);
                         "Session cleared.".to_owned()
                     }
+                    "__ABORT__" => {
+                        // Set abort flag for this session to interrupt running turn
+                        let resolved_key = self.resolve_session_key(session_key);
+                        let mut flags = self.handle.abort_flags.write().await;
+                        if let Some(flag) = flags.get(resolved_key) {
+                            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                            "Abort signal sent. The running task will stop shortly.".to_owned()
+                        } else {
+                            "No active task found for this session.".to_owned()
+                        }
+                    }
                     "__RESET__" => {
                         // Clear in-memory cache AND redb session data.
                         let key = self.resolve_session_key(session_key).to_owned();
@@ -1698,6 +1714,7 @@ impl AgentRuntime {
                             loop_detector: crate::agent::loop_detection::LoopDetector::default(),
                             has_images: false,
                             user_msg_with_images: None,
+                            parse_error_count: 0,
                         },
                         "",
                         &tool,
@@ -2403,6 +2420,7 @@ impl AgentRuntime {
             } else {
                 None
             },
+            parse_error_count: 0,
         };
 
         let reply = time::timeout(
@@ -3074,6 +3092,23 @@ impl AgentRuntime {
                         "Your tool call contained malformed JSON. Please try again."
                     };
                     warn!(tool = %tool_name, "skipping tool with parse error: {}", parse_error);
+
+                    // Increment parse error counter and check threshold
+                    ctx.parse_error_count += 1;
+                    if ctx.parse_error_count >= MAX_PARSE_ERRORS {
+                        tracing::error!(
+                            parse_error_count = ctx.parse_error_count,
+                            "Too many consecutive parse errors, aborting turn"
+                        );
+                        // Record for loop detection
+                        ctx.loop_detector.record_result(&serde_json::json!({"error": "too many parse errors"}));
+                        // Return error to break the loop
+                        return Err(anyhow!(
+                            "Turn aborted: {} consecutive tool parse errors. Model output may be corrupted.",
+                            ctx.parse_error_count
+                        ));
+                    }
+
                     // Record for loop detection so error doesn't count as a "different result"
                     ctx.loop_detector.record_result(&serde_json::json!({"error": err_msg}));
 
@@ -3132,6 +3167,8 @@ impl AgentRuntime {
 
                 let (result_text, result_images) = match result {
                     Ok(v) => {
+                        // Reset parse error counter on successful tool execution
+                        ctx.parse_error_count = 0;
                         // Record result for progress-aware loop detection.
                         // Same args + different results = making progress, not a loop.
                         ctx.loop_detector.record_result(&v);
@@ -6846,6 +6883,7 @@ fn build_help_text_filtered(allowed: &str) -> String {
 
     help.push_str("Session:\n");
     help.push_str("  /clear            Clear session\n");
+    help.push_str("  /abort            Abort running task\n");
     if has("/reset") {
         help.push_str("  /reset            Reset session\n");
     }
