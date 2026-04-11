@@ -83,7 +83,6 @@ const DEFAULT_MAX_TEXT_CHARS: usize = 50_000;
 
 /// RAII guard that clears the abort flag for a session when dropped.
 struct AbortFlagGuard {
-    flag: Arc<AtomicBool>,
     handle: Arc<AgentHandle>,
     session_key: String,
 }
@@ -2294,7 +2293,6 @@ impl AgentRuntime {
 
         // RAII guard: clears abort flag when turn exits (normal or error).
         let _guard = AbortFlagGuard {
-            flag: Arc::clone(&abort_flag),
             handle: Arc::clone(&self.handle),
             session_key: session_key.to_string(),
         };
@@ -4069,11 +4067,21 @@ impl AgentRuntime {
             }
             CompactionMode::Safeguard => {
                 const CHUNK_SIZE: usize = 40_000;
-                let chunks: Vec<&str> = old_text
-                    .as_bytes()
-                    .chunks(CHUNK_SIZE)
-                    .map(|c| std::str::from_utf8(c).unwrap_or(""))
-                    .collect();
+                // Split at char boundaries to avoid breaking multi-byte UTF-8.
+                let chunks: Vec<&str> = {
+                    let mut result = Vec::new();
+                    let mut remaining = old_text.as_str();
+                    while !remaining.is_empty() {
+                        let mut end = CHUNK_SIZE.min(remaining.len());
+                        while end < remaining.len() && !remaining.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        let (chunk, rest) = remaining.split_at(end);
+                        result.push(chunk);
+                        remaining = rest;
+                    }
+                    result
+                };
                 let mut combined = String::new();
                 for chunk in chunks {
                     match self.compact_single(compaction_model, chunk).await {
