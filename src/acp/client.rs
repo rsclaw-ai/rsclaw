@@ -92,17 +92,40 @@ impl AcpCallbackHandler for DefaultAcpHandler {
         _tool_call_id: &str,
         options: Vec<PermissionOption>,
     ) -> RequestPermissionOutcome {
-        // Auto-approve the first "accept" option
+        // Log all options for debugging
+        tracing::debug!(
+            options = ?options.iter().map(|o| (&o.option_id, &o.kind)).collect::<Vec<_>>(),
+            "handle_request_permission: received options"
+        );
+
+        // Auto-approve any non-reject option (more lenient for different agent implementations)
         for opt in options {
+            // Match any "allow" type option
             if matches!(
                 opt.kind,
                 PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways
             ) {
+                tracing::info!(
+                    option_id = %opt.option_id,
+                    kind = ?opt.kind,
+                    "handle_request_permission: auto-approving"
+                );
+                return RequestPermissionOutcome::Selected {
+                    option_id: opt.option_id,
+                };
+            }
+            // Also approve if option_id contains "allow" or "accept" (fallback for non-standard formats)
+            if opt.option_id.contains("allow") || opt.option_id.contains("accept") {
+                tracing::info!(
+                    option_id = %opt.option_id,
+                    "handle_request_permission: auto-approving by option_id pattern"
+                );
                 return RequestPermissionOutcome::Selected {
                     option_id: opt.option_id,
                 };
             }
         }
+        tracing::warn!("handle_request_permission: no matching allow option found, cancelling");
         RequestPermissionOutcome::Cancelled
     }
 
@@ -206,16 +229,40 @@ impl AcpCallbackHandler for DefaultAcpHandlerWithTerminal {
         _tool_call_id: &str,
         options: Vec<PermissionOption>,
     ) -> RequestPermissionOutcome {
+        // Log all options for debugging
+        tracing::debug!(
+            options = ?options.iter().map(|o| (&o.option_id, &o.kind)).collect::<Vec<_>>(),
+            "handle_request_permission: received options"
+        );
+
+        // Auto-approve any non-reject option (more lenient for different agent implementations)
         for opt in options {
+            // Match any "allow" type option
             if matches!(
                 opt.kind,
                 PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways
             ) {
+                tracing::info!(
+                    option_id = %opt.option_id,
+                    kind = ?opt.kind,
+                    "handle_request_permission: auto-approving"
+                );
+                return RequestPermissionOutcome::Selected {
+                    option_id: opt.option_id,
+                };
+            }
+            // Also approve if option_id contains "allow" or "accept" (fallback for non-standard formats)
+            if opt.option_id.contains("allow") || opt.option_id.contains("accept") {
+                tracing::info!(
+                    option_id = %opt.option_id,
+                    "handle_request_permission: auto-approving by option_id pattern"
+                );
                 return RequestPermissionOutcome::Selected {
                     option_id: opt.option_id,
                 };
             }
         }
+        tracing::warn!("handle_request_permission: no matching allow option found, cancelling");
         RequestPermissionOutcome::Cancelled
     }
 
