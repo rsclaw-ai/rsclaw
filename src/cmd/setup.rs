@@ -672,8 +672,8 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         );
     }
 
-    // Write gateway.language to config (for all non-English languages).
-    if lang != "en" {
+    // Write gateway.language to config so `rsclaw onboard` skips language selection.
+    {
         let lang_name = lang_code_to_name(lang);
         if let Ok(raw) = std::fs::read_to_string(&config_path) {
             if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&raw) {
@@ -708,20 +708,17 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
 
 pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
     // Language selection as the very first step.
+    // Skip if language was already configured (e.g. via `rsclaw setup`).
     let lang = {
-        // Try loading from existing config first.
-        let mut resolved = "en";
-        if let Ok(config) = crate::config::load() {
-            if let Some(l) = config.raw.gateway.as_ref().and_then(|g| g.language.as_deref()) {
-                resolved = crate::i18n::resolve_lang(l);
-            }
-        }
-        // If no config or lang not set, prompt.
-        if resolved == "en" {
-            select_language()?
-        } else {
+        let configured_lang = crate::config::load()
+            .ok()
+            .and_then(|c| c.raw.gateway.as_ref().and_then(|g| g.language.clone()));
+        if let Some(ref l) = configured_lang {
+            let resolved = crate::i18n::resolve_lang(l);
             crate::i18n::set_default_lang(resolved);
             resolved
+        } else {
+            select_language()?
         }
     };
 
