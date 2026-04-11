@@ -33,7 +33,6 @@ libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 
 [features]
 # this feature is used for production builds or when `devPath` points to the filesystem and the built-in dev server is disabled.

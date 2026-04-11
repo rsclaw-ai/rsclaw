@@ -91,7 +91,7 @@ pub async fn stream_fetch(
       }
       let status = res.status().as_u16();
 
-      tokio::spawn(async move {
+      tauri::async_runtime::spawn(async move {
         let mut stream = res.bytes_stream();
 
         while let Some(chunk) = stream.next().await {
@@ -124,7 +124,7 @@ pub async fn stream_fetch(
         .map(|e| e.to_string())
         .unwrap_or_else(|| "Unknown error occurred".to_string());
       println!("Error response: {:?}", error);
-      tokio::spawn( async move {
+      tauri::async_runtime::spawn( async move {
         if let Err(e) = window.emit(event_name, ChunkPayload{ request_id, chunk: error.into_bytes() }) {
           println!("Failed to emit chunk payload: {:?}", e);
         }
