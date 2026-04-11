@@ -27,6 +27,7 @@ import { isIOS, useMobileScreen } from "../utils";
 import dynamic from "next/dynamic";
 import { showConfirm } from "./ui-lib";
 import clsx from "clsx";
+import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
 import { getAgents, getHealth } from "../lib/rsclaw-api";
 
 const ChatList = dynamic(async () => (await import("./chat-list")).ChatList, {
@@ -126,8 +127,11 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
     setStatus("starting");
     setErrorMsg("");
     try {
-      const tauriInvoke = (window as any).__TAURI__?.invoke;
-      if (tauriInvoke) await tauriInvoke("start_gateway");
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
+      if (tauriInvoke) {
+        await tauriInvoke("start_gateway");
+        tauriInvoke("set_gateway_user_stopped", { stopped: false }).catch(() => {});
+      }
       setUserStopped(false);
       setTimeout(() => {
         getHealth()
@@ -151,8 +155,11 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
 
   const doStop = async () => {
     try {
-      const tauriInvoke = (window as any).__TAURI__?.invoke;
-      if (tauriInvoke) await tauriInvoke("stop_gateway");
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
+      if (tauriInvoke) {
+        await tauriInvoke("stop_gateway");
+        tauriInvoke("set_gateway_user_stopped", { stopped: true }).catch(() => {});
+      }
       setUserStopped(true);
       setStatus("offline");
       setErrorMsg("");
@@ -165,7 +172,7 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
     setStatus("starting");
     setErrorMsg("");
     try {
-      const tauriInvoke = (window as any).__TAURI__?.invoke;
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       if (tauriInvoke) {
         await tauriInvoke("stop_gateway");
         await new Promise((r) => setTimeout(r, 500));
@@ -198,6 +205,24 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
     else if (action === "stop") doStop();
   };
 
+  // Listen for tray menu actions (stop/quit/status)
+  React.useEffect(() => {
+    if (!isTauri) return;
+    let unlisten: Function | undefined;
+    import("../utils/tauri").then(({ listen }) => {
+      listen("tray-gateway-action", (e: any) => {
+        const action = e?.payload;
+        if (action === "stop" || action === "quit") {
+          setUserStopped(true);
+          setStatus("offline");
+        } else if (action === "status") {
+          navigate("/rsclaw");
+        }
+      }).then((u: any) => { unlisten = u; });
+    });
+    return () => { unlisten?.(); };
+  }, []);
+
   React.useEffect(() => {
     const check = () => {
       getHealth()
@@ -206,7 +231,7 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
           if (starting) return; // don't overwrite "starting" state
           setStatus("offline");
           // Auto-start on first offline detection (unless user manually stopped)
-          const tauriInvoke = (window as any).__TAURI__?.invoke;
+          const tauriInvoke = isTauri ? tauriInvokeV2 : null;
           if (tauriInvoke && !getUserStopped() && !autoStarted.current) {
             autoStarted.current = true;
             doStart();

@@ -23,6 +23,7 @@ import {
   API_TYPE_DEFAULT_URLS,
   API_TYPE_NEEDS_KEY,
 } from "../lib/provider-defaults";
+import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
 
 // ── i18n translations for the wizard ──
 
@@ -1654,7 +1655,7 @@ export function OnboardingPage() {
     // Read gateway URL + auth token early so API calls work
     (async () => {
       try {
-        const tauriInvoke = (window as any).__TAURI__?.invoke;
+        const tauriInvoke = isTauri ? tauriInvokeV2 : null;
         if (tauriInvoke) {
           const gw: any = await tauriInvoke("get_gateway_port");
           if (gw?.url) setGatewayUrl(gw.url);
@@ -1673,7 +1674,7 @@ export function OnboardingPage() {
     if (detectRanRef.current) return;
     detectRanRef.current = true;
     (async () => {
-      const tauriInvoke = (window as any).__TAURI__?.invoke;
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       if (tauriInvoke) {
         // Check if config already has gateway.language set (e.g. from `rsclaw setup` CLI)
         try {
@@ -1735,7 +1736,7 @@ export function OnboardingPage() {
     setMigrating(true);
     setMigrateResult("idle");
     try {
-      const tauriInvoke = (window as any).__TAURI__?.invoke;
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       if (tauriInvoke) {
         await tauriInvoke("migrate_openclaw", { sourcePath: openclawPath });
       }
@@ -1852,7 +1853,7 @@ export function OnboardingPage() {
       const baseUrl = id === "custom"
         ? (prov.baseUrl || (prov.apiType ? API_TYPE_DEFAULT_URLS[prov.apiType] : undefined))
         : ((provDef?.isUrl || provDef?.hasBaseUrl) ? prov.baseUrl : undefined);
-      const tauriInvoke = (window as any).__TAURI__?.invoke;
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       let result: any;
       let modelIds: string[] = [];
       if (tauriInvoke) {
@@ -1961,7 +1962,7 @@ export function OnboardingPage() {
   };
 
   const startChannelQr = async (channelId: string) => {
-    const tauriInvoke = (window as any).__TAURI__?.invoke;
+    const tauriInvoke = isTauri ? tauriInvokeV2 : null;
     if (!tauriInvoke) return;
 
     setChs((prev) => {
@@ -2118,7 +2119,7 @@ export function OnboardingPage() {
       // 1: write config — deep merge into existing, never delete existing keys
       update(0, "loading");
       const newConfig = JSON.parse(generateConfig());
-      const tauriInvoke = (window as any).__TAURI__?.invoke;
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
 
       // Deep merge helper: recursively merge src into dst without deleting dst keys
       const deepMerge = (dst: any, src: any): any => {
@@ -2670,7 +2671,7 @@ export function OnboardingPage() {
                     if (!canNextStep2) return;
                     // Ensure rsclaw dirs + config exist before channel login
                     try {
-                      const invoke = (window as any).__TAURI__?.invoke;
+                      const invoke = isTauri ? tauriInvokeV2 : null;
                       if (invoke) await invoke("run_setup");
                     } catch {}
                     setStep(3);

@@ -190,8 +190,8 @@ export class ChatGPTApi implements LLMApi {
   async chat(options: ChatOptions) {
     // RsClaw: route through agent runtime via /api/v1/message (non-streaming)
     // This gives full agent features: context compression, memory, tools, etc.
-    const isTauri = typeof window !== "undefined" && !!(window as any).__TAURI__;
-    if (isTauri || true) {
+    const isTauriApp = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+    if (isTauriApp || true) {
       try {
         const { getGatewayUrl, getAuthToken } = require("../../lib/rsclaw-api");
         const gwUrl = getGatewayUrl() || "http://localhost:18888";

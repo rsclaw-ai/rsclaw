@@ -7,95 +7,46 @@ extern crate objc;
 
 mod stream;
 
-use tauri::api::process::Command;
-use tauri::{
-    CustomMenuItem, Manager, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem,
-};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tauri::{Emitter, Manager};
+use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
+use tauri::tray::TrayIconBuilder;
 
-// ---------------------------------------------------------------------------
-// macOS: restore hidden window when user clicks dock icon
-// ---------------------------------------------------------------------------
-#[cfg(target_os = "macos")]
-mod mac_dock {
-    use std::sync::OnceLock;
-    use tauri::Manager;
-    use objc::declare::ClassDecl;
-    use objc::runtime::{BOOL, Object, Sel, YES};
+/// True when user has manually stopped gateway (close = quit instead of hide).
+static GATEWAY_USER_STOPPED: AtomicBool = AtomicBool::new(false);
 
-    static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+/// True when app is exiting (Dock quit, Cmd+Q) — don't prevent window close.
+static APP_EXITING: AtomicBool = AtomicBool::new(false);
 
-    extern "C" fn handle_reopen(_self: &Object, _cmd: Sel, _app: *mut Object, _has_visible: BOOL) -> BOOL {
-        if let Some(handle) = APP_HANDLE.get() {
-            if let Some(win) = handle.get_window("main") {
-                let _ = win.show();
-                let _ = win.unminimize();
-                let _ = win.set_focus();
-            }
-        }
-        YES
-    }
+/// Set by SIGTERM signal handler.
+static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
 
-    /// Install a new NSApplicationDelegate that handles dock icon clicks.
-    /// Must be called from `setup()` after Tauri has configured its own delegate.
-    pub fn install(handle: tauri::AppHandle) {
-        APP_HANDLE.get_or_init(|| handle);
-
-        unsafe {
-            // Create a new delegate class with the reopen handler
-            if let Some(mut decl) = ClassDecl::new("RsClawDockDelegate", objc::class!(NSObject)) {
-                decl.add_method(
-                    objc::sel!(applicationShouldHandleReopen:hasVisibleWindows:),
-                    handle_reopen as extern "C" fn(&Object, Sel, *mut Object, BOOL) -> BOOL,
-                );
-                let cls = decl.register();
-                let delegate: *mut Object = objc::msg_send![cls, new];
-                let app: *mut Object = objc::msg_send![objc::class!(NSApplication), sharedApplication];
-                let _: () = objc::msg_send![app, setDelegate: delegate];
-            }
-        }
-    }
-}
-
-/// Check if a process is alive (cross-platform).
-fn is_process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        // kill -0 checks if process exists without sending a signal
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-    }
-    #[cfg(windows)]
-    {
-        // tasklist /FI checks if a specific PID exists
-        std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
-            .unwrap_or(false)
-    }
+#[cfg(unix)]
+extern "C" fn handle_sigterm(_sig: libc::c_int) {
+    SIGTERM_RECEIVED.store(true, Ordering::Relaxed);
 }
 
 fn run_rsclaw_command(args: &[&str]) -> Result<String, String> {
-    // Try sidecar first; if it doesn't exist, fall back to PATH.
-    let result = Command::new_sidecar("rsclaw-cli")
+    // Try sidecar binary next to the executable first, then fall back to PATH.
+    let exe_dir = std::env::current_exe()
         .ok()
-        .and_then(|cmd| cmd.args(args).output().ok());
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
-    let output = match result {
-        Some(o) => o,
-        None => {
-            // Fallback: try "rsclaw" from PATH.
-            let o = std::process::Command::new("rsclaw")
+    let sidecar_result = exe_dir.as_ref().and_then(|dir| {
+        let sidecar = dir.join("rsclaw-cli");
+        eprintln!("[cmd] sidecar path: {} exists={}", sidecar.display(), sidecar.exists());
+        if sidecar.exists() {
+            std::process::Command::new(&sidecar)
                 .args(args)
                 .output()
-                .map_err(|e| format!("Failed to execute rsclaw: {}", e))?;
-            // Convert to same format.
+                .ok()
+        } else {
+            None
+        }
+    });
+
+    let output = match sidecar_result {
+        Some(o) => {
             return if o.status.success() {
                 Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
             } else {
@@ -107,16 +58,24 @@ fn run_rsclaw_command(args: &[&str]) -> Result<String, String> {
                 ))
             };
         }
+        None => {
+            // Fallback: try "rsclaw" from PATH.
+            let o = std::process::Command::new("rsclaw")
+                .args(args)
+                .output()
+                .map_err(|e| format!("Failed to execute rsclaw: {}", e))?;
+            o
+        }
     };
 
     if output.status.success() {
-        Ok(output.stdout.trim().to_string())
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
         Err(format!(
             "rsclaw {} failed: {}{}",
             args.join(" "),
-            output.stdout,
-            output.stderr
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         ))
     }
 }
@@ -127,13 +86,26 @@ fn run_rsclaw_command(args: &[&str]) -> Result<String, String> {
 #[tauri::command]
 fn run_rsclaw_cli(args: Vec<String>) -> Result<String, String> {
     let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    // Try sidecar first, fallback to PATH
-    let result = Command::new_sidecar("rsclaw-cli")
+    let exe_dir = std::env::current_exe()
         .ok()
-        .and_then(|cmd| cmd.args(&str_args).output().ok());
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
-    let (stdout, stderr, success) = match result {
-        Some(o) => (o.stdout, o.stderr, o.status.success()),
+    let (stdout, stderr, success) = match exe_dir.as_ref().and_then(|dir| {
+        let sidecar = dir.join("rsclaw-cli");
+        if sidecar.exists() {
+            std::process::Command::new(&sidecar)
+                .args(&str_args)
+                .output()
+                .ok()
+        } else {
+            None
+        }
+    }) {
+        Some(o) => (
+            String::from_utf8_lossy(&o.stdout).to_string(),
+            String::from_utf8_lossy(&o.stderr).to_string(),
+            o.status.success(),
+        ),
         None => {
             let o = std::process::Command::new("rsclaw")
                 .args(&str_args)
@@ -160,11 +132,21 @@ fn run_rsclaw_cli(args: Vec<String>) -> Result<String, String> {
 #[tauri::command]
 fn start_gateway() -> Result<String, String> {
     // Gateway runs as a long-lived process — must spawn, not wait for output.
-    let spawned = Command::new_sidecar("rsclaw-cli")
+    let exe_dir = std::env::current_exe()
         .ok()
-        .and_then(|cmd| cmd.args(&["gateway", "start"]).spawn().ok());
-    if spawned.is_some() {
-        return Ok("gateway starting (sidecar)".to_string());
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+
+    if let Some(dir) = &exe_dir {
+        let sidecar = dir.join("rsclaw-cli");
+        if sidecar.exists() {
+            std::process::Command::new(&sidecar)
+                .args(["gateway", "start"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| format!("Failed to start gateway: {e}"))?;
+            return Ok("gateway starting (sidecar)".to_string());
+        }
     }
     // Fallback: PATH
     std::process::Command::new("rsclaw")
@@ -438,10 +420,25 @@ fn channel_login_start(channel: String) -> Result<String, String> {
     let mtime = std::fs::metadata(&config_path).ok().and_then(|m| m.modified().ok());
     *LOGIN_START_MTIME.lock().unwrap() = mtime.or(Some(std::time::SystemTime::now()));
 
-    // Try sidecar spawn (non-blocking)
-    let spawned = Command::new_sidecar("rsclaw-cli")
+    // Try sidecar binary next to executable
+    let exe_dir = std::env::current_exe()
         .ok()
-        .and_then(|cmd| cmd.args(&["channels", "login", &channel]).spawn().ok());
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+
+    let spawned = exe_dir.as_ref().and_then(|dir| {
+        let sidecar = dir.join("rsclaw-cli");
+        if sidecar.exists() {
+            std::process::Command::new(&sidecar)
+                .args(["channels", "login", &channel])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok()
+        } else {
+            None
+        }
+    });
+
     if spawned.is_none() {
         // Fallback: spawn via PATH
         std::process::Command::new("rsclaw")
@@ -838,81 +835,67 @@ fn get_auto_start() -> Result<bool, String> {
         .map_err(|e| format!("Failed to check auto-start status: {}", e))
 }
 
-// -- System tray --
-
-fn build_system_tray() -> SystemTray {
-    let open = CustomMenuItem::new("open".to_string(), "Open RsClaw");
-    let start = CustomMenuItem::new("start_gw".to_string(), "Start Gateway");
-    let stop = CustomMenuItem::new("stop_gw".to_string(), "Stop Gateway");
-    let status = CustomMenuItem::new("status_gw".to_string(), "Gateway Status");
-    let quit = CustomMenuItem::new("quit".to_string(), "Quit");
-
-    let tray_menu = SystemTrayMenu::new()
-        .add_item(open)
-        .add_native_item(SystemTrayMenuItem::Separator)
-        .add_item(start)
-        .add_item(stop)
-        .add_item(status)
-        .add_native_item(SystemTrayMenuItem::Separator)
-        .add_item(quit);
-
-    SystemTray::new().with_menu(tray_menu)
+/// Called by frontend when user manually stops/starts gateway.
+#[tauri::command]
+fn set_gateway_user_stopped(stopped: bool) {
+    GATEWAY_USER_STOPPED.store(stopped, Ordering::Relaxed);
 }
 
-fn handle_tray_event(app: &tauri::AppHandle, event: SystemTrayEvent) {
-    match event {
-        SystemTrayEvent::LeftClick { .. } => {
-            // Toggle main window visibility on left click
-            if let Some(window) = app.get_window("main") {
-                if window.is_visible().unwrap_or(false) {
-                    let _ = window.hide();
-                } else {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
-            }
-        }
-        SystemTrayEvent::MenuItemClick { id, .. } => match id.as_str() {
-            "open" => {
-                if let Some(window) = app.get_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
-            }
-            "start_gw" => {
-                let _ = run_rsclaw_command(&["gateway", "start"]);
-            }
-            "stop_gw" => {
-                let _ = run_rsclaw_command(&["gateway", "stop"]);
-            }
-            "status_gw" => {
-                if let Some(window) = app.get_window("main") {
-                    let status = run_rsclaw_command(&["gateway", "status"])
-                        .unwrap_or_else(|e| format!("Error: {}", e));
-                    let _ = tauri::api::dialog::message(Some(&window), "Gateway Status", status);
-                }
-            }
-            "quit" => {
-                // Stop gateway (rsclaw-cli) before quitting.
-                // Log result for debugging; wait for stop to complete.
-                match stop_gateway() {
-                    Ok(msg) => eprintln!("[tray quit] gateway stopped: {msg}"),
-                    Err(e) => eprintln!("[tray quit] gateway stop failed: {e}"),
-                }
-                // Give gateway a moment to shut down
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                std::process::exit(0);
-            }
-            _ => {}
-        },
-        _ => {}
+/// macOS: hide app from dock (agent mode). App only visible via tray icon.
+#[cfg(target_os = "macos")]
+fn set_dock_visible(visible: bool) {
+    unsafe {
+        let app: *mut objc::runtime::Object = objc::msg_send![objc::class!(NSApplication), sharedApplication];
+        // NSApplicationActivationPolicyRegular = 0 (show in dock)
+        // NSApplicationActivationPolicyAccessory = 1 (no dock, no menu bar)
+        let policy: i64 = if visible { 0 } else { 1 };
+        let _: () = objc::msg_send![app, setActivationPolicy: policy];
+    }
+}
+
+fn stop_gateway_sync() {
+    eprintln!("[shutdown] stopping gateway...");
+    match run_rsclaw_command(&["gateway", "stop"]) {
+        Ok(msg) => eprintln!("[shutdown] gateway stopped: {msg}"),
+        Err(e) => eprintln!("[shutdown] gateway stop failed: {e}"),
     }
 }
 
 fn main() {
+    // Catch SIGTERM/SIGINT (macOS/Linux Dock quit, Ctrl+C) to stop gateway before exit.
+    #[cfg(unix)]
+    {
+        std::thread::spawn(|| {
+            unsafe {
+                libc::signal(libc::SIGTERM, handle_sigterm as usize);
+                libc::signal(libc::SIGINT, handle_sigterm as usize);
+            }
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if SIGTERM_RECEIVED.load(Ordering::Relaxed) {
+                    stop_gateway_sync();
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
+
+    // Windows: catch Ctrl+C / console close to stop gateway before exit.
+    #[cfg(windows)]
+    {
+        unsafe extern "system" fn handler(_ctrl_type: u32) -> i32 {
+            SIGTERM_RECEIVED.store(true, Ordering::Relaxed);
+            stop_gateway_sync();
+            0 // allow default handler to terminate
+        }
+        extern "system" { fn SetConsoleCtrlHandler(handler: unsafe extern "system" fn(u32) -> i32, add: i32) -> i32; }
+        unsafe { SetConsoleCtrlHandler(handler, 1); }
+    }
+
     tauri::Builder::default()
-        .system_tray(build_system_tray())
-        .on_system_tray_event(handle_tray_event)
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             stream::stream_fetch,
             start_gateway,
@@ -944,32 +927,146 @@ fn main() {
             migrate_openclaw,
             set_auto_start,
             get_auto_start,
+            set_gateway_user_stopped,
         ])
-        .on_window_event(|event| {
-            // Closing the window minimizes to tray instead of quitting.
-            // The gateway service keeps running. User must right-click
-            // tray → Quit to fully exit and stop the gateway.
-            match event.event() {
-                tauri::WindowEvent::CloseRequested { api, .. } => {
-                    eprintln!("[window] CloseRequested — hiding to tray");
-                    api.prevent_close();
-                    let window = event.window();
-                    let _ = window.hide();
-                }
-                _ => {}
-            }
-        })
         .setup(|app| {
-            // macOS: handle dock icon click to restore hidden window
-            #[cfg(target_os = "macos")]
-            mac_dock::install(app.handle());
+            // Build system tray
+            let open = MenuItemBuilder::with_id("open", "Open RsClaw").build(app)?;
+            let sep1 = PredefinedMenuItem::separator(app)?;
+            let start = MenuItemBuilder::with_id("start_gw", "Start Gateway").build(app)?;
+            let stop = MenuItemBuilder::with_id("stop_gw", "Stop Gateway").build(app)?;
+            let status = MenuItemBuilder::with_id("status_gw", "Gateway Status").build(app)?;
+            let sep2 = PredefinedMenuItem::separator(app)?;
+            let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+
+            let menu = MenuBuilder::new(app)
+                .item(&open)
+                .item(&sep1)
+                .item(&start)
+                .item(&stop)
+                .item(&status)
+                .item(&sep2)
+                .item(&quit)
+                .build()?;
+
+            let tray_icon = {
+                let icon_path = app.path().resource_dir()
+                    .ok()
+                    .map(|d| d.join("icons/icon.png"));
+                let icon = icon_path
+                    .and_then(|p| {
+                        eprintln!("[tray] loading icon from: {}", p.display());
+                        tauri::image::Image::from_path(&p).ok()
+                    });
+                if icon.is_none() {
+                    eprintln!("[tray] WARNING: failed to load tray icon, using default");
+                }
+                icon
+            };
+
+            let mut tray_builder = TrayIconBuilder::new()
+                .menu(&menu)
+                .tooltip("RsClaw")
+                .show_menu_on_left_click(false);
+            if let Some(icon) = tray_icon {
+                tray_builder = tray_builder.icon(icon);
+            }
+            let _tray = tray_builder
+                .on_menu_event(|app, event| {
+                    match event.id().as_ref() {
+                        "open" => {
+                            #[cfg(target_os = "macos")]
+                            set_dock_visible(true);
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        "start_gw" => {
+                            GATEWAY_USER_STOPPED.store(false, Ordering::Relaxed);
+                            let _ = run_rsclaw_command(&["gateway", "start"]);
+                        }
+                        "stop_gw" => {
+                            GATEWAY_USER_STOPPED.store(true, Ordering::Relaxed);
+                            // Notify frontend to set userStopped flag before stopping
+                            let _ = app.emit("tray-gateway-action", "stop");
+                            let _ = run_rsclaw_command(&["gateway", "stop"]);
+                        }
+                        "status_gw" => {
+                            #[cfg(target_os = "macos")]
+                            set_dock_visible(true);
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                                let _ = window.emit("tray-gateway-action", "status");
+                            }
+                        }
+                        "quit" => {
+                            // Notify frontend to set userStopped flag
+                            let _ = app.emit("tray-gateway-action", "quit");
+                            // Stop gateway before quitting.
+                            eprintln!("[tray quit] stopping gateway via rsclaw-cli...");
+                            let result = run_rsclaw_command(&["gateway", "stop"]);
+                            eprintln!("[tray quit] result: {result:?}");
+                            std::thread::sleep(std::time::Duration::from_millis(800));
+                            app.exit(0);
+                        }
+                        _ => {}
+                    }
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } = event {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            if window.is_visible().unwrap_or(false) {
+                                let _ = window.hide();
+                                #[cfg(target_os = "macos")]
+                                set_dock_visible(false);
+                            } else {
+                                #[cfg(target_os = "macos")]
+                                set_dock_visible(true);
+                                let _ = window.show();
+                                let _ = window.unminimize();
+                                let _ = window.set_focus();
+                            }
+                        }
+                    }
+                })
+                .build(app)?;
+
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app_handle, _event| {
-            // Do NOT stop gateway on RunEvent::Exit — the tray "Quit"
-            // handler already calls stop_gateway() before exit(0).
-            // macOS dock click is handled by mac_dock::install() above.
+        .run(|app_handle, event| {
+            match event {
+                // macOS: clicking dock icon restores hidden window (native v2 support)
+                tauri::RunEvent::Reopen { .. } => {
+                    #[cfg(target_os = "macos")]
+                    set_dock_visible(true);
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                    }
+                }
+                // Window close → hide to tray + hide from dock
+                tauri::RunEvent::WindowEvent {
+                    event: tauri::WindowEvent::CloseRequested { api, .. },
+                    ..
+                } => {
+                    api.prevent_close();
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let _ = window.hide();
+                    }
+                    #[cfg(target_os = "macos")]
+                    set_dock_visible(false);
+                }
+                _ => {}
+            }
         });
 }

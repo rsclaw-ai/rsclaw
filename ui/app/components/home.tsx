@@ -17,6 +17,7 @@ import { ErrorBoundary } from "./error";
 import { ToastContainer } from "./toast-container";
 import { isFirstLaunch, resetSetup } from "../lib/first-launch";
 import { setGatewayUrl, setAuthToken } from "../lib/rsclaw-api";
+import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
 
 import { getISOLang, getLang } from "../locales";
 
@@ -209,7 +210,7 @@ function Screen() {
     // Read gateway port from config via Tauri and sync everywhere
     (async () => {
       try {
-        const tauriInvoke = (window as any).__TAURI__?.invoke;
+        const tauriInvoke = isTauri ? tauriInvokeV2 : null;
         if (tauriInvoke) {
           const gw: any = await tauriInvoke("get_gateway_port");
           if (gw?.url) {
@@ -234,7 +235,7 @@ function Screen() {
       let needsOnboarding = isFirstLaunch();
       if (!needsOnboarding) {
         try {
-          const invoke = (window as any).__TAURI__?.invoke;
+          const invoke = isTauri ? tauriInvokeV2 : null;
           if (invoke) {
             const setupDone = await invoke("check_setup");
             if (!setupDone) {

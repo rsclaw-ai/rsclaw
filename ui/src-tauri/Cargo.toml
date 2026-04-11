@@ -12,41 +12,28 @@ rust-version = "1.60"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [build-dependencies]
-tauri-build = { version = "1.5.1", features = [] }
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
-tauri = { version = "1.5.4", features = [ "devtools", "shell-sidecar", "shell-execute", "http-all",
-    "notification-all",
-    "fs-all",
-    "clipboard-all",
-    "dialog-all",
-    "shell-open",
-    "system-tray",
-    "window-close",
-    "window-hide",
-    "window-maximize",
-    "window-minimize",
-    "window-set-icon",
-    "window-set-ignore-cursor-events",
-    "window-set-resizable",
-    "window-show",
-    "window-start-dragging",
-    "window-unmaximize",
-    "window-unminimize",
-] }
-tauri-plugin-window-state = { git = "https://github.com/tauri-apps/plugins-workspace", branch = "v1" }
+tauri = { version = "2", features = ["devtools", "tray-icon", "image-png"] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+time = { version = "0.3", features = ["serde-well-known"] }
+tauri-plugin-notification = "2"
 json5 = "0.4"
 percent-encoding = "2.3.1"
-reqwest = "0.11.18"
+reqwest = { version = "0.11.18", features = ["json", "stream"] }
 futures-util = "0.3.30"
 bytes = "1.7.2"
 auto-launch = "0.5"
 dirs = "5"
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
+tokio = { version = "1", features = ["macros", "rt"] }
 
 [features]
 # this feature is used for production builds or when `devPath` points to the filesystem and the built-in dev server is disabled.

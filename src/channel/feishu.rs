@@ -278,9 +278,7 @@ fn markdown_to_feishu_post(text: &str) -> serde_json::Value {
 /// For interactive cards, the second value is the raw card JSON (not
 /// stringified).
 fn build_feishu_card(text: &str, brand: &str) -> serde_json::Value {
-    // Strip <think>...</think> tags
-    let think_re = regex::Regex::new(r"(?s)<think>.*?</think>\s*").unwrap();
-    let cleaned = think_re.replace_all(text, "");
+    let cleaned = text;
 
     json!({
         "msg_type": "interactive",

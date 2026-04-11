@@ -1,121 +1,18 @@
 {
-  "$schema": "../node_modules/@tauri-apps/cli/schema.json",
+  "$schema": "https://raw.githubusercontent.com/nicegoodthings/tauri-v2-schema/refs/heads/main/tauri.conf.json",
+  "productName": "RsClaw",
+  "version": "26.4.8",
+  "identifier": "ai.rsclaw.app",
   "build": {
     "beforeBuildCommand": "yarn export",
     "beforeDevCommand": "yarn export:dev",
-    "devPath": "http://localhost:3000",
-    "distDir": "../out",
-    "withGlobalTauri": true
+    "devUrl": "http://localhost:3000",
+    "frontendDist": "../out"
   },
-  "package": {
-    "productName": "RsClaw",
-    "version": "26.4.8"
-  },
-  "tauri": {
-    "allowlist": {
-      "all": false,
-      "shell": {
-        "all": false,
-        "open": true,
-        "execute": true,
-        "sidecar": true,
-        "scope": [
-          {
-            "name": "rsclaw-cli",
-            "cmd": "rsclaw-cli",
-            "args": [
-              "start",
-              "stop",
-              "restart",
-              "status",
-              "--dev"
-            ]
-          }
-        ]
-      },
-      "dialog": {
-        "all": true,
-        "ask": true,
-        "confirm": true,
-        "message": true,
-        "open": true,
-        "save": true
-      },
-      "clipboard": {
-        "all": true,
-        "writeText": true,
-        "readText": true
-      },
-      "window": {
-        "all": false,
-        "close": true,
-        "hide": true,
-        "maximize": true,
-        "minimize": true,
-        "setIcon": true,
-        "setIgnoreCursorEvents": true,
-        "setResizable": true,
-        "show": true,
-        "startDragging": true,
-        "unmaximize": true,
-        "unminimize": true
-      },
-      "fs": {
-        "all": true
-      },
-      "notification": {
-        "all": true
-      },
-      "http": {
-        "all": true,
-        "request": true,
-        "scope": ["https://*", "http://*"]
-      }
-    },
-    "bundle": {
-      "active": true,
-      "category": "DeveloperTool",
-      "copyright": "2026, RsClaw Contributors. All Rights Reserved.",
-      "deb": {
-        "depends": []
-      },
-      "externalBin": ["binaries/rsclaw-cli"],
-      "icon": [
-        "icons/32x32.png",
-        "icons/128x128.png",
-        "icons/128x128@2x.png",
-        "icons/icon.icns",
-        "icons/icon.ico"
-      ],
-      "identifier": "ai.rsclaw.app",
-      "longDescription": "RsClaw Multi-Agent AI Engine - manage intelligent agents, model routing, and multi-channel messaging.",
-      "macOS": {
-        "entitlements": null,
-        "exceptionDomain": "",
-        "frameworks": [],
-        "providerShortName": null,
-        "signingIdentity": null
-      },
-      "resources": [],
-      "shortDescription": "RsClaw Multi-Agent AI Engine",
-      "targets": "all",
-      "windows": {
-        "certificateThumbprint": null,
-        "digestAlgorithm": "sha256",
-        "timestampUrl": ""
-      }
-    },
+  "app": {
+    "withGlobalTauri": true,
     "security": {
-      "csp": null,
-      "dangerousUseHttpScheme": true
-    },
-    "systemTray": {
-      "iconPath": "icons/icon.png",
-      "iconAsTemplate": false,
-      "menuOnLeftClick": false
-    },
-    "updater": {
-      "active": false
+      "csp": null
     },
     "windows": [
       {
@@ -131,5 +28,44 @@
         "center": true
       }
     ]
+  },
+  "bundle": {
+    "active": true,
+    "category": "DeveloperTool",
+    "copyright": "2026, RsClaw Contributors. All Rights Reserved.",
+    "linux": {
+      "deb": {
+        "depends": []
+      }
+    },
+    "externalBin": ["binaries/rsclaw-cli"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "longDescription": "RsClaw Multi-Agent AI Engine - manage intelligent agents, model routing, and multi-channel messaging.",
+    "macOS": {
+      "entitlements": null,
+      "exceptionDomain": "",
+      "frameworks": [],
+      "providerShortName": null,
+      "signingIdentity": null
+    },
+    "resources": ["icons/icon.png"],
+    "shortDescription": "RsClaw Multi-Agent AI Engine",
+    "targets": "all",
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": ""
+    }
+  },
+  "plugins": {
+    "shell": {
+      "open": true
+    }
   }
 }

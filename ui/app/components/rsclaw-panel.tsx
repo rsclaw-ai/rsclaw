@@ -50,6 +50,7 @@ import {
   API_TYPE_DEFAULT_URLS,
   API_TYPE_NEEDS_KEY,
 } from "../lib/provider-defaults";
+import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
 
 // ── Types ──────────────────────────────────────────────
 interface ChannelInfo {
@@ -182,7 +183,7 @@ function StatusPage() {
   const executeAction = async (action: string) => {
     setActionLoading(true);
     try {
-      const tauriInvoke = (window as any).__TAURI__?.invoke;
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       if (tauriInvoke) {
         if (action === "stop") {
           const { setUserStopped } = await import("./sidebar");
@@ -473,7 +474,7 @@ function ConfigEditorPage() {
   ];
 
   const [activeTab, setActiveTab] = useState<TabKey>("gateway");
-  const [rawMode, setRawMode] = useState(() => typeof window !== "undefined" && !!(window as any).__TAURI__);
+  const [rawMode, setRawMode] = useState(() => isTauri);
   const [rawConfig, setRawConfig] = useState("");
   const [configPath, setConfigPath] = useState("");
   const [loading, setLoading] = useState(true);
@@ -628,7 +629,7 @@ function ConfigEditorPage() {
       } catch {
         // Fallback: read config file directly via Tauri
         try {
-          const tauriInvoke = (window as any).__TAURI__?.invoke;
+          const tauriInvoke = isTauri ? tauriInvokeV2 : null;
           if (tauriInvoke) {
             const cp: string = await tauriInvoke("get_config_path");
             const home = cp || "~/.rsclaw";
@@ -1665,7 +1666,7 @@ function AgentManagerPage() {
 
   const fetchAgentList = useCallback(async () => {
     // Read directly from config file (no gateway API dependency)
-    const invoke = (window as any).__TAURI__?.invoke;
+    const invoke = isTauri ? tauriInvokeV2 : null;
     if (!invoke) return;
     try {
       const raw: string = await invoke("read_config_file");
@@ -1695,7 +1696,7 @@ function AgentManagerPage() {
     // Load channel accounts and config models
     (async () => {
       try {
-        const invoke = (window as any).__TAURI__?.invoke;
+        const invoke = isTauri ? tauriInvokeV2 : null;
         if (invoke) {
           const accts: Record<string, string[]> = await invoke("get_channel_accounts");
           setChannelAccounts(accts || {});
@@ -1758,7 +1759,7 @@ function AgentManagerPage() {
       channels: newChannels.length > 0 ? newChannels : [],
     };
     try {
-      const invoke = (window as any).__TAURI__?.invoke;
+      const invoke = isTauri ? tauriInvokeV2 : null;
       if (!invoke) throw new Error("Tauri not available");
       // Write agent config to JSON file
       const raw: string = await invoke("read_config_file");
@@ -1807,7 +1808,7 @@ function AgentManagerPage() {
       setAgentList((prev) => prev.filter((a) => a.id !== id));
       setConfirmDeleteId(null);
       // Delete from config file via Tauri
-      const invoke = (window as any).__TAURI__?.invoke;
+      const invoke = isTauri ? tauriInvokeV2 : null;
       if (invoke) {
         const raw: string = await invoke("read_config_file");
         const cfg = JSON.parse(raw || "{}");
@@ -1859,7 +1860,7 @@ function AgentManagerPage() {
     setProviderModels([]);
     setShowModal(true);
     try {
-      const invoke = (window as any).__TAURI__?.invoke;
+      const invoke = isTauri ? tauriInvokeV2 : null;
       if (invoke) {
         const raw = await invoke("read_config_file");
         const cfg = JSON.parse(raw || "{}");
@@ -2156,7 +2157,7 @@ function AgentManagerPage() {
                   // Fetch models from provider via Tauri (direct client request, no gateway)
                   setLoadingModels(true);
                   try {
-                    const invoke = (window as any).__TAURI__?.invoke;
+                    const invoke = isTauri ? tauriInvokeV2 : null;
                     if (invoke) {
                       const raw: string = await invoke("read_config_file");
                       const cfg = JSON.parse(raw || "{}");
@@ -2391,7 +2392,7 @@ function SetupWizardPage() {
   useEffect(() => {
     (async () => {
       try {
-        const tauriInvoke = (window as any).__TAURI__?.invoke;
+        const tauriInvoke = isTauri ? tauriInvokeV2 : null;
         if (tauriInvoke) {
           const path = await tauriInvoke("detect_openclaw");
           setOpenclawPath(path || null);
@@ -2406,7 +2407,7 @@ function SetupWizardPage() {
     setMigrating(true);
     setMigrateError("");
     try {
-      const tauriInvoke = (window as any).__TAURI__?.invoke;
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       if (tauriInvoke) {
         await tauriInvoke("migrate_openclaw", { sourcePath: openclawPath });
       }
@@ -2473,7 +2474,7 @@ function SetupWizardPage() {
     try {
       // Step 1: Write config (merge with existing to preserve auth token)
       const newConfig = JSON.parse(generateConfig());
-      const tauriInvoke = (window as any).__TAURI__?.invoke;
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       if (tauriInvoke) {
         try { await tauriInvoke("run_setup"); } catch {}
         let existing: any = {};
@@ -3130,7 +3131,7 @@ function DoctorPage() {
   };
 
   const runCliDoctor = async (fix: boolean) => {
-    const invoke = (window as any).__TAURI__?.invoke;
+    const invoke = isTauri ? tauriInvokeV2 : null;
     if (!invoke) {
       toast.error("Tauri not available");
       return;
@@ -3283,7 +3284,7 @@ function TauriConfigPageInner() {
   useEffect(() => {
     (async () => {
       try {
-        const invoke = (window as any).__TAURI__?.invoke;
+        const invoke = isTauri ? tauriInvokeV2 : null;
         if (invoke) {
           const cp: string = await invoke("get_config_path");
           setCfgPath(cp ? cp + "/rsclaw.json5" : "~/.rsclaw/rsclaw.json5");
@@ -3380,7 +3381,7 @@ function TauriConfigPageInner() {
     try { JSON.parse(raw); } catch { toast.error(zh ? "JSON 格式错误" : "Invalid JSON"); return; }
     setSaving(true);
     try {
-      const invoke = (window as any).__TAURI__?.invoke;
+      const invoke = isTauri ? tauriInvokeV2 : null;
       if (invoke) {
         await invoke("write_config", { content: raw });
         try { await reloadConfig(); } catch {}
@@ -3474,7 +3475,7 @@ function TauriConfigPageInner() {
     setProvTest((prev) => ({ ...prev, [provId]: "testing" }));
     setProvErr((prev) => ({ ...prev, [provId]: "" }));
     try {
-      const tauriInvoke = (window as any).__TAURI__?.invoke;
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       let res: any;
       if (tauriInvoke) {
         res = await tauriInvoke("test_provider", { provider: provId, apiKey, baseUrl: baseUrl || null, apiType: apiType || null });
@@ -3548,7 +3549,7 @@ function TauriConfigPageInner() {
   const handleQrStart = async (chId: string) => {
     setQrStatus((prev) => ({ ...prev, [chId]: zh ? "\u83B7\u53D6\u4E2D..." : "Loading..." }));
     try {
-      const tauriInvoke = (window as any).__TAURI__?.invoke;
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       if (tauriInvoke) {
         // Use sidecar to start channel login
         await tauriInvoke("channel_login_start", { channel: chId });
@@ -4599,7 +4600,7 @@ function CronTaskPage() {
 
   const fetchJobs = useCallback(async () => {
     try {
-      const tauriInvoke = (window as any).__TAURI__?.invoke;
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       if (tauriInvoke) {
         const data: any = await tauriInvoke("get_cron_jobs");
         setJobs(data.jobs || []);
@@ -4619,7 +4620,7 @@ function CronTaskPage() {
 
   const saveJob = async () => {
     try {
-      const invoke = (window as any).__TAURI__?.invoke;
+      const invoke = isTauri ? tauriInvokeV2 : null;
       if (invoke) {
         const data: any = await invoke("get_cron_jobs");
         const existing = data.jobs || [];
@@ -4654,7 +4655,7 @@ function CronTaskPage() {
 
   const deleteJob = async (id: string) => {
     try {
-      const invoke = (window as any).__TAURI__?.invoke;
+      const invoke = isTauri ? tauriInvokeV2 : null;
       if (invoke) {
         const data: any = await invoke("get_cron_jobs");
         const jobs = (data.jobs || []).filter((j: any) => j.id !== id);
@@ -4673,7 +4674,7 @@ function CronTaskPage() {
   };
   const toggleJob = async (job: CronJob) => {
     try {
-      const invoke = (window as any).__TAURI__?.invoke;
+      const invoke = isTauri ? tauriInvokeV2 : null;
       if (invoke) {
         const data: any = await invoke("get_cron_jobs");
         const jobs = data.jobs || [];
@@ -4871,7 +4872,7 @@ function SkillsPage() {
 
   const fetchSkills = useCallback(async () => {
     try {
-      const tauriInvoke = (window as any).__TAURI__?.invoke;
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       if (tauriInvoke) {
         const data: any = await tauriInvoke("get_skills");
         const skills = (data?.skills || []).map((s: any) => ({
@@ -4891,7 +4892,7 @@ function SkillsPage() {
   const doInstall = async (name: string) => {
     setInstalling(name);
     try {
-      const tauriInvoke = (window as any).__TAURI__?.invoke;
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       if (tauriInvoke) { await tauriInvoke("install_skill", { name }); }
       else { await gatewayFetch("/api/v1/skills/install", { method: "POST", body: JSON.stringify({ name }) }); }
       await fetchSkills();
@@ -4906,7 +4907,7 @@ function SkillsPage() {
   };
   const doUninstall = async (name: string) => {
     try {
-      const tauriInvoke = (window as any).__TAURI__?.invoke;
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       if (tauriInvoke) { await tauriInvoke("uninstall_skill", { name }); }
       else { await gatewayFetch(`/api/v1/skills/${encodeURIComponent(name)}`, { method: "DELETE" }); }
       await fetchSkills(); setDetailSkill(null);
@@ -4919,7 +4920,7 @@ function SkillsPage() {
     if (!search.trim()) { setSearchResults([]); return; }
     setSearching(true);
     try {
-      const tauriInvoke = (window as any).__TAURI__?.invoke;
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       if (tauriInvoke) {
         const data: any = await tauriInvoke("search_skills", { query: search.trim() });
         setSearchResults(data?.results || []);
@@ -5214,7 +5215,7 @@ export function RsClawPanel() {
     (async () => {
       // Ensure gateway URL + auth token are set before any API call
       try {
-        const tauriInvoke = (window as any).__TAURI__?.invoke;
+        const tauriInvoke = isTauri ? tauriInvokeV2 : null;
         if (tauriInvoke) {
           const gw: any = await tauriInvoke("get_gateway_port");
           if (gw?.url) {
@@ -5252,7 +5253,7 @@ export function RsClawPanel() {
         <div className={styles["panel-body"]}>
           <div className={styles["rsp-content"]} style={{ flex: 1 }}>
             {activePage === "status" && <StatusPage />}
-            {activePage === "config" && <ErrorBoundary>{(window as any).__TAURI__?.invoke ? <TauriConfigPage /> : <ConfigEditorPage />}</ErrorBoundary>}
+            {activePage === "config" && <ErrorBoundary>{isTauri ? <TauriConfigPage /> : <ConfigEditorPage />}</ErrorBoundary>}
             {activePage === "agents" && <AgentManagerPage />}
             {activePage === "cron" && <CronTaskPage />}
             {activePage === "skills" && <SkillsPage />}

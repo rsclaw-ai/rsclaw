@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use futures_util::{StreamExt};
 use reqwest::Client;
 use reqwest::header::{HeaderName, HeaderMap};
+use tauri::Emitter;
 
 static REQUEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -28,12 +29,12 @@ pub struct EndPayload {
 #[derive(Clone, serde::Serialize)]
 pub struct ChunkPayload {
   request_id: u32,
-  chunk: bytes::Bytes,
+  chunk: Vec<u8>,
 }
 
 #[tauri::command]
 pub async fn stream_fetch(
-  window: tauri::Window,
+  window: tauri::WebviewWindow,
   method: String,
   url: String,
   headers: HashMap<String, String>,
@@ -90,14 +91,14 @@ pub async fn stream_fetch(
       }
       let status = res.status().as_u16();
 
-      tauri::async_runtime::spawn(async move {
+      tokio::spawn(async move {
         let mut stream = res.bytes_stream();
 
         while let Some(chunk) = stream.next().await {
           match chunk {
             Ok(bytes) => {
               // println!("chunk: {:?}", bytes);
-              if let Err(e) = window.emit(event_name, ChunkPayload{ request_id, chunk: bytes }) {
+              if let Err(e) = window.emit(event_name, ChunkPayload{ request_id, chunk: bytes.to_vec() }) {
                 println!("Failed to emit chunk payload: {:?}", e);
               }
             }
@@ -123,8 +124,8 @@ pub async fn stream_fetch(
         .map(|e| e.to_string())
         .unwrap_or_else(|| "Unknown error occurred".to_string());
       println!("Error response: {:?}", error);
-      tauri::async_runtime::spawn( async move {
-        if let Err(e) = window.emit(event_name, ChunkPayload{ request_id, chunk: error.into() }) {
+      tokio::spawn( async move {
+        if let Err(e) = window.emit(event_name, ChunkPayload{ request_id, chunk: error.into_bytes() }) {
           println!("Failed to emit chunk payload: {:?}", e);
         }
         if let Err(e) = window.emit(event_name, EndPayload{ request_id, status: 0 }) {

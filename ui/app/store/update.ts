@@ -122,43 +122,35 @@ export const useUpdateStore = createPersistStore(
         set(() => ({
           remoteVersion: remoteId,
         }));
-        if (window.__TAURI__?.notification && isApp) {
-          // Check if notification permission is granted
-          await window.__TAURI__?.notification
-            .isPermissionGranted()
-            .then((granted) => {
-              if (!granted) {
-                return;
-              } else {
-                // Request permission to show notifications
-                window.__TAURI__?.notification
-                  .requestPermission()
-                  .then((permission) => {
-                    if (permission === "granted") {
-                      if (version === remoteId) {
-                        // Show a notification using Tauri
-                        window.__TAURI__?.notification.sendNotification({
-                          title: "RsClaw",
-                          body: `${Locale.Settings.Update.IsLatest}`,
-                          icon: `${ChatGptIcon.src}`,
-                          sound: "Default",
-                        });
-                      } else {
-                        const updateMessage =
-                          Locale.Settings.Update.FoundUpdate(`${remoteId}`);
-                        // Show a notification for the new version using Tauri
-                        window.__TAURI__?.notification.sendNotification({
-                          title: "RsClaw",
-                          body: updateMessage,
-                          icon: `${ChatGptIcon.src}`,
-                          sound: "Default",
-                        });
-                        clientUpdate();
-                      }
-                    }
-                  });
-              }
-            });
+        if (isApp) {
+          try {
+            const {
+              isPermissionGranted,
+              requestPermission,
+              sendNotification,
+            } = await import("@tauri-apps/plugin-notification");
+            const granted = await isPermissionGranted();
+            if (!granted) {
+              const perm = await requestPermission();
+              if (perm !== "granted") return;
+            }
+            if (version === remoteId) {
+              sendNotification({
+                title: "RsClaw",
+                body: `${Locale.Settings.Update.IsLatest}`,
+              });
+            } else {
+              const updateMessage =
+                Locale.Settings.Update.FoundUpdate(`${remoteId}`);
+              sendNotification({
+                title: "RsClaw",
+                body: updateMessage,
+              });
+              clientUpdate();
+            }
+          } catch (e) {
+            console.warn("Notification error:", e);
+          }
         }
         console.log("[Got Upstream] ", remoteId);
       } catch (error) {

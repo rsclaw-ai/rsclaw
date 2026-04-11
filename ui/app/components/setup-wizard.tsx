@@ -6,6 +6,7 @@ import ConfirmIcon from "../icons/confirm.svg";
 import { useNavigate } from "react-router-dom";
 import { useState, useEffect, useRef } from "react";
 import { Path } from "../constant";
+import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
 import { showToast } from "./ui-lib";
 import {
   type ApiType,
@@ -118,7 +119,7 @@ export function SetupWizardPage() {
     langCheckRef.current = true;
     (async () => {
       try {
-        const tauriInvoke = (window as any).__TAURI__?.invoke;
+        const tauriInvoke = isTauri ? tauriInvokeV2 : null;
         let cfgLang: string | undefined;
         if (tauriInvoke) {
           const raw: string = await tauriInvoke("read_config_file");
