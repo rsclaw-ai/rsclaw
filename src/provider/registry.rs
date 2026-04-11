@@ -104,21 +104,22 @@ impl ProviderRegistry {
 }
 
 fn infer_provider(model: &str) -> &str {
-    if model.starts_with("claude") {
+    let m = model.to_ascii_lowercase();
+    if m.starts_with("claude") {
         "anthropic"
-    } else if model.starts_with("gemini") {
+    } else if m.starts_with("gemini") {
         "gemini"
-    } else if model.starts_with("deepseek") {
+    } else if m.starts_with("deepseek") {
         "deepseek"
-    } else if model.starts_with("qwen") {
+    } else if m.starts_with("qwen") {
         "qwen"
-    } else if model.starts_with("glm") || model.starts_with("chatglm") {
+    } else if m.starts_with("glm") || m.starts_with("chatglm") {
         "zhipu"
-    } else if model.starts_with("moonshot") || model.starts_with("kimi") {
+    } else if m.starts_with("moonshot") || m.starts_with("kimi") {
         "kimi"
-    } else if model.starts_with("step") {
+    } else if m.starts_with("step") {
         "stepfun"
-    } else if model.starts_with("grok") {
+    } else if m.starts_with("grok") {
         "xai"
     } else {
         "openai"
