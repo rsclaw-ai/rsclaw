@@ -368,10 +368,8 @@ pub struct PermissionOption {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RequestPermissionOutcome {
-    Selected {
-        #[serde(rename = "optionId")]
-        option_id: String,
-    },
+    #[serde(rename = "selected")]
+    Selected(String),
     Cancelled,
 }
 
