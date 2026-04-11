@@ -1680,7 +1680,7 @@ mod tests {
     #[test]
     fn test_default_handler_permission() {
         let _handler = DefaultAcpHandler;
-        let options = vec![
+        let options = [
             PermissionOption {
                 option_id: "deny".to_string(),
                 kind: PermissionOptionKind::RejectOnce,

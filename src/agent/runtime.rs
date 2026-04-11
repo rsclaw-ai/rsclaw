@@ -1393,7 +1393,7 @@ impl AgentRuntime {
                     "__ABORT__" => {
                         // Set abort flag for this session to interrupt running turn
                         let resolved_key = self.resolve_session_key(session_key);
-                        let mut flags = self.handle.abort_flags.write().unwrap();
+                        let flags = self.handle.abort_flags.write().unwrap();
                         if let Some(flag) = flags.get(resolved_key) {
                             flag.store(true, std::sync::atomic::Ordering::SeqCst);
                             "Abort signal sent. The running task will stop shortly.".to_owned()
