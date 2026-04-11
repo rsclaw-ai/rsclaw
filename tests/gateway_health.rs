@@ -47,6 +47,7 @@ fn minimal_config(port: u16) -> RuntimeConfig {
             channel_health_check_minutes: 5,
             channel_stale_event_threshold_minutes: 30,
             channel_max_restarts_per_hour: 10,
+            user_agent: None,
         },
         agents: AgentsRuntime {
             defaults: Default::default(),
@@ -85,6 +86,7 @@ fn minimal_config(port: u16) -> RuntimeConfig {
 }
 
 async fn start_server(addr: SocketAddr) {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let config = Arc::new(minimal_config(addr.port()));
     let live = Arc::new(LiveConfig::new((*config).clone()));
 
@@ -111,6 +113,7 @@ async fn start_server(addr: SocketAddr) {
         started_at: std::time::Instant::now(),
         dm_enforcers: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         custom_webhooks: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        cron_reload: broadcast::channel(1).0,
     };
 
     // Leak the tempdir so the store stays valid for the lifetime of the server.
@@ -198,6 +201,7 @@ async fn auth_token_gates_non_health_endpoints() {
         started_at: std::time::Instant::now(),
         dm_enforcers: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         custom_webhooks: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        cron_reload: broadcast::channel(1).0,
     };
     std::mem::forget(data_dir);
     tokio::spawn(async move { serve(state, addr).await.expect("serve") });

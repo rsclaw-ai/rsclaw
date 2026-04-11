@@ -53,6 +53,7 @@ async fn send_text_push() {
         text: "Hello, LINE!".to_owned(),
         reply_to: None,
         images: vec![],
+    ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -78,6 +79,7 @@ async fn send_chunked_5000() {
         text: long_text,
         reply_to: None,
         images: vec![],
+    ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -166,6 +168,7 @@ async fn send_push_uses_bearer_auth() {
         text: "Auth check".to_owned(),
         reply_to: None,
         images: vec![],
+    ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed with bearer auth");
@@ -188,6 +191,7 @@ async fn http_error_returns_err() {
         text: "Hello".to_owned(),
         reply_to: None,
         images: vec![],
+    ..Default::default()
     };
 
     let result = ch.send(msg).await;

@@ -1000,7 +1000,7 @@ async fn run_cron_job(job: &CronJob, agents: &AgentRegistry) -> Result<String> {
         .payload
         .as_ref()
         .and_then(|p| match p {
-            CronPayload::Structured { timeout_seconds, .. } => timeout_seconds.clone(),
+CronPayload::Structured { timeout_seconds, .. } => timeout_seconds.clone(),
             CronPayload::Text(_) => None,
         })
         .unwrap_or(300);

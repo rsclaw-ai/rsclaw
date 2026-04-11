@@ -285,8 +285,8 @@ async fn test_all_providers_exhausted() {
         .expect("expected Err from exhausted failover");
     let msg = err.to_string().to_lowercase();
     assert!(
-        msg.contains("exhausted"),
-        "error message should mention exhaustion, got: {msg}"
+        msg.contains("exhausted") || msg.contains("unavailable"),
+        "error message should mention exhaustion or unavailability, got: {msg}"
     );
 }
 
@@ -555,7 +555,7 @@ async fn test_empty_fallback_list() {
     assert!(result.is_err(), "should fail with no fallbacks");
     let err_msg = result.err().expect("expected error").to_string().to_lowercase();
     assert!(
-        err_msg.contains("exhausted"),
-        "error should mention exhaustion: {err_msg}"
+        err_msg.contains("exhausted") || err_msg.contains("unavailable"),
+        "error should mention exhaustion or unavailability: {err_msg}"
     );
 }

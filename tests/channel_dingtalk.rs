@@ -85,6 +85,7 @@ async fn token_refresh_and_send_to_user() {
             text: "Hello DingTalk".to_owned(),
             reply_to: None,
             images: vec![],
+        ..Default::default()
         })
         .await;
 
@@ -135,6 +136,7 @@ async fn send_chunked_20000() {
             text: long_text,
             reply_to: None,
             images: vec![],
+        ..Default::default()
         })
         .await;
 
@@ -180,6 +182,7 @@ async fn send_to_group() {
             text: "Group hello".to_owned(),
             reply_to: None,
             images: vec![],
+        ..Default::default()
         })
         .await;
 

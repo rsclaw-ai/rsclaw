@@ -918,7 +918,7 @@ const en: LocaleType = {
     Running: "running",
     Offline: "offline",
 
-    SubTitle: "High-performance multi-agent AI engine",
+    SubTitle: "High-perf Multi-Agent AI Gateway",
     Sidebar: {
       Service: "Gateway",
       ServiceTitle: "Gateway Status",

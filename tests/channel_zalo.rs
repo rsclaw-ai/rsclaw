@@ -53,6 +53,7 @@ async fn send_text_posts_to_message_cs() {
         text: "Hello, Zalo!".to_owned(),
         reply_to: None,
         images: vec![],
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -78,6 +79,7 @@ async fn send_chunked_2000() {
         text: long_text,
         reply_to: None,
         images: vec![],
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -158,6 +160,7 @@ async fn send_uses_access_token_header() {
         text: "Auth check".to_owned(),
         reply_to: None,
         images: vec![],
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed with access_token header");
@@ -180,6 +183,7 @@ async fn http_error_returns_err() {
         text: "Hello".to_owned(),
         reply_to: None,
         images: vec![],
+        ..Default::default()
     };
 
     let result = ch.send(msg).await;

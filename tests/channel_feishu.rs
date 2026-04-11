@@ -100,6 +100,7 @@ async fn tenant_token_refresh_and_send_text() {
             text: "Hello Feishu".to_owned(),
             reply_to: None,
             images: vec![],
+        ..Default::default()
         })
         .await;
 
@@ -145,6 +146,7 @@ async fn send_chunked_4000() {
             text: long_text,
             reply_to: None,
             images: vec![],
+        ..Default::default()
         })
         .await;
 

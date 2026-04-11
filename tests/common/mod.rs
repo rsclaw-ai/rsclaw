@@ -45,6 +45,7 @@ pub fn minimal_config(port: u16) -> RuntimeConfig {
             channel_health_check_minutes: 5,
             channel_stale_event_threshold_minutes: 30,
             channel_max_restarts_per_hour: 10,
+            user_agent: None,
         },
         agents: AgentsRuntime {
             defaults: Default::default(),
@@ -111,6 +112,7 @@ pub async fn start_server(addr: SocketAddr) {
         started_at: std::time::Instant::now(),
         dm_enforcers: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         custom_webhooks: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        cron_reload: broadcast::channel(1).0,
     };
 
     // Leak tempdir — store must stay live for the lifetime of the server task.

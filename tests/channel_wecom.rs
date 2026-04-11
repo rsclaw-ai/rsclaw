@@ -72,6 +72,7 @@ async fn send_without_ws_connection_does_not_panic() {
             text: "test message".to_owned(),
             reply_to: None,
             images: vec![],
+        ..Default::default()
         })
         .await;
 
