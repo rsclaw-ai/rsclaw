@@ -3789,12 +3789,36 @@ function TauriConfigPageInner() {
               </div>
               <input style={{ ...fInput, minWidth: 100 }} type="number" value={getVal("agents.defaults.timeoutSeconds", 600)} onChange={(e) => updateConfig("agents.defaults.timeoutSeconds", parseInt(e.target.value) || 600)} />
             </div>
-            <div style={{ ...fieldRow, borderBottom: "none" }}>
+            <div style={fieldRow}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>Max Tokens <span style={{ color: V.t3, fontWeight: 400 }}>(0 = auto)</span></div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.maxTokens</div>
               </div>
               <input style={{ ...fInput, minWidth: 100 }} type="number" value={getVal("agents.defaults.model.maxTokens", 0)} onChange={(e) => updateConfig("agents.defaults.model.maxTokens", parseInt(e.target.value) || 0)} />
+            </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "上下文窗口" : "Context Window"} <span style={{ color: V.t3, fontWeight: 400 }}>(tokens)</span></div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.contextTokens</div>
+              </div>
+              <input style={{ ...fInput, minWidth: 100 }} type="number" value={getVal("agents.defaults.contextTokens", 64000)} onChange={(e) => updateConfig("agents.defaults.contextTokens", parseInt(e.target.value) || 64000)} />
+            </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "清理思考标签" : "Strip Think Tags"}</div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.stripThinkTags</div>
+              </div>
+              <select style={{ ...fSelect, minWidth: 100 }} value={getVal("agents.defaults.stripThinkTags", false) ? "true" : "false"} onChange={(e) => updateConfig("agents.defaults.stripThinkTags", e.target.value === "true")}>
+                <option value="false">{zh ? "关闭" : "Off"}</option>
+                <option value="true">{zh ? "开启" : "On"}</option>
+              </select>
+            </div>
+            <div style={{ ...fieldRow, borderBottom: "none" }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "思考预算" : "Thinking Budget"} <span style={{ color: V.t3, fontWeight: 400 }}>(0 = {zh ? "禁用" : "disabled"})</span></div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.thinking.budget</div>
+              </div>
+              <input style={{ ...fInput, minWidth: 100 }} type="number" value={getVal("agents.defaults.thinking.budget", 0)} onChange={(e) => updateConfig("agents.defaults.thinking.budget", parseInt(e.target.value) || 0)} />
             </div>
           </div>
         </div>)}
