@@ -255,6 +255,7 @@ pub struct AgentDefaults {
     pub timezone: Option<String>,
     pub timestamp: Option<Value>,
     pub thinking: Option<ThinkingConfig>,
+    pub strip_think_tags: Option<bool>,
     pub streaming: Option<StreamingMode>,
     pub timeout: Option<Value>,
     pub tools: Option<Value>,

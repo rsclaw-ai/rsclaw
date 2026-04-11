@@ -2811,11 +2811,21 @@ impl AgentRuntime {
 
             // Strip any residual <think>...</think> tags from accumulated text
             // (qwen3.5/QwQ may split tags across chunks).
-            // Remember pre-strip length: if the model only produced thinking
-            // content the user already saw it via streaming, so we treat the
-            // empty post-strip result as a silent no-op rather than an error.
+            // Configurable via agents.defaults.stripThinkTags (default: false).
             let pre_strip_len = text_buf.trim().len();
-            text_buf = crate::provider::openai::strip_think_tags_pub(&text_buf);
+            let strip_enabled = self.config.agents.defaults.strip_think_tags.unwrap_or(false);
+            if strip_enabled {
+                let before = text_buf.clone();
+                text_buf = crate::provider::openai::strip_think_tags_pub(&text_buf);
+                if before != text_buf {
+                    tracing::debug!(
+                        before_len = before.len(),
+                        after_len = text_buf.len(),
+                        stripped_bytes = before.len() - text_buf.len(),
+                        "strip_think_tags: content changed"
+                    );
+                }
+            }
 
             // Reasoning models (e.g. kimi-for-coding) may return only reasoning_content
             // with empty content. Use reasoning as the reply text to avoid saving an
