@@ -434,16 +434,12 @@ impl AgentRuntime {
             let events = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
             let events_clone = Arc::clone(&events);
 
-            // Event collection task - runs in background
-            let notif_tx_clone = notif_tx_bg.clone();
-            let target_id_clone = target_id_bg.clone();
-            let channel_clone = channel_bg.clone();
+            // Event collection task - collects events for final summary, NO intermediate notifications
             let _event_collector = tokio::spawn(async move {
-                let mut pending = String::new();
-                let mut interval = 0u64;
                 loop {
                     match event_rx.recv().await {
                         Ok(event) => {
+                            // Only collect tool call events for summary, skip thoughts (AgentThoughtChunk)
                             let event_str = match &event {
                                 crate::acp::client::SessionEvent::ToolCallStarted {
                                     title, ..
@@ -468,28 +464,12 @@ impl AgentRuntime {
                                 } => {
                                     format!("❌ {}", error)
                                 }
+                                // Skip AgentThoughtChunk - don't send thinking messages to user
                                 _ => String::new(),
                             };
 
                             if !event_str.is_empty() {
                                 events_clone.lock().await.push(event_str.clone());
-                                if let Some(ref tx) = notif_tx_clone {
-                                    pending.push_str(&event_str);
-                                    pending.push('\n');
-                                    interval += 1;
-                                    if interval >= 3 || pending.len() > 400 {
-                                        let _ = tx.send(crate::channel::OutboundMessage {
-                                            target_id: target_id_clone.clone(),
-                                            is_group: false,
-                                            text: format!("🔄 OpenCode\n{}", pending.trim()),
-                                            reply_to: None,
-                                            images: vec![],
-                                            channel: Some(channel_clone.clone()),
-                                        });
-                                        pending.clear();
-                                        interval = 0;
-                                    }
-                                }
                             }
                         }
                         Err(_) => break,
@@ -513,17 +493,16 @@ impl AgentRuntime {
                         resp.stop_reason
                     );
 
-                    let events_text = events.lock().await.join("\n");
+                    let events_list = events.lock().await.clone();
                     let collected = client.get_collected_content().await;
                     tracing::info!(
-                        "tool_opencode: events_text len={}, collected len={}",
-                        events_text.len(),
+                        "tool_opencode: events count={}, collected len={}",
+                        events_list.len(),
                         collected.len()
                     );
 
-                    let output = if !events_text.is_empty() {
-                        events_text
-                    } else if !collected.is_empty() {
+                    // Get the final result content
+                    let result_content = if !collected.is_empty() {
                         collected
                     } else if let Some(result) = resp.result {
                         result
@@ -538,25 +517,50 @@ impl AgentRuntime {
                             .collect::<Vec<_>>()
                             .join("\n")
                     } else {
-                        "(无输出)".to_string()
+                        String::new()
                     };
 
-                    let final_output = if output.len() > 4000 {
-                        format!("{}...\n\n[已截断]", &output[..4000])
+                    // Build a concise summary instead of dumping all events
+                    let tool_count = events_list.iter().filter(|e| e.starts_with("🔧")).count();
+                    let status_icon = match resp.stop_reason {
+                        crate::acp::types::StopReason::EndTurn => "✅",
+                        crate::acp::types::StopReason::MaxTokens => "⚠️",
+                        crate::acp::types::StopReason::Cancelled => "⏹️",
+                        crate::acp::types::StopReason::Incomplete => "❓",
+                        _ => "✅",
+                    };
+
+                    let summary = if !result_content.is_empty() {
+                        // Show result, truncated if too long
+                        let truncated = if result_content.len() > 2000 {
+                            format!("{}...\n\n[已截断]", &result_content[..2000])
+                        } else {
+                            result_content
+                        };
+                        format!(
+                            "{} OpenCode 完成\n\n**调用工具**: {} 个\n\n**结果**:\n{}",
+                            status_icon, tool_count, truncated
+                        )
+                    } else if tool_count > 0 {
+                        // No text result but had tool calls
+                        format!(
+                            "{} OpenCode 完成\n\n**调用工具**: {} 个\n\n**执行摘要**:\n{}",
+                            status_icon, tool_count, events_list.join("\n")
+                        )
                     } else {
-                        output
+                        format!("{} OpenCode 完成\n\n**调用工具**: 0 个\n\n(无输出)", status_icon)
                     };
 
-                    // If we got here, it means we have results - send notification to user
+                    // Send notification to user
                     tracing::info!(
-                        "tool_opencode: sending completion notification, output_len={}",
-                        final_output.len()
+                        "tool_opencode: sending completion notification, summary_len={}",
+                        summary.len()
                     );
                     if let Some(ref tx) = notif_tx_bg {
                         match tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
-                            text: format!("✅ OpenCode 完成\n\n{}", final_output),
+                            text: summary,
                             reply_to: None,
                             images: vec![],
                             channel: Some(channel_bg.clone()),
@@ -779,16 +783,12 @@ impl AgentRuntime {
             let events = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
             let events_clone = Arc::clone(&events);
 
-            // Event collection task - runs in background
-            let notif_tx_clone = notif_tx_bg.clone();
-            let target_id_clone = target_id_bg.clone();
-            let channel_clone = channel_bg.clone();
+            // Event collection task - collects events for final summary, NO intermediate notifications
             let _event_collector = tokio::spawn(async move {
-                let mut pending = String::new();
-                let mut interval = 0u64;
                 loop {
                     match event_rx.recv().await {
                         Ok(event) => {
+                            // Only collect tool call events for summary, skip thoughts (AgentThoughtChunk)
                             let event_str = match &event {
                                 crate::acp::client::SessionEvent::ToolCallStarted {
                                     title, ..
@@ -813,34 +813,12 @@ impl AgentRuntime {
                                 } => {
                                     format!("❌ {}", error)
                                 }
-                                crate::acp::client::SessionEvent::AgentThoughtChunk {
-                                    content,
-                                    ..
-                                } => {
-                                    format!("💭 {}", content)
-                                }
+                                // Skip AgentThoughtChunk - don't send thinking messages to user
                                 _ => String::new(),
                             };
 
                             if !event_str.is_empty() {
                                 events_clone.lock().await.push(event_str.clone());
-                                if let Some(ref tx) = notif_tx_clone {
-                                    pending.push_str(&event_str);
-                                    pending.push('\n');
-                                    interval += 1;
-                                    if interval >= 3 || pending.len() > 400 {
-                                        let _ = tx.send(crate::channel::OutboundMessage {
-                                            target_id: target_id_clone.clone(),
-                                            is_group: false,
-                                            text: format!("🔄 Claude Code\n{}", pending.trim()),
-                                            reply_to: None,
-                                            images: vec![],
-                                            channel: Some(channel_clone.clone()),
-                                        });
-                                        pending.clear();
-                                        interval = 0;
-                                    }
-                                }
                             }
                         }
                         Err(_) => break,
@@ -860,17 +838,16 @@ impl AgentRuntime {
                         resp.stop_reason
                     );
 
-                    let events_text = events.lock().await.join("\n");
+                    let events_list = events.lock().await.clone();
                     let collected = client.get_collected_content().await;
                     tracing::info!(
-                        "tool_claudecode: events_text len={}, collected len={}",
-                        events_text.len(),
+                        "tool_claudecode: events count={}, collected len={}",
+                        events_list.len(),
                         collected.len()
                     );
 
-                    let output = if !events_text.is_empty() {
-                        events_text
-                    } else if !collected.is_empty() {
+                    // Get the final result content
+                    let result_content = if !collected.is_empty() {
                         collected
                     } else if let Some(result) = resp.result {
                         result
@@ -885,25 +862,63 @@ impl AgentRuntime {
                             .collect::<Vec<_>>()
                             .join("\n")
                     } else {
-                        "(无输出)".to_string()
+                        String::new()
                     };
 
-                    let final_output = if output.len() > 4000 {
-                        format!("{}...\n\n[已截断]", &output[..4000])
+                    // Build a concise summary instead of dumping all events
+                    let tool_count = events_list.iter().filter(|e| e.starts_with("🔧")).count();
+                    let status_icon = match resp.stop_reason {
+                        crate::acp::types::StopReason::EndTurn => "✅",
+                        crate::acp::types::StopReason::MaxTokens => "⚠️",
+                        crate::acp::types::StopReason::Cancelled => "⏹️",
+                        crate::acp::types::StopReason::Incomplete => "❓",
+                        _ => "✅",
+                    };
+
+                    let summary = if !result_content.is_empty() {
+                        // Show result, truncated if too long
+                        let truncated = if result_content.len() > 2000 {
+                            format!("{}...\n\n[已截断]", &result_content[..2000])
+                        } else {
+                            result_content
+                        };
+                        format!(
+                            "{} Claude Code 完成\n\n**调用工具**: {} 个\n\n**结果**:\n{}",
+                            status_icon, tool_count, truncated
+                        )
+                    } else if tool_count > 0 {
+                        // No text result but had tool calls
+                        format!(
+                            "{} Claude Code 完成\n\n**调用工具**: {} 个\n\n**执行摘要**:\n{}",
+                            status_icon, tool_count, events_list.join("\n")
+                        )
                     } else {
-                        output
+                        format!("{} Claude Code 完成\n\n**调用工具**: 0 个\n\n(无输出)", status_icon)
                     };
 
                     // Send notification to user
+                    tracing::info!(
+                        "tool_claudecode: sending completion notification, summary_len={}",
+                        summary.len()
+                    );
                     if let Some(ref tx) = notif_tx_bg {
-                        let _ = tx.send(crate::channel::OutboundMessage {
+                        match tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
-                            text: format!("✅ Claude Code 完成\n\n{}", final_output),
+                            text: summary,
                             reply_to: None,
                             images: vec![],
                             channel: Some(channel_bg.clone()),
-                        });
+                        }) {
+                            Ok(_) => {
+                                tracing::info!("tool_claudecode: notification sent successfully")
+                            }
+                            Err(e) => {
+                                tracing::error!("tool_claudecode: failed to send notification: {}", e)
+                            }
+                        }
+                    } else {
+                        tracing::warn!("tool_claudecode: no notification channel available");
                     }
                 }
                 Err(e) => {
