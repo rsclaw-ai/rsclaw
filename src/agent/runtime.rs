@@ -4382,11 +4382,20 @@ impl AgentRuntime {
             cmd.to_owned()
         } else if let Some(cmd) = args["cmd"].as_str() {
             // Reconstruct command string from cmd + args array.
+            // Quote args containing spaces/special chars to preserve paths
+            // like "C:/Program Files/chrome/chrome.exe".
             let cmd_args = args["args"]
                 .as_array()
                 .map(|a| {
                     a.iter()
                         .filter_map(|v| v.as_str())
+                        .map(|s| {
+                            if s.contains(' ') || s.contains('\"') || s.contains('\'') {
+                                format!("\"{}\"", s.replace('\"', "\\\""))
+                            } else {
+                                s.to_owned()
+                            }
+                        })
                         .collect::<Vec<_>>()
                         .join(" ")
                 })
