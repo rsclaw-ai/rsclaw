@@ -36,3 +36,4 @@ workspace/
 /.worktrees/
 /.claude/worktrees/
 *.sh
+ui/src-tauri/gen/
