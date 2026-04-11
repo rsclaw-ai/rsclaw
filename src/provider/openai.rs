@@ -706,6 +706,12 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
         body["temperature"] = json!(t);
     }
 
+    if let Some(fp) = req.frequency_penalty {
+        if fp > 0.0 {
+            body["frequency_penalty"] = json!(fp);
+        }
+    }
+
     if !req.tools.is_empty() {
         let tools: Vec<Value> = req
             .tools

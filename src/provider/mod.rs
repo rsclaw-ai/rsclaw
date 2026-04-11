@@ -101,6 +101,7 @@ pub struct LlmRequest {
     pub system: Option<String>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    pub frequency_penalty: Option<f32>,
     /// If > 0, the provider should enable extended thinking with this budget.
     pub thinking_budget: Option<u32>,
 }

@@ -3816,6 +3816,18 @@ function TauriConfigPageInner() {
                 <option value="true">{zh ? "开启" : "On"}</option>
               </select>
             </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "重复惩罚" : "Frequency Penalty"} <span style={{ color: V.t3, fontWeight: 400 }}>(0 = {zh ? "关闭" : "off"})</span></div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.frequencyPenalty</div>
+              </div>
+              <select style={{ ...fSelect, minWidth: 200 }} value={String(getVal("agents.defaults.frequencyPenalty", 0))} onChange={(e) => updateConfig("agents.defaults.frequencyPenalty", parseFloat(e.target.value))}>
+                <option value="0">{zh ? "关闭" : "Off"}</option>
+                <option value="0.3">{zh ? "轻度 (0.3)" : "Light (0.3)"}</option>
+                <option value="0.5">{zh ? "中度 (0.5)" : "Medium (0.5)"}</option>
+                <option value="0.8">{zh ? "强 (0.8)" : "Strong (0.8)"}</option>
+              </select>
+            </div>
             <div style={{ ...fieldRow, borderBottom: "none" }}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "深度思考" : "Deep Thinking"}</div>

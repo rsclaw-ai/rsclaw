@@ -951,6 +951,7 @@ async fn btw_direct_call(
         system: Some(system),
         max_tokens: Some(500),
         temperature: None,
+        frequency_penalty: None,
         thinking_budget: None,
     };
 

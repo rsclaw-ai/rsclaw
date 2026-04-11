@@ -1040,6 +1040,7 @@ impl AgentRuntime {
             ),
             max_tokens: Some(500),
             temperature: None,
+            frequency_penalty: None,
             thinking_budget: None,
         };
 
@@ -2765,6 +2766,7 @@ impl AgentRuntime {
                 system: Some(effective_system.clone()),
                 max_tokens: Some(max_tokens),
                 temperature: None,
+                frequency_penalty: self.config.agents.defaults.frequency_penalty,
                 thinking_budget,
             };
 
@@ -4346,6 +4348,7 @@ impl AgentRuntime {
             ),
             max_tokens: Some(2048), // structured output needs more room
             temperature: None,
+            frequency_penalty: None,
             thinking_budget: None,
         };
 
@@ -4410,6 +4413,7 @@ impl AgentRuntime {
             ),
             max_tokens: Some(1024),
             temperature: None,
+            frequency_penalty: None,
             thinking_budget: None,
         };
 
