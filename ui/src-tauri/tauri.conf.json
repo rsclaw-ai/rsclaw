@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicegoodthings/tauri-v2-schema/refs/heads/main/tauri.conf.json",
   "productName": "RsClaw",
-  "version": "26.4.8",
+  "version": "26.4.11",
   "identifier": "ai.rsclaw.app",
   "build": {
     "beforeBuildCommand": "yarn export",
