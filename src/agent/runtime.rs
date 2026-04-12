@@ -7693,6 +7693,7 @@ fn toolset_allowed_names(
         "image",
         "channel",
         "cron",
+        "computer_use",
     ];
 
     let base: Option<&[&str]> = match toolset {
