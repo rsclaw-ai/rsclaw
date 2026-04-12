@@ -5257,7 +5257,7 @@ impl AgentRuntime {
             .unwrap_or("");
         let is_zh = lang.to_lowercase().starts_with("zh")
             || lang.to_lowercase().starts_with("chinese");
-        match provider {
+        let (html, results) = match provider {
             "bing-free" => {
                 let bing_host = if is_zh { "cn.bing.com" } else { "www.bing.com" };
                 let mkt = lang_to_bing_mkt(lang);
@@ -5274,22 +5274,39 @@ impl AgentRuntime {
                     .get(&url)
                     .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
                     .send().await?.text().await?;
-                Ok(parse_bing_html_results(&html, limit))
+                let r = parse_bing_html_results(&html, limit);
+                (html, r)
             }
             "duckduckgo-free" => {
                 let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoding::encode(query));
                 let html = client.get(&url).send().await?.text().await?;
-                Ok(parse_ddg_results(&html, limit))
+                let r = parse_ddg_results(&html, limit);
+                (html, r)
             }
             "baidu-free" => {
                 let url = format!("https://www.baidu.com/s?wd={}&rn={limit}", urlencoding::encode(query));
                 let html = client.get(&url)
                     .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
                     .send().await?.text().await?;
-                Ok(parse_baidu_results(&html, limit))
+                let r = parse_baidu_results(&html, limit);
+                (html, r)
             }
-            _ => Ok(vec![]),
+            "sogou-free" => {
+                let url = format!("https://www.sogou.com/web?query={}", urlencoding::encode(query));
+                let html = client.get(&url)
+                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                    .send().await?.text().await?;
+                let r = parse_sogou_results(&html, limit);
+                (html, r)
+            }
+            _ => return Ok(vec![]),
+        };
+
+        if results.is_empty() && is_captcha_page(&html) {
+            warn!(provider, "web_search: CAPTCHA detected, provider may be rate-limited");
         }
+
+        Ok(results)
     }
 
     async fn tool_web_fetch(&self, args: Value) -> Result<Value> {
@@ -7598,6 +7615,18 @@ fn parse_sogou_results(html: &str, limit: usize) -> Vec<Value> {
         }
     }
     results
+}
+
+/// Detect if HTML response is a CAPTCHA/verification page.
+fn is_captcha_page(html: &str) -> bool {
+    let lower = html.to_lowercase();
+    lower.contains("captcha") || lower.contains("验证码")
+        || lower.contains("人机验证") || lower.contains("verify you are human")
+        || lower.contains("robot") || lower.contains("unusual traffic")
+        || lower.contains("are you a robot") || lower.contains("security check")
+        || lower.contains("challenge-form") || lower.contains("cf-browser-verification")
+        || lower.contains("antibot") || lower.contains("recaptcha")
+        || lower.contains("hcaptcha") || lower.contains("turnstile")
 }
 
 /// Simple percent-decoding for URL extraction.
