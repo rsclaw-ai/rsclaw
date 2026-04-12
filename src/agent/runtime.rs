@@ -3939,9 +3939,9 @@ impl AgentRuntime {
     async fn compact_if_needed(&mut self, session_key: &str, model: &str) {
         use crate::config::schema::CompactionMode;
 
-        let Some(cfg) = self.config.agents.defaults.compaction.clone() else {
-            return;
-        };
+        // Use configured compaction settings, or sensible defaults.
+        let cfg = self.config.agents.defaults.compaction.clone()
+            .unwrap_or_default();
 
         // Multi-condition compaction trigger: token threshold OR turn count OR time
         // elapsed. Whichever fires first.

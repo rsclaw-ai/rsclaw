@@ -470,7 +470,7 @@ pub struct PruningToolPolicy {
 // compaction
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactionConfig {
     pub mode: Option<CompactionMode>,
