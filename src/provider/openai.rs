@@ -323,8 +323,16 @@ impl OpenAiProvider {
             "think": false,
         });
 
+        // Ollama uses "options" for parameters, not top-level fields.
+        let mut options = serde_json::Map::new();
         if let Some(t) = req.temperature {
-            body["options"] = json!({"temperature": t});
+            options.insert("temperature".into(), json!(t));
+        }
+        if let Some(max) = req.max_tokens {
+            options.insert("num_predict".into(), json!(max));
+        }
+        if !options.is_empty() {
+            body["options"] = Value::Object(options);
         }
 
         if !req.tools.is_empty() {
