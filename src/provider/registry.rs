@@ -85,20 +85,10 @@ impl ProviderRegistry {
             }
         }
         let (provider, model_id) = Self::parse_model(model);
-        if self.providers.contains_key(provider) {
-            return (provider, model_id);
-        }
-        // Provider not registered -- pick the best fallback.
-        if self.providers.contains_key("custom") {
-            return ("custom", model_id);
-        }
-        if self.providers.contains_key("ollama") {
-            return ("ollama", model_id);
-        }
-        // Use first registered provider if there is one.
-        if let Some(name) = self.providers.keys().next() {
-            return (name.as_str(), model_id);
-        }
+        // Return the resolved provider if registered; otherwise return as-is
+        // and let the caller handle the "provider not found" error.
+        // Do NOT silently fallback to custom/ollama/openai — that causes
+        // requests to be routed to the wrong provider.
         (provider, model_id)
     }
 }
