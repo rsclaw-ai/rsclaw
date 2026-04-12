@@ -776,10 +776,10 @@ impl MemoryStore {
             }
         }
         if skipped > 0 {
-            warn!(
+            info!(
                 skipped,
                 expected_dim,
-                "memory: skipped docs with mismatched vector dimension (re-embed needed)"
+                "memory: dimension mismatch detected, auto-reindexing"
             );
         }
 
@@ -787,13 +787,23 @@ impl MemoryStore {
             info!(count = docs.len(), "memory store loaded from redb");
         }
 
-        Ok(Self {
+        let mut store = Self {
             db,
             hnsw,
             docs,
             embedder,
             embed_dim,
-        })
+        };
+
+        // Auto-reindex if any docs had mismatched vector dimensions.
+        if skipped > 0 {
+            match store.reindex().await {
+                Ok(n) => info!(count = n, "auto-reindex complete"),
+                Err(e) => warn!("auto-reindex failed: {e:#}"),
+            }
+        }
+
+        Ok(store)
     }
 
     pub async fn add(&mut self, mut doc: MemoryDoc) -> Result<()> {
