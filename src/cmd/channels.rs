@@ -77,15 +77,24 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
             std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
             ok(&format!("removed channel '{}'", cyan(&channel)));
         }
-        ChannelsCommand::Login { channel } => {
-            banner(&format!("rsclaw channel login v{}", env!("RSCLAW_BUILD_VERSION")));
+        ChannelsCommand::Login { channel, quiet } => {
+            if !quiet {
+                banner(&format!("rsclaw channel login v{}", env!("RSCLAW_BUILD_VERSION")));
+            }
             match channel.as_str() {
                 "wechat" | "weixin" | "openclaw-weixin" => {
-                    kv("channel", &cyan("WeChat Personal"));
+                    if !quiet { kv("channel", &cyan("WeChat Personal")); }
                     let client = reqwest::Client::new();
                     let (_url, qrcode) =
                         crate::channel::wechat::WeChatPersonalChannel::start_qr_login(&client)
                             .await?;
+                    // In quiet mode, just print the QR image path for UI consumption.
+                    if quiet {
+                        let qr_path = std::env::temp_dir().join("rsclaw_qr.png");
+                        if qr_path.exists() {
+                            println!("{}", qr_path.display());
+                        }
+                    }
                     let (token, bot_id) =
                         crate::channel::wechat::WeChatPersonalChannel::wait_qr_login(
                             &client, &qrcode,
@@ -119,9 +128,11 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                         }
                     }
                     std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
-                    ok(&format!("login successful, bot_id={}", bold(&bot_id)));
-                    kv("token saved", &dim(&path.display().to_string()));
-                    println!("  {}", dim("Restart gateway to activate."));
+                    if !quiet {
+                        ok(&format!("login successful, bot_id={}", bold(&bot_id)));
+                        kv("token saved", &dim(&path.display().to_string()));
+                        println!("  {}", dim("Restart gateway to activate."));
+                    }
                 }
                 "feishu" | "lark" | "openclaw-lark" => {
                     let client = reqwest::Client::new();
@@ -159,11 +170,13 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                         }
                     }
                     std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
-                    ok(&format!(
-                        "config saved to {}",
-                        dim(&path.display().to_string())
-                    ));
-                    println!("  {}", dim("Restart gateway to activate."));
+                    if !quiet {
+                        ok(&format!(
+                            "config saved to {}",
+                            dim(&path.display().to_string())
+                        ));
+                        println!("  {}", dim("Restart gateway to activate."));
+                    }
                 }
                 "dingtalk" => {
                     let config = config::load()?;

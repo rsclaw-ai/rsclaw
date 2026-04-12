@@ -13,7 +13,12 @@ pub enum ChannelsCommand {
     /// Remove a channel from config.
     Remove { channel: String },
     /// Interactive login for a channel (QR scan, OAuth, etc.).
-    Login { channel: String },
+    Login {
+        channel: String,
+        /// Quiet mode: only output QR image path (for desktop app integration).
+        #[arg(long, short)]
+        quiet: bool,
+    },
     /// Remove stored credentials for a channel.
     Logout { channel: String },
     /// Approve a pairing code (for dmPolicy=pairing).

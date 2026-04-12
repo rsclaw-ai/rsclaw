@@ -429,7 +429,7 @@ fn channel_login_start(channel: String) -> Result<String, String> {
         let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw.exe" } else { "rsclaw" });
         if sidecar.exists() {
             std::process::Command::new(&sidecar)
-                .args(["channels", "login", &channel])
+                .args(["channels", "login", "--quiet", &channel])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
@@ -442,7 +442,7 @@ fn channel_login_start(channel: String) -> Result<String, String> {
     if spawned.is_none() {
         // Fallback: spawn via PATH
         std::process::Command::new("rsclaw")
-            .args(["channels", "login", &channel])
+            .args(["channels", "login", "--quiet", &channel])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
