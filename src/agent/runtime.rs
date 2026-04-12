@@ -8340,6 +8340,10 @@ fn build_system_prompt(
     // Tool usage guidance
     parts.push(
         "## Tool Usage Guidelines\n\
+         - IMPORTANT: When you don't know the answer, when the question involves recent events, \
+         real-time information, or anything beyond your training data cutoff, you MUST use the \
+         `web_search` tool FIRST before answering. Never guess or fabricate information about \
+         current events — always search.\n\
          - For code generation: write complete files, one module at a time.\n\
          - Use edit tool for small changes to existing files.\n\
          - For cron jobs: use the `cron` tool (action=list/add/remove). The `cron` tool is a first-class tool — always use it instead of trying to invoke a `cron` shell command."
