@@ -1415,8 +1415,11 @@ impl AgentRuntime {
                             .parse()
                             .unwrap_or(20);
                         if let Some(msgs) = self.sessions.get(session_key) {
+                            let total_tokens: usize = msgs.iter().map(msg_tokens).sum();
                             let start = msgs.len().saturating_sub(n);
-                            let mut lines = Vec::new();
+                            let mut lines = vec![
+                                format!("📊 Context: {} messages, ~{} tokens", msgs.len(), total_tokens),
+                            ];
                             for (i, msg) in msgs[start..].iter().enumerate() {
                                 let role = match msg.role {
                                     crate::provider::Role::User => "You",
