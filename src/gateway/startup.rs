@@ -517,6 +517,7 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     "anthropic" => ApiFormat::Anthropic,
                     "gemini" => ApiFormat::Gemini,
                     "doubao" | "bytedance" => ApiFormat::OpenAiResponses,
+                    "ollama" => ApiFormat::Ollama,
                     _ => ApiFormat::OpenAiCompletions,
                 }
             });
