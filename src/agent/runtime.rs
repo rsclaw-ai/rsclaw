@@ -4821,6 +4821,10 @@ impl AgentRuntime {
             .and_then(|c| c.google_cx.clone())
             .or_else(|| std::env::var("GOOGLE_SEARCH_CX").ok());
         let bing_key = resolve_key(ws_cfg.and_then(|c| c.bing_api_key.as_ref()), "BING_API_KEY");
+        let serper_key = resolve_key(
+            ws_cfg.and_then(|c| c.serper_api_key.as_ref()),
+            "SERPER_API_KEY",
+        );
 
         // Auto-detect provider: explicit arg > config default > keyed provider >
         // DuckDuckGo
@@ -4828,6 +4832,8 @@ impl AgentRuntime {
             provider.to_owned()
         } else if let Some(default) = ws_cfg.and_then(|c| c.provider.as_deref()) {
             default.to_owned()
+        } else if serper_key.is_some() {
+            "serper".to_owned()
         } else if brave_key.is_some() {
             "brave".to_owned()
         } else if google_key.is_some() && google_cx.is_some() {
@@ -4979,6 +4985,33 @@ impl AgentRuntime {
                     })
                     .unwrap_or_default()
             }
+            "serper" => {
+                let key = serper_key.ok_or_else(|| anyhow!("web_search: serper API key not set (config tools.webSearch.serperApiKey or env SERPER_API_KEY)"))?;
+                let resp: Value = client
+                    .post("https://google.serper.dev/search")
+                    .header("X-API-KEY", &key)
+                    .header("Content-Type", "application/json")
+                    .json(&json!({ "q": query, "num": limit.min(10) }))
+                    .send()
+                    .await?
+                    .json()
+                    .await?;
+                resp["organic"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .take(limit)
+                            .map(|item| {
+                                json!({
+                                    "title": item["title"].as_str().unwrap_or(""),
+                                    "url": item["link"].as_str().unwrap_or(""),
+                                    "snippet": item["snippet"].as_str().unwrap_or("")
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
             // Free HTML scraping providers (no API key needed)
             "bing-free" => {
                 let lang = self
@@ -5101,40 +5134,227 @@ impl AgentRuntime {
     }
 
     async fn tool_web_fetch(&self, args: Value) -> Result<Value> {
+        use moka::future::Cache;
+        use std::sync::LazyLock;
+
+        /// LRU cache: URL → (title, markdown). 15 min TTL, ~50 MB.
+        static FETCH_CACHE: LazyLock<Cache<String, (String, String)>> = LazyLock::new(|| {
+            Cache::builder()
+                .max_capacity(500)
+                .time_to_live(Duration::from_secs(15 * 60))
+                .build()
+        });
+
         let url = args["url"]
             .as_str()
             .ok_or_else(|| anyhow!("web_fetch: `url` required"))?;
+        let prompt = args.get("prompt").and_then(|v| v.as_str());
+
+        let max_length = self.config.ext.tools.as_ref()
+            .and_then(|t| t.web_fetch.as_ref())
+            .and_then(|f| f.max_length)
+            .unwrap_or(100_000);
+        let user_agent = self.config.ext.tools.as_ref()
+            .and_then(|t| t.web_fetch.as_ref())
+            .and_then(|f| f.user_agent.clone())
+            .unwrap_or_else(|| "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+                AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".to_owned());
+
+        // Upgrade http → https.
+        let fetch_url = if url.starts_with("http://") {
+            url.replacen("http://", "https://", 1)
+        } else {
+            url.to_owned()
+        };
+
+        // Check cache.
+        if let Some((cached_title, cached_md)) = FETCH_CACHE.get(&fetch_url).await {
+            let text = truncate_chars(&cached_md, max_length);
+            let text = self.maybe_summarize(&text, prompt).await;
+            return Ok(json!({
+                "url": url,
+                "title": cached_title,
+                "text": text,
+                "length": text.len(),
+            }));
+        }
+
+        // Build HTTP client with same-host-only redirect policy.
+        let original_host = reqwest::Url::parse(&fetch_url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_owned()));
+        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() > 10 {
+                return attempt.error(anyhow!("too many redirects"));
+            }
+            // Allow same-host (ignoring www. prefix).
+            let new_host = attempt.url().host_str().unwrap_or("");
+            let strip_www = |h: &str| h.strip_prefix("www.").unwrap_or(h).to_owned();
+            let orig = original_host.as_deref().map(strip_www).unwrap_or_default();
+            if strip_www(new_host) == orig {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        });
 
         let client = reqwest::Client::builder()
-            .user_agent(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-                 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            )
+            .user_agent(&user_agent)
             .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::limited(10))
+            .redirect(redirect_policy)
             .build()?;
 
-        let html = client.get(url).send().await?.text().await?;
+        let response = client.get(&fetch_url).send().await?;
 
-        // Extract title.
+        // Cross-host redirect: report to agent, let it decide.
+        if response.status().is_redirection() {
+            if let Some(loc) = response.headers().get("location").and_then(|v| v.to_str().ok()) {
+                return Ok(json!({
+                    "url": url,
+                    "redirect": loc,
+                    "text": format!("Redirected to different host: {loc}. Fetch that URL if needed."),
+                }));
+            }
+        }
+
+        // Enforce 10 MB content-length limit.
+        if let Some(len) = response.content_length() {
+            if len > 10 * 1024 * 1024 {
+                bail!("web_fetch: content too large ({} bytes, max 10MB)", len);
+            }
+        }
+
+        let content_type = response.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let html = response.text().await?;
+
         let title = extract_html_title(&html);
 
-        // Strip HTML to plain text.
-        let text = strip_html(&html);
-
-        // Truncate to 50000 chars (char-safe for UTF-8).
-        let truncated: String = if text.chars().count() > 50_000 {
-            text.chars().take(50_000).collect()
+        // Convert HTML → Markdown (htmd, Turndown-inspired).
+        let markdown = if content_type.contains("text/html") {
+            htmd::convert(&html).unwrap_or_else(|_| strip_html(&html))
         } else {
-            text.clone()
+            html.clone()
         };
+
+        // Detect SPA (large HTML but almost no text) → fallback to browser.
+        let plain_len = strip_html(&html).trim().len();
+        let is_spa = content_type.contains("text/html") && plain_len < 200 && html.len() > 10_000;
+
+        let (final_title, final_md) = if is_spa {
+            // Try browser fallback for JS-rendered pages.
+            match self.browser_get_article(&fetch_url).await {
+                Ok((t, md)) if !md.is_empty() => (t, md),
+                _ => (title.clone(), markdown.clone()),
+            }
+        } else {
+            (title.clone(), markdown.clone())
+        };
+
+        // Cache the result.
+        FETCH_CACHE.insert(fetch_url, (final_title.clone(), final_md.clone())).await;
+
+        let text = truncate_chars(&final_md, max_length);
+        let text = self.maybe_summarize(&text, prompt).await;
 
         Ok(json!({
             "url": url,
-            "title": title,
-            "text": truncated,
-            "length": truncated.len()
+            "title": final_title,
+            "text": text,
+            "length": text.len(),
         }))
+    }
+
+    /// Use web_browser to fetch JS-rendered page content via get_article.
+    async fn browser_get_article(&self, url: &str) -> Result<(String, String)> {
+        let mut browser = self.browser.lock().await;
+
+        // Ensure browser session exists.
+        if browser.is_none() {
+            let chrome_path = self.config.ext.tools.as_ref()
+                .and_then(|t| t.web_browser.as_ref())
+                .and_then(|b| b.chrome_path.clone())
+                .or_else(|| crate::agent::runtime::detect_chrome())
+                .ok_or_else(|| anyhow!("Chrome not found for SPA fallback"))?;
+            crate::browser::can_launch_chrome()?;
+            let headed = self.config.ext.tools.as_ref()
+                .and_then(|t| t.web_browser.as_ref())
+                .and_then(|b| b.headed)
+                .unwrap_or(false);
+            *browser = Some(crate::browser::BrowserSession::start(&chrome_path, headed).await?);
+        }
+
+        let bs = browser.as_mut().unwrap();
+        bs.execute("open", &json!({"url": url})).await?;
+        let article = bs.execute("get_article", &json!({})).await?;
+
+        let title = article["title"].as_str().unwrap_or("").to_owned();
+        let text = article["text"].as_str().unwrap_or("").to_owned();
+        Ok((title, text))
+    }
+
+    /// If summaryModel is configured and a prompt is provided, summarize
+    /// the content with a secondary model. Otherwise return content as-is.
+    async fn maybe_summarize(&self, content: &str, prompt: Option<&str>) -> String {
+        let summary_model = self.config.ext.tools.as_ref()
+            .and_then(|t| t.web_fetch.as_ref())
+            .and_then(|f| f.summary_model.clone());
+
+        let (Some(model_str), Some(prompt)) = (summary_model, prompt) else {
+            return content.to_owned();
+        };
+
+        // Resolve provider/model and call directly (bypass failover for simplicity).
+        let (provider_name, model_id) = self.providers.resolve_model(&model_str);
+
+        let provider = match self.providers.get(provider_name) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("web_fetch: provider '{provider_name}' not available: {e}");
+                return content.to_owned();
+            }
+        };
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::Text(format!(
+                "Web page content:\n---\n{content}\n---\n\n{prompt}\n\n\
+                 Provide a concise response based on the content above."
+            )),
+        }];
+
+        let req = crate::provider::LlmRequest {
+            model: model_id.to_owned(),
+            messages,
+            tools: vec![],
+            system: None,
+            max_tokens: Some(2000),
+            temperature: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+        };
+
+        match provider.stream(req).await {
+            Ok(mut stream) => {
+                let mut buf = String::new();
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Ok(StreamEvent::TextDelta(d)) => buf.push_str(&d),
+                        Ok(StreamEvent::Done { .. }) | Ok(StreamEvent::Error(_)) => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                if buf.is_empty() { content.to_owned() } else { buf }
+            }
+            Err(e) => {
+                warn!("web_fetch summary model failed: {e:#}");
+                content.to_owned()
+            }
+        }
     }
 
     async fn tool_web_browser(&self, args: Value) -> Result<Value> {
@@ -7267,6 +7487,17 @@ fn strip_inline_tags(s: &str) -> String {
 }
 
 /// Extract <title> content from HTML.
+/// Truncate a string to at most `max` characters (UTF-8 safe).
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_owned()
+    } else {
+        let mut t: String = s.chars().take(max).collect();
+        t.push_str("\n...(truncated)");
+        t
+    }
+}
+
 fn extract_html_title(html: &str) -> String {
     let re = regex::Regex::new(r"(?is)<title[^>]*>(.*?)</title>").unwrap();
     re.captures(html)
@@ -8196,12 +8427,15 @@ fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "web_fetch".to_owned(),
-        description: "Download a web page and extract its text content. Strips HTML tags, scripts, and styles. Truncates to 50000 chars.".to_owned(),
+        description: "Fetch a web page, convert HTML to Markdown, and extract content. \
+            Automatically falls back to browser rendering for JS-heavy pages. \
+            Results are cached for 15 minutes. If summaryModel is configured \
+            and prompt is provided, content is summarized by a secondary model.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "url":      {"type": "string", "description": "URL to fetch"},
-                "selector": {"type": "string", "description": "CSS-like selector hint for content extraction"}
+                "url":    {"type": "string", "description": "URL to fetch (http auto-upgraded to https)"},
+                "prompt": {"type": "string", "description": "What to extract from the page (requires summaryModel config)"}
             },
             "required": ["url"]
         }),

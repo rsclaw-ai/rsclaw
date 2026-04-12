@@ -80,18 +80,27 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     info!("{} agent(s) registered", registry.len());
 
     // 6. Open shared memory store.
-    // Auto-detect embedding model: prefer bge-small-zh (multilingual), fallback to
-    // bge-small-en.
+    // Auto-detect embedding model: prefer bge-small-zh, fallback to bge-small-en.
+    // Auto-download if neither exists.
+    let search_cfg = config.raw.memory_search.as_ref();
     let model_dir = {
         let zh = base_dir.join("models/bge-small-zh");
         let en = base_dir.join("models/bge-small-en");
         if zh.join("config.json").exists() {
             zh
-        } else {
+        } else if en.join("config.json").exists() {
             en
+        } else {
+            // Auto-download BGE model.
+            let target_dir = zh; // default to zh
+            if let Err(e) = download_bge_model(&target_dir, search_cfg).await {
+                warn!("BGE model auto-download failed: {e:#}");
+                warn!("semantic memory search will use FNV fallback (low quality)");
+                warn!("to fix: manually download BGE model or configure memory.search.provider");
+            }
+            target_dir
         }
     };
-    let search_cfg = config.raw.memory_search.as_ref();
     let memory = match MemoryStore::open(&data_dir, Some(&model_dir), tier, search_cfg).await {
         Ok(m) => {
             info!("memory store opened");
@@ -6335,4 +6344,83 @@ async fn handle_pending_analysis(
                 .await;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// BGE model auto-download
+// ---------------------------------------------------------------------------
+
+/// Download BGE-Small embedding model files from HuggingFace.
+/// Uses hf-mirror.com for Chinese locale, huggingface.co otherwise.
+async fn download_bge_model(
+    target_dir: &std::path::Path,
+    search_cfg: Option<&crate::config::schema::MemorySearchConfig>,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let local_cfg = search_cfg.and_then(|c| c.local.as_ref());
+
+    // Determine model repo.
+    let repo = local_cfg
+        .and_then(|c| c.model_repo.as_deref())
+        .unwrap_or("BAAI/bge-small-zh-v1.5");
+
+    // Determine base URL: config override > locale auto-detect.
+    let base_url = if let Some(url) = local_cfg.and_then(|c| c.model_download_url.as_deref()) {
+        url.trim_end_matches('/').to_owned()
+    } else {
+        // Auto-detect: check LANG/LC_ALL for zh → use mirror.
+        let is_zh = std::env::var("LANG")
+            .or_else(|_| std::env::var("LC_ALL"))
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("zh");
+        let host = if is_zh {
+            "https://hf-mirror.com"
+        } else {
+            "https://huggingface.co"
+        };
+        format!("{host}/{repo}/resolve/main")
+    };
+
+    let files = ["config.json", "model.safetensors", "tokenizer.json"];
+
+    info!("downloading BGE embedding model from {base_url} ...");
+    std::fs::create_dir_all(target_dir)?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
+
+    for filename in &files {
+        let url = format!("{base_url}/{filename}");
+        let dest = target_dir.join(filename);
+
+        if dest.exists() {
+            debug!("{filename} already exists, skipping");
+            continue;
+        }
+
+        info!("  downloading {filename} ...");
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to download {filename}: {e}"))?;
+
+        if !response.status().is_success() {
+            anyhow::bail!(
+                "failed to download {filename}: HTTP {}",
+                response.status()
+            );
+        }
+
+        let bytes = response.bytes().await?;
+        let mut file = tokio::fs::File::create(&dest).await?;
+        file.write_all(&bytes).await?;
+        info!("  {filename} downloaded ({} bytes)", bytes.len());
+    }
+
+    info!("BGE model downloaded to {}", target_dir.display());
+    Ok(())
 }

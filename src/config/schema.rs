@@ -1305,13 +1305,15 @@ pub struct ExecToolConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebSearchConfig {
-    /// Default search provider: "duckduckgo" | "google" | "bing" | "brave"
+    /// Default search provider: "duckduckgo" | "google" | "bing" | "brave" | "serper"
     pub provider: Option<String>,
     /// API keys (alternative to env vars)
     pub brave_api_key: Option<SecretOrString>,
     pub google_api_key: Option<SecretOrString>,
     pub google_cx: Option<String>,
     pub bing_api_key: Option<SecretOrString>,
+    /// Serper.dev API key for Google search results
+    pub serper_api_key: Option<SecretOrString>,
     /// Max results per search (default: 5)
     pub max_results: Option<usize>,
     /// Disable web_search tool entirely
@@ -1322,10 +1324,13 @@ pub struct WebSearchConfig {
 #[serde(rename_all = "camelCase")]
 pub struct WebFetchConfig {
     pub enabled: Option<bool>,
-    /// Max content length in chars (default: 50000)
+    /// Max content length in chars (default: 100000)
     pub max_length: Option<usize>,
     /// Custom User-Agent
     pub user_agent: Option<String>,
+    /// Model for content summarization (e.g. "doubao-lite"). If set and
+    /// the agent passes a `prompt`, fetched content is summarized by this model.
+    pub summary_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1658,6 +1663,11 @@ pub struct MemorySearchConfig {
 pub struct LocalEmbeddingConfig {
     /// Path to a GGUF model file for local embedding
     pub model_path: Option<String>,
+    /// Override HuggingFace download URL for the embedding model.
+    /// Default: auto-detect based on locale (hf-mirror.com for zh, huggingface.co otherwise).
+    pub model_download_url: Option<String>,
+    /// Model repo name on HuggingFace (default: "BAAI/bge-small-zh-v1.5")
+    pub model_repo: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

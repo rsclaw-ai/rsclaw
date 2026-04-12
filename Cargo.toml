@@ -97,6 +97,8 @@ matrix-sdk = { version = "0.9", optional = true, default-features = false, featu
 fs2 = "0.4.3"
 rusqlite = { version = "0.32", optional = true, features = ["bundled"] }
 async-trait = "0.1"
+htmd = "0.5"
+moka = { version = "0.12", features = ["future"] }
 
 # System tray (optional)
 tray-icon = { version = "0.21", optional = true }
