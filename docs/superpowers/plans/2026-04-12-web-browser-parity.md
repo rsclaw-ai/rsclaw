@@ -980,7 +980,116 @@ git commit -m "feat(browser): add highlight, clipboard, and semantic find action
 
 ---
 
-### Task 14: Update Tool Definition (final)
+### Task 14: Structured Content Extraction (get_article)
+
+**Files:**
+- Modify: `src/browser/mod.rs` (new cmd_get_article)
+- Modify: `src/agent/runtime.rs` (dispatch + tool definition)
+
+- [ ] **Step 1: Add Readability-style extraction JS**
+
+Inject a lightweight Readability algorithm via JS that strips nav/header/footer/sidebar/ads and returns clean article content:
+
+```rust
+async fn cmd_get_article(&self) -> Result<Value> {
+    let js = r#"(function(){
+        // Clone body to avoid mutating the page
+        var doc = document.cloneNode(true);
+        var body = doc.querySelector('body');
+        if (!body) return JSON.stringify({title:'',content:'',text:''});
+
+        // Remove known noise elements
+        var noise = 'nav,header,footer,aside,.sidebar,.nav,.menu,.breadcrumb,.pagination,'+
+            '.cookie-banner,.modal,.popup,.ad,.ads,.advertisement,[role=navigation],'+
+            '[role=banner],[role=contentinfo],script,style,noscript,svg,iframe,'+
+            '.social-share,.share-buttons,.related-posts,.comments,#comments,'+
+            '.newsletter,.subscribe,.signup-form';
+        doc.querySelectorAll(noise).forEach(function(el){ el.remove(); });
+
+        // Try common article containers
+        var selectors = ['article','[role=main]','main','.post-content','.article-content',
+            '.entry-content','.content','#content','.post','#main'];
+        var article = null;
+        for (var i = 0; i < selectors.length; i++) {
+            var el = doc.querySelector(selectors[i]);
+            if (el && el.innerText.trim().length > 200) { article = el; break; }
+        }
+
+        // Fallback: largest text-dense block
+        if (!article) {
+            var best = null, bestLen = 0;
+            doc.querySelectorAll('div, section').forEach(function(el) {
+                var len = el.innerText.trim().length;
+                // Prefer elements with high text-to-html ratio
+                var ratio = len / (el.innerHTML.length || 1);
+                var score = len * ratio;
+                if (score > bestLen) { bestLen = score; best = el; }
+            });
+            article = best || body;
+        }
+
+        // Extract structured content
+        var title = (doc.querySelector('h1') || doc.querySelector('title') || {}).innerText || document.title || '';
+        var text = article.innerText.trim();
+
+        // Extract links from article
+        var links = [];
+        article.querySelectorAll('a[href]').forEach(function(a) {
+            var t = a.innerText.trim();
+            if (t && t.length > 2) links.push({text: t.substring(0,100), href: a.href});
+        });
+
+        // Extract images from article
+        var images = [];
+        article.querySelectorAll('img[src]').forEach(function(img) {
+            images.push({src: img.src, alt: img.alt || ''});
+        });
+
+        // Truncate text to 50KB
+        if (text.length > 50000) text = text.substring(0, 50000) + '...(truncated)';
+
+        return JSON.stringify({
+            title: title.substring(0, 200),
+            text: text,
+            links: links.slice(0, 50),
+            images: images.slice(0, 20),
+            length: text.length
+        });
+    })()"#;
+
+    let result_str = self.eval_js(js).await?;
+    let result: Value = serde_json::from_str(&result_str)
+        .unwrap_or_else(|_| json!({"title":"","text":"","links":[],"images":[]}));
+
+    Ok(json!({
+        "action": "get_article",
+        "title": result["title"],
+        "text": result["text"],
+        "links": result["links"],
+        "images": result["images"],
+        "length": result["length"],
+    }))
+}
+```
+
+- [ ] **Step 2: Add dispatch**: `"get_article" => self.cmd_get_article().await,`
+
+- [ ] **Step 3: Test with real pages**:
+  - News article (e.g. Hacker News post) — should extract article text, strip nav
+  - Blog post — should get title + body, ignore sidebar/comments
+  - Product page — should extract product description, ignore header/footer
+  - SPA (e.g. React app) — test with dynamically loaded content
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/browser/mod.rs src/agent/runtime.rs
+git commit -m "feat(browser): add get_article for structured content extraction (Readability-style)"
+```
+
+---
+
+### Task 15: Update Tool Definition (final)
 
 **Files:**
 - Modify: `src/agent/runtime.rs` (tool definition)
@@ -994,7 +1103,7 @@ tools.push(ToolDef {
         select, check, uncheck, scroll, screenshot, pdf, back, forward, reload, \
         get_text, get_url, get_title, wait, evaluate, cookies, press, set_viewport, \
         dialog, state, network, new_tab, list_tabs, switch_tab, close_tab, \
-        highlight, clipboard, find".to_owned(),
+        highlight, clipboard, find, get_article".to_owned(),
     parameters: json!({
         "type": "object",
         "properties": {
@@ -1004,7 +1113,8 @@ tools.push(ToolDef {
                 "back", "forward", "reload", "get_text", "get_url", "get_title",
                 "wait", "evaluate", "cookies", "press", "set_viewport",
                 "dialog", "state", "network", "new_tab", "list_tabs",
-                "switch_tab", "close_tab", "highlight", "clipboard", "find"
+                "switch_tab", "close_tab", "highlight", "clipboard", "find",
+                "get_article"
             ]},
             "url":        {"type": "string", "description": "URL for open/navigate"},
             "ref":        {"type": "string", "description": "Element ref like @e3 from snapshot"},
@@ -1047,7 +1157,7 @@ cargo check 2>&1 | tail -5
 
 ```bash
 git add src/agent/runtime.rs
-git commit -m "feat(browser): update tool definition with all 33 actions"
+git commit -m "feat(browser): update tool definition with all 34 actions"
 ```
 
 ---
@@ -1058,6 +1168,8 @@ git commit -m "feat(browser): update tool definition with all 33 actions"
 |-------|-------|-------------|
 | Phase 1 (Quick Wins) | Tasks 1-7 | headed mode, enhanced scroll, screenshot JPEG/full-page, press, wait networkidle/fn, set_viewport, dialog |
 | Phase 2 (Medium) | Tasks 8-12 | iframe support, multi-tab (4 actions), state save/load, network requests/block, annotated screenshot |
-| Phase 3 (Small) | Tasks 13-14 | highlight, clipboard, semantic find, final tool definition |
+| Phase 3 (Small) | Tasks 13-15 | highlight, clipboard, semantic find, get_article (Readability), final tool definition |
+
+**Total: 34 actions** (from current 20), covering all agent-browser features plus structured content extraction.
 
 **Total: 33 actions** (from current 20), covering all agent-browser features except video recording, profiler, and cloud providers (which are external tool concerns, not core browser actions).
