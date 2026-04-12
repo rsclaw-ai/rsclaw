@@ -4875,7 +4875,7 @@ impl AgentRuntime {
             .timeout(Duration::from_secs(15))
             .build()?;
 
-        let results: Vec<Value> = match chosen.as_str() {
+        let mut results: Vec<Value> = match chosen.as_str() {
             "duckduckgo" => {
                 let base = search_engine_url("duckduckgo");
                 let url = format!(
@@ -5152,11 +5152,149 @@ impl AgentRuntime {
                 .await?;
             let fallback = parse_bing_html_results(&html, limit);
             if !fallback.is_empty() {
-                return Ok(json!({ "results": fallback, "provider": "bing-free (fallback)" }));
+                results = fallback;
             }
         }
 
-        Ok(json!({ "results": results }))
+        // --- Multi-provider parallel merge (free providers only) ---
+        // When no API key is configured (free scraping mode), run 2 providers
+        // concurrently for better coverage. Provider pair selected by language:
+        //   zh → random 2 from [bing-free, baidu, sogou, 360]
+        //   other → bing-free + duckduckgo
+        let free_providers = ["duckduckgo", "bing-free", "baidu", "sogou", "360"];
+        let is_free_mode = free_providers.contains(&chosen.as_str());
+        if is_free_mode {
+            let lang = self.config.raw.gateway.as_ref()
+                .and_then(|g| g.language.as_deref())
+                .unwrap_or("");
+            let is_zh = lang.starts_with("zh")
+                || std::env::var("LANG").unwrap_or_default().to_lowercase().contains("zh");
+
+            let pair: [&str; 2] = if is_zh {
+                // Chinese: random 2 from 4 free Chinese-friendly providers.
+                let mut pool = vec!["bing-free", "baidu", "sogou", "360"];
+                use rand::seq::SliceRandom;
+                pool.shuffle(&mut rand::rng());
+                [pool[0], pool[1]]
+            } else {
+                ["bing-free", "duckduckgo"]
+            };
+
+            // Run both in parallel.
+            let (r1, r2) = tokio::join!(
+                self.search_provider(pair[0], query, limit, &client),
+                self.search_provider(pair[1], query, limit, &client),
+            );
+
+            // Merge both into results, dedup by URL.
+            results.clear();
+            let mut seen_urls = std::collections::HashSet::new();
+            for batch in [r1, r2] {
+                if let Ok(items) = batch {
+                    for r in items {
+                        if let Some(url) = r["url"].as_str() {
+                            if seen_urls.insert(url.to_owned()) {
+                                results.push(r);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Auto-fetch top 3 results for deeper content ---
+        let fetch_count = results.len().min(3);
+        let fetch_urls: Vec<String> = results.iter()
+            .take(fetch_count)
+            .filter_map(|r| r["url"].as_str().map(String::from))
+            .collect();
+
+        if !fetch_urls.is_empty() {
+            let fetch_client = reqwest::Client::builder()
+                .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+                    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::limited(5))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
+
+            // Fetch all URLs concurrently.
+            let fetches = fetch_urls.iter().map(|url| {
+                let client = fetch_client.clone();
+                let url = url.clone();
+                async move {
+                    let resp = client.get(&url).send().await.ok()?;
+                    let html = resp.text().await.ok()?;
+                    let content_type = "text/html"; // assume HTML
+                    let md = if content_type.contains("text/html") {
+                        htmd::convert(&html).unwrap_or_else(|_| strip_html(&html))
+                    } else {
+                        html
+                    };
+                    // Truncate to 2000 chars.
+                    let truncated = truncate_chars(&md, 2000);
+                    Some((url, truncated))
+                }
+            });
+            let fetched: Vec<Option<(String, String)>> = futures::future::join_all(fetches).await;
+
+            // Attach content to matching results.
+            for (url, content) in fetched.into_iter().flatten() {
+                for r in results.iter_mut() {
+                    if r["url"].as_str() == Some(url.as_str()) {
+                        r["content"] = json!(content);
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(json!({ "results": results, "provider": chosen }))
+    }
+
+    /// Helper: run a free scraping search provider and return results.
+    async fn search_provider(
+        &self,
+        provider: &str,
+        query: &str,
+        limit: usize,
+        client: &reqwest::Client,
+    ) -> Result<Vec<Value>> {
+        let lang = self.config.raw.gateway.as_ref()
+            .and_then(|g| g.language.as_deref())
+            .unwrap_or("");
+        match provider {
+            "bing-free" => {
+                let mkt = lang_to_bing_mkt(lang);
+                let mkt_param = if mkt.is_empty() {
+                    String::new()
+                } else {
+                    format!("&mkt={mkt}&setlang={}", &mkt[..2])
+                };
+                let url = format!(
+                    "https://www.bing.com/search?q={}&count={limit}{mkt_param}",
+                    urlencoding::encode(query)
+                );
+                let html = client
+                    .get(&url)
+                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                    .send().await?.text().await?;
+                Ok(parse_bing_html_results(&html, limit))
+            }
+            "duckduckgo" => {
+                let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoding::encode(query));
+                let html = client.get(&url).send().await?.text().await?;
+                Ok(parse_ddg_results(&html, limit))
+            }
+            "baidu" => {
+                let url = format!("https://www.baidu.com/s?wd={}&rn={limit}", urlencoding::encode(query));
+                let html = client.get(&url)
+                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                    .send().await?.text().await?;
+                Ok(parse_baidu_results(&html, limit))
+            }
+            _ => Ok(vec![]),
+        }
     }
 
     async fn tool_web_fetch(&self, args: Value) -> Result<Value> {
