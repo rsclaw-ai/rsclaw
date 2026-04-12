@@ -2796,7 +2796,10 @@ impl AgentRuntime {
                 match event? {
                     StreamEvent::TextDelta(delta) => {
                         // Close <think> tag when transitioning from reasoning to text.
-                        if !reasoning_buf.is_empty() && !text_buf.ends_with("</think>") {
+                        if thinking_budget.unwrap_or(0) > 0
+                            && !reasoning_buf.is_empty()
+                            && !text_buf.ends_with("</think>")
+                        {
                             text_buf.push_str("</think>");
                             delta_buf.push_str("</think>");
                         }
@@ -2833,14 +2836,17 @@ impl AgentRuntime {
                         }
                     }
                     StreamEvent::ReasoningDelta(delta) => {
-                        // Emit reasoning as <think> tags in the text stream.
-                        if reasoning_buf.is_empty() {
-                            text_buf.push_str("<think>");
-                            delta_buf.push_str("<think>");
-                        }
                         reasoning_buf.push_str(&delta);
-                        text_buf.push_str(&delta);
-                        delta_buf.push_str(&delta);
+                        // Only emit <think> tags when thinking is explicitly enabled.
+                        if thinking_budget.unwrap_or(0) > 0 {
+                            if reasoning_buf.len() == delta.len() {
+                                // First chunk — open tag.
+                                text_buf.push_str("<think>");
+                                delta_buf.push_str("<think>");
+                            }
+                            text_buf.push_str(&delta);
+                            delta_buf.push_str(&delta);
+                        }
                     }
                     StreamEvent::ToolCall { id, name, input } => {
                         if !id.is_empty() && !name.is_empty() {
@@ -2912,7 +2918,10 @@ impl AgentRuntime {
             }
 
             // Close unclosed <think> tag if stream ended during reasoning.
-            if !reasoning_buf.is_empty() && !text_buf.ends_with("</think>") {
+            if thinking_budget.unwrap_or(0) > 0
+                && !reasoning_buf.is_empty()
+                && !text_buf.ends_with("</think>")
+            {
                 text_buf.push_str("</think>");
                 delta_buf.push_str("</think>");
             }
@@ -2929,11 +2938,13 @@ impl AgentRuntime {
                 }
             }
 
-            // Strip any residual <think>...</think> tags from accumulated text
-            // (qwen3.5/QwQ may split tags across chunks).
-            // Configurable via agents.defaults.stripThinkTags (default: false).
+            // Strip <think>...</think> tags from accumulated text.
+            // Auto-enabled when thinking is not explicitly requested (budget=0 or None),
+            // since some models (MiniMax, QwQ) may still emit <think> tags regardless.
+            // Can be overridden via agents.defaults.stripThinkTags.
             let pre_strip_len = text_buf.trim().len();
-            let strip_enabled = self.config.agents.defaults.strip_think_tags.unwrap_or(false);
+            let thinking_active = thinking_budget.unwrap_or(0) > 0;
+            let strip_enabled = self.config.agents.defaults.strip_think_tags.unwrap_or(!thinking_active);
             if strip_enabled {
                 let before = text_buf.clone();
                 text_buf = crate::provider::openai::strip_think_tags_pub(&text_buf);

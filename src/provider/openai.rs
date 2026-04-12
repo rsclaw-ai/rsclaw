@@ -675,6 +675,9 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
 
     // Thinking/reasoning mode: configurable via agents.defaults.thinking or per-agent thinking.
     // Default: disabled. When enabled with budget > 0, model uses reasoning_content field.
+    let model_lower = req.model.to_lowercase();
+    let is_minimax = model_lower.contains("minimax");
+
     match req.thinking_budget {
         Some(budget) if budget > 0 => {
             body["enable_thinking"] = json!(true);
@@ -682,11 +685,16 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
             body["chat_template_kwargs"] = json!({"enable_thinking": true});
         }
         _ => {
-            // Disable thinking for all models by default.
-            // DashScope/official APIs use enable_thinking, llama.cpp uses chat_template_kwargs.
+            // Disable thinking for models that support it (DashScope, llama.cpp).
             body["enable_thinking"] = json!(false);
             body["chat_template_kwargs"] = json!({"enable_thinking": false});
         }
+    }
+
+    // MiniMax: always split reasoning into reasoning_content field so <think>
+    // tags don't leak into content. Works regardless of thinking_budget.
+    if is_minimax {
+        body["reasoning_split"] = json!(true);
     }
 
     if let Some(sys) = &req.system {
