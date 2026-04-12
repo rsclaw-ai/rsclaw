@@ -329,7 +329,9 @@ impl OpenAiProvider {
             options.insert("temperature".into(), json!(t));
         }
         if let Some(max) = req.max_tokens {
-            options.insert("num_predict".into(), json!(max));
+            if max > 0 {
+                options.insert("num_predict".into(), json!(max));
+            }
         }
         if !options.is_empty() {
             body["options"] = Value::Object(options);
@@ -678,7 +680,9 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
         "messages":   messages,
     });
     if let Some(max_tokens) = req.max_tokens {
-        body["max_tokens"] = json!(max_tokens);
+        if max_tokens > 0 {
+            body["max_tokens"] = json!(max_tokens);
+        }
     }
 
     // Thinking/reasoning mode: configurable via agents.defaults.thinking or per-agent thinking.
@@ -1100,7 +1104,9 @@ fn build_responses_body(req: &LlmRequest, file_id_map: &HashMap<String, String>)
     }
 
     if let Some(max_tokens) = req.max_tokens {
-        body["max_output_tokens"] = json!(max_tokens);
+        if max_tokens > 0 {
+            body["max_output_tokens"] = json!(max_tokens);
+        }
     }
 
     if let Some(t) = req.temperature {
