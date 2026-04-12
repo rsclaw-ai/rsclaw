@@ -2059,24 +2059,22 @@ async fn configure_web_search(val: &mut serde_json::Value) -> Result<()> {
             "Bing (免费)".into(),
             "Baidu/百度 (免费)".into(),
             "Sogou/搜狗 (免费)".into(),
-            "360搜索 (免费)".into(),
             "DuckDuckGo (免费)".into(),
+            "Serper/Google (需要接口密钥)".into(),
             "Google (需要接口密钥)".into(),
             "Bing (需要接口密钥)".into(),
             "Brave (需要接口密钥)".into(),
-            "Baidu/百度 (需要接口密钥)".into(),
         ]
     } else {
         vec![
             "Bing (free, no key)".into(),
             "Baidu (free, no key)".into(),
             "Sogou (free, no key)".into(),
-            "360 Search (free, no key)".into(),
             "DuckDuckGo (free, no key)".into(),
+            "Serper/Google (API key)".into(),
             "Google (API key)".into(),
             "Bing (API key)".into(),
             "Brave (API key)".into(),
-            "Baidu (API key)".into(),
         ]
     };
     let provider_refs: Vec<&str> = providers.iter().map(|s| s.as_str()).collect();
@@ -2088,13 +2086,12 @@ async fn configure_web_search(val: &mut serde_json::Value) -> Result<()> {
     let default_idx = match current.as_str() {
         "bing-free" => 0,
         "baidu-free" => 1,
-        "sogou" => 2,
-        "360" => 3,
-        "duckduckgo" => 4,
+        "sogou-free" => 2,
+        "duckduckgo-free" => 3,
+        "serper" => 4,
         "google" => 5,
         "bing" => 6,
         "brave" => 7,
-        "baidu" => 8,
         _ => 0,
     };
 
@@ -2116,19 +2113,29 @@ async fn configure_web_search(val: &mut serde_json::Value) -> Result<()> {
             // Sogou Free
             ensure_json_path(val, &["tools"]);
             ensure_json_path(val, &["tools", "webSearch"]);
-            set_nested_value(val, "tools.webSearch.provider", serde_json::json!("sogou"))?;
+            set_nested_value(val, "tools.webSearch.provider", serde_json::json!("sogou-free"))?;
         }
         StepResult::Next(3) => {
-            // 360 Search Free
+            // DuckDuckGo Free
             ensure_json_path(val, &["tools"]);
             ensure_json_path(val, &["tools", "webSearch"]);
-            set_nested_value(val, "tools.webSearch.provider", serde_json::json!("360"))?;
+            set_nested_value(val, "tools.webSearch.provider", serde_json::json!("duckduckgo-free"))?;
         }
         StepResult::Next(4) => {
-            // DuckDuckGo
+            // Serper (Google results via API)
             ensure_json_path(val, &["tools"]);
             ensure_json_path(val, &["tools", "webSearch"]);
-            set_nested_value(val, "tools.webSearch.provider", serde_json::json!("duckduckgo"))?;
+            set_nested_value(val, "tools.webSearch.provider", serde_json::json!("serper"))?;
+            match password_step("  Serper API Key") {
+                StepResult::Next(key) if !key.is_empty() => {
+                    set_nested_value(
+                        val,
+                        "tools.webSearch.serperApiKey",
+                        serde_json::json!(key),
+                    )?;
+                }
+                _ => {}
+            }
         }
         StepResult::Next(5) => {
             // Google
@@ -2154,7 +2161,7 @@ async fn configure_web_search(val: &mut serde_json::Value) -> Result<()> {
             }
         }
         StepResult::Next(6) => {
-            // Bing
+            // Bing API
             ensure_json_path(val, &["tools"]);
             ensure_json_path(val, &["tools", "webSearch"]);
             set_nested_value(val, "tools.webSearch.provider", serde_json::json!("bing"))?;
@@ -2170,7 +2177,7 @@ async fn configure_web_search(val: &mut serde_json::Value) -> Result<()> {
             }
         }
         StepResult::Next(7) => {
-            // Brave
+            // Brave API
             ensure_json_path(val, &["tools"]);
             ensure_json_path(val, &["tools", "webSearch"]);
             set_nested_value(val, "tools.webSearch.provider", serde_json::json!("brave"))?;
@@ -2179,22 +2186,6 @@ async fn configure_web_search(val: &mut serde_json::Value) -> Result<()> {
                     set_nested_value(
                         val,
                         "tools.webSearch.braveApiKey",
-                        serde_json::json!(key),
-                    )?;
-                }
-                _ => {}
-            }
-        }
-        StepResult::Next(8) => {
-            // Baidu API
-            ensure_json_path(val, &["tools"]);
-            ensure_json_path(val, &["tools", "webSearch"]);
-            set_nested_value(val, "tools.webSearch.provider", serde_json::json!("baidu"))?;
-            match password_step("  Baidu API Key") {
-                StepResult::Next(key) if !key.is_empty() => {
-                    set_nested_value(
-                        val,
-                        "tools.webSearch.baiduApiKey",
                         serde_json::json!(key),
                     )?;
                 }

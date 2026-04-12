@@ -4876,7 +4876,7 @@ impl AgentRuntime {
             .build()?;
 
         let mut results: Vec<Value> = match chosen.as_str() {
-            "duckduckgo" => {
+            "duckduckgo-free" => {
                 let base = search_engine_url("duckduckgo");
                 let url = format!(
                     "{}?q={}",
@@ -5072,7 +5072,7 @@ impl AgentRuntime {
                     .await?;
                 parse_bing_html_results(&html, limit)
             }
-            "baidu" => {
+            "baidu-free" => {
                 let url = format!(
                     "https://www.baidu.com/s?wd={}&rn={limit}",
                     urlencoding::encode(query)
@@ -5089,7 +5089,7 @@ impl AgentRuntime {
                     .await?;
                 parse_baidu_results(&html, limit)
             }
-            "sogou" => {
+            "sogou-free" => {
                 let url = format!(
                     "https://www.sogou.com/web?query={}&num={limit}",
                     urlencoding::encode(query)
@@ -5110,7 +5110,7 @@ impl AgentRuntime {
         };
 
         // Fallback: if DDG returned empty (captcha), try bing-free
-        if results.is_empty() && chosen == "duckduckgo" {
+        if results.is_empty() && chosen == "duckduckgo-free" {
             tracing::warn!("web_search: DuckDuckGo returned 0 results, falling back to bing-free");
             let lang = self
                 .config
@@ -5153,7 +5153,7 @@ impl AgentRuntime {
         // concurrently for better coverage. Provider pair selected by language:
         //   zh → random 2 from [bing-free, baidu, sogou, 360]
         //   other → bing-free + duckduckgo
-        let free_providers = ["duckduckgo", "bing-free", "baidu", "sogou"];
+        let free_providers = ["duckduckgo-free", "bing-free", "baidu-free", "sogou-free"];
         let is_free_mode = free_providers.contains(&chosen.as_str());
         if is_free_mode {
             let lang = self.config.raw.gateway.as_ref()
@@ -5164,12 +5164,12 @@ impl AgentRuntime {
 
             let pair: [&str; 2] = if is_zh {
                 // Chinese: random 2 from 4 free Chinese-friendly providers.
-                let mut pool = vec!["bing-free", "baidu", "sogou"];
+                let mut pool = vec!["bing-free", "baidu-free", "sogou-free"];
                 use rand::seq::SliceRandom;
                 pool.shuffle(&mut rand::rng());
                 [pool[0], pool[1]]
             } else {
-                ["bing-free", "duckduckgo"]
+                ["bing-free", "duckduckgo-free"]
             };
 
             // Run both in parallel.
@@ -5276,12 +5276,12 @@ impl AgentRuntime {
                     .send().await?.text().await?;
                 Ok(parse_bing_html_results(&html, limit))
             }
-            "duckduckgo" => {
+            "duckduckgo-free" => {
                 let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoding::encode(query));
                 let html = client.get(&url).send().await?.text().await?;
                 Ok(parse_ddg_results(&html, limit))
             }
-            "baidu" => {
+            "baidu-free" => {
                 let url = format!("https://www.baidu.com/s?wd={}&rn={limit}", urlencoding::encode(query));
                 let html = client.get(&url)
                     .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")

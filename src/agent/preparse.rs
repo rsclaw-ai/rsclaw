@@ -515,7 +515,9 @@ fn build_args(template: &ArgTemplate, caps: &regex::Captures<'_>, _full_input: &
                 let last_word = input[last_space + 1..].trim().to_lowercase();
                 if known.contains(&last_word.as_str()) {
                     let provider = match last_word.as_str() {
-                        "ddg" => "duckduckgo",
+                        "ddg" | "duckduckgo" => "duckduckgo-free",
+                        "baidu" => "baidu-free",
+                        "sogou" => "sogou-free",
                         other => other,
                     };
                     return json!({"query": input[..last_space].trim(), "provider": provider});
