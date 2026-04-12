@@ -165,16 +165,23 @@ fn default_config(lang: &str) -> String {
     provider: "local",               // "local" | "openai" | "ollama"
     local: {{
       modelRepo: "BAAI/bge-small-zh-v1.5",
-      // modelDownloadUrl: "https://hf-mirror.com/BAAI/bge-small-zh-v1.5/resolve/main",
+      {model_download_url}
     }},
   }},
+  // Model files auto-downloaded to $BASE_DIR/models/ on first startup.
   // channels: {{
   //   telegram: {{ botToken: "${{TELEGRAM_BOT_TOKEN}}" }},
   //   feishu: {{ appId: "xxx", appSecret: "xxx" }},
   //   discord: {{ token: "${{DISCORD_BOT_TOKEN}}" }},
   // }},
 }}
-"#
+"#,
+        lang_name = lang_name,
+        model_download_url = if lang == "zh" {
+            r#"modelDownloadUrl: "https://hf-mirror.com/BAAI/bge-small-zh-v1.5/resolve/main","#
+        } else {
+            r#"modelDownloadUrl: "https://huggingface.co/BAAI/bge-small-zh-v1.5/resolve/main","#
+        },
     )
 }
 
