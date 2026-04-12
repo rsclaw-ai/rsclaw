@@ -38,7 +38,7 @@
         "depends": []
       }
     },
-    "externalBin": ["binaries/rsclaw-cli"],
+    "externalBin": ["binaries/rsclaw"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

@@ -33,7 +33,7 @@ fn run_rsclaw_command(args: &[&str]) -> Result<String, String> {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
     let sidecar_result = exe_dir.as_ref().and_then(|dir| {
-        let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw-cli.exe" } else { "rsclaw-cli" });
+        let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw.exe" } else { "rsclaw" });
         eprintln!("[cmd] sidecar path: {} exists={}", sidecar.display(), sidecar.exists());
         if sidecar.exists() {
             std::process::Command::new(&sidecar)
@@ -82,7 +82,7 @@ fn run_rsclaw_command(args: &[&str]) -> Result<String, String> {
 
 // -- Tauri commands for frontend --
 
-/// Run rsclaw-cli with arbitrary arguments and return combined stdout+stderr.
+/// Run rsclaw with arbitrary arguments and return combined stdout+stderr.
 #[tauri::command]
 fn run_rsclaw_cli(args: Vec<String>) -> Result<String, String> {
     let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -91,7 +91,7 @@ fn run_rsclaw_cli(args: Vec<String>) -> Result<String, String> {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
     let (stdout, stderr, success) = match exe_dir.as_ref().and_then(|dir| {
-        let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw-cli.exe" } else { "rsclaw-cli" });
+        let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw.exe" } else { "rsclaw" });
         if sidecar.exists() {
             std::process::Command::new(&sidecar)
                 .args(&str_args)
@@ -137,7 +137,7 @@ fn start_gateway() -> Result<String, String> {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
     if let Some(dir) = &exe_dir {
-        let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw-cli.exe" } else { "rsclaw-cli" });
+        let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw.exe" } else { "rsclaw" });
         if sidecar.exists() {
             std::process::Command::new(&sidecar)
                 .args(["gateway", "start"])
@@ -426,7 +426,7 @@ fn channel_login_start(channel: String) -> Result<String, String> {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
     let spawned = exe_dir.as_ref().and_then(|dir| {
-        let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw-cli.exe" } else { "rsclaw-cli" });
+        let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw.exe" } else { "rsclaw" });
         if sidecar.exists() {
             std::process::Command::new(&sidecar)
                 .args(["channels", "login", &channel])
@@ -1017,7 +1017,7 @@ fn main() {
                             // Notify frontend to set userStopped flag
                             let _ = app.emit("tray-gateway-action", "quit");
                             // Stop gateway before quitting.
-                            eprintln!("[tray quit] stopping gateway via rsclaw-cli...");
+                            eprintln!("[tray quit] stopping gateway via rsclaw...");
                             let result = run_rsclaw_command(&["gateway", "stop"]);
                             eprintln!("[tray quit] result: {result:?}");
                             std::thread::sleep(std::time::Duration::from_millis(800));
