@@ -5047,6 +5047,9 @@ impl AgentRuntime {
                     .as_ref()
                     .and_then(|g| g.language.as_deref())
                     .unwrap_or("");
+                let is_zh = lang.to_lowercase().starts_with("zh")
+                    || lang.to_lowercase().starts_with("chinese");
+                let bing_host = if is_zh { "cn.bing.com" } else { "www.bing.com" };
                 let mkt = lang_to_bing_mkt(lang);
                 let mkt_param = if mkt.is_empty() {
                     String::new()
@@ -5054,7 +5057,7 @@ impl AgentRuntime {
                     format!("&mkt={mkt}&setlang={}", &mkt[..2])
                 };
                 let url = format!(
-                    "https://www.bing.com/search?q={}&count={limit}{mkt_param}",
+                    "https://{bing_host}/search?q={}&count={limit}{mkt_param}",
                     urlencoding::encode(query)
                 );
                 let html = client
@@ -5103,20 +5106,6 @@ impl AgentRuntime {
                     .await?;
                 parse_sogou_results(&html, limit)
             }
-            "360" => {
-                let url = format!("https://www.so.com/s?q={}", urlencoding::encode(query));
-                let html = client
-                    .get(&url)
-                    .header(
-                        "User-Agent",
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-                    )
-                    .send()
-                    .await?
-                    .text()
-                    .await?;
-                parse_360_results(&html, limit)
-            }
             other => return Err(anyhow!("web_search: unknown provider `{other}`")),
         };
 
@@ -5130,6 +5119,9 @@ impl AgentRuntime {
                 .as_ref()
                 .and_then(|g| g.language.as_deref())
                 .unwrap_or("");
+            let is_zh = lang.to_lowercase().starts_with("zh")
+                || lang.to_lowercase().starts_with("chinese");
+            let bing_host = if is_zh { "cn.bing.com" } else { "www.bing.com" };
             let mkt = lang_to_bing_mkt(lang);
             let mkt_param = if mkt.is_empty() {
                 String::new()
@@ -5137,7 +5129,7 @@ impl AgentRuntime {
                 format!("&mkt={mkt}&setlang={}", &mkt[..2])
             };
             let url = format!(
-                "https://www.bing.com/search?q={}&count={limit}{mkt_param}",
+                "https://{bing_host}/search?q={}&count={limit}{mkt_param}",
                 urlencoding::encode(query)
             );
             let html = client
@@ -5161,7 +5153,7 @@ impl AgentRuntime {
         // concurrently for better coverage. Provider pair selected by language:
         //   zh → random 2 from [bing-free, baidu, sogou, 360]
         //   other → bing-free + duckduckgo
-        let free_providers = ["duckduckgo", "bing-free", "baidu", "sogou", "360"];
+        let free_providers = ["duckduckgo", "bing-free", "baidu", "sogou"];
         let is_free_mode = free_providers.contains(&chosen.as_str());
         if is_free_mode {
             let lang = self.config.raw.gateway.as_ref()
@@ -5172,7 +5164,7 @@ impl AgentRuntime {
 
             let pair: [&str; 2] = if is_zh {
                 // Chinese: random 2 from 4 free Chinese-friendly providers.
-                let mut pool = vec!["bing-free", "baidu", "sogou", "360"];
+                let mut pool = vec!["bing-free", "baidu", "sogou"];
                 use rand::seq::SliceRandom;
                 pool.shuffle(&mut rand::rng());
                 [pool[0], pool[1]]
@@ -5263,8 +5255,11 @@ impl AgentRuntime {
         let lang = self.config.raw.gateway.as_ref()
             .and_then(|g| g.language.as_deref())
             .unwrap_or("");
+        let is_zh = lang.to_lowercase().starts_with("zh")
+            || lang.to_lowercase().starts_with("chinese");
         match provider {
             "bing-free" => {
+                let bing_host = if is_zh { "cn.bing.com" } else { "www.bing.com" };
                 let mkt = lang_to_bing_mkt(lang);
                 let mkt_param = if mkt.is_empty() {
                     String::new()
@@ -5272,7 +5267,7 @@ impl AgentRuntime {
                     format!("&mkt={mkt}&setlang={}", &mkt[..2])
                 };
                 let url = format!(
-                    "https://www.bing.com/search?q={}&count={limit}{mkt_param}",
+                    "https://{bing_host}/search?q={}&count={limit}{mkt_param}",
                     urlencoding::encode(query)
                 );
                 let html = client
@@ -7589,23 +7584,6 @@ fn parse_baidu_results(html: &str, limit: usize) -> Vec<Value> {
 }
 
 fn parse_sogou_results(html: &str, limit: usize) -> Vec<Value> {
-    let mut results = Vec::new();
-    let link_re = regex::Regex::new(r#"<h3[^>]*>\s*<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>"#).unwrap();
-    for cap in link_re.captures_iter(html).take(limit) {
-        let url = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        let title = cap.get(2).map(|m| m.as_str()).unwrap_or("");
-        if !url.is_empty() {
-            results.push(json!({
-                "title": strip_inline_tags(title),
-                "url": url,
-                "snippet": ""
-            }));
-        }
-    }
-    results
-}
-
-fn parse_360_results(html: &str, limit: usize) -> Vec<Value> {
     let mut results = Vec::new();
     let link_re = regex::Regex::new(r#"<h3[^>]*>\s*<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>"#).unwrap();
     for cap in link_re.captures_iter(html).take(limit) {
