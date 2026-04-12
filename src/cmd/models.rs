@@ -374,12 +374,14 @@ fn cmd_list_installed() {
         found = true;
     }
 
-    // Check bge-small-en
-    let en_dir = models_dir.join("bge-small-en");
-    if en_dir.join("config.json").exists() {
-        let size = dir_size(&en_dir);
-        println!("  {}    {}    {}MB", cyan("bge-small-en"), dim("BAAI/bge-small-en-v1.5"), size / 1_000_000);
-        found = true;
+    // Check bge-small-zh / bge-small-en
+    for (name, repo) in [("bge-small-zh", "BAAI/bge-small-zh-v1.5"), ("bge-small-en", "BAAI/bge-small-en-v1.5")] {
+        let dir = models_dir.join(name);
+        if dir.join("config.json").exists() {
+            let size = dir_size(&dir);
+            println!("  {}    {}    {}MB", cyan(name), dim(repo), size / 1_000_000);
+            found = true;
+        }
     }
 
     // Check whisper-tiny

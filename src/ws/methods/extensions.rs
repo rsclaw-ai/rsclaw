@@ -23,7 +23,11 @@ pub async fn memory_search(ctx: MethodCtx) -> MethodResult {
 
     let base = crate::config::loader::base_dir();
     let data_dir = base.join("var/data");
-    let model_dir = base.join("models/bge-small-en");
+    let model_dir = {
+        let zh = base.join("models/bge-small-zh");
+        let en = base.join("models/bge-small-en");
+        if zh.join("config.json").exists() { zh } else { en }
+    };
     let tier = crate::sys::detect_memory_tier();
     let search_cfg = load_search_cfg();
     let mut mem = crate::agent::memory::MemoryStore::open(
@@ -75,7 +79,11 @@ pub async fn memory_store(ctx: MethodCtx) -> MethodResult {
 
     let base = crate::config::loader::base_dir();
     let data_dir = base.join("var/data");
-    let model_dir = base.join("models/bge-small-en");
+    let model_dir = {
+        let zh = base.join("models/bge-small-zh");
+        let en = base.join("models/bge-small-en");
+        if zh.join("config.json").exists() { zh } else { en }
+    };
     let tier = crate::sys::detect_memory_tier();
     let search_cfg = load_search_cfg();
     let mut mem = crate::agent::memory::MemoryStore::open(
@@ -111,7 +119,11 @@ pub async fn memory_store(ctx: MethodCtx) -> MethodResult {
 pub async fn memory_status(_ctx: MethodCtx) -> MethodResult {
     let base = crate::config::loader::base_dir();
     let data_dir = base.join("var/data");
-    let model_dir = base.join("models/bge-small-en");
+    let model_dir = {
+        let zh = base.join("models/bge-small-zh");
+        let en = base.join("models/bge-small-en");
+        if zh.join("config.json").exists() { zh } else { en }
+    };
     let tier = crate::sys::detect_memory_tier();
     let search_cfg = load_search_cfg();
     let mem = crate::agent::memory::MemoryStore::open(

@@ -7,7 +7,11 @@ pub async fn cmd_memory(sub: MemoryCommand) -> Result<()> {
     let tier = detect_memory_tier();
     let base = config::loader::base_dir();
     let data_dir = base.join("var/data");
-    let model_dir = base.join("models/bge-small-en");
+    let model_dir = {
+        let zh = base.join("models/bge-small-zh");
+        let en = base.join("models/bge-small-en");
+        if zh.join("config.json").exists() { zh } else { en }
+    };
     let cfg = config::load().ok();
     let search_cfg = cfg.as_ref().and_then(|c| c.raw.memory_search.as_ref());
     match sub {
