@@ -2737,28 +2737,14 @@ impl AgentRuntime {
                 from_agent.or(from_defaults).or(from_provider)
             };
 
-            // Use built-in defaults if not configured
-            let max_tokens = crate::provider::model_defaults::resolve_max_tokens(
-                provider_name,
-                model_id,
-                configured_max_tokens,
-            );
-
-            // Log max_tokens resolution for debugging
-            if configured_max_tokens.is_some() {
+            // Only pass max_tokens when explicitly configured.
+            // When None, the model/provider decides its own output limit.
+            if let Some(configured) = configured_max_tokens {
                 info!(
                     session = %ctx.session_key,
                     model = %model,
-                    configured = configured_max_tokens.unwrap(),
-                    effective = max_tokens,
+                    max_tokens = configured,
                     "LLM request max_tokens (from config)"
-                );
-            } else {
-                info!(
-                    session = %ctx.session_key,
-                    model = %model,
-                    effective = max_tokens,
-                    "LLM request max_tokens (using builtin default)"
                 );
             }
 
@@ -2767,7 +2753,7 @@ impl AgentRuntime {
                 messages,
                 tools: tools.clone(),
                 system: Some(effective_system.clone()),
-                max_tokens: Some(max_tokens),
+                max_tokens: configured_max_tokens,
                 temperature: None,
                 frequency_penalty: self.config.agents.defaults.frequency_penalty,
                 thinking_budget,
