@@ -58,6 +58,8 @@ enum ArgTemplate {
     Named(HashMap<String, String>),
     /// Static args
     Static(Value),
+    /// Search query: parse optional trailing provider name
+    SearchQuery,
 }
 
 impl PreParseEngine {
@@ -127,14 +129,12 @@ impl PreParseEngine {
         ); // special handling
 
         // --- Search & web ---
+        // /search <query> [provider] — provider is optional last word matching known engines
         add_cmd(
             &mut commands,
-            r"(?i)^/(?:search|google|bing|ddg)\s+(.+)$",
+            r"(?i)^/search\s+(.+)$",
             "web_search",
-            ArgTemplate::Single {
-                param: "query".into(),
-                group: 1,
-            },
+            ArgTemplate::SearchQuery,
         );
         add_cmd(
             &mut commands,
@@ -507,6 +507,22 @@ fn build_args(template: &ArgTemplate, caps: &regex::Captures<'_>, _full_input: &
             } else {
                 json!({})
             }
+        }
+        ArgTemplate::SearchQuery => {
+            let input = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+            let known = ["google", "bing", "baidu", "ddg", "duckduckgo", "so", "sogou", "serper", "brave"];
+            if let Some(last_space) = input.rfind(' ') {
+                let last_word = input[last_space + 1..].trim().to_lowercase();
+                if known.contains(&last_word.as_str()) {
+                    let provider = match last_word.as_str() {
+                        "ddg" => "duckduckgo",
+                        "so" => "360",
+                        other => other,
+                    };
+                    return json!({"query": input[..last_space].trim(), "provider": provider});
+                }
+            }
+            json!({"query": input})
         }
         ArgTemplate::Static(val) => {
             let mut v = val.clone();
