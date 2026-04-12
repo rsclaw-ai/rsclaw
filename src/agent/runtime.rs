@@ -5183,6 +5183,19 @@ impl AgentRuntime {
             }
         }
 
+        // --- Browser fallback: when all free providers are blocked by CAPTCHA ---
+        if results.is_empty() && is_free_mode {
+            info!("web_search: all free providers returned empty, trying browser fallback");
+            match self.browser_search(query, limit).await {
+                Ok(browser_results) if !browser_results.is_empty() => {
+                    info!(count = browser_results.len(), "web_search: browser fallback succeeded");
+                    results = browser_results;
+                }
+                Ok(_) => warn!("web_search: browser fallback also returned empty"),
+                Err(e) => warn!("web_search: browser fallback failed: {e:#}"),
+            }
+        }
+
         // --- Auto-fetch top 3 results for deeper content ---
         let fetch_count = results.len().min(3);
         let fetch_urls: Vec<String> = results.iter()
@@ -5228,6 +5241,15 @@ impl AgentRuntime {
                     }
                 }
             }
+        }
+
+        // If still empty after all attempts, add a hint about API keys.
+        if results.is_empty() && is_free_mode {
+            return Ok(json!({
+                "results": [],
+                "provider": chosen,
+                "error": "All free search providers were blocked (CAPTCHA). Consider configuring an API key (serper, brave, or bing) for reliable search."
+            }));
         }
 
         Ok(json!({ "results": results, "provider": chosen }))
@@ -5459,6 +5481,72 @@ impl AgentRuntime {
         let title = article["title"].as_str().unwrap_or("").to_owned();
         let text = article["text"].as_str().unwrap_or("").to_owned();
         Ok((title, text))
+    }
+
+    /// Browser-based search fallback: open a search engine in the browser,
+    /// extract results from the rendered page. Bypasses CAPTCHA since it uses
+    /// a real browser session.
+    async fn browser_search(&self, query: &str, limit: usize) -> Result<Vec<Value>> {
+        let mut browser = self.browser.lock().await;
+
+        if browser.is_none() {
+            let chrome_path = self.config.ext.tools.as_ref()
+                .and_then(|t| t.web_browser.as_ref())
+                .and_then(|b| b.chrome_path.clone())
+                .or_else(|| crate::agent::runtime::detect_chrome())
+                .ok_or_else(|| anyhow!("Chrome not found for browser search fallback"))?;
+            crate::browser::can_launch_chrome()?;
+            let headed = self.config.ext.tools.as_ref()
+                .and_then(|t| t.web_browser.as_ref())
+                .and_then(|b| b.headed)
+                .unwrap_or(false);
+            *browser = Some(crate::browser::BrowserSession::start(&chrome_path, headed).await?);
+        }
+
+        let bs = browser.as_mut().unwrap();
+
+        // Use Bing as the browser search engine.
+        let lang = self.config.raw.gateway.as_ref()
+            .and_then(|g| g.language.as_deref())
+            .unwrap_or("");
+        let is_zh = lang.to_lowercase().starts_with("zh")
+            || lang.to_lowercase().starts_with("chinese");
+        let bing_host = if is_zh { "cn.bing.com" } else { "www.bing.com" };
+        let url = format!("https://{bing_host}/search?q={}", urlencoding::encode(query));
+
+        bs.execute("open", &json!({"url": url})).await?;
+
+        // Wait for results to load.
+        let _ = bs.execute("wait", &json!({"target": "element", "value": ".b_algo", "timeout": 10})).await;
+
+        // Extract search results via JS.
+        let js = format!(r#"(function(){{
+            var results = [];
+            var items = document.querySelectorAll('.b_algo');
+            for (var i = 0; i < Math.min(items.length, {limit}); i++) {{
+                var a = items[i].querySelector('a');
+                var p = items[i].querySelector('p');
+                if (a) {{
+                    results.push({{
+                        title: a.innerText || '',
+                        url: a.href || '',
+                        snippet: p ? p.innerText || '' : ''
+                    }});
+                }}
+            }}
+            return JSON.stringify(results);
+        }})()"#);
+
+        let result = bs.execute("evaluate", &json!({"js": js})).await?;
+        let result_str = result["result"].as_str()
+            .or_else(|| result["result"].as_str())
+            .unwrap_or("[]");
+        let parsed: Vec<Value> = serde_json::from_str(
+            // result might be a JSON string or already parsed
+            if result_str.starts_with('[') { result_str } else { "[]" }
+        ).unwrap_or_default();
+
+        Ok(parsed)
     }
 
     /// If summaryModel is configured and a prompt is provided, summarize
