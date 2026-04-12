@@ -3039,6 +3039,30 @@ impl AgentRuntime {
             // Drop tool calls with empty names (incomplete streaming)
             tool_calls.retain(|(_, name, _)| !name.is_empty());
 
+            // Rescue tool calls from text output — some small models (qwen3.5:9b)
+            // emit tool calls as XML text instead of proper function_call format.
+            // Detect <tool_call>/<function=...> patterns and parse them.
+            if tool_calls.is_empty() && text_buf.contains("<function=") {
+                let re = regex::Regex::new(
+                    r#"<function=(\w+)>\s*<parameter=(\w+)>\s*([\s\S]*?)\s*</parameter>\s*</function>"#
+                ).unwrap();
+                for cap in re.captures_iter(&text_buf) {
+                    let name = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                    let param = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+                    let value = cap.get(3).map(|m| m.as_str().trim()).unwrap_or("");
+                    if !name.is_empty() {
+                        let input = json!({ param: value });
+                        let id = format!("rescued_{name}_{}", tool_calls.len());
+                        tracing::info!(name, param, "agent_loop: rescued tool call from text");
+                        tool_calls.push((id, name.to_owned(), input));
+                    }
+                }
+                if !tool_calls.is_empty() {
+                    // Clear the text since it was a tool call, not a real reply.
+                    text_buf.clear();
+                }
+            }
+
             // If no tool calls, we have the final assistant reply.
             tracing::info!(
                 session = %ctx.session_key,
