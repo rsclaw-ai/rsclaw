@@ -494,7 +494,7 @@ fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     "deepseek" => Some("https://api.deepseek.com/v1".to_owned()),
                     "kimi" | "moonshot" => Some("https://api.moonshot.cn/v1".to_owned()),
                     "zhipu" => Some("https://open.bigmodel.cn/api/paas/v4".to_owned()),
-                    "minimax" => Some("https://api.minimax.chat/v1".to_owned()),
+                    "minimax" => Some("https://api.minimaxi.com/v1".to_owned()),
                     "siliconflow" => Some("https://api.siliconflow.cn/v1".to_owned()),
                     "groq"        => Some("https://api.groq.com/openai/v1".to_owned()),
                     "openrouter"  => Some("https://openrouter.ai/api/v1".to_owned()),
