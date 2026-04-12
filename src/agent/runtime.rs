@@ -8472,7 +8472,7 @@ fn build_tool_list(
             select, check, uncheck, scroll, screenshot, pdf, back, forward, reload, \
             get_text, get_url, get_title, wait, evaluate, cookies, press, set_viewport, \
             dialog, state, network, new_tab, list_tabs, switch_tab, close_tab, \
-            highlight, clipboard, find, get_article".to_owned(),
+            highlight, clipboard, find, get_article, upload, context, emulate, diff, record".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -8483,12 +8483,12 @@ fn build_tool_list(
                     "wait", "evaluate", "cookies", "press", "set_viewport",
                     "dialog", "state", "network", "new_tab", "list_tabs",
                     "switch_tab", "close_tab", "highlight", "clipboard", "find",
-                    "get_article"
+                    "get_article", "upload", "context", "emulate", "diff", "record"
                 ]},
                 "url":        {"type": "string", "description": "URL for open/navigate"},
                 "ref":        {"type": "string", "description": "Element ref like @e3 from snapshot"},
-                "text":       {"type": "string", "description": "Text for fill/type/clipboard write/dialog prompt"},
-                "value":      {"type": "string", "description": "Value for select, or sub-action for cookies/state/dialog/network/clipboard"},
+                "text":       {"type": "string", "description": "Text for fill/type/click-by-text/clipboard/dialog"},
+                "value":      {"type": "string", "description": "Value for select, or sub-action for cookies/state/dialog/network/clipboard/context/emulate/diff/record"},
                 "key":        {"type": "string", "description": "Key name for press (Enter, Tab, Escape, etc.)"},
                 "direction":  {"type": "string", "enum": ["up", "down", "left", "right"], "description": "Scroll direction"},
                 "amount":     {"type": "integer", "description": "Scroll distance in pixels (default 500)"},
@@ -8506,10 +8506,20 @@ fn build_tool_list(
                 "mobile":     {"type": "boolean", "description": "Mobile emulation for set_viewport"},
                 "target_id":  {"type": "string", "description": "Tab target ID for switch_tab/close_tab"},
                 "state":      {"type": "object", "description": "State object for state load"},
-                "pattern":    {"type": "string", "description": "URL pattern for network block"},
+                "pattern":    {"type": "string", "description": "URL pattern for network block/intercept"},
                 "by":         {"type": "string", "enum": ["text", "label"], "description": "Find element by text or label"},
                 "then":       {"type": "string", "description": "Action after find (click)"},
-                "cookie":     {"type": "object", "description": "Cookie object for cookies set"}
+                "cookie":     {"type": "object", "description": "Cookie object for cookies set"},
+                "files":      {"type": "array", "items": {"type": "string"}, "description": "File paths for upload"},
+                "context_id": {"type": "string", "description": "Browser context ID for cookie isolation"},
+                "latitude":   {"type": "number", "description": "Latitude for geolocation emulation"},
+                "longitude":  {"type": "number", "description": "Longitude for geolocation emulation"},
+                "accuracy":   {"type": "number", "description": "Geolocation accuracy in meters"},
+                "locale":     {"type": "string", "description": "Locale for emulation (e.g. en-US, zh-CN)"},
+                "timezone_id":{"type": "string", "description": "IANA timezone (e.g. Asia/Shanghai)"},
+                "permissions":{"type": "array", "items": {"type": "string"}, "description": "Browser permissions to grant"},
+                "action_type":{"type": "string", "description": "Intercept action: block or mock"},
+                "body":       {"type": "string", "description": "Mock response body for network intercept"}
             },
             "required": ["action"]
         }),

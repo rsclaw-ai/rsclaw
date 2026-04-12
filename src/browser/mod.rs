@@ -14,6 +14,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow, bail};
+use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::{
@@ -435,8 +436,14 @@ pub struct BrowserSession {
     pending_dialog: Option<String>,
     /// Accumulated blocked URL patterns for network interception.
     blocked_urls: Vec<String>,
+    /// Request interception rules: (url_pattern, action).
+    intercept_rules: Vec<(String, String)>,
     /// Last activity timestamp (for idle timeout).
     last_activity: Arc<AtomicU64>,
+    /// Stored screenshot for diff comparison.
+    before_screenshot: Option<String>,
+    /// Operation recording entries.
+    recording: Option<Vec<Value>>,
 }
 
 impl BrowserSession {
@@ -459,7 +466,10 @@ impl BrowserSession {
             headed,
             pending_dialog: None,
             blocked_urls: Vec::new(),
+            intercept_rules: Vec::new(),
             last_activity: Arc::new(AtomicU64::new(now)),
+            before_screenshot: None,
+            recording: None,
         })
     }
 
@@ -547,24 +557,55 @@ impl BrowserSession {
 
         self.touch_activity();
 
-        // Drain events, then handle dialogs outside the lock to avoid holding it during CDP send.
-        let dialog_events: Vec<Value> = {
+        // Drain events, then handle dialogs and fetch interceptions outside the lock.
+        let (dialog_events, fetch_events): (Vec<Value>, Vec<Value>) = {
             let mut rx = self.cdp.events_rx.lock().await;
-            let mut events = Vec::new();
+            let mut dialogs = Vec::new();
+            let mut fetches = Vec::new();
             while let Ok(event) = rx.try_recv() {
-                if event.get("method").and_then(|m| m.as_str()) == Some("Page.javascriptDialogOpening") {
-                    events.push(event);
+                match event.get("method").and_then(|m| m.as_str()) {
+                    Some("Page.javascriptDialogOpening") => dialogs.push(event),
+                    Some("Fetch.requestPaused") => fetches.push(event),
+                    _ => {}
                 }
             }
-            events
+            (dialogs, fetches)
         };
-        for event in dialog_events {
+        for event in &dialog_events {
             let msg = event["params"]["message"].as_str().unwrap_or("").to_string();
             let dtype = event["params"]["type"].as_str().unwrap_or("");
             if dtype == "alert" || dtype == "beforeunload" {
                 let _ = self.cdp.send("Page.handleJavaScriptDialog", json!({"accept": true})).await;
             } else {
                 self.pending_dialog = Some(msg);
+            }
+        }
+        // Handle intercepted fetch requests.
+        for event in &fetch_events {
+            let req_id = event["params"]["requestId"].as_str().unwrap_or("");
+            let req_url = event["params"]["request"]["url"].as_str().unwrap_or("");
+            let mut handled = false;
+            for (pattern, rule_action) in &self.intercept_rules {
+                if req_url.contains(pattern.as_str()) {
+                    if rule_action == "block" {
+                        let _ = self.cdp.send("Fetch.failRequest", json!({
+                            "requestId": req_id, "errorReason": "BlockedByClient"
+                        })).await;
+                    } else if let Some(body) = rule_action.strip_prefix("mock:") {
+                        let encoded = base64::engine::general_purpose::STANDARD.encode(body);
+                        let _ = self.cdp.send("Fetch.fulfillRequest", json!({
+                            "requestId": req_id,
+                            "responseCode": 200,
+                            "responseHeaders": [{"name": "Content-Type", "value": "application/json"}],
+                            "body": encoded,
+                        })).await;
+                    }
+                    handled = true;
+                    break;
+                }
+            }
+            if !handled {
+                let _ = self.cdp.send("Fetch.continueRequest", json!({"requestId": req_id})).await;
             }
         }
 
@@ -601,8 +642,33 @@ impl BrowserSession {
             "clipboard" => self.cmd_clipboard(args).await,
             "find" => self.cmd_find(args).await,
             "get_article" => self.cmd_get_article().await,
+            "upload" => self.cmd_upload(args).await,
+            "context" => self.cmd_context(args).await,
+            "emulate" => self.cmd_emulate(args).await,
+            "diff" => self.cmd_diff(args).await,
+            "record" => self.cmd_record(args).await,
             other => Err(anyhow!("web_browser: unsupported action `{other}`")),
         };
+
+        // Record operation if recording is active.
+        if let Ok(ref _val) = result {
+            if let Some(ref mut entries) = self.recording {
+                if entries.len() < 200 {
+                    let mut entry = json!({
+                        "action": action,
+                        "args": args,
+                        "ts": chrono::Utc::now().timestamp_millis(),
+                    });
+                    // Capture low-quality screenshot for trace.
+                    if let Ok(ss) = self.cdp.send("Page.captureScreenshot", json!({"format": "jpeg", "quality": 30})).await {
+                        if let Some(data) = ss.get("data").and_then(|v| v.as_str()) {
+                            entry["screenshot"] = json!(format!("data:image/jpeg;base64,{data}"));
+                        }
+                    }
+                    entries.push(entry);
+                }
+            }
+        }
 
         // If the command failed, Chrome might be in a bad state (crashed or CDP connection
         // broken). Restart it so the next call gets a fresh session.
@@ -698,34 +764,54 @@ impl BrowserSession {
     }
 
     async fn cmd_click(&self, args: &Value) -> Result<Value> {
-        let eref = args
-            .get("ref")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("click: `ref` required (e.g. @e3)"))?;
+        let eref = args.get("ref").and_then(|v| v.as_str());
+        let text_sel = args.get("text").and_then(|v| v.as_str());
 
-        // Use JS to find element by data-ref (including inside iframes) and click it.
+        let find_js = if let Some(eref) = eref {
+            format!(
+                r#"{FIND_REF_JS} var el=findRef('{}'); if(!el) return 'NOT_FOUND';"#,
+                escape_js_string(eref),
+                FIND_REF_JS = FIND_REF_JS,
+            )
+        } else if let Some(text) = text_sel {
+            format!(
+                r#"var el=(function(){{var all=document.querySelectorAll('a,button,[role=button],[role=link],input[type=submit]');for(var i=0;i<all.length;i++){{if(all[i].innerText&&all[i].innerText.trim().includes('{}'))return all[i];}};return null;}})(); if(!el) return 'NOT_FOUND';"#,
+                escape_js_string(text),
+            )
+        } else {
+            bail!("click: `ref` or `text` required");
+        };
+
         let js = format!(
-            r#"(function(){{
-                {FIND_REF_JS}
-                var el = findRef('{}');
-                if (!el) return 'NOT_FOUND';
+            r#"(async function(){{
+                {find_js}
+                {WAIT_ACTIONABLE_JS}
+                var status = await waitActionable(el, 5000);
+                if (status === 'TIMEOUT') return 'TIMEOUT';
                 el.scrollIntoView({{block:'center'}});
                 el.click();
                 return 'OK';
             }})()"#,
-            escape_js_string(eref),
-            FIND_REF_JS = FIND_REF_JS,
+            find_js = find_js,
+            WAIT_ACTIONABLE_JS = WAIT_ACTIONABLE_JS,
         );
 
-        let result = self.eval_js(&js).await?;
-        if result == "NOT_FOUND" {
-            bail!("click: element {eref} not found (run snapshot first)");
+        let result = self.cdp.send("Runtime.evaluate", json!({
+            "expression": js,
+            "returnByValue": true,
+            "awaitPromise": true,
+        })).await?;
+        let value = result.get("result").and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str()).unwrap_or("");
+
+        match value {
+            "NOT_FOUND" => bail!("click: element not found (ref={}, text={})",
+                eref.unwrap_or(""), text_sel.unwrap_or("")),
+            "TIMEOUT" => bail!("click: element not actionable within 5s"),
+            _ => {}
         }
 
-        // Small delay for any triggered navigation / DOM updates.
-        time::sleep(Duration::from_millis(200)).await;
-
-        Ok(json!({ "action": "click", "ref": eref, "text": format!("Clicked {eref}") }))
+        Ok(json!({ "action": "click", "ref": eref, "text": format!("Clicked {}", eref.or(text_sel).unwrap_or("element")) }))
     }
 
     async fn cmd_fill(&self, args: &Value) -> Result<Value> {
@@ -736,13 +822,16 @@ impl BrowserSession {
             .ok_or_else(|| anyhow!("fill/type: `text` required"))?;
 
         if let Some(eref) = eref {
-            // Fill a specific element.
+            // Fill a specific element with auto-wait.
             let escaped_text = escape_js_string(text);
             let js = format!(
-                r#"(function(){{
+                r#"(async function(){{
                     {FIND_REF_JS}
                     var el = findRef('{}');
                     if (!el) return 'NOT_FOUND';
+                    {WAIT_ACTIONABLE_JS}
+                    var status = await waitActionable(el, 5000);
+                    if (status === 'TIMEOUT') return 'TIMEOUT';
                     el.focus();
                     el.value = '{}';
                     el.dispatchEvent(new Event('input', {{bubbles:true}}));
@@ -752,11 +841,21 @@ impl BrowserSession {
                 escape_js_string(eref),
                 escaped_text,
                 FIND_REF_JS = FIND_REF_JS,
+                WAIT_ACTIONABLE_JS = WAIT_ACTIONABLE_JS,
             );
 
-            let result = self.eval_js(&js).await?;
-            if result == "NOT_FOUND" {
-                bail!("fill: element {eref} not found (run snapshot first)");
+            let result = self.cdp.send("Runtime.evaluate", json!({
+                "expression": js,
+                "returnByValue": true,
+                "awaitPromise": true,
+            })).await?;
+            let value = result.get("result").and_then(|r| r.get("value"))
+                .and_then(|v| v.as_str()).unwrap_or("");
+
+            match value {
+                "NOT_FOUND" => bail!("fill: element {eref} not found (run snapshot first)"),
+                "TIMEOUT" => bail!("fill: element {eref} not actionable within 5s"),
+                _ => {}
             }
 
             Ok(json!({ "action": "fill", "ref": eref, "text": format!("Filled {eref} with text") }))
@@ -797,10 +896,13 @@ impl BrowserSession {
             .ok_or_else(|| anyhow!("select: `value` required"))?;
 
         let js = format!(
-            r#"(function(){{
+            r#"(async function(){{
                 {FIND_REF_JS}
                 var el = findRef('{}');
                 if (!el) return 'NOT_FOUND';
+                {WAIT_ACTIONABLE_JS}
+                var status = await waitActionable(el, 5000);
+                if (status === 'TIMEOUT') return 'TIMEOUT';
                 el.value = '{}';
                 el.dispatchEvent(new Event('change', {{bubbles:true}}));
                 return 'OK';
@@ -808,11 +910,21 @@ impl BrowserSession {
             escape_js_string(eref),
             escape_js_string(value),
             FIND_REF_JS = FIND_REF_JS,
+            WAIT_ACTIONABLE_JS = WAIT_ACTIONABLE_JS,
         );
 
-        let result = self.eval_js(&js).await?;
-        if result == "NOT_FOUND" {
-            bail!("select: element {eref} not found");
+        let result = self.cdp.send("Runtime.evaluate", json!({
+            "expression": js,
+            "returnByValue": true,
+            "awaitPromise": true,
+        })).await?;
+        let value_str = result.get("result").and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str()).unwrap_or("");
+
+        match value_str {
+            "NOT_FOUND" => bail!("select: element {eref} not found"),
+            "TIMEOUT" => bail!("select: element {eref} not actionable within 5s"),
+            _ => {}
         }
 
         Ok(json!({ "action": "select", "ref": eref, "text": format!("Selected {value} on {eref}") }))
@@ -826,21 +938,34 @@ impl BrowserSession {
 
         let desired = if check { "true" } else { "false" };
         let js = format!(
-            r#"(function(){{
+            r#"(async function(){{
                 {FIND_REF_JS}
                 var el = findRef('{}');
                 if (!el) return 'NOT_FOUND';
+                {WAIT_ACTIONABLE_JS}
+                var status = await waitActionable(el, 5000);
+                if (status === 'TIMEOUT') return 'TIMEOUT';
                 if (el.checked !== {}) el.click();
                 return 'OK';
             }})()"#,
             escape_js_string(eref),
             desired,
             FIND_REF_JS = FIND_REF_JS,
+            WAIT_ACTIONABLE_JS = WAIT_ACTIONABLE_JS,
         );
 
-        let result = self.eval_js(&js).await?;
-        if result == "NOT_FOUND" {
-            bail!("check: element {eref} not found");
+        let result = self.cdp.send("Runtime.evaluate", json!({
+            "expression": js,
+            "returnByValue": true,
+            "awaitPromise": true,
+        })).await?;
+        let value = result.get("result").and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str()).unwrap_or("");
+
+        match value {
+            "NOT_FOUND" => bail!("check: element {eref} not found"),
+            "TIMEOUT" => bail!("check: element {eref} not actionable within 5s"),
+            _ => {}
         }
 
         let verb = if check { "Checked" } else { "Unchecked" };
@@ -1387,7 +1512,31 @@ impl BrowserSession {
                 self.cdp.send("Network.setBlockedURLs", json!({"urls": []})).await?;
                 Ok(json!({"action": "network", "text": "All URL blocks removed"}))
             }
-            _ => Err(anyhow!("network: unknown sub-action (use requests/block/unblock)"))
+            "intercept" => {
+                let pattern = args.get("pattern").and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("network intercept: `pattern` required"))?;
+                let action = args.get("action_type").and_then(|v| v.as_str()).unwrap_or("block");
+                let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
+
+                if self.intercept_rules.is_empty() {
+                    self.cdp.send("Fetch.enable", json!({"patterns": [{"urlPattern": "*"}]})).await?;
+                }
+
+                let rule_action = if action == "mock" {
+                    format!("mock:{body}")
+                } else {
+                    action.to_string()
+                };
+                self.intercept_rules.push((pattern.to_string(), rule_action));
+
+                Ok(json!({"action": "network", "text": format!("Intercept rule added: {pattern} -> {action}")}))
+            }
+            "clear_intercepts" => {
+                self.intercept_rules.clear();
+                let _ = self.cdp.send("Fetch.disable", json!({})).await;
+                Ok(json!({"action": "network", "text": "All intercept rules cleared"}))
+            }
+            _ => Err(anyhow!("network: unknown sub-action (use requests/block/unblock/intercept/clear_intercepts)"))
         }
     }
 
@@ -1477,6 +1626,37 @@ impl BrowserSession {
         Ok(json!({"action": "find", "by": by, "value": value, "result": result}))
     }
 
+    async fn cmd_upload(&self, args: &Value) -> Result<Value> {
+        let eref = args.get("ref").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("upload: `ref` required (file input element)"))?;
+        let files: Vec<String> = args.get("files")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        if files.is_empty() {
+            bail!("upload: `files` array required");
+        }
+
+        // Get the backend node ID via DOM.querySelector
+        let doc_root = self.cdp.send("DOM.getDocument", json!({})).await?;
+        let root_id = doc_root["root"]["nodeId"].as_i64().unwrap_or(0);
+        let node_result = self.cdp.send("DOM.querySelector", json!({
+            "nodeId": root_id,
+            "selector": format!("[data-ref=\"{}\"]", escape_js_string(eref)),
+        })).await?;
+        let node_id = node_result["nodeId"].as_i64().unwrap_or(0);
+        if node_id == 0 {
+            bail!("upload: could not resolve DOM node for {eref}");
+        }
+
+        self.cdp.send("DOM.setFileInputFiles", json!({
+            "files": files,
+            "nodeId": node_id,
+        })).await?;
+
+        Ok(json!({"action": "upload", "ref": eref, "files": files.len()}))
+    }
+
     async fn cmd_get_article(&self) -> Result<Value> {
         let js = r#"(function(){
             var doc=document.cloneNode(true);var body=doc.querySelector('body');
@@ -1562,6 +1742,131 @@ impl BrowserSession {
             None => Ok(String::new()),
         }
     }
+
+    // -- Task 4: Cookie Isolation -----------------------------------------------
+
+    async fn cmd_context(&mut self, args: &Value) -> Result<Value> {
+        let sub = args.get("value").and_then(|v| v.as_str()).unwrap_or("new");
+        match sub {
+            "new" => {
+                let result = self.cdp.send("Target.createBrowserContext", json!({})).await?;
+                let ctx_id = result["browserContextId"].as_str().unwrap_or("");
+                Ok(json!({"action": "context", "sub": "new", "browserContextId": ctx_id}))
+            }
+            "dispose" => {
+                let ctx_id = args.get("context_id").and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("context dispose: `context_id` required"))?;
+                self.cdp.send("Target.disposeBrowserContext", json!({"browserContextId": ctx_id})).await?;
+                Ok(json!({"action": "context", "sub": "dispose"}))
+            }
+            "new_tab" => {
+                let ctx_id = args.get("context_id").and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("context new_tab: `context_id` required"))?;
+                let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("about:blank");
+                let result = self.cdp.send("Target.createTarget", json!({"url": url, "browserContextId": ctx_id})).await?;
+                let target_id = result["targetId"].as_str().unwrap_or("");
+                Ok(json!({"action": "context", "sub": "new_tab", "targetId": target_id}))
+            }
+            _ => Err(anyhow!("context: use new/dispose/new_tab"))
+        }
+    }
+
+    // -- Task 5: Geolocation & Emulation ----------------------------------------
+
+    async fn cmd_emulate(&self, args: &Value) -> Result<Value> {
+        let sub = args.get("value").and_then(|v| v.as_str()).unwrap_or("geo");
+        match sub {
+            "geo" => {
+                let lat = args.get("latitude").and_then(|v| v.as_f64())
+                    .ok_or_else(|| anyhow!("emulate geo: `latitude` required"))?;
+                let lon = args.get("longitude").and_then(|v| v.as_f64())
+                    .ok_or_else(|| anyhow!("emulate geo: `longitude` required"))?;
+                let accuracy = args.get("accuracy").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                self.cdp.send("Emulation.setGeolocationOverride", json!({
+                    "latitude": lat, "longitude": lon, "accuracy": accuracy
+                })).await?;
+                let _ = self.cdp.send("Browser.grantPermissions", json!({"permissions": ["geolocation"]})).await;
+                Ok(json!({"action": "emulate", "sub": "geo", "latitude": lat, "longitude": lon}))
+            }
+            "locale" => {
+                let locale = args.get("locale").and_then(|v| v.as_str()).unwrap_or("en-US");
+                self.cdp.send("Emulation.setLocaleOverride", json!({"locale": locale})).await?;
+                Ok(json!({"action": "emulate", "sub": "locale", "locale": locale}))
+            }
+            "timezone" => {
+                let tz = args.get("timezone_id").and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("emulate timezone: `timezone_id` required"))?;
+                self.cdp.send("Emulation.setTimezoneOverride", json!({"timezoneId": tz})).await?;
+                Ok(json!({"action": "emulate", "sub": "timezone", "timezone_id": tz}))
+            }
+            "permission" => {
+                let perms: Vec<String> = args.get("permissions")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                self.cdp.send("Browser.grantPermissions", json!({"permissions": perms})).await?;
+                Ok(json!({"action": "emulate", "sub": "permission", "granted": perms}))
+            }
+            _ => Err(anyhow!("emulate: use geo/locale/timezone/permission"))
+        }
+    }
+
+    // -- Task 6: Screenshot Diff ------------------------------------------------
+
+    async fn cmd_diff(&mut self, args: &Value) -> Result<Value> {
+        let sub = args.get("value").and_then(|v| v.as_str()).unwrap_or("mark");
+        match sub {
+            "mark" => {
+                let result = self.cdp.send("Page.captureScreenshot", json!({"format": "png"})).await?;
+                let data = result.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                self.before_screenshot = Some(data.to_owned());
+                Ok(json!({"action": "diff", "sub": "mark", "text": "Baseline screenshot captured"}))
+            }
+            "compare" => {
+                let before = self.before_screenshot.as_deref()
+                    .ok_or_else(|| anyhow!("diff compare: call diff mark first"))?;
+                let after_result = self.cdp.send("Page.captureScreenshot", json!({"format": "png"})).await?;
+                let after = after_result.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                let changed = before != after;
+                let before_bytes = before.len();
+                let after_bytes = after.len();
+                let diff_ratio = if before_bytes == 0 { 1.0 } else {
+                    let common = before.bytes().zip(after.bytes()).filter(|(a, b)| a == b).count();
+                    1.0 - (common as f64 / before_bytes.max(after_bytes) as f64)
+                };
+                Ok(json!({
+                    "action": "diff", "sub": "compare", "changed": changed,
+                    "diff_ratio": format!("{:.1}%", diff_ratio * 100.0),
+                    "before_image": format!("data:image/png;base64,{before}"),
+                    "after_image": format!("data:image/png;base64,{after}"),
+                }))
+            }
+            _ => Err(anyhow!("diff: use mark/compare"))
+        }
+    }
+
+    // -- Task 7: Operation Recording --------------------------------------------
+
+    async fn cmd_record(&mut self, args: &Value) -> Result<Value> {
+        let sub = args.get("value").and_then(|v| v.as_str()).unwrap_or("start");
+        match sub {
+            "start" => {
+                self.recording = Some(Vec::new());
+                Ok(json!({"action": "record", "sub": "start", "text": "Recording started"}))
+            }
+            "stop" => {
+                let entries = self.recording.take().unwrap_or_default();
+                let count = entries.len();
+                Ok(json!({"action": "record", "sub": "stop", "operations": count, "trace": entries}))
+            }
+            "status" => {
+                let active = self.recording.is_some();
+                let count = self.recording.as_ref().map(|e| e.len()).unwrap_or(0);
+                Ok(json!({"action": "record", "sub": "status", "active": active, "operations": count}))
+            }
+            _ => Err(anyhow!("record: use start/stop/status"))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1585,6 +1890,9 @@ fn escape_js_string(s: &str) -> String {
 
 /// JS helper to find an element by data-ref, including inside same-origin iframes.
 const FIND_REF_JS: &str = r#"function findRef(ref){var el=document.querySelector('[data-ref="'+ref+'"]');if(el)return el;var iframes=document.querySelectorAll('iframe');for(var i=0;i<iframes.length;i++){try{var doc=iframes[i].contentDocument;if(doc){el=doc.querySelector('[data-ref="'+ref+'"]');if(el)return el;}}catch(e){}}return null;}"#;
+
+/// JS helper: wait for element to be visible, enabled, and position-stable.
+const WAIT_ACTIONABLE_JS: &str = r#"function waitActionable(el,ms){return new Promise(function(resolve){var deadline=Date.now()+(ms||5000);var lastRect=null;function check(){if(Date.now()>deadline){resolve('TIMEOUT');return;}var rect=el.getBoundingClientRect();var style=getComputedStyle(el);var visible=rect.width>0&&rect.height>0&&style.visibility!=='hidden'&&style.display!=='none';var enabled=!el.disabled;var stable=lastRect&&Math.abs(rect.top-lastRect.top)<2&&Math.abs(rect.left-lastRect.left)<2;lastRect=rect;if(visible&&enabled&&stable){resolve('OK');}else{setTimeout(check,50);}}check();});}"#;
 
 const SNAPSHOT_JS: &str = r#"(function(){
   var lines = [];
