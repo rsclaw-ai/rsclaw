@@ -538,7 +538,6 @@ impl AgentRuntime {
                         crate::acp::types::StopReason::MaxTokens => "⚠️",
                         crate::acp::types::StopReason::Cancelled => "⏹️",
                         crate::acp::types::StopReason::Incomplete => "❓",
-                        _ => "✅",
                     };
 
                     let summary = if !result_content.is_empty() {
@@ -893,7 +892,6 @@ impl AgentRuntime {
                         crate::acp::types::StopReason::MaxTokens => "⚠️",
                         crate::acp::types::StopReason::Cancelled => "⏹️",
                         crate::acp::types::StopReason::Incomplete => "❓",
-                        _ => "✅",
                     };
 
                     let summary = if !result_content.is_empty() {
