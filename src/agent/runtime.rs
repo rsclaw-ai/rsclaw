@@ -2795,6 +2795,11 @@ impl AgentRuntime {
                 }
                 match event? {
                     StreamEvent::TextDelta(delta) => {
+                        // Close <think> tag when transitioning from reasoning to text.
+                        if !reasoning_buf.is_empty() && !text_buf.ends_with("</think>") {
+                            text_buf.push_str("</think>");
+                            delta_buf.push_str("</think>");
+                        }
                         text_buf.push_str(&delta);
                         // Update live status text preview (first ~200 chars).
                         if text_buf.len() <= 250 {
@@ -2828,10 +2833,14 @@ impl AgentRuntime {
                         }
                     }
                     StreamEvent::ReasoningDelta(delta) => {
-                        reasoning_buf.push_str(&delta);
-                        if reasoning_buf.len() <= 50 {
-                            tracing::debug!(reasoning_len = reasoning_buf.len(), "agent_loop: got reasoning delta");
+                        // Emit reasoning as <think> tags in the text stream.
+                        if reasoning_buf.is_empty() {
+                            text_buf.push_str("<think>");
+                            delta_buf.push_str("<think>");
                         }
+                        reasoning_buf.push_str(&delta);
+                        text_buf.push_str(&delta);
+                        delta_buf.push_str(&delta);
                     }
                     StreamEvent::ToolCall { id, name, input } => {
                         if !id.is_empty() && !name.is_empty() {
@@ -2900,6 +2909,12 @@ impl AgentRuntime {
                         return Err(anyhow!("LLM stream error: {e}"));
                     }
                 }
+            }
+
+            // Close unclosed <think> tag if stream ended during reasoning.
+            if !reasoning_buf.is_empty() && !text_buf.ends_with("</think>") {
+                text_buf.push_str("</think>");
+                delta_buf.push_str("</think>");
             }
 
             // Flush any remaining buffered delta.
