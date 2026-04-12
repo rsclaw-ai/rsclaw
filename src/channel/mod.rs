@@ -74,6 +74,9 @@ pub struct OutboundMessage {
     pub reply_to: Option<String>,
     /// Image attachments (base64 data URIs).
     pub images: Vec<String>,
+    /// File attachments: Vec<(filename, mime_type, file_path_or_url)>.
+    /// Supported by channels that can send files (feishu, telegram, etc.).
+    pub files: Vec<(String, String, String)>,
     /// Channel name to use for sending (e.g., "feishu", "telegram").
     /// Used by background tasks (opencode, claudecode) to route notifications.
     pub channel: Option<String>,

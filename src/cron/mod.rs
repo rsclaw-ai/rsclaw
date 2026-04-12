@@ -1143,6 +1143,7 @@ async fn send_delivery(
         text: text.to_owned(),
         reply_to: delivery.thread_id.clone(),
         images: vec![],
+        files: vec![],
         channel: Some(channel_name.to_owned()),
     };
 

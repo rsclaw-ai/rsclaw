@@ -406,6 +406,7 @@ impl AgentRuntime {
                         text: format!("❌ OpenCode 启动失败\n\n{}", e),
                         reply_to: None,
                         images: vec![],
+                        files: vec![],
                         channel: Some(channel_name.clone()),
                     });
                 }
@@ -425,6 +426,7 @@ impl AgentRuntime {
                 text: "🚀 OpenCode 任务已提交，执行中...".to_string(),
                 reply_to: None,
                 images: vec![],
+                files: vec![],
                 channel: Some(channel_name.clone()),
             });
         }
@@ -578,6 +580,7 @@ impl AgentRuntime {
                             text: summary,
                             reply_to: None,
                             images: vec![],
+                            files: vec![],
                             channel: Some(channel_bg.clone()),
                         }) {
                             Ok(_) => {
@@ -600,6 +603,7 @@ impl AgentRuntime {
                             text: format!("❌ OpenCode 错误\n\n{}", e),
                             reply_to: None,
                             images: vec![],
+                            files: vec![],
                             channel: Some(channel_bg.clone()),
                         });
                     }
@@ -765,6 +769,7 @@ impl AgentRuntime {
                         text: format!("❌ Claude Code 启动失败\n\n{}", e),
                         reply_to: None,
                         images: vec![],
+                        files: vec![],
                         channel: Some(channel_name.clone()),
                     });
                 }
@@ -784,6 +789,7 @@ impl AgentRuntime {
                 text: "🚀 Claude Code 任务已提交，执行中...".to_string(),
                 reply_to: None,
                 images: vec![],
+                files: vec![],
                 channel: Some(channel_name.clone()),
             });
         }
@@ -932,6 +938,7 @@ impl AgentRuntime {
                             text: summary,
                             reply_to: None,
                             images: vec![],
+                            files: vec![],
                             channel: Some(channel_bg.clone()),
                         }) {
                             Ok(_) => {
@@ -954,6 +961,7 @@ impl AgentRuntime {
                             text: format!("❌ Claude Code 错误\n\n{}", e),
                             reply_to: None,
                             images: vec![],
+                            files: vec![],
                             channel: Some(channel_bg.clone()),
                         });
                     }

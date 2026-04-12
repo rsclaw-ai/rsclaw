@@ -908,7 +908,8 @@ async fn send_processing(
             reply_to: None,
             images: vec![],
             channel: None,
-        }),
+
+                    files: vec![],        }),
     )
     .await;
 }
@@ -1090,7 +1091,8 @@ fn start_channels(
                                 reply_to: None,
                                 images: reply.images,
                                 channel: None,
-                            })
+
+                    files: vec![],                            })
                             .await;
                     }
                     if let Some(analysis) = pending {
@@ -1274,7 +1276,8 @@ fn start_channels(
                                             reply_to: None,
                                             images: vec![],
             channel: None,
-                                        })
+
+                    files: vec![],                                        })
                                         .await;
                                     return;
                                 }
@@ -1287,7 +1290,8 @@ fn start_channels(
                                             reply_to: None,
                                             images: vec![],
             channel: None,
-                                        })
+
+                    files: vec![],                                        })
                                         .await;
                                     return;
                                 }
@@ -1377,7 +1381,8 @@ fn start_channels(
                                                         reply_to: None,
                                                         images: r.images,
                                                         channel: None,
-                                                    })
+
+                    files: vec![],                                                    })
                                                     .await;
                                             }
                                             if let Some(analysis) = pending {
@@ -1433,7 +1438,8 @@ fn start_channels(
                                         reply_to: None,
                                         images: vec![],
             channel: None,
-                                    }).await;
+
+                    files: vec![],                                    }).await;
                                 }
                             });
                             return;
@@ -1721,7 +1727,8 @@ fn start_discord_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -1738,7 +1745,8 @@ fn start_discord_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -1831,7 +1839,8 @@ fn start_discord_if_configured(
                                                     reply_to: None,
                                                     images: r.images,
                                                     channel: None,
-                                                })
+
+                    files: vec![],                                                })
                                                 .await;
                                         }
                                         if let Some(analysis) = pending {
@@ -1882,7 +1891,8 @@ fn start_discord_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                             }
                         });
@@ -2094,7 +2104,8 @@ fn start_slack_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -2111,7 +2122,8 @@ fn start_slack_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -2204,7 +2216,8 @@ fn start_slack_if_configured(
                                                     reply_to: None,
                                                     images: r.images,
                                                     channel: None,
-                                                })
+
+                    files: vec![],                                                })
                                                 .await;
                                         }
                                         if let Some(analysis) = pending {
@@ -2255,7 +2268,8 @@ fn start_slack_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                             }
                         });
@@ -2415,7 +2429,8 @@ fn start_whatsapp_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -2432,7 +2447,8 @@ fn start_whatsapp_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -2506,7 +2522,8 @@ fn start_whatsapp_if_configured(
                                             reply_to: None,
                                             images: r.images,
                                             channel: None,
-                                        })
+
+                    files: vec![],                                        })
                                         .await;
                                 }
                                 if let Some(analysis) = pending {
@@ -2557,7 +2574,8 @@ fn start_whatsapp_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                             }
                         });
@@ -2741,7 +2759,8 @@ fn start_line_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -2758,7 +2777,8 @@ fn start_line_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -2837,7 +2857,8 @@ fn start_line_if_configured(
                                                 reply_to: None,
                                                 images: r.images,
                                                 channel: None,
-                                            })
+
+                    files: vec![],                                            })
                                             .await;
                                     }
                                     if let Some(analysis) = pending {
@@ -2888,7 +2909,8 @@ fn start_line_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                             }
                         });
@@ -3038,7 +3060,8 @@ fn start_zalo_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -3055,7 +3078,8 @@ fn start_zalo_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -3129,7 +3153,8 @@ fn start_zalo_if_configured(
                                                 reply_to: None,
                                                 images: r.images,
                                                 channel: None,
-                                            })
+
+                    files: vec![],                                            })
                                             .await;
                                     }
                                     if let Some(analysis) = pending {
@@ -3180,7 +3205,8 @@ fn start_zalo_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                             }
                         });
@@ -3349,7 +3375,8 @@ fn start_signal_if_configured(
                                     reply_to: None,
                                     images: vec![],
                                     channel: None,
-                                })
+
+                    files: vec![],                                })
                                 .await;
                             return;
                         }
@@ -3366,7 +3393,8 @@ fn start_signal_if_configured(
                                     reply_to: None,
                                     images: vec![],
                                     channel: None,
-                                })
+
+                    files: vec![],                                })
                                 .await;
                             return;
                         }
@@ -3447,7 +3475,8 @@ fn start_signal_if_configured(
                                             reply_to: None,
                                             images: r.images,
                                             channel: None,
-                                        })
+
+                    files: vec![],                                        })
                                         .await;
                                 }
                                 if let Some(analysis) = pending {
@@ -3494,7 +3523,8 @@ fn start_signal_if_configured(
                                     reply_to: None,
                                     images: vec![],
                                     channel: None,
-                                })
+
+                    files: vec![],                                })
                                 .await;
                         }
                     });
@@ -3692,7 +3722,8 @@ fn spawn_wechat_user_worker(
                                     reply_to: None,
                                     images: r.images,
                                     channel: None,
-                                })
+
+                    files: vec![],                                })
                                 .await
                             {
                                 error!("wechat: failed to queue reply: {e:#}");
@@ -3887,7 +3918,8 @@ fn start_wechat_personal_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -3904,7 +3936,8 @@ fn start_wechat_personal_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -3972,7 +4005,8 @@ fn start_wechat_personal_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                             }
                         });
@@ -4234,7 +4268,8 @@ fn start_feishu_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -4251,7 +4286,8 @@ fn start_feishu_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -4353,7 +4389,8 @@ fn start_feishu_if_configured(
                                                         reply_to: None,
                                                         images: r.images,
                                                         channel: None,
-                                                    })
+
+                    files: vec![],                                                    })
                                                     .await;
                                             }
                                             if let Some(analysis) = pending {
@@ -4406,7 +4443,8 @@ fn start_feishu_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                             }
                         });
@@ -4640,7 +4678,8 @@ fn start_dingtalk_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -4657,7 +4696,8 @@ fn start_dingtalk_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -4758,7 +4798,8 @@ fn start_dingtalk_if_configured(
                                                         reply_to: None,
                                                         images: r.images,
                                                         channel: None,
-                                                    })
+
+                    files: vec![],                                                    })
                                                     .await;
                                             }
                                             if let Some(analysis) = pending {
@@ -4813,7 +4854,8 @@ fn start_dingtalk_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                             }
                         });
@@ -5101,7 +5143,8 @@ fn start_qq_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -5118,7 +5161,8 @@ fn start_qq_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -5196,7 +5240,8 @@ fn start_qq_if_configured(
                                                 reply_to: Some(msg_id),
                                                 images: r.images,
                                                 channel: None,
-                                            })
+
+                    files: vec![],                                            })
                                             .await;
                                         if let Some(analysis) = pending {
                                             handle_pending_analysis(
@@ -5248,7 +5293,8 @@ fn start_qq_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                             }
                         });
@@ -5465,7 +5511,8 @@ fn start_matrix_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -5482,7 +5529,8 @@ fn start_matrix_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -5565,7 +5613,8 @@ fn start_matrix_if_configured(
                                             reply_to: None,
                                             images: r.images,
                                             channel: None,
-                                        }).await;
+
+                    files: vec![],                                        }).await;
                                     }
                                     if let Some(analysis) = pending {
                                         handle_pending_analysis(
@@ -5618,7 +5667,8 @@ fn start_matrix_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                             }
                         });
@@ -5815,7 +5865,8 @@ fn start_wecom_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                                 return;
                             }
@@ -5904,7 +5955,8 @@ fn start_wecom_if_configured(
                                             reply_to: None,
                                             images: r.images,
                                             channel: None,
-                                        })
+
+                    files: vec![],                                        })
                                         .await;
                                 }
                                 if let Some(analysis) = pending {
@@ -5957,7 +6009,8 @@ fn start_wecom_if_configured(
                                         reply_to: None,
                                         images: vec![],
                                         channel: None,
-                                    })
+
+                    files: vec![],                                    })
                                     .await;
                             }
                         });
@@ -6120,7 +6173,8 @@ fn start_custom_webhook(
                             reply_to: None,
                             images: r.images,
                             channel: None,
-                        })
+
+                    files: vec![],                        })
                         .await;
                 }
                 if let Some(analysis) = pending {
@@ -6231,7 +6285,8 @@ fn start_custom_websocket(
                             reply_to: None,
                             images: r.images,
                             channel: None,
-                        })
+
+                    files: vec![],                        })
                         .await;
                 }
                 if let Some(analysis) = pending {
@@ -6313,7 +6368,8 @@ async fn handle_pending_analysis(
                 reply_to: None,
                 images: vec![],
                 channel: None,
-            })
+
+                    files: vec![],            })
             .await;
         return;
     }
@@ -6327,7 +6383,8 @@ async fn handle_pending_analysis(
                     reply_to: None,
                     images: r.images,
                     channel: None,
-                })
+
+                    files: vec![],                })
                 .await;
         }
         Ok(Ok(_)) => {} // empty reply, nothing to send
@@ -6340,7 +6397,8 @@ async fn handle_pending_analysis(
                     reply_to: None,
                     images: vec![],
                     channel: None,
-                })
+
+                    files: vec![],                })
                 .await;
         }
         Err(_) => {
@@ -6352,7 +6410,8 @@ async fn handle_pending_analysis(
                     reply_to: None,
                     images: vec![],
                     channel: None,
-                })
+
+                    files: vec![],                })
                 .await;
         }
     }
