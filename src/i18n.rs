@@ -1176,6 +1176,15 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "de" => "Verarbeitung läuft, bitte warten...",
     );
 
+    msg!("search_captcha_blocked",
+        "en" => "All free search providers were blocked (CAPTCHA). Consider configuring an API key (serper, brave, or bing) in settings for reliable search.",
+        "zh" => "所有免费搜索引擎被人机验证拦截。建议在设置中配置搜索 API 密钥（serper、brave 或 bing）以获得稳定的搜索服务。",
+        "ja" => "全ての無料検索エンジンがCAPTCHAでブロックされました。安定した検索のため、設定でAPIキー（serper、brave、bing）の設定をお勧めします。",
+        "ko" => "모든 무료 검색 엔진이 CAPTCHA에 의해 차단되었습니다. 안정적인 검색을 위해 설정에서 API 키(serper, brave, bing)를 구성하세요.",
+        "fr" => "Tous les moteurs de recherche gratuits sont bloqués (CAPTCHA). Configurez une clé API (serper, brave ou bing) pour une recherche fiable.",
+        "de" => "Alle kostenlosen Suchmaschinen wurden durch CAPTCHA blockiert. Konfigurieren Sie einen API-Schlüssel (serper, brave oder bing) für zuverlässige Suche.",
+    );
+
     m
 });
 

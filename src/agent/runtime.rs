@@ -5245,10 +5245,11 @@ impl AgentRuntime {
 
         // If still empty after all attempts, add a hint about API keys.
         if results.is_empty() && is_free_mode {
+            let i18n_lang = crate::i18n::default_lang();
             return Ok(json!({
                 "results": [],
                 "provider": chosen,
-                "error": "All free search providers were blocked (CAPTCHA). Consider configuring an API key (serper, brave, or bing) for reliable search."
+                "error": crate::i18n::t("search_captcha_blocked", i18n_lang)
             }));
         }
 
