@@ -5171,7 +5171,11 @@ impl AgentRuntime {
                 // Check memory before launching
                 crate::browser::can_launch_chrome()?;
 
-                let bs = crate::browser::BrowserSession::start(&chrome_path).await?;
+                let headed = self.config.ext.tools.as_ref()
+                    .and_then(|t| t.web_browser.as_ref())
+                    .and_then(|b| b.headed)
+                    .unwrap_or(false);
+                let bs = crate::browser::BrowserSession::start(&chrome_path, headed).await?;
                 *guard = Some(bs);
             }
         }
@@ -8204,19 +8208,48 @@ fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "web_browser".to_owned(),
-        description: "Control a web browser via CDP. Actions: open, snapshot, click, fill, type, select, check, uncheck, scroll, screenshot, pdf, back, forward, reload, get_text, get_url, get_title, wait, evaluate, cookies".to_owned(),
+        description: "Control a web browser via CDP. Actions: open, snapshot, click, fill, type, \
+            select, check, uncheck, scroll, screenshot, pdf, back, forward, reload, \
+            get_text, get_url, get_title, wait, evaluate, cookies, press, set_viewport, \
+            dialog, state, network, new_tab, list_tabs, switch_tab, close_tab, \
+            highlight, clipboard, find, get_article".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "action":    {"type": "string", "description": "Action to perform"},
-                "url":       {"type": "string", "description": "URL for open action"},
-                "ref":       {"type": "string", "description": "Element reference like @e3 from snapshot"},
-                "text":      {"type": "string", "description": "Text for fill/type actions"},
-                "value":     {"type": "string", "description": "Value for select action"},
-                "direction": {"type": "string", "description": "up/down for scroll"},
-                "js":        {"type": "string", "description": "JavaScript for evaluate action"},
-                "target":    {"type": "string", "description": "element/text/url for wait action"},
-                "timeout":   {"type": "number", "description": "Timeout in seconds (default 15)"}
+                "action":     {"type": "string", "enum": [
+                    "open", "navigate", "snapshot", "click", "fill", "type",
+                    "select", "check", "uncheck", "scroll", "screenshot", "pdf",
+                    "back", "forward", "reload", "get_text", "get_url", "get_title",
+                    "wait", "evaluate", "cookies", "press", "set_viewport",
+                    "dialog", "state", "network", "new_tab", "list_tabs",
+                    "switch_tab", "close_tab", "highlight", "clipboard", "find",
+                    "get_article"
+                ]},
+                "url":        {"type": "string", "description": "URL for open/navigate"},
+                "ref":        {"type": "string", "description": "Element ref like @e3 from snapshot"},
+                "text":       {"type": "string", "description": "Text for fill/type/clipboard write/dialog prompt"},
+                "value":      {"type": "string", "description": "Value for select, or sub-action for cookies/state/dialog/network/clipboard"},
+                "key":        {"type": "string", "description": "Key name for press (Enter, Tab, Escape, etc.)"},
+                "direction":  {"type": "string", "enum": ["up", "down", "left", "right"], "description": "Scroll direction"},
+                "amount":     {"type": "integer", "description": "Scroll distance in pixels (default 500)"},
+                "selector":   {"type": "string", "description": "CSS selector for scroll container"},
+                "js":         {"type": "string", "description": "JavaScript for evaluate action"},
+                "target":     {"type": "string", "description": "Wait target: CSS selector, text, url, networkidle, fn"},
+                "timeout":    {"type": "number", "description": "Timeout in seconds (default 15)"},
+                "format":     {"type": "string", "enum": ["png", "jpeg"], "description": "Screenshot format"},
+                "quality":    {"type": "integer", "description": "JPEG quality (1-100)"},
+                "full_page":  {"type": "boolean", "description": "Capture full scrollable page"},
+                "annotate":   {"type": "boolean", "description": "Overlay numbered labels on interactive elements"},
+                "width":      {"type": "integer", "description": "Viewport width for set_viewport"},
+                "height":     {"type": "integer", "description": "Viewport height for set_viewport"},
+                "scale":      {"type": "number", "description": "Device scale factor for set_viewport"},
+                "mobile":     {"type": "boolean", "description": "Mobile emulation for set_viewport"},
+                "target_id":  {"type": "string", "description": "Tab target ID for switch_tab/close_tab"},
+                "state":      {"type": "object", "description": "State object for state load"},
+                "pattern":    {"type": "string", "description": "URL pattern for network block"},
+                "by":         {"type": "string", "enum": ["text", "label"], "description": "Find element by text or label"},
+                "then":       {"type": "string", "description": "Action after find (click)"},
+                "cookie":     {"type": "object", "description": "Cookie object for cookies set"}
             },
             "required": ["action"]
         }),

@@ -31,6 +31,8 @@ workspace/
 # Claude
 /CLAUDE.md
 /.claude/settings.local.json
+docs/superpowers/
+.opencode/
 
 # Sub-agent worktrees
 /.worktrees/

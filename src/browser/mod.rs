@@ -154,21 +154,25 @@ struct ChromeProcess {
 }
 
 impl ChromeProcess {
-    async fn launch(chrome_path: &str) -> Result<Self> {
+    async fn launch(chrome_path: &str, headed: bool) -> Result<Self> {
         can_launch_chrome()?;
 
         let tmp_dir = tempfile::tempdir()
             .map_err(|e| anyhow!("failed to create temp dir for Chrome profile: {e}"))?;
 
+        let mut args = vec![
+            "--disable-gpu",
+            "--no-sandbox",
+            "--disable-extensions",
+            "--remote-debugging-port=0",
+            "--window-size=1280,720",
+        ];
+        if !headed {
+            args.push("--headless=new");
+        }
+
         let mut child = tokio::process::Command::new(chrome_path)
-            .args([
-                "--headless=new",
-                "--disable-gpu",
-                "--no-sandbox",
-                "--disable-extensions",
-                "--remote-debugging-port=0",
-                "--window-size=1280,720",
-            ])
+            .args(&args)
             .arg(format!("--user-data-dir={}", tmp_dir.path().display()))
             .stderr(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
@@ -280,6 +284,7 @@ impl Drop for ChromeProcess {
 // ---------------------------------------------------------------------------
 
 struct CdpClient {
+    ws_url: String,
     ws_tx: mpsc::UnboundedSender<String>,
     pending: Arc<Mutex<HashMap<u32, oneshot::Sender<Value>>>>,
     events_rx: Mutex<mpsc::UnboundedReceiver<Value>>,
@@ -338,11 +343,16 @@ impl CdpClient {
         });
 
         Ok(Self {
+            ws_url: ws_url.to_owned(),
             ws_tx,
             pending,
             events_rx: Mutex::new(events_rx),
             next_id: AtomicU32::new(1),
         })
+    }
+
+    fn ws_url(&self) -> &str {
+        &self.ws_url
     }
 
     /// Send a CDP command and wait for the matching response.
@@ -419,14 +429,20 @@ pub struct BrowserSession {
     ref_counter: u32,
     /// Chrome binary path (for restart).
     chrome_path: String,
+    /// Run with visible window.
+    headed: bool,
+    /// Pending dialog message (confirm/prompt).
+    pending_dialog: Option<String>,
+    /// Accumulated blocked URL patterns for network interception.
+    blocked_urls: Vec<String>,
     /// Last activity timestamp (for idle timeout).
     last_activity: Arc<AtomicU64>,
 }
 
 impl BrowserSession {
     /// Launch Chrome, discover the default page target, and connect CDP.
-    pub async fn start(chrome_path: &str) -> Result<Self> {
-        let chrome = ChromeProcess::launch(chrome_path).await?;
+    pub async fn start(chrome_path: &str, headed: bool) -> Result<Self> {
+        let chrome = ChromeProcess::launch(chrome_path, headed).await?;
         let cdp = Self::connect_cdp(&chrome).await?;
 
         let now = std::time::SystemTime::now()
@@ -440,6 +456,9 @@ impl BrowserSession {
             refs: HashMap::new(),
             ref_counter: 0,
             chrome_path: chrome_path.to_owned(),
+            headed,
+            pending_dialog: None,
+            blocked_urls: Vec::new(),
             last_activity: Arc::new(AtomicU64::new(now)),
         })
     }
@@ -471,6 +490,7 @@ impl BrowserSession {
         cdp.send("DOM.enable", json!({})).await?;
         cdp.send("Runtime.enable", json!({})).await?;
         cdp.send("Network.enable", json!({})).await?;
+        cdp.send("Target.setDiscoverTargets", json!({"discover": true})).await?;
 
         Ok(cdp)
     }
@@ -494,7 +514,7 @@ impl BrowserSession {
     async fn restart(&mut self) -> Result<()> {
         warn!("restarting Chrome browser session");
         // Drop old chrome (kills process via Drop)
-        let new_chrome = ChromeProcess::launch(&self.chrome_path).await?;
+        let new_chrome = ChromeProcess::launch(&self.chrome_path, self.headed).await?;
         let new_cdp = Self::connect_cdp(&new_chrome).await?;
         self.chrome = new_chrome;
         self.cdp = new_cdp;
@@ -527,6 +547,27 @@ impl BrowserSession {
 
         self.touch_activity();
 
+        // Drain events, then handle dialogs outside the lock to avoid holding it during CDP send.
+        let dialog_events: Vec<Value> = {
+            let mut rx = self.cdp.events_rx.lock().await;
+            let mut events = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                if event.get("method").and_then(|m| m.as_str()) == Some("Page.javascriptDialogOpening") {
+                    events.push(event);
+                }
+            }
+            events
+        };
+        for event in dialog_events {
+            let msg = event["params"]["message"].as_str().unwrap_or("").to_string();
+            let dtype = event["params"]["type"].as_str().unwrap_or("");
+            if dtype == "alert" || dtype == "beforeunload" {
+                let _ = self.cdp.send("Page.handleJavaScriptDialog", json!({"accept": true})).await;
+            } else {
+                self.pending_dialog = Some(msg);
+            }
+        }
+
         let result = match action {
             "open" | "navigate" => self.cmd_open(args).await,
             "snapshot" => self.cmd_snapshot().await,
@@ -536,7 +577,7 @@ impl BrowserSession {
             "check" => self.cmd_check(args, true).await,
             "uncheck" => self.cmd_check(args, false).await,
             "scroll" => self.cmd_scroll(args).await,
-            "screenshot" => self.cmd_screenshot().await,
+            "screenshot" => self.cmd_screenshot(args).await,
             "pdf" => self.cmd_pdf().await,
             "back" => self.cmd_back().await,
             "forward" => self.cmd_forward().await,
@@ -547,6 +588,19 @@ impl BrowserSession {
             "wait" => self.cmd_wait(args).await,
             "evaluate" => self.cmd_evaluate(args).await,
             "cookies" => self.cmd_cookies(args).await,
+            "press" => self.cmd_press(args).await,
+            "set_viewport" => self.cmd_set_viewport(args).await,
+            "dialog" => self.cmd_dialog(args).await,
+            "new_tab" => self.cmd_new_tab(args).await,
+            "list_tabs" => self.cmd_list_tabs().await,
+            "switch_tab" => self.cmd_switch_tab(args).await,
+            "close_tab" => self.cmd_close_tab(args).await,
+            "state" => self.cmd_state(args).await,
+            "network" => self.cmd_network(args).await,
+            "highlight" => self.cmd_highlight(args).await,
+            "clipboard" => self.cmd_clipboard(args).await,
+            "find" => self.cmd_find(args).await,
+            "get_article" => self.cmd_get_article().await,
             other => Err(anyhow!("web_browser: unsupported action `{other}`")),
         };
 
@@ -649,16 +703,18 @@ impl BrowserSession {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("click: `ref` required (e.g. @e3)"))?;
 
-        // Use JS to find element by data-ref and click it.
+        // Use JS to find element by data-ref (including inside iframes) and click it.
         let js = format!(
             r#"(function(){{
-                var el = document.querySelector('[data-ref="{}"]');
+                {FIND_REF_JS}
+                var el = findRef('{}');
                 if (!el) return 'NOT_FOUND';
                 el.scrollIntoView({{block:'center'}});
                 el.click();
                 return 'OK';
             }})()"#,
-            escape_js_string(eref)
+            escape_js_string(eref),
+            FIND_REF_JS = FIND_REF_JS,
         );
 
         let result = self.eval_js(&js).await?;
@@ -684,7 +740,8 @@ impl BrowserSession {
             let escaped_text = escape_js_string(text);
             let js = format!(
                 r#"(function(){{
-                    var el = document.querySelector('[data-ref="{}"]');
+                    {FIND_REF_JS}
+                    var el = findRef('{}');
                     if (!el) return 'NOT_FOUND';
                     el.focus();
                     el.value = '{}';
@@ -693,7 +750,8 @@ impl BrowserSession {
                     return 'OK';
                 }})()"#,
                 escape_js_string(eref),
-                escaped_text
+                escaped_text,
+                FIND_REF_JS = FIND_REF_JS,
             );
 
             let result = self.eval_js(&js).await?;
@@ -740,14 +798,16 @@ impl BrowserSession {
 
         let js = format!(
             r#"(function(){{
-                var el = document.querySelector('[data-ref="{}"]');
+                {FIND_REF_JS}
+                var el = findRef('{}');
                 if (!el) return 'NOT_FOUND';
                 el.value = '{}';
                 el.dispatchEvent(new Event('change', {{bubbles:true}}));
                 return 'OK';
             }})()"#,
             escape_js_string(eref),
-            escape_js_string(value)
+            escape_js_string(value),
+            FIND_REF_JS = FIND_REF_JS,
         );
 
         let result = self.eval_js(&js).await?;
@@ -767,13 +827,15 @@ impl BrowserSession {
         let desired = if check { "true" } else { "false" };
         let js = format!(
             r#"(function(){{
-                var el = document.querySelector('[data-ref="{}"]');
+                {FIND_REF_JS}
+                var el = findRef('{}');
                 if (!el) return 'NOT_FOUND';
                 if (el.checked !== {}) el.click();
                 return 'OK';
             }})()"#,
             escape_js_string(eref),
-            desired
+            desired,
+            FIND_REF_JS = FIND_REF_JS,
         );
 
         let result = self.eval_js(&js).await?;
@@ -790,28 +852,97 @@ impl BrowserSession {
             .get("direction")
             .and_then(|v| v.as_str())
             .unwrap_or("down");
+        let amount = args
+            .get("amount")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(500);
+        let selector = args.get("selector").and_then(|v| v.as_str());
 
-        let delta = if direction == "up" { -500 } else { 500 };
-        let js = format!("window.scrollBy(0, {delta})");
-        self.eval_js(&js).await?;
+        let (dx, dy) = match direction {
+            "up" => (0, -amount),
+            "down" => (0, amount),
+            "left" => (-amount, 0),
+            "right" => (amount, 0),
+            _ => (0, amount),
+        };
 
-        Ok(json!({ "action": "scroll", "direction": direction, "text": format!("Scrolled {direction}") }))
+        let js = if let Some(sel) = selector {
+            format!(
+                r#"(function(){{var el=document.querySelector('{}');if(!el)return 'NOT_FOUND';el.scrollBy({dx},{dy});return 'OK';}})()"#,
+                escape_js_string(sel)
+            )
+        } else {
+            format!("window.scrollBy({dx}, {dy}); 'OK'")
+        };
+
+        let result = self.eval_js(&js).await?;
+        if result == "NOT_FOUND" {
+            bail!("scroll: container `{}` not found", selector.unwrap_or(""));
+        }
+
+        Ok(json!({ "action": "scroll", "direction": direction, "amount": amount }))
     }
 
-    async fn cmd_screenshot(&self) -> Result<Value> {
-        let result = self
-            .cdp
-            .send("Page.captureScreenshot", json!({ "format": "png" }))
-            .await?;
+    async fn cmd_screenshot(&mut self, args: &Value) -> Result<Value> {
+        let format = args.get("format").and_then(|v| v.as_str()).unwrap_or("png");
+        let quality = args.get("quality").and_then(|v| v.as_i64());
+        let full_page = args.get("full_page").and_then(|v| v.as_bool()).unwrap_or(false);
+        let annotate = args.get("annotate").and_then(|v| v.as_bool()).unwrap_or(false);
 
-        let data = result
-            .get("data")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let mut params = json!({ "format": format });
+        if let Some(q) = quality {
+            params["quality"] = json!(q);
+        }
+        if full_page {
+            let dims = self.eval_js(
+                "JSON.stringify({w: document.documentElement.scrollWidth, h: document.documentElement.scrollHeight})"
+            ).await?;
+            if let Ok(d) = serde_json::from_str::<Value>(&dims) {
+                let w = d["w"].as_f64().unwrap_or(1280.0);
+                let h = d["h"].as_f64().unwrap_or(720.0);
+                params["clip"] = json!({ "x": 0, "y": 0, "width": w, "height": h, "scale": 1 });
+                params["captureBeyondViewport"] = json!(true);
+            }
+        }
+
+        let mime = if format == "jpeg" { "image/jpeg" } else { "image/png" };
+
+        // Annotated screenshot: overlay numbered labels on interactive elements
+        if annotate {
+            self.cmd_snapshot().await?;
+
+            let annotate_js = r#"(function(){
+                var refs=document.querySelectorAll('[data-ref]');var labels=[];
+                refs.forEach(function(el){var ref=el.getAttribute('data-ref');
+                var num=ref.replace('@e','');var rect=el.getBoundingClientRect();
+                var label=document.createElement('div');label.className='__rsclaw_annotation';
+                label.textContent=num;label.style.cssText='position:fixed;z-index:999999;background:red;color:white;font-size:11px;font-weight:bold;padding:1px 4px;border-radius:8px;pointer-events:none;left:'+(rect.left-4)+'px;top:'+(rect.top-4)+'px;';
+                document.body.appendChild(label);
+                labels.push({num:parseInt(num),ref:ref,tag:el.tagName.toLowerCase(),text:(el.innerText||el.value||el.alt||'').substring(0,50)});});
+                return JSON.stringify(labels);
+            })()"#;
+
+            let legend_raw = self.eval_js(annotate_js).await?;
+            let result = self.cdp.send("Page.captureScreenshot", params).await?;
+            let data = result.get("data").and_then(|v| v.as_str()).unwrap_or("");
+
+            // Remove annotations
+            let _ = self.eval_js("document.querySelectorAll('.__rsclaw_annotation').forEach(e=>e.remove())").await;
+
+            let legend: Value = serde_json::from_str(&legend_raw).unwrap_or(json!([]));
+            return Ok(json!({
+                "action": "screenshot",
+                "image": format!("data:{mime};base64,{data}"),
+                "legend": legend,
+            }));
+        }
+
+        let result = self.cdp.send("Page.captureScreenshot", params).await?;
+        let data = result.get("data").and_then(|v| v.as_str()).unwrap_or("");
 
         Ok(json!({
             "action": "screenshot",
-            "image": format!("data:image/png;base64,{data}")
+            "image": format!("data:{mime};base64,{data}")
         }))
     }
 
@@ -889,6 +1020,10 @@ impl BrowserSession {
                 r#"document.body.innerText.includes('{}')"#,
                 escape_js_string(value)
             ),
+            "networkidle" => {
+                r#"(function(){var entries=performance.getEntriesByType('resource');if(entries.length===0)return true;var last=entries[entries.length-1];return(performance.now()-last.responseEnd)>500;})()"#.to_string()
+            }
+            "fn" | "js" | "function" => value.to_string(),
             // Default: wait for an element matching a CSS selector.
             _ => format!(
                 r#"!!document.querySelector('{}')"#,
@@ -967,6 +1102,441 @@ impl BrowserSession {
         }
     }
 
+    // -- New actions (Phase 1-3) -----------------------------------------------
+
+    async fn cmd_press(&self, args: &Value) -> Result<Value> {
+        let key = args.get("key").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("press: `key` required"))?;
+
+        let lower = key.to_lowercase();
+        let (key_code, code, text): (i32, String, String) = match lower.as_str() {
+            "enter" | "return" => (13, "Enter".into(), "\r".into()),
+            "tab" => (9, "Tab".into(), "\t".into()),
+            "escape" | "esc" => (27, "Escape".into(), String::new()),
+            "backspace" => (8, "Backspace".into(), String::new()),
+            "delete" => (46, "Delete".into(), String::new()),
+            "arrowup" | "up" => (38, "ArrowUp".into(), String::new()),
+            "arrowdown" | "down" => (40, "ArrowDown".into(), String::new()),
+            "arrowleft" | "left" => (37, "ArrowLeft".into(), String::new()),
+            "arrowright" | "right" => (39, "ArrowRight".into(), String::new()),
+            "space" => (32, "Space".into(), " ".into()),
+            "home" => (36, "Home".into(), String::new()),
+            "end" => (35, "End".into(), String::new()),
+            "pageup" => (33, "PageUp".into(), String::new()),
+            "pagedown" => (34, "PageDown".into(), String::new()),
+            "f1" => (112, "F1".into(), String::new()),
+            "f2" => (113, "F2".into(), String::new()),
+            "f3" => (114, "F3".into(), String::new()),
+            "f4" => (115, "F4".into(), String::new()),
+            "f5" => (116, "F5".into(), String::new()),
+            "f6" => (117, "F6".into(), String::new()),
+            "f7" => (118, "F7".into(), String::new()),
+            "f8" => (119, "F8".into(), String::new()),
+            "f9" => (120, "F9".into(), String::new()),
+            "f10" => (121, "F10".into(), String::new()),
+            "f11" => (122, "F11".into(), String::new()),
+            "f12" => (123, "F12".into(), String::new()),
+            other => {
+                // Single printable character
+                let ch = other.chars().next().unwrap_or('\0');
+                let vk = if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_uppercase() as i32
+                } else {
+                    0
+                };
+                (vk, key.to_string(), if ch.is_ascii() && !ch.is_ascii_control() { ch.to_string() } else { String::new() })
+            }
+        };
+
+        self.cdp.send("Input.dispatchKeyEvent", json!({
+            "type": "keyDown",
+            "key": code,
+            "windowsVirtualKeyCode": key_code,
+            "nativeVirtualKeyCode": key_code,
+            "text": text,
+        })).await?;
+        self.cdp.send("Input.dispatchKeyEvent", json!({
+            "type": "keyUp",
+            "key": code,
+            "windowsVirtualKeyCode": key_code,
+            "nativeVirtualKeyCode": key_code,
+        })).await?;
+
+        Ok(json!({ "action": "press", "key": key }))
+    }
+
+    async fn cmd_set_viewport(&self, args: &Value) -> Result<Value> {
+        let width = args.get("width").and_then(|v| v.as_u64()).unwrap_or(1280) as u32;
+        let height = args.get("height").and_then(|v| v.as_u64()).unwrap_or(720) as u32;
+        let scale = args.get("scale").and_then(|v| v.as_f64()).unwrap_or(1.0);
+        let mobile = args.get("mobile").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        self.cdp.send("Emulation.setDeviceMetricsOverride", json!({
+            "width": width,
+            "height": height,
+            "deviceScaleFactor": scale,
+            "mobile": mobile,
+        })).await?;
+
+        Ok(json!({ "action": "set_viewport", "width": width, "height": height, "scale": scale }))
+    }
+
+    async fn cmd_dialog(&mut self, args: &Value) -> Result<Value> {
+        let sub = args.get("value").and_then(|v| v.as_str()).unwrap_or("accept");
+        match sub {
+            "accept" => {
+                let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let mut params = json!({"accept": true});
+                if !text.is_empty() {
+                    params["promptText"] = json!(text);
+                }
+                match self.cdp.send("Page.handleJavaScriptDialog", params).await {
+                    Ok(_) => {
+                        self.pending_dialog = None;
+                        Ok(json!({"action": "dialog", "text": "Dialog accepted"}))
+                    }
+                    Err(_) => Ok(json!({"action": "dialog", "text": "No dialog open to accept"})),
+                }
+            }
+            "dismiss" => {
+                match self.cdp.send("Page.handleJavaScriptDialog", json!({"accept": false})).await {
+                    Ok(_) => {
+                        self.pending_dialog = None;
+                        Ok(json!({"action": "dialog", "text": "Dialog dismissed"}))
+                    }
+                    Err(_) => Ok(json!({"action": "dialog", "text": "No dialog open to dismiss"})),
+                }
+            }
+            "status" => {
+                Ok(json!({"action": "dialog", "pending": self.pending_dialog.is_some(),
+                           "message": self.pending_dialog.as_deref().unwrap_or("")}))
+            }
+            _ => Err(anyhow!("dialog: unknown sub-action (use accept/dismiss/status)"))
+        }
+    }
+
+    async fn cmd_new_tab(&self, args: &Value) -> Result<Value> {
+        let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("about:blank");
+        let result = self.cdp.send("Target.createTarget", json!({"url": url})).await?;
+        let target_id = result.get("targetId").and_then(|v| v.as_str()).unwrap_or("");
+        Ok(json!({"action": "new_tab", "targetId": target_id}))
+    }
+
+    async fn cmd_list_tabs(&self) -> Result<Value> {
+        let port = self.chrome.port()?;
+        let url = format!("http://127.0.0.1:{port}/json");
+        let targets: Vec<Value> = reqwest::get(&url).await?.json().await?;
+        let tabs: Vec<Value> = targets.iter()
+            .filter(|t| t["type"].as_str() == Some("page"))
+            .map(|t| json!({
+                "id": t["id"],
+                "title": t["title"],
+                "url": t["url"],
+            }))
+            .collect();
+        Ok(json!({"action": "list_tabs", "tabs": tabs}))
+    }
+
+    async fn cmd_switch_tab(&mut self, args: &Value) -> Result<Value> {
+        let target_id = args.get("target_id").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("switch_tab: `target_id` required"))?;
+
+        self.cdp.send("Target.activateTarget", json!({"targetId": target_id})).await?;
+
+        let port = self.chrome.port()?;
+        let url = format!("http://127.0.0.1:{port}/json");
+        let targets: Vec<Value> = reqwest::get(&url).await?.json().await?;
+        let target = targets.iter()
+            .find(|t| t["id"].as_str() == Some(target_id))
+            .ok_or_else(|| anyhow!("switch_tab: target not found"))?;
+        let ws_url = target["webSocketDebuggerUrl"].as_str()
+            .ok_or_else(|| anyhow!("switch_tab: no WebSocket URL"))?;
+
+        let new_cdp = CdpClient::connect(ws_url).await?;
+        new_cdp.send("Page.enable", json!({})).await?;
+        new_cdp.send("DOM.enable", json!({})).await?;
+        new_cdp.send("Runtime.enable", json!({})).await?;
+        new_cdp.send("Network.enable", json!({})).await?;
+
+        self.cdp = new_cdp;
+        self.refs.clear();
+        self.ref_counter = 0;
+
+        Ok(json!({"action": "switch_tab", "target_id": target_id}))
+    }
+
+    async fn cmd_close_tab(&mut self, args: &Value) -> Result<Value> {
+        let target_id = args.get("target_id").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("close_tab: `target_id` required"))?;
+
+        // Detect if this is the active tab by checking the current CDP ws_url.
+        // If closing the active tab, switch to another tab first.
+        let port = self.chrome.port()?;
+        let url = format!("http://127.0.0.1:{port}/json");
+        let targets: Vec<Value> = reqwest::get(&url).await?.json().await?;
+        let is_active = targets.iter().any(|t| {
+            t["id"].as_str() == Some(target_id) &&
+            t["webSocketDebuggerUrl"].as_str().map(|ws| self.cdp.ws_url() == ws).unwrap_or(false)
+        });
+
+        if is_active {
+            // Find another tab to switch to
+            let other = targets.iter()
+                .find(|t| t["type"].as_str() == Some("page") && t["id"].as_str() != Some(target_id));
+            if let Some(other_target) = other {
+                let other_id = other_target["id"].as_str().unwrap_or("");
+                self.cmd_switch_tab(&json!({"target_id": other_id})).await?;
+            } else {
+                bail!("close_tab: cannot close the only remaining tab");
+            }
+        }
+
+        self.cdp.send("Target.closeTarget", json!({"targetId": target_id})).await?;
+        Ok(json!({"action": "close_tab", "target_id": target_id}))
+    }
+
+    async fn cmd_state(&mut self, args: &Value) -> Result<Value> {
+        let sub = args.get("value").and_then(|v| v.as_str()).unwrap_or("save");
+        match sub {
+            "save" => {
+                let cookies_result = self.cdp.send("Network.getCookies", json!({})).await?;
+                let cookies = cookies_result.get("cookies").cloned().unwrap_or(json!([]));
+                let local_storage = self.eval_js("JSON.stringify(Object.assign({}, localStorage))").await?;
+                let session_storage = self.eval_js("JSON.stringify(Object.assign({}, sessionStorage))").await?;
+                let url = self.eval_js("location.href").await?;
+
+                let state = json!({
+                    "url": url,
+                    "cookies": cookies,
+                    "localStorage": serde_json::from_str::<Value>(&local_storage).unwrap_or(json!({})),
+                    "sessionStorage": serde_json::from_str::<Value>(&session_storage).unwrap_or(json!({})),
+                });
+
+                Ok(json!({"action": "state", "sub": "save", "state": state}))
+            }
+            "load" => {
+                let state = args.get("state")
+                    .ok_or_else(|| anyhow!("state load: `state` object required"))?;
+
+                if let Some(cookies) = state.get("cookies").and_then(|v| v.as_array()) {
+                    for cookie in cookies {
+                        let _ = self.cdp.send("Network.setCookie", cookie.clone()).await;
+                    }
+                }
+
+                if let Some(url) = state.get("url").and_then(|v| v.as_str()) {
+                    self.cdp.send("Page.navigate", json!({"url": url})).await?;
+                    let _ = self.cdp.wait_event("Page.loadEventFired", 15).await;
+                }
+
+                if let Some(ls) = state.get("localStorage").and_then(|v| v.as_object()) {
+                    for (k, v) in ls {
+                        let val = v.as_str().unwrap_or("");
+                        let _ = self.eval_js(&format!(
+                            "localStorage.setItem('{}', '{}')",
+                            escape_js_string(k), escape_js_string(val)
+                        )).await;
+                    }
+                }
+
+                if let Some(ss) = state.get("sessionStorage").and_then(|v| v.as_object()) {
+                    for (k, v) in ss {
+                        let val = v.as_str().unwrap_or("");
+                        let _ = self.eval_js(&format!(
+                            "sessionStorage.setItem('{}', '{}')",
+                            escape_js_string(k), escape_js_string(val)
+                        )).await;
+                    }
+                }
+
+                self.cdp.send("Page.reload", json!({})).await?;
+                let _ = self.cdp.wait_event("Page.loadEventFired", 15).await;
+
+                Ok(json!({"action": "state", "sub": "load", "text": "State restored"}))
+            }
+            _ => Err(anyhow!("state: unknown sub-action (use save/load)"))
+        }
+    }
+
+    async fn cmd_network(&mut self, args: &Value) -> Result<Value> {
+        let sub = args.get("value").and_then(|v| v.as_str()).unwrap_or("requests");
+        match sub {
+            "requests" => {
+                let js = r#"JSON.stringify(
+                    performance.getEntriesByType('resource').slice(-50).map(e=>({
+                        name:e.name,type:e.initiatorType,
+                        duration:Math.round(e.duration),
+                        size:e.transferSize||0
+                    }))
+                )"#;
+                let result = self.eval_js(js).await?;
+                let entries: Value = serde_json::from_str(&result).unwrap_or(json!([]));
+                Ok(json!({"action": "network", "requests": entries}))
+            }
+            "block" => {
+                let pattern = args.get("pattern").and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("network block: `pattern` required"))?;
+                if !self.blocked_urls.contains(&pattern.to_string()) {
+                    self.blocked_urls.push(pattern.to_string());
+                }
+                self.cdp.send("Network.setBlockedURLs", json!({"urls": self.blocked_urls})).await?;
+                Ok(json!({"action": "network", "text": format!("Blocking {} pattern(s)", self.blocked_urls.len())}))
+            }
+            "unblock" => {
+                self.blocked_urls.clear();
+                self.cdp.send("Network.setBlockedURLs", json!({"urls": []})).await?;
+                Ok(json!({"action": "network", "text": "All URL blocks removed"}))
+            }
+            _ => Err(anyhow!("network: unknown sub-action (use requests/block/unblock)"))
+        }
+    }
+
+    async fn cmd_highlight(&self, args: &Value) -> Result<Value> {
+        let eref = args.get("ref").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("highlight: `ref` required"))?;
+        let js = format!(
+            r#"(function(){{var el=document.querySelector('[data-ref="{}"]');if(!el)return 'NOT_FOUND';el.style.outline='3px solid red';el.style.outlineOffset='2px';el.scrollIntoView({{block:'center'}});return 'OK';}})()"#,
+            escape_js_string(eref)
+        );
+        let result = self.eval_js(&js).await?;
+        if result == "NOT_FOUND" { bail!("highlight: {eref} not found"); }
+        Ok(json!({"action": "highlight", "ref": eref}))
+    }
+
+    async fn cmd_clipboard(&self, args: &Value) -> Result<Value> {
+        // Grant clipboard permissions to avoid rejection in headless mode.
+        let _ = self.cdp.send("Browser.grantPermissions", json!({
+            "permissions": ["clipboardReadWrite", "clipboardSanitizedWrite"]
+        })).await;
+
+        let sub = args.get("value").and_then(|v| v.as_str()).unwrap_or("read");
+        match sub {
+            "read" => {
+                let result = self.cdp.send("Runtime.evaluate", json!({
+                    "expression": "navigator.clipboard.readText()",
+                    "awaitPromise": true,
+                    "returnByValue": true,
+                    "userGesture": true,
+                })).await?;
+                let text = result.get("result")
+                    .and_then(|r| r.get("value"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                Ok(json!({"action": "clipboard", "text": text}))
+            }
+            "write" => {
+                let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let result = self.cdp.send("Runtime.evaluate", json!({
+                    "expression": format!("navigator.clipboard.writeText('{}')", escape_js_string(text)),
+                    "awaitPromise": true,
+                    "returnByValue": true,
+                    "userGesture": true,
+                })).await?;
+                // Check for exception
+                if result.get("exceptionDetails").is_some() {
+                    bail!("clipboard write failed (may not be supported in headless mode)");
+                }
+                Ok(json!({"action": "clipboard", "text": "Written to clipboard"}))
+            }
+            _ => Err(anyhow!("clipboard: use read/write"))
+        }
+    }
+
+    async fn cmd_find(&self, args: &Value) -> Result<Value> {
+        let by = args.get("by").and_then(|v| v.as_str()).unwrap_or("text");
+        let value = args.get("value").and_then(|v| v.as_str()).unwrap_or("");
+        let then = args.get("then").and_then(|v| v.as_str());
+
+        let js = match by {
+            "text" => format!(
+                r#"(function(){{var all=document.querySelectorAll('a,button,[role=button],[role=link]');for(var i=0;i<all.length;i++){{if(all[i].innerText&&all[i].innerText.trim().includes('{}')){{all[i].scrollIntoView({{block:'center'}});return JSON.stringify({{found:true,tag:all[i].tagName,text:all[i].innerText.substring(0,100)}});}}}};return JSON.stringify({{found:false}});}})()"#,
+                escape_js_string(value)
+            ),
+            "label" => format!(
+                r#"(function(){{var labels=document.querySelectorAll('label');for(var i=0;i<labels.length;i++){{if(labels[i].textContent.includes('{}')){{var input=labels[i].querySelector('input,select,textarea')||document.getElementById(labels[i].getAttribute('for'));if(input){{input.scrollIntoView({{block:'center'}});return JSON.stringify({{found:true,tag:input.tagName}});}}}}}};return JSON.stringify({{found:false}});}})()"#,
+                escape_js_string(value)
+            ),
+            _ => return Err(anyhow!("find: `by` must be text or label")),
+        };
+
+        let result_str = self.eval_js(&js).await?;
+        let result: Value = serde_json::from_str(&result_str).unwrap_or(json!({"found": false}));
+
+        if result["found"].as_bool() == Some(true) {
+            if let Some("click") = then {
+                if by == "text" {
+                    let click_js = format!(
+                        r#"(function(){{var all=document.querySelectorAll('a,button,[role=button],[role=link]');for(var i=0;i<all.length;i++){{if(all[i].innerText&&all[i].innerText.trim().includes('{}')){{all[i].click();return 'OK';}}}};return 'NOT_FOUND';}})()"#,
+                        escape_js_string(value)
+                    );
+                    self.eval_js(&click_js).await?;
+                }
+            }
+        }
+
+        Ok(json!({"action": "find", "by": by, "value": value, "result": result}))
+    }
+
+    async fn cmd_get_article(&self) -> Result<Value> {
+        let js = r#"(function(){
+            var doc=document.cloneNode(true);var body=doc.querySelector('body');
+            if(!body)return JSON.stringify({title:'',content:'',text:''});
+            var noise='nav,header,footer,aside,.sidebar,.nav,.menu,.breadcrumb,.pagination,'+
+                '.cookie-banner,.modal,.popup,.ad,.ads,.advertisement,[role=navigation],'+
+                '[role=banner],[role=contentinfo],script,style,noscript,svg,iframe,'+
+                '.social-share,.share-buttons,.related-posts,.comments,#comments,'+
+                '.newsletter,.subscribe,.signup-form';
+            doc.querySelectorAll(noise).forEach(function(el){el.remove();});
+            var selectors=['article','[role=main]','main','.post-content','.article-content',
+                '.entry-content','.content','#content','.post','#main'];
+            var article=null;
+            for(var i=0;i<selectors.length;i++){
+                var el=doc.querySelector(selectors[i]);
+                if(el&&el.innerText.trim().length>200){article=el;break;}
+            }
+            if(!article){
+                var best=null,bestLen=0;
+                doc.querySelectorAll('div,section').forEach(function(el){
+                    var len=el.innerText.trim().length;
+                    var ratio=len/(el.innerHTML.length||1);
+                    var score=len*ratio;
+                    if(score>bestLen){bestLen=score;best=el;}
+                });
+                article=best||body;
+            }
+            var title=(doc.querySelector('h1')||doc.querySelector('title')||{}).innerText||document.title||'';
+            var text=article.innerText.trim();
+            var links=[];
+            article.querySelectorAll('a[href]').forEach(function(a){
+                var t=a.innerText.trim();
+                if(t&&t.length>2)links.push({text:t.substring(0,100),href:a.href});
+            });
+            var images=[];
+            article.querySelectorAll('img[src]').forEach(function(img){
+                images.push({src:img.src,alt:img.alt||''});
+            });
+            if(text.length>50000)text=text.substring(0,50000)+'...(truncated)';
+            return JSON.stringify({
+                title:title.substring(0,200),text:text,
+                links:links.slice(0,50),images:images.slice(0,20),
+                length:text.length
+            });
+        })()"#;
+
+        let result_str = self.eval_js(js).await?;
+        let result: Value = serde_json::from_str(&result_str)
+            .unwrap_or_else(|_| json!({"title":"","text":"","links":[],"images":[]}));
+
+        Ok(json!({
+            "action": "get_article",
+            "title": result["title"],
+            "text": result["text"],
+            "links": result["links"],
+            "images": result["images"],
+            "length": result["length"],
+        }))
+    }
+
     // -- Helpers ----------------------------------------------------------------
 
     /// Evaluate a JS expression and return its string value.
@@ -1001,15 +1571,20 @@ impl BrowserSession {
 /// Escape a string for embedding in a JS string literal (single-quoted).
 fn escape_js_string(s: &str) -> String {
     s.replace('\\', "\\\\")
+        .replace('\0', "\\0")
         .replace('\'', "\\'")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
+        .replace(']', "\\]")
 }
 
 // ---------------------------------------------------------------------------
 // Snapshot JS -- injected into the page to build an accessibility-like tree
 // ---------------------------------------------------------------------------
+
+/// JS helper to find an element by data-ref, including inside same-origin iframes.
+const FIND_REF_JS: &str = r#"function findRef(ref){var el=document.querySelector('[data-ref="'+ref+'"]');if(el)return el;var iframes=document.querySelectorAll('iframe');for(var i=0;i<iframes.length;i++){try{var doc=iframes[i].contentDocument;if(doc){el=doc.querySelector('[data-ref="'+ref+'"]');if(el)return el;}}catch(e){}}return null;}"#;
 
 const SNAPSHOT_JS: &str = r#"(function(){
   var lines = [];
@@ -1064,6 +1639,17 @@ const SNAPSHOT_JS: &str = r#"(function(){
         valueStr = ' value="' + el.value.substring(0, 50) + '"';
       }
       lines.push(prefix + '[' + label + ']' + refStr + textStr + valueStr);
+    }
+    if (tag === 'iframe') {
+      try {
+        var iframeDoc = el.contentDocument || el.contentWindow.document;
+        if (iframeDoc && iframeDoc.body) {
+          lines.push('  '.repeat(depth + 1) + '[iframe-content]');
+          walk(iframeDoc.body, depth + 2);
+        }
+      } catch(e) {
+        lines.push('  '.repeat(depth + 1) + '[iframe: cross-origin]');
+      }
     }
     for (var child = node.firstChild; child; child = child.nextSibling) {
       walk(child, label ? depth + 1 : depth);

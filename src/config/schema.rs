@@ -1334,6 +1334,8 @@ pub struct WebBrowserConfig {
     pub enabled: Option<bool>,
     /// Path to Chrome/Chromium binary (auto-detect if not set)
     pub chrome_path: Option<String>,
+    /// Run browser with visible window (default: false = headless)
+    pub headed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
