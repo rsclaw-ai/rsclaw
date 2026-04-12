@@ -16,8 +16,9 @@ pub async fn cmd_memory(sub: MemoryCommand) -> Result<()> {
     let search_cfg = cfg.as_ref().and_then(|c| c.raw.memory_search.as_ref());
     match sub {
         MemoryCommand::Status(args) => {
+            // Read-only: won't conflict with running gateway.
             let mem =
-                agent::memory::MemoryStore::open(&data_dir, Some(&model_dir), tier, search_cfg)
+                agent::memory::MemoryStore::open_readonly(&data_dir, Some(&model_dir), search_cfg)
                     .await?;
             let count = mem.count().await?;
             if args.json {
@@ -29,8 +30,9 @@ pub async fn cmd_memory(sub: MemoryCommand) -> Result<()> {
         }
         MemoryCommand::Search(args) => {
             banner(&format!("rsclaw memory search v{}", env!("RSCLAW_BUILD_VERSION")));
+            // Read-only: won't conflict with running gateway.
             let mut mem =
-                agent::memory::MemoryStore::open(&data_dir, Some(&model_dir), tier, search_cfg)
+                agent::memory::MemoryStore::open_readonly(&data_dir, Some(&model_dir), search_cfg)
                     .await?;
             let results = mem.search(&args.query, None, args.max_results).await?;
             if results.is_empty() {
@@ -50,6 +52,7 @@ pub async fn cmd_memory(sub: MemoryCommand) -> Result<()> {
             }
         }
         MemoryCommand::Index(_args) => {
+            // Write operation: needs exclusive access. Gateway must be stopped.
             let mut mem =
                 agent::memory::MemoryStore::open(&data_dir, Some(&model_dir), tier, search_cfg)
                     .await?;

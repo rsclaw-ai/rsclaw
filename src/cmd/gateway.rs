@@ -72,6 +72,17 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
 
             let config = std::sync::Arc::new(config::load_quiet()?);
             let port = config.gateway.port;
+
+            // Check if another instance is already running on this port.
+            // Try binding to 127.0.0.1 first (always detects local conflicts),
+            // then try the configured bind address if different.
+            // Exit cleanly (exit 0) so systemd doesn't keep restarting.
+            let port_in_use = std::net::TcpListener::bind(format!("127.0.0.1:{port}")).is_err();
+            if port_in_use {
+                eprintln!("  [!] Port {port} already in use. Another gateway instance is running.");
+                eprintln!("  [!] Exiting cleanly to avoid conflict.");
+                std::process::exit(0);
+            }
             let bind = match config.gateway.bind {
                 crate::config::schema::BindMode::Auto
                 | crate::config::schema::BindMode::Lan

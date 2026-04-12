@@ -702,6 +702,7 @@ pub struct MemoryStore {
 }
 
 impl MemoryStore {
+    /// Open memory store with exclusive write access (for gateway).
     pub async fn open(
         data_dir: &Path,
         model_dir: Option<&Path>,
@@ -710,18 +711,37 @@ impl MemoryStore {
     ) -> Result<Self> {
         let mem_dir = data_dir.join("memory");
         std::fs::create_dir_all(&mem_dir)?;
+        let db_path = mem_dir.join("memory.redb");
+        let db = redb::Database::create(&db_path).context("open memory redb")?;
+        Self::open_with_db(db, model_dir, search_cfg).await
+    }
 
+    /// Open memory store in read-only mode (for CLI, won't conflict with running gateway).
+    pub async fn open_readonly(
+        data_dir: &Path,
+        model_dir: Option<&Path>,
+        search_cfg: Option<&MemorySearchConfig>,
+    ) -> Result<Self> {
+        let db_path = data_dir.join("memory/memory.redb");
+        if !db_path.exists() {
+            anyhow::bail!("memory database not found at {}", db_path.display());
+        }
+        let db = redb::Database::open(&db_path).context("open memory redb (readonly)")?;
+        Self::open_with_db(db, model_dir, search_cfg).await
+    }
+
+    async fn open_with_db(
+        db: redb::Database,
+        model_dir: Option<&Path>,
+        search_cfg: Option<&MemorySearchConfig>,
+    ) -> Result<Self> {
         let embedder: Arc<dyn Embedder> = choose_embedder(search_cfg, model_dir);
         let embed_dim = embedder.dimension();
 
-        let db_path = mem_dir.join("memory.redb");
-        let db = redb::Database::create(&db_path).context("open memory redb")?;
-
-        // Ensure table exists.
-        {
-            let write = db.begin_write()?;
-            let _ = write.open_table(REDB_TABLE)?;
-            write.commit()?;
+        // Ensure table exists (skip if readonly — open() would have failed anyway).
+        if let Ok(write) = db.begin_write() {
+            let _ = write.open_table(REDB_TABLE);
+            let _ = write.commit();
         }
 
         // Load existing docs and rebuild HNSW index.
