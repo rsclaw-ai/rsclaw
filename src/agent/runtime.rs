@@ -4871,7 +4871,7 @@ impl AgentRuntime {
         };
 
         let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (compatible; rsclaw/1.0)")
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .timeout(Duration::from_secs(15))
             .build()?;
 
