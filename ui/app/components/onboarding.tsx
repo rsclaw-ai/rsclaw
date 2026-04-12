@@ -113,7 +113,7 @@ const T: Record<WizLang, WizText> = {
     test: "\u83B7\u53D6\u6A21\u578B",
     testing: "\u83B7\u53D6\u4E2D",
     connected: "\u2713 \u5DF2\u8FDE\u63A5",
-    retry: "\u91CD\u65B0\u6D4B\u8BD5",
+    retry: "\u91CD\u65B0\u83B7\u53D6",
     launch: "\u542F\u52A8\u7F51\u5173",
     launching: "\u542F\u52A8\u4E2D",
     enterConsole: "\u8FDB\u5165\u63A7\u5236\u53F0",
