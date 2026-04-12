@@ -33,7 +33,7 @@ fn run_rsclaw_command(args: &[&str]) -> Result<String, String> {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
     let sidecar_result = exe_dir.as_ref().and_then(|dir| {
-        let sidecar = dir.join("rsclaw-cli");
+        let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw-cli.exe" } else { "rsclaw-cli" });
         eprintln!("[cmd] sidecar path: {} exists={}", sidecar.display(), sidecar.exists());
         if sidecar.exists() {
             std::process::Command::new(&sidecar)
@@ -91,7 +91,7 @@ fn run_rsclaw_cli(args: Vec<String>) -> Result<String, String> {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
     let (stdout, stderr, success) = match exe_dir.as_ref().and_then(|dir| {
-        let sidecar = dir.join("rsclaw-cli");
+        let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw-cli.exe" } else { "rsclaw-cli" });
         if sidecar.exists() {
             std::process::Command::new(&sidecar)
                 .args(&str_args)
@@ -137,7 +137,7 @@ fn start_gateway() -> Result<String, String> {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
     if let Some(dir) = &exe_dir {
-        let sidecar = dir.join("rsclaw-cli");
+        let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw-cli.exe" } else { "rsclaw-cli" });
         if sidecar.exists() {
             std::process::Command::new(&sidecar)
                 .args(["gateway", "start"])
@@ -426,7 +426,7 @@ fn channel_login_start(channel: String) -> Result<String, String> {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
     let spawned = exe_dir.as_ref().and_then(|dir| {
-        let sidecar = dir.join("rsclaw-cli");
+        let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw-cli.exe" } else { "rsclaw-cli" });
         if sidecar.exists() {
             std::process::Command::new(&sidecar)
                 .args(["channels", "login", &channel])
@@ -793,10 +793,16 @@ fn migrate_openclaw(source_path: String) -> Result<String, String> {
 #[tauri::command]
 fn set_auto_start(enable: bool) -> Result<bool, String> {
     let app_name = "RsClaw";
-    let app_path = std::env::current_exe()
+    let raw_path = std::env::current_exe()
         .map_err(|e| format!("Failed to get executable path: {}", e))?
         .to_string_lossy()
         .to_string();
+    // Wrap in quotes for paths with spaces (Windows registry requires this).
+    let app_path = if raw_path.contains(' ') && !raw_path.starts_with('"') {
+        format!("\"{}\"", raw_path)
+    } else {
+        raw_path
+    };
 
     let auto = auto_launch::AutoLaunchBuilder::new()
         .set_app_name(app_name)
@@ -819,10 +825,16 @@ fn set_auto_start(enable: bool) -> Result<bool, String> {
 #[tauri::command]
 fn get_auto_start() -> Result<bool, String> {
     let app_name = "RsClaw";
-    let app_path = std::env::current_exe()
+    let raw_path = std::env::current_exe()
         .map_err(|e| format!("Failed to get executable path: {}", e))?
         .to_string_lossy()
         .to_string();
+    // Wrap in quotes for paths with spaces (Windows registry requires this).
+    let app_path = if raw_path.contains(' ') && !raw_path.starts_with('"') {
+        format!("\"{}\"", raw_path)
+    } else {
+        raw_path
+    };
 
     let auto = auto_launch::AutoLaunchBuilder::new()
         .set_app_name(app_name)
