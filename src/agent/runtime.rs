@@ -3619,11 +3619,20 @@ impl AgentRuntime {
         let docs = store.search(&query, scope.as_deref(), top_k).await?;
         let results: Vec<Value> = docs
             .into_iter()
-            .map(
-                |d| json!({"id": d.id, "scope": d.scope, "kind": d.kind, "text": d.display_text()}),
-            )
+            .map(|d| {
+                let age = memory_age_label(chrono::Utc::now().timestamp(), d.created_at);
+                json!({
+                    "id": d.id,
+                    "kind": d.kind,
+                    "content": d.text,
+                    "summary": d.display_text(),
+                    "age": age,
+                    "importance": d.importance,
+                    "access_count": d.access_count,
+                })
+            })
             .collect();
-        Ok(json!({"results": results}))
+        Ok(json!({"count": results.len(), "results": results}))
     }
 
     async fn tool_memory_get(&self, args: Value) -> Result<Value> {
