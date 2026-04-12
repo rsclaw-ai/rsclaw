@@ -161,10 +161,13 @@ fn default_config(lang: &str) -> String {
     recallTopK: 10,                  // results per backend before fusion
     recallFinalK: 5,                 // final results after RRF fusion
   }},
-  // memorySearch: {{
-  //   provider: "local",            // "local" | "openai" | "ollama"
-  //   // local: {{ modelRepo: "BAAI/bge-small-zh-v1.5" }},
-  // }},
+  memorySearch: {{
+    provider: "local",               // "local" | "openai" | "ollama"
+    local: {{
+      modelRepo: "BAAI/bge-small-zh-v1.5",
+      // modelDownloadUrl: "https://hf-mirror.com/BAAI/bge-small-zh-v1.5/resolve/main",
+    }},
+  }},
   // channels: {{
   //   telegram: {{ botToken: "${{TELEGRAM_BOT_TOKEN}}" }},
   //   feishu: {{ appId: "xxx", appSecret: "xxx" }},
