@@ -346,6 +346,21 @@ fn try_service_stop() -> bool {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        let is_active = std::process::Command::new("sc")
+            .args(["query", "rsclaw"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("RUNNING"))
+            .unwrap_or(false);
+        if is_active {
+            let status = std::process::Command::new("sc")
+                .args(["stop", "rsclaw"])
+                .status();
+            return status.map(|s| s.success()).unwrap_or(false);
+        }
+    }
+
     false
 }
 
@@ -531,14 +546,64 @@ async fn cmd_gateway_uninstall() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "windows")]
 async fn cmd_gateway_install() -> Result<()> {
-    println!("  [!] Gateway install is only supported on macOS and Linux");
+    let binary = std::env::current_exe()?;
+    let binary_str = binary.to_string_lossy();
+
+    // Register as a Windows service using sc.exe.
+    // The service runs `rsclaw gateway run` in the background.
+    // sc.exe requires "key= value" format (space after =, value as next arg).
+    let bin_path = format!("\"{}\" gateway run", binary_str);
+    let status = std::process::Command::new("sc")
+        .args([
+            "create", "rsclaw",
+            "binPath=", &bin_path,
+            "start=", "auto",
+            "DisplayName=", "RsClaw AI Gateway",
+        ])
+        .status()?;
+    if !status.success() {
+        eprintln!("  [!] sc create failed. Try running as Administrator.");
+        return Ok(());
+    }
+    println!("  [+] Service registered: rsclaw");
+
+    // Start the service.
+    let _ = std::process::Command::new("sc")
+        .args(["start", "rsclaw"])
+        .status();
+    println!("  [ok] Service installed and started");
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "windows")]
 async fn cmd_gateway_uninstall() -> Result<()> {
-    println!("  [!] Gateway uninstall is only supported on macOS and Linux");
+    // Stop first.
+    let _ = std::process::Command::new("sc")
+        .args(["stop", "rsclaw"])
+        .status();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let status = std::process::Command::new("sc")
+        .args(["delete", "rsclaw"])
+        .status()?;
+    if !status.success() {
+        eprintln!("  [!] sc delete failed. Try running as Administrator.");
+    } else {
+        println!("  [ok] Service uninstalled");
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+async fn cmd_gateway_install() -> Result<()> {
+    println!("  [!] Gateway install is not supported on this platform");
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+async fn cmd_gateway_uninstall() -> Result<()> {
+    println!("  [!] Gateway uninstall is not supported on this platform");
     Ok(())
 }
