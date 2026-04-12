@@ -55,8 +55,19 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let data_dir = base_dir.join("var/data");
     std::fs::create_dir_all(&data_dir).context("create data dir")?;
 
-    // 2. Open store.
-    let store = Arc::new(Store::open(&data_dir, tier).context("open store")?);
+    // 2. Open store. If the database is locked by another instance, exit cleanly
+    //    so systemd won't keep restarting.
+    let store = match Store::open(&data_dir, tier) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            if msg.contains("already open") || msg.contains("Cannot acquire lock") {
+                eprintln!("  [!] Database locked by another gateway instance. Exiting cleanly.");
+                std::process::exit(0);
+            }
+            return Err(e).context("open store");
+        }
+    };
     info!("store opened at {}", data_dir.display());
 
     // 3. Build provider registry.
