@@ -115,25 +115,59 @@ fn default_config(lang: &str) -> String {
     providers: {{
       anthropic: {{ apiKey: "${{ANTHROPIC_API_KEY}}" }},
       // openai: {{ apiKey: "${{OPENAI_API_KEY}}" }},
+      // ollama: {{ baseUrl: "http://localhost:11434" }},
+      // minimax: {{ apiKey: "${{MINIMAX_API_KEY}}" }},
+      // doubao: {{ baseUrl: "https://ark.cn-beijing.volces.com/api/v3" }},
     }},
   }},
   agents: {{
     defaults: {{
-      contextTokens: 64000,       // max context window tokens (adjust for your model)
-      stripThinkTags: false,      // strip <think> tags from output (enable if model leaks them)
-      // thinking: {{ budget: 0 }}, // set budget > 0 to enable model thinking/reasoning
+      contextTokens: 64000,          // max context window tokens
+      stripThinkTags: false,         // strip <think> tags (auto when thinking disabled)
+      frequencyPenalty: 0.3,         // reduce repetition (0.0-2.0)
+      thinking: {{ budget: 0 }},       // set > 0 to enable model reasoning
+      compaction: {{
+        mode: "layered",             // "layered" | "default" | "safeguard"
+        reserveTokensFloor: 8000,    // trigger compaction above this threshold
+        keepRecentPairs: 5,          // keep N recent user-assistant pairs intact
+        extractFacts: true,          // extract key facts to long-term memory
+        maxTranscriptTokens: 16000,  // token budget for compact LLM
+      }},
     }},
     list: [
       {{
         id: "main",
         default: true,
-        // workspace defaults to $base_dir/workspace
         model: {{ primary: "anthropic/claude-sonnet-4-6" }},
       }},
     ],
   }},
+  tools: {{
+    webSearch: {{
+      // provider: "bing-free",      // bing-free | baidu-free | sogou-free | duckduckgo-free | serper | google | bing | brave
+      // serperApiKey: "${{SERPER_API_KEY}}",
+    }},
+    webFetch: {{
+      maxLength: 100000,             // max content chars
+      // summaryModel: "doubao-lite", // secondary model for content summarization
+    }},
+    webBrowser: {{
+      // headed: false,              // true = visible Chrome window
+      // chromePath: "/path/to/chrome",
+    }},
+  }},
+  memory: {{
+    enabled: true,
+    recallTopK: 10,                  // results per backend before fusion
+    recallFinalK: 5,                 // final results after RRF fusion
+  }},
+  // memorySearch: {{
+  //   provider: "local",            // "local" | "openai" | "ollama"
+  //   // local: {{ modelRepo: "BAAI/bge-small-zh-v1.5" }},
+  // }},
   // channels: {{
   //   telegram: {{ botToken: "${{TELEGRAM_BOT_TOKEN}}" }},
+  //   feishu: {{ appId: "xxx", appSecret: "xxx" }},
   //   discord: {{ token: "${{DISCORD_BOT_TOKEN}}" }},
   // }},
 }}
