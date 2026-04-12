@@ -263,6 +263,15 @@ fn detect_port() -> u16 {
 }
 
 pub fn gateway_signal_stop() -> Result<()> {
+    // Try service manager first (handles auto-restart properly).
+    if try_service_stop() {
+        // Wait a moment for the service to fully stop.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let _ = std::fs::remove_file(gateway_pid_file());
+        return Ok(());
+    }
+
+    // Fallback: direct PID kill (for manual `gateway start` without service).
     let pid = gateway_read_pid()
         .ok_or_else(|| anyhow::anyhow!("gateway is not running (no PID file)"))?;
     if !process_alive(pid) {
@@ -280,6 +289,64 @@ pub fn gateway_signal_stop() -> Result<()> {
     // Clean up PID file.
     let _ = std::fs::remove_file(gateway_pid_file());
     Ok(())
+}
+
+/// Try to stop gateway via service manager (launchctl/systemctl).
+/// Returns true if a service was found and stop was attempted.
+fn try_service_stop() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let plist = dirs_next::home_dir()
+            .map(|h| h.join("Library/LaunchAgents/ai.rsclaw.gateway.plist"));
+        if let Some(ref path) = plist {
+            if path.exists() {
+                let status = std::process::Command::new("launchctl")
+                    .args(["unload", "-w"])
+                    .arg(path)
+                    .status();
+                if let Ok(s) = status {
+                    if s.success() {
+                        // Reload so it can be started again later.
+                        let _ = std::process::Command::new("launchctl")
+                            .args(["load", "-w"])
+                            .arg(path)
+                            .status();
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Check if systemd service exists and is active.
+        let is_active = std::process::Command::new("systemctl")
+            .args(["--user", "is-active", "rsclaw"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if is_active {
+            let status = std::process::Command::new("systemctl")
+                .args(["--user", "stop", "rsclaw"])
+                .status();
+            return status.map(|s| s.success()).unwrap_or(false);
+        }
+        // Try system-level service too.
+        let is_active = std::process::Command::new("systemctl")
+            .args(["is-active", "rsclaw"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if is_active {
+            let status = std::process::Command::new("systemctl")
+                .args(["stop", "rsclaw"])
+                .status();
+            return status.map(|s| s.success()).unwrap_or(false);
+        }
+    }
+
+    false
 }
 
 pub fn gateway_print_status() -> Result<()> {
