@@ -206,7 +206,7 @@ impl PreParseEngine {
             r"(?i)^/remember\s+(.+)$",
             "memory_put",
             ArgTemplate::Single {
-                param: "content".into(),
+                param: "text".into(),
                 group: 1,
             },
         );

@@ -253,6 +253,27 @@ impl TelegramChannel {
                 continue;
             }
 
+            if status.as_u16() == 400 {
+                let err = resp.text().await.unwrap_or_default();
+                if err.contains("parse entities") || err.contains("can't parse") {
+                    // Markdown parse error — retry without parse_mode (plain text).
+                    warn!("Telegram: Markdown parse error, retrying as plain text");
+                    let mut plain_body = body.clone();
+                    plain_body.as_object_mut().map(|o| o.remove("parse_mode"));
+                    match self.client.post(self.api_url("sendMessage"))
+                        .json(&plain_body).send().await
+                    {
+                        Ok(r) if r.status().is_success() => return Ok(()),
+                        Ok(r) => {
+                            let e = r.text().await.unwrap_or_default();
+                            return Err(anyhow::anyhow!("sendMessage plain failed: {e}"));
+                        }
+                        Err(e) => return Err(anyhow::anyhow!("sendMessage plain error: {e}")),
+                    }
+                }
+                return Err(anyhow::anyhow!("sendMessage failed {status}: {err}"));
+            }
+
             if !status.is_success() {
                 let err = resp.text().await.unwrap_or_default();
                 return Err(anyhow::anyhow!("sendMessage failed {status}: {err}"));
@@ -609,6 +630,48 @@ impl Channel for TelegramChannel {
                     }
                     Err(e) => warn!(idx, "telegram: sendPhoto request failed: {e}"),
                     Ok(_) => {}
+                }
+            }
+
+            // Send file attachments via sendDocument
+            for (idx, (filename, mime, path_or_url)) in msg.files.iter().enumerate() {
+                let bytes = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
+                    match self.client.get(path_or_url.as_str()).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            match resp.bytes().await {
+                                Ok(b) if !b.is_empty() => b.to_vec(),
+                                _ => { warn!(idx, "telegram: empty file download"); continue; }
+                            }
+                        }
+                        _ => { warn!(idx, "telegram: file download failed: {path_or_url}"); continue; }
+                    }
+                } else {
+                    match std::fs::read(path_or_url) {
+                        Ok(b) => b,
+                        Err(e) => { warn!(idx, "telegram: failed to read file {path_or_url}: {e}"); continue; }
+                    }
+                };
+
+                let part = match reqwest::multipart::Part::bytes(bytes)
+                    .file_name(filename.clone())
+                    .mime_str(mime)
+                {
+                    Ok(p) => p,
+                    Err(e) => { warn!(idx, "telegram: build multipart failed: {e}"); continue; }
+                };
+                let form = reqwest::multipart::Form::new()
+                    .text("chat_id", msg.target_id.clone())
+                    .part("document", part);
+
+                let url = self.api_url("sendDocument");
+                match self.client.post(&url).multipart(form).send().await {
+                    Ok(resp) if !resp.status().is_success() => {
+                        let status = resp.status();
+                        let body = resp.text().await.unwrap_or_default();
+                        warn!(idx, %status, "telegram: sendDocument failed: {body}");
+                    }
+                    Err(e) => warn!(idx, "telegram: sendDocument request failed: {e}"),
+                    Ok(_) => debug!(idx, "telegram: file sent: {filename}"),
                 }
             }
 

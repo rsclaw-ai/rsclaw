@@ -980,6 +980,109 @@ impl Channel for DingTalkChannel {
                 }
             }
 
+            // Send file attachments
+            for (filename, mime, path_or_url) in &msg.files {
+                let bytes = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
+                    match self.client.get(path_or_url.as_str()).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            match resp.bytes().await {
+                                Ok(b) if !b.is_empty() => b.to_vec(),
+                                _ => { warn!("DingTalk: empty file download"); continue; }
+                            }
+                        }
+                        _ => { warn!("DingTalk: file download failed: {path_or_url}"); continue; }
+                    }
+                } else {
+                    match std::fs::read(path_or_url) {
+                        Ok(b) => b,
+                        Err(e) => { warn!("DingTalk: failed to read file {path_or_url}: {e}"); continue; }
+                    }
+                };
+
+                let token = self.get_access_token().await?;
+                let part = match reqwest::multipart::Part::bytes(bytes)
+                    .file_name(filename.clone())
+                    .mime_str(mime)
+                {
+                    Ok(p) => p,
+                    Err(e) => { warn!("DingTalk: multipart error: {e}"); continue; }
+                };
+                let form = reqwest::multipart::Form::new()
+                    .text("type", "file")
+                    .part("media", part);
+                let upload_url = format!("{}/media/upload", self.oapi_base);
+                let upload_resp = self.client
+                    .post(&upload_url)
+                    .query(&[("access_token", token.as_str())])
+                    .multipart(form)
+                    .send()
+                    .await;
+
+                let media_id = match upload_resp {
+                    Ok(r) => match r.json::<serde_json::Value>().await {
+                        Ok(body) => {
+                            if let Some(id) = body.get("media_id").and_then(|v| v.as_str()) {
+                                id.to_owned()
+                            } else {
+                                warn!("DingTalk: file upload missing media_id: {body}");
+                                continue;
+                            }
+                        }
+                        Err(e) => { warn!("DingTalk: file upload parse error: {e}"); continue; }
+                    },
+                    Err(e) => { warn!("DingTalk: file upload failed: {e}"); continue; }
+                };
+
+                // Extract file extension for fileType field.
+                let file_ext = filename.rsplit('.').next().unwrap_or("").to_owned();
+                let token2 = self.get_access_token().await?;
+                let msg_param = json!({
+                    "mediaId": media_id,
+                    "fileName": filename,
+                    "fileType": file_ext,
+                }).to_string();
+
+                let send_result = if msg.is_group {
+                    self.client
+                        .post(format!("{}/v1.0/robot/groupMessages/send", self.api_base))
+                        .header("x-acs-dingtalk-access-token", &token2)
+                        .json(&json!({
+                            "robotCode": self.robot_code,
+                            "openConversationId": msg.target_id,
+                            "msgKey": "sampleFile",
+                            "msgParam": msg_param,
+                        }))
+                        .send()
+                        .await
+                } else {
+                    self.client
+                        .post(format!("{}/v1.0/robot/oToMessages/batchSend", self.api_base))
+                        .header("x-acs-dingtalk-access-token", &token2)
+                        .json(&json!({
+                            "robotCode": self.robot_code,
+                            "userIds": [msg.target_id],
+                            "msgKey": "sampleFile",
+                            "msgParam": msg_param,
+                        }))
+                        .send()
+                        .await
+                };
+
+                match send_result {
+                    Ok(r) if r.status().is_success() => {
+                        debug!("DingTalk: file sent: {filename}");
+                    }
+                    Ok(r) => {
+                        let status = r.status();
+                        let err = r.text().await.unwrap_or_default();
+                        warn!("DingTalk: file send failed {status}: {err}");
+                    }
+                    Err(e) => {
+                        warn!("DingTalk: file send request failed: {e}");
+                    }
+                }
+            }
+
             Ok(())
         })
     }

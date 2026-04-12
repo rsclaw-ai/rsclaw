@@ -79,7 +79,7 @@ pub use webhooks::WebhooksCommand;
 #[command(
     name = "rsclaw",
     version = env!("RSCLAW_BUILD_VERSION"),
-    about = "OpenClaw-compatible multi-agent AI gateway",
+    about = "High-performance Multi-Agent AI gateway with native OpenClaw A2A orchestration",
     long_about = None,
 )]
 pub struct Cli {

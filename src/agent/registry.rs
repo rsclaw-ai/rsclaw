@@ -114,6 +114,8 @@ pub struct AgentReply {
     pub tool_calls: Option<Vec<serde_json::Value>>,
     /// Images to send (base64 data URIs or file paths).
     pub images: Vec<String>,
+    /// File attachments: Vec<(filename, mime_type, file_path_or_url)>.
+    pub files: Vec<(String, String, String)>,
     /// If set, the worker should send a follow-up LLM analysis after the
     /// immediate reply.
     pub pending_analysis: Option<PendingAnalysis>,

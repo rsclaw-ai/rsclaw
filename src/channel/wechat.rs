@@ -1093,7 +1093,6 @@ impl WeChatPersonalChannel {
     }
 
     /// Send a file attachment message referencing a previously uploaded file.
-    #[allow(dead_code)]
     async fn send_file_message(
         &self,
         to_user_id: &str,
@@ -1233,6 +1232,39 @@ impl Channel for WeChatPersonalChannel {
                 match self.send_outbound_image(&msg.target_id, image_data_uri).await {
                     Ok(()) => info!(index = i, "wechat: image sent"),
                     Err(e) => warn!(index = i, "wechat: image send failed: {e:#}"),
+                }
+            }
+
+            // Send file attachments
+            for (idx, (filename, _mime, path_or_url)) in msg.files.iter().enumerate() {
+                let bytes = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
+                    match self.client.get(path_or_url.as_str()).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            match resp.bytes().await {
+                                Ok(b) if !b.is_empty() => b.to_vec(),
+                                _ => { warn!(index = idx, "wechat: empty file download"); continue; }
+                            }
+                        }
+                        _ => { warn!(index = idx, "wechat: file download failed: {path_or_url}"); continue; }
+                    }
+                } else {
+                    match std::fs::read(path_or_url) {
+                        Ok(b) => b,
+                        Err(e) => { warn!(index = idx, "wechat: failed to read file {path_or_url}: {e}"); continue; }
+                    }
+                };
+
+                match self.upload_media(&bytes, &msg.target_id, UploadMediaType::File).await {
+                    Ok(uploaded) => {
+                        if let Err(e) = self.send_file_message(&msg.target_id, filename, &uploaded).await {
+                            warn!(index = idx, "wechat: send file message failed: {e:#}");
+                        } else {
+                            info!(index = idx, filename = %filename, "wechat: file sent");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(index = idx, "wechat: file upload failed: {e:#}");
+                    }
                 }
             }
 

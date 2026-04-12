@@ -271,30 +271,44 @@ pub struct AgentDefaults {
 #[serde(rename_all = "camelCase")]
 pub struct AgentEntry {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub lane: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub lane_concurrency: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub group_chat: Option<GroupChatConfig>,
     /// rsclaw extension: which channels this agent handles (None = all)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub channels: Option<Vec<String>>,
     /// Custom slash commands for this agent (in addition to built-in ones)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub commands: Option<Vec<AgentCommand>>,
     /// Allowed pre-parsed commands: "*" = all (default for main agent),
     /// pipe-separated list = specific (e.g. "/help|/search|/version"),
     /// empty/null = none (default for non-main agents).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_commands: Option<String>,
     /// rsclaw extension: use OpenCode ACP client instead of LLM
     /// When set, this agent spawns opencode acp subprocess and routes all prompts through it.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub opencode: Option<OpenCodeConfig>,
     /// rsclaw extension: use Claude Code ACP client instead of LLM
     /// When set, this agent spawns claude-agent-acp subprocess and routes all prompts through it.
     /// Uses the official Claude Agent SDK via ACP protocol.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub claudecode: Option<ClaudeCodeConfig>,
     /// OpenClaw-specific
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
 }
 
@@ -344,23 +358,33 @@ pub struct AgentCommand {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub primary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fallbacks: Option<Vec<String>>,
     /// Text-to-image model, e.g. "doubao/doubao-seedream-5-0-260128".
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub image_fallbacks: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
     /// Whether to send tool definitions to the model. Default: true.
     /// Set to false for reasoning models (deepseek-r1, qwen-r1) that don't support tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tools_enabled: Option<bool>,
     /// Tool set level: "minimal" (7 core), "standard" (12, default), "full" (all 32+).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub toolset: Option<String>,
     /// Extra tool names to include on top of the toolset level.
     /// Also used as a whitelist when toolset is not set.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
     /// Context window size in tokens. Used to calculate history budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,
     /// Maximum tokens for LLM response. Default: 2048.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
 }
 

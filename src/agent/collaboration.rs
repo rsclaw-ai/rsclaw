@@ -57,6 +57,7 @@ pub async fn run_sequential(
             is_empty: true,
             tool_calls: None,
             images: vec![],
+            files: vec![],
             pending_analysis: None,
         });
     }
@@ -75,6 +76,7 @@ pub async fn run_sequential(
         text: current_text,
         tool_calls: None,
         images: vec![],
+        files: vec![],
         pending_analysis: None,
     })
 }

@@ -634,6 +634,11 @@ impl FeishuChannel {
                     break;
                 }
                 Err(e) => {
+                    let err_str = format!("{e:#}");
+                    if err_str.contains("UTF-8") || err_str.contains("utf-8") {
+                        warn!("feishu: WS frame UTF-8 error (skipping): {e:#}");
+                        continue;
+                    }
                     warn!("feishu: WS read error: {e:#}");
                     break;
                 }
@@ -1368,8 +1373,7 @@ impl Channel for FeishuChannel {
                 };
 
                 // Determine file type for Feishu API.
-                let is_video = mime.starts_with("video/");
-                let file_type = if is_video { "mp4" }
+                let file_type = if mime.starts_with("video/") { "mp4" }
                     else if mime.contains("pdf") { "pdf" }
                     else if mime.contains("doc") { "doc" }
                     else if mime.contains("sheet") || mime.contains("xls") { "xls" }
@@ -1418,11 +1422,7 @@ impl Channel for FeishuChannel {
                     else if msg.target_id.starts_with("oc_") { "chat_id" }
                     else { "chat_id" };
                 let send_url = format!("{}/im/v1/messages?receive_id_type={id_type}", self.api_base());
-                let (msg_type, content) = if is_video {
-                    ("media", serde_json::json!({"file_key": file_key}).to_string())
-                } else {
-                    ("file", serde_json::json!({"file_key": file_key}).to_string())
-                };
+                let (msg_type, content) = ("file", serde_json::json!({"file_key": file_key}).to_string());
 
                 let token2 = match self.get_token().await {
                     Ok(t) => t,

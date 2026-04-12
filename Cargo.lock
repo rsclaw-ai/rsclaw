@@ -5225,7 +5225,7 @@ dependencies = [
 
 [[package]]
 name = "rsclaw"
-version = "2026.4.11"
+version = "2026.4.12"
 dependencies = [
  "aes",
  "anyhow",

@@ -1,4 +1,4 @@
-//! rsclaw — OpenClaw-compatible multi-agent AI gateway
+//! rsclaw — High-performance Multi-Agent AI gateway with native OpenClaw A2A orchestration
 //!
 //! Architecture reference: AGENTS.md
 //! Entry point: detects memory tier, sets up tokio runtime, dispatches CLI.

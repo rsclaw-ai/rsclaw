@@ -144,6 +144,7 @@ impl AgentSpawner {
                         is_empty: false,
                         tool_calls: None,
                         images: vec![],
+                        files: vec![],
                         pending_analysis: None,
                     }
                 });

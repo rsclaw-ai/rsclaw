@@ -20,8 +20,8 @@ use matrix_sdk::{
     config::SyncSettings,
     matrix_auth::{MatrixSession, MatrixSessionTokens},
     ruma::events::room::message::{
-        ImageMessageEventContent, MessageType, OriginalSyncRoomMessageEvent,
-        RoomMessageEventContent,
+        FileMessageEventContent, ImageMessageEventContent, MessageType,
+        OriginalSyncRoomMessageEvent, RoomMessageEventContent,
     },
     Client as MatrixSdkClient, Room, RoomState, SessionMeta,
 };
@@ -190,6 +190,45 @@ impl Channel for MatrixChannel {
                     }
                     Err(e) => {
                         warn!(idx, "Matrix SDK: image upload failed: {e}");
+                    }
+                }
+            }
+
+            // Send file attachments via matrix-sdk upload + m.file message
+            for (idx, (filename, mime_str, path_or_url)) in msg.files.iter().enumerate() {
+                let bytes = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
+                    match reqwest::Client::new().get(path_or_url.as_str()).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            match resp.bytes().await {
+                                Ok(b) if !b.is_empty() => b.to_vec(),
+                                _ => { warn!(idx, "Matrix SDK: empty file download"); continue; }
+                            }
+                        }
+                        _ => { warn!(idx, "Matrix SDK: file download failed"); continue; }
+                    }
+                } else {
+                    match std::fs::read(path_or_url) {
+                        Ok(b) => b,
+                        Err(e) => { warn!(idx, "Matrix SDK: read file failed: {e}"); continue; }
+                    }
+                };
+
+                let mime: mime::Mime = mime_str.parse().unwrap_or(mime::APPLICATION_OCTET_STREAM);
+                match client.media().upload(&mime, bytes, None).await {
+                    Ok(resp) => {
+                        let file_content = FileMessageEventContent::plain(
+                            filename.clone(),
+                            resp.content_uri,
+                        );
+                        let msg_content = RoomMessageEventContent::new(
+                            MessageType::File(file_content),
+                        );
+                        if let Err(e) = room.send(msg_content).await {
+                            warn!(idx, "Matrix SDK: file send failed: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(idx, "Matrix SDK: file upload failed: {e}");
                     }
                 }
             }
@@ -559,6 +598,76 @@ impl Channel for MatrixChannel {
                     warn!(idx, "matrix: send_image failed: {e}");
                 }
             }
+
+            // Send file attachments via Matrix upload + m.file message
+            for (idx, (filename, mime_str, path_or_url)) in msg.files.iter().enumerate() {
+                let bytes = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
+                    match self.client.get(path_or_url.as_str()).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            match resp.bytes().await {
+                                Ok(b) if !b.is_empty() => b.to_vec(),
+                                _ => { warn!(idx, "matrix: empty file download"); continue; }
+                            }
+                        }
+                        _ => { warn!(idx, "matrix: file download failed"); continue; }
+                    }
+                } else {
+                    match std::fs::read(path_or_url) {
+                        Ok(b) => b,
+                        Err(e) => { warn!(idx, "matrix: read file failed: {e}"); continue; }
+                    }
+                };
+
+                // Upload via /_matrix/media/v3/upload
+                let upload_url = format!(
+                    "{}/_matrix/media/v3/upload?filename={}",
+                    self.homeserver,
+                    urlencoding::encode(filename),
+                );
+                match self.client
+                    .post(&upload_url)
+                    .bearer_auth(&self.access_token)
+                    .header("content-type", mime_str.as_str())
+                    .body(bytes)
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(body) = resp.json::<serde_json::Value>().await {
+                            if let Some(content_uri) = body.get("content_uri").and_then(|v| v.as_str()) {
+                                // Send m.file message
+                                let event = serde_json::json!({
+                                    "msgtype": "m.file",
+                                    "body": filename,
+                                    "url": content_uri,
+                                    "info": { "mimetype": mime_str },
+                                });
+                                let send_url = format!(
+                                    "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+                                    self.homeserver,
+                                    urlencoding::encode(&msg.target_id),
+                                    uuid::Uuid::new_v4(),
+                                );
+                                if let Err(e) = self.client
+                                    .put(&send_url)
+                                    .bearer_auth(&self.access_token)
+                                    .json(&event)
+                                    .send()
+                                    .await
+                                {
+                                    warn!(idx, "matrix: file send failed: {e}");
+                                }
+                            }
+                        }
+                    }
+                    Ok(r) => {
+                        let err = r.text().await.unwrap_or_default();
+                        warn!(idx, "matrix: file upload failed: {err}");
+                    }
+                    Err(e) => { warn!(idx, "matrix: file upload error: {e}"); }
+                }
+            }
+
             Ok(())
         })
     }

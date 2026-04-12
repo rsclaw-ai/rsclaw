@@ -857,6 +857,29 @@ impl WeComChannel {
         }
         Ok(())
     }
+
+    /// Send a file message using a previously uploaded `media_id`.
+    async fn send_file_message(&self, chat_id: &str, media_id: &str) -> Result<()> {
+        let req_id = uuid::Uuid::new_v4().to_string();
+        let frame = json!({
+            "cmd": "aibot_send_msg",
+            "headers": { "req_id": &req_id },
+            "body": {
+                "chatid": chat_id,
+                "msgtype": "file",
+                "file": { "media_id": media_id },
+            }
+        });
+        debug!(req_id = %req_id, chat_id, media_id, "WeCom: sending file message");
+        let resp = self.send_rpc(&req_id, frame).await
+            .context("WeCom: send file message RPC")?;
+        let errcode = resp.get("errcode").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if errcode != 0 {
+            let errmsg = resp.get("errmsg").and_then(|m| m.as_str()).unwrap_or("unknown");
+            bail!("WeCom: send file message failed ({errcode}): {errmsg}");
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -904,6 +927,36 @@ impl Channel for WeComChannel {
                     }
                     Err(e) => {
                         error!(idx, "WeCom: media upload failed: {e:#}");
+                    }
+                }
+            }
+            // Send file attachments
+            for (idx, (_filename, _mime, path_or_url)) in msg.files.iter().enumerate() {
+                let bytes = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
+                    match reqwest::Client::new().get(path_or_url.as_str()).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            match resp.bytes().await {
+                                Ok(b) if !b.is_empty() => b.to_vec(),
+                                _ => { warn!(idx, "WeCom: empty file download"); continue; }
+                            }
+                        }
+                        _ => { warn!(idx, "WeCom: file download failed: {path_or_url}"); continue; }
+                    }
+                } else {
+                    match std::fs::read(path_or_url) {
+                        Ok(b) => b,
+                        Err(e) => { warn!(idx, "WeCom: failed to read file {path_or_url}: {e}"); continue; }
+                    }
+                };
+
+                match self.upload_media(&bytes).await {
+                    Ok(media_id) => {
+                        if let Err(e) = self.send_file_message(&msg.target_id, &media_id).await {
+                            error!(idx, "WeCom: send file message failed: {e:#}");
+                        }
+                    }
+                    Err(e) => {
+                        error!(idx, "WeCom: file upload failed: {e:#}");
                     }
                 }
             }

@@ -1,9 +1,9 @@
 [package]
 name = "rsclaw"
-version = "2026.4.11"
+version = "2026.4.12"
 edition = "2024"
 rust-version = "1.91"
-description = "High-performance AI gateway with native OpenClaw A2A orchestration"
+description = "High-performance Multi-Agent AI gateway with native OpenClaw A2A orchestration"
 repository = "https://github.com/rsclaw-ai/rsclaw"
 license = "AGPL-3.0"
 

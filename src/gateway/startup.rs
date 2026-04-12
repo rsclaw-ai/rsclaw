@@ -841,6 +841,7 @@ fn spawn_agent_tasks(
                         is_empty: false,
                         tool_calls: None,
                         images: vec![],
+                        files: vec![],
                         pending_analysis: None,
                     }
                 });
@@ -862,6 +863,27 @@ fn default_dm_scope(config: &RuntimeConfig) -> DmScope {
         .dm_scope
         .clone()
         .unwrap_or(DmScope::PerChannelPeer)
+}
+
+/// Check if a message is a fast preparse command that should bypass the per-user queue.
+/// These are local slash commands that execute instantly and should not wait behind
+/// slow LLM requests in the queue.
+fn is_fast_preparse(text: &str) -> bool {
+    let t = text.trim();
+    let lower = t.to_lowercase();
+    // Single-word commands (no args needed)
+    matches!(
+        lower.as_str(),
+        "/ls" | "/status" | "/version" | "/help" | "/?" | "/health" | "/uptime"
+            | "/models" | "/clear" | "/abort" | "/sessions"
+    )
+    // Commands with optional/required args
+    || lower.starts_with("/ls ")
+    || lower.starts_with("/cat ")
+    || lower.starts_with("/ss")
+    || lower.starts_with("/remember ")
+    || lower.starts_with("/recall ")
+    || lower.starts_with("/model ")
 }
 
 // ---------------------------------------------------------------------------
@@ -1091,8 +1113,8 @@ fn start_channels(
                                 reply_to: None,
                                 images: reply.images,
                                 channel: None,
-
-                    files: vec![],                            })
+                                files: reply.files,
+                            })
                             .await;
                     }
                     if let Some(analysis) = pending {
@@ -1380,9 +1402,8 @@ fn start_channels(
                                                         text: r.text,
                                                         reply_to: None,
                                                         images: r.images,
-                                                        channel: None,
-
-                    files: vec![],                                                    })
+                                                        files: r.files,
+                                                        channel: None,                                                    })
                                                     .await;
                                             }
                                             if let Some(analysis) = pending {
@@ -1440,6 +1461,75 @@ fn start_channels(
             channel: None,
 
                     files: vec![],                                    }).await;
+                                }
+                            });
+                            return;
+                        }
+                        // Fast preparse bypass: local commands skip per-user queue
+                        if is_fast_preparse(&text) {
+                            let reg = Arc::clone(&reg);
+                            let tx = tx.clone();
+                            let cfg = Arc::clone(&cfg);
+                            let peer_id_s = peer_id.to_string();
+                            let chat_id_s = chat_id.to_string();
+                            let bound = bound.clone();
+                            tokio::spawn(async move {
+                                let handle = if let Some(ref agent_id) = bound {
+                                    match reg.get(agent_id) {
+                                        Ok(h) => h,
+                                        Err(_) => match reg.route("telegram") {
+                                            Ok(h) => h,
+                                            Err(_) => return,
+                                        },
+                                    }
+                                } else {
+                                    match reg.route("telegram") {
+                                        Ok(h) => h,
+                                        Err(_) => return,
+                                    }
+                                };
+                                let dm_scope = default_dm_scope(&cfg);
+                                let session_key = derive_session_key(&SessionKeyParams {
+                                    agent_id: handle.id.clone(),
+                                    kind: if is_group {
+                                        MessageKind::GroupMessage {
+                                            group_id: chat_id_s.clone(),
+                                            thread_id: None,
+                                        }
+                                    } else {
+                                        MessageKind::DirectMessage { account_id: None }
+                                    },
+                                    channel: "telegram".to_string(),
+                                    peer_id: peer_id_s.clone(),
+                                    dm_scope,
+                                });
+                                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                                let msg = AgentMessage {
+                                    session_key,
+                                    text,
+                                    channel: "telegram".to_string(),
+                                    peer_id: peer_id_s,
+                                    chat_id: String::new(),
+                                    reply_tx,
+                                    extra_tools: vec![],
+                                    images,
+                                    files: file_attachments,
+                                };
+                                if handle.tx.send(msg).await.is_err() {
+                                    return;
+                                }
+                                if let Ok(r) = reply_rx.await {
+                                    if !r.is_empty {
+                                        let _ = tx.send(OutboundMessage {
+                                            target_id: chat_id_s,
+                                            is_group,
+                                            text: r.text,
+                                            reply_to: None,
+                                            images: r.images,
+                                            files: r.files,
+                                            channel: None,
+                                        }).await;
+                                    }
                                 }
                             });
                             return;
@@ -1838,9 +1928,8 @@ fn start_discord_if_configured(
                                                     text: r.text,
                                                     reply_to: None,
                                                     images: r.images,
-                                                    channel: None,
-
-                    files: vec![],                                                })
+                                                    files: r.files,
+                                                    channel: None,                                                })
                                                 .await;
                                         }
                                         if let Some(analysis) = pending {
@@ -1894,6 +1983,75 @@ fn start_discord_if_configured(
 
                     files: vec![],                                    })
                                     .await;
+                            }
+                        });
+                        return;
+                    }
+                    // Fast preparse bypass: local commands skip per-user queue
+                    if is_fast_preparse(&text) {
+                        let reg = Arc::clone(&reg);
+                        let tx = tx.clone();
+                        let cfg = Arc::clone(&cfg);
+                        let peer_id = peer_id.clone();
+                        let channel_id = channel_id.clone();
+                        let bound = bound.clone();
+                        tokio::spawn(async move {
+                            let handle = if let Some(ref agent_id) = bound {
+                                match reg.get(agent_id) {
+                                    Ok(h) => h,
+                                    Err(_) => match reg.route("discord") {
+                                        Ok(h) => h,
+                                        Err(_) => return,
+                                    },
+                                }
+                            } else {
+                                match reg.route("discord") {
+                                    Ok(h) => h,
+                                    Err(_) => return,
+                                }
+                            };
+                            let dm_scope = default_dm_scope(&cfg);
+                            let session_key = derive_session_key(&SessionKeyParams {
+                                agent_id: handle.id.clone(),
+                                kind: if is_guild {
+                                    MessageKind::GroupMessage {
+                                        group_id: channel_id.clone(),
+                                        thread_id: None,
+                                    }
+                                } else {
+                                    MessageKind::DirectMessage { account_id: None }
+                                },
+                                channel: "discord".to_string(),
+                                peer_id: peer_id.clone(),
+                                dm_scope,
+                            });
+                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                            let msg = AgentMessage {
+                                session_key,
+                                text,
+                                channel: "discord".to_string(),
+                                peer_id,
+                                chat_id: String::new(),
+                                reply_tx,
+                                extra_tools: vec![],
+                                images: vec![],
+                                files: vec![],
+                            };
+                            if handle.tx.send(msg).await.is_err() {
+                                return;
+                            }
+                            if let Ok(r) = reply_rx.await {
+                                if !r.is_empty {
+                                    let _ = tx.send(OutboundMessage {
+                                        target_id: channel_id,
+                                        is_group: is_guild,
+                                        text: r.text,
+                                        reply_to: None,
+                                        images: r.images,
+                                        files: r.files,
+                                        channel: None,
+                                    }).await;
+                                }
                             }
                         });
                         return;
@@ -2215,9 +2373,8 @@ fn start_slack_if_configured(
                                                     text: r.text,
                                                     reply_to: None,
                                                     images: r.images,
-                                                    channel: None,
-
-                    files: vec![],                                                })
+                                                    files: r.files,
+                                                    channel: None,                                                })
                                                 .await;
                                         }
                                         if let Some(analysis) = pending {
@@ -2271,6 +2428,75 @@ fn start_slack_if_configured(
 
                     files: vec![],                                    })
                                     .await;
+                            }
+                        });
+                        return;
+                    }
+                    // Fast preparse bypass: local commands skip per-user queue
+                    if is_fast_preparse(&text) {
+                        let reg = Arc::clone(&reg);
+                        let tx = tx.clone();
+                        let cfg = Arc::clone(&cfg);
+                        let peer_id = peer_id.clone();
+                        let channel_id = channel_id.clone();
+                        let bound = bound.clone();
+                        tokio::spawn(async move {
+                            let handle = if let Some(ref agent_id) = bound {
+                                match reg.get(agent_id) {
+                                    Ok(h) => h,
+                                    Err(_) => match reg.route("slack") {
+                                        Ok(h) => h,
+                                        Err(_) => return,
+                                    },
+                                }
+                            } else {
+                                match reg.route("slack") {
+                                    Ok(h) => h,
+                                    Err(_) => return,
+                                }
+                            };
+                            let dm_scope = default_dm_scope(&cfg);
+                            let session_key = derive_session_key(&SessionKeyParams {
+                                agent_id: handle.id.clone(),
+                                kind: if is_channel {
+                                    MessageKind::GroupMessage {
+                                        group_id: channel_id.clone(),
+                                        thread_id: None,
+                                    }
+                                } else {
+                                    MessageKind::DirectMessage { account_id: None }
+                                },
+                                channel: "slack".to_string(),
+                                peer_id: peer_id.clone(),
+                                dm_scope,
+                            });
+                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                            let msg = AgentMessage {
+                                session_key,
+                                text,
+                                channel: "slack".to_string(),
+                                peer_id,
+                                chat_id: String::new(),
+                                reply_tx,
+                                extra_tools: vec![],
+                                images: vec![],
+                                files: vec![],
+                            };
+                            if handle.tx.send(msg).await.is_err() {
+                                return;
+                            }
+                            if let Ok(r) = reply_rx.await {
+                                if !r.is_empty {
+                                    let _ = tx.send(OutboundMessage {
+                                        target_id: channel_id,
+                                        is_group: is_channel,
+                                        text: r.text,
+                                        reply_to: None,
+                                        images: r.images,
+                                        files: r.files,
+                                        channel: None,
+                                    }).await;
+                                }
                             }
                         });
                         return;
@@ -2521,9 +2747,8 @@ fn start_whatsapp_if_configured(
                                             text: r.text,
                                             reply_to: None,
                                             images: r.images,
-                                            channel: None,
-
-                    files: vec![],                                        })
+                                            files: r.files,
+                                            channel: None,                                        })
                                         .await;
                                 }
                                 if let Some(analysis) = pending {
@@ -2577,6 +2802,56 @@ fn start_whatsapp_if_configured(
 
                     files: vec![],                                    })
                                     .await;
+                            }
+                        });
+                        return;
+                    }
+                    // Fast preparse bypass: local commands skip per-user queue
+                    if is_fast_preparse(&text) {
+                        let reg = Arc::clone(&reg);
+                        let tx = tx.clone();
+                        let cfg = Arc::clone(&cfg);
+                        let from = from.clone();
+                        tokio::spawn(async move {
+                            let handle = match reg.route("whatsapp") {
+                                Ok(h) => h,
+                                Err(_) => return,
+                            };
+                            let dm_scope = default_dm_scope(&cfg);
+                            let session_key = derive_session_key(&SessionKeyParams {
+                                agent_id: handle.id.clone(),
+                                kind: MessageKind::DirectMessage { account_id: None },
+                                channel: "whatsapp".to_string(),
+                                peer_id: from.clone(),
+                                dm_scope,
+                            });
+                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                            let msg = AgentMessage {
+                                session_key,
+                                text,
+                                channel: "whatsapp".to_string(),
+                                peer_id: from.clone(),
+                                chat_id: String::new(),
+                                reply_tx,
+                                extra_tools: vec![],
+                                images,
+                                files: vec![],
+                            };
+                            if handle.tx.send(msg).await.is_err() {
+                                return;
+                            }
+                            if let Ok(r) = reply_rx.await {
+                                if !r.is_empty {
+                                    let _ = tx.send(OutboundMessage {
+                                        target_id: from,
+                                        is_group: false,
+                                        text: r.text,
+                                        reply_to: None,
+                                        images: r.images,
+                                        files: r.files,
+                                        channel: None,
+                                    }).await;
+                                }
                             }
                         });
                         return;
@@ -2856,9 +3131,8 @@ fn start_line_if_configured(
                                                 text: r.text,
                                                 reply_to: None,
                                                 images: r.images,
-                                                channel: None,
-
-                    files: vec![],                                            })
+                                                files: r.files,
+                                                channel: None,                                            })
                                             .await;
                                     }
                                     if let Some(analysis) = pending {
@@ -2912,6 +3186,63 @@ fn start_line_if_configured(
 
                     files: vec![],                                    })
                                     .await;
+                            }
+                        });
+                        return;
+                    }
+                    // Fast preparse bypass: local commands skip per-user queue
+                    if is_fast_preparse(&text) {
+                        let reg = Arc::clone(&reg);
+                        let tx = tx.clone();
+                        let cfg = Arc::clone(&cfg);
+                        let user_id = user_id.clone();
+                        tokio::spawn(async move {
+                            let handle = match reg.route("line") {
+                                Ok(h) => h,
+                                Err(_) => return,
+                            };
+                            let dm_scope = default_dm_scope(&cfg);
+                            let session_key = derive_session_key(&SessionKeyParams {
+                                agent_id: handle.id.clone(),
+                                kind: if is_group {
+                                    MessageKind::GroupMessage {
+                                        group_id: user_id.clone(),
+                                        thread_id: None,
+                                    }
+                                } else {
+                                    MessageKind::DirectMessage { account_id: None }
+                                },
+                                channel: "line".to_string(),
+                                peer_id: user_id.clone(),
+                                dm_scope,
+                            });
+                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                            let msg = AgentMessage {
+                                session_key,
+                                text,
+                                channel: "line".to_string(),
+                                peer_id: user_id.clone(),
+                                chat_id: String::new(),
+                                reply_tx,
+                                extra_tools: vec![],
+                                images,
+                                files: vec![],
+                            };
+                            if handle.tx.send(msg).await.is_err() {
+                                return;
+                            }
+                            if let Ok(r) = reply_rx.await {
+                                if !r.is_empty {
+                                    let _ = tx.send(OutboundMessage {
+                                        target_id: user_id,
+                                        is_group,
+                                        text: r.text,
+                                        reply_to: None,
+                                        images: r.images,
+                                        files: r.files,
+                                        channel: None,
+                                    }).await;
+                                }
                             }
                         });
                         return;
@@ -3152,9 +3483,8 @@ fn start_zalo_if_configured(
                                                 text: r.text,
                                                 reply_to: None,
                                                 images: r.images,
-                                                channel: None,
-
-                    files: vec![],                                            })
+                                                files: r.files,
+                                                channel: None,                                            })
                                             .await;
                                     }
                                     if let Some(analysis) = pending {
@@ -3208,6 +3538,56 @@ fn start_zalo_if_configured(
 
                     files: vec![],                                    })
                                     .await;
+                            }
+                        });
+                        return;
+                    }
+                    // Fast preparse bypass: local commands skip per-user queue
+                    if is_fast_preparse(&text) {
+                        let reg = Arc::clone(&reg);
+                        let tx = tx.clone();
+                        let cfg = Arc::clone(&cfg);
+                        let sender_id = sender_id.clone();
+                        tokio::spawn(async move {
+                            let handle = match reg.route("zalo") {
+                                Ok(h) => h,
+                                Err(_) => return,
+                            };
+                            let dm_scope = default_dm_scope(&cfg);
+                            let session_key = derive_session_key(&SessionKeyParams {
+                                agent_id: handle.id.clone(),
+                                kind: MessageKind::DirectMessage { account_id: None },
+                                channel: "zalo".to_string(),
+                                peer_id: sender_id.clone(),
+                                dm_scope,
+                            });
+                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                            let msg = AgentMessage {
+                                session_key,
+                                text,
+                                channel: "zalo".to_string(),
+                                peer_id: sender_id.clone(),
+                                chat_id: String::new(),
+                                reply_tx,
+                                extra_tools: vec![],
+                                images,
+                                files: vec![],
+                            };
+                            if handle.tx.send(msg).await.is_err() {
+                                return;
+                            }
+                            if let Ok(r) = reply_rx.await {
+                                if !r.is_empty {
+                                    let _ = tx.send(OutboundMessage {
+                                        target_id: sender_id,
+                                        is_group: false,
+                                        text: r.text,
+                                        reply_to: None,
+                                        images: r.images,
+                                        files: r.files,
+                                        channel: None,
+                                    }).await;
+                                }
                             }
                         });
                         return;
@@ -3474,9 +3854,8 @@ fn start_signal_if_configured(
                                             text: r.text,
                                             reply_to: None,
                                             images: r.images,
-                                            channel: None,
-
-                    files: vec![],                                        })
+                                            files: r.files,
+                                            channel: None,                                        })
                                         .await;
                                 }
                                 if let Some(analysis) = pending {
@@ -3526,6 +3905,63 @@ fn start_signal_if_configured(
 
                     files: vec![],                                })
                                 .await;
+                        }
+                    });
+                    return;
+                }
+                // Fast preparse bypass: local commands skip per-user queue
+                if is_fast_preparse(&text) {
+                    let reg = Arc::clone(&reg);
+                    let tx = tx.clone();
+                    let cfg = Arc::clone(&cfg);
+                    let sender = sender.clone();
+                    tokio::spawn(async move {
+                        let handle = match reg.route("signal") {
+                            Ok(h) => h,
+                            Err(_) => return,
+                        };
+                        let dm_scope = default_dm_scope(&cfg);
+                        let session_key = derive_session_key(&SessionKeyParams {
+                            agent_id: handle.id.clone(),
+                            kind: if is_group {
+                                MessageKind::GroupMessage {
+                                    group_id: sender.clone(),
+                                    thread_id: None,
+                                }
+                            } else {
+                                MessageKind::DirectMessage { account_id: None }
+                            },
+                            channel: "signal".to_string(),
+                            peer_id: sender.clone(),
+                            dm_scope,
+                        });
+                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        let msg = AgentMessage {
+                            session_key,
+                            text,
+                            channel: "signal".to_string(),
+                            peer_id: sender.clone(),
+                            chat_id: String::new(),
+                            reply_tx,
+                            extra_tools: vec![],
+                            images: vec![],
+                            files: vec![],
+                        };
+                        if handle.tx.send(msg).await.is_err() {
+                            return;
+                        }
+                        if let Ok(r) = reply_rx.await {
+                            if !r.is_empty {
+                                let _ = tx.send(OutboundMessage {
+                                    target_id: sender,
+                                    is_group,
+                                    text: r.text,
+                                    reply_to: None,
+                                    images: r.images,
+                                    files: r.files,
+                                    channel: None,
+                                }).await;
+                            }
                         }
                     });
                     return;
@@ -3713,7 +4149,7 @@ fn spawn_wechat_user_worker(
                             "wechat: got agent reply"
                         );
                         let pending = r.pending_analysis;
-                        if !r.text.is_empty() || !r.images.is_empty() {
+                        if !r.text.is_empty() || !r.images.is_empty() || !r.files.is_empty() {
                             if let Err(e) = out_tx
                                 .send(OutboundMessage {
                                     target_id: user_id.clone(),
@@ -3721,9 +4157,8 @@ fn spawn_wechat_user_worker(
                                     text: r.text,
                                     reply_to: None,
                                     images: r.images,
-                                    channel: None,
-
-                    files: vec![],                                })
+                                    files: r.files,
+                                    channel: None,                                })
                                 .await
                             {
                                 error!("wechat: failed to queue reply: {e:#}");
@@ -4008,6 +4443,56 @@ fn start_wechat_personal_if_configured(
 
                     files: vec![],                                    })
                                     .await;
+                            }
+                        });
+                        return;
+                    }
+                    // Fast preparse bypass: local commands skip per-user queue
+                    if is_fast_preparse(&text) {
+                        let reg = Arc::clone(&reg);
+                        let tx = tx.clone();
+                        let cfg = cfg.clone();
+                        let from_user = from_user.clone();
+                        tokio::spawn(async move {
+                            let handle = match reg.get("main").or_else(|_| reg.default_agent()) {
+                                Ok(h) => h,
+                                Err(_) => return,
+                            };
+                            let dm_scope = default_dm_scope(&cfg);
+                            let session_key = derive_session_key(&SessionKeyParams {
+                                agent_id: handle.id.clone(),
+                                kind: MessageKind::DirectMessage { account_id: None },
+                                channel: "wechat".to_string(),
+                                peer_id: from_user.clone(),
+                                dm_scope,
+                            });
+                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                            let msg = AgentMessage {
+                                session_key,
+                                text,
+                                channel: "wechat".to_string(),
+                                peer_id: from_user.clone(),
+                                chat_id: String::new(),
+                                reply_tx,
+                                extra_tools: vec![],
+                                images,
+                                files: file_attachments,
+                            };
+                            if handle.tx.send(msg).await.is_err() {
+                                return;
+                            }
+                            if let Ok(r) = reply_rx.await {
+                                if !r.is_empty {
+                                    let _ = tx.send(OutboundMessage {
+                                        target_id: from_user,
+                                        is_group: false,
+                                        text: r.text,
+                                        reply_to: None,
+                                        images: r.images,
+                                        files: r.files,
+                                        channel: None,
+                                    }).await;
+                                }
                             }
                         });
                         return;
@@ -4380,7 +4865,7 @@ fn start_feishu_if_configured(
                                     match reply {
                                         Ok(r) => {
                                             let pending = r.pending_analysis;
-                                            if !r.text.is_empty() || !r.images.is_empty() {
+                                            if !r.text.is_empty() || !r.images.is_empty() || !r.files.is_empty() {
                                                 let _ = w_tx
                                                     .send(OutboundMessage {
                                                         target_id: fs_target.clone(),
@@ -4388,9 +4873,8 @@ fn start_feishu_if_configured(
                                                         text: r.text,
                                                         reply_to: None,
                                                         images: r.images,
-                                                        channel: None,
-
-                    files: vec![],                                                    })
+                                                        files: r.files,
+                                                        channel: None,                                                    })
                                                     .await;
                                             }
                                             if let Some(analysis) = pending {
@@ -4446,6 +4930,75 @@ fn start_feishu_if_configured(
 
                     files: vec![],                                    })
                                     .await;
+                            }
+                        });
+                        return;
+                    }
+                    // Fast preparse bypass: local commands skip per-user queue
+                    if is_fast_preparse(&text) {
+                        let reg = Arc::clone(&reg);
+                        let tx = tx.clone();
+                        let cfg = cfg.clone();
+                        let sender_id = sender_id.clone();
+                        let chat_id = chat_id.clone();
+                        let bound = bound.clone();
+                        tokio::spawn(async move {
+                            let handle = if let Some(ref agent_id) = bound {
+                                match reg.get(agent_id) {
+                                    Ok(h) => h,
+                                    Err(_) => match reg.route_account("feishu", None) {
+                                        Ok(h) => h,
+                                        Err(_) => return,
+                                    },
+                                }
+                            } else {
+                                match reg.route_account("feishu", None) {
+                                    Ok(h) => h,
+                                    Err(_) => return,
+                                }
+                            };
+                            let dm_scope = default_dm_scope(&cfg);
+                            let session_key = derive_session_key(&SessionKeyParams {
+                                agent_id: handle.id.clone(),
+                                kind: if is_group {
+                                    MessageKind::GroupMessage {
+                                        group_id: chat_id.clone(),
+                                        thread_id: None,
+                                    }
+                                } else {
+                                    MessageKind::DirectMessage { account_id: None }
+                                },
+                                channel: "feishu".to_string(),
+                                peer_id: sender_id.clone(),
+                                dm_scope,
+                            });
+                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                            let msg = AgentMessage {
+                                session_key,
+                                text,
+                                channel: "feishu".to_string(),
+                                peer_id: sender_id,
+                                chat_id: String::new(),
+                                reply_tx,
+                                extra_tools: vec![],
+                                images,
+                                files: file_attachments,
+                            };
+                            if handle.tx.send(msg).await.is_err() {
+                                return;
+                            }
+                            if let Ok(r) = reply_rx.await {
+                                if !r.is_empty {
+                                    let _ = tx.send(OutboundMessage {
+                                        target_id: chat_id,
+                                        is_group,
+                                        text: r.text,
+                                        reply_to: None,
+                                        images: r.images,
+                                        files: r.files,
+                                        channel: None,
+                                    }).await;
+                                }
                             }
                         });
                         return;
@@ -4789,7 +5342,7 @@ fn start_dingtalk_if_configured(
                                     match reply {
                                         Ok(r) => {
                                             let pending = r.pending_analysis;
-                                            if !r.text.is_empty() || !r.images.is_empty() {
+                                            if !r.text.is_empty() || !r.images.is_empty() || !r.files.is_empty() {
                                                 let _ = w_tx
                                                     .send(OutboundMessage {
                                                         target_id: dt_target.clone(),
@@ -4797,9 +5350,8 @@ fn start_dingtalk_if_configured(
                                                         text: r.text,
                                                         reply_to: None,
                                                         images: r.images,
-                                                        channel: None,
-
-                    files: vec![],                                                    })
+                                                        files: r.files,
+                                                        channel: None,                                                    })
                                                     .await;
                                             }
                                             if let Some(analysis) = pending {
@@ -4857,6 +5409,76 @@ fn start_dingtalk_if_configured(
 
                     files: vec![],                                    })
                                     .await;
+                            }
+                        });
+                        return;
+                    }
+                    // Fast preparse bypass: local commands skip per-user queue
+                    if is_fast_preparse(&text) {
+                        let reg = Arc::clone(&reg);
+                        let tx = tx.clone();
+                        let cfg = cfg.clone();
+                        let sender_id = sender_id.clone();
+                        let conversation_id = conversation_id.clone();
+                        let bound = bound.clone();
+                        tokio::spawn(async move {
+                            let handle = if let Some(ref agent_id) = bound {
+                                match reg.get(agent_id) {
+                                    Ok(h) => h,
+                                    Err(_) => match reg.route_account("dingtalk", None) {
+                                        Ok(h) => h,
+                                        Err(_) => return,
+                                    },
+                                }
+                            } else {
+                                match reg.route_account("dingtalk", None) {
+                                    Ok(h) => h,
+                                    Err(_) => return,
+                                }
+                            };
+                            let dm_scope = default_dm_scope(&cfg);
+                            let session_key = derive_session_key(&SessionKeyParams {
+                                agent_id: handle.id.clone(),
+                                kind: if is_group {
+                                    MessageKind::GroupMessage {
+                                        group_id: conversation_id.clone(),
+                                        thread_id: None,
+                                    }
+                                } else {
+                                    MessageKind::DirectMessage { account_id: None }
+                                },
+                                channel: "dingtalk".to_string(),
+                                peer_id: sender_id.clone(),
+                                dm_scope,
+                            });
+                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                            let msg = AgentMessage {
+                                session_key,
+                                text,
+                                channel: "dingtalk".to_string(),
+                                peer_id: sender_id.clone(),
+                                chat_id: String::new(),
+                                reply_tx,
+                                extra_tools: vec![],
+                                images,
+                                files: vec![],
+                            };
+                            if handle.tx.send(msg).await.is_err() {
+                                return;
+                            }
+                            if let Ok(r) = reply_rx.await {
+                                if !r.is_empty {
+                                    let target = if is_group { conversation_id } else { sender_id };
+                                    let _ = tx.send(OutboundMessage {
+                                        target_id: target,
+                                        is_group,
+                                        text: r.text,
+                                        reply_to: None,
+                                        images: r.images,
+                                        files: r.files,
+                                        channel: None,
+                                    }).await;
+                                }
                             }
                         });
                         return;
@@ -5239,9 +5861,8 @@ fn start_qq_if_configured(
                                                 text: r.text,
                                                 reply_to: Some(msg_id),
                                                 images: r.images,
-                                                channel: None,
-
-                    files: vec![],                                            })
+                                                files: r.files,
+                                                channel: None,                                            })
                                             .await;
                                         if let Some(analysis) = pending {
                                             handle_pending_analysis(
@@ -5296,6 +5917,64 @@ fn start_qq_if_configured(
 
                     files: vec![],                                    })
                                     .await;
+                            }
+                        });
+                        return;
+                    }
+                    // Fast preparse bypass: local commands skip per-user queue
+                    if is_fast_preparse(&text) {
+                        let reg = Arc::clone(&reg);
+                        let tx = tx.clone();
+                        let qq_cfg = Arc::clone(&qq_cfg);
+                        let sender_id = sender_id.clone();
+                        let target_id = target_id.clone();
+                        tokio::spawn(async move {
+                            let handle = match reg.route("qq").or_else(|_| reg.default_agent()) {
+                                Ok(h) => h,
+                                Err(_) => return,
+                            };
+                            let dm_scope = default_dm_scope(&qq_cfg);
+                            let session_key = derive_session_key(&SessionKeyParams {
+                                agent_id: handle.id.clone(),
+                                kind: if is_group {
+                                    MessageKind::GroupMessage {
+                                        group_id: target_id.clone(),
+                                        thread_id: None,
+                                    }
+                                } else {
+                                    MessageKind::DirectMessage { account_id: None }
+                                },
+                                channel: "qq".to_string(),
+                                peer_id: sender_id.clone(),
+                                dm_scope,
+                            });
+                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                            let msg = AgentMessage {
+                                session_key,
+                                text,
+                                channel: "qq".to_string(),
+                                peer_id: sender_id,
+                                chat_id: String::new(),
+                                reply_tx,
+                                extra_tools: vec![],
+                                images,
+                                files: file_attachments,
+                            };
+                            if handle.tx.send(msg).await.is_err() {
+                                return;
+                            }
+                            if let Ok(r) = reply_rx.await {
+                                if !r.is_empty {
+                                    let _ = tx.send(OutboundMessage {
+                                        target_id,
+                                        is_group,
+                                        text: r.text,
+                                        reply_to: None,
+                                        images: r.images,
+                                        files: r.files,
+                                        channel: None,
+                                    }).await;
+                                }
                             }
                         });
                         return;
@@ -5612,9 +6291,8 @@ fn start_matrix_if_configured(
                                             text: r.text,
                                             reply_to: None,
                                             images: r.images,
-                                            channel: None,
-
-                    files: vec![],                                        }).await;
+                                            files: r.files,
+                                            channel: None,                                        }).await;
                                     }
                                     if let Some(analysis) = pending {
                                         handle_pending_analysis(
@@ -5670,6 +6348,65 @@ fn start_matrix_if_configured(
 
                     files: vec![],                                    })
                                     .await;
+                            }
+                        });
+                        return;
+                    }
+                    // Fast preparse bypass: local commands skip per-user queue
+                    if is_fast_preparse(&text) {
+                        let reg = Arc::clone(&reg);
+                        let tx = tx.clone();
+                        let cfg = cfg.clone();
+                        let sender = sender.clone();
+                        let room_id = room_id.clone();
+                        tokio::spawn(async move {
+                            let handle = match reg.route("matrix").or_else(|_| reg.default_agent())
+                            {
+                                Ok(h) => h,
+                                Err(_) => return,
+                            };
+                            let dm_scope = default_dm_scope(&cfg);
+                            let session_key = derive_session_key(&SessionKeyParams {
+                                agent_id: handle.id.clone(),
+                                kind: if is_group {
+                                    MessageKind::GroupMessage {
+                                        group_id: room_id.clone(),
+                                        thread_id: None,
+                                    }
+                                } else {
+                                    MessageKind::DirectMessage { account_id: None }
+                                },
+                                channel: "matrix".to_string(),
+                                peer_id: sender.clone(),
+                                dm_scope,
+                            });
+                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                            let msg = AgentMessage {
+                                session_key,
+                                text,
+                                channel: "matrix".to_string(),
+                                peer_id: sender,
+                                chat_id: String::new(),
+                                reply_tx,
+                                extra_tools: vec![],
+                                images,
+                                files,
+                            };
+                            if handle.tx.send(msg).await.is_err() {
+                                return;
+                            }
+                            if let Ok(r) = reply_rx.await {
+                                if !r.is_empty {
+                                    let _ = tx.send(OutboundMessage {
+                                        target_id: room_id,
+                                        is_group,
+                                        text: r.text,
+                                        reply_to: None,
+                                        images: r.images,
+                                        files: r.files,
+                                        channel: None,
+                                    }).await;
+                                }
                             }
                         });
                         return;
@@ -5954,9 +6691,8 @@ fn start_wecom_if_configured(
                                             text: r.text,
                                             reply_to: None,
                                             images: r.images,
-                                            channel: None,
-
-                    files: vec![],                                        })
+                                            files: r.files,
+                                            channel: None,                                        })
                                         .await;
                                 }
                                 if let Some(analysis) = pending {
@@ -6012,6 +6748,65 @@ fn start_wecom_if_configured(
 
                     files: vec![],                                    })
                                     .await;
+                            }
+                        });
+                        return;
+                    }
+                    // Fast preparse bypass: local commands skip per-user queue
+                    if is_fast_preparse(&text) {
+                        let reg = Arc::clone(&reg);
+                        let tx = tx.clone();
+                        let cfg = Arc::clone(&cfg);
+                        let from = from.clone();
+                        let chat_id = chat_id.clone();
+                        tokio::spawn(async move {
+                            let handle = match reg.route("wecom").or_else(|_| reg.default_agent()) {
+                                Ok(h) => h,
+                                Err(_) => return,
+                            };
+                            let dm_scope = default_dm_scope(&cfg);
+                            let session_key = derive_session_key(&SessionKeyParams {
+                                agent_id: handle.id.clone(),
+                                kind: if is_group {
+                                    MessageKind::GroupMessage {
+                                        group_id: chat_id.clone(),
+                                        thread_id: None,
+                                    }
+                                } else {
+                                    MessageKind::DirectMessage { account_id: None }
+                                },
+                                channel: "wecom".to_string(),
+                                peer_id: from.clone(),
+                                dm_scope,
+                            });
+                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                            let msg = AgentMessage {
+                                session_key,
+                                text,
+                                channel: "wecom".to_string(),
+                                peer_id: from.clone(),
+                                chat_id: String::new(),
+                                reply_tx,
+                                extra_tools: vec![],
+                                images,
+                                files,
+                            };
+                            if handle.tx.send(msg).await.is_err() {
+                                return;
+                            }
+                            if let Ok(r) = reply_rx.await {
+                                if !r.is_empty {
+                                    let target = if is_group { chat_id } else { from };
+                                    let _ = tx.send(OutboundMessage {
+                                        target_id: target,
+                                        is_group,
+                                        text: r.text,
+                                        reply_to: None,
+                                        images: r.images,
+                                        files: r.files,
+                                        channel: None,
+                                    }).await;
+                                }
                             }
                         });
                         return;
@@ -6172,9 +6967,8 @@ fn start_custom_webhook(
                             text: r.text,
                             reply_to: None,
                             images: r.images,
-                            channel: None,
-
-                    files: vec![],                        })
+                            files: r.files,
+                            channel: None,                        })
                         .await;
                 }
                 if let Some(analysis) = pending {
@@ -6284,9 +7078,8 @@ fn start_custom_websocket(
                             text: r.text,
                             reply_to: None,
                             images: r.images,
-                            channel: None,
-
-                    files: vec![],                        })
+                            files: r.files,
+                            channel: None,                        })
                         .await;
                 }
                 if let Some(analysis) = pending {
@@ -6374,7 +7167,7 @@ async fn handle_pending_analysis(
         return;
     }
     match tokio::time::timeout(Duration::from_secs(600), reply_rx).await {
-        Ok(Ok(r)) if !r.text.is_empty() || !r.images.is_empty() => {
+        Ok(Ok(r)) if !r.text.is_empty() || !r.images.is_empty() || !r.files.is_empty() => {
             let _ = out_tx
                 .send(crate::channel::OutboundMessage {
                     target_id,
@@ -6382,9 +7175,8 @@ async fn handle_pending_analysis(
                     text: r.text,
                     reply_to: None,
                     images: r.images,
-                    channel: None,
-
-                    files: vec![],                })
+                    files: r.files,
+                    channel: None,                })
                 .await;
         }
         Ok(Ok(_)) => {} // empty reply, nothing to send

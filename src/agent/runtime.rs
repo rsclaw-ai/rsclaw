@@ -1076,6 +1076,7 @@ impl AgentRuntime {
             is_empty: text_buf.is_empty(),
             tool_calls: None,
             images: vec![],
+            files: vec![],
             pending_analysis: None,
         })
     }
@@ -1197,6 +1198,7 @@ impl AgentRuntime {
                             is_empty: false,
                             tool_calls: None,
                             images: vec![],
+                            files: vec![],
                             pending_analysis: None,
                         });
                     }
@@ -1207,6 +1209,7 @@ impl AgentRuntime {
                         is_empty: false,
                         tool_calls: None,
                         images: vec![],
+                        files: vec![],
                         pending_analysis: Some(crate::agent::PendingAnalysis {
                             text: analysis_text,
                             session_key: session_key.to_owned(),
@@ -1268,6 +1271,7 @@ impl AgentRuntime {
                             is_empty: false,
                             tool_calls: None,
                             images: vec![],
+                            files: vec![],
                             pending_analysis: None,
                         });
                     }
@@ -1284,6 +1288,7 @@ impl AgentRuntime {
                         is_empty: false,
                         tool_calls: None,
                         images: vec![],
+                        files: vec![],
                         pending_analysis: Some(crate::agent::PendingAnalysis {
                             text: analysis_text,
                             session_key: session_key.to_owned(),
@@ -1303,6 +1308,7 @@ impl AgentRuntime {
                         is_empty: false,
                         tool_calls: None,
                         images: vec![],
+                        files: vec![],
                         pending_analysis: None,
                     });
                 }
@@ -1350,13 +1356,31 @@ impl AgentRuntime {
                 // Handle special directives
                 let reply_text = match response.as_str() {
                     "__HELP__" => build_help_text_filtered(allowed),
-                    "__VERSION__" => format!("rsclaw v{}", env!("RSCLAW_BUILD_VERSION")),
+                    "__VERSION__" => format!("rsclaw {}", env!("RSCLAW_BUILD_VERSION")),
                     "__STATUS__" => {
                         let model = self.resolve_model_name();
                         let sessions = self.sessions.len();
                         let uptime = format_duration(self.started_at.elapsed());
+                        let os = if cfg!(target_os = "macos") { "macOS" }
+                            else if cfg!(target_os = "linux") {
+                                // Check for Android (linux + ANDROID_ROOT env)
+                                if std::env::var("ANDROID_ROOT").is_ok() { "Android" } else { "Linux" }
+                            }
+                            else if cfg!(target_os = "windows") { "Windows" }
+                            else if cfg!(target_os = "ios") { "iOS" }
+                            else { "Unknown" };
+                        let ctx_tokens: usize = self.sessions.get(session_key)
+                            .map(|msgs| msgs.iter().map(msg_tokens).sum())
+                            .unwrap_or(0);
+                        let ctx_limit = self.handle.config.model.as_ref()
+                            .and_then(|m| m.context_tokens)
+                            .or(self.config.agents.defaults.model.as_ref()
+                                .and_then(|m| m.context_tokens))
+                            .unwrap_or(64000) as usize;
                         format!(
-                            "Gateway: running\nModel: {model}\nSessions: {sessions}\nUptime: {uptime}\nVersion: rsclaw v{}",
+                            "Gateway: running\nOS: {os}\nModel: {model}\nSessions: {sessions}\nContext: ~{:.1}k/{:.0}k tokens\nUptime: {uptime}\nVersion: rsclaw {}",
+                            ctx_tokens as f64 / 1000.0,
+                            ctx_limit as f64 / 1000.0,
                             env!("RSCLAW_BUILD_VERSION")
                         )
                     }
@@ -1366,7 +1390,7 @@ impl AgentRuntime {
                             crate::provider::registry::ProviderRegistry::parse_model(&model);
                         let provider_ok = self.providers.get(prov_name).is_ok();
                         format!(
-                            "Health check:\n  Provider ({}): {}\n  Store: ok\n  Agent: {}\n  Version: rsclaw v{}",
+                            "Health check:\n  Provider ({}): {}\n  Store: ok\n  Agent: {}\n  Version: rsclaw {}",
                             model,
                             if provider_ok { "ok" } else { "unavailable" },
                             self.handle.id,
@@ -1394,6 +1418,10 @@ impl AgentRuntime {
                     }
                     "__CLEAR__" => {
                         self.sessions.remove(session_key);
+                        // Also clear persisted session from redb.
+                        if let Err(e) = self.store.db.delete_session(session_key) {
+                            warn!("failed to clear persisted session: {e:#}");
+                        }
                         "Session cleared.".to_owned()
                     }
                     "__ABORT__" => {
@@ -1704,6 +1732,7 @@ impl AgentRuntime {
                             is_empty: true,
                             tool_calls: None,
                             images: vec![],
+                            files: vec![],
                             pending_analysis: None,
                         });
                     }
@@ -1715,6 +1744,7 @@ impl AgentRuntime {
                         is_empty: false,
                         tool_calls: None,
                         images: vec![],
+                        files: vec![],
                         pending_analysis: None,
                     });
                 }
@@ -1731,10 +1761,20 @@ impl AgentRuntime {
                         is_empty: false,
                         tool_calls: None,
                         images: vec![],
+                        files: vec![],
                         pending_analysis: None,
                     });
                 }
                 info!(tool = %tool, "pre-parse: executing tool directly");
+                // /remember command: inject kind=remember and action=put
+                let args = if tool == "memory_put" {
+                    let mut a = args;
+                    a["kind"] = json!("remember");
+                    a["action"] = json!("put");
+                    a
+                } else {
+                    args
+                };
                 let result = self
                     .dispatch_tool(
                         &RunContext {
@@ -1767,6 +1807,7 @@ impl AgentRuntime {
                             is_empty: reply_text.is_empty() && reply_images.is_empty(),
                             tool_calls: None,
                             images: reply_images,
+                            files: vec![],
                             pending_analysis: None,
                         });
                     }
@@ -1776,6 +1817,7 @@ impl AgentRuntime {
                             is_empty: false,
                             tool_calls: None,
                             images: vec![],
+                            files: vec![],
                             pending_analysis: None,
                         });
                     }
@@ -1797,6 +1839,7 @@ impl AgentRuntime {
                         is_empty: false,
                         tool_calls: None,
                         images: vec![],
+                        files: vec![],
                         pending_analysis: None,
                     });
                 }
@@ -1819,6 +1862,7 @@ impl AgentRuntime {
                         is_empty: false,
                         tool_calls: None,
                         images: vec![],
+                        files: vec![],
                         pending_analysis: None,
                     });
                 }
@@ -1833,6 +1877,7 @@ impl AgentRuntime {
                     is_empty: false,
                     tool_calls: None,
                     images: vec![],
+                    files: vec![],
                     pending_analysis: None,
                 });
             }
@@ -1848,6 +1893,7 @@ impl AgentRuntime {
                 is_empty: false,
                 tool_calls: None,
                 images: vec![],
+                files: vec![],
                 pending_analysis: None,
             });
         }
@@ -2000,6 +2046,7 @@ impl AgentRuntime {
                     is_empty: false,
                     tool_calls: None,
                     images: vec![],
+                    files: vec![],
                     pending_analysis: None,
                 });
             }
@@ -2024,6 +2071,7 @@ impl AgentRuntime {
                     is_empty: false,
                     tool_calls: None,
                     images: vec![],
+                    files: vec![],
                     pending_analysis: None,
                 });
             }
@@ -2105,6 +2153,7 @@ impl AgentRuntime {
                 is_empty: false,
                 tool_calls: None,
                 images: vec![],
+                files: vec![],
                 pending_analysis: None,
             });
         }
@@ -2417,6 +2466,7 @@ impl AgentRuntime {
                 is_empty: false,
                 tool_calls: None,
                 images: vec![],
+                files: vec![],
                 pending_analysis: None,
             });
         }
@@ -2604,6 +2654,7 @@ impl AgentRuntime {
             .unwrap_or(64_000) as usize;
 
         let mut tool_images: Vec<String> = Vec::new();
+        let mut tool_files: Vec<(String, String, String)> = Vec::new();
 
         loop {
             // Apply legacy context pruning (hard clear / soft trim) as fallback.
@@ -3123,6 +3174,7 @@ impl AgentRuntime {
                     is_empty: no_reply && tool_images.is_empty(),
                     tool_calls: None,
                     images: tool_images,
+                    files: tool_files,
                     pending_analysis: None,
                 });
             }
@@ -3184,6 +3236,7 @@ impl AgentRuntime {
                     is_empty: true,
                     tool_calls: Some(oai_tool_calls),
                     images: vec![],
+                    files: vec![],
                     pending_analysis: None,
                 });
             }
@@ -3316,6 +3369,84 @@ impl AgentRuntime {
                 };
 
                 tool_images.extend(result_images);
+
+                // send_file tool: directly add file to tool_files.
+                if tool_name == "send_file" {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result_text) {
+                        if v.get("__send_file").and_then(|b| b.as_bool()).unwrap_or(false) {
+                            if let Some(path_str) = v.get("path").and_then(|p| p.as_str()) {
+                                let full = std::path::PathBuf::from(path_str);
+                                let filename = v.get("filename").and_then(|f| f.as_str()).unwrap_or("file").to_owned();
+                                let lower = filename.to_lowercase();
+                                let mime = if lower.ends_with(".xlsx") { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }
+                                    else if lower.ends_with(".docx") { "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+                                    else if lower.ends_with(".pptx") { "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
+                                    else if lower.ends_with(".pdf") { "application/pdf" }
+                                    else if lower.ends_with(".csv") { "text/csv" }
+                                    else if lower.ends_with(".mp4") { "video/mp4" }
+                                    else if lower.ends_with(".mp3") { "audio/mpeg" }
+                                    else if lower.ends_with(".zip") { "application/zip" }
+                                    else { "application/octet-stream" };
+                                tool_files.push((filename, mime.to_owned(), full.to_string_lossy().to_string()));
+                                tracing::info!(path = %full.display(), "agent: send_file queued");
+                            }
+                        }
+                    }
+                }
+
+                // Collect sendable file attachments from write/exec tool results.
+                if matches!(tool_name.as_str(), "write" | "exec") {
+                    let workspace = self.handle.config.workspace.as_deref()
+                        .or(self.config.agents.defaults.workspace.as_deref())
+                        .map(expand_tilde)
+                        .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+
+                    // Helper: check if a path is a sendable file type and add to tool_files.
+                    let mut try_add_file = |path_str: &str| {
+                        let lower = path_str.to_lowercase();
+                        let sendable_exts = [".xlsx", ".xls", ".docx", ".doc", ".pptx", ".ppt",
+                            ".pdf", ".csv", ".mp4", ".mp3", ".zip", ".tar.gz", ".txt", ".json",
+                            ".html", ".py", ".md"];
+                        if !sendable_exts.iter().any(|ext| lower.ends_with(ext)) { return; }
+                        let pb = std::path::PathBuf::from(path_str);
+                        let full = if pb.is_absolute() { pb } else { workspace.join(path_str) };
+                        if !full.exists() { return; }
+                        // Skip very large files (>50MB)
+                        if let Ok(meta) = full.metadata() {
+                            if meta.len() > 50_000_000 { return; }
+                        }
+                        let filename = full.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        // Avoid duplicates
+                        if tool_files.iter().any(|(_, _, p)| p == &full.to_string_lossy().to_string()) { return; }
+                        let mime = if lower.ends_with(".xlsx") { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }
+                            else if lower.ends_with(".docx") { "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+                            else if lower.ends_with(".pptx") { "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
+                            else if lower.ends_with(".pdf") { "application/pdf" }
+                            else if lower.ends_with(".csv") { "text/csv" }
+                            else if lower.ends_with(".mp4") { "video/mp4" }
+                            else if lower.ends_with(".mp3") { "audio/mpeg" }
+                            else if lower.ends_with(".zip") { "application/zip" }
+                            else { "application/octet-stream" };
+                        tool_files.push((filename, mime.to_owned(), full.to_string_lossy().to_string()));
+                        tracing::info!(path = %full.display(), "agent: sendable file detected");
+                    };
+
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result_text) {
+                        // write tool: {"written": true, "path": "xxx.xlsx"}
+                        if let Some(path_str) = v.get("path").and_then(|p| p.as_str()) {
+                            try_add_file(path_str);
+                        }
+                        // exec tool: scan stdout for file paths the script may have printed
+                        if let Some(stdout) = v.get("stdout").and_then(|s| s.as_str()) {
+                            for line in stdout.lines() {
+                                let trimmed = line.trim();
+                                if trimmed.contains('.') && !trimmed.contains(' ') && trimmed.len() < 256 {
+                                    try_add_file(trimmed);
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Truncate tool result for session storage (prevent bloat).
                 // Current LLM round already has full result via tool dispatch.
@@ -3487,6 +3618,38 @@ impl AgentRuntime {
             }
 
             // --- Standalone tools (unchanged) ---
+            "send_file" => {
+                // Returns a marker that the agent loop picks up to add to tool_files.
+                let path = args["path"].as_str().unwrap_or("").to_owned();
+                let workspace = self.handle.config.workspace.as_deref()
+                    .or(self.config.agents.defaults.workspace.as_deref())
+                    .map(expand_tilde)
+                    .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+                let pb = std::path::PathBuf::from(&path);
+                let full = if pb.is_absolute() { pb } else { workspace.join(&path) };
+
+                // Reuse the same safety checks as the read tool.
+                if let Err(e) = check_read_safety(&path, &full) {
+                    warn!("send_file: {e}");
+                    return Ok(json!({"error": e.to_string()}));
+                }
+
+                if !full.exists() {
+                    return Ok(json!({"error": format!("file not found: {}", full.display())}));
+                }
+                if let Ok(meta) = full.metadata() {
+                    if meta.len() > 50_000_000 {
+                        return Ok(json!({"error": "file too large (>50MB)"}));
+                    }
+                }
+                let filename = full.file_name().unwrap_or_default().to_string_lossy().to_string();
+                return Ok(json!({
+                    "__send_file": true,
+                    "path": full.to_string_lossy(),
+                    "filename": filename,
+                    "size": full.metadata().map(|m| m.len()).unwrap_or(0),
+                }));
+            }
             "read" => return self.tool_read(args).await,
             "write" => return self.tool_write(args).await,
             "exec" => return self.tool_exec(args).await,
@@ -3715,7 +3878,11 @@ impl AgentRuntime {
         {
             tracing::warn!("BM25 index failed for memory_put doc: {e:#}");
         }
-        // Also append to MEMORY.md for persistent system prompt injection
+        // Only append to MEMORY.md for user-initiated /remember commands,
+        // not for automatic memory_put calls by the model.
+        if kind != "remember" {
+            return Ok(json!({"stored": true, "id": id}));
+        }
         let ws_str = self
             .handle
             .config
@@ -3780,7 +3947,7 @@ impl AgentRuntime {
             .as_deref()
             .or(self.config.agents.defaults.workspace.as_deref())
             .map(expand_tilde)
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
+            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
 
         // Normalize path separators for Windows
         let path_normalized = path.replace('/', std::path::MAIN_SEPARATOR.to_string().as_str());
@@ -3900,7 +4067,7 @@ impl AgentRuntime {
             .as_deref()
             .or(self.config.agents.defaults.workspace.as_deref())
             .map(expand_tilde)
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
+            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
 
         // Normalize path separators for Windows
         let path_normalized = path.replace('/', std::path::MAIN_SEPARATOR.to_string().as_str());
@@ -4746,14 +4913,17 @@ impl AgentRuntime {
             .as_str()
             .ok_or_else(|| anyhow!("agent_spawn: `id` required"))?
             .to_owned();
-        let model = args["model"]
-            .as_str()
-            .ok_or_else(|| anyhow!("agent_spawn: `model` required"))?
+        let model = args["model"].as_str()
+            .filter(|s| !s.is_empty() && *s != "default")
+            .unwrap_or(&self.resolve_model_name())
             .to_owned();
         let system = args["system"]
             .as_str()
             .ok_or_else(|| anyhow!("agent_spawn: `system` required"))?
             .to_owned();
+        let channels: Option<Vec<String>> = args["channels"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_owned())).collect());
 
         use crate::config::schema::{AgentEntry, ModelConfig};
 
@@ -4761,9 +4931,7 @@ impl AgentRuntime {
             id: id.clone(),
             default: Some(false),
             workspace: Some(crate::config::loader::path_to_forward_slash(
-                &dirs_next::home_dir()
-                    .unwrap_or_default()
-                    .join(format!(".rsclaw/workspace/{id}")),
+                &crate::config::loader::base_dir().join(format!("workspace-{id}")),
             )),
             model: Some(ModelConfig {
                 primary: Some(model),
@@ -4780,7 +4948,7 @@ impl AgentRuntime {
             lane: None,
             lane_concurrency: None,
             group_chat: None,
-            channels: None,
+            channels: channels.clone(),
             name: None,
             agent_dir: None,
             system: None,
@@ -4790,20 +4958,31 @@ impl AgentRuntime {
             claudecode: None,
         };
 
-        spawner.spawn_agent(entry)?;
+        spawner.spawn_agent(entry.clone())?;
 
         // Write system prompt as SOUL.md in the new agent's workspace.
-        let ws_path = dirs_next::home_dir()
-            .unwrap_or_default()
-            .join(format!(".rsclaw/workspace/{id}"));
+        let ws_path = crate::config::loader::base_dir().join(format!("workspace-{id}"));
         let _ = tokio::fs::create_dir_all(&ws_path).await;
         let soul_path = ws_path.join("SOUL.md");
         let _ = tokio::fs::write(&soul_path, format!("# Agent: {id}\n\n{system}\n")).await;
 
+        // Persist to config file by default (user-created agents survive restart).
+        // Pass persistent=false only for temporary task-delegation agents.
+        let persistent = args["persistent"].as_bool().unwrap_or(true);
+        if persistent {
+            if let Err(e) = persist_agent_to_config(&entry).await {
+                warn!("agent_spawn: failed to persist to config: {e:#}");
+            }
+        }
+
+        let needs_restart = persistent && channels.is_some();
         Ok(json!({
             "spawned": id,
             "model": args["model"],
-            "status": "ready"
+            "persistent": persistent,
+            "channels": channels,
+            "needs_restart": needs_restart,
+            "status": if needs_restart { "saved — restart gateway to bind channels" } else { "ready" }
         }))
     }
 
@@ -8204,7 +8383,7 @@ fn toolset_allowed_names(
     toolset: &str,
     custom_tools: Option<&Vec<String>>,
 ) -> Option<std::collections::HashSet<String>> {
-    const MINIMAL: &[&str] = &["exec", "read", "write", "web_search", "web_fetch", "memory"];
+    const MINIMAL: &[&str] = &["exec", "read", "write", "send_file", "web_search", "web_fetch", "memory"];
     const STANDARD: &[&str] = &[
         "exec",
         "read",
@@ -8639,7 +8818,7 @@ fn build_tool_list(
                 "id":     {"type": "string", "description": "Memory document ID (for get/delete)"},
                 "text":   {"type": "string", "description": "Content to store (for put action)"},
                 "scope":  {"type": "string", "description": "Scope filter (optional)"},
-                "kind":   {"type": "string", "description": "Document kind: note, fact, summary (for put)"},
+                "kind":   {"type": "string", "description": "Document kind: note, fact, summary, or remember. Use 'remember' ONLY when the user explicitly asks to remember/memorize something."},
                 "top_k":  {"type": "integer", "description": "Max results (for search, default 5)"}
             },
             "required": ["action"]
@@ -8669,6 +8848,20 @@ fn build_tool_list(
                 "content": {"type": "string", "description": "File content to write (REQUIRED)."}
             },
             "required": ["path", "content"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "send_file".to_owned(),
+        description: "Send a file from the workspace to the user as an attachment. \
+            Use this when the user asks you to send, share, or download a file. \
+            The file will be delivered as a chat attachment (not as text). \
+            Path is relative to workspace root.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path to send (relative to workspace or absolute)"}
+            },
+            "required": ["path"]
         }),
     });
     tools.push(ToolDef {
@@ -9520,6 +9713,54 @@ fn apply_context_budget_trim(
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Persist dynamic agent to config file
+// ---------------------------------------------------------------------------
+
+/// Append an AgentEntry to the `agents.list` array in the config file.
+/// The hot-reload watcher will pick up the change automatically.
+async fn persist_agent_to_config(entry: &crate::config::schema::AgentEntry) -> anyhow::Result<()> {
+    let config_path = crate::config::loader::detect_config_path()
+        .ok_or_else(|| anyhow!("no config file found"))?;
+    let raw = tokio::fs::read_to_string(&config_path).await?;
+    let mut doc: serde_json::Value = json5::from_str(&raw)
+        .map_err(|e| anyhow!("parse config: {e}"))?;
+
+    // Don't duplicate if agent already exists.
+    let id = entry.id.as_str();
+    let already_exists = doc.pointer("/agents/list")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().any(|e| e.get("id").and_then(|v| v.as_str()) == Some(id)))
+        .unwrap_or(false);
+    if already_exists {
+        return Ok(());
+    }
+
+    let mut entry_val = serde_json::to_value(entry)?;
+
+    // Strip model field if it matches agents.defaults.model.primary
+    // (no need to persist what the defaults already provide).
+    let defaults_primary = doc.pointer("/agents/defaults/model/primary")
+        .and_then(|v| v.as_str()).map(|s| s.to_owned());
+    let entry_primary = entry_val.pointer("/model/primary")
+        .and_then(|v| v.as_str()).map(|s| s.to_owned());
+    if defaults_primary.is_some() && defaults_primary == entry_primary {
+        entry_val.as_object_mut().map(|o| o.remove("model"));
+    }
+
+    let list = doc
+        .pointer_mut("/agents/list")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| anyhow!("agents.list not found in config"))?;
+    list.push(entry_val);
+
+    // Write back as pretty JSON (json5-compatible).
+    let output = serde_json::to_string_pretty(&doc)?;
+    tokio::fs::write(&config_path, output).await?;
+    tracing::info!(agent_id = %id, "agent persisted to config");
+    Ok(())
+}
+
 // Tests
 // ---------------------------------------------------------------------------
 
