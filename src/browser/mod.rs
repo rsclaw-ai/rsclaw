@@ -775,7 +775,7 @@ impl BrowserSession {
             )
         } else if let Some(text) = text_sel {
             format!(
-                r#"var el=(function(){{var all=document.querySelectorAll('a,button,[role=button],[role=link],input[type=submit]');for(var i=0;i<all.length;i++){{if(all[i].innerText&&all[i].innerText.trim().includes('{}'))return all[i];}};return null;}})(); if(!el) return 'NOT_FOUND';"#,
+                r#"var el=(function(){{var t='{}';var all=document.querySelectorAll('a,button,[role=button],[role=link],input[type=submit]');for(var i=0;i<all.length;i++){{if(all[i].innerText&&all[i].innerText.trim().includes(t))return all[i];}};var everything=document.querySelectorAll('*');for(var i=0;i<everything.length;i++){{var s=window.getComputedStyle(everything[i]);if(s.cursor==='pointer'&&everything[i].innerText&&everything[i].innerText.trim()===t)return everything[i];}};for(var i=0;i<everything.length;i++){{var s=window.getComputedStyle(everything[i]);if(s.cursor==='pointer'&&everything[i].innerText&&everything[i].innerText.trim().includes(t))return everything[i];}};return null;}})(); if(!el) return 'NOT_FOUND';"#,
                 escape_js_string(text),
             )
         } else {
@@ -1598,7 +1598,7 @@ impl BrowserSession {
 
         let js = match by {
             "text" => format!(
-                r#"(function(){{var all=document.querySelectorAll('a,button,[role=button],[role=link]');for(var i=0;i<all.length;i++){{if(all[i].innerText&&all[i].innerText.trim().includes('{}')){{all[i].scrollIntoView({{block:'center'}});return JSON.stringify({{found:true,tag:all[i].tagName,text:all[i].innerText.substring(0,100)}});}}}};return JSON.stringify({{found:false}});}})()"#,
+                r#"(function(){{var t='{}';var all=document.querySelectorAll('a,button,[role=button],[role=link]');for(var i=0;i<all.length;i++){{if(all[i].innerText&&all[i].innerText.trim().includes(t)){{all[i].scrollIntoView({{block:'center'}});return JSON.stringify({{found:true,tag:all[i].tagName,text:all[i].innerText.substring(0,100)}});}}}};var everything=document.querySelectorAll('*');for(var i=0;i<everything.length;i++){{var s=window.getComputedStyle(everything[i]);if(s.cursor==='pointer'&&everything[i].innerText&&everything[i].innerText.trim().includes(t)){{everything[i].scrollIntoView({{block:'center'}});return JSON.stringify({{found:true,tag:everything[i].tagName,text:everything[i].innerText.substring(0,100)}});}}}};return JSON.stringify({{found:false}});}})()"#,
                 escape_js_string(value)
             ),
             "label" => format!(
@@ -1615,7 +1615,7 @@ impl BrowserSession {
             if let Some("click") = then {
                 if by == "text" {
                     let click_js = format!(
-                        r#"(function(){{var all=document.querySelectorAll('a,button,[role=button],[role=link]');for(var i=0;i<all.length;i++){{if(all[i].innerText&&all[i].innerText.trim().includes('{}')){{all[i].click();return 'OK';}}}};return 'NOT_FOUND';}})()"#,
+                        r#"(function(){{var t='{}';var all=document.querySelectorAll('a,button,[role=button],[role=link]');for(var i=0;i<all.length;i++){{if(all[i].innerText&&all[i].innerText.trim().includes(t)){{all[i].click();return 'OK';}}}};var everything=document.querySelectorAll('*');for(var i=0;i<everything.length;i++){{var s=window.getComputedStyle(everything[i]);if(s.cursor==='pointer'&&everything[i].innerText&&everything[i].innerText.trim().includes(t)){{everything[i].click();return 'OK';}}}};return 'NOT_FOUND';}})()"#,
                         escape_js_string(value)
                     );
                     self.eval_js(&click_js).await?;
