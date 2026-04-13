@@ -677,11 +677,21 @@ impl BrowserSession {
             }
         }
 
-        // If the command failed, Chrome might be in a bad state (crashed or CDP connection
-        // broken). Restart it so the next call gets a fresh session.
-        if result.is_err() && self.is_alive() {
-            warn!("CDP command failed, restarting Chrome to recover");
-            let _ = self.restart().await;
+        // If the command failed due to a CDP transport error (WebSocket disconnected,
+        // Chrome crashed, etc.), restart the session. Do NOT restart for normal business
+        // errors like "element not found" or "timeout".
+        if let Err(ref e) = result {
+            let msg = e.to_string();
+            let is_transport_error = msg.contains("WebSocket")
+                || msg.contains("connection")
+                || msg.contains("broken pipe")
+                || msg.contains("Connection reset")
+                || msg.contains("EOF")
+                || !self.is_alive();
+            if is_transport_error {
+                warn!("CDP transport error, restarting Chrome to recover");
+                let _ = self.restart().await;
+            }
         }
 
         result
