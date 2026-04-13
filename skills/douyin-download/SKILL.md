@@ -1,49 +1,49 @@
 ---
 name: douyin-download
-description: 下载抖音视频，动态创建子 agent 完成浏览器自动化和下载任务
-version: 2.1.0
+description: 下载抖音视频，用 web_browser 打开视频页面提取真实下载链接
+version: 3.0.0
 ---
 
 # 抖音视频下载
 
-当用户提供抖音视频链接或要求下载抖音视频时，按以下流程操作。
+当用户要求下载抖音视频时，按以下步骤执行。web_browser 工具的调用格式如下：
 
-## 流程
+## web_browser 调用格式
 
-### 第一步：创建下载子 agent
+- 打开页面：`{"action":"open","url":"页面URL"}`
+- 等待：`{"action":"wait","ms":5000}`
+- 执行JS：`{"action":"evaluate","js":"JS代码"}`
+- 截图：`{"action":"screenshot"}`
 
-用 `agent` tool spawn 一个专门的下载子 agent：
+## 下载流程
 
-```json
-{
-  "action": "spawn",
-  "id": "douyin-downloader",
-  "model": "doubao/doubao-seed-2-0-pro-260215",
-  "system": "你是抖音视频下载助手。web_browser 工具调用格式：打开页面用 {\"action\":\"open\",\"url\":\"URL\"}，截图用 {\"action\":\"screenshot\"}，执行JS用 {\"action\":\"evaluate\",\"js\":\"代码\"}，等待用 {\"action\":\"wait\",\"ms\":5000}。接到任务后：1) 调用 web_browser {\"action\":\"open\",\"url\":\"视频URL\"} 打开页面；2) 等待5秒 {\"action\":\"wait\",\"ms\":5000}；3) 调用 {\"action\":\"evaluate\",\"js\":\"document.querySelector('video')?.src\"} 提取 video src；4) 如果 src 为空或是 blob，执行 {\"action\":\"evaluate\",\"js\":\"JSON.stringify(Array.from(document.querySelectorAll('video,source')).map(e=>e.src||e.currentSrc).filter(s=>s&&s.startsWith('http')))\"} 获取所有视频URL；5) 拿到真实 http URL 后用 exec 下载：macOS/Linux 用 curl -L -o ~/Downloads/douyin_$(date +%Y%m%d_%H%M%S).mp4 \"URL\"，Windows 用 powershell Invoke-WebRequest，通用备选 python3 -c \"import urllib.request; urllib.request.urlretrieve('URL','path')\"；6) 返回下载结果（文件路径和大小）。如果页面需要登录先用 {\"action\":\"screenshot\"} 截图发给用户扫码。"
-}
-```
+1. **打开视频页面**
+   ```json
+   {"action":"open","url":"<用户提供的抖音视频URL>"}
+   ```
 
-### 第二步：发送下载任务
+2. **等待视频加载（5秒）**
+   ```json
+   {"action":"wait","ms":5000}
+   ```
 
-用 `session` tool 发送任务给子 agent：
+3. **提取视频真实 URL**
+   ```json
+   {"action":"evaluate","js":"document.querySelector('video')?.src"}
+   ```
+   如果返回空或 blob URL，再执行：
+   ```json
+   {"action":"evaluate","js":"JSON.stringify(Array.from(document.querySelectorAll('video,source')).map(e=>e.src||e.currentSrc).filter(s=>s&&s.startsWith('http')))"}
+   ```
 
-```json
-{
-  "action": "send",
-  "agentId": "douyin-downloader",
-  "message": "请下载这个抖音视频：<用户提供的URL>"
-}
-```
+4. **下载视频文件**（用 exec 工具，选择对应平台命令）
+   - macOS/Linux：`curl -L -o ~/Downloads/douyin_$(date +%Y%m%d_%H%M%S).mp4 "真实URL"`
+   - Windows：`powershell -Command "Invoke-WebRequest -Uri '真实URL' -OutFile \"$env:USERPROFILE\Downloads\douyin_$(Get-Date -Format yyyyMMddHHmmss).mp4\""`
 
-### 第三步：汇报结果
-
-收到子 agent 回复后，告知用户：
-- 下载成功：文件保存在哪里、大小多少
-- 下载失败：原因是什么
+5. **告知用户**下载完成的文件路径和大小
 
 ## 注意事项
 
-- 子 agent 复用已保存的 douyin.com 登录态（web_browser 使用 rsclaw profile）
-- 如果视频是加密 blob URL 无法直接下载，告知用户"该视频受保护"
-- 下载完成后不需要 kill 子 agent，它会自动待机复用
-- 如果用户要批量下载，对每个链接都用 `session send` 发给同一个子 agent 处理
+- 如果页面需要登录，用 `{"action":"screenshot"}` 截图发给用户扫码
+- 如果 video src 是 blob:// 开头，无法直接下载，告知用户该视频受保护
+- 使用已保存的 douyin.com 登录态（rsclaw profile）
