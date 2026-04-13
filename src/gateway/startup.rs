@@ -102,14 +102,24 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         } else if en.join("config.json").exists() {
             en
         } else {
-            // Auto-download BGE model.
+            // Auto-download BGE model in background (don't block startup).
             let target_dir = zh; // default to zh
-            let lang = config.raw.gateway.as_ref().and_then(|g| g.language.as_deref());
-            if let Err(e) = download_bge_model(&target_dir, search_cfg, lang).await {
-                warn!("BGE model auto-download failed: {e:#}");
-                warn!("semantic memory search will use FNV fallback (low quality)");
-                warn!("to fix: manually download BGE model or configure memory.search.provider");
-            }
+            let lang = config.raw.gateway.as_ref().and_then(|g| g.language.as_deref()).map(str::to_owned);
+            let search_cfg_clone = search_cfg.cloned();
+            let dl_dir = target_dir.clone();
+            tokio::spawn(async move {
+                info!("BGE embedding model not found, downloading in background...");
+                match download_bge_model(&dl_dir, search_cfg_clone.as_ref(), lang.as_deref()).await {
+                    Ok(()) => {
+                        info!("BGE model downloaded. Restart gateway to enable semantic memory search.");
+                    }
+                    Err(e) => {
+                        warn!("BGE model auto-download failed: {e:#}");
+                        warn!("semantic memory search using FNV fallback (low quality)");
+                        warn!("to fix: run `rsclaw models download` or configure memorySearch.provider");
+                    }
+                }
+            });
             target_dir
         }
     };
