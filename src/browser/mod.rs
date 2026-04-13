@@ -474,20 +474,27 @@ impl BrowserSession {
     }
 
     /// Connect CDP to a Chrome process's page target.
+    /// Retries discovery up to 10 times (headed mode can be slow to initialize).
     async fn connect_cdp(chrome: &ChromeProcess) -> Result<CdpClient> {
         let port = chrome.port()?;
         let discovery_url = format!("http://127.0.0.1:{port}/json");
-        let targets: Vec<Value> = reqwest::get(&discovery_url)
-            .await
-            .map_err(|e| anyhow!("failed to discover CDP targets: {e}"))?
-            .json()
-            .await
-            .map_err(|e| anyhow!("failed to parse CDP targets: {e}"))?;
 
-        let page_target = targets
-            .iter()
-            .find(|t| t["type"].as_str() == Some("page"))
-            .ok_or_else(|| anyhow!("no page target found in CDP target list"))?;
+        let mut page_target: Option<Value> = None;
+        for attempt in 0..10 {
+            if let Ok(resp) = reqwest::get(&discovery_url).await {
+                if let Ok(targets) = resp.json::<Vec<Value>>().await {
+                    if let Some(target) = targets.into_iter().find(|t| t["type"].as_str() == Some("page")) {
+                        page_target = Some(target);
+                        break;
+                    }
+                }
+            }
+            if attempt < 9 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+        let page_target = page_target
+            .ok_or_else(|| anyhow!("no page target found in CDP target list after 10 attempts"))?;
 
         let page_ws_url = page_target["webSocketDebuggerUrl"]
             .as_str()
