@@ -1369,7 +1369,7 @@ fn start_channels(
                                         // Debounce: wait briefly then drain queued messages.
                                         tokio::time::sleep(Duration::from_secs(2)).await;
                                         while let Ok((extra_text, _, _, _, _, extra_images, extra_files)) = urx.try_recv() {
-                                            if !extra_text.is_empty() {
+                                            if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
                                                 text.push('\n');
                                                 text.push_str(&extra_text);
                                             }
@@ -1905,7 +1905,7 @@ fn start_discord_if_configured(
                                     // Debounce: wait briefly then drain queued messages.
                                     tokio::time::sleep(Duration::from_secs(2)).await;
                                     while let Ok((extra_text, _, _, _, _)) = urx.try_recv() {
-                                        if !extra_text.is_empty() {
+                                        if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
                                             text.push('\n');
                                             text.push_str(&extra_text);
                                         }
@@ -2358,7 +2358,7 @@ fn start_slack_if_configured(
                                     // Debounce: wait briefly then drain queued messages.
                                     tokio::time::sleep(Duration::from_secs(2)).await;
                                     while let Ok((extra_text, _, _, _, _)) = urx.try_recv() {
-                                        if !extra_text.is_empty() {
+                                        if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
                                             text.push('\n');
                                             text.push_str(&extra_text);
                                         }
@@ -2757,7 +2757,7 @@ fn start_whatsapp_if_configured(
                                     // Debounce: wait briefly then drain queued messages.
                                     tokio::time::sleep(Duration::from_secs(2)).await;
                                     while let Ok((extra_text, _, extra_images)) = urx.try_recv() {
-                                        if !extra_text.is_empty() {
+                                        if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
                                             text.push('\n');
                                             text.push_str(&extra_text);
                                         }
@@ -3146,7 +3146,7 @@ fn start_line_if_configured(
                                     // Debounce: wait briefly then drain queued messages.
                                     tokio::time::sleep(Duration::from_secs(2)).await;
                                     while let Ok((extra_text, _, _, extra_images)) = urx.try_recv() {
-                                        if !extra_text.is_empty() {
+                                        if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
                                             text.push('\n');
                                             text.push_str(&extra_text);
                                         }
@@ -3511,7 +3511,7 @@ fn start_zalo_if_configured(
                                     // Debounce: wait briefly then drain queued messages.
                                     tokio::time::sleep(Duration::from_secs(2)).await;
                                     while let Ok((extra_text, _, extra_images)) = urx.try_recv() {
-                                        if !extra_text.is_empty() {
+                                        if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
                                             text.push('\n');
                                             text.push_str(&extra_text);
                                         }
@@ -3884,7 +3884,7 @@ fn start_signal_if_configured(
                                 // Debounce: wait briefly then drain queued messages.
                                 tokio::time::sleep(Duration::from_secs(2)).await;
                                 while let Ok((extra_text, _, _)) = urx.try_recv() {
-                                    if !extra_text.is_empty() {
+                                    if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
                                         text.push('\n');
                                         text.push_str(&extra_text);
                                     }
@@ -4114,7 +4114,7 @@ fn spawn_wechat_user_worker(
             // Debounce: wait briefly then drain queued messages.
             tokio::time::sleep(Duration::from_secs(2)).await;
             while let Ok((extra_text, extra_images, extra_files)) = rx.try_recv() {
-                if !extra_text.is_empty() {
+                if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
                     text.push('\n');
                     text.push_str(&extra_text);
                 }
@@ -4830,7 +4830,7 @@ fn start_feishu_if_configured(
                                     // Debounce: wait briefly then drain queued messages.
                                     tokio::time::sleep(Duration::from_secs(2)).await;
                                     while let Ok((extra_text, _, _, _, _, extra_images, extra_files)) = urx.try_recv() {
-                                        if !extra_text.is_empty() {
+                                        if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
                                             text.push('\n');
                                             text.push_str(&extra_text);
                                         }
@@ -5317,7 +5317,7 @@ fn start_dingtalk_if_configured(
                                     // Debounce: wait briefly then drain queued messages.
                                     tokio::time::sleep(Duration::from_secs(2)).await;
                                     while let Ok((extra_text, _, _, _, _, extra_images)) = urx.try_recv() {
-                                        if !extra_text.is_empty() {
+                                        if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
                                             text.push('\n');
                                             text.push_str(&extra_text);
                                         }
@@ -5861,7 +5861,7 @@ fn start_qq_if_configured(
                                     // Debounce: wait briefly then drain queued messages.
                                     tokio::time::sleep(Duration::from_secs(2)).await;
                                     while let Ok((extra_text, _, _, _, _, extra_images, extra_files)) = urx.try_recv() {
-                                        if !extra_text.is_empty() {
+                                        if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
                                             text.push('\n');
                                             text.push_str(&extra_text);
                                         }
@@ -6289,7 +6289,7 @@ fn start_matrix_if_configured(
                                     // Debounce: wait briefly then drain queued messages.
                                     tokio::time::sleep(Duration::from_secs(2)).await;
                                     while let Ok((extra_text, _, _, _, extra_images, extra_files)) = urx.try_recv() {
-                                        if !extra_text.is_empty() {
+                                        if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
                                             text.push('\n');
                                             text.push_str(&extra_text);
                                         }
@@ -6698,7 +6698,7 @@ fn start_wecom_if_configured(
                                     // Debounce: wait briefly then drain queued messages.
                                     tokio::time::sleep(Duration::from_secs(2)).await;
                                     while let Ok((extra_text, _, _, _, extra_images, extra_files)) = urx.try_recv() {
-                                        if !extra_text.is_empty() {
+                                        if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
                                             text.push('\n');
                                             text.push_str(&extra_text);
                                         }
