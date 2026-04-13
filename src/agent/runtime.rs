@@ -3403,8 +3403,11 @@ impl AgentRuntime {
                                         else if lower.ends_with(".mp3") { "audio/mpeg" }
                                         else if lower.ends_with(".zip") { "application/zip" }
                                         else { "application/octet-stream" };
-                                    tool_files.push((filename, mime.to_owned(), full.to_string_lossy().to_string()));
-                                    tracing::info!(path = %full.display(), "agent: send_file queued");
+                                    let full_str = full.to_string_lossy().to_string();
+                                    if !tool_files.iter().any(|(_, _, p)| p == &full_str) {
+                                        tool_files.push((filename, mime.to_owned(), full_str));
+                                        tracing::info!(path = %full.display(), "agent: send_file queued");
+                                    }
                                 }
                             }
                         }
