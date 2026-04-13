@@ -277,7 +277,7 @@ impl HeartbeatRunner {
             }
 
             // Send heartbeat message to agent.
-            match self.send_heartbeat(agent_id, &spec.content).await {
+            match self.send_heartbeat(agent_id, &state_key, &spec.content).await {
                 Ok(()) => {
                     hb_state.record_success();
                 }
@@ -314,13 +314,13 @@ impl HeartbeatRunner {
     }
 
     /// Send a heartbeat message to the agent and wait for reply.
-    async fn send_heartbeat(&self, agent_id: &str, content: &str) -> Result<()> {
+    async fn send_heartbeat(&self, agent_id: &str, state_key: &str, content: &str) -> Result<()> {
         let handle = self.registry.get(agent_id)
             .map_err(|e| anyhow!("agent not found: {e:#}"))?;
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let msg = AgentMessage {
-            session_key: format!("heartbeat:{agent_id}"),
+            session_key: format!("heartbeat:{state_key}"),
             text: content.to_owned(),
             channel: "heartbeat".to_owned(),
             peer_id: "heartbeat".to_owned(),
