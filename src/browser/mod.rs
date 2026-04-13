@@ -171,6 +171,8 @@ impl ChromeProcess {
         if !headed {
             args.push("--headless=new");
         }
+        // Headed mode needs an initial URL to ensure a page target is created.
+        args.push("about:blank");
 
         let mut child = tokio::process::Command::new(chrome_path)
             .args(&args)
