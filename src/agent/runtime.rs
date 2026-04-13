@@ -8663,17 +8663,36 @@ fn build_system_prompt(
     parts.push(platform_info.to_string());
 
     // Tool usage guidance
-    parts.push(
-        "## Tool Usage Guidelines\n\
-         - IMPORTANT: When you don't know the answer, when the question involves recent events, \
-         real-time information, or anything beyond your training data cutoff, you MUST use the \
-         `web_search` tool FIRST before answering. Never guess or fabricate information about \
-         current events — always search.\n\
-         - For code generation: write complete files, one module at a time.\n\
-         - Use edit tool for small changes to existing files.\n\
-         - For cron jobs: use the `cron` tool (action=list/add/remove). The `cron` tool is a first-class tool — always use it instead of trying to invoke a `cron` shell command."
-            .to_string(),
-    );
+    {
+        let base = crate::config::loader::base_dir();
+        let tools_dir = base.join("tools");
+        let tools_hint = if tools_dir.exists() {
+            format!(
+                "\n- Before using complex tools (web_browser, exec, etc.), read `{}/tools/<tool_name>/prompt.md` for usage guide.",
+                base.display()
+            )
+        } else {
+            String::new()
+        };
+        parts.push(format!(
+            "## Tool Usage Guidelines\n\
+             - IMPORTANT: When you don't know the answer, when the question involves recent events, \
+             real-time information, or anything beyond your training data cutoff, you MUST use the \
+             `web_search` tool FIRST before answering. Never guess or fabricate information about \
+             current events — always search.\n\
+             - For code generation: write complete files, one module at a time.\n\
+             - Use edit tool for small changes to existing files.\n\
+             - For cron jobs: use the `cron` tool (action=list/add/remove). The `cron` tool is a first-class tool — always use it instead of trying to invoke a `cron` shell command.\n\
+             - Never fabricate URLs or file paths — only use data from real sources.{tools_hint}\n\n\
+             ## Self-Evolution — Auto Skill Creation\n\
+             When you notice a task pattern repeating (>=3 similar requests), package it as a standard skill after completing the task:\n\
+             1. Create SKILL.md in workspace/skills/<slug>/\n\
+             2. Frontmatter must include: name, description, version\n\
+             3. Body: describe trigger conditions and execution steps\n\
+             4. Record in memory (memory_put) to avoid duplicates\n\
+             5. Inform the user"
+        ));
+    }
 
     // Workspace files segment.
     let ws_segment = ws_ctx.to_prompt_segment();
