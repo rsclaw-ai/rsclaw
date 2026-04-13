@@ -193,12 +193,11 @@ const selectors = [
 - **QR 提示**: "请使用微信扫码登录"
 - **成功判断**: URL 跳转到企业邮箱主界面
 
-### 21. mail.aliyun.com（阿里邮箱）
-- **登录 URL**: `https://mail.aliyun.com`
-- **操作**: 点击"扫码登录"，可能跳转到阿里巴巴统一登录页
-- **二次跳转**: 可能跳转到 login.alibaba.com
-- **QR 提示**: "请使用钉钉/淘宝 APP 扫码登录"
-- **成功判断**: URL 跳转到邮箱收件箱页面
+### 21. mail.aliyun.com（阿里邮箱企业版）
+- **登录 URL**: `https://qiye.aliyun.com`（个人版 mail.aliyun.com 无扫码，需进企业版）
+- **操作**: 点击登录框中的"Scan to sign in with Alimail"按钮，显示二维码
+- **QR 提示**: "请使用阿里邮箱/钉钉 APP 扫码登录"
+- **成功判断**: URL 跳转到企业邮箱收件箱页面
 
 ### 22. mail.sina.com.cn（新浪邮箱）
 - **登录 URL**: `https://mail.sina.com.cn`
