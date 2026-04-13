@@ -5033,10 +5033,14 @@ impl AgentRuntime {
         // Auto-generate a short unique ID scoped under the parent agent's workspace.
         let short_id = &uuid::Uuid::new_v4().to_string()[..8];
         let id = format!("task-{short_id}");
-        // Workspace: ~/.rsclaw/workspace-<parent>/task-<short_id>/
-        let ws_path = crate::config::loader::base_dir()
-            .join(format!("workspace-{}", ctx.agent_id))
-            .join(format!("task-{short_id}"));
+        // Resolve parent workspace the same way as the runtime does:
+        // main agent → ~/.rsclaw/workspace, others → ~/.rsclaw/workspace-{id}
+        let base = crate::config::loader::base_dir();
+        let parent_ws = self.handle.config.workspace
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| base.join("workspace"));
+        let ws_path = parent_ws.join(format!("task-{short_id}"));
         use crate::config::schema::{AgentEntry, ModelConfig};
         let entry = AgentEntry {
             id: id.clone(),
