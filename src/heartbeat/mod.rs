@@ -141,43 +141,75 @@ fn parse_time_range(s: &str) -> Result<(NaiveTime, NaiveTime)> {
 }
 
 /// Heartbeat runner — scans agent workspaces and spawns per-agent heartbeat loops.
+/// Periodically rescans to discover new HEARTBEAT.md files from dynamically created agents.
 pub struct HeartbeatRunner {
     registry: Arc<AgentRegistry>,
     store: Arc<HeartbeatStore>,
-    agent_ids: Vec<String>,
+    /// Tracks which agents already have a running heartbeat loop.
+    active: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl HeartbeatRunner {
     pub fn new(
         registry: Arc<AgentRegistry>,
         data_dir: &Path,
-        agent_ids: Vec<String>,
     ) -> Self {
         let state_path = data_dir.join("heartbeat").join("state.json");
         Self {
             registry,
             store: Arc::new(HeartbeatStore::new(state_path)),
-            agent_ids,
+            active: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
-    /// Start heartbeat loops for all agents that have a HEARTBEAT.md.
+    /// Start heartbeat loops for existing agents and spawn a rescan task
+    /// to discover new HEARTBEAT.md files from dynamically created agents.
     pub fn run(self: Arc<Self>) {
-        for agent_id in &self.agent_ids {
-            let workspace = resolve_workspace(agent_id);
-            let heartbeat_path = workspace.join("HEARTBEAT.md");
-            if !heartbeat_path.exists() {
+        self.scan_and_spawn();
+
+        // Rescan every 60 seconds for new HEARTBEAT.md files.
+        let runner = Arc::clone(&self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                runner.scan_and_spawn();
+            }
+        });
+    }
+
+    /// Scan all workspace directories for HEARTBEAT.md and spawn loops for new ones.
+    fn scan_and_spawn(self: &Arc<Self>) {
+        let base = base_dir();
+        // Collect workspace dirs: "workspace" + "workspace-*"
+        let mut dirs: Vec<(String, PathBuf)> = vec![
+            ("main".to_string(), base.join("workspace")),
+        ];
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Some(agent_id) = name.strip_prefix("workspace-") {
+                    dirs.push((agent_id.to_string(), entry.path()));
+                }
+            }
+        }
+
+        let mut active = self.active.lock().unwrap();
+        for (agent_id, workspace) in dirs {
+            if active.contains(&agent_id) {
+                continue;
+            }
+            if !workspace.join("HEARTBEAT.md").exists() {
                 continue;
             }
 
-            let agent_id_owned = agent_id.clone();
-            let runner = Arc::clone(&self);
+            active.insert(agent_id.clone());
+            let runner = Arc::clone(self);
+
+            info!(agent_id = %agent_id, "heartbeat loop started");
 
             tokio::spawn(async move {
-                runner.agent_loop(&agent_id_owned).await;
+                runner.agent_loop(&agent_id).await;
             });
-
-            info!(agent_id, "heartbeat loop started");
         }
     }
 
