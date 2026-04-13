@@ -245,6 +245,12 @@ impl AgentRegistry {
         inner.agents.insert(handle.id.clone(), handle);
     }
 
+    /// Remove an agent handle by ID (used for task agents after completion).
+    pub fn remove_handle(&self, id: &str) {
+        let mut inner = self.inner.write().unwrap();
+        inner.agents.remove(id);
+    }
+
     /// Look up an agent by ID.
     pub fn get(&self, id: &str) -> Result<Arc<AgentHandle>> {
         self.inner

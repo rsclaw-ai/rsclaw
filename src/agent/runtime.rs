@@ -3542,7 +3542,7 @@ impl AgentRuntime {
             // --- Consolidated tools (new unified names) ---
             "memory" => return self.tool_memory_consolidated(ctx, args).await,
             "session" => return self.tool_session_consolidated(ctx, args).await,
-            "agent" | "subagents" => return self.tool_agent_consolidated(args).await,
+            "agent" | "subagents" => return self.tool_agent_consolidated(ctx, args).await,
             "channel" => return self.tool_channel_consolidated(args).await,
 
             // --- Backward compat: old names map to consolidated handlers ---
@@ -3588,12 +3588,12 @@ impl AgentRuntime {
             }
             "agent_spawn" | "sessions_spawn" => {
                 return self
-                    .tool_agent_consolidated(inject_action(args, "spawn"))
+                    .tool_agent_consolidated(ctx, inject_action(args, "spawn"))
                     .await;
             }
             "agent_list" | "agents_list" => {
                 return self
-                    .tool_agent_consolidated(inject_action(args, "list"))
+                    .tool_agent_consolidated(ctx, inject_action(args, "list"))
                     .await;
             }
             "telegram_actions" => {
@@ -5004,6 +5004,112 @@ impl AgentRuntime {
             "needs_restart": needs_restart,
             "status": if needs_restart { "saved — restart gateway to bind channels" } else { "ready" }
         }))
+    }
+
+    /// One-shot task agent: spawn → send message → wait reply → auto-cleanup.
+    /// No persistence, no leftover agent in registry or config.
+    async fn tool_agent_task(&self, ctx: &RunContext, args: Value) -> Result<Value> {
+        let spawner = self
+            .spawner
+            .as_ref()
+            .ok_or_else(|| anyhow!("agent_task: spawner not available"))?;
+
+        let model = args["model"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.resolve_model_name())
+            .to_owned();
+
+        let system = args["system"]
+            .as_str()
+            .ok_or_else(|| anyhow!("agent_task: `system` required"))?
+            .to_owned();
+
+        let message = args["message"]
+            .as_str()
+            .ok_or_else(|| anyhow!("agent_task: `message` required"))?
+            .to_owned();
+
+        // Auto-generate a short unique ID scoped under the parent agent's workspace.
+        let short_id = &uuid::Uuid::new_v4().to_string()[..8];
+        let id = format!("task-{short_id}");
+        // Workspace: ~/.rsclaw/workspace-<parent>/task-<short_id>/
+        let ws_path = crate::config::loader::base_dir()
+            .join(format!("workspace-{}", ctx.agent_id))
+            .join(format!("task-{short_id}"));
+        use crate::config::schema::{AgentEntry, ModelConfig};
+        let entry = AgentEntry {
+            id: id.clone(),
+            default: Some(false),
+            workspace: Some(crate::config::loader::path_to_forward_slash(&ws_path)),
+            model: Some(ModelConfig {
+                primary: Some(model),
+                fallbacks: None,
+                image: None,
+                image_fallbacks: None,
+                thinking: None,
+                tools_enabled: None,
+                toolset: None,
+                tools: None,
+                context_tokens: None,
+                max_tokens: None,
+            }),
+            lane: None,
+            lane_concurrency: None,
+            group_chat: None,
+            channels: None,
+            name: None,
+            agent_dir: None,
+            system: None,
+            commands: None,
+            allowed_commands: None,
+            opencode: None,
+            claudecode: None,
+        };
+
+        spawner.spawn_agent(entry)?;
+
+        // Write system prompt as SOUL.md.
+        let _ = tokio::fs::create_dir_all(&ws_path).await;
+        let _ = tokio::fs::write(ws_path.join("SOUL.md"), format!("# Agent: {id}\n\n{system}\n")).await;
+
+        // Send message and wait for reply.
+        let registry = self
+            .agents
+            .as_ref()
+            .ok_or_else(|| anyhow!("agent_task: agent registry not available"))?;
+        let target = registry.get(&id)?;
+        let session_key = format!("{}:task:{}", ctx.session_key, &uuid::Uuid::new_v4().to_string()[..8]);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
+        let msg = AgentMessage {
+            session_key,
+            text: message,
+            channel: format!("task:{}", ctx.agent_id),
+            peer_id: ctx.agent_id.clone(),
+            chat_id: String::new(),
+            reply_tx,
+            extra_tools: vec![],
+            images: vec![],
+            files: vec![],
+        };
+        target.tx.send(msg).await.map_err(|_| anyhow!("agent_task: agent inbox closed"))?;
+
+        let timeout_secs = self
+            .config
+            .agents
+            .defaults
+            .timeout_seconds
+            .unwrap_or(DEFAULT_TIMEOUT_SECONDS as u32) as u64;
+        let reply = tokio::time::timeout(Duration::from_secs(timeout_secs), reply_rx)
+            .await
+            .map_err(|_| anyhow!("agent_task: timed out after {timeout_secs}s"))?
+            .map_err(|_| anyhow!("agent_task: reply channel dropped"))?;
+
+        // Cleanup: remove from registry (drops tx → task exits) and delete workspace.
+        registry.remove_handle(&id);
+        let _ = tokio::fs::remove_dir_all(&ws_path).await;
+
+        Ok(json!({ "reply": reply.text }))
     }
 
     async fn tool_agent_list(&self) -> Result<Value> {
@@ -7577,10 +7683,11 @@ impl AgentRuntime {
         }
     }
 
-    async fn tool_agent_consolidated(&self, args: Value) -> Result<Value> {
+    async fn tool_agent_consolidated(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let action = args["action"].as_str().unwrap_or("list");
         match action {
             "spawn" => self.tool_agent_spawn(args).await,
+            "task" => self.tool_agent_task(ctx, args).await,
             "list" => self.tool_agent_list().await,
             "kill" => {
                 let id = args["id"]
@@ -7592,7 +7699,7 @@ impl AgentRuntime {
                     "note": "agent termination not yet implemented; agent will stop on next idle timeout"
                 }))
             }
-            _ => bail!("agent: unknown action '{action}' (spawn, list, kill)"),
+            _ => bail!("agent: unknown action '{action}' (spawn, task, list, kill)"),
         }
     }
 
@@ -8560,7 +8667,7 @@ fn build_help_text_filtered(allowed: &str) -> String {
         help.push_str("Tools (consolidated):\n");
         help.push_str("  memory   search/get/put/delete long-term memory\n");
         help.push_str("  session  send/list/history/status for sessions\n");
-        help.push_str("  agent    spawn/list/kill sub-agents\n");
+        help.push_str("  agent    spawn/task/list/kill sub-agents\n");
         help.push_str("  channel  send/reply/pin/delete across channels\n");
         help.push('\n');
     }
@@ -8935,11 +9042,11 @@ fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "agent".to_owned(),
-        description: "Manage agents. Actions: spawn (create new sub-agent), list (all registered agents), kill (stop an agent).".to_owned(),
+        description: "Manage agents. Actions: spawn (create persistent sub-agent), task (one-shot disposable agent: spawn+send+wait+cleanup in one call), list (all registered agents), kill (stop an agent).".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["spawn", "list", "kill"], "description": "Action to perform"},
+                "action": {"type": "string", "enum": ["spawn", "task", "list", "kill"], "description": "Action to perform"},
                 "id":     {"type": "string", "description": "Agent ID (for spawn/kill)"},
                 "model":  {"type": "string", "description": "Model string (for spawn)"},
                 "system": {"type": "string", "description": "System prompt (for spawn)"}
