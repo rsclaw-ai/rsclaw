@@ -5707,7 +5707,7 @@ impl AgentRuntime {
                 .or_else(|| crate::agent::runtime::detect_chrome())
                 .ok_or_else(|| anyhow!("Chrome not found for SPA fallback"))?;
             crate::browser::can_launch_chrome()?;
-            let headed = wb_cfg.and_then(|b| b.headed).unwrap_or(false);
+            let headed = wb_cfg.and_then(|b| b.headed).unwrap_or_else(has_display);
             let profile = wb_cfg.and_then(|b| b.profile.clone());
             *browser = Some(crate::browser::BrowserSession::start(&chrome_path, headed, profile.as_deref()).await?);
         }
@@ -5735,7 +5735,7 @@ impl AgentRuntime {
                 .or_else(|| crate::agent::runtime::detect_chrome())
                 .ok_or_else(|| anyhow!("Chrome not found for browser search fallback"))?;
             crate::browser::can_launch_chrome()?;
-            let headed = wb_cfg.and_then(|b| b.headed).unwrap_or(false);
+            let headed = wb_cfg.and_then(|b| b.headed).unwrap_or_else(has_display);
             let profile = wb_cfg.and_then(|b| b.profile.clone());
             *browser = Some(crate::browser::BrowserSession::start(&chrome_path, headed, profile.as_deref()).await?);
         }
@@ -5870,7 +5870,7 @@ impl AgentRuntime {
             // Determine headed mode: per-request `headed` param overrides config.
             let wb_cfg = self.config.ext.tools.as_ref()
                 .and_then(|t| t.web_browser.as_ref());
-            let config_headed = wb_cfg.and_then(|b| b.headed).unwrap_or(false);
+            let config_headed = wb_cfg.and_then(|b| b.headed).unwrap_or_else(has_display);
             let request_headed = args.get("headed").and_then(|v| v.as_bool());
             let headed = request_headed.unwrap_or(config_headed);
             let profile = wb_cfg.and_then(|b| b.profile.clone());
@@ -8163,6 +8163,16 @@ fn write_config_value(dot_path: &str, value: serde_json::Value) -> anyhow::Resul
     set_nested_value(&mut val, dot_path, value)?;
     std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
     Ok(())
+}
+
+/// Auto-detect if a graphical display is available.
+/// macOS/Windows always have one; Linux checks DISPLAY/WAYLAND_DISPLAY.
+fn has_display() -> bool {
+    if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+        true
+    } else {
+        std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok()
+    }
 }
 
 /// Detect Chrome/Chromium binary path.
