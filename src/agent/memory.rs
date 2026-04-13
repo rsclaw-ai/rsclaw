@@ -1075,7 +1075,7 @@ fn choose_embedder(
 
         _ => {
             if let Some(dir) = model_dir {
-                if dir.exists() {
+                if dir.join("config.json").exists() {
                     match LocalBgeEmbedder::load(dir) {
                         Ok(e) => {
                             info!("BGE-Small embedder loaded from {}", dir.display());
