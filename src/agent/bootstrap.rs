@@ -251,6 +251,13 @@ winget install Google.Chrome --accept-package-agreements --accept-source-agreeme
 winget install OpenJS.NodeJS.LTS --accept-package-agreements --accept-source-agreements
 ```
 
+### Git
+```powershell
+winget install Git.Git --accept-package-agreements --accept-source-agreements
+# 或: choco install git -y
+# 或手动下载: https://registry.npmmirror.com/-/binary/git-for-windows/ (国内镜像)
+```
+
 ### 包管理器（choco）
 ```powershell
 Set-ExecutionPolicy Bypass -Scope Process -Force
@@ -260,12 +267,20 @@ iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocola
 
 ## macOS 软件安装
 ```bash
-brew install python3 && brew install --cask google-chrome && brew install node
+brew install python3 git && brew install --cask google-chrome && brew install node
+```
+
+## Git 常用操作
+```bash
+git config --global user.name "用户名"
+git config --global user.email "邮箱"
+git clone <repo_url>
+git add . && git commit -m "消息" && git push
 ```
 
 ## 安装后验证
 ```bash
-python3 --version && node --version
+python3 --version && node --version && git --version
 ```
 
 ## 禁止事项
@@ -325,6 +340,11 @@ winget install Google.Chrome --accept-package-agreements --accept-source-agreeme
 winget install OpenJS.NodeJS.LTS --accept-package-agreements --accept-source-agreements
 ```
 
+### Git
+```powershell
+winget install Git.Git --accept-package-agreements --accept-source-agreements
+```
+
 ### Chocolatey (package manager)
 ```powershell
 Set-ExecutionPolicy Bypass -Scope Process -Force
@@ -334,11 +354,19 @@ iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocola
 
 ## macOS
 ```bash
-brew install python3 && brew install --cask google-chrome && brew install node
+brew install python3 git && brew install --cask google-chrome && brew install node
+```
+
+## Git basics
+```bash
+git config --global user.name "Name"
+git config --global user.email "email"
+git clone <repo_url>
+git add . && git commit -m "message" && git push
 ```
 
 ## Always verify after install
 ```bash
-python3 --version && node --version
+python3 --version && node --version && git --version
 ```
 "#;
