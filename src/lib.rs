@@ -12,6 +12,7 @@ pub mod config;
 pub mod cron;
 pub mod events;
 pub mod gateway;
+pub mod heartbeat;
 pub mod hooks;
 pub mod i18n;
 pub mod mcp;
