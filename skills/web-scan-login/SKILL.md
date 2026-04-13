@@ -141,6 +141,7 @@ const selectors = [
 - **二次跳转**: 可能从主站跳到 zhiyou.smzdm.com
 - **QR 提示**: "请使用什么值得买 APP 扫码登录"
 - **成功判断**: URL 跳转离开登录页
+- **注意**: 登录页有腾讯 TCaptcha 滑块验证码且会检测自动化工具（国内网络环境可能不触发）。如果验证码拦截，请用户在真实浏览器手动登录后，用 `state save` 保存登录态复用
 
 ### 13. fanqienovel.com（番茄小说）
 - **登录 URL**: `https://fanqienovel.com`
