@@ -126,6 +126,7 @@ async fn start_echo_server(addr: SocketAddr) {
                     is_empty: false,
                     tool_calls: None,
                     images: vec![],
+                    files: vec![],
                     pending_analysis: None,
                 });
             }

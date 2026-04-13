@@ -156,6 +156,7 @@ async fn test_cron_job_runs() {
                     is_empty: false,
                     tool_calls: None,
                     images: vec![],
+                    files: vec![],
                     pending_analysis: None,
                 });
             }
@@ -199,6 +200,7 @@ async fn test_cron_enable_disable() {
                     is_empty: false,
                     tool_calls: None,
                     images: vec![],
+                    files: vec![],
                     pending_analysis: None,
                 });
             }
