@@ -264,8 +264,24 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         });
     }
 
-    // 9. Start heartbeat schedulers for agents that have heartbeat configured.
-    spawn_heartbeat_tasks(&config, Arc::clone(&registry));
+    // 9. Start heartbeat runner — scans agent workspaces for HEARTBEAT.md.
+    let hb_enabled = config
+        .agents
+        .defaults
+        .heartbeat
+        .as_ref()
+        .and_then(|h| h.enabled)
+        .unwrap_or(true);
+    if hb_enabled {
+        let agent_ids: Vec<String> = config.agents.list.iter().map(|a| a.id.clone()).collect();
+        let runner = std::sync::Arc::new(crate::heartbeat::HeartbeatRunner::new(
+            Arc::clone(&registry),
+            &data_dir,
+            agent_ids,
+        ));
+        runner.run();
+        info!("heartbeat runner started");
+    }
 
     // 11. Build LiveConfig for hot-reloadable per-domain access.
     let live = Arc::new(LiveConfig::new((*config).clone()));
@@ -4000,85 +4016,6 @@ fn start_signal_if_configured(
     } // end for sig_accounts
 }
 
-// ---------------------------------------------------------------------------
-// Heartbeat scheduler
-// ---------------------------------------------------------------------------
-
-/// Parse a human-readable duration string into `Duration`.
-/// Supported suffixes: s, m, h, d.  Defaults to 60 minutes if unparseable.
-fn parse_duration(s: &str) -> Duration {
-    let s = s.trim();
-    let (digits, suffix) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
-    let n: u64 = digits.parse().unwrap_or(60);
-    match suffix.trim() {
-        "s" | "sec" | "secs" | "second" | "seconds" => Duration::from_secs(n),
-        "m" | "min" | "mins" | "minute" | "minutes" => Duration::from_secs(n * 60),
-        "h" | "hr" | "hrs" | "hour" | "hours" => Duration::from_secs(n * 3600),
-        "d" | "day" | "days" => Duration::from_secs(n * 86400),
-        _ => Duration::from_secs(n * 60), // default: treat bare number as minutes
-    }
-}
-
-/// For each agent with `heartbeat.enabled = true`, spawn a tokio task that
-/// fires a silent heartbeat turn at the configured interval.
-///
-/// The heartbeat sends "[heartbeat]" to the agent's inbox.  The workspace
-/// context loader will include HEARTBEAT.md for this session type.  If the
-/// reply is NO_REPLY, nothing is forwarded to channels (spec §31).
-fn spawn_heartbeat_tasks(config: &RuntimeConfig, registry: Arc<AgentRegistry>) {
-    // Heartbeat is configured globally in agents.defaults.heartbeat.
-    let Some(hb) = config.agents.defaults.heartbeat.as_ref() else {
-        return;
-    };
-    if !hb.enabled.unwrap_or(false) {
-        return;
-    }
-
-    let interval = hb
-        .every
-        .as_deref()
-        .map(parse_duration)
-        .unwrap_or(Duration::from_secs(3600));
-
-    for agent in &config.agents.list {
-        let agent_id = agent.id.clone();
-        let log_id = agent_id.clone();
-        let session_key = format!("heartbeat:{agent_id}");
-        let registry = Arc::clone(&registry);
-
-        tokio::spawn(async move {
-            // Offset startup by one interval so we don't fire immediately.
-            tokio::time::sleep(interval).await;
-            loop {
-                let handle = match registry.get(&agent_id) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        warn!(agent_id, "heartbeat: agent not found: {e:#}");
-                        break;
-                    }
-                };
-                let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
-                let msg = AgentMessage {
-                    session_key: session_key.clone(),
-                    text: "[heartbeat]".to_owned(),
-                    channel: "heartbeat".to_owned(),
-                    peer_id: "heartbeat".to_owned(),
-                    chat_id: String::new(),
-                    reply_tx,
-                    extra_tools: vec![],
-                    images: vec![],
-                    files: vec![],
-                };
-                if let Err(e) = handle.tx.send(msg).await {
-                    warn!(agent_id, "heartbeat send failed: {e:#}");
-                }
-                tokio::time::sleep(interval).await;
-            }
-        });
-
-        info!(agent_id = %log_id, ?interval, "heartbeat scheduler started");
-    }
-}
 
 // ---------------------------------------------------------------------------
 // WeChat Personal (via ilink)
