@@ -7323,36 +7323,92 @@ async fn download_bge_model(
     std::fs::create_dir_all(target_dir)?;
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+        .timeout(std::time::Duration::from_secs(600))
         .build()?;
 
     for filename in &files {
         let url = format!("{base_url}/{filename}");
         let dest = target_dir.join(filename);
+        let partial = target_dir.join(format!("{filename}.partial"));
 
         if dest.exists() {
             debug!("{filename} already exists, skipping");
             continue;
         }
 
-        info!("  downloading {filename} ...");
-        let response = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to download {filename}: {e}"))?;
+        // Retry up to 3 times with resume support.
+        let mut success = false;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                info!("  retrying {filename} (attempt {})...", attempt + 1);
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
 
-        if !response.status().is_success() {
-            anyhow::bail!(
-                "failed to download {filename}: HTTP {}",
-                response.status()
-            );
+            // Check if partial file exists for resume.
+            let existing_len = tokio::fs::metadata(&partial).await.map(|m| m.len()).unwrap_or(0);
+
+            let mut req = client.get(&url);
+            if existing_len > 0 {
+                info!("  resuming {filename} from byte {existing_len}...");
+                req = req.header("Range", format!("bytes={existing_len}-"));
+            } else {
+                info!("  downloading {filename} ...");
+            }
+
+            let response = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("  download request failed: {e}");
+                    continue;
+                }
+            };
+
+            let status = response.status();
+            if !status.is_success() && status.as_u16() != 206 {
+                warn!("  download failed: HTTP {status}");
+                continue;
+            }
+
+            // Stream to partial file (append if resuming).
+            let mut file = if existing_len > 0 && status.as_u16() == 206 {
+                tokio::fs::OpenOptions::new().append(true).open(&partial).await?
+            } else {
+                tokio::fs::File::create(&partial).await?
+            };
+
+            let mut stream = response.bytes_stream();
+            use futures::StreamExt;
+            let mut downloaded = existing_len;
+            let mut stream_ok = true;
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        file.write_all(&bytes).await?;
+                        downloaded += bytes.len() as u64;
+                    }
+                    Err(e) => {
+                        warn!("  stream error at byte {downloaded}: {e}");
+                        stream_ok = false;
+                        break;
+                    }
+                }
+            }
+            file.flush().await?;
+
+            if stream_ok {
+                // Rename partial to final.
+                tokio::fs::rename(&partial, &dest).await?;
+                info!("  {filename} downloaded ({downloaded} bytes)");
+                success = true;
+                break;
+            }
         }
 
-        let bytes = response.bytes().await?;
-        let mut file = tokio::fs::File::create(&dest).await?;
-        file.write_all(&bytes).await?;
-        info!("  {filename} downloaded ({} bytes)", bytes.len());
+        if !success {
+            // Clean up partial file on final failure.
+            let _ = tokio::fs::remove_file(&partial).await;
+            anyhow::bail!("failed to download {filename} after 3 attempts");
+        }
     }
 
     info!("BGE model downloaded to {}", target_dir.display());
