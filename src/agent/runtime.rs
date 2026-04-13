@@ -3370,7 +3370,7 @@ impl AgentRuntime {
 
                 tool_images.extend(result_images);
 
-                // send_file tool: directly add file to tool_files.
+                // send_file tool: images go to tool_images, other files to tool_files.
                 if tool_name == "send_file" {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result_text) {
                         if v.get("__send_file").and_then(|b| b.as_bool()).unwrap_or(false) {
@@ -3378,17 +3378,34 @@ impl AgentRuntime {
                                 let full = std::path::PathBuf::from(path_str);
                                 let filename = v.get("filename").and_then(|f| f.as_str()).unwrap_or("file").to_owned();
                                 let lower = filename.to_lowercase();
-                                let mime = if lower.ends_with(".xlsx") { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }
-                                    else if lower.ends_with(".docx") { "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
-                                    else if lower.ends_with(".pptx") { "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
-                                    else if lower.ends_with(".pdf") { "application/pdf" }
-                                    else if lower.ends_with(".csv") { "text/csv" }
-                                    else if lower.ends_with(".mp4") { "video/mp4" }
-                                    else if lower.ends_with(".mp3") { "audio/mpeg" }
-                                    else if lower.ends_with(".zip") { "application/zip" }
-                                    else { "application/octet-stream" };
-                                tool_files.push((filename, mime.to_owned(), full.to_string_lossy().to_string()));
-                                tracing::info!(path = %full.display(), "agent: send_file queued");
+                                let is_image = lower.ends_with(".jpg") || lower.ends_with(".jpeg")
+                                    || lower.ends_with(".png") || lower.ends_with(".webp")
+                                    || lower.ends_with(".gif");
+                                if is_image {
+                                    // Send as inline image, not file attachment.
+                                    if let Ok(bytes) = std::fs::read(&full) {
+                                        use base64::Engine as _;
+                                        let mime = if lower.ends_with(".png") { "image/png" }
+                                            else if lower.ends_with(".webp") { "image/webp" }
+                                            else if lower.ends_with(".gif") { "image/gif" }
+                                            else { "image/jpeg" };
+                                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                        tool_images.push(format!("data:{mime};base64,{b64}"));
+                                        tracing::info!(path = %full.display(), "agent: send_file queued as image");
+                                    }
+                                } else {
+                                    let mime = if lower.ends_with(".xlsx") { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }
+                                        else if lower.ends_with(".docx") { "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+                                        else if lower.ends_with(".pptx") { "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
+                                        else if lower.ends_with(".pdf") { "application/pdf" }
+                                        else if lower.ends_with(".csv") { "text/csv" }
+                                        else if lower.ends_with(".mp4") { "video/mp4" }
+                                        else if lower.ends_with(".mp3") { "audio/mpeg" }
+                                        else if lower.ends_with(".zip") { "application/zip" }
+                                        else { "application/octet-stream" };
+                                    tool_files.push((filename, mime.to_owned(), full.to_string_lossy().to_string()));
+                                    tracing::info!(path = %full.display(), "agent: send_file queued");
+                                }
                             }
                         }
                     }
