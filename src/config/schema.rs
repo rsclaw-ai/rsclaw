@@ -1355,6 +1355,10 @@ pub struct WebBrowserConfig {
     pub chrome_path: Option<String>,
     /// Run browser with visible window (default: false = headless)
     pub headed: Option<bool>,
+    /// Chrome profile to use. "default" = system default profile,
+    /// other string = named profile directory under ~/.rsclaw/browser-profiles/.
+    /// If not set, uses a temporary profile (no cookies/history).
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

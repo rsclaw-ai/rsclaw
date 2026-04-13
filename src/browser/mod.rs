@@ -151,15 +151,44 @@ pub fn can_launch_chrome() -> Result<()> {
 struct ChromeProcess {
     child: tokio::process::Child,
     ws_url: String,
-    _tmp_dir: tempfile::TempDir,
+    _tmp_dir: Option<tempfile::TempDir>,
 }
 
 impl ChromeProcess {
-    async fn launch(chrome_path: &str, headed: bool) -> Result<Self> {
+    async fn launch(chrome_path: &str, headed: bool, profile: Option<&str>) -> Result<Self> {
         can_launch_chrome()?;
 
-        let tmp_dir = tempfile::tempdir()
-            .map_err(|e| anyhow!("failed to create temp dir for Chrome profile: {e}"))?;
+        // Resolve user-data-dir: named profile or temp dir.
+        let (user_data_dir, tmp_dir) = if let Some(profile_name) = profile {
+            let profile_dir = if profile_name == "default" {
+                // Use Chrome's default user data directory.
+                #[cfg(target_os = "macos")]
+                let dir = dirs_next::home_dir()
+                    .unwrap_or_default()
+                    .join("Library/Application Support/Google/Chrome");
+                #[cfg(target_os = "windows")]
+                let dir = dirs_next::data_local_dir()
+                    .unwrap_or_default()
+                    .join("Google/Chrome/User Data");
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                let dir = dirs_next::config_dir()
+                    .unwrap_or_default()
+                    .join("google-chrome");
+                dir
+            } else {
+                // Named profile under ~/.rsclaw/browser-profiles/
+                crate::config::loader::base_dir()
+                    .join("browser-profiles")
+                    .join(profile_name)
+            };
+            std::fs::create_dir_all(&profile_dir).ok();
+            (profile_dir, None)
+        } else {
+            let tmp = tempfile::tempdir()
+                .map_err(|e| anyhow!("failed to create temp dir for Chrome profile: {e}"))?;
+            let dir = tmp.path().to_path_buf();
+            (dir, Some(tmp))
+        };
 
         let mut args = vec![
             "--remote-debugging-port=0",
@@ -187,7 +216,7 @@ impl ChromeProcess {
 
         let mut child = tokio::process::Command::new(chrome_path)
             .args(&args)
-            .arg(format!("--user-data-dir={}", tmp_dir.path().display()))
+            .arg(format!("--user-data-dir={}", user_data_dir.display()))
             .stderr(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stdin(std::process::Stdio::null())
@@ -445,6 +474,8 @@ pub struct BrowserSession {
     chrome_path: String,
     /// Run with visible window.
     pub headed: bool,
+    /// Chrome profile name (for restart).
+    profile: Option<String>,
     /// Pending dialog message (confirm/prompt).
     pending_dialog: Option<String>,
     /// Accumulated blocked URL patterns for network interception.
@@ -461,8 +492,8 @@ pub struct BrowserSession {
 
 impl BrowserSession {
     /// Launch Chrome, discover the default page target, and connect CDP.
-    pub async fn start(chrome_path: &str, headed: bool) -> Result<Self> {
-        let chrome = ChromeProcess::launch(chrome_path, headed).await?;
+    pub async fn start(chrome_path: &str, headed: bool, profile: Option<&str>) -> Result<Self> {
+        let chrome = ChromeProcess::launch(chrome_path, headed, profile).await?;
         let cdp = Self::connect_cdp(&chrome).await?;
 
         let now = std::time::SystemTime::now()
@@ -477,6 +508,7 @@ impl BrowserSession {
             ref_counter: 0,
             chrome_path: chrome_path.to_owned(),
             headed,
+            profile: profile.map(str::to_owned),
             pending_dialog: None,
             blocked_urls: Vec::new(),
             intercept_rules: Vec::new(),
@@ -550,7 +582,7 @@ impl BrowserSession {
     async fn restart(&mut self) -> Result<()> {
         warn!("restarting Chrome browser session");
         // Drop old chrome (kills process via Drop)
-        let new_chrome = ChromeProcess::launch(&self.chrome_path, self.headed).await?;
+        let new_chrome = ChromeProcess::launch(&self.chrome_path, self.headed, self.profile.as_deref()).await?;
         let new_cdp = Self::connect_cdp(&new_chrome).await?;
         self.chrome = new_chrome;
         self.cdp = new_cdp;

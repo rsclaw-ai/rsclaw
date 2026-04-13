@@ -5697,17 +5697,16 @@ impl AgentRuntime {
 
         // Ensure browser session exists.
         if browser.is_none() {
-            let chrome_path = self.config.ext.tools.as_ref()
-                .and_then(|t| t.web_browser.as_ref())
+            let wb_cfg = self.config.ext.tools.as_ref()
+                .and_then(|t| t.web_browser.as_ref());
+            let chrome_path = wb_cfg
                 .and_then(|b| b.chrome_path.clone())
                 .or_else(|| crate::agent::runtime::detect_chrome())
                 .ok_or_else(|| anyhow!("Chrome not found for SPA fallback"))?;
             crate::browser::can_launch_chrome()?;
-            let headed = self.config.ext.tools.as_ref()
-                .and_then(|t| t.web_browser.as_ref())
-                .and_then(|b| b.headed)
-                .unwrap_or(false);
-            *browser = Some(crate::browser::BrowserSession::start(&chrome_path, headed).await?);
+            let headed = wb_cfg.and_then(|b| b.headed).unwrap_or(false);
+            let profile = wb_cfg.and_then(|b| b.profile.clone());
+            *browser = Some(crate::browser::BrowserSession::start(&chrome_path, headed, profile.as_deref()).await?);
         }
 
         let bs = browser.as_mut().unwrap();
@@ -5726,17 +5725,16 @@ impl AgentRuntime {
         let mut browser = self.browser.lock().await;
 
         if browser.is_none() {
-            let chrome_path = self.config.ext.tools.as_ref()
-                .and_then(|t| t.web_browser.as_ref())
+            let wb_cfg = self.config.ext.tools.as_ref()
+                .and_then(|t| t.web_browser.as_ref());
+            let chrome_path = wb_cfg
                 .and_then(|b| b.chrome_path.clone())
                 .or_else(|| crate::agent::runtime::detect_chrome())
                 .ok_or_else(|| anyhow!("Chrome not found for browser search fallback"))?;
             crate::browser::can_launch_chrome()?;
-            let headed = self.config.ext.tools.as_ref()
-                .and_then(|t| t.web_browser.as_ref())
-                .and_then(|b| b.headed)
-                .unwrap_or(false);
-            *browser = Some(crate::browser::BrowserSession::start(&chrome_path, headed).await?);
+            let headed = wb_cfg.and_then(|b| b.headed).unwrap_or(false);
+            let profile = wb_cfg.and_then(|b| b.profile.clone());
+            *browser = Some(crate::browser::BrowserSession::start(&chrome_path, headed, profile.as_deref()).await?);
         }
 
         let bs = browser.as_mut().unwrap();
@@ -5867,12 +5865,12 @@ impl AgentRuntime {
             }
 
             // Determine headed mode: per-request `headed` param overrides config.
-            let config_headed = self.config.ext.tools.as_ref()
-                .and_then(|t| t.web_browser.as_ref())
-                .and_then(|b| b.headed)
-                .unwrap_or(false);
+            let wb_cfg = self.config.ext.tools.as_ref()
+                .and_then(|t| t.web_browser.as_ref());
+            let config_headed = wb_cfg.and_then(|b| b.headed).unwrap_or(false);
             let request_headed = args.get("headed").and_then(|v| v.as_bool());
             let headed = request_headed.unwrap_or(config_headed);
+            let profile = wb_cfg.and_then(|b| b.profile.clone());
 
             // If headed mode changed, restart the session.
             if let Some(ref session) = *guard {
@@ -5885,8 +5883,7 @@ impl AgentRuntime {
             // If no session, initialize one.
             if guard.is_none() {
                 // Check Chrome availability
-                let chrome_path = self.config.ext.tools.as_ref()
-                    .and_then(|t| t.web_browser.as_ref())
+                let chrome_path = wb_cfg
                     .and_then(|b| b.chrome_path.clone())
                     .or_else(|| detect_chrome())
                     .ok_or_else(|| anyhow!(
@@ -5896,7 +5893,7 @@ impl AgentRuntime {
                 // Check memory before launching
                 crate::browser::can_launch_chrome()?;
 
-                let bs = crate::browser::BrowserSession::start(&chrome_path, headed).await?;
+                let bs = crate::browser::BrowserSession::start(&chrome_path, headed, profile.as_deref()).await?;
                 *guard = Some(bs);
             }
         }
