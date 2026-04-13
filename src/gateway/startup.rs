@@ -104,7 +104,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         } else {
             // Auto-download BGE model.
             let target_dir = zh; // default to zh
-            if let Err(e) = download_bge_model(&target_dir, search_cfg).await {
+            let lang = config.raw.gateway.as_ref().and_then(|g| g.language.as_deref());
+            if let Err(e) = download_bge_model(&target_dir, search_cfg, lang).await {
                 warn!("BGE model auto-download failed: {e:#}");
                 warn!("semantic memory search will use FNV fallback (low quality)");
                 warn!("to fix: manually download BGE model or configure memory.search.provider");
@@ -7273,6 +7274,7 @@ async fn handle_pending_analysis(
 async fn download_bge_model(
     target_dir: &std::path::Path,
     search_cfg: Option<&crate::config::schema::MemorySearchConfig>,
+    config_language: Option<&str>,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
 
@@ -7288,12 +7290,16 @@ async fn download_bge_model(
         let host = if let Some(url) = local_cfg.and_then(|c| c.model_download_url.as_deref()) {
             url.trim_end_matches('/').to_owned()
         } else {
-            // Auto-detect: check LANG/LC_ALL for zh → use mirror.
-            let is_zh = std::env::var("LANG")
-                .or_else(|_| std::env::var("LC_ALL"))
-                .unwrap_or_default()
-                .to_lowercase()
-                .contains("zh");
+            // Auto-detect: config language > LANG/LC_ALL env var.
+            let is_zh = config_language
+                .map(|l| l.to_lowercase().contains("chinese") || l.to_lowercase().contains("zh"))
+                .unwrap_or_else(|| {
+                    std::env::var("LANG")
+                        .or_else(|_| std::env::var("LC_ALL"))
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        .contains("zh")
+                });
             if is_zh {
                 "https://hf-mirror.com".to_owned()
             } else {
