@@ -5849,6 +5849,22 @@ impl AgentRuntime {
                 }
             }
 
+            // Determine headed mode: per-request `headed` param overrides config.
+            let config_headed = self.config.ext.tools.as_ref()
+                .and_then(|t| t.web_browser.as_ref())
+                .and_then(|b| b.headed)
+                .unwrap_or(false);
+            let request_headed = args.get("headed").and_then(|v| v.as_bool());
+            let headed = request_headed.unwrap_or(config_headed);
+
+            // If headed mode changed, restart the session.
+            if let Some(ref session) = *guard {
+                if request_headed.is_some() && session.headed != headed {
+                    info!(headed, "browser headed mode changed, restarting session");
+                    *guard = None;
+                }
+            }
+
             // If no session, initialize one.
             if guard.is_none() {
                 // Check Chrome availability
@@ -5863,10 +5879,6 @@ impl AgentRuntime {
                 // Check memory before launching
                 crate::browser::can_launch_chrome()?;
 
-                let headed = self.config.ext.tools.as_ref()
-                    .and_then(|t| t.web_browser.as_ref())
-                    .and_then(|b| b.headed)
-                    .unwrap_or(false);
                 let bs = crate::browser::BrowserSession::start(&chrome_path, headed).await?;
                 *guard = Some(bs);
             }
@@ -8980,7 +8992,8 @@ fn build_tool_list(
                 "timezone_id":{"type": "string", "description": "IANA timezone (e.g. Asia/Shanghai)"},
                 "permissions":{"type": "array", "items": {"type": "string"}, "description": "Browser permissions to grant"},
                 "action_type":{"type": "string", "description": "Intercept action: block or mock"},
-                "body":       {"type": "string", "description": "Mock response body for network intercept"}
+                "body":       {"type": "string", "description": "Mock response body for network intercept"},
+                "headed":     {"type": "boolean", "description": "true=foreground (visible window), false=background (headless). Default: false"}
             },
             "required": ["action"]
         }),
