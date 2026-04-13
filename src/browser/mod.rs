@@ -431,7 +431,7 @@ pub struct BrowserSession {
     /// Chrome binary path (for restart).
     chrome_path: String,
     /// Run with visible window.
-    headed: bool,
+    pub headed: bool,
     /// Pending dialog message (confirm/prompt).
     pending_dialog: Option<String>,
     /// Accumulated blocked URL patterns for network interception.
