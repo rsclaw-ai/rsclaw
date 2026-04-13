@@ -7074,16 +7074,7 @@ $synth.Speak('{}')
             .as_str()
             .ok_or_else(|| anyhow!("cron: `action` required"))?;
 
-        // Cron config stored at openclaw-compatible path.
-        // Respects OPENCLAW_STATE_DIR env var (same as openclaw).
-        let cron_dir = if let Some(state_dir) = std::env::var_os("OPENCLAW_STATE_DIR") {
-            tracing::debug!("tool_cron: OPENCLAW_STATE_DIR={}", state_dir.to_string_lossy());
-            std::path::PathBuf::from(state_dir)
-        } else {
-            let home = dirs_next::home_dir().unwrap_or_default();
-            tracing::debug!("tool_cron: OPENCLAW_STATE_DIR not set, home={}", home.display());
-            home.join(".openclaw")
-        };
+        let cron_dir = crate::config::loader::base_dir();
         let cron_path = cron_dir.join("cron").join("jobs.json");
 
         match action {
