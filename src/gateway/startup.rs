@@ -1351,7 +1351,17 @@ fn start_channels(
                                 let w_tx = tx.clone();
                                 let w_uid = queue_key.clone();
                                 tokio::spawn(async move {
-                                    while let Some((text, peer_id, chat_id, is_group, bound, images, file_attachments)) = urx.recv().await {
+                                    while let Some((mut text, peer_id, chat_id, is_group, bound, mut images, mut file_attachments)) = urx.recv().await {
+                                        // Debounce: wait briefly then drain queued messages.
+                                        tokio::time::sleep(Duration::from_secs(2)).await;
+                                        while let Ok((extra_text, _, _, _, _, extra_images, extra_files)) = urx.try_recv() {
+                                            if !extra_text.is_empty() {
+                                                text.push('\n');
+                                                text.push_str(&extra_text);
+                                            }
+                                            images.extend(extra_images);
+                                            file_attachments.extend(extra_files);
+                                        }
                                         let process_result = tokio::time::timeout(
                                             Duration::from_secs(600),
                                             async {
@@ -1875,9 +1885,17 @@ fn start_discord_if_configured(
                             let w_tx = tx.clone();
                             let w_uid = peer_id.clone();
                             tokio::spawn(async move {
-                                while let Some((text, peer_id, channel_id, is_guild, bound)) =
+                                while let Some((mut text, peer_id, channel_id, is_guild, bound)) =
                                     urx.recv().await
                                 {
+                                    // Debounce: wait briefly then drain queued messages.
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    while let Ok((extra_text, _, _, _, _)) = urx.try_recv() {
+                                        if !extra_text.is_empty() {
+                                            text.push('\n');
+                                            text.push_str(&extra_text);
+                                        }
+                                    }
                                     let process_result = tokio::time::timeout(
                                         Duration::from_secs(172800), // 48 hours, matching OpenClaw default
                                         async {
@@ -2320,9 +2338,17 @@ fn start_slack_if_configured(
                             let w_tx = tx.clone();
                             let w_uid = peer_id.clone();
                             tokio::spawn(async move {
-                                while let Some((text, peer_id, channel_id, is_channel, bound)) =
+                                while let Some((mut text, peer_id, channel_id, is_channel, bound)) =
                                     urx.recv().await
                                 {
+                                    // Debounce: wait briefly then drain queued messages.
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    while let Ok((extra_text, _, _, _, _)) = urx.try_recv() {
+                                        if !extra_text.is_empty() {
+                                            text.push('\n');
+                                            text.push_str(&extra_text);
+                                        }
+                                    }
                                     let process_result = tokio::time::timeout(
                                         Duration::from_secs(172800), // 48 hours, matching OpenClaw default
                                         async {
@@ -2713,7 +2739,16 @@ fn start_whatsapp_if_configured(
                             let w_tx = tx.clone();
                             let w_uid = from.clone();
                             tokio::spawn(async move {
-                                while let Some((text, from, images)) = urx.recv().await {
+                                while let Some((mut text, from, mut images)) = urx.recv().await {
+                                    // Debounce: wait briefly then drain queued messages.
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    while let Ok((extra_text, _, extra_images)) = urx.try_recv() {
+                                        if !extra_text.is_empty() {
+                                            text.push('\n');
+                                            text.push_str(&extra_text);
+                                        }
+                                        images.extend(extra_images);
+                                    }
                                     let process_result = tokio::time::timeout(
                                 Duration::from_secs(600),
                                 async {
@@ -3092,8 +3127,17 @@ fn start_line_if_configured(
                             let w_tx = tx.clone();
                             let w_uid = user_id.clone();
                             tokio::spawn(async move {
-                                while let Some((text, user_id, is_group, images)) = urx.recv().await
+                                while let Some((mut text, user_id, is_group, mut images)) = urx.recv().await
                                 {
+                                    // Debounce: wait briefly then drain queued messages.
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    while let Ok((extra_text, _, _, extra_images)) = urx.try_recv() {
+                                        if !extra_text.is_empty() {
+                                            text.push('\n');
+                                            text.push_str(&extra_text);
+                                        }
+                                        images.extend(extra_images);
+                                    }
                                     let process_result = tokio::time::timeout(
                                     Duration::from_secs(600),
                                     async {
@@ -3449,7 +3493,16 @@ fn start_zalo_if_configured(
                             let w_tx = tx.clone();
                             let w_uid = sender_id.clone();
                             tokio::spawn(async move {
-                                while let Some((text, sender_id, images)) = urx.recv().await {
+                                while let Some((mut text, sender_id, mut images)) = urx.recv().await {
+                                    // Debounce: wait briefly then drain queued messages.
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    while let Ok((extra_text, _, extra_images)) = urx.try_recv() {
+                                        if !extra_text.is_empty() {
+                                            text.push('\n');
+                                            text.push_str(&extra_text);
+                                        }
+                                        images.extend(extra_images);
+                                    }
                                     let process_result = tokio::time::timeout(
                                     Duration::from_secs(600),
                                     async {
@@ -3813,7 +3866,15 @@ fn start_signal_if_configured(
                         let w_tx = tx.clone();
                         let w_uid = sender.clone();
                         tokio::spawn(async move {
-                            while let Some((text, sender, is_group)) = urx.recv().await {
+                            while let Some((mut text, sender, is_group)) = urx.recv().await {
+                                // Debounce: wait briefly then drain queued messages.
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                                while let Ok((extra_text, _, _)) = urx.try_recv() {
+                                    if !extra_text.is_empty() {
+                                        text.push('\n');
+                                        text.push_str(&extra_text);
+                                    }
+                                }
                                 let process_result = tokio::time::timeout(
                                 Duration::from_secs(600),
                                 async {
@@ -4035,7 +4096,17 @@ fn spawn_wechat_user_worker(
 ) {
     tokio::spawn(async move {
         debug!(user = %user_id, "wechat: per-user worker started");
-        while let Some((text, images, file_attachments)) = rx.recv().await {
+        while let Some((mut text, mut images, mut file_attachments)) = rx.recv().await {
+            // Debounce: wait briefly then drain queued messages.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            while let Ok((extra_text, extra_images, extra_files)) = rx.try_recv() {
+                if !extra_text.is_empty() {
+                    text.push('\n');
+                    text.push_str(&extra_text);
+                }
+                images.extend(extra_images);
+                file_attachments.extend(extra_files);
+            }
             debug!(user = %user_id, text_start = %text.chars().take(30).collect::<String>(), "wechat: worker processing");
             let process_result = tokio::time::timeout(Duration::from_secs(600), async {
                 let handle = match reg.route_account("wechat", Some("default")).or_else(|_| reg.default_agent()) {
@@ -5221,14 +5292,23 @@ fn start_dingtalk_if_configured(
                             let w_uid = sender_id.clone();
                             tokio::spawn(async move {
                                 while let Some((
-                                    text,
+                                    mut text,
                                     sender_id,
                                     conversation_id,
                                     is_group,
                                     bound,
-                                    images,
+                                    mut images,
                                 )) = urx.recv().await
                                 {
+                                    // Debounce: wait briefly then drain queued messages.
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    while let Ok((extra_text, _, _, _, _, extra_images)) = urx.try_recv() {
+                                        if !extra_text.is_empty() {
+                                            text.push('\n');
+                                            text.push_str(&extra_text);
+                                        }
+                                        images.extend(extra_images);
+                                    }
                                     let process_result = tokio::time::timeout(
                                         Duration::from_secs(172800), // 48 hours, matching OpenClaw default
                                         async {
@@ -5755,15 +5835,25 @@ fn start_qq_if_configured(
                             let w_cfg = Arc::clone(&qq_cfg);
                             tokio::spawn(async move {
                                 while let Some((
-                                    text,
+                                    mut text,
                                     sender_id,
                                     target_id,
                                     is_group,
                                     msg_id,
-                                    images,
-                                    file_attachments,
+                                    mut images,
+                                    mut file_attachments,
                                 )) = urx.recv().await
                                 {
+                                    // Debounce: wait briefly then drain queued messages.
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    while let Ok((extra_text, _, _, _, _, extra_images, extra_files)) = urx.try_recv() {
+                                        if !extra_text.is_empty() {
+                                            text.push('\n');
+                                            text.push_str(&extra_text);
+                                        }
+                                        images.extend(extra_images);
+                                        file_attachments.extend(extra_files);
+                                    }
                                     let process_result = tokio::time::timeout(
                                     Duration::from_secs(600),
                                     async {
@@ -6179,9 +6269,19 @@ fn start_matrix_if_configured(
                             let w_tx = tx.clone();
                             let w_uid = sender.clone();
                             tokio::spawn(async move {
-                                while let Some((text, sender, room_id, is_group, images, files)) =
+                                while let Some((mut text, sender, room_id, is_group, mut images, mut files)) =
                                     urx.recv().await
                                 {
+                                    // Debounce: wait briefly then drain queued messages.
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    while let Ok((extra_text, _, _, _, extra_images, extra_files)) = urx.try_recv() {
+                                        if !extra_text.is_empty() {
+                                            text.push('\n');
+                                            text.push_str(&extra_text);
+                                        }
+                                        images.extend(extra_images);
+                                        files.extend(extra_files);
+                                    }
                                     let process_result = tokio::time::timeout(
                                 Duration::from_secs(600),
                                 async {
@@ -6578,9 +6678,19 @@ fn start_wecom_if_configured(
                             let w_tx = tx.clone();
                             let w_uid = from.clone();
                             tokio::spawn(async move {
-                                while let Some((text, from, chat_id, is_group, images, files)) =
+                                while let Some((mut text, from, chat_id, is_group, mut images, mut files)) =
                                     urx.recv().await
                                 {
+                                    // Debounce: wait briefly then drain queued messages.
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    while let Ok((extra_text, _, _, _, extra_images, extra_files)) = urx.try_recv() {
+                                        if !extra_text.is_empty() {
+                                            text.push('\n');
+                                            text.push_str(&extra_text);
+                                        }
+                                        images.extend(extra_images);
+                                        files.extend(extra_files);
+                                    }
                                     let process_result = tokio::time::timeout(
                                 Duration::from_secs(600),
                                 async {
