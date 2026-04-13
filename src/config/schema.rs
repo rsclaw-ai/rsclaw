@@ -539,16 +539,6 @@ pub struct MemoryFlushConfig {
 #[serde(rename_all = "camelCase")]
 pub struct HeartbeatConfig {
     pub enabled: Option<bool>,
-    pub every: Option<String>,
-    pub target: Option<HeartbeatTarget>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HeartbeatTarget {
-    pub channel: Option<String>,
-    pub peer_id: Option<String>,
-    pub group_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
