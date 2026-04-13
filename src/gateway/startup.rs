@@ -273,11 +273,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         .and_then(|h| h.enabled)
         .unwrap_or(true);
     if hb_enabled {
-        let agent_ids: Vec<String> = config.agents.list.iter().map(|a| a.id.clone()).collect();
         let runner = std::sync::Arc::new(crate::heartbeat::HeartbeatRunner::new(
             Arc::clone(&registry),
             &data_dir,
-            agent_ids,
         ));
         runner.run();
         info!("heartbeat runner started");
