@@ -1130,7 +1130,7 @@ fn start_channels(
                 if handle.tx.send(msg).await.is_err() {
                     return;
                 }
-                if let Ok(reply) = reply_rx.await {
+                if let Ok(Ok(reply)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                     let pending = reply.pending_analysis;
                     if !reply.is_empty {
                         let _ = tx
@@ -1556,7 +1556,7 @@ fn start_channels(
                                 if handle.tx.send(msg).await.is_err() {
                                     return;
                                 }
-                                if let Ok(r) = reply_rx.await {
+                                if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                                     if !r.is_empty {
                                         let _ = tx.send(OutboundMessage {
                                             target_id: chat_id_s,
@@ -2086,7 +2086,7 @@ fn start_discord_if_configured(
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }
-                            if let Ok(r) = reply_rx.await {
+                            if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                                 if !r.is_empty {
                                     let _ = tx.send(OutboundMessage {
                                         target_id: channel_id,
@@ -2539,7 +2539,7 @@ fn start_slack_if_configured(
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }
-                            if let Ok(r) = reply_rx.await {
+                            if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                                 if !r.is_empty {
                                     let _ = tx.send(OutboundMessage {
                                         target_id: channel_id,
@@ -2903,7 +2903,7 @@ fn start_whatsapp_if_configured(
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }
-                            if let Ok(r) = reply_rx.await {
+                            if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                                 if !r.is_empty {
                                     let _ = tx.send(OutboundMessage {
                                         target_id: from,
@@ -3303,7 +3303,7 @@ fn start_line_if_configured(
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }
-                            if let Ok(r) = reply_rx.await {
+                            if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                                 if !r.is_empty {
                                     let _ = tx.send(OutboundMessage {
                                         target_id: user_id,
@@ -3657,7 +3657,7 @@ fn start_zalo_if_configured(
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }
-                            if let Ok(r) = reply_rx.await {
+                            if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                                 if !r.is_empty {
                                     let _ = tx.send(OutboundMessage {
                                         target_id: sender_id,
@@ -4039,7 +4039,7 @@ fn start_signal_if_configured(
                         if handle.tx.send(msg).await.is_err() {
                             return;
                         }
-                        if let Ok(r) = reply_rx.await {
+                        if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                             if !r.is_empty {
                                 let _ = tx.send(OutboundMessage {
                                     target_id: sender,
@@ -4501,7 +4501,7 @@ fn start_wechat_personal_if_configured(
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }
-                            if let Ok(r) = reply_rx.await {
+                            if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                                 if !r.is_empty {
                                     let _ = tx.send(OutboundMessage {
                                         target_id: from_user,
@@ -5017,7 +5017,7 @@ fn start_feishu_if_configured(
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }
-                            if let Ok(r) = reply_rx.await {
+                            if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                                 if !r.is_empty {
                                     let _ = tx.send(OutboundMessage {
                                         target_id: chat_id,
@@ -5505,7 +5505,7 @@ fn start_dingtalk_if_configured(
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }
-                            if let Ok(r) = reply_rx.await {
+                            if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                                 if !r.is_empty {
                                     let target = if is_group { conversation_id } else { sender_id };
                                     let _ = tx.send(OutboundMessage {
@@ -6012,7 +6012,7 @@ fn start_qq_if_configured(
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }
-                            if let Ok(r) = reply_rx.await {
+                            if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                                 if !r.is_empty {
                                     let _ = tx.send(OutboundMessage {
                                         target_id,
@@ -6454,7 +6454,7 @@ fn start_matrix_if_configured(
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }
-                            if let Ok(r) = reply_rx.await {
+                            if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                                 if !r.is_empty {
                                     let _ = tx.send(OutboundMessage {
                                         target_id: room_id,
@@ -6863,7 +6863,7 @@ fn start_wecom_if_configured(
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }
-                            if let Ok(r) = reply_rx.await {
+                            if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                                 if !r.is_empty {
                                     let target = if is_group { chat_id } else { from };
                                     let _ = tx.send(OutboundMessage {
