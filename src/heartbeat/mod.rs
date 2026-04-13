@@ -5,6 +5,12 @@ use anyhow::{anyhow, bail, Result};
 use chrono::NaiveTime;
 use chrono_tz::Tz;
 use std::time::Duration;
+use crate::agent::registry::{AgentMessage, AgentRegistry};
+use crate::config::loader::base_dir;
+use state::{HeartbeatState, HeartbeatStore};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tracing::{info, warn};
 
 /// Parsed representation of a HEARTBEAT.md file.
 #[derive(Debug, Clone)]
@@ -132,6 +138,169 @@ fn parse_time_range(s: &str) -> Result<(NaiveTime, NaiveTime)> {
         .map_err(|e| anyhow!("Invalid end time '{}': {}", end_str.trim(), e))?;
 
     Ok((start, end))
+}
+
+/// Heartbeat runner — scans agent workspaces and spawns per-agent heartbeat loops.
+pub struct HeartbeatRunner {
+    registry: Arc<AgentRegistry>,
+    store: Arc<HeartbeatStore>,
+    agent_ids: Vec<String>,
+}
+
+impl HeartbeatRunner {
+    pub fn new(
+        registry: Arc<AgentRegistry>,
+        data_dir: &Path,
+        agent_ids: Vec<String>,
+    ) -> Self {
+        let state_path = data_dir.join("heartbeat").join("state.json");
+        Self {
+            registry,
+            store: Arc::new(HeartbeatStore::new(state_path)),
+            agent_ids,
+        }
+    }
+
+    /// Start heartbeat loops for all agents that have a HEARTBEAT.md.
+    pub fn run(self: Arc<Self>) {
+        for agent_id in &self.agent_ids {
+            let workspace = resolve_workspace(agent_id);
+            let heartbeat_path = workspace.join("HEARTBEAT.md");
+            if !heartbeat_path.exists() {
+                continue;
+            }
+
+            let agent_id_owned = agent_id.clone();
+            let runner = Arc::clone(&self);
+
+            tokio::spawn(async move {
+                runner.agent_loop(&agent_id_owned).await;
+            });
+
+            info!(agent_id, "heartbeat loop started");
+        }
+    }
+
+    /// Per-agent heartbeat loop.
+    async fn agent_loop(&self, agent_id: &str) {
+        let workspace = resolve_workspace(agent_id);
+        let heartbeat_path = workspace.join("HEARTBEAT.md");
+
+        // Load persisted state for startup delay.
+        let mut hb_state = self.store.load(agent_id).unwrap_or_else(|e| {
+            warn!(agent_id, "failed to load heartbeat state: {e:#}");
+            HeartbeatState::new(agent_id)
+        });
+
+        // Initial spec read for startup delay calculation.
+        let spec = match self.read_spec(&heartbeat_path) {
+            Some(s) => s,
+            None => return,
+        };
+        let delay = schedule::startup_delay(spec.every, hb_state.last_run_at);
+        info!(agent_id, ?delay, "heartbeat waiting for first tick");
+        tokio::time::sleep(delay).await;
+
+        loop {
+            // Re-read HEARTBEAT.md each tick (auto hot-reload).
+            let spec = match self.read_spec(&heartbeat_path) {
+                Some(s) => s,
+                None => {
+                    info!(agent_id, "HEARTBEAT.md removed, stopping heartbeat");
+                    return;
+                }
+            };
+
+            // Check active hours — sleep until window if outside.
+            if let Some(sleep_dur) = schedule::check_active_hours(spec.active_hours, spec.timezone) {
+                info!(agent_id, secs = sleep_dur.as_secs(), "outside active_hours, sleeping");
+                tokio::time::sleep(sleep_dur).await;
+                continue;
+            }
+
+            // Send heartbeat message to agent.
+            match self.send_heartbeat(agent_id, &spec.content).await {
+                Ok(()) => {
+                    hb_state.record_success();
+                }
+                Err(e) => {
+                    warn!(agent_id, "heartbeat failed: {e:#}");
+                    hb_state.record_failure(&e.to_string());
+                }
+            }
+
+            // Persist state (best-effort).
+            if let Err(e) = self.store.save(hb_state.clone()) {
+                warn!(agent_id, "failed to save heartbeat state: {e:#}");
+            }
+
+            // Sleep with backoff.
+            let interval = schedule::backoff_interval(spec.every, hb_state.consecutive_failures);
+            tokio::time::sleep(interval).await;
+        }
+    }
+
+    /// Read and parse HEARTBEAT.md. Returns None if file missing or unparseable.
+    fn read_spec(&self, path: &Path) -> Option<HeartbeatSpec> {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+        match parse_heartbeat_md(&raw) {
+            Ok(spec) => Some(spec),
+            Err(e) => {
+                warn!(path = %path.display(), "failed to parse HEARTBEAT.md: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Send a heartbeat message to the agent and wait for reply.
+    async fn send_heartbeat(&self, agent_id: &str, content: &str) -> Result<()> {
+        let handle = self.registry.get(agent_id)
+            .map_err(|e| anyhow!("agent not found: {e:#}"))?;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let msg = AgentMessage {
+            session_key: format!("heartbeat:{agent_id}"),
+            text: content.to_owned(),
+            channel: "heartbeat".to_owned(),
+            peer_id: "heartbeat".to_owned(),
+            chat_id: String::new(),
+            reply_tx,
+            extra_tools: vec![],
+            images: vec![],
+            files: vec![],
+        };
+
+        handle
+            .tx
+            .send(msg)
+            .await
+            .map_err(|_| anyhow!("heartbeat send failed: agent channel closed"))?;
+
+        // Wait for reply with timeout (5 minutes).
+        match tokio::time::timeout(Duration::from_secs(300), reply_rx).await {
+            Ok(Ok(_reply)) => Ok(()),
+            Ok(Err(_)) => Ok(()), // reply_tx dropped — agent finished without explicit reply
+            Err(_) => bail!("heartbeat timed out after 300s"),
+        }
+    }
+}
+
+/// Resolve the workspace directory for an agent.
+fn resolve_workspace(agent_id: &str) -> PathBuf {
+    let base = base_dir();
+    if agent_id == "default" || agent_id == "main" || agent_id.is_empty() {
+        base.join("workspace")
+    } else {
+        let specific = base.join(format!("workspace-{agent_id}"));
+        if specific.exists() {
+            specific
+        } else {
+            base.join("workspace")
+        }
+    }
 }
 
 #[cfg(test)]
