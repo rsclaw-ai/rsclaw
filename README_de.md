@@ -1,6 +1,6 @@
 # RsClaw
 
-**High-performance Multi-Agent AI gateway with native OpenClaw A2A orchestration.**
+**AI Automation Manager Compatible with OpenClaw.**
 
 [![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)

@@ -3,7 +3,7 @@ name = "rsclaw"
 version = "2026.4.12"
 edition = "2024"
 rust-version = "1.91"
-description = "High-performance Multi-Agent AI gateway with native OpenClaw A2A orchestration"
+description = "AI Automation Manager Compatible with OpenClaw"
 repository = "https://github.com/rsclaw-ai/rsclaw"
 license = "AGPL-3.0"
 

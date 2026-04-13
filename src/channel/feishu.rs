@@ -287,9 +287,9 @@ fn build_feishu_card(text: &str, brand: &str) -> serde_json::Value {
             "header": {
                 "title": {
                     "content": if brand == "lark" {
-                        "\u{1F980}rsclaw.ai | Multi-Agent AI Gateway"
+                        "\u{1F980}rsclaw.ai | Your AI Automation Manager"
                     } else {
-                        "\u{1F980}rsclaw.ai | \u{591A}\u{667A}\u{80FD}\u{4F53}AI\u{7F51}\u{5173}"
+                        "\u{1F980}rsclaw.ai | \u{8783}\u{87F9}AI\u{81EA}\u{52A8}\u{5316}\u{7BA1}\u{5BB6}"
                     },
                     "tag": "plain_text"
                 },

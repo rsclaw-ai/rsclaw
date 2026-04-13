@@ -2857,6 +2857,7 @@ impl AgentRuntime {
 
             let msg_count = messages.len();
             let approx_tokens: usize = messages.iter().map(msg_tokens).sum();
+            self.handle.last_ctx_tokens.store(approx_tokens, std::sync::atomic::Ordering::Relaxed);
             info!(session = %ctx.session_key, msg_count, approx_tokens, model = %model, "LLM call: context size");
 
             // Context usage awareness: inject hint when usage is high.

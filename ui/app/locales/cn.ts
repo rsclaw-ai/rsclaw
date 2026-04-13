@@ -19,7 +19,7 @@ const cn = {
     Later: "稍后再说",
     SaasTips: "配置太麻烦，想要立即使用",
     TopTips:
-      "RsClaw 多智能体AI网关 - 通过统一端点访问所有模型",
+      "RsClaw 螃蟹AI自动化管家 - 通过统一端点访问所有模型",
   },
   ChatItem: {
     ChatItemCount: (count: number) => `${count} 条对话`,
@@ -313,7 +313,7 @@ const cn = {
         Title: "使用 RsClaw AI",
         Label: "",
         SubTitle:
-          "RsClaw 多智能体AI网关 - 统一访问所有模型",
+          "RsClaw 螃蟹AI自动化管家 - 统一访问所有模型",
         ChatNow: "立刻对话",
       },
       AccessCode: {
@@ -903,13 +903,13 @@ const cn = {
   },
 
   RsClawPanel: {
-    Splash: "欢迎使用螃蟹高性能多智能体AI网关!",
+    Splash: "欢迎使用螃蟹AI自动化管家!",
     Title: "RsClaw 控制台",
     BackToChat: "返回会话",
     Running: "运行中",
     Offline: "离线",
 
-    SubTitle: "螃蟹高性能多智能体AI网关",
+    SubTitle: "螃蟹AI自动化管家",
     Sidebar: {
       Service: "网关状态",
       ServiceTitle: "网关状态",
