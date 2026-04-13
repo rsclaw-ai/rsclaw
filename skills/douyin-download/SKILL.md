@@ -1,49 +1,20 @@
 ---
 name: douyin-download
-description: 下载抖音视频，用 web_browser 打开视频页面提取真实下载链接
-version: 3.0.0
+description: 下载抖音视频，用 task agent 调用 doubao 完成浏览器自动化和下载
+version: 4.0.0
 ---
 
 # 抖音视频下载
 
-当用户要求下载抖音视频时，按以下步骤执行。web_browser 工具的调用格式如下：
+当用户要求下载抖音视频时，用 `agent` tool 的 `task` action 派发给 doubao 完成：
 
-## web_browser 调用格式
+```json
+{
+  "action": "task",
+  "model": "doubao/doubao-seed-2-0-pro-260215",
+  "system": "你是抖音视频下载助手。web_browser 工具调用格式：打开页面用 {\"action\":\"open\",\"url\":\"URL\"}，等待用 {\"action\":\"wait\",\"ms\":5000}，执行JS用 {\"action\":\"evaluate\",\"js\":\"代码\"}，截图用 {\"action\":\"screenshot\"}。任务流程：1) 调用 web_browser {\"action\":\"open\",\"url\":\"视频URL\"} 打开页面；2) 等待5秒；3) 执行 {\"action\":\"evaluate\",\"js\":\"document.querySelector('video')?.src\"} 提取视频URL；4) 若为空或blob，执行 {\"action\":\"evaluate\",\"js\":\"JSON.stringify(Array.from(document.querySelectorAll('video,source')).map(e=>e.src||e.currentSrc).filter(s=>s&&s.startsWith('http')))\"}；5) 拿到真实http URL后用 exec 下载：macOS/Linux用 curl -L -o ~/Downloads/douyin_$(date +%Y%m%d_%H%M%S).mp4 \"URL\"，Windows用 powershell Invoke-WebRequest；6) 返回下载结果（文件路径和大小）。若页面需要登录先截图发给用户扫码。若src是blob://告知视频受保护无法下载。",
+  "message": "请下载这个抖音视频：<用户提供的URL>"
+}
+```
 
-- 打开页面：`{"action":"open","url":"页面URL"}`
-- 等待：`{"action":"wait","ms":5000}`
-- 执行JS：`{"action":"evaluate","js":"JS代码"}`
-- 截图：`{"action":"screenshot"}`
-
-## 下载流程
-
-1. **打开视频页面**
-   ```json
-   {"action":"open","url":"<用户提供的抖音视频URL>"}
-   ```
-
-2. **等待视频加载（5秒）**
-   ```json
-   {"action":"wait","ms":5000}
-   ```
-
-3. **提取视频真实 URL**
-   ```json
-   {"action":"evaluate","js":"document.querySelector('video')?.src"}
-   ```
-   如果返回空或 blob URL，再执行：
-   ```json
-   {"action":"evaluate","js":"JSON.stringify(Array.from(document.querySelectorAll('video,source')).map(e=>e.src||e.currentSrc).filter(s=>s&&s.startsWith('http')))"}
-   ```
-
-4. **下载视频文件**（用 exec 工具，选择对应平台命令）
-   - macOS/Linux：`curl -L -o ~/Downloads/douyin_$(date +%Y%m%d_%H%M%S).mp4 "真实URL"`
-   - Windows：`powershell -Command "Invoke-WebRequest -Uri '真实URL' -OutFile \"$env:USERPROFILE\Downloads\douyin_$(Get-Date -Format yyyyMMddHHmmss).mp4\""`
-
-5. **告知用户**下载完成的文件路径和大小
-
-## 注意事项
-
-- 如果页面需要登录，用 `{"action":"screenshot"}` 截图发给用户扫码
-- 如果 video src 是 blob:// 开头，无法直接下载，告知用户该视频受保护
-- 使用已保存的 douyin.com 登录态（rsclaw profile）
+收到 task 回复后，告知用户下载结果（文件路径和大小，或失败原因）。
