@@ -2629,6 +2629,32 @@ impl AgentRuntime {
             parse_error_count: 0,
         };
 
+        // On-demand skill injection: match user text against skill
+        // descriptions and inject full prompt for relevant skills.
+        {
+            let matched = match_skills(text, &self.skills);
+            if !matched.is_empty() {
+                let skill_prompts: String = matched
+                    .iter()
+                    .map(|s| format!(
+                        "<active_skill name=\"{}\" version=\"{}\">\n{}\n</active_skill>",
+                        s.name,
+                        s.version.as_deref().unwrap_or(""),
+                        s.prompt.trim(),
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                system_prompt.push_str(&format!(
+                    "\n\n## Active Skills (matched to current request)\n\
+                     Follow these skill instructions carefully:\n\n{skill_prompts}"
+                ));
+                info!(
+                    skills = ?matched.iter().map(|s| &s.name).collect::<Vec<_>>(),
+                    "skills matched for turn"
+                );
+            }
+        }
+
         let reply = time::timeout(
             Duration::from_secs(timeout_secs),
             self.agent_loop(&mut ctx, &model, &system_prompt, tools, extra_tools, abort_flag.clone()),
@@ -8941,7 +8967,8 @@ fn build_system_prompt(
         parts.push(ws_segment);
     }
 
-    // Available skills XML (AGENTS.md §20, item 3).
+    // Available skills — list only (name + description).
+    // Full skill prompts are injected on-demand per-turn via match_skills().
     if !skills.is_empty() {
         let skill_xml: String = skills
             .all()
@@ -10178,4 +10205,74 @@ mod tests {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// On-demand skill matching
+// ---------------------------------------------------------------------------
+
+/// Match user text against installed skills by keyword overlap.
+/// Returns skills whose description or name keywords appear in the user text.
+/// Only returns prompt-only skills (no tools) since tool-based skills are
+/// already available via the tool list.
+fn match_skills<'a>(
+    text: &str,
+    skills: &'a crate::skill::SkillRegistry,
+) -> Vec<&'a crate::skill::SkillManifest> {
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    let lower = text.to_lowercase();
+    let mut matched = Vec::new();
+
+    for skill in skills.all() {
+        // Skip tool-based skills — they're already in the tool list.
+        if !skill.tools.is_empty() {
+            continue;
+        }
+        // Skip skills with no prompt body.
+        if skill.prompt.trim().is_empty() {
+            continue;
+        }
+
+        // Build keyword set from skill name + description.
+        let mut keywords: Vec<&str> = Vec::new();
+
+        // Name-derived keywords (split on hyphens/spaces).
+        for part in skill.name.split(|c: char| c == '-' || c == '_' || c == ' ') {
+            let p = part.trim();
+            if p.len() >= 2 {
+                keywords.push(p);
+            }
+        }
+
+        // Description keywords (Chinese + English).
+        if let Some(ref desc) = skill.description {
+            // Extract meaningful words/phrases from description.
+            for word in desc.split(|c: char| !c.is_alphanumeric() && c != '/' && c != '.') {
+                let w = word.trim();
+                if w.len() >= 2 {
+                    keywords.push(w);
+                }
+            }
+        }
+
+        // Check if any keyword matches the user text.
+        let hit = keywords.iter().any(|kw| {
+            let kl = kw.to_lowercase();
+            // Skip very generic words.
+            if matches!(kl.as_str(), "the" | "and" | "for" | "with" | "use" | "when" | "from"
+                | "create" | "edit" | "file" | "files" | "data" | "tool" | "agent"
+                | "的" | "和" | "在" | "是" | "了" | "等") {
+                return false;
+            }
+            lower.contains(&kl)
+        });
+
+        if hit {
+            matched.push(skill);
+        }
+    }
+
+    matched
 }

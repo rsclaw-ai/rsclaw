@@ -2,6 +2,8 @@
 name: web-scan-login
 description: 自主登录需要扫码的网站（京东/淘宝/B站/抖音/微博/邮箱/云服务/微信等28个站点），截取二维码发给用户扫码，完成后持久化登录态
 version: 1.0.0
+icon: "🔐"
+author: "@rsclaw"
 ---
 
 # Web Scan Login

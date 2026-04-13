@@ -1,6 +1,6 @@
 # RsClaw
 
-**AI Automation Manager Compatible with OpenClaw.**
+**支持 OpenClaw 一键迁移的 AI 自动化管家，自带长期记忆，永不健忘。**
 
 [![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
@@ -8,7 +8,7 @@
 
 [English](README.md) | **中文** | [日本語](README_ja.md) | [한국어](README_ko.md) | [ไทย](README_th.md) | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | [Русский](README_ru.md)
 
-RsClaw 是 [OpenClaw](https://github.com/openclaw/openclaw) 的 Rust 全新重写，提供相同的多智能体 AI 网关协议，同时实现 10 倍启动速度、10 倍更小体积，零 Node.js 依赖。
+螃蟹 AI（RsClaw）是基于 Rust 从零重构的 AI 自动化管家，拥有原生长期记忆与自我进化能力，全平台桌面版一键安装，开箱即用。支持 OpenClaw 一键迁移，原有配置无缝切换。
 
 ---
 

@@ -1068,6 +1068,97 @@ $g.Dispose();$b.Dispose()"#
         }
         return Some(txt("screenshot failed".to_owned()));
     }
+    // /skill list — list installed skills (system + agent workspace)
+    if lower == "/skill list" {
+        let base = crate::config::loader::base_dir();
+        let global_dir = base.join("skills");
+        let ws_dir = workspace().join("skills");
+
+        let scan = |dir: &std::path::Path| -> Vec<String> {
+            let mut names = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() && p.join("SKILL.md").exists() {
+                        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                            names.push(name.to_owned());
+                        }
+                    }
+                }
+            }
+            names.sort();
+            names
+        };
+
+        let global = scan(&global_dir);
+        let agent = scan(&ws_dir);
+
+        let mut lines = Vec::new();
+        lines.push(format!("System skills ({}):", global.len()));
+        if global.is_empty() {
+            lines.push("  (none)".to_owned());
+        } else {
+            for s in &global { lines.push(format!("  {s}")); }
+        }
+        lines.push(format!("Agent skills ({}):", agent.len()));
+        if agent.is_empty() {
+            lines.push("  (none)".to_owned());
+        } else {
+            for s in &agent { lines.push(format!("  {s}")); }
+        }
+        return Some(txt(lines.join("\n")));
+    }
+    // /cron — list cron jobs (reads from disk)
+    if lower == "/cron" || lower == "/cron list" {
+        let jobs_path = crate::config::loader::base_dir().join("cron/jobs.json");
+        let reply = match tokio::fs::read_to_string(&jobs_path).await {
+            Ok(content) => {
+                match serde_json::from_str::<Vec<serde_json::Value>>(&content) {
+                    Ok(jobs) if jobs.is_empty() => "No cron jobs configured.".to_owned(),
+                    Ok(jobs) => {
+                        let mut lines = vec!["Cron jobs:".to_owned()];
+                        for job in &jobs {
+                            let id = job.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                            let schedule = job.get("schedule").and_then(|v| v.as_str()).unwrap_or("?");
+                            let agent = job.get("agentId").and_then(|v| v.as_str()).unwrap_or("main");
+                            let msg = job.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                            let enabled = job.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+                            let status = if enabled { "" } else { " (disabled)" };
+                            let msg_preview = if msg.len() > 50 {
+                                let end = msg.char_indices().nth(47).map(|(i, _)| i).unwrap_or(msg.len());
+                                format!("{}...", &msg[..end])
+                            } else {
+                                msg.to_owned()
+                            };
+                            lines.push(format!("  [{}] {} -> {} \"{}\"{}",
+                                id, schedule, agent, msg_preview, status));
+                        }
+                        lines.join("\n")
+                    }
+                    Err(_) => "No cron jobs configured.".to_owned(),
+                }
+            }
+            Err(_) => "No cron jobs configured.".to_owned(),
+        };
+        return Some(txt(reply));
+    }
+    // /model — show current model; /models — list providers; /model <name> — switch
+    if lower == "/model" || lower == "/models" {
+        let model = handle.config.model.as_ref()
+            .and_then(|m| m.primary.as_deref())
+            .unwrap_or("default");
+        let mut lines = vec![format!("Current model: {model}")];
+        lines.push(String::new());
+        lines.push("Registered providers:".to_owned());
+        for name in handle.providers.names() {
+            lines.push(format!("  {name}"));
+        }
+        return Some(txt(lines.join("\n")));
+    }
+    if lower.starts_with("/model ") {
+        let model = t.get(7..).unwrap_or("").trim();
+        return Some(txt(format!("Model switched to: {model} (runtime only, use configure to persist)")));
+    }
     // /run <cmd>, /sh <cmd>, /exec <cmd>, ! <cmd>, $ <cmd> — shell execution
     let shell_cmd: Option<&str> = if lower.starts_with("/run ")
         || lower.starts_with("/sh ")
@@ -1123,7 +1214,7 @@ fn is_fast_preparse(text: &str) -> bool {
     matches!(
         lower.as_str(),
         "/ls" | "/status" | "/version" | "/help" | "/?" | "/health" | "/uptime"
-            | "/models" | "/clear" | "/abort" | "/sessions"
+            | "/model" | "/models" | "/cron" | "/clear" | "/abort" | "/sessions"
     )
     // Commands with optional/required args
     || lower.starts_with("/ls ")
@@ -1131,6 +1222,8 @@ fn is_fast_preparse(text: &str) -> bool {
     || lower.starts_with("/ss")
     || lower.starts_with("/remember ")
     || lower.starts_with("/recall ")
+    || lower.starts_with("/cron ")
+    || lower.starts_with("/skill ")
     || lower.starts_with("/model ")
     || lower.starts_with("/run ")
     || lower.starts_with("/sh ")

@@ -2,6 +2,8 @@
 name: douyin-download
 description: 下载抖音视频，用 task agent 调用 doubao 完成浏览器自动化和下载
 version: 4.0.0
+icon: "🎬"
+author: "@rsclaw"
 ---
 
 # 抖音视频下载
