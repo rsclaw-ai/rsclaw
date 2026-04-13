@@ -162,14 +162,22 @@ impl ChromeProcess {
             .map_err(|e| anyhow!("failed to create temp dir for Chrome profile: {e}"))?;
 
         let mut args = vec![
-            "--disable-gpu",
-            "--no-sandbox",
-            "--disable-extensions",
-            "--disable-background-networking",
-            "--disable-component-extensions-with-background-pages",
+            "--remote-debugging-port=0",
             "--no-first-run",
             "--no-default-browser-check",
-            "--remote-debugging-port=0",
+            "--disable-background-networking",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-component-update",
+            "--disable-default-apps",
+            "--disable-hang-monitor",
+            "--disable-popup-blocking",
+            "--disable-prompt-on-repost",
+            "--disable-sync",
+            "--disable-features=Translate",
+            "--enable-features=NetworkService,NetworkServiceInProcess",
+            "--metrics-recording-only",
+            "--password-store=basic",
+            "--use-mock-keychain",
             "--window-size=1280,720",
             "about:blank",
         ];
