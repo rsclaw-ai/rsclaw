@@ -7299,26 +7299,21 @@ async fn download_bge_model(
         .unwrap_or("BAAI/bge-small-zh-v1.5");
 
     // Determine base URL: config override > locale auto-detect.
-    let base_url = {
-        let host = if let Some(url) = local_cfg.and_then(|c| c.model_download_url.as_deref()) {
-            url.trim_end_matches('/').to_owned()
-        } else {
-            // Auto-detect: config language > LANG/LC_ALL env var.
-            let is_zh = config_language
-                .map(|l| l.to_lowercase().contains("chinese") || l.to_lowercase().contains("zh"))
-                .unwrap_or_else(|| {
-                    std::env::var("LANG")
-                        .or_else(|_| std::env::var("LC_ALL"))
-                        .unwrap_or_default()
-                        .to_lowercase()
-                        .contains("zh")
-                });
-            if is_zh {
-                "https://hf-mirror.com".to_owned()
-            } else {
-                "https://huggingface.co".to_owned()
-            }
-        };
+    let base_url = if let Some(url) = local_cfg.and_then(|c| c.model_download_url.as_deref()) {
+        // User provided full URL — use as-is.
+        url.trim_end_matches('/').to_owned()
+    } else {
+        // Auto-detect: config language > LANG/LC_ALL env var.
+        let is_zh = config_language
+            .map(|l| l.to_lowercase().contains("chinese") || l.to_lowercase().contains("zh"))
+            .unwrap_or_else(|| {
+                std::env::var("LANG")
+                    .or_else(|_| std::env::var("LC_ALL"))
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains("zh")
+            });
+        let host = if is_zh { "https://hf-mirror.com" } else { "https://huggingface.co" };
         format!("{host}/{repo}/resolve/main")
     };
 
