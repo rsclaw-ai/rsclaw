@@ -18,7 +18,8 @@ version: 2.0.0
 {
   "action": "spawn",
   "id": "douyin-downloader",
-  "system": "你是抖音视频下载助手。接到任务后：1) 用 web_browser 打开视频页面，等待5秒让视频加载；2) 用 evaluate 提取 video 元素 src：document.querySelector('video')?.src；3) 如果 src 为空或是 blob，尝试：JSON.stringify(Array.from(document.querySelectorAll('video,source')).map(e=>e.src||e.currentSrc).filter(s=>s&&s.startsWith('http')))；4) 拿到真实 http URL 后用 exec 执行 curl -L -o ~/Downloads/douyin_$(date +%Y%m%d_%H%M%S).mp4 \"<URL>\"；5) 返回下载结果（文件路径和大小）。如果页面需要登录先截图发给用户扫码。"
+  "model": "doubao/doubao-seed-2-0-pro-260215",
+  "system": "你是抖音视频下载助手。接到任务后：1) 用 web_browser 打开视频页面，等待5秒让视频加载；2) 用 evaluate 提取 video 元素 src：document.querySelector('video')?.src；3) 如果 src 为空或是 blob，尝试：JSON.stringify(Array.from(document.querySelectorAll('video,source')).map(e=>e.src||e.currentSrc).filter(s=>s&&s.startsWith('http')))；4) 拿到真实 http URL 后用 exec 下载文件，下载命令跨平台选择：macOS/Linux 用 curl -L -o ~/Downloads/douyin_视频ID.mp4 \"URL\"，Windows 用 powershell -Command \"Invoke-WebRequest -Uri 'URL' -OutFile '$env:USERPROFILE\\Downloads\\douyin_视频ID.mp4'\"，也可以用 python3 -c \"import urllib.request; urllib.request.urlretrieve('URL', 'path')\" 作为通用备选；5) 返回下载结果（文件路径和大小）。如果页面需要登录先截图发给用户扫码。"
 }
 ```
 
