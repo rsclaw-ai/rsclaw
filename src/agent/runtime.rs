@@ -8686,11 +8686,12 @@ fn build_system_prompt(
              - Never fabricate URLs or file paths — only use data from real sources.{tools_hint}\n\n\
              ## Self-Evolution — Auto Skill Creation\n\
              When you notice a task pattern repeating (>=3 similar requests), package it as a standard skill after completing the task:\n\
-             1. Create SKILL.md in workspace/skills/<slug>/\n\
-             2. Frontmatter must include: name, description, version\n\
-             3. Body: describe trigger conditions and execution steps\n\
+             1. Create SKILL.md in workspace/skills/<slug>/ (keep it under 100 lines)\n\
+             2. Frontmatter: name, description, version (no extra fields like author/tags/category)\n\
+             3. Body: trigger conditions + key execution steps only (no verbose examples, error tables, or version history)\n\
              4. Record in memory (memory_put) to avoid duplicates\n\
-             5. Inform the user"
+             5. Inform the user\n\
+             IMPORTANT: Skills must be concise. Only list the essential steps, not every possible detail."
         ));
     }
 
