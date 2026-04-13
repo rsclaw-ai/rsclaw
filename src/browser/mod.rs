@@ -165,14 +165,17 @@ impl ChromeProcess {
             "--disable-gpu",
             "--no-sandbox",
             "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-component-extensions-with-background-pages",
+            "--no-first-run",
+            "--no-default-browser-check",
             "--remote-debugging-port=0",
             "--window-size=1280,720",
+            "about:blank",
         ];
         if !headed {
             args.push("--headless=new");
         }
-        // Headed mode needs an initial URL to ensure a page target is created.
-        args.push("about:blank");
 
         let mut child = tokio::process::Command::new(chrome_path)
             .args(&args)
@@ -482,16 +485,22 @@ impl BrowserSession {
         let discovery_url = format!("http://127.0.0.1:{port}/json");
 
         let mut page_target: Option<Value> = None;
-        for attempt in 0..10 {
+        for attempt in 0..20 {
             if let Ok(resp) = reqwest::get(&discovery_url).await {
                 if let Ok(targets) = resp.json::<Vec<Value>>().await {
+                    if attempt == 0 || attempt == 9 || attempt == 19 {
+                        let types: Vec<&str> = targets.iter()
+                            .filter_map(|t| t["type"].as_str())
+                            .collect();
+                        warn!(attempt, ?types, "CDP target types discovered");
+                    }
                     if let Some(target) = targets.into_iter().find(|t| t["type"].as_str() == Some("page")) {
                         page_target = Some(target);
                         break;
                     }
                 }
             }
-            if attempt < 9 {
+            if attempt < 19 {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         }
