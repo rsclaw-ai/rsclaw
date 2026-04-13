@@ -4733,15 +4733,25 @@ fn start_feishu_if_configured(
                             let w_uid = sender_id.clone();
                             tokio::spawn(async move {
                                 while let Some((
-                                    text,
+                                    mut text,
                                     sender_id,
                                     chat_id,
                                     is_group,
                                     bound,
-                                    images,
-                                    file_attachments,
+                                    mut images,
+                                    mut file_attachments,
                                 )) = urx.recv().await
                                 {
+                                    // Debounce: wait briefly then drain queued messages.
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    while let Ok((extra_text, _, _, _, _, extra_images, extra_files)) = urx.try_recv() {
+                                        if !extra_text.is_empty() {
+                                            text.push('\n');
+                                            text.push_str(&extra_text);
+                                        }
+                                        images.extend(extra_images);
+                                        file_attachments.extend(extra_files);
+                                    }
                                     let process_result = tokio::time::timeout(
                                         Duration::from_secs(172800), // 48 hours, matching OpenClaw default
                                         async {
