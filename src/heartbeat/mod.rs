@@ -177,7 +177,7 @@ impl HeartbeatRunner {
         });
     }
 
-    /// Scan all workspace directories for HEARTBEAT.md and spawn loops for new ones.
+    /// Scan all workspace directories for HEARTBEAT*.md and spawn loops for new ones.
     fn scan_and_spawn(self: &Arc<Self>) {
         let base = base_dir();
         // Collect workspace dirs: "workspace" + "workspace-*"
@@ -194,34 +194,60 @@ impl HeartbeatRunner {
         }
 
         let mut active = self.active.lock().unwrap();
-        for (agent_id, workspace) in dirs {
-            if active.contains(&agent_id) {
-                continue;
+        for (agent_id, workspace) in &dirs {
+            // Find all HEARTBEAT*.md files in the workspace.
+            let heartbeat_files = Self::find_heartbeat_files(workspace);
+            for hb_path in heartbeat_files {
+                let filename = hb_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let key = format!("{agent_id}:{filename}");
+                if active.contains(&key) {
+                    continue;
+                }
+
+                active.insert(key);
+                let runner = Arc::clone(self);
+                let agent_id = agent_id.clone();
+
+                info!(agent_id = %agent_id, file = %filename, "heartbeat loop started");
+
+                tokio::spawn(async move {
+                    runner.agent_loop(&agent_id, &hb_path).await;
+                });
             }
-            if !workspace.join("HEARTBEAT.md").exists() {
-                continue;
-            }
-
-            active.insert(agent_id.clone());
-            let runner = Arc::clone(self);
-
-            info!(agent_id = %agent_id, "heartbeat loop started");
-
-            tokio::spawn(async move {
-                runner.agent_loop(&agent_id).await;
-            });
         }
     }
 
+    /// Find all HEARTBEAT*.md files in a workspace directory.
+    fn find_heartbeat_files(workspace: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(workspace) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("HEARTBEAT") && name.ends_with(".md") {
+                    files.push(entry.path());
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
     /// Per-agent heartbeat loop.
-    async fn agent_loop(&self, agent_id: &str) {
-        let workspace = resolve_workspace(agent_id);
-        let heartbeat_path = workspace.join("HEARTBEAT.md");
+    async fn agent_loop(&self, agent_id: &str, heartbeat_path: &Path) {
+        let filename = heartbeat_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let state_key = format!("{agent_id}:{filename}");
 
         // Load persisted state for startup delay.
-        let mut hb_state = self.store.load(agent_id).unwrap_or_else(|e| {
+        let mut hb_state = self.store.load(&state_key).unwrap_or_else(|e| {
             warn!(agent_id, "failed to load heartbeat state: {e:#}");
-            HeartbeatState::new(agent_id)
+            HeartbeatState::new(&state_key)
         });
 
         // Initial spec read for startup delay calculation.
@@ -320,20 +346,6 @@ impl HeartbeatRunner {
     }
 }
 
-/// Resolve the workspace directory for an agent.
-fn resolve_workspace(agent_id: &str) -> PathBuf {
-    let base = base_dir();
-    if agent_id == "default" || agent_id == "main" || agent_id.is_empty() {
-        base.join("workspace")
-    } else {
-        let specific = base.join(format!("workspace-{agent_id}"));
-        if specific.exists() {
-            specific
-        } else {
-            base.join("workspace")
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
