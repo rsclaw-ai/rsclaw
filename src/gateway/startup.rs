@@ -893,6 +893,85 @@ fn default_dm_scope(config: &RuntimeConfig) -> DmScope {
         .unwrap_or(DmScope::PerChannelPeer)
 }
 
+/// Handle certain fast preparse commands locally — without going through the agent queue.
+/// Returns `Some(reply_text)` for commands that can be answered immediately, `None` otherwise.
+/// This avoids blocking on the agent's sequential LLM loop for simple commands like /ls, /status.
+async fn try_preparse_locally(
+    text: &str,
+    handle: &crate::agent::AgentHandle,
+) -> Option<String> {
+    use std::sync::atomic::Ordering;
+    let t = text.trim();
+    let lower = t.to_lowercase();
+
+    // /version
+    if lower == "/version" {
+        return Some(format!("rsclaw {}", env!("RSCLAW_BUILD_VERSION")));
+    }
+    // /health
+    if lower == "/health" {
+        let secs = handle.started_at.elapsed().as_secs();
+        let uptime = if secs < 60 { format!("{secs}s") }
+            else if secs < 3600 { format!("{}m {}s", secs/60, secs%60) }
+            else { format!("{}h {}m", secs/3600, (secs%3600)/60) };
+        return Some(format!("OK · up {uptime}"));
+    }
+    // /uptime
+    if lower == "/uptime" {
+        let secs = handle.started_at.elapsed().as_secs();
+        let s = if secs < 60 { format!("{secs}s") }
+            else if secs < 3600 { format!("{}m {}s", secs/60, secs%60) }
+            else { format!("{}h {}m", secs/3600, (secs%3600)/60) };
+        return Some(s);
+    }
+    // /abort — set all abort flags
+    if lower == "/abort" {
+        let flags = handle.abort_flags.read().unwrap();
+        let count = flags.len();
+        for f in flags.values() { f.store(true, Ordering::SeqCst); }
+        return Some(if count > 0 { format!("✓ abort signal sent ({count} session(s))") } else { "nothing to abort".to_owned() });
+    }
+    // /status
+    if lower == "/status" {
+        let version = env!("RSCLAW_BUILD_VERSION");
+        let model = handle.config.model.as_ref()
+            .and_then(|m| m.primary.as_deref())
+            .unwrap_or("default");
+        let sessions = handle.session_count.load(Ordering::Relaxed);
+        let secs = handle.started_at.elapsed().as_secs();
+        let uptime = if secs < 60 { format!("{secs}s") }
+            else if secs < 3600 { format!("{}m {}s", secs/60, secs%60) }
+            else { format!("{}h {}m", secs/3600, (secs%3600)/60) };
+        let state = handle.live_status.try_read()
+            .map(|s| if s.state.is_empty() { "idle".to_owned() } else { s.state.clone() })
+            .unwrap_or_else(|_| "busy".to_owned());
+        return Some(format!("rsclaw {version}\nagent: {}\nmodel: {model}\nsessions: {sessions}\nuptime: {uptime}\nstate: {state}", handle.id));
+    }
+    // /ls [path] — run in workspace
+    if lower == "/ls" || lower.starts_with("/ls ") {
+        let path_arg = t.get(3..).unwrap_or("").trim();
+        let base = crate::config::loader::base_dir();
+        let ws = handle.config.workspace.as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| base.join("workspace"));
+        let target = if path_arg.is_empty() {
+            ws
+        } else {
+            let p = std::path::PathBuf::from(path_arg);
+            if p.is_absolute() { p } else { ws.join(path_arg) }
+        };
+        let out = tokio::process::Command::new("ls")
+            .arg("-la")
+            .arg(&target)
+            .output()
+            .await
+            .ok()?;
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        return Some(if stdout.trim().is_empty() { "(empty directory)".to_owned() } else { stdout });
+    }
+    None
+}
+
 /// Check if a message is a fast preparse command that should bypass the per-user queue.
 /// These are local slash commands that execute instantly and should not wait behind
 /// slow LLM requests in the queue.
@@ -1541,6 +1620,12 @@ fn start_channels(
                                     peer_id: peer_id_s.clone(),
                                     dm_scope,
                                 });
+                                if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
+                                    if !local_reply.is_empty() {
+                                        let _ = tx.send(OutboundMessage { target_id: chat_id_s, is_group, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                                    }
+                                    return;
+                                }
                                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                                 let msg = AgentMessage {
                                     session_key,
@@ -2071,6 +2156,12 @@ fn start_discord_if_configured(
                                 peer_id: peer_id.clone(),
                                 dm_scope,
                             });
+                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
+                                if !local_reply.is_empty() {
+                                    let _ = tx.send(OutboundMessage { target_id: channel_id, is_group: is_guild, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                                }
+                                return;
+                            }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
                                 session_key,
@@ -2524,6 +2615,12 @@ fn start_slack_if_configured(
                                 peer_id: peer_id.clone(),
                                 dm_scope,
                             });
+                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
+                                if !local_reply.is_empty() {
+                                    let _ = tx.send(OutboundMessage { target_id: channel_id, is_group: is_channel, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                                }
+                                return;
+                            }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
                                 session_key,
@@ -2888,6 +2985,12 @@ fn start_whatsapp_if_configured(
                                 peer_id: from.clone(),
                                 dm_scope,
                             });
+                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
+                                if !local_reply.is_empty() {
+                                    let _ = tx.send(OutboundMessage { target_id: from.clone(), is_group: false, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                                }
+                                return;
+                            }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
                                 session_key,
@@ -3288,6 +3391,12 @@ fn start_line_if_configured(
                                 peer_id: user_id.clone(),
                                 dm_scope,
                             });
+                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
+                                if !local_reply.is_empty() {
+                                    let _ = tx.send(OutboundMessage { target_id: user_id.clone(), is_group, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                                }
+                                return;
+                            }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
                                 session_key,
@@ -3642,6 +3751,12 @@ fn start_zalo_if_configured(
                                 peer_id: sender_id.clone(),
                                 dm_scope,
                             });
+                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
+                                if !local_reply.is_empty() {
+                                    let _ = tx.send(OutboundMessage { target_id: sender_id.clone(), is_group: false, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                                }
+                                return;
+                            }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
                                 session_key,
@@ -4024,6 +4139,12 @@ fn start_signal_if_configured(
                             peer_id: sender.clone(),
                             dm_scope,
                         });
+                        if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
+                            if !local_reply.is_empty() {
+                                let _ = tx.send(OutboundMessage { target_id: sender.clone(), is_group, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                            }
+                            return;
+                        }
                         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                         let msg = AgentMessage {
                             session_key,
@@ -4486,6 +4607,12 @@ fn start_wechat_personal_if_configured(
                                 peer_id: from_user.clone(),
                                 dm_scope,
                             });
+                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
+                                if !local_reply.is_empty() {
+                                    let _ = tx.send(OutboundMessage { target_id: from_user.clone(), is_group: false, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                                }
+                                return;
+                            }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
                                 session_key,
@@ -5002,6 +5129,12 @@ fn start_feishu_if_configured(
                                 peer_id: sender_id.clone(),
                                 dm_scope,
                             });
+                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
+                                if !local_reply.is_empty() {
+                                    let _ = tx.send(OutboundMessage { target_id: chat_id.clone(), is_group, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                                }
+                                return;
+                            }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
                                 session_key,
@@ -5490,6 +5623,13 @@ fn start_dingtalk_if_configured(
                                 peer_id: sender_id.clone(),
                                 dm_scope,
                             });
+                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
+                                if !local_reply.is_empty() {
+                                    let dt_target = if is_group { conversation_id.clone() } else { sender_id.clone() };
+                                    let _ = tx.send(OutboundMessage { target_id: dt_target, is_group, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                                }
+                                return;
+                            }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
                                 session_key,
@@ -5997,6 +6137,12 @@ fn start_qq_if_configured(
                                 peer_id: sender_id.clone(),
                                 dm_scope,
                             });
+                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
+                                if !local_reply.is_empty() {
+                                    let _ = tx.send(OutboundMessage { target_id: target_id.clone(), is_group, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                                }
+                                return;
+                            }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
                                 session_key,
@@ -6439,6 +6585,12 @@ fn start_matrix_if_configured(
                                 peer_id: sender.clone(),
                                 dm_scope,
                             });
+                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
+                                if !local_reply.is_empty() {
+                                    let _ = tx.send(OutboundMessage { target_id: room_id.clone(), is_group, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                                }
+                                return;
+                            }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
                                 session_key,
@@ -6848,6 +7000,13 @@ fn start_wecom_if_configured(
                                 peer_id: from.clone(),
                                 dm_scope,
                             });
+                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
+                                if !local_reply.is_empty() {
+                                    let wc_target = if is_group { chat_id.clone() } else { from.clone() };
+                                    let _ = tx.send(OutboundMessage { target_id: wc_target, is_group, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                                }
+                                return;
+                            }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let msg = AgentMessage {
                                 session_key,

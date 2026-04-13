@@ -9,7 +9,8 @@
 use std::{
     collections::HashMap,
     sync::Arc,
-    sync::atomic::AtomicBool,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    time::Instant,
 };
 
 use anyhow::Result;
@@ -43,6 +44,10 @@ pub struct AgentHandle {
     /// Per-session abort flags: session_key -> atomic abort flag.
     /// Uses std::sync::RwLock (not tokio) so it can be accessed in Drop impls.
     pub abort_flags: Arc<std::sync::RwLock<HashMap<String, Arc<AtomicBool>>>>,
+    /// When this agent handle was created (for /status uptime).
+    pub started_at: Instant,
+    /// Number of active sessions (updated after each turn for /status).
+    pub session_count: Arc<AtomicUsize>,
 }
 
 /// An image attachment sent by the user.
@@ -219,6 +224,8 @@ impl AgentRegistry {
                     ),
                     providers: Arc::clone(&providers),
                     abort_flags: Arc::new(std::sync::RwLock::new(HashMap::new())),
+                    started_at: Instant::now(),
+                    session_count: Arc::new(AtomicUsize::new(0)),
                 });
                 inner.agents.insert(entry.id.clone(), handle);
                 receivers.insert(entry.id.clone(), rx);

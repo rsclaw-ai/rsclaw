@@ -2532,6 +2532,7 @@ impl AgentRuntime {
             status.current_task.clear();
             status.text_preview.clear();
         }
+        self.handle.session_count.store(self.sessions.len(), std::sync::atomic::Ordering::Relaxed);
 
         // Append to JSONL transcript (AGENTS.md §20 step 11).
         self.append_transcript(session_key, text, &reply.text).await;
