@@ -1,6 +1,6 @@
 ---
 name: web-scan-login
-description: 自主登录需要扫码的网站（京东/淘宝/B站/抖音/微博/邮箱/云服务等26个站点），截取二维码发给用户扫码，完成后持久化登录态
+description: 自主登录需要扫码的网站（京东/淘宝/B站/抖音/微博/邮箱/云服务/微信等28个站点），截取二维码发给用户扫码，完成后持久化登录态
 version: 1.0.0
 ---
 
@@ -230,6 +230,18 @@ const selectors = [
 - **二次跳转**: 是，跳转到 auth.huaweicloud.com
 - **QR 提示**: "请使用华为云 APP 扫码登录"
 - **成功判断**: URL 跳回 www.huaweicloud.com 且出现用户信息
+
+### 27. mp.weixin.qq.com（微信公众号后台）
+- **登录 URL**: `https://mp.weixin.qq.com`
+- **操作**: 页面直接显示微信扫码登录二维码，无需额外点击
+- **QR 提示**: "请使用微信扫码登录公众号后台"
+- **成功判断**: URL 跳转到公众号管理主界面（mp.weixin.qq.com/cgi-bin/...）
+
+### 28. channels.weixin.qq.com（微信视频号）
+- **登录 URL**: `https://channels.weixin.qq.com`
+- **操作**: 页面直接显示微信扫码登录二维码，无需额外点击
+- **QR 提示**: "请使用微信扫码登录视频号"
+- **成功判断**: URL 跳转到视频号创作者中心主界面
 
 ## 重要注意事项
 
