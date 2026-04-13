@@ -127,6 +127,20 @@
         keepRecentPairs: 5,
         extractFacts: true,
       },
+      // heartbeat: {
+      //   enabled: true,            // Global on/off for heartbeat scanning (default: true)
+      // },                          // Interval/active_hours configured in HEARTBEAT*.md frontmatter
+      // memory: {
+      //   enabled: true,            // Enable per-agent memory (default: true)
+      //   autoCapture: true,        // Auto-capture facts from conversations
+      //   autoRecall: true,         // Auto-recall relevant memories each turn
+      //   enableManagementTools: true, // Expose memory_search/memory_put/memory_delete tools
+      //   recallTopK: 10,           // Per-backend recall count before fusion
+      //   recallFinalK: 5,          // Final results after fusion
+      //   // scope: {
+      //   //   default: "agent",     // Default scope for new memories
+      //   // },
+      // },
       // model: {
       //   primary: "anthropic/claude-sonnet-4-20250514",
       // },
@@ -233,15 +247,43 @@
       // googleCx: "search-engine-id",
       // bingApiKey: "${BING_API_KEY}",
     },
+    // webBrowser: {
+    //   headed: false,             // true = visible window, false = headless (default)
+    //   profile: "rsclaw",         // Chrome profile: "default" = system profile, "rsclaw" = isolated
+    //                              // Unset = temporary profile (no cookies/history)
+    //   // chromePath: "/path/to/chrome",  // Auto-detected if not set
+    // },
   },
 
   // =================================================================
-  // MEMORY — Long-term memory
+  // MEMORY — Long-term memory (top-level)
   // =================================================================
   memory: {
-    recallTopK: 10,               // Results per backend before fusion
-    recallFinalK: 5,              // Final results after RRF
+    // enabled: true,               // Enable memory system (default: true)
+    // provider: "local",           // Embedding provider: "local", "openai", "ollama"
+    recallTopK: 10,               // Results per backend (vector/BM25) before fusion
+    recallFinalK: 5,              // Final results after RRF fusion
+    // search: {
+    //   model: "bge-small-zh",    // Embedding model name
+    //   maxResults: 10,           // Max search results
+    // },
   },
+
+  // =================================================================
+  // MEMORY SEARCH — Embedding configuration
+  // =================================================================
+  // memorySearch: {
+  //   provider: "local",           // "local", "openai", "gemini", "voyage", "ollama"
+  //   model: "bge-small-zh",       // Embedding model name
+  //   // sources: ["memory"],      // What to index: "memory", "sessions"
+  //   // baseUrl: "http://localhost:11434/v1",  // Custom embedding API URL
+  //   // apiKey: "${EMBEDDING_API_KEY}",        // API key for cloud embedding
+  //   // local: {
+  //   //   modelPath: "~/.rsclaw/models/bge-small-zh",  // Path to local GGUF model
+  //   //   modelRepo: "BAAI/bge-small-zh-v1.5",         // HuggingFace repo name
+  //   //   modelDownloadUrl: "https://hf-mirror.com",    // Download mirror (auto: hf-mirror.com for zh)
+  //   // },
+  // },
 
   // =================================================================
   // CRON — Scheduled jobs (also see cron/jobs.json)
