@@ -59,6 +59,7 @@ pub async fn run_sequential(
             images: vec![],
             files: vec![],
             pending_analysis: None,
+            was_preparse: false,
         });
     }
 
@@ -78,6 +79,7 @@ pub async fn run_sequential(
         images: vec![],
         files: vec![],
         pending_analysis: None,
+        was_preparse: false,
     })
 }
 

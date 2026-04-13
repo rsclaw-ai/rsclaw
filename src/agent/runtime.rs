@@ -389,6 +389,11 @@ impl AgentRuntime {
 
         tracing::info!(task = %task, "tool_opencode: starting");
 
+        let lang = self.config.raw.gateway.as_ref()
+            .and_then(|g| g.language.as_deref())
+            .map(crate::i18n::resolve_lang)
+            .unwrap_or("en");
+
         // Get notification sender early for error reporting
         let notif_tx = self.notification_tx.clone();
         let target_id = ctx.peer_id.clone();
@@ -403,7 +408,7 @@ impl AgentRuntime {
                     let _ = tx.send(crate::channel::OutboundMessage {
                         target_id: target_id.clone(),
                         is_group: false,
-                        text: format!("❌ OpenCode 启动失败\n\n{}", e),
+                        text: crate::i18n::t_fmt("acp_start_failed", lang, &[("name", "OpenCode"), ("error", &e.to_string())]),
                         reply_to: None,
                         images: vec![],
                         files: vec![],
@@ -423,7 +428,7 @@ impl AgentRuntime {
             let _ = tx.send(crate::channel::OutboundMessage {
                 target_id: target_id.clone(),
                 is_group: false,
-                text: "🚀 OpenCode 任务已提交，执行中...".to_string(),
+                text: crate::i18n::t_fmt("acp_submitted", lang, &[("name", "OpenCode")]),
                 reply_to: None,
                 images: vec![],
                 files: vec![],
@@ -435,6 +440,7 @@ impl AgentRuntime {
         let notif_tx_bg = notif_tx.clone();
         let target_id_bg = target_id.clone();
         let channel_bg = channel_name.clone();
+        let lang_bg = lang;
         tokio::spawn(async move {
             tracing::info!("tool_opencode: background task started");
             // Start event collection FIRST (in parallel with send_prompt)
@@ -542,6 +548,47 @@ impl AgentRuntime {
                         crate::acp::types::StopReason::Incomplete => "❓",
                     };
 
+                    // Scan result_content for downloadable file paths (e.g. mp4 downloaded by opencode).
+                    let notif_files: Vec<(String, String, String)> = {
+                        let sendable_exts = [".mp4", ".mp3", ".zip", ".pdf", ".xlsx", ".docx", ".pptx", ".csv", ".tar.gz"];
+                        let mut found = Vec::new();
+                        for token in result_content.split_whitespace() {
+                            let trimmed = token.trim_matches(|c: char| "\"'.,;:()[]{}".contains(c));
+                            // Strip any leading non-path characters (e.g. Chinese prefix like "路径：")
+                            // by finding the first '/' or '~' in the token.
+                            let trimmed = if let Some(pos) = trimmed.find(|c| c == '/' || c == '~') {
+                                &trimmed[pos..]
+                            } else {
+                                trimmed
+                            };
+                            let lower = trimmed.to_lowercase();
+                            if sendable_exts.iter().any(|ext| lower.ends_with(ext)) {
+                                let path = expand_tilde(trimmed);
+                                if path.exists() {
+                                    if let Ok(meta) = path.metadata() {
+                                        if meta.len() <= 50_000_000 {
+                                            let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                            let mime = if lower.ends_with(".mp4") { "video/mp4" }
+                                                else if lower.ends_with(".mp3") { "audio/mpeg" }
+                                                else if lower.ends_with(".pdf") { "application/pdf" }
+                                                else if lower.ends_with(".zip") || lower.ends_with(".tar.gz") { "application/zip" }
+                                                else if lower.ends_with(".xlsx") { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }
+                                                else if lower.ends_with(".docx") { "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+                                                else if lower.ends_with(".pptx") { "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
+                                                else { "text/csv" };
+                                            let path_str = path.to_string_lossy().to_string();
+                                            if !found.iter().any(|(_, _, p): &(String, String, String)| p == &path_str) {
+                                                tracing::info!(path = %path_str, "tool_opencode: attaching file to notification");
+                                                found.push((filename, mime.to_owned(), path_str));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        found
+                    };
+
                     let summary = if !result_content.is_empty() {
                         // Show result, truncated if too long (character-safe truncation)
                         let truncated = if result_content.chars().count() > 2000 {
@@ -550,28 +597,29 @@ impl AgentRuntime {
                                 .nth(2000)
                                 .map(|(i, _)| i)
                                 .unwrap_or(result_content.len());
-                            format!("{}...\n\n[已截断]", &result_content[..cutoff])
+                            crate::i18n::t_fmt("acp_truncated", lang_bg, &[("content", &result_content[..cutoff])])
                         } else {
                             result_content
                         };
-                        format!(
-                            "{} OpenCode 完成\n\n**调用工具**: {} 个\n\n**结果**:\n{}",
-                            status_icon, tool_count, truncated
-                        )
+                        crate::i18n::t_fmt("acp_done_result", lang_bg, &[
+                            ("status", status_icon), ("name", "OpenCode"),
+                            ("count", &tool_count.to_string()), ("result", &truncated),
+                        ])
                     } else if tool_count > 0 {
-                        // No text result but had tool calls
-                        format!(
-                            "{} OpenCode 完成\n\n**调用工具**: {} 个\n\n**执行摘要**:\n{}",
-                            status_icon, tool_count, events_list.join("\n")
-                        )
+                        crate::i18n::t_fmt("acp_done_summary", lang_bg, &[
+                            ("status", status_icon), ("name", "OpenCode"),
+                            ("count", &tool_count.to_string()), ("summary", &events_list.join("\n")),
+                        ])
                     } else {
-                        format!("{} OpenCode 完成\n\n**调用工具**: 0 个\n\n(无输出)", status_icon)
+                        crate::i18n::t_fmt("acp_done_empty", lang_bg, &[
+                            ("status", status_icon), ("name", "OpenCode"),
+                        ])
                     };
 
                     // Send notification to user
-                    tracing::info!(
-                        "tool_opencode: sending completion notification, summary_len={}",
-                        summary.len()
+                    tracing::debug!(
+                        "tool_opencode: sending completion notification, summary_len={}, files={}",
+                        summary.len(), notif_files.len()
                     );
                     if let Some(ref tx) = notif_tx_bg {
                         match tx.send(crate::channel::OutboundMessage {
@@ -580,11 +628,11 @@ impl AgentRuntime {
                             text: summary,
                             reply_to: None,
                             images: vec![],
-                            files: vec![],
+                            files: notif_files,
                             channel: Some(channel_bg.clone()),
                         }) {
                             Ok(_) => {
-                                tracing::info!("tool_opencode: notification sent successfully")
+                                tracing::debug!("tool_opencode: notification sent successfully")
                             }
                             Err(e) => {
                                 tracing::error!("tool_opencode: failed to send notification: {}", e)
@@ -600,7 +648,7 @@ impl AgentRuntime {
                         let _ = tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
-                            text: format!("❌ OpenCode 错误\n\n{}", e),
+                            text: crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "OpenCode"), ("error", &e.to_string())]),
                             reply_to: None,
                             images: vec![],
                             files: vec![],
@@ -616,7 +664,7 @@ impl AgentRuntime {
         });
 
         Ok(serde_json::json!({
-            "output": "OpenCode 任务已提交，完成后将推送结果。",
+            "output": crate::i18n::t_fmt("acp_queued", lang, &[("name", "OpenCode")]),
             "status": "submitted",
             "session_id": session_id_clone
         }))
@@ -752,6 +800,11 @@ impl AgentRuntime {
 
         tracing::info!(task = %task, "tool_claudecode: starting");
 
+        let lang = self.config.raw.gateway.as_ref()
+            .and_then(|g| g.language.as_deref())
+            .map(crate::i18n::resolve_lang)
+            .unwrap_or("en");
+
         // Get notification sender early for error reporting
         let notif_tx = self.notification_tx.clone();
         let target_id = ctx.peer_id.clone();
@@ -766,7 +819,7 @@ impl AgentRuntime {
                     let _ = tx.send(crate::channel::OutboundMessage {
                         target_id: target_id.clone(),
                         is_group: false,
-                        text: format!("❌ Claude Code 启动失败\n\n{}", e),
+                        text: crate::i18n::t_fmt("acp_start_failed", lang, &[("name", "Claude Code"), ("error", &e.to_string())]),
                         reply_to: None,
                         images: vec![],
                         files: vec![],
@@ -786,7 +839,7 @@ impl AgentRuntime {
             let _ = tx.send(crate::channel::OutboundMessage {
                 target_id: target_id.clone(),
                 is_group: false,
-                text: "🚀 Claude Code 任务已提交，执行中...".to_string(),
+                text: crate::i18n::t_fmt("acp_submitted", lang, &[("name", "Claude Code")]),
                 reply_to: None,
                 images: vec![],
                 files: vec![],
@@ -798,6 +851,7 @@ impl AgentRuntime {
         let notif_tx_bg = notif_tx.clone();
         let target_id_bg = target_id.clone();
         let channel_bg = channel_name.clone();
+        let lang_bg = lang;
         tokio::spawn(async move {
             // Start event collection FIRST (in parallel with send_prompt)
             let mut event_rx = client.subscribe_events();
@@ -900,6 +954,47 @@ impl AgentRuntime {
                         crate::acp::types::StopReason::Incomplete => "❓",
                     };
 
+                    // Scan result_content for downloadable file paths.
+                    let notif_files: Vec<(String, String, String)> = {
+                        let sendable_exts = [".mp4", ".mp3", ".zip", ".pdf", ".xlsx", ".docx", ".pptx", ".csv", ".tar.gz"];
+                        let mut found = Vec::new();
+                        for token in result_content.split_whitespace() {
+                            let trimmed = token.trim_matches(|c: char| "\"'.,;:()[]{}".contains(c));
+                            // Strip any leading non-path characters (e.g. Chinese prefix like "路径：")
+                            // by finding the first '/' or '~' in the token.
+                            let trimmed = if let Some(pos) = trimmed.find(|c| c == '/' || c == '~') {
+                                &trimmed[pos..]
+                            } else {
+                                trimmed
+                            };
+                            let lower = trimmed.to_lowercase();
+                            if sendable_exts.iter().any(|ext| lower.ends_with(ext)) {
+                                let path = expand_tilde(trimmed);
+                                if path.exists() {
+                                    if let Ok(meta) = path.metadata() {
+                                        if meta.len() <= 50_000_000 {
+                                            let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                            let mime = if lower.ends_with(".mp4") { "video/mp4" }
+                                                else if lower.ends_with(".mp3") { "audio/mpeg" }
+                                                else if lower.ends_with(".pdf") { "application/pdf" }
+                                                else if lower.ends_with(".zip") || lower.ends_with(".tar.gz") { "application/zip" }
+                                                else if lower.ends_with(".xlsx") { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }
+                                                else if lower.ends_with(".docx") { "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+                                                else if lower.ends_with(".pptx") { "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
+                                                else { "text/csv" };
+                                            let path_str = path.to_string_lossy().to_string();
+                                            if !found.iter().any(|(_, _, p): &(String, String, String)| p == &path_str) {
+                                                tracing::info!(path = %path_str, "tool_claudecode: attaching file to notification");
+                                                found.push((filename, mime.to_owned(), path_str));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        found
+                    };
+
                     let summary = if !result_content.is_empty() {
                         // Show result, truncated if too long (character-safe truncation)
                         let truncated = if result_content.chars().count() > 2000 {
@@ -908,28 +1003,29 @@ impl AgentRuntime {
                                 .nth(2000)
                                 .map(|(i, _)| i)
                                 .unwrap_or(result_content.len());
-                            format!("{}...\n\n[已截断]", &result_content[..cutoff])
+                            crate::i18n::t_fmt("acp_truncated", lang_bg, &[("content", &result_content[..cutoff])])
                         } else {
                             result_content
                         };
-                        format!(
-                            "{} Claude Code 完成\n\n**调用工具**: {} 个\n\n**结果**:\n{}",
-                            status_icon, tool_count, truncated
-                        )
+                        crate::i18n::t_fmt("acp_done_result", lang_bg, &[
+                            ("status", status_icon), ("name", "Claude Code"),
+                            ("count", &tool_count.to_string()), ("result", &truncated),
+                        ])
                     } else if tool_count > 0 {
-                        // No text result but had tool calls
-                        format!(
-                            "{} Claude Code 完成\n\n**调用工具**: {} 个\n\n**执行摘要**:\n{}",
-                            status_icon, tool_count, events_list.join("\n")
-                        )
+                        crate::i18n::t_fmt("acp_done_summary", lang_bg, &[
+                            ("status", status_icon), ("name", "Claude Code"),
+                            ("count", &tool_count.to_string()), ("summary", &events_list.join("\n")),
+                        ])
                     } else {
-                        format!("{} Claude Code 完成\n\n**调用工具**: 0 个\n\n(无输出)", status_icon)
+                        crate::i18n::t_fmt("acp_done_empty", lang_bg, &[
+                            ("status", status_icon), ("name", "Claude Code"),
+                        ])
                     };
 
                     // Send notification to user
-                    tracing::info!(
-                        "tool_claudecode: sending completion notification, summary_len={}",
-                        summary.len()
+                    tracing::debug!(
+                        "tool_claudecode: sending completion notification, summary_len={}, files={}",
+                        summary.len(), notif_files.len()
                     );
                     if let Some(ref tx) = notif_tx_bg {
                         match tx.send(crate::channel::OutboundMessage {
@@ -938,11 +1034,11 @@ impl AgentRuntime {
                             text: summary,
                             reply_to: None,
                             images: vec![],
-                            files: vec![],
+                            files: notif_files,
                             channel: Some(channel_bg.clone()),
                         }) {
                             Ok(_) => {
-                                tracing::info!("tool_claudecode: notification sent successfully")
+                                tracing::debug!("tool_claudecode: notification sent successfully")
                             }
                             Err(e) => {
                                 tracing::error!("tool_claudecode: failed to send notification: {}", e)
@@ -958,7 +1054,7 @@ impl AgentRuntime {
                         let _ = tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
-                            text: format!("❌ Claude Code 错误\n\n{}", e),
+                            text: crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "Claude Code"), ("error", &e.to_string())]),
                             reply_to: None,
                             images: vec![],
                             files: vec![],
@@ -971,7 +1067,7 @@ impl AgentRuntime {
         });
 
         Ok(serde_json::json!({
-            "output": "Claude Code 任务已提交，完成后将推送结果。",
+            "output": crate::i18n::t_fmt("acp_queued", lang, &[("name", "Claude Code")]),
             "status": "submitted",
             "session_id": session_id_clone
         }))
@@ -1078,6 +1174,7 @@ impl AgentRuntime {
             images: vec![],
             files: vec![],
             pending_analysis: None,
+            was_preparse: false,
         })
     }
 
@@ -1200,6 +1297,7 @@ impl AgentRuntime {
                             images: vec![],
                             files: vec![],
                             pending_analysis: None,
+                            was_preparse: false,
                         });
                     }
                     // Has extractable text: return "analyzing..." immediately,
@@ -1216,6 +1314,7 @@ impl AgentRuntime {
                             channel: channel.to_owned(),
                             peer_id: peer_id.to_owned(),
                         }),
+                        was_preparse: false,
                     });
                 }
                 "2" => {
@@ -1273,6 +1372,7 @@ impl AgentRuntime {
                             images: vec![],
                             files: vec![],
                             pending_analysis: None,
+                            was_preparse: false,
                         });
                     }
                     // Has extractable text: return "analyzing..." immediately,
@@ -1295,6 +1395,7 @@ impl AgentRuntime {
                             channel: channel.to_owned(),
                             peer_id: peer_id.to_owned(),
                         }),
+                        was_preparse: false,
                     });
                 }
                 _ => {
@@ -1310,6 +1411,7 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
+                        was_preparse: false,
                     });
                 }
             }
@@ -1363,7 +1465,6 @@ impl AgentRuntime {
                         let uptime = format_duration(self.started_at.elapsed());
                         let os = if cfg!(target_os = "macos") { "macOS" }
                             else if cfg!(target_os = "linux") {
-                                // Check for Android (linux + ANDROID_ROOT env)
                                 if std::env::var("ANDROID_ROOT").is_ok() { "Android" } else { "Linux" }
                             }
                             else if cfg!(target_os = "windows") { "Windows" }
@@ -1372,6 +1473,7 @@ impl AgentRuntime {
                         let ctx_tokens: usize = self.sessions.get(session_key)
                             .map(|msgs| msgs.iter().map(msg_tokens).sum())
                             .unwrap_or(0);
+                        self.handle.last_ctx_tokens.store(ctx_tokens, std::sync::atomic::Ordering::Relaxed);
                         let ctx_limit = self.handle.config.model.as_ref()
                             .and_then(|m| m.context_tokens)
                             .or(self.config.agents.defaults.model.as_ref()
@@ -1734,6 +1836,7 @@ impl AgentRuntime {
                             images: vec![],
                             files: vec![],
                             pending_analysis: None,
+                            was_preparse: true,
                         });
                     }
                     other => other.to_owned(),
@@ -1746,6 +1849,7 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
+                        was_preparse: true,
                     });
                 }
                 // Fall through to LLM for unhandled directives
@@ -1763,6 +1867,7 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
+                        was_preparse: true,
                     });
                 }
                 info!(tool = %tool, "pre-parse: executing tool directly");
@@ -1809,6 +1914,7 @@ impl AgentRuntime {
                             images: reply_images,
                             files: vec![],
                             pending_analysis: None,
+                            was_preparse: true,
                         });
                     }
                     Err(e) => {
@@ -1819,6 +1925,7 @@ impl AgentRuntime {
                             images: vec![],
                             files: vec![],
                             pending_analysis: None,
+                            was_preparse: true,
                         });
                     }
                 }
@@ -1841,6 +1948,7 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
+                        was_preparse: true,
                     });
                 }
                 // Safety off: fall through to execute anyway
@@ -1864,6 +1972,7 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
+                        was_preparse: true,
                     });
                 }
                 // Safety off: fall through to execute anyway
@@ -1879,6 +1988,7 @@ impl AgentRuntime {
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
+                    was_preparse: true,
                 });
             }
         }
@@ -1895,6 +2005,7 @@ impl AgentRuntime {
                 images: vec![],
                 files: vec![],
                 pending_analysis: None,
+                was_preparse: false,
             });
         }
 
@@ -2048,6 +2159,7 @@ impl AgentRuntime {
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
+                    was_preparse: false,
                 });
             }
             let files = accepted;
@@ -2073,6 +2185,7 @@ impl AgentRuntime {
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
+                    was_preparse: false,
                 });
             }
 
@@ -2155,6 +2268,7 @@ impl AgentRuntime {
                 images: vec![],
                 files: vec![],
                 pending_analysis: None,
+                was_preparse: false,
             });
         }
 
@@ -2468,6 +2582,7 @@ impl AgentRuntime {
                 images: vec![],
                 files: vec![],
                 pending_analysis: None,
+                was_preparse: false,
             });
         }
 
@@ -3177,6 +3292,7 @@ impl AgentRuntime {
                     images: tool_images,
                     files: tool_files,
                     pending_analysis: None,
+                    was_preparse: false,
                 });
             }
 
@@ -3239,6 +3355,7 @@ impl AgentRuntime {
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
+                    was_preparse: false,
                 });
             }
 

@@ -837,6 +837,7 @@ fn spawn_agent_tasks(
             notification_tx.clone(),
         );
 
+        let event_tx_task = event_tx.clone();
         tokio::spawn(async move {
             info!(agent_id = %handle.id, "agent runtime task started");
             while let Some(msg) = rx.recv().await {
@@ -871,8 +872,28 @@ fn spawn_agent_tasks(
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
+                        was_preparse: false,
                     }
                 });
+                // Emit to event_bus only for preparse turns (agent_loop already emits
+                // streaming deltas + done for LLM turns; a second emit would send a
+                // duplicate done frame to WS clients).
+                if reply.was_preparse {
+                    if !reply.text.is_empty() {
+                        let _ = event_tx_task.send(crate::events::AgentEvent {
+                            session_id: session_key.clone(),
+                            agent_id: handle.id.clone(),
+                            delta: reply.text.clone(),
+                            done: false,
+                        });
+                    }
+                    let _ = event_tx_task.send(crate::events::AgentEvent {
+                        session_id: session_key.clone(),
+                        agent_id: handle.id.clone(),
+                        delta: String::new(),
+                        done: true,
+                    });
+                }
                 let _ = reply_tx.send(reply);
             }
             info!(agent_id = %handle.id, "agent runtime task ended (channel closed)");
@@ -899,14 +920,33 @@ fn default_dm_scope(config: &RuntimeConfig) -> DmScope {
 async fn try_preparse_locally(
     text: &str,
     handle: &crate::agent::AgentHandle,
-) -> Option<String> {
+) -> Option<OutboundMessage> {
     use std::sync::atomic::Ordering;
     let t = text.trim();
     let lower = t.to_lowercase();
 
+    // Helper: text-only reply (target_id/is_group filled in by caller).
+    let txt = |s: String| OutboundMessage {
+        target_id: String::new(),
+        is_group: false,
+        text: s,
+        reply_to: None,
+        images: vec![],
+        files: vec![],
+        channel: None,
+    };
+
+    // Workspace resolver (shared by /ls, /cat, shell cmds).
+    let workspace = || {
+        let base = crate::config::loader::base_dir();
+        handle.config.workspace.as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| base.join("workspace"))
+    };
+
     // /version
     if lower == "/version" {
-        return Some(format!("rsclaw {}", env!("RSCLAW_BUILD_VERSION")));
+        return Some(txt(format!("rsclaw {}", env!("RSCLAW_BUILD_VERSION"))));
     }
     // /health
     if lower == "/health" {
@@ -914,7 +954,7 @@ async fn try_preparse_locally(
         let uptime = if secs < 60 { format!("{secs}s") }
             else if secs < 3600 { format!("{}m {}s", secs/60, secs%60) }
             else { format!("{}h {}m", secs/3600, (secs%3600)/60) };
-        return Some(format!("OK · up {uptime}"));
+        return Some(txt(format!("OK · up {uptime}")));
     }
     // /uptime
     if lower == "/uptime" {
@@ -922,18 +962,17 @@ async fn try_preparse_locally(
         let s = if secs < 60 { format!("{secs}s") }
             else if secs < 3600 { format!("{}m {}s", secs/60, secs%60) }
             else { format!("{}h {}m", secs/3600, (secs%3600)/60) };
-        return Some(s);
+        return Some(txt(s));
     }
     // /abort — set all abort flags
     if lower == "/abort" {
         let flags = handle.abort_flags.read().unwrap();
         let count = flags.len();
         for f in flags.values() { f.store(true, Ordering::SeqCst); }
-        return Some(if count > 0 { format!("✓ abort signal sent ({count} session(s))") } else { "nothing to abort".to_owned() });
+        return Some(txt(if count > 0 { format!("✓ abort signal sent ({count} session(s))") } else { "nothing to abort".to_owned() }));
     }
     // /status
     if lower == "/status" {
-        let version = env!("RSCLAW_BUILD_VERSION");
         let model = handle.config.model.as_ref()
             .and_then(|m| m.primary.as_deref())
             .unwrap_or("default");
@@ -942,18 +981,27 @@ async fn try_preparse_locally(
         let uptime = if secs < 60 { format!("{secs}s") }
             else if secs < 3600 { format!("{}m {}s", secs/60, secs%60) }
             else { format!("{}h {}m", secs/3600, (secs%3600)/60) };
-        let state = handle.live_status.try_read()
-            .map(|s| if s.state.is_empty() { "idle".to_owned() } else { s.state.clone() })
-            .unwrap_or_else(|_| "busy".to_owned());
-        return Some(format!("rsclaw {version}\nagent: {}\nmodel: {model}\nsessions: {sessions}\nuptime: {uptime}\nstate: {state}", handle.id));
+        let os = if cfg!(target_os = "macos") { "macOS" }
+            else if cfg!(target_os = "linux") {
+                if std::env::var("ANDROID_ROOT").is_ok() { "Android" } else { "Linux" }
+            }
+            else if cfg!(target_os = "windows") { "Windows" }
+            else { "Unknown" };
+        let ctx_tokens = handle.last_ctx_tokens.load(Ordering::Relaxed);
+        let ctx_limit = handle.config.model.as_ref()
+            .and_then(|m| m.context_tokens)
+            .unwrap_or(64000) as usize;
+        return Some(txt(format!(
+            "Gateway: running\nOS: {os}\nModel: {model}\nSessions: {sessions}\nContext: ~{:.1}k/{:.0}k tokens\nUptime: {uptime}\nVersion: rsclaw {}",
+            ctx_tokens as f64 / 1000.0,
+            ctx_limit as f64 / 1000.0,
+            env!("RSCLAW_BUILD_VERSION")
+        )));
     }
-    // /ls [path] — run in workspace
+    // /ls [path] — list workspace directory
     if lower == "/ls" || lower.starts_with("/ls ") {
         let path_arg = t.get(3..).unwrap_or("").trim();
-        let base = crate::config::loader::base_dir();
-        let ws = handle.config.workspace.as_deref()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| base.join("workspace"));
+        let ws = workspace();
         let target = if path_arg.is_empty() {
             ws
         } else {
@@ -961,13 +1009,106 @@ async fn try_preparse_locally(
             if p.is_absolute() { p } else { ws.join(path_arg) }
         };
         let out = tokio::process::Command::new("ls")
-            .arg("-la")
-            .arg(&target)
+            .current_dir(&target)
             .output()
             .await
             .ok()?;
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        return Some(if stdout.trim().is_empty() { "(empty directory)".to_owned() } else { stdout });
+        return Some(txt(if stdout.trim().is_empty() { "(empty directory)".to_owned() } else { stdout }));
+    }
+    // /cat <path> — read file from workspace
+    if lower.starts_with("/cat ") {
+        let path_arg = t.get(5..).unwrap_or("").trim();
+        let ws = workspace();
+        let target = {
+            let p = std::path::PathBuf::from(path_arg);
+            if p.is_absolute() { p } else { ws.join(path_arg) }
+        };
+        let content = tokio::fs::read_to_string(&target).await
+            .unwrap_or_else(|e| format!("error reading {}: {e}", target.display()));
+        return Some(txt(content));
+    }
+    // /ss — desktop screenshot
+    if lower == "/ss" || lower == "/screenshot" {
+        let tmp_path = std::env::temp_dir().join("rsclaw_screen.png");
+        let tmp_s = tmp_path.to_string_lossy().to_string();
+        let ok = if cfg!(target_os = "macos") {
+            tokio::process::Command::new("screencapture")
+                .args(["-x", &tmp_s]).status().await.map(|s| s.success()).unwrap_or(false)
+        } else if cfg!(target_os = "windows") {
+            let script = format!(
+                r#"Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+$b=New-Object System.Drawing.Bitmap([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width,[System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height)
+$g=[System.Drawing.Graphics]::FromImage($b)
+$g.CopyFromScreen(0,0,0,0,$b.Size)
+$b.Save('{tmp_s}')
+$g.Dispose();$b.Dispose()"#
+            );
+            tokio::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", &script])
+                .status().await.map(|s| s.success()).unwrap_or(false)
+        } else {
+            tokio::process::Command::new("scrot")
+                .arg(&tmp_s).status().await.map(|s| s.success()).unwrap_or(false)
+        };
+        if ok {
+            if let Ok(bytes) = tokio::fs::read(&tmp_path).await {
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                return Some(OutboundMessage {
+                    target_id: String::new(),
+                    is_group: false,
+                    text: String::new(),
+                    reply_to: None,
+                    images: vec![format!("data:image/png;base64,{b64}")],
+                    files: vec![],
+                    channel: None,
+                });
+            }
+        }
+        return Some(txt("screenshot failed".to_owned()));
+    }
+    // /run <cmd>, /sh <cmd>, /exec <cmd>, ! <cmd>, $ <cmd> — shell execution
+    let shell_cmd: Option<&str> = if lower.starts_with("/run ")
+        || lower.starts_with("/sh ")
+        || lower.starts_with("/exec ")
+    {
+        t.find(' ').map(|i| t[i + 1..].trim())
+    } else if t.starts_with("! ") {
+        Some(t[2..].trim())
+    } else if t.starts_with("$ ") {
+        Some(t[2..].trim())
+    } else {
+        None
+    };
+    if let Some(cmd) = shell_cmd {
+        let (shell, arg) = if cfg!(target_os = "windows") {
+            ("powershell", "-Command")
+        } else {
+            ("sh", "-c")
+        };
+        let ws = workspace();
+        let out = tokio::process::Command::new(shell)
+            .args([arg, cmd])
+            .current_dir(&ws)
+            .output()
+            .await;
+        let reply = match out {
+            Ok(o) => {
+                let mut result = String::from_utf8_lossy(&o.stdout).into_owned();
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                if !stderr.trim().is_empty() {
+                    if !result.is_empty() { result.push('\n'); }
+                    result.push_str(stderr.trim());
+                }
+                if result.trim().is_empty() {
+                    if o.status.success() { "(no output)".to_owned() }
+                    else { format!("exit {}", o.status.code().unwrap_or(-1)) }
+                } else { result }
+            }
+            Err(e) => format!("exec error: {e}"),
+        };
+        return Some(txt(reply));
     }
     None
 }
@@ -991,6 +1132,11 @@ fn is_fast_preparse(text: &str) -> bool {
     || lower.starts_with("/remember ")
     || lower.starts_with("/recall ")
     || lower.starts_with("/model ")
+    || lower.starts_with("/run ")
+    || lower.starts_with("/sh ")
+    || lower.starts_with("/exec ")
+    || t.starts_with("! ")
+    || t.starts_with("$ ")
 }
 
 // ---------------------------------------------------------------------------
@@ -1620,9 +1766,11 @@ fn start_channels(
                                     peer_id: peer_id_s.clone(),
                                     dm_scope,
                                 });
-                                if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
-                                    if !local_reply.is_empty() {
-                                        let _ = tx.send(OutboundMessage { target_id: chat_id_s, is_group, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                                if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                                    reply.target_id = chat_id_s;
+                                    reply.is_group = is_group;
+                                    if !reply.text.is_empty() || !reply.images.is_empty() {
+                                        let _ = tx.send(reply).await;
                                     }
                                     return;
                                 }
@@ -2156,9 +2304,11 @@ fn start_discord_if_configured(
                                 peer_id: peer_id.clone(),
                                 dm_scope,
                             });
-                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
-                                if !local_reply.is_empty() {
-                                    let _ = tx.send(OutboundMessage { target_id: channel_id, is_group: is_guild, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                                reply.target_id = channel_id;
+                                reply.is_group = is_guild;
+                                if !reply.text.is_empty() || !reply.images.is_empty() {
+                                    let _ = tx.send(reply).await;
                                 }
                                 return;
                             }
@@ -2615,9 +2765,11 @@ fn start_slack_if_configured(
                                 peer_id: peer_id.clone(),
                                 dm_scope,
                             });
-                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
-                                if !local_reply.is_empty() {
-                                    let _ = tx.send(OutboundMessage { target_id: channel_id, is_group: is_channel, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                                reply.target_id = channel_id;
+                                reply.is_group = is_channel;
+                                if !reply.text.is_empty() || !reply.images.is_empty() {
+                                    let _ = tx.send(reply).await;
                                 }
                                 return;
                             }
@@ -2985,9 +3137,11 @@ fn start_whatsapp_if_configured(
                                 peer_id: from.clone(),
                                 dm_scope,
                             });
-                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
-                                if !local_reply.is_empty() {
-                                    let _ = tx.send(OutboundMessage { target_id: from.clone(), is_group: false, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                                reply.target_id = from.clone();
+                                reply.is_group = false;
+                                if !reply.text.is_empty() || !reply.images.is_empty() {
+                                    let _ = tx.send(reply).await;
                                 }
                                 return;
                             }
@@ -3391,9 +3545,11 @@ fn start_line_if_configured(
                                 peer_id: user_id.clone(),
                                 dm_scope,
                             });
-                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
-                                if !local_reply.is_empty() {
-                                    let _ = tx.send(OutboundMessage { target_id: user_id.clone(), is_group, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                                reply.target_id = user_id.clone();
+                                reply.is_group = is_group;
+                                if !reply.text.is_empty() || !reply.images.is_empty() {
+                                    let _ = tx.send(reply).await;
                                 }
                                 return;
                             }
@@ -3751,9 +3907,11 @@ fn start_zalo_if_configured(
                                 peer_id: sender_id.clone(),
                                 dm_scope,
                             });
-                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
-                                if !local_reply.is_empty() {
-                                    let _ = tx.send(OutboundMessage { target_id: sender_id.clone(), is_group: false, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                                reply.target_id = sender_id.clone();
+                                reply.is_group = false;
+                                if !reply.text.is_empty() || !reply.images.is_empty() {
+                                    let _ = tx.send(reply).await;
                                 }
                                 return;
                             }
@@ -4139,9 +4297,11 @@ fn start_signal_if_configured(
                             peer_id: sender.clone(),
                             dm_scope,
                         });
-                        if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
-                            if !local_reply.is_empty() {
-                                let _ = tx.send(OutboundMessage { target_id: sender.clone(), is_group, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                        if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                            reply.target_id = sender.clone();
+                            reply.is_group = is_group;
+                            if !reply.text.is_empty() || !reply.images.is_empty() {
+                                let _ = tx.send(reply).await;
                             }
                             return;
                         }
@@ -4607,9 +4767,11 @@ fn start_wechat_personal_if_configured(
                                 peer_id: from_user.clone(),
                                 dm_scope,
                             });
-                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
-                                if !local_reply.is_empty() {
-                                    let _ = tx.send(OutboundMessage { target_id: from_user.clone(), is_group: false, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                                reply.target_id = from_user.clone();
+                                reply.is_group = false;
+                                if !reply.text.is_empty() || !reply.images.is_empty() {
+                                    let _ = tx.send(reply).await;
                                 }
                                 return;
                             }
@@ -5129,9 +5291,11 @@ fn start_feishu_if_configured(
                                 peer_id: sender_id.clone(),
                                 dm_scope,
                             });
-                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
-                                if !local_reply.is_empty() {
-                                    let _ = tx.send(OutboundMessage { target_id: chat_id.clone(), is_group, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                                reply.target_id = chat_id.clone();
+                                reply.is_group = is_group;
+                                if !reply.text.is_empty() || !reply.images.is_empty() {
+                                    let _ = tx.send(reply).await;
                                 }
                                 return;
                             }
@@ -5623,10 +5787,11 @@ fn start_dingtalk_if_configured(
                                 peer_id: sender_id.clone(),
                                 dm_scope,
                             });
-                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
-                                if !local_reply.is_empty() {
-                                    let dt_target = if is_group { conversation_id.clone() } else { sender_id.clone() };
-                                    let _ = tx.send(OutboundMessage { target_id: dt_target, is_group, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                                reply.target_id = if is_group { conversation_id.clone() } else { sender_id.clone() };
+                                reply.is_group = is_group;
+                                if !reply.text.is_empty() || !reply.images.is_empty() {
+                                    let _ = tx.send(reply).await;
                                 }
                                 return;
                             }
@@ -6137,9 +6302,11 @@ fn start_qq_if_configured(
                                 peer_id: sender_id.clone(),
                                 dm_scope,
                             });
-                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
-                                if !local_reply.is_empty() {
-                                    let _ = tx.send(OutboundMessage { target_id: target_id.clone(), is_group, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                                reply.target_id = target_id.clone();
+                                reply.is_group = is_group;
+                                if !reply.text.is_empty() || !reply.images.is_empty() {
+                                    let _ = tx.send(reply).await;
                                 }
                                 return;
                             }
@@ -6585,9 +6752,11 @@ fn start_matrix_if_configured(
                                 peer_id: sender.clone(),
                                 dm_scope,
                             });
-                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
-                                if !local_reply.is_empty() {
-                                    let _ = tx.send(OutboundMessage { target_id: room_id.clone(), is_group, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                                reply.target_id = room_id.clone();
+                                reply.is_group = is_group;
+                                if !reply.text.is_empty() || !reply.images.is_empty() {
+                                    let _ = tx.send(reply).await;
                                 }
                                 return;
                             }
@@ -7000,10 +7169,11 @@ fn start_wecom_if_configured(
                                 peer_id: from.clone(),
                                 dm_scope,
                             });
-                            if let Some(local_reply) = try_preparse_locally(&text, &handle).await {
-                                if !local_reply.is_empty() {
-                                    let wc_target = if is_group { chat_id.clone() } else { from.clone() };
-                                    let _ = tx.send(OutboundMessage { target_id: wc_target, is_group, text: local_reply, reply_to: None, images: vec![], files: vec![], channel: None }).await;
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                                reply.target_id = if is_group { chat_id.clone() } else { from.clone() };
+                                reply.is_group = is_group;
+                                if !reply.text.is_empty() || !reply.images.is_empty() {
+                                    let _ = tx.send(reply).await;
                                 }
                                 return;
                             }

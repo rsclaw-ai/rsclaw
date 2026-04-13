@@ -105,7 +105,7 @@ impl AcpCallbackHandler for DefaultAcpHandler {
                 opt.kind,
                 PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways
             ) {
-                tracing::info!(
+                tracing::debug!(
                     option_id = %opt.option_id,
                     kind = ?opt.kind,
                     "handle_request_permission: auto-approving"
@@ -116,7 +116,7 @@ impl AcpCallbackHandler for DefaultAcpHandler {
             }
             // Also approve if option_id contains "allow" or "accept" (fallback for non-standard formats)
             if opt.option_id.contains("allow") || opt.option_id.contains("accept") {
-                tracing::info!(
+                tracing::debug!(
                     option_id = %opt.option_id,
                     "handle_request_permission: auto-approving by option_id pattern"
                 );
@@ -242,7 +242,7 @@ impl AcpCallbackHandler for DefaultAcpHandlerWithTerminal {
                 opt.kind,
                 PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways
             ) {
-                tracing::info!(
+                tracing::debug!(
                     option_id = %opt.option_id,
                     kind = ?opt.kind,
                     "handle_request_permission: auto-approving"
@@ -253,7 +253,7 @@ impl AcpCallbackHandler for DefaultAcpHandlerWithTerminal {
             }
             // Also approve if option_id contains "allow" or "accept" (fallback for non-standard formats)
             if opt.option_id.contains("allow") || opt.option_id.contains("accept") {
-                tracing::info!(
+                tracing::debug!(
                     option_id = %opt.option_id,
                     "handle_request_permission: auto-approving by option_id pattern"
                 );
@@ -691,7 +691,7 @@ impl AcpClient {
             }
         });
         let resp = self.rpc(methods::INITIALIZE, params).await?;
-        tracing::info!(response = ?resp, "ACP initialize response");
+        tracing::debug!(response = ?resp, "ACP initialize response");
         let result = resp
             .get("result")
             .cloned()
@@ -714,7 +714,7 @@ impl AcpClient {
         model: Option<&str>,
         mcp_servers: Option<Vec<McpServerConfig>>,
     ) -> Result<NewSessionResponse> {
-        tracing::info!(
+        tracing::debug!(
             cwd = %cwd,
             model = ?model,
             "create_session: called with params"
@@ -726,13 +726,13 @@ impl AcpClient {
 
         if let Some(m) = model {
             params["modelId"] = serde_json::json!(m);
-            tracing::info!(model = %m, params = ?params, "Adding modelId to session/new request");
+            tracing::debug!(model = %m, params = ?params, "Adding modelId to session/new request");
         } else {
             tracing::warn!("create_session: no model provided, will use agent default");
         }
 
         let resp = self.rpc(methods::SESSION_NEW, params).await?;
-        tracing::info!(response = ?resp, "ACP session/new response");
+        tracing::debug!(response = ?resp, "ACP session/new response");
         let result = resp
             .get("result")
             .cloned()
@@ -746,12 +746,12 @@ impl AcpClient {
         state.models = session_resp.models.clone();
 
         if let Some(ref models) = session_resp.models {
-            tracing::info!("Available models: {:?}", models.available_models);
+            tracing::debug!("Available models: {:?}", models.available_models);
         }
         if let Some(ref opts) = session_resp.config_options {
-            tracing::info!("Config options available: {}", opts.len());
+            tracing::debug!("Config options available: {}", opts.len());
             for opt in opts {
-                tracing::info!(
+                tracing::debug!(
                     "  - {}: {} (current: {})",
                     opt.id,
                     opt.name,
@@ -807,16 +807,15 @@ impl AcpClient {
                     || e.to_string().contains("Subprocess task died")
                     || e.to_string().contains("Channel closed")
                 {
-                    anyhow::anyhow!(
-                        "OpenCode 执行超时或进程异常退出。请检查 OpenCode 是否正常运行后重试。"
-                    )
+                    let lang = crate::i18n::default_lang();
+                    anyhow::anyhow!("{}", crate::i18n::t_fmt("acp_timeout", lang, &[("name", "OpenCode")]))
                 } else {
                     e
                 }
             })?;
 
-        tracing::info!("=== send_prompt raw response ===");
-        tracing::info!(
+        tracing::debug!("=== send_prompt raw response ===");
+        tracing::debug!(
             "Full response: {}",
             serde_json::to_string(&resp).unwrap_or_default()
         );
@@ -826,8 +825,8 @@ impl AcpClient {
             .cloned()
             .unwrap_or(serde_json::Value::Null);
 
-        tracing::info!("=== send_prompt result ===");
-        tracing::info!(
+        tracing::debug!("=== send_prompt result ===");
+        tracing::debug!(
             "Result: {}",
             serde_json::to_string(&result).unwrap_or_default()
         );
@@ -835,31 +834,31 @@ impl AcpClient {
         let prompt_resp: PromptResponse =
             serde_json::from_value(result.clone()).context("Failed to parse prompt response")?;
 
-        tracing::info!("=== send_prompt parsed ===");
-        tracing::info!("stop_reason: {:?}", prompt_resp.stop_reason);
-        tracing::info!("usage: {:?}", prompt_resp.usage);
+        tracing::debug!("=== send_prompt parsed ===");
+        tracing::debug!("stop_reason: {:?}", prompt_resp.stop_reason);
+        tracing::debug!("usage: {:?}", prompt_resp.usage);
         if let Some(ref r) = prompt_resp.result {
-            tracing::info!("content blocks: {}", r.content.len());
+            tracing::debug!("content blocks: {}", r.content.len());
             for (i, block) in r.content.iter().enumerate() {
                 match block {
                     crate::acp::types::ContentBlock::Text { text } => {
-                        tracing::info!("  [{}] Text: {}", i, text);
+                        tracing::debug!("  [{}] Text: {}", i, text);
                     }
                     crate::acp::types::ContentBlock::Image { .. } => {
-                        tracing::info!("  [{}] Image", i);
+                        tracing::debug!("  [{}] Image", i);
                     }
                     crate::acp::types::ContentBlock::Resource { .. } => {
-                        tracing::info!("  [{}] Resource", i);
+                        tracing::debug!("  [{}] Resource", i);
                     }
                     crate::acp::types::ContentBlock::ResourceLink { .. } => {
-                        tracing::info!("  [{}] ResourceLink", i);
+                        tracing::debug!("  [{}] ResourceLink", i);
                     }
                 }
             }
             if let Some(ref calls) = r.tool_calls {
-                tracing::info!("tool_calls: {} calls", calls.len());
+                tracing::debug!("tool_calls: {} calls", calls.len());
                 for (i, call) in calls.iter().enumerate() {
-                    tracing::info!("  [{}] tool_call: id={}, name={}", i, call.id, call.name);
+                    tracing::debug!("  [{}] tool_call: id={}, name={}", i, call.id, call.name);
                 }
             }
         }
@@ -932,9 +931,9 @@ impl AcpClient {
             "configId": "model",
             "value": model_id
         });
-        tracing::info!(model_id = %model_id, "Calling session/set_config_option");
+        tracing::debug!(model_id = %model_id, "Calling session/set_config_option");
         let resp = self.rpc(methods::SESSION_SET_CONFIG_OPTION, params).await?;
-        tracing::info!(response = ?resp, "set_model response");
+        tracing::debug!(response = ?resp, "set_model response");
 
         let result = resp
             .get("result")
@@ -1019,7 +1018,7 @@ impl AcpClient {
             "params": params
         }))?;
 
-        tracing::info!(method, id, request = %request, "ACP sending request");
+        tracing::debug!(method, id, request = %request, "ACP sending request");
 
         tx.send(SubprocessCmd::SendRequest {
             request,
@@ -1063,7 +1062,7 @@ impl AcpClient {
             "params": params
         }))?;
 
-        tracing::info!(method, id, request = %request, "ACP sending request (no timeout)");
+        tracing::debug!(method, id, request = %request, "ACP sending request (no timeout)");
 
         tx.send(SubprocessCmd::SendRequest {
             request,
@@ -1187,9 +1186,9 @@ async fn run_subprocess(
 
                                                 // Log all incoming messages with method field at INFO level
                                                 if let Some(method) = method_field {
-                                                    tracing::info!("ACP incoming method: {} | msg: {}", method, line);
+                                                    tracing::debug!("ACP incoming method: {} | msg: {}", method, line);
                                                 } else if msg.get("id").is_some() {
-                                                    tracing::info!("ACP response: {}", line);
+                                                    tracing::debug!("ACP response: {}", line);
                                                 } else {
                                                     tracing::debug!("ACP message: {}", line);
                                                 }
@@ -1202,7 +1201,7 @@ async fn run_subprocess(
 
                                                 // Handle Agent → Client requests
                                                 if let Some(method) = method_field {
-                                                    tracing::info!("Handling agent request: {}", method);
+                                                    tracing::debug!("Handling agent request: {}", method);
                                                     if handle_agent_request(&mut stdin, &msg, method, &handler).await {
                                                         continue;
                                                     }
@@ -1264,11 +1263,11 @@ async fn handle_session_update(
 
         match session_update {
             Some("plan") => {
-                tracing::info!("ACP plan received");
+                tracing::debug!("ACP plan received");
                 if let Some(entries) = update.get("entries").and_then(|e| e.as_array()) {
                     for entry in entries {
                         if let Some(content) = entry.get("content").and_then(|c| c.as_str()) {
-                            tracing::info!("Plan entry: {}", content);
+                            tracing::debug!("Plan entry: {}", content);
                         }
                     }
                 }
@@ -1314,7 +1313,7 @@ async fn handle_session_update(
                 let kind = parse_tool_kind(update.get("kind").and_then(|k| k.as_str()));
                 let status = update.get("status").and_then(|s| s.as_str());
 
-                tracing::info!(
+                tracing::debug!(
                     "ACP tool_call: {} - {:?} ({:?})",
                     tool_call_id,
                     title,
@@ -1328,10 +1327,11 @@ async fn handle_session_update(
                             title: title.clone(),
                             kind: kind.clone(),
                         });
+                        let _lang = crate::i18n::default_lang();
                         let notif = Notification::new(
                             NotificationPriority::Medium,
-                            "工具开始",
-                            &format!("执行工具: {}", title.clone().unwrap_or_default()),
+                            &crate::i18n::t("acp_tool_start", _lang),
+                            &crate::i18n::t_fmt("acp_tool_executing", _lang, &[("title", title.as_deref().unwrap_or(""))]),
                         );
                         if let Ok(nm) = notification_manager.try_lock() {
                             nm.send(&notif.with_session_id(session_id.clone().unwrap_or_default()))
@@ -1351,10 +1351,11 @@ async fn handle_session_update(
                             tool_call_id: tool_call_id.clone(),
                             result: result.clone(),
                         });
+                        let _lang = crate::i18n::default_lang();
                         let notif = Notification::new(
                             NotificationPriority::Medium,
-                            "工具完成",
-                            &format!("工具执行完成: {}", title.clone().unwrap_or_default()),
+                            &crate::i18n::t("acp_tool_done", _lang),
+                            &crate::i18n::t_fmt("acp_tool_completed", _lang, &[("title", title.as_deref().unwrap_or(""))]),
                         );
                         if let Ok(nm) = notification_manager.try_lock() {
                             nm.send(&notif.with_session_id(session_id.clone().unwrap_or_default()))
@@ -1371,14 +1372,14 @@ async fn handle_session_update(
                             tool_call_id: tool_call_id.clone(),
                             error: error.clone(),
                         });
+                        let _lang = crate::i18n::default_lang();
                         let notif = Notification::new(
                             NotificationPriority::High,
-                            "工具失败",
-                            &format!(
-                                "工具执行失败: {} - {}",
-                                title.clone().unwrap_or_default(),
-                                error
-                            ),
+                            &crate::i18n::t("acp_tool_failed", _lang),
+                            &crate::i18n::t_fmt("acp_tool_error", _lang, &[
+                                ("title", title.as_deref().unwrap_or("")),
+                                ("error", &error),
+                            ]),
                         )
                         .with_burn_after_read();
                         if let Ok(nm) = notification_manager.try_lock() {
@@ -1391,7 +1392,7 @@ async fn handle_session_update(
             }
             Some("mode_change") => {
                 if let Some(mode_id) = update.get("modeId").and_then(|m| m.as_str()) {
-                    tracing::info!("ACP mode_change: {}", mode_id);
+                    tracing::debug!("ACP mode_change: {}", mode_id);
                     let _ = event_tx.send(SessionEvent::ModeChanged {
                         mode_id: mode_id.to_string(),
                     });
@@ -1421,14 +1422,14 @@ async fn handle_session_update(
                     title: title.clone(),
                     updated_at: updated_at.clone(),
                 });
+                let _lang = crate::i18n::default_lang();
                 let notif = Notification::new(
                     NotificationPriority::High,
-                    "会话已创建",
-                    &format!(
-                        "Session ID: {}\n标题: {}",
-                        session_id.clone().unwrap_or_default(),
-                        title.clone().unwrap_or_default()
-                    ),
+                    &crate::i18n::t("acp_session_created", _lang),
+                    &crate::i18n::t_fmt("acp_session_info", _lang, &[
+                        ("id", session_id.as_deref().unwrap_or("")),
+                        ("title", title.as_deref().unwrap_or("")),
+                    ]),
                 )
                 .with_burn_after_read();
                 if let Ok(nm) = notification_manager.try_lock() {
@@ -1649,7 +1650,7 @@ async fn handle_agent_request(
         };
 
         let response_str = serde_json::to_string(&response).unwrap_or_default();
-        tracing::info!("ACP response to agent: {}", response_str);
+        tracing::debug!("ACP response to agent: {}", response_str);
 
         let mut combined = response_str.as_bytes().to_vec();
         combined.push(b'\n');
@@ -1663,7 +1664,7 @@ async fn handle_agent_request(
             tracing::error!("ACP response flush failed: {}", e);
         }
 
-        tracing::info!("ACP response sent successfully for method {}", method);
+        tracing::debug!("ACP response sent successfully for method {}", method);
     }
 
     true

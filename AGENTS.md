@@ -116,6 +116,55 @@ Role files live in `.claude/roles/`. Activate with: `cp .claude/roles/<role>.md 
 
 ## Key Patterns
 
+### i18n (Internationalisation)
+
+All user-facing strings sent through channels (Telegram, Discord, WeChat, etc.) **must** go through `src/i18n.rs`. CLI output, log messages, and internal errors stay in English.
+
+**Adding a new message key**
+
+```
+1. Open src/i18n.rs
+2. Add a msg!() block inside the MESSAGES LazyLock initialiser (before `m`):
+
+   msg!("my_key",
+       "en" => "English text",        // required
+       "zh" => "中文文本",              // required
+       "th" => "ข้อความภาษาไทย",
+       "vi" => "Van ban tieng Viet",
+       "ja" => "日本語テキスト",
+       "es" => "Texto en español",
+       "ko" => "한국어 텍스트",
+       "ru" => "Русский текст",
+       "fr" => "Texte français",
+       "de" => "Deutscher Text",
+   );
+
+3. Use in Rust:
+   - Static:      crate::i18n::t("my_key", lang)
+   - With params: crate::i18n::t_fmt("my_key", lang, &[("param", value)])
+   - Params in template strings use {param} syntax.
+
+4. Get `lang` from config inside run_turn (already set as i18n_lang),
+   or derive inline for tool handlers:
+       let lang = self.config.raw.gateway.as_ref()
+           .and_then(|g| g.language.as_deref())
+           .map(crate::i18n::resolve_lang)
+           .unwrap_or("en");
+   For notification-only code outside a turn (e.g. background spawns), capture
+   lang_bg = lang before tokio::spawn and move it into the closure.
+```
+
+**Rules**
+
+- Supported languages: `en`, `zh`, `th`, `vi`, `ja`, `es`, `ko`, `ru`, `fr`, `de` (10 total; `json` is debug-only).
+- Minimum required per key: `en` + `zh`. Add the rest as available.
+- Keys are snake_case, grouped by feature (prefix: `acp_`, `cli_`, etc.).
+- Desktop/system Notification strings use `crate::i18n::default_lang()`.
+- Never hardcode Chinese (or any non-English) text outside i18n.rs.
+- Review gate: `[BLOCK]` if user-facing string is hardcoded in channel code.
+
+---
+
 ### New Channel
 
 ```

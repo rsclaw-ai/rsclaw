@@ -48,6 +48,8 @@ pub struct AgentHandle {
     pub started_at: Instant,
     /// Number of active sessions (updated after each turn for /status).
     pub session_count: Arc<AtomicUsize>,
+    /// Context tokens of the most recent turn (updated by runtime for /status).
+    pub last_ctx_tokens: Arc<AtomicUsize>,
 }
 
 /// An image attachment sent by the user.
@@ -124,6 +126,10 @@ pub struct AgentReply {
     /// If set, the worker should send a follow-up LLM analysis after the
     /// immediate reply.
     pub pending_analysis: Option<PendingAnalysis>,
+    /// True when the reply was produced by the preparse engine (not LLM).
+    /// The outer agent loop uses this to decide whether to emit to event_bus,
+    /// since agent_loop already emits for LLM turns.
+    pub was_preparse: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +232,7 @@ impl AgentRegistry {
                     abort_flags: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     started_at: Instant::now(),
                     session_count: Arc::new(AtomicUsize::new(0)),
+                    last_ctx_tokens: Arc::new(AtomicUsize::new(0)),
                 });
                 inner.agents.insert(entry.id.clone(), handle);
                 receivers.insert(entry.id.clone(), rx);
