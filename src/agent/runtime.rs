@@ -8064,6 +8064,8 @@ fn format_tool_result(val: &serde_json::Value) -> String {
         for (i, r) in results.iter().enumerate() {
             let title = r
                 .get("title")
+                .or_else(|| r.get("summary"))
+                .or_else(|| r.get("content"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("(no title)");
             let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
