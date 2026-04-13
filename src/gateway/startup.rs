@@ -55,6 +55,14 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let data_dir = base_dir.join("var/data");
     std::fs::create_dir_all(&data_dir).context("create data dir")?;
 
+    // 1b. Seed tool prompts if not present.
+    {
+        let lang = config.raw.gateway.as_ref().and_then(|g| g.language.as_deref());
+        if let Err(e) = crate::agent::bootstrap::seed_tools(&base_dir, lang) {
+            warn!("failed to seed tool prompts: {e:#}");
+        }
+    }
+
     // 2. Open store. If the database is locked by another instance, exit cleanly
     //    so systemd won't keep restarting.
     let store = match Store::open(&data_dir, tier) {
