@@ -1229,12 +1229,8 @@ pub async fn read_jobs_from_file(cron_dir: PathBuf) -> Result<Vec<CronJob>> {
 /// Returns the cron store file path.
 /// Respects RSCLAW_BASE_DIR env var (same as other rsclaw data).
 pub fn resolve_cron_store_path() -> PathBuf {
-    let cron_dir = if let Some(state_dir) = std::env::var_os("OPENCLAW_STATE_DIR") {
-        PathBuf::from(state_dir)
-    } else {
-        dirs_next::home_dir().unwrap_or_default().join(".openclaw")
-    };
-    cron_dir.join("cron").join("jobs.json")
+    let base = crate::config::loader::base_dir();
+    base.join("cron").join("jobs.json")
 }
 
 /// Load cron jobs from the cron store file (openclaw-compatible path).

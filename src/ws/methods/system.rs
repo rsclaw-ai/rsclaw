@@ -3,7 +3,6 @@ use crate::ws::{
     types::ErrorShape,
 };
 use tracing::warn;
-use std::path::PathBuf;
 
 pub async fn health(ctx: MethodCtx) -> MethodResult {
     let uptime = ctx.state.started_at.elapsed();
@@ -365,12 +364,7 @@ pub async fn cron_runs(ctx: MethodCtx) -> MethodResult {
         .and_then(|v| v.as_u64())
         .unwrap_or(50) as usize;
 
-    // Openclaw-compatible path for cron run logs (respects OPENCLAW_STATE_DIR).
-    let data_dir = if let Some(state_dir) = std::env::var_os("OPENCLAW_STATE_DIR") {
-        PathBuf::from(state_dir)
-    } else {
-        dirs_next::home_dir().unwrap_or_default().join(".openclaw")
-    }.join("var/data/cron");
+    let data_dir = crate::config::loader::base_dir().join("var/data/cron");
     let mut runs: Vec<crate::cron::RunLogEntry> = Vec::new();
 
     if data_dir.exists() {

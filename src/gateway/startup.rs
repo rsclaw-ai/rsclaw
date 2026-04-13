@@ -3,7 +3,7 @@
 //! Wires together: config, store, providers, agent runtimes, channels,
 //! cron scheduler, and HTTP server into a running gateway.
 
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use futures::StreamExt as _;
@@ -403,12 +403,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         }
 
         if cron_enabled {
-            // Use openclaw-compatible path for cron run logs (respects OPENCLAW_STATE_DIR)
-            let cron_data_dir = if let Some(state_dir) = std::env::var_os("OPENCLAW_STATE_DIR") {
-                PathBuf::from(state_dir)
-            } else {
-                dirs_next::home_dir().unwrap_or_default().join(".openclaw")
-            }.join("var").join("data");
+            let cron_data_dir = base_dir.join("var").join("data");
             let runner = CronRunner::new(
                 &cron_cfg,
                 jobs,

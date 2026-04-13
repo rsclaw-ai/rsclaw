@@ -20,7 +20,7 @@ pub mod spawner;
 pub mod tool_call_repair;
 pub mod workspace;
 
-pub use bootstrap::{seed_workspace, seed_workspace_with_lang};
+pub use bootstrap::{seed_tools, seed_workspace, seed_workspace_with_lang};
 pub use collaboration::CollabMode;
 pub use loop_detection::LoopDetector;
 pub use memory::{MemoryDoc, MemoryStore};

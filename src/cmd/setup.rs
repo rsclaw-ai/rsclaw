@@ -737,6 +737,13 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         );
     }
 
+    // Seed tool prompts.
+    if let Ok(n) = agent::seed_tools(&base, ws_lang) {
+        if n > 0 {
+            step("+", &format!("Seeded {n} tool prompt(s) in {}/tools/", base.display()));
+        }
+    }
+
     // Language is already written into the config template via default_config(lang).
     step("+", &crate::i18n::t_fmt("cli_gateway_language_set", lang, &[("lang", lang_code_to_name(lang))]));
 
