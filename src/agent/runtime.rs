@@ -2310,6 +2310,13 @@ impl AgentRuntime {
         // Build system prompt.
         let mut system_prompt = build_system_prompt(&ws_ctx, &self.skills, &self.config.raw);
 
+        // DEBUG: dump full system prompt to file for inspection
+        if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
+            let dump_path = crate::config::loader::base_dir().join("debug_system_prompt.txt");
+            let _ = std::fs::write(&dump_path, &system_prompt);
+            tracing::info!(path = %dump_path.display(), len = system_prompt.len(), "dumped system prompt");
+        }
+
         // Auto-Recall (AGENTS.md §31): hybrid vector+BM25 recall before prompt.
         if let Some(ref mem) = self.memory
             && !text.trim().is_empty()
@@ -9095,23 +9102,22 @@ fn build_system_prompt(
         parts.push(ws_segment);
     }
 
-    // Available skills — list only (name + description).
-    // Full skill prompts are injected on-demand per-turn via match_skills().
+    // Available skills — name + short description. Full prompts injected on-demand.
     if !skills.is_empty() {
-        let skill_xml: String = skills
+        let lines: Vec<_> = skills
             .all()
             .map(|s| {
-                format!(
-                    "  <skill name=\"{}\">{}</skill>",
-                    s.name,
-                    s.description.as_deref().unwrap_or("")
-                )
+                let desc = s.description.as_deref().unwrap_or("");
+                // Truncate description to first sentence or 60 chars
+                let short = desc.find('。').or_else(|| desc.find(". "))
+                    .map(|i| &desc[..i+1])
+                    .unwrap_or_else(|| if desc.len() > 60 { &desc[..60] } else { desc });
+                format!("- {}: {}", s.name, short)
             })
-            .collect::<Vec<_>>()
-            .join("\n");
-        parts.push(format!(
-            "<available_skills>\n{skill_xml}\n</available_skills>"
-        ));
+            .collect();
+        if !lines.is_empty() {
+            parts.push(format!("Available skills:\n{}", lines.join("\n")));
+        }
     }
 
     parts.join("\n\n")
