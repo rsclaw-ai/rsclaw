@@ -192,6 +192,8 @@ pub struct RunContext {
     pub session_key: String,
     pub channel: String,
     pub peer_id: String,
+    /// Chat/conversation ID for sending intermediate progress messages.
+    pub chat_id: String,
     pub loop_detector: LoopDetector,
     /// Whether the current turn includes images.
     pub has_images: bool,
@@ -1899,6 +1901,7 @@ impl AgentRuntime {
                             session_key: session_key.to_owned(),
                             channel: channel.to_owned(),
                             peer_id: peer_id.to_owned(),
+                            chat_id: String::new(),
                             loop_detector: crate::agent::loop_detection::LoopDetector::default(),
                             has_images: false,
                             user_msg_with_images: None,
@@ -2610,6 +2613,7 @@ impl AgentRuntime {
             session_key: session_key.to_owned(),
             channel: channel.to_owned(),
             peer_id: peer_id.to_owned(),
+            chat_id: String::new(),
             loop_detector: {
                 let ld_cfg = self
                     .config
@@ -3382,6 +3386,24 @@ impl AgentRuntime {
                     pending_analysis: None,
                     was_preparse: false,
                 });
+            }
+
+            // Send intermediate text to user immediately (progress feedback).
+            // Model often says "好的，我来帮你搜索" before calling tools — send it now
+            // instead of waiting for the entire turn to complete.
+            if !text_buf.is_empty() && !tool_calls.is_empty() {
+                if let Some(ref ntx) = self.notification_tx {
+                    let _ = ntx.send(crate::channel::OutboundMessage {
+                        target_id: String::new(),
+                        is_group: false,
+                        text: text_buf.clone(),
+                        reply_to: None,
+                        images: vec![],
+                        files: vec![],
+                        channel: Some(ctx.channel.clone()),
+                    });
+                    tracing::debug!(text_len = text_buf.len(), "agent_loop: sent intermediate text to user");
+                }
             }
 
             // Push assistant message with tool_calls as Parts.
