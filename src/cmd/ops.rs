@@ -199,6 +199,12 @@ pub async fn cmd_status(args: StatusArgs) -> Result<()> {
                 kv("Config:", &red(&format!("error \u{2014} {e:#}")));
             }
         }
+
+        // Tools
+        let (avail, total) = super::tools::tools_count();
+        let summary = super::tools::tools_summary_line();
+        kv("Tools:", &format!("{}/{} — {}", avail, total, summary));
+
         println!();
     }
     Ok(())

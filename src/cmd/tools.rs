@@ -94,6 +94,33 @@ fn tool_status(def: &ToolDef) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Public: tools summary for `rsclaw status`
+// ---------------------------------------------------------------------------
+
+/// Returns a one-line tools summary, e.g. "chromium ✓  ffmpeg ✓  node ✓  python ✓  sherpa-onnx ✗"
+pub fn tools_summary_line() -> String {
+    TOOLS
+        .iter()
+        .map(|def| {
+            let icon = if tool_status(def) == "missing" { "✗" } else { "✓" };
+            format!("{} {}", def.name, icon)
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+/// Returns count of (available, total) tools
+pub fn tools_count() -> (usize, usize) {
+    let available = TOOLS.iter().filter(|d| tool_status(d) != "missing").count();
+    (available, TOOLS.len())
+}
+
+/// Returns names of missing tools
+pub fn tools_missing() -> Vec<&'static str> {
+    TOOLS.iter().filter(|d| tool_status(d) == "missing").map(|d| d.name).collect()
+}
+
+// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
@@ -348,6 +375,8 @@ async fn download_and_extract(
     url: &str,
     dest: &std::path::Path,
 ) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
     let resp = client
         .get(url)
         .timeout(std::time::Duration::from_secs(600))
@@ -355,30 +384,48 @@ async fn download_and_extract(
         .await?
         .error_for_status()?;
 
-    let bytes = resp.bytes().await?;
-    let size_mb = bytes.len() / 1_000_000;
-    println!("    Downloaded {}MB, extracting...", size_mb);
+    // Stream to temp file to avoid loading entire archive into memory
+    // (critical for 1-core/1GB machines where 500MB+ archives would OOM)
+    let tmp_dir = tempfile::tempdir()?;
+    let filename = url.rsplit('/').next().unwrap_or("download");
+    let tmp_path = tmp_dir.path().join(filename);
+
+    {
+        let mut stream = resp.bytes_stream();
+        let mut file = tokio::fs::File::create(&tmp_path).await?;
+        let mut downloaded: u64 = 0;
+        use futures::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            file.write_all(&chunk).await?;
+            downloaded += chunk.len() as u64;
+            // Progress every ~10MB
+            if downloaded % (10 * 1024 * 1024) < chunk.len() as u64 {
+                print!("\r    Downloaded {}MB...", downloaded / 1_000_000);
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+        }
+        file.flush().await?;
+        println!("\r    Downloaded {}MB, extracting...", downloaded / 1_000_000);
+    }
 
     if url.ends_with(".zip") {
-        extract_zip(&bytes, dest)?;
+        extract_zip(&tmp_path, dest)?;
     } else if url.ends_with(".tar.xz") {
-        extract_tar_xz(&bytes, dest)?;
+        extract_tar_xz(&tmp_path, dest)?;
     } else if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
-        extract_tar_gz(&bytes, dest)?;
+        extract_tar_gz(&tmp_path, dest)?;
     } else {
-        // Unknown format — just save the raw file
-        let filename = url.rsplit('/').next().unwrap_or("download");
-        std::fs::write(dest.join(filename), &bytes)?;
+        // Unknown format — move the raw file
+        std::fs::rename(&tmp_path, dest.join(filename))?;
     }
 
     Ok(())
 }
 
-fn extract_zip(data: &[u8], dest: &std::path::Path) -> Result<()> {
-    use std::io::{Cursor, Read};
-
-    let reader = Cursor::new(data);
-    let mut archive = zip::ZipArchive::new(reader)?;
+fn extract_zip(archive_path: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    let file = std::fs::File::open(archive_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
@@ -402,9 +449,9 @@ fn extract_zip(data: &[u8], dest: &std::path::Path) -> Result<()> {
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let mut buf = Vec::new();
-            file.read_to_end(&mut buf)?;
-            std::fs::write(&out_path, &buf)?;
+            // Stream extract: copy file-by-file instead of reading all into memory
+            let mut out_file = std::fs::File::create(&out_path)?;
+            std::io::copy(&mut file, &mut out_file)?;
 
             // Preserve executable permission on Unix
             #[cfg(unix)]
@@ -419,17 +466,17 @@ fn extract_zip(data: &[u8], dest: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn extract_tar_xz(data: &[u8], dest: &std::path::Path) -> Result<()> {
-    use std::io::Cursor;
-
-    let xz_reader = xz2::read::XzDecoder::new(Cursor::new(data));
+fn extract_tar_xz(archive_path: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    let file = std::fs::File::open(archive_path)?;
+    let buf = std::io::BufReader::new(file);
+    let xz_reader = xz2::read::XzDecoder::new(buf);
     extract_tar(xz_reader, dest)
 }
 
-fn extract_tar_gz(data: &[u8], dest: &std::path::Path) -> Result<()> {
-    use std::io::Cursor;
-
-    let gz_reader = flate2::read::GzDecoder::new(Cursor::new(data));
+fn extract_tar_gz(archive_path: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    let file = std::fs::File::open(archive_path)?;
+    let buf = std::io::BufReader::new(file);
+    let gz_reader = flate2::read::GzDecoder::new(buf);
     extract_tar(gz_reader, dest)
 }
 

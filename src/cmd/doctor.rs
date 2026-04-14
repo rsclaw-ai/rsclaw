@@ -213,6 +213,54 @@ pub async fn cmd_doctor(args: DoctorArgs) -> Result<()> {
         }
     }
 
+    // -- 6. Tools check -------------------------------------------------------
+    {
+        let (avail, total) = super::tools::tools_count();
+        let summary = super::tools::tools_summary_line();
+        if avail == total {
+            println!("  {} tools {}/{} — {}", green("[ok]"), avail, total, summary);
+            passed += 1;
+        } else {
+            let missing: Vec<&str> = super::tools::tools_missing();
+            println!("  {} tools {}/{} — {}", yellow("[warn]"), avail, total, summary);
+            issues.push(Issue::warn(format!(
+                "missing tools: {}. Install with `rsclaw tools install {}`",
+                missing.join(", "),
+                if missing.len() == 1 { missing[0].to_string() } else { "all".to_string() }
+            )));
+        }
+    }
+
+    // -- 7. Plugins check ----------------------------------------------------
+    {
+        let plugins_dir = config::loader::base_dir().join("plugins");
+        match crate::plugin::manifest::scan_plugins(&plugins_dir) {
+            Ok(plugins) if !plugins.is_empty() => {
+                let mut broken = Vec::new();
+                for p in &plugins {
+                    if !which::which(&p.runtime).is_ok() {
+                        broken.push(format!("{} (runtime `{}` not found)", p.name, p.runtime));
+                    }
+                }
+                if broken.is_empty() {
+                    println!("  {} {} plugin(s) OK", green("[ok]"), plugins.len());
+                    passed += 1;
+                } else {
+                    println!("  {} {} plugin(s), {} broken", yellow("[warn]"), plugins.len(), broken.len());
+                    for b in &broken {
+                        issues.push(Issue::warn(format!("plugin {b}")));
+                    }
+                }
+            }
+            Ok(_) => {
+                println!("  {} no plugins installed", dim("[--]"));
+            }
+            Err(_) => {
+                println!("  {} plugins directory not accessible", dim("[--]"));
+            }
+        }
+    }
+
     // -- Summary & apply fixes ------------------------------------------------
     let fixable_count = issues.iter().filter(|i| i.fix_fn.is_some()).count();
     let issue_count = issues.len();

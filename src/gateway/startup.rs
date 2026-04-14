@@ -104,19 +104,22 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         broadcast::channel::<crate::channel::OutboundMessage>(64);
 
     // 6. Open shared memory store.
-    // Auto-detect embedding model: prefer bge-small-zh, fallback to bge-small-en.
-    // Auto-download if neither exists.
+    // Auto-detect embedding model: prefer higher-quality models first.
+    // Priority: bge-base-zh > bge-small-zh > bge-small-en > auto-download small-zh.
     let search_cfg = config.raw.memory_search.as_ref();
     let model_dir = {
+        let base_zh = base_dir.join("models/bge-base-zh");
         let zh = base_dir.join("models/bge-small-zh");
         let en = base_dir.join("models/bge-small-en");
-        if zh.join("config.json").exists() {
+        if base_zh.join("config.json").exists() {
+            base_zh
+        } else if zh.join("config.json").exists() {
             zh
         } else if en.join("config.json").exists() {
             en
         } else {
             // Auto-download BGE model in background (don't block startup).
-            let target_dir = zh; // default to zh
+            let target_dir = zh; // default to small-zh
             let cfg_lang = config.raw.gateway.as_ref().and_then(|g| g.language.as_deref()).map(str::to_owned);
             let i18n_lang = crate::i18n::resolve_lang(cfg_lang.as_deref().unwrap_or("en")).to_owned();
             let search_cfg_clone = search_cfg.cloned();
