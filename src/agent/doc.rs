@@ -7,6 +7,7 @@
 //!   - create_ppt   (.pptx) via zip + OOXML templates
 //!   - edit_excel   (.xlsx) read existing + merge changes via calamine + rust_xlsxwriter
 //!   - edit_word    (.docx) read existing + append/replace via zip XML manipulation
+//!   - edit_pdf     (.pdf)  replace text / delete pages via lopdf
 //!   - read_doc     (.xlsx/.docx/.pdf) extract text content for inspection
 
 use std::path::Path;
@@ -35,6 +36,7 @@ pub async fn handle(args: &Value, full_path: &Path) -> Result<Value> {
         "create_ppt" => create_ppt(&args, &path),
         "edit_excel" => edit_excel(&args, &path),
         "edit_word" => edit_word(&args, &path),
+        "edit_pdf" => edit_pdf(&args, &path),
         "read_doc" => read_doc(&path),
         other => Ok(json!({"error": format!("doc: unknown action '{other}'")})),
     })
@@ -702,6 +704,174 @@ fn edit_word(args: &Value, path: &Path) -> Result<Value> {
         "path": path.display().to_string(),
         "format": "docx",
         "mode": "append",
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Edit PDF (.pdf) — replace text / delete pages via lopdf
+// ---------------------------------------------------------------------------
+
+fn edit_pdf(args: &Value, path: &Path) -> Result<Value> {
+    use lopdf::{Document, Object};
+
+    let replacements = args["replacements"].as_array();
+    let delete_pages = args["delete_pages"].as_array();
+    let append_content = args["content"].as_str();
+
+    if replacements.is_none() && delete_pages.is_none() && append_content.is_none() {
+        return Err(anyhow!(
+            "edit_pdf: at least one of `replacements`, `delete_pages`, or `content` (append_page) is required"
+        ));
+    }
+
+    let mut doc = Document::load(path)
+        .map_err(|e| anyhow!("edit_pdf: cannot open '{}': {e}", path.display()))?;
+
+    let mut actions_done = Vec::new();
+
+    // --- replace_text: find/replace in page content streams ---
+    if let Some(replacements) = replacements {
+        let mut total_replaced = 0usize;
+        let page_ids: Vec<_> = doc.page_iter().collect();
+
+        // Collect (stream_object_ids, modified_content) pairs first to avoid borrow conflicts.
+        let mut updates: Vec<(Vec<lopdf::ObjectId>, Vec<u8>)> = Vec::new();
+
+        for page_id in &page_ids {
+            if let Ok(content) = doc.get_page_content(*page_id) {
+                let content_str = String::from_utf8_lossy(&content).to_string();
+                let mut modified = content_str.clone();
+
+                for r in replacements {
+                    let find = r["find"].as_str().unwrap_or("");
+                    let replace = r["replace"].as_str().unwrap_or("");
+                    if find.is_empty() {
+                        continue;
+                    }
+                    let count = modified.matches(find).count();
+                    if count > 0 {
+                        modified = modified.replace(find, replace);
+                        total_replaced += count;
+                    }
+                }
+
+                if modified != content_str {
+                    // Collect the stream object IDs from the page's Contents entry.
+                    let mut stream_ids = Vec::new();
+                    if let Ok(page_obj) = doc.get_object(*page_id) {
+                        if let Object::Dictionary(ref dict) = *page_obj {
+                            if let Ok(contents_ref) = dict.get(b"Contents") {
+                                match contents_ref {
+                                    Object::Reference(obj_id) => {
+                                        stream_ids.push(*obj_id);
+                                    }
+                                    Object::Array(arr) => {
+                                        for obj_ref in arr {
+                                            if let Object::Reference(oid) = obj_ref {
+                                                stream_ids.push(*oid);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    if !stream_ids.is_empty() {
+                        updates.push((stream_ids, modified.into_bytes()));
+                    }
+                }
+            }
+        }
+
+        // Now apply updates with mutable borrows.
+        for (stream_ids, new_content) in updates {
+            // Put all content in the first stream, clear the rest.
+            for (i, oid) in stream_ids.iter().enumerate() {
+                if let Ok(stream_obj) = doc.get_object_mut(*oid) {
+                    if let Object::Stream(ref mut stream) = *stream_obj {
+                        if i == 0 {
+                            stream.set_plain_content(new_content.clone());
+                        } else {
+                            stream.set_plain_content(Vec::new());
+                        }
+                    }
+                }
+            }
+        }
+
+        actions_done.push(json!({
+            "action": "replace_text",
+            "replacements_applied": total_replaced,
+            "note": "Text replacement works on raw PDF content streams. It may not work for text that is split across multiple TJ/Tj operators or uses font encoding."
+        }));
+    }
+
+    // --- delete_pages: remove pages by 1-indexed page numbers ---
+    if let Some(pages_to_delete) = delete_pages {
+        let mut page_numbers: Vec<u32> = pages_to_delete
+            .iter()
+            .filter_map(|v| v.as_u64().map(|n| n as u32))
+            .collect();
+        // Sort descending so we delete from the back first (indices stay valid).
+        page_numbers.sort_unstable();
+        page_numbers.dedup();
+
+        let total_pages = doc.get_pages().len() as u32;
+        let valid: Vec<u32> = page_numbers
+            .iter()
+            .copied()
+            .filter(|&p| p >= 1 && p <= total_pages)
+            .collect();
+
+        if !valid.is_empty() {
+            doc.delete_pages(&valid);
+        }
+
+        actions_done.push(json!({
+            "action": "delete_pages",
+            "deleted": valid,
+            "total_pages_before": total_pages,
+            "total_pages_after": total_pages as i64 - valid.len() as i64,
+        }));
+    }
+
+    // --- append_page: create a new PDF with the content, save alongside ---
+    if let Some(content) = append_content {
+        // lopdf does not easily support creating new rendered text pages,
+        // so we create a separate file with the appended content.
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("doc");
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let appended_path = parent.join(format!("{stem}_appended.pdf"));
+
+        // Use genpdf to create the appended page.
+        let append_args = serde_json::json!({
+            "title": "",
+            "content": content,
+        });
+        create_pdf(&append_args, &appended_path)?;
+
+        actions_done.push(json!({
+            "action": "append_page",
+            "appended_file": appended_path.display().to_string(),
+            "note": "New page saved as separate file. Use a PDF merge tool or read both files to combine. lopdf cannot easily render new text pages into an existing PDF."
+        }));
+    }
+
+    // Save the modified document (replace_text and delete_pages are in-place).
+    if replacements.is_some() || delete_pages.is_some() {
+        doc.save(path)
+            .map_err(|e| anyhow!("edit_pdf: save failed: {e}"))?;
+    }
+
+    Ok(json!({
+        "edited": true,
+        "path": path.display().to_string(),
+        "format": "pdf",
+        "actions": actions_done,
     }))
 }
 

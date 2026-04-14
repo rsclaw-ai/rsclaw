@@ -3629,6 +3629,7 @@ version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c5c8ecfc6c72051981c0459f75ccc585e7ff67c70829560cda8e647882a9abff"
 dependencies = [
+ "chrono",
  "encoding_rs",
  "flate2",
  "indexmap",
@@ -3637,6 +3638,7 @@ dependencies = [
  "md-5",
  "nom",
  "rangemap",
+ "rayon",
  "time 0.3.45",
  "weezl",
 ]
@@ -5556,6 +5558,7 @@ dependencies = [
  "json5",
  "lark-websocket-protobuf",
  "libc",
+ "lopdf 0.34.0",
  "matrix-sdk",
  "md-5",
  "mime",

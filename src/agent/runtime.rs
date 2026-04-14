@@ -9675,11 +9675,11 @@ fn build_tool_list(
     // Document creation & editing tool.
     tools.push(ToolDef {
         name: "doc".to_owned(),
-        description: "Create, edit, and read Office documents. Actions: create_excel, create_word, create_pdf, create_ppt, edit_excel, edit_word, read_doc. To edit PDF/PPT: use read_doc to read content, then re-create with create_pdf/create_ppt. Files are relative to workspace.".to_owned(),
+        description: "Create, edit, and read Office documents. Actions: create_excel, create_word, create_pdf, create_ppt, edit_excel, edit_word, edit_pdf, read_doc. To edit PPT: use read_doc + create_ppt. edit_pdf supports replace_text (find/replace in content streams), delete_pages, and append_page. Files are relative to workspace.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "action":  {"type": "string", "enum": ["create_excel", "create_word", "create_pdf", "create_ppt", "edit_excel", "edit_word", "read_doc"], "description": "Action to perform"},
+                "action":  {"type": "string", "enum": ["create_excel", "create_word", "create_pdf", "create_ppt", "edit_excel", "edit_word", "edit_pdf", "read_doc"], "description": "Action to perform"},
                 "path":    {"type": "string", "description": "File path relative to workspace, e.g. 'report.xlsx'"},
                 "title":   {"type": "string", "description": "Document title (optional, for word/pdf)"},
                 "sheets":  {"type": "array", "description": "For create_excel/edit_excel: [{name, headers: [str], rows: [[value]]}]. For edit_excel, matching sheet names replace existing sheets; new names add sheets.",
@@ -9692,6 +9692,15 @@ fn build_tool_list(
                 "append_rows": {"description": "For edit_excel: append rows to existing sheet. Either {sheet, rows: [[value]]} or [{sheet, rows}]"},
                 "content": {"type": "string", "description": "For create_word/create_pdf: text content. For edit_word: replacement content (replaces entire document). Paragraphs separated by blank lines. Lines starting with # are headings."},
                 "append":  {"type": "string", "description": "For edit_word: text to append to existing document. Paragraphs separated by blank lines. Lines starting with # are headings."},
+                "replacements": {"type": "array", "description": "For edit_pdf replace_text: [{find: 'old', replace: 'new'}]. Works on raw PDF content streams — may not work for text split across operators.",
+                    "items": {"type": "object", "properties": {
+                        "find":    {"type": "string"},
+                        "replace": {"type": "string"}
+                    }}
+                },
+                "delete_pages": {"type": "array", "description": "For edit_pdf: 1-indexed page numbers to delete, e.g. [1, 3]",
+                    "items": {"type": "integer"}
+                },
                 "slides":  {"type": "array", "description": "For create_ppt: [{title, body}]",
                     "items": {"type": "object", "properties": {
                         "title": {"type": "string"},
