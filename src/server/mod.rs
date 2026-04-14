@@ -1687,27 +1687,14 @@ async fn run_doctor_cmd(fix: bool) -> Response {
             for line in stdout.lines() {
                 let clean = ansi_re.replace_all(line, "");
                 let clean = clean.trim();
-                if clean.starts_with("[ok]") {
-                    checks.push(serde_json::json!({
-                        "status": "ok",
-                        "message": clean[4..].trim(),
-                    }));
-                } else if clean.starts_with("[warn]") {
-                    checks.push(serde_json::json!({
-                        "status": "warn",
-                        "message": clean[6..].trim(),
-                    }));
-                } else if clean.starts_with("[err]") || clean.starts_with("[error]") {
-                    let msg = if clean.starts_with("[err]") { &clean[5..] } else { &clean[7..] };
-                    checks.push(serde_json::json!({
-                        "status": "error",
-                        "message": msg.trim(),
-                    }));
-                } else if clean.starts_with("[fixed]") {
-                    checks.push(serde_json::json!({
-                        "status": "fixed",
-                        "message": clean[7..].trim(),
-                    }));
+                if let Some(msg) = clean.strip_prefix("[ok]") {
+                    checks.push(serde_json::json!({"status": "ok", "message": msg.trim()}));
+                } else if let Some(msg) = clean.strip_prefix("[warn]") {
+                    checks.push(serde_json::json!({"status": "warn", "message": msg.trim()}));
+                } else if let Some(msg) = clean.strip_prefix("[error]").or_else(|| clean.strip_prefix("[err]")) {
+                    checks.push(serde_json::json!({"status": "error", "message": msg.trim()}));
+                } else if let Some(msg) = clean.strip_prefix("[fixed]") {
+                    checks.push(serde_json::json!({"status": "fixed", "message": msg.trim()}));
                 }
             }
             Json(serde_json::json!({
@@ -1764,17 +1751,17 @@ async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
 
         if clean.len() > 30 && clean.as_bytes().get(4) == Some(&b'-') {
             // Has timestamp
-            if let Some(space_pos) = clean.find("Z ") {
-                ts = &clean[..space_pos + 1];
-                let rest = clean[space_pos + 1..].trim();
+            if let Some((before_z, rest)) = clean.split_once("Z ") {
+                ts = &clean[..before_z.len() + 1]; // includes 'Z'
+                let rest = rest.trim();
                 // Extract level
                 for lvl in &["ERROR", "WARN", "INFO", "DEBUG", "TRACE"] {
-                    if rest.starts_with(lvl) {
+                    if let Some(after_lvl) = rest.strip_prefix(lvl) {
                         level = lvl;
-                        msg = rest[lvl.len()..].trim();
+                        msg = after_lvl.trim();
                         // Strip module prefix "rsclaw::xxx:"
-                        if let Some(colon_pos) = msg.find(": ") {
-                            msg = &msg[colon_pos + 2..];
+                        if let Some((_, after_colon)) = msg.split_once(": ") {
+                            msg = after_colon;
                         }
                         break;
                     }

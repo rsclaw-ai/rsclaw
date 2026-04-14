@@ -113,7 +113,7 @@ pub fn has_version_suffix(url: &str) -> bool {
     trimmed
         .rsplit('/')
         .next()
-        .is_some_and(|seg| seg.starts_with('v') && seg.len() >= 2 && seg[1..2].chars().all(|c| c.is_ascii_digit()))
+        .is_some_and(|seg| seg.starts_with('v') && seg.chars().nth(1).is_some_and(|c| c.is_ascii_digit()))
 }
 
 /// Build the models-list URL for a provider.

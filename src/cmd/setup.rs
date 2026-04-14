@@ -39,8 +39,9 @@ where
     // Show current value, let user choose: edit or keep (ESC = back)
     let current = default.to_string();
     if !current.is_empty() {
-        let display_val = if current.len() > 50 {
-            format!("{}...", &current[..47])
+        let display_val = if current.chars().count() > 50 {
+            let end = current.char_indices().nth(47).map(|(i,_)| i).unwrap_or(current.len());
+            format!("{}...", &current[..end])
         } else {
             current.clone()
         };
@@ -533,7 +534,9 @@ fn load_existing_defaults(defs: &Defaults) -> ExistingConfig {
                 if k.starts_with("${") {
                     ec.api_key_display = k;
                 } else if k.len() > 8 {
-                    ec.api_key_display = format!("{}...{}", &k[..4], &k[k.len() - 4..]);
+                    let start: String = k.chars().take(4).collect();
+                    let end: String = k.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+                    ec.api_key_display = format!("{start}...{end}");
                 } else if !k.is_empty() {
                     ec.api_key_display = "*".repeat(k.len().min(20));
                 }
