@@ -3829,6 +3829,7 @@ impl AgentRuntime {
             "cron" => return self.tool_cron(args).await,
             "gateway" => return self.tool_gateway(args).await,
             "pairing" => return self.tool_pairing(args).await,
+            "doc" => return self.tool_doc(args).await,
             "opencode" => return self.tool_opencode(ctx, args).await,
             "claudecode" => return self.tool_claudecode(ctx, args).await,
             _ => {}
@@ -7806,6 +7807,29 @@ impl AgentRuntime {
         }
     }
 
+    async fn tool_doc(&self, args: Value) -> Result<Value> {
+        let path_str = args["path"]
+            .as_str()
+            .ok_or_else(|| anyhow!("doc: `path` required"))?;
+
+        let workspace = self
+            .handle
+            .config
+            .workspace
+            .as_deref()
+            .or(self.config.agents.defaults.workspace.as_deref())
+            .map(expand_tilde)
+            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+
+        let pb = std::path::PathBuf::from(path_str);
+        let full = if pb.is_absolute() { pb } else { workspace.join(path_str) };
+        if let Some(parent) = full.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        super::doc::handle(&args, &full).await
+    }
+
     // -------------------------------------------------------------------
     // Consolidated tool handlers
     // -------------------------------------------------------------------
@@ -9465,6 +9489,35 @@ fn build_tool_list(
                 "peerId":  {"type": "string", "description": "Peer ID to revoke (for revoke action)"}
             },
             "required": ["action"]
+        }),
+    });
+
+    // Document creation tool.
+    tools.push(ToolDef {
+        name: "doc".to_owned(),
+        description: "Create Office documents. Actions: create_excel (.xlsx), create_word (.docx), create_pdf (.pdf), create_ppt (.pptx). Files are written to the workspace.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "action":  {"type": "string", "enum": ["create_excel", "create_word", "create_pdf", "create_ppt"], "description": "Document type to create"},
+                "path":    {"type": "string", "description": "Output file path relative to workspace, e.g. 'report.xlsx'"},
+                "title":   {"type": "string", "description": "Document title (optional, for word/pdf)"},
+                "sheets":  {"type": "array", "description": "For create_excel: [{name, headers: [str], rows: [[value]]}]",
+                    "items": {"type": "object", "properties": {
+                        "name":    {"type": "string"},
+                        "headers": {"type": "array", "items": {"type": "string"}},
+                        "rows":    {"type": "array", "items": {"type": "array"}}
+                    }}
+                },
+                "content": {"type": "string", "description": "For create_word/create_pdf: text content. Paragraphs separated by blank lines. Lines starting with # are headings."},
+                "slides":  {"type": "array", "description": "For create_ppt: [{title, body}]",
+                    "items": {"type": "object", "properties": {
+                        "title": {"type": "string"},
+                        "body":  {"type": "string"}
+                    }}
+                }
+            },
+            "required": ["action", "path"]
         }),
     });
 
