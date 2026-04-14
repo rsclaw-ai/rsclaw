@@ -3884,6 +3884,7 @@ impl AgentRuntime {
             "exec" => return self.tool_exec(args).await,
             "web_search" => return self.tool_web_search(args).await,
             "web_fetch" => return self.tool_web_fetch(args).await,
+            "web_download" => return self.tool_web_download(args).await,
             "web_browser" | "browser" => return self.tool_web_browser(ctx, args).await,
             "computer_use" => return self.tool_computer_use(args).await,
             "image" => return self.tool_image(args).await,
@@ -6175,6 +6176,65 @@ impl AgentRuntime {
                 content.to_owned()
             }
         }
+    }
+
+    async fn tool_web_download(&self, args: Value) -> Result<Value> {
+        let url = args["url"]
+            .as_str()
+            .ok_or_else(|| anyhow!("web_download: `url` required"))?;
+        let path_str = args["path"]
+            .as_str()
+            .ok_or_else(|| anyhow!("web_download: `path` required"))?;
+
+        // Resolve path: absolute or relative to workspace.
+        let pb = std::path::PathBuf::from(path_str);
+        let full = if pb.is_absolute() {
+            pb
+        } else {
+            let workspace = self.handle.config.workspace.as_deref()
+                .or(self.config.agents.defaults.workspace.as_deref())
+                .map(expand_tilde)
+                .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+            workspace.join(path_str)
+        };
+
+        // Ensure parent directory exists.
+        if let Some(parent) = full.parent() {
+            tokio::fs::create_dir_all(parent).await
+                .map_err(|e| anyhow!("web_download: cannot create directory {}: {e}", parent.display()))?;
+        }
+
+        let client = reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (compatible; RsClaw/1.0)")
+            .timeout(Duration::from_secs(300))
+            .build()?;
+
+        let resp = client.get(url).send().await
+            .map_err(|e| anyhow!("web_download: request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            bail!("web_download: HTTP {} for {url}", resp.status());
+        }
+
+        // Stream to file (low memory).
+        let mut stream = resp.bytes_stream();
+        let mut file = tokio::fs::File::create(&full).await
+            .map_err(|e| anyhow!("web_download: cannot create {}: {e}", full.display()))?;
+        let mut size: u64 = 0;
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| anyhow!("web_download: stream error: {e}"))?;
+            file.write_all(&chunk).await?;
+            size += chunk.len() as u64;
+        }
+        file.flush().await?;
+
+        Ok(json!({
+            "status": "ok",
+            "path": full.to_string_lossy(),
+            "size_bytes": size,
+        }))
     }
 
     async fn tool_web_browser(&self, ctx: &RunContext, args: Value) -> Result<Value> {
@@ -9067,6 +9127,7 @@ fn build_system_prompt(
         parts.push(
             "## Tool Usage Guidelines\n\
              - When you don't know the answer or need real-time information, use `web_search` first.\n\
+             - For documents (xlsx/docx/pdf/pptx): use the `doc` tool, not exec.\n\
              - For code generation: write complete files, one module at a time.\n\
              - Use edit tool for small changes to existing files.\n\
              - For cron jobs: use the `cron` tool (action=list/add/remove).\n\
@@ -9361,6 +9422,20 @@ fn build_tool_list(
                 "prompt": {"type": "string", "description": "What to extract from the page (requires summaryModel config)"}
             },
             "required": ["url"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "web_download".to_owned(),
+        description: "Download a file from a URL to a local path using streaming (low memory). \
+            Supports images, videos, archives, etc. Cross-platform, no external tools needed. \
+            下载文件到本地路径，流式写入，低内存占用，跨平台。".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "url":  {"type": "string", "description": "URL of the file to download / 要下载的文件URL"},
+                "path": {"type": "string", "description": "Destination file path (absolute or relative to workspace) / 保存路径"}
+            },
+            "required": ["url", "path"]
         }),
     });
     tools.push(ToolDef {
