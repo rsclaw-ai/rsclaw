@@ -9108,10 +9108,15 @@ fn build_system_prompt(
             .all()
             .map(|s| {
                 let desc = s.description.as_deref().unwrap_or("");
-                // Truncate description to first sentence or 60 chars
-                let short = desc.find('。').or_else(|| desc.find(". "))
-                    .map(|i| &desc[..i+1])
-                    .unwrap_or_else(|| if desc.len() > 60 { &desc[..60] } else { desc });
+                // Truncate to first sentence or ~60 chars (UTF-8 safe)
+                let end = desc.find('。').map(|i| i + '。'.len_utf8())
+                    .or_else(|| desc.find(". ").map(|i| i + 1));
+                let short = match end {
+                    Some(i) => &desc[..i],
+                    None => desc.char_indices().nth(60)
+                        .map(|(i, _)| &desc[..i])
+                        .unwrap_or(desc),
+                };
                 format!("- {}: {}", s.name, short)
             })
             .collect();
