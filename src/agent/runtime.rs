@@ -9214,7 +9214,8 @@ fn build_system_prompt(
     {
         parts.push(
             "## Tool Usage Guidelines\n\
-             - When you don't know the answer or need real-time information, use `web_search` first.\n\
+             - When user asks to go to a specific site (e.g. 'go to douyin', 'open taobao'), use `web_browser` directly. Do NOT search first.\n\
+             - For general questions or info lookup, use `web_search` first.\n\
              - For documents (xlsx/docx/pdf/pptx): use the `doc` tool, not exec.\n\
              - For code generation: write complete files, one module at a time.\n\
              - Use edit tool for small changes to existing files.\n\
