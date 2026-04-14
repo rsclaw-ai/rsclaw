@@ -1197,6 +1197,18 @@ impl AgentRuntime {
         let session_key = self.resolve_session_key(session_key).to_owned();
         let session_key = session_key.as_str();
 
+        // Check clear_signal: if /clear was issued via bypass, clear sessions now.
+        if self.handle.clear_signal.load(Ordering::SeqCst) {
+            self.handle.clear_signal.store(false, Ordering::SeqCst);
+            info!("clear_signal received, clearing all sessions");
+            self.sessions.clear();
+            self.compaction_state.clear();
+            // Also clear persisted sessions from redb
+            for key in self.store.db.list_sessions().unwrap_or_default() {
+                let _ = self.store.db.delete_session(&key);
+            }
+        }
+
         // Acquire concurrency permit (blocks if too many concurrent turns).
         let sem = Arc::clone(&self.handle.concurrency);
         let _permit = sem
@@ -2806,6 +2818,22 @@ impl AgentRuntime {
 
         loop {
             iteration += 1;
+            // Check clear_signal mid-loop: clear sessions and abort.
+            if self.handle.clear_signal.load(Ordering::SeqCst) {
+                self.handle.clear_signal.store(false, Ordering::SeqCst);
+                info!(session = %ctx.session_key, "agent_loop: clear_signal, clearing sessions");
+                self.sessions.clear();
+                self.compaction_state.clear();
+                return Ok(AgentReply {
+                    text: "[session cleared]".to_string(),
+                    is_empty: false,
+                    tool_calls: None,
+                    images: vec![],
+                    files: vec![],
+                    pending_analysis: None,
+                    was_preparse: false,
+                });
+            }
             // Check abort flag at start of each iteration (allows /abort to
             // interrupt even when tool dispatch is blocking between LLM calls).
             if abort_flag.load(Ordering::SeqCst) {

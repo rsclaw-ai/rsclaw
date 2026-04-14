@@ -50,6 +50,8 @@ pub struct AgentHandle {
     pub session_count: Arc<AtomicUsize>,
     /// Context tokens of the most recent turn (updated by runtime for /status).
     pub last_ctx_tokens: Arc<AtomicUsize>,
+    /// Signal to clear all sessions (set by /clear bypass, consumed by runtime).
+    pub clear_signal: Arc<AtomicBool>,
 }
 
 /// An image attachment sent by the user.
@@ -233,6 +235,7 @@ impl AgentRegistry {
                     started_at: Instant::now(),
                     session_count: Arc::new(AtomicUsize::new(0)),
                     last_ctx_tokens: Arc::new(AtomicUsize::new(0)),
+                    clear_signal: Arc::new(AtomicBool::new(false)),
                 });
                 inner.agents.insert(entry.id.clone(), handle);
                 receivers.insert(entry.id.clone(), rx);

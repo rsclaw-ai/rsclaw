@@ -85,6 +85,7 @@ impl AgentSpawner {
             started_at: std::time::Instant::now(),
             session_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_ctx_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            clear_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
 
         self.registry.insert_handle(Arc::clone(&handle));

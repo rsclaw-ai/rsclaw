@@ -1002,6 +1002,16 @@ async fn try_preparse_locally(
         for f in flags.values() { f.store(true, Ordering::SeqCst); }
         return Some(txt(if count > 0 { format!("✓ abort signal sent ({count} session(s))") } else { "nothing to abort".to_owned() }));
     }
+    // /clear — abort running turns + signal session clear (fully non-blocking)
+    if lower == "/clear" {
+        // 1. Abort all running turns
+        let flags = handle.abort_flags.read().unwrap();
+        for f in flags.values() { f.store(true, Ordering::SeqCst); }
+        drop(flags);
+        // 2. Signal runtime to clear sessions at next opportunity
+        handle.clear_signal.store(true, Ordering::SeqCst);
+        return Some(txt("✓ Session cleared.".to_owned()));
+    }
     // /status
     if lower == "/status" {
         let model = handle.config.model.as_ref()
@@ -5218,7 +5228,7 @@ fn start_feishu_if_configured(
                             }
                         }
                     }
-                    // Fast preparse bypass: /clear, /status etc. skip per-user queue
+                    // Fast preparse bypass: /status, /abort etc. skip per-user queue
                     if is_fast_preparse(&text) {
                         let handle = if let Some(ref agent_id) = bound {
                             match reg.get(agent_id) {
@@ -5240,8 +5250,10 @@ fn start_feishu_if_configured(
                             if !reply.text.is_empty() || !reply.images.is_empty() {
                                 let _ = tx.send(reply).await;
                             }
+                            return;
                         }
-                        return;
+                        // try_preparse_locally returned None (e.g. /clear sets abort
+                        // then falls through to agent queue for actual cleanup)
                     }
                     // Get or create a per-user queue.
                     let user_tx = {
