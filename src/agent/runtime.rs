@@ -6209,31 +6209,47 @@ impl AgentRuntime {
             .timeout(Duration::from_secs(300))
             .build()?;
 
-        let resp = client.get(url).send().await
+        // Resume support: if file exists, try Range request to continue download.
+        let existing_size = tokio::fs::metadata(&full).await.map(|m| m.len()).unwrap_or(0);
+        let mut req = client.get(url);
+        if existing_size > 0 {
+            req = req.header("Range", format!("bytes={existing_size}-"));
+        }
+
+        let resp = req.send().await
             .map_err(|e| anyhow!("web_download: request failed: {e}"))?;
 
-        if !resp.status().is_success() {
+        if !resp.status().is_success() && resp.status().as_u16() != 206 {
             bail!("web_download: HTTP {} for {url}", resp.status());
         }
 
-        // Stream to file (low memory).
+        let resumed = resp.status().as_u16() == 206;
+
+        // Stream to file (low memory). Append if resuming, create otherwise.
         let mut stream = resp.bytes_stream();
-        let mut file = tokio::fs::File::create(&full).await
-            .map_err(|e| anyhow!("web_download: cannot create {}: {e}", full.display()))?;
-        let mut size: u64 = 0;
         use futures::StreamExt;
         use tokio::io::AsyncWriteExt;
+        let mut file = if resumed {
+            tokio::fs::OpenOptions::new().append(true).open(&full).await
+                .map_err(|e| anyhow!("web_download: cannot open for append {}: {e}", full.display()))?
+        } else {
+            tokio::fs::File::create(&full).await
+                .map_err(|e| anyhow!("web_download: cannot create {}: {e}", full.display()))?
+        };
+        let mut downloaded: u64 = 0;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| anyhow!("web_download: stream error: {e}"))?;
             file.write_all(&chunk).await?;
-            size += chunk.len() as u64;
+            downloaded += chunk.len() as u64;
         }
         file.flush().await?;
 
+        let total = existing_size + downloaded;
         Ok(json!({
             "status": "ok",
             "path": full.to_string_lossy(),
-            "size_bytes": size,
+            "size_bytes": total,
+            "resumed": resumed,
         }))
     }
 
