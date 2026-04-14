@@ -2869,7 +2869,7 @@ impl AgentRuntime {
                     "agent_loop: hit max iteration limit, breaking out"
                 );
                 return Ok(AgentReply {
-                    text: "[error: agent reached maximum iteration limit. Please try a simpler request or start a new conversation.]".to_string(),
+                    text: crate::i18n::t("agent_max_iterations", crate::i18n::default_lang()).to_owned(),
                     is_empty: false,
                     tool_calls: None,
                     images: vec![],

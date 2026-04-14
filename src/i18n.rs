@@ -2145,6 +2145,12 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "ja" => "[システム] {tool} が見つかりません。`rsclaw tools install {tool}` を実行するか https://gitfast.io からダウンロードしてください",
     );
 
+    msg!("agent_max_iterations",
+        "en" => "Task too complex or stuck in a loop. Please try a simpler request or send /clear to start over.",
+        "zh" => "任务过于复杂或陷入循环，请尝试简化请求，或发送 /clear 重新开始。",
+        "ja" => "タスクが複雑すぎるかループしています。リクエストを簡略化するか、/clear で最初からやり直してください。",
+    );
+
     m
 });
 
