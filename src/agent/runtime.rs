@@ -2821,10 +2821,12 @@ impl AgentRuntime {
         let mut tool_images: Vec<String> = Vec::new();
         let mut tool_files: Vec<(String, String, String)> = Vec::new();
 
-        // Hard cap on iterations to prevent runaway loops (e.g. small models
-        // repeatedly calling the same tool). Loop detection catches pattern-based
-        // loops; this is the safety net for everything else.
-        const MAX_ITERATIONS: usize = 30;
+        // Dynamic iteration limit based on task complexity.
+        // Simple tasks: 10 iterations. Browser/complex tasks: 50.
+        // Adjusted upward when web_browser or opencode tools are used.
+        const BASE_ITERATIONS: usize = 10;
+        const COMPLEX_ITERATIONS: usize = 50;
+        let mut max_iterations = BASE_ITERATIONS;
         let mut iteration = 0usize;
 
         loop {
@@ -2860,7 +2862,7 @@ impl AgentRuntime {
                     was_preparse: false,
                 });
             }
-            if iteration > MAX_ITERATIONS {
+            if iteration > max_iterations {
                 warn!(
                     session = %ctx.session_key,
                     iterations = iteration,
@@ -3523,6 +3525,11 @@ impl AgentRuntime {
                 }
 
                 debug!(tool = %tool_name, "dispatching tool call");
+
+                // Upgrade iteration limit for complex tools
+                if matches!(tool_name.as_str(), "web_browser" | "opencode" | "claudecode") {
+                    max_iterations = max_iterations.max(COMPLEX_ITERATIONS);
+                }
 
                 // Update live status: tool call starting.
                 if let Ok(mut status) = self.live_status.try_write() {

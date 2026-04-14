@@ -164,34 +164,21 @@ pub fn tool_prompts_for_system(base_dir: &Path, lang: Option<&str>) -> String {
     let mut parts = Vec::new();
 
     // web_browser: short summary + pointer to full guide
-    let wb_path = base_dir.join("tools/web_browser/prompt.md");
-    let wb_summary = if zh {
-        format!(
-            "# web_browser 摘要\n\
-             - 流程: open → snapshot → 用 ref 操作 → 再 snapshot\n\
-             - 登录: 优先扫码，screenshot 截图发给用户\n\
-             - 搜索/抓取静态页面请优先用 web_search / web_fetch\n\
-             - 完整指南: `{}`",
-            wb_path.display()
-        )
-    } else {
-        format!(
-            "# web_browser Summary\n\
-             - Flow: open → snapshot → interact with refs → re-snapshot\n\
-             - Login: prefer QR scan, screenshot and send to user\n\
-             - For search/static pages, prefer web_search / web_fetch\n\
-             - Full guide: `{}`",
-            wb_path.display()
-        )
-    };
-    parts.push(wb_summary);
+    parts.push(format!(
+        "# web_browser\n\
+         - Flow: open → snapshot → interact with refs → re-snapshot\n\
+         - Login: prefer QR scan, screenshot and send to user\n\
+         - For search/static pages, prefer web_search / web_fetch first\n\
+         - Full guide: `{}/tools/web_browser/prompt.md`",
+        base_dir.display()
+    ));
 
-    // Other tools: inject directly (short prompts)
-    let short_tools: &[(&str, &str)] = if zh {
-        &[("exec", ZH_TOOL_EXEC), ("web_search", ZH_TOOL_WEB_SEARCH), ("web_fetch", ZH_TOOL_WEB_FETCH)]
-    } else {
-        &[("exec", EN_TOOL_EXEC), ("web_search", EN_TOOL_WEB_SEARCH), ("web_fetch", EN_TOOL_WEB_FETCH)]
-    };
+    // Other tools: inject directly (short prompts, always English for LLM)
+    let short_tools: &[(&str, &str)] = &[
+        ("exec", EN_TOOL_EXEC),
+        ("web_search", EN_TOOL_WEB_SEARCH),
+        ("web_fetch", EN_TOOL_WEB_FETCH),
+    ];
     for (name, fallback) in short_tools {
         let path = base_dir.join("tools").join(name).join("prompt.md");
         let content = std::fs::read_to_string(&path)
