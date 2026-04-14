@@ -9057,15 +9057,27 @@ fn build_system_prompt(
 
     // Tool usage guidance
     {
-        parts.push(format!(
+        parts.push(
             "## Tool Usage Guidelines\n\
              - When you don't know the answer or need real-time information, use `web_search` first.\n\
              - For code generation: write complete files, one module at a time.\n\
              - Use edit tool for small changes to existing files.\n\
              - For cron jobs: use the `cron` tool (action=list/add/remove).\n\
              - If a tool call fails, do NOT retry with the same arguments. Try a different approach or inform the user.\n\
-             - Never fabricate URLs or file paths.\n\n\
-             ## Self-Evolution — Auto Skill Creation\n\
+             - Never fabricate URLs or file paths."
+                .to_owned(),
+        );
+
+        // Inject tool-specific prompts (web_browser, exec) directly into system prompt.
+        let base = crate::config::loader::base_dir();
+        let lang = config.gateway.as_ref().and_then(|g| g.language.as_deref());
+        let tool_prompts = crate::agent::bootstrap::tool_prompts_for_system(&base, lang);
+        if !tool_prompts.is_empty() {
+            parts.push(tool_prompts);
+        }
+
+        parts.push(
+            "## Self-Evolution — Auto Skill Creation\n\
              When you notice a task pattern repeating (>=3 similar requests), package it as a standard skill after completing the task:\n\
              1. Create SKILL.md in workspace/skills/<slug>/ (keep it under 100 lines)\n\
              2. Frontmatter: name, description, version (no extra fields like author/tags/category)\n\
@@ -9073,7 +9085,8 @@ fn build_system_prompt(
              4. Record in memory (memory_put) to avoid duplicates\n\
              5. Inform the user\n\
              IMPORTANT: Skills must be concise. Only list the essential steps, not every possible detail."
-        ));
+                .to_owned(),
+        );
     }
 
     // Workspace files segment.

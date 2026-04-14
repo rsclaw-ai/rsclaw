@@ -154,6 +154,32 @@ pub fn seed_workspace_with_lang(workspace: &Path, lang: Option<&str>) -> Result<
 // Tool prompt seeding
 // ---------------------------------------------------------------------------
 
+/// Returns all built-in tool prompts as a combined string for system prompt injection.
+/// Reads from disk (user may have customized), falls back to built-in defaults.
+pub fn tool_prompts_for_system(base_dir: &Path, lang: Option<&str>) -> String {
+    let resolved = lang.map(crate::i18n::resolve_lang).unwrap_or("en");
+    let zh = resolved == "zh";
+
+    let defaults: &[(&str, &str)] = if zh {
+        &[("web_browser", ZH_TOOL_WEB_BROWSER), ("exec", ZH_TOOL_EXEC),
+          ("web_search", ZH_TOOL_WEB_SEARCH), ("web_fetch", ZH_TOOL_WEB_FETCH)]
+    } else {
+        &[("web_browser", EN_TOOL_WEB_BROWSER), ("exec", EN_TOOL_EXEC),
+          ("web_search", EN_TOOL_WEB_SEARCH), ("web_fetch", EN_TOOL_WEB_FETCH)]
+    };
+
+    let mut parts = Vec::new();
+    for (name, fallback) in defaults {
+        let path = base_dir.join("tools").join(name).join("prompt.md");
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| fallback.to_string());
+        if !content.trim().is_empty() {
+            parts.push(content.trim().to_owned());
+        }
+    }
+    parts.join("\n\n")
+}
+
 /// Seed default tool prompt files under `base_dir/tools/`.
 /// Creates `tools/<name>/prompt.md` for each built-in tool guide.
 pub fn seed_tools(base_dir: &Path, lang: Option<&str>) -> Result<usize> {
@@ -164,11 +190,15 @@ pub fn seed_tools(base_dir: &Path, lang: Option<&str>) -> Result<usize> {
         &[
             ("web_browser", ZH_TOOL_WEB_BROWSER),
             ("exec", ZH_TOOL_EXEC),
+            ("web_search", ZH_TOOL_WEB_SEARCH),
+            ("web_fetch", ZH_TOOL_WEB_FETCH),
         ]
     } else {
         &[
             ("web_browser", EN_TOOL_WEB_BROWSER),
             ("exec", EN_TOOL_EXEC),
+            ("web_search", EN_TOOL_WEB_SEARCH),
+            ("web_fetch", EN_TOOL_WEB_FETCH),
         ]
     };
 
@@ -269,4 +299,32 @@ const EN_TOOL_EXEC: &str = r#"# exec Usage Guide
 - If a command fails, do NOT retry the same command — try a different approach or inform the user
 - Windows: use PowerShell. macOS/Linux: use bash
 - Never run dangerous commands (rm -rf, format, disable firewall, etc.)
+"#;
+
+// -- web_search / web_fetch prompts -----------------------------------------
+
+const ZH_TOOL_WEB_SEARCH: &str = r#"# web_search 使用指南
+
+- 搜索信息时优先使用 web_search，不要打开浏览器去搜索引擎
+- web_search 失败后可以重试一次换关键词，仍然失败才用 web_browser 打开搜索引擎
+- 返回空结果时换关键词，不要用相同关键词重复搜索
+"#;
+
+const EN_TOOL_WEB_SEARCH: &str = r#"# web_search Usage Guide
+
+- Always use web_search for information lookup — do NOT open a browser to visit search engines
+- If web_search fails, retry once with different keywords. Only fall back to web_browser if still empty
+- On empty results, change keywords — do NOT retry with the same query
+"#;
+
+const ZH_TOOL_WEB_FETCH: &str = r#"# web_fetch 使用指南
+
+- 抓取网页内容时优先使用 web_fetch，不要打开浏览器
+- web_fetch 只能获取静态内容，需要交互（登录、点击）时才用 web_browser
+"#;
+
+const EN_TOOL_WEB_FETCH: &str = r#"# web_fetch Usage Guide
+
+- Always use web_fetch to read web pages — do NOT open a browser for static content
+- Only use web_browser when interaction is needed (login, clicking, form filling)
 "#;
