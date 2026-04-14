@@ -6204,14 +6204,57 @@ impl AgentRuntime {
                 .map_err(|e| anyhow!("web_download: cannot create directory {}: {e}", parent.display()))?;
         }
 
+        // Build cookie header: manual cookies param > auto from browser session
+        let mut cookie_header = String::new();
+        if let Some(cookies) = args["cookies"].as_str() {
+            cookie_header = cookies.to_owned();
+        } else if args["use_browser_cookies"].as_bool().unwrap_or(false) {
+            // Extract cookies from active browser session via CDP
+            let mut guard = self.browser.lock().await;
+            if let Some(ref mut session) = *guard {
+                match session.execute("cookies", &json!({})).await {
+                    Ok(resp) => {
+                        if let Some(cookies) = resp["cookies"].as_array() {
+                            let url_parsed = reqwest::Url::parse(url).ok();
+                            let domain = url_parsed.as_ref().and_then(|u| u.host_str());
+                            let parts: Vec<String> = cookies.iter()
+                                .filter(|c| {
+                                    // Filter cookies matching the download URL domain
+                                    if let (Some(d), Some(cd)) = (domain, c["domain"].as_str()) {
+                                        let cd = cd.trim_start_matches('.');
+                                        d == cd || d.ends_with(&format!(".{cd}"))
+                                    } else {
+                                        true
+                                    }
+                                })
+                                .filter_map(|c| {
+                                    let name = c["name"].as_str()?;
+                                    let value = c["value"].as_str()?;
+                                    Some(format!("{name}={value}"))
+                                })
+                                .collect();
+                            cookie_header = parts.join("; ");
+                            tracing::debug!(cookies_count = parts.len(), "web_download: extracted browser cookies");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("web_download: failed to get browser cookies: {e}");
+                    }
+                }
+            }
+        }
+
         let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (compatible; RsClaw/1.0)")
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
             .timeout(Duration::from_secs(300))
             .build()?;
 
         // Resume support: if file exists, try Range request to continue download.
         let existing_size = tokio::fs::metadata(&full).await.map(|m| m.len()).unwrap_or(0);
         let mut req = client.get(url);
+        if !cookie_header.is_empty() {
+            req = req.header("Cookie", &cookie_header);
+        }
         if existing_size > 0 {
             req = req.header("Range", format!("bytes={existing_size}-"));
         }
@@ -9442,14 +9485,14 @@ fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "web_download".to_owned(),
-        description: "Download a file from a URL to a local path using streaming (low memory). \
-            Supports images, videos, archives, etc. Cross-platform, no external tools needed. \
-            下载文件到本地路径，流式写入，低内存占用，跨平台。".to_owned(),
+        description: "Download a file from URL to local path. Supports resume and browser cookies for authenticated downloads.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "url":  {"type": "string", "description": "URL of the file to download / 要下载的文件URL"},
-                "path": {"type": "string", "description": "Destination file path (absolute or relative to workspace) / 保存路径"}
+                "url":  {"type": "string", "description": "URL to download"},
+                "path": {"type": "string", "description": "Destination path (absolute or relative to workspace)"},
+                "cookies": {"type": "string", "description": "Cookie header string, e.g. 'session=abc; token=xyz'"},
+                "use_browser_cookies": {"type": "boolean", "description": "Auto-extract cookies from active browser session for this URL's domain"}
             },
             "required": ["url", "path"]
         }),
