@@ -9107,17 +9107,7 @@ fn build_system_prompt(
         let lines: Vec<_> = skills
             .all()
             .map(|s| {
-                let desc = s.description.as_deref().unwrap_or("");
-                // Truncate to first sentence or ~60 chars (UTF-8 safe)
-                let end = desc.find('。').map(|i| i + '。'.len_utf8())
-                    .or_else(|| desc.find(". ").map(|i| i + 1));
-                let short = match end {
-                    Some(i) => &desc[..i],
-                    None => desc.char_indices().nth(60)
-                        .map(|(i, _)| &desc[..i])
-                        .unwrap_or(desc),
-                };
-                format!("- {}: {}", s.name, short)
+                format!("- {}", s.name)
             })
             .collect();
         if !lines.is_empty() {
