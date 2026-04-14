@@ -1134,12 +1134,20 @@ impl AgentRuntime {
             model,
             messages,
             tools: vec![], // NO tools -- read-only side query
-            system: Some(
-                "You are answering a quick side question (/btw). Be concise and direct. \
-                 You have no tools available. Answer from the conversation context and \
-                 your general knowledge only."
-                    .to_owned(),
-            ),
+            system: Some({
+                let lang = self.config.raw.gateway.as_ref()
+                    .and_then(|g| g.language.as_deref())
+                    .map(crate::i18n::resolve_lang)
+                    .unwrap_or("en");
+                if lang == "zh" {
+                    "你正在回答一个旁路快速提问（/btw）。请简洁直接地回答。\
+                     你没有可用的工具。仅根据对话上下文和你的知识回答。".to_owned()
+                } else {
+                    "You are answering a quick side question (/btw). Be concise and direct. \
+                     You have no tools available. Answer from the conversation context and \
+                     your general knowledge only.".to_owned()
+                }
+            }),
             max_tokens: Some(500),
             temperature: None,
             frequency_penalty: None,
