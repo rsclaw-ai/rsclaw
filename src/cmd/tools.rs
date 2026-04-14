@@ -8,10 +8,10 @@ use crate::cli::ToolsCommand;
 // Mirror URL (Chinese users) / upstream fallback
 // ---------------------------------------------------------------------------
 
-const MIRROR_BASE: &str = "https://gitfast.io/tools";
+const MIRROR_BASE: &str = "https://gitfast.org/tools";
 
 /// Manifest endpoint — returns JSON with versions and download URLs.
-const MANIFEST_URL: &str = "https://gitfast.io/tools/manifest.json";
+const MANIFEST_URL: &str = "https://gitfast.org/tools/manifest.json";
 
 // ---------------------------------------------------------------------------
 // Tool definitions

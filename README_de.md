@@ -1,6 +1,6 @@
 # RsClaw
 
-**AI Automation Manager Compatible with OpenClaw.**
+**AI Automation Manager with One-Click OpenClaw Migration & Native Long-Term Memory.**
 
 [![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
