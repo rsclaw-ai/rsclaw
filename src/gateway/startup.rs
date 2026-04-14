@@ -1210,11 +1210,18 @@ $g.Dispose();$b.Dispose()"#
             ("sh", "-c")
         };
         let ws = workspace();
-        let out = tokio::process::Command::new(shell)
-            .args([arg, cmd])
+        let mut proc = tokio::process::Command::new(shell);
+        proc.args([arg, cmd])
             .current_dir(&ws)
-            .output()
-            .await;
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            proc.creation_flags(CREATE_NO_WINDOW);
+        }
+        let out = proc.output().await;
         let reply = match out {
             Ok(o) => {
                 let mut result = String::from_utf8_lossy(&o.stdout).into_owned();

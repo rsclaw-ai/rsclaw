@@ -5051,13 +5051,23 @@ impl AgentRuntime {
             .and_then(|e| e.timeout_seconds)
             .unwrap_or(1800);
 
+        let mut cmd = tokio::process::Command::new(shell);
+        cmd.args(&shell_args)
+            .arg(command)
+            .current_dir(&workspace)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            tokio::process::Command::new(shell)
-                .args(&shell_args)
-                .arg(command)
-                .current_dir(&workspace)
-                .output()
+            cmd.output()
         )
         .await
         .map_err(|_| {

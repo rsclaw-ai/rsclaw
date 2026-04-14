@@ -290,11 +290,17 @@ impl AcpCallbackHandler for DefaultAcpHandlerWithTerminal {
         _args: Option<Vec<String>>,
     ) -> Result<String> {
         let shell = command.unwrap_or("powershell.exe");
-        let child = Command::new(shell)
-            .stdin(Stdio::piped())
+        let mut cmd = Command::new(shell);
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let child = cmd.spawn()
             .context("Failed to spawn terminal process")?;
         let terminal_id = format!("terminal-{}", uuid::Uuid::new_v4());
 
