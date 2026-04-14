@@ -3520,7 +3520,10 @@ impl AgentRuntime {
                         // Record error result for loop detection (errors count as results too).
                         ctx.loop_detector
                             .record_result(&serde_json::json!({"error": e.to_string()}));
-                        (format!("{{\"error\":\"{}\"}}", e), vec![])
+                        (format!(
+                            "{{\"error\":\"{}\",\"_do_not_retry\":true,\"hint\":\"This tool call failed. Do NOT retry the same tool with the same arguments. Try a different approach or inform the user.\"}}",
+                            e
+                        ), vec![])
                     }
                 };
 
@@ -8418,7 +8421,7 @@ fn format_tool_result(val: &serde_json::Value) -> String {
             out.push('\n');
         }
         if out.is_empty() {
-            "No results found.".to_owned()
+            "No results found. Do NOT retry the same search. Try different keywords or inform the user that no results were found.".to_owned()
         } else {
             out.trim_end().to_owned()
         }
