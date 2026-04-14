@@ -38,16 +38,22 @@ const TOOLS: &[ToolDef] = &[
         local_bin: "ffmpeg",
     },
     ToolDef {
-        name: "whisper-cpp",
-        display: "whisper.cpp (speech-to-text)",
-        detect_cmd: &["whisper-cli", "whisper", "whisper-cpp"],
-        local_bin: "whisper-cpp",
-    },
-    ToolDef {
         name: "node",
         display: "Node.js (plugin runtime)",
         detect_cmd: &["node"],
         local_bin: "node",
+    },
+    ToolDef {
+        name: "python",
+        display: "Python 3 (skill/plugin runtime)",
+        detect_cmd: &["python3", "python"],
+        local_bin: "python",
+    },
+    ToolDef {
+        name: "sherpa-onnx",
+        display: "sherpa-onnx (STT + TTS engine)",
+        detect_cmd: &["sherpa-onnx-offline-tts", "sherpa-onnx-offline", "sherpa-onnx"],
+        local_bin: "sherpa-onnx",
     },
 ];
 
@@ -281,15 +287,15 @@ fn resolve_download_url(
 
     match tool {
         "chromium" => {
-            let rev = section.get("revision")?.as_str()?;
+            let ver = section.get("version")?.as_str()?;
             let filename = match platform {
-                "linux-x64" => "chromium-linux.zip",
-                "mac-x64" => "chromium-mac.zip",
-                "mac-arm64" => "chromium-mac-arm64.zip",
-                "win-x64" => "chromium-win64.zip",
+                "linux-x64" => "chrome-linux64.zip",
+                "mac-x64" => "chrome-mac-x64.zip",
+                "mac-arm64" => "chrome-mac-arm64.zip",
+                "win-x64" => "chrome-win64.zip",
                 _ => return None,
             };
-            Some(format!("{MIRROR_BASE}/chromium/{rev}/{filename}"))
+            Some(format!("{MIRROR_BASE}/chromium/{ver}/{filename}"))
         }
         "ffmpeg" => {
             let filename = match platform {
@@ -300,17 +306,6 @@ fn resolve_download_url(
                 _ => return None,
             };
             Some(format!("{MIRROR_BASE}/ffmpeg/{filename}"))
-        }
-        "whisper-cpp" => {
-            let ver = section.get("version")?.as_str()?;
-            // whisper.cpp release naming varies; manifest.downloads is preferred.
-            // Fallback: try common pattern
-            let filename = match platform {
-                "linux-x64" => format!("whisper-{ver}-bin-linux-x64.zip"),
-                "win-x64" => format!("whisper-{ver}-bin-x64.zip"),
-                _ => return None,
-            };
-            Some(format!("{MIRROR_BASE}/whisper-cpp/{ver}/{filename}"))
         }
         "node" => {
             let ver = section.get("version")?.as_str()?;
@@ -323,6 +318,22 @@ fn resolve_download_url(
                 _ => return None,
             };
             Some(format!("{MIRROR_BASE}/node/{ver}/{filename}"))
+        }
+        "python" => {
+            let ver = section.get("version")?.as_str()?;
+            let filename = match platform {
+                "linux-x64" => "python-linux-x64.tar.gz",
+                "linux-arm64" => "python-linux-arm64.tar.gz",
+                "mac-x64" => "python-mac-x64.tar.gz",
+                "mac-arm64" => "python-mac-arm64.tar.gz",
+                "win-x64" => "python-win-x64.tar.gz",
+                _ => return None,
+            };
+            Some(format!("{MIRROR_BASE}/python/{ver}/{filename}"))
+        }
+        "sherpa-onnx" => {
+            let ver = section.get("version")?.as_str()?;
+            Some(format!("{MIRROR_BASE}/sherpa-onnx/{ver}/"))
         }
         _ => None,
     }

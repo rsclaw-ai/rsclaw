@@ -98,6 +98,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let registry = Arc::new(registry);
     info!("{} agent(s) registered", registry.len());
 
+    // Create notification broadcast channel early so background model downloads
+    // can also send notifications to users via channels.
+    let (notification_tx, notification_rx) =
+        broadcast::channel::<crate::channel::OutboundMessage>(64);
+
     // 6. Open shared memory store.
     // Auto-detect embedding model: prefer bge-small-zh, fallback to bge-small-en.
     // Auto-download if neither exists.
@@ -112,19 +117,37 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         } else {
             // Auto-download BGE model in background (don't block startup).
             let target_dir = zh; // default to zh
-            let lang = config.raw.gateway.as_ref().and_then(|g| g.language.as_deref()).map(str::to_owned);
+            let cfg_lang = config.raw.gateway.as_ref().and_then(|g| g.language.as_deref()).map(str::to_owned);
+            let i18n_lang = crate::i18n::resolve_lang(cfg_lang.as_deref().unwrap_or("en")).to_owned();
             let search_cfg_clone = search_cfg.cloned();
             let dl_dir = target_dir.clone();
+            let ntx = notification_tx.clone();
             tokio::spawn(async move {
                 info!("BGE embedding model not found, downloading in background...");
-                match download_bge_model(&dl_dir, search_cfg_clone.as_ref(), lang.as_deref()).await {
+                match download_bge_model(&dl_dir, search_cfg_clone.as_ref(), cfg_lang.as_deref()).await {
                     Ok(()) => {
-                        info!("BGE model downloaded. Restart gateway to enable semantic memory search.");
+                        info!("BGE model downloaded. Notifying user to restart.");
+                        let _ = ntx.send(crate::channel::OutboundMessage {
+                            target_id: String::new(),
+                            is_group: false,
+                            text: crate::i18n::t("bge_model_downloaded", &i18n_lang),
+                            reply_to: None,
+                            images: vec![],
+                            files: vec![],
+                            channel: None,
+                        });
                     }
                     Err(e) => {
                         warn!("BGE model auto-download failed: {e:#}");
-                        warn!("semantic memory search using FNV fallback (low quality)");
-                        warn!("to fix: run `rsclaw models download` or configure memorySearch.provider");
+                        let _ = ntx.send(crate::channel::OutboundMessage {
+                            target_id: String::new(),
+                            is_group: false,
+                            text: crate::i18n::t_fmt("bge_model_download_failed", &i18n_lang, &[("error", &format!("{e:#}"))]),
+                            reply_to: None,
+                            images: vec![],
+                            files: vec![],
+                            channel: None,
+                        });
                     }
                 }
             });
@@ -184,11 +207,6 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // available).
     let mcp_registry = Arc::new(crate::mcp::McpRegistry::new());
     spawn_mcp_servers(&config, Arc::clone(&mcp_registry)).await;
-
-    // Create notification broadcast channel for routing OutboundMessages from
-    // ACP tools (OpenCode, ClaudeCode) back to the correct channel.
-    let (notification_tx, notification_rx) =
-        broadcast::channel::<crate::channel::OutboundMessage>(64);
 
     spawn_agent_tasks(
         receivers,

@@ -2128,6 +2128,23 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "ru" => "ID сессии: {id}\nЗаголовок: {title}",
     );
 
+    // -- Tool / model auto-download notifications --
+    msg!("bge_model_downloaded",
+        "en" => "[system] BGE embedding model downloaded. Please restart gateway to enable semantic memory search.",
+        "zh" => "[系统] BGE 向量模型下载完成，请重启 gateway 以启用语义搜索。",
+        "ja" => "[システム] BGE埋め込みモデルのダウンロードが完了しました。セマンティック検索を有効にするにはゲートウェイを再起動してください。",
+    );
+    msg!("bge_model_download_failed",
+        "en" => "[system] BGE model download failed: {error}\nRun `rsclaw models download` or download from https://gitfast.io",
+        "zh" => "[系统] BGE 模型下载失败: {error}\n请运行 `rsclaw models download` 或从 https://gitfast.io 下载",
+        "ja" => "[システム] BGEモデルのダウンロードに失敗: {error}\n`rsclaw models download` を実行するか https://gitfast.io からダウンロードしてください",
+    );
+    msg!("tool_missing",
+        "en" => "[system] {tool} not found. Run `rsclaw tools install {tool}`, or download from https://gitfast.io",
+        "zh" => "[系统] 未找到 {tool}，请运行 `rsclaw tools install {tool}` 或从 https://gitfast.io 下载安装",
+        "ja" => "[システム] {tool} が見つかりません。`rsclaw tools install {tool}` を実行するか https://gitfast.io からダウンロードしてください",
+    );
+
     m
 });
 

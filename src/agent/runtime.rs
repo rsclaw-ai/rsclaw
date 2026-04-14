@@ -6136,14 +6136,14 @@ impl AgentRuntime {
                 {
                     Some(p) => p,
                     None => {
-                        let msg = "Chrome/Chromium not found. Run `rsclaw tools install chromium`, download from https://gitfast.io, or set browser.chrome_path in config.";
+                        let lang = crate::i18n::default_lang();
+                        let msg = crate::i18n::t_fmt("tool_missing", lang, &[("tool", "chromium")]);
                         warn!("{}", msg);
-                        // Notify user via channel
                         if let Some(ref tx) = self.notification_tx {
                             let _ = tx.send(crate::channel::OutboundMessage {
                                 target_id: ctx.peer_id.clone(),
                                 is_group: false,
-                                text: format!("[tool missing] {}", msg),
+                                text: msg.clone(),
                                 reply_to: None,
                                 images: vec![],
                                 files: vec![],

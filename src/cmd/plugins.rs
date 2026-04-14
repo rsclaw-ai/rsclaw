@@ -248,8 +248,11 @@ fn plugins_doctor() -> Result<()> {
     ];
 
     println!("  {}:", bold("Runtimes"));
+    let tools_base = crate::config::loader::base_dir().join("tools");
     for (bin, label) in &runtimes {
-        match which::which(bin) {
+        // Check tools dir first
+        let tools_bin = tools_base.join(bin).join("bin").join(bin);
+        match if tools_bin.exists() { Ok(tools_bin) } else { which::which(bin) } {
             Ok(path) => {
                 // Try to get version
                 let version = std::process::Command::new(bin)
