@@ -227,68 +227,11 @@ const ZH_TOOL_WEB_BROWSER: &str = r#"# web_browser 使用指南
 
 const ZH_TOOL_EXEC: &str = r#"# exec 使用指南
 
-- 安装工具优先用 `rsclaw tools install <name>` (chromium/ffmpeg/node/python/sherpa-onnx)
-
-## 跨平台注意事项
-- macOS 用 `brew install`，Linux 用 `apt/yum`，Windows 用 `winget` 或 `choco`
-- Windows 优先用 PowerShell
-
-## Windows 软件安装（优先级：winget > choco > 手动下载）
-
-### Python
-```powershell
-winget install Python.Python.3.12 --accept-package-agreements --accept-source-agreements
-# 或: choco install python3 -y
-```
-
-### Chrome
-```powershell
-winget install Google.Chrome --accept-package-agreements --accept-source-agreements
-# 或: choco install googlechrome -y
-# 或手动下载: https://www.google.cn/chrome/ (国内) / https://www.google.com/chrome/ (海外)
-```
-
-### Node.js
-```powershell
-winget install OpenJS.NodeJS.LTS --accept-package-agreements --accept-source-agreements
-```
-
-### Git
-```powershell
-winget install Git.Git --accept-package-agreements --accept-source-agreements
-# 或: choco install git -y
-# 或手动下载: https://registry.npmmirror.com/-/binary/git-for-windows/ (国内镜像)
-```
-
-### 包管理器（choco）
-```powershell
-Set-ExecutionPolicy Bypass -Scope Process -Force
-[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-```
-
-## macOS 软件安装
-```bash
-brew install python3 git && brew install --cask google-chrome && brew install node
-```
-
-## Git 常用操作
-```bash
-git config --global user.name "用户名"
-git config --global user.email "邮箱"
-git clone <repo_url>
-git add . && git commit -m "消息" && git push
-```
-
-## 安装后验证
-```bash
-python3 --version && node --version && git --version
-```
-
-## 禁止事项
-- 不要下载来源不明的安装包
-- 不要关闭系统安全防护
-- 安装失败时先检查是否需要管理员权限
+- 只在用户明确要求时才执行命令
+- 执行前确认操作系统（macOS/Linux/Windows）
+- 命令失败时不要重复尝试同样的命令，换一种方式或告知用户
+- Windows 用 PowerShell，macOS/Linux 用 bash
+- 不要执行危险命令（rm -rf、格式化、关闭防火墙等）
 "#;
 
 // -- Tool prompts (English) --------------------------------------------------
@@ -321,56 +264,9 @@ const EN_TOOL_WEB_BROWSER: &str = r#"# web_browser Usage Guide
 
 const EN_TOOL_EXEC: &str = r#"# exec Usage Guide
 
-- Prefer `rsclaw tools install <name>` for chromium/ffmpeg/node/python/sherpa-onnx
-
-## Cross-Platform
-- macOS: `brew install`, Linux: `apt/yum`, Windows: `winget` or `choco`
-- Windows: prefer PowerShell
-
-## Windows Software Installation (priority: winget > choco > manual)
-
-### Python
-```powershell
-winget install Python.Python.3.12 --accept-package-agreements --accept-source-agreements
-```
-
-### Chrome
-```powershell
-winget install Google.Chrome --accept-package-agreements --accept-source-agreements
-```
-
-### Node.js
-```powershell
-winget install OpenJS.NodeJS.LTS --accept-package-agreements --accept-source-agreements
-```
-
-### Git
-```powershell
-winget install Git.Git --accept-package-agreements --accept-source-agreements
-```
-
-### Chocolatey (package manager)
-```powershell
-Set-ExecutionPolicy Bypass -Scope Process -Force
-[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-```
-
-## macOS
-```bash
-brew install python3 git && brew install --cask google-chrome && brew install node
-```
-
-## Git basics
-```bash
-git config --global user.name "Name"
-git config --global user.email "email"
-git clone <repo_url>
-git add . && git commit -m "message" && git push
-```
-
-## Always verify after install
-```bash
-python3 --version && node --version && git --version
-```
+- Only execute commands when the user explicitly asks
+- Detect OS first (macOS/Linux/Windows) before running platform-specific commands
+- If a command fails, do NOT retry the same command — try a different approach or inform the user
+- Windows: use PowerShell. macOS/Linux: use bash
+- Never run dangerous commands (rm -rf, format, disable firewall, etc.)
 "#;
