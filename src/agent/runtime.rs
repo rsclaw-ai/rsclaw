@@ -6102,27 +6102,37 @@ impl AgentRuntime {
 
         let bs = browser.as_mut().unwrap();
 
-        // Use Bing as the browser search engine.
+        // Use Baidu (Chinese) or Google (others) as browser search fallback.
+        // Bing triggers CAPTCHA too aggressively.
         let lang = self.config.raw.gateway.as_ref()
             .and_then(|g| g.language.as_deref())
             .unwrap_or("");
         let is_zh = lang.to_lowercase().starts_with("zh")
             || lang.to_lowercase().starts_with("chinese");
-        let bing_host = if is_zh { "cn.bing.com" } else { "www.bing.com" };
-        let url = format!("https://{bing_host}/search?q={}", urlencoding::encode(query));
+        let (url, result_selector) = if is_zh {
+            (
+                format!("https://www.baidu.com/s?wd={}", urlencoding::encode(query)),
+                ".result.c-container",
+            )
+        } else {
+            (
+                format!("https://www.google.com/search?q={}", urlencoding::encode(query)),
+                "div.g",
+            )
+        };
 
         bs.execute("open", &json!({"url": url})).await?;
 
         // Wait for results to load.
-        let _ = bs.execute("wait", &json!({"target": "element", "value": ".b_algo", "timeout": 10})).await;
+        let _ = bs.execute("wait", &json!({"target": "element", "value": result_selector, "timeout": 10})).await;
 
-        // Extract search results via JS.
+        // Extract search results via JS (generic: works for Baidu and Google).
         let js = format!(r#"(function(){{
             var results = [];
-            var items = document.querySelectorAll('.b_algo');
+            var items = document.querySelectorAll('{result_selector}');
             for (var i = 0; i < Math.min(items.length, {limit}); i++) {{
                 var a = items[i].querySelector('a');
-                var p = items[i].querySelector('p');
+                var p = items[i].querySelector('p, .c-abstract, span.st, div[data-sncf]');
                 if (a) {{
                     results.push({{
                         title: a.innerText || '',
