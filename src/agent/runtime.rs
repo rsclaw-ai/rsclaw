@@ -8997,6 +8997,7 @@ fn build_system_prompt(
              - For code generation: write complete files, one module at a time.\n\
              - Use edit tool for small changes to existing files.\n\
              - For cron jobs: use the `cron` tool (action=list/add/remove). The `cron` tool is a first-class tool — always use it instead of trying to invoke a `cron` shell command.\n\
+             - To install tools (chromium/ffmpeg/node/python/sherpa-onnx), use `rsclaw tools install <name>` instead of brew/apt/winget.\n\
              - Never fabricate URLs or file paths — only use data from real sources.{tools_hint}\n\n\
              ## Self-Evolution — Auto Skill Creation\n\
              When you notice a task pattern repeating (>=3 similar requests), package it as a standard skill after completing the task:\n\

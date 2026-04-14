@@ -227,6 +227,8 @@ const ZH_TOOL_WEB_BROWSER: &str = r#"# web_browser 使用指南
 
 const ZH_TOOL_EXEC: &str = r#"# exec 使用指南
 
+- 安装工具优先用 `rsclaw tools install <name>` (chromium/ffmpeg/node/python/sherpa-onnx)
+
 ## 跨平台注意事项
 - macOS 用 `brew install`，Linux 用 `apt/yum`，Windows 用 `winget` 或 `choco`
 - Windows 优先用 PowerShell
@@ -318,6 +320,8 @@ const EN_TOOL_WEB_BROWSER: &str = r#"# web_browser Usage Guide
 "#;
 
 const EN_TOOL_EXEC: &str = r#"# exec Usage Guide
+
+- Prefer `rsclaw tools install <name>` for chromium/ffmpeg/node/python/sherpa-onnx
 
 ## Cross-Platform
 - macOS: `brew install`, Linux: `apt/yum`, Windows: `winget` or `choco`

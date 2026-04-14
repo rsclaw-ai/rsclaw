@@ -310,7 +310,9 @@ fn resolve_download_url(
     }
 
     // Fallback: construct URL from mirror base + tool conventions
-    let section = manifest.get(tool)?;
+    // manifest keys use underscores (sherpa_onnx), tool names use hyphens (sherpa-onnx)
+    let manifest_key = tool.replace('-', "_");
+    let section = manifest.get(&manifest_key).or_else(|| manifest.get(tool))?;
 
     match tool {
         "chromium" => {
@@ -360,7 +362,15 @@ fn resolve_download_url(
         }
         "sherpa-onnx" => {
             let ver = section.get("version")?.as_str()?;
-            Some(format!("{MIRROR_BASE}/sherpa-onnx/{ver}/"))
+            let filename = match platform {
+                "linux-x64" => format!("sherpa-onnx-v{ver}-linux-x64-shared-lib.tar.bz2"),
+                "linux-arm64" => format!("sherpa-onnx-v{ver}-linux-aarch64-shared-cpu-lib.tar.bz2"),
+                "mac-x64" => format!("sherpa-onnx-v{ver}-osx-x64-shared-lib.tar.bz2"),
+                "mac-arm64" => format!("sherpa-onnx-v{ver}-osx-arm64-shared-lib.tar.bz2"),
+                "win-x64" => format!("sherpa-onnx-v{ver}-win-x64-shared-MT-Release-lib.tar.bz2"),
+                _ => return None,
+            };
+            Some(format!("{MIRROR_BASE}/sherpa-onnx/{ver}/{filename}"))
         }
         _ => None,
     }
@@ -415,6 +425,8 @@ async fn download_and_extract(
         extract_tar_xz(&tmp_path, dest)?;
     } else if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
         extract_tar_gz(&tmp_path, dest)?;
+    } else if url.ends_with(".tar.bz2") {
+        extract_tar_bz2(&tmp_path, dest)?;
     } else {
         // Unknown format — move the raw file
         std::fs::rename(&tmp_path, dest.join(filename))?;
@@ -478,6 +490,13 @@ fn extract_tar_gz(archive_path: &std::path::Path, dest: &std::path::Path) -> Res
     let buf = std::io::BufReader::new(file);
     let gz_reader = flate2::read::GzDecoder::new(buf);
     extract_tar(gz_reader, dest)
+}
+
+fn extract_tar_bz2(archive_path: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    let file = std::fs::File::open(archive_path)?;
+    let buf = std::io::BufReader::new(file);
+    let bz2_reader = bzip2::read::BzDecoder::new(buf);
+    extract_tar(bz2_reader, dest)
 }
 
 fn extract_tar<R: std::io::Read>(reader: R, dest: &std::path::Path) -> Result<()> {
