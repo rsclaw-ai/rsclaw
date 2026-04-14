@@ -9675,7 +9675,7 @@ fn build_tool_list(
     // Document creation & editing tool.
     tools.push(ToolDef {
         name: "doc".to_owned(),
-        description: "Create, edit, and read Office documents. Actions: create_excel (.xlsx), create_word (.docx), create_pdf (.pdf), create_ppt (.pptx), edit_excel (modify existing .xlsx), edit_word (modify existing .docx), read_doc (extract text from .xlsx/.docx/.pdf). Files are relative to workspace.".to_owned(),
+        description: "Create, edit, and read Office documents. Actions: create_excel, create_word, create_pdf, create_ppt, edit_excel, edit_word, read_doc. To edit PDF/PPT: use read_doc to read content, then re-create with create_pdf/create_ppt. Files are relative to workspace.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
