@@ -5218,6 +5218,31 @@ fn start_feishu_if_configured(
                             }
                         }
                     }
+                    // Fast preparse bypass: /clear, /status etc. skip per-user queue
+                    if is_fast_preparse(&text) {
+                        let handle = if let Some(ref agent_id) = bound {
+                            match reg.get(agent_id) {
+                                Ok(h) => h,
+                                Err(_) => match reg.route_account("feishu", None) {
+                                    Ok(h) => h,
+                                    Err(_) => return,
+                                },
+                            }
+                        } else {
+                            match reg.route_account("feishu", None) {
+                                Ok(h) => h,
+                                Err(_) => return,
+                            }
+                        };
+                        if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                            reply.target_id = chat_id.clone();
+                            reply.is_group = is_group;
+                            if !reply.text.is_empty() || !reply.images.is_empty() {
+                                let _ = tx.send(reply).await;
+                            }
+                        }
+                        return;
+                    }
                     // Get or create a per-user queue.
                     let user_tx = {
                         let mut map = queues.lock().await;

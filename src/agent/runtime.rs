@@ -2806,6 +2806,21 @@ impl AgentRuntime {
 
         loop {
             iteration += 1;
+            // Check abort flag at start of each iteration (allows /abort to
+            // interrupt even when tool dispatch is blocking between LLM calls).
+            if abort_flag.load(Ordering::SeqCst) {
+                abort_flag.store(false, Ordering::SeqCst);
+                info!(session = %ctx.session_key, iteration, "agent_loop: aborted by user");
+                return Ok(AgentReply {
+                    text: "[aborted]".to_string(),
+                    is_empty: false,
+                    tool_calls: None,
+                    images: vec![],
+                    files: vec![],
+                    pending_analysis: None,
+                    was_preparse: false,
+                });
+            }
             if iteration > MAX_ITERATIONS {
                 warn!(
                     session = %ctx.session_key,
