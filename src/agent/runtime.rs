@@ -9672,24 +9672,26 @@ fn build_tool_list(
         }),
     });
 
-    // Document creation tool.
+    // Document creation & editing tool.
     tools.push(ToolDef {
         name: "doc".to_owned(),
-        description: "Create Office documents. Actions: create_excel (.xlsx), create_word (.docx), create_pdf (.pdf), create_ppt (.pptx). Files are written to the workspace.".to_owned(),
+        description: "Create, edit, and read Office documents. Actions: create_excel (.xlsx), create_word (.docx), create_pdf (.pdf), create_ppt (.pptx), edit_excel (modify existing .xlsx), edit_word (modify existing .docx), read_doc (extract text from .xlsx/.docx/.pdf). Files are relative to workspace.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "action":  {"type": "string", "enum": ["create_excel", "create_word", "create_pdf", "create_ppt"], "description": "Document type to create"},
-                "path":    {"type": "string", "description": "Output file path relative to workspace, e.g. 'report.xlsx'"},
+                "action":  {"type": "string", "enum": ["create_excel", "create_word", "create_pdf", "create_ppt", "edit_excel", "edit_word", "read_doc"], "description": "Action to perform"},
+                "path":    {"type": "string", "description": "File path relative to workspace, e.g. 'report.xlsx'"},
                 "title":   {"type": "string", "description": "Document title (optional, for word/pdf)"},
-                "sheets":  {"type": "array", "description": "For create_excel: [{name, headers: [str], rows: [[value]]}]",
+                "sheets":  {"type": "array", "description": "For create_excel/edit_excel: [{name, headers: [str], rows: [[value]]}]. For edit_excel, matching sheet names replace existing sheets; new names add sheets.",
                     "items": {"type": "object", "properties": {
                         "name":    {"type": "string"},
                         "headers": {"type": "array", "items": {"type": "string"}},
                         "rows":    {"type": "array", "items": {"type": "array"}}
                     }}
                 },
-                "content": {"type": "string", "description": "For create_word/create_pdf: text content. Paragraphs separated by blank lines. Lines starting with # are headings."},
+                "append_rows": {"description": "For edit_excel: append rows to existing sheet. Either {sheet, rows: [[value]]} or [{sheet, rows}]"},
+                "content": {"type": "string", "description": "For create_word/create_pdf: text content. For edit_word: replacement content (replaces entire document). Paragraphs separated by blank lines. Lines starting with # are headings."},
+                "append":  {"type": "string", "description": "For edit_word: text to append to existing document. Paragraphs separated by blank lines. Lines starting with # are headings."},
                 "slides":  {"type": "array", "description": "For create_ppt: [{title, body}]",
                     "items": {"type": "object", "properties": {
                         "title": {"type": "string"},

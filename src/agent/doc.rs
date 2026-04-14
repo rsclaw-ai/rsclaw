@@ -1,10 +1,13 @@
-//! Built-in `doc` tool — create Office documents natively.
+//! Built-in `doc` tool — create & edit Office documents natively.
 //!
 //! Supported actions:
 //!   - create_excel (.xlsx) via rust_xlsxwriter
 //!   - create_word  (.docx) via docx-rs
 //!   - create_pdf   (.pdf)  via genpdf
 //!   - create_ppt   (.pptx) via zip + OOXML templates
+//!   - edit_excel   (.xlsx) read existing + merge changes via calamine + rust_xlsxwriter
+//!   - edit_word    (.docx) read existing + append/replace via zip XML manipulation
+//!   - read_doc     (.xlsx/.docx/.pdf) extract text content for inspection
 
 use std::path::Path;
 
@@ -30,6 +33,9 @@ pub async fn handle(args: &Value, full_path: &Path) -> Result<Value> {
         "create_word" => create_word(&args, &path),
         "create_pdf" => create_pdf(&args, &path),
         "create_ppt" => create_ppt(&args, &path),
+        "edit_excel" => edit_excel(&args, &path),
+        "edit_word" => edit_word(&args, &path),
+        "read_doc" => read_doc(&path),
         other => Ok(json!({"error": format!("doc: unknown action '{other}'")})),
     })
     .await
@@ -390,6 +396,458 @@ fn create_ppt(args: &Value, path: &Path) -> Result<Value> {
         "path": path.display().to_string(),
         "format": "pptx",
         "slides": slide_data.len(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Edit Excel (.xlsx) — read existing + merge changes
+// ---------------------------------------------------------------------------
+
+fn edit_excel(args: &Value, path: &Path) -> Result<Value> {
+    use calamine::{Reader, open_workbook, Xlsx, Data};
+    use rust_xlsxwriter::*;
+
+    let mut wb_reader: Xlsx<_> = open_workbook(path)
+        .map_err(|e| anyhow!("edit_excel: cannot open '{}': {e}", path.display()))?;
+
+    // Read all existing sheets into memory: Vec<(name, headers_opt, rows)>.
+    let sheet_names: Vec<String> = wb_reader.sheet_names().to_vec();
+    let mut existing: Vec<(String, Vec<Vec<String>>)> = Vec::new();
+    for name in &sheet_names {
+        let range = wb_reader
+            .worksheet_range(name)
+            .map_err(|e| anyhow!("edit_excel: cannot read sheet '{name}': {e}"))?;
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        for row in range.rows() {
+            let cells: Vec<String> = row
+                .iter()
+                .map(|c| match c {
+                    Data::Empty => String::new(),
+                    Data::String(s) => s.clone(),
+                    Data::Float(f) => f.to_string(),
+                    Data::Int(i) => i.to_string(),
+                    Data::Bool(b) => b.to_string(),
+                    Data::DateTime(dt) => dt.to_string(),
+                    Data::DateTimeIso(s) => s.clone(),
+                    Data::DurationIso(s) => s.clone(),
+                    Data::Error(e) => format!("{e:?}"),
+                })
+                .collect();
+            rows.push(cells);
+        }
+        existing.push((name.clone(), rows));
+    }
+
+    // Build a new workbook merging existing data with edits.
+    let mut workbook = Workbook::new();
+    let header_fmt = Format::new().set_bold();
+
+    // Apply "sheets" param: if a sheet name matches existing, replace it; otherwise add new.
+    let new_sheets = args["sheets"].as_array();
+    let mut replaced: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    if let Some(new_sheets) = new_sheets {
+        for sd in new_sheets {
+            let name = sd["name"].as_str().unwrap_or("Sheet");
+            replaced.insert(name.to_owned());
+        }
+    }
+
+    // Apply "append_rows": map sheet_name -> rows to append.
+    let mut appends: std::collections::HashMap<String, Vec<Vec<Value>>> =
+        std::collections::HashMap::new();
+    if let Some(ar) = args["append_rows"].as_object() {
+        let sheet_name = ar.get("sheet").and_then(|s| s.as_str()).unwrap_or("Sheet1");
+        if let Some(rows) = ar.get("rows").and_then(|r| r.as_array()) {
+            let parsed: Vec<Vec<Value>> = rows
+                .iter()
+                .filter_map(|r| r.as_array().cloned())
+                .collect();
+            appends.insert(sheet_name.to_owned(), parsed);
+        }
+    }
+    // Also support append_rows as array of {sheet, rows} objects.
+    if let Some(arr) = args["append_rows"].as_array() {
+        for item in arr {
+            let sheet_name = item["sheet"].as_str().unwrap_or("Sheet1");
+            if let Some(rows) = item["rows"].as_array() {
+                let parsed: Vec<Vec<Value>> = rows
+                    .iter()
+                    .filter_map(|r| r.as_array().cloned())
+                    .collect();
+                appends
+                    .entry(sheet_name.to_owned())
+                    .or_default()
+                    .extend(parsed);
+            }
+        }
+    }
+
+    // Write existing sheets (not replaced).
+    for (name, rows) in &existing {
+        if replaced.contains(name) {
+            continue;
+        }
+        let ws = workbook.add_worksheet();
+        ws.set_name(name)?;
+        for (r, row) in rows.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                // Try to write as number if possible.
+                if let Ok(n) = cell.parse::<f64>() {
+                    ws.write_number(r as u32, c as u16, n)?;
+                } else if r == 0 {
+                    ws.write_string_with_format(r as u32, c as u16, cell, &header_fmt)?;
+                } else {
+                    ws.write_string(r as u32, c as u16, cell)?;
+                }
+            }
+        }
+        // Append rows if any.
+        if let Some(extra_rows) = appends.get(name) {
+            let start_row = rows.len() as u32;
+            for (r, row) in extra_rows.iter().enumerate() {
+                for (c, cell) in row.iter().enumerate() {
+                    let row_idx = start_row + r as u32;
+                    let col_idx = c as u16;
+                    match cell {
+                        Value::Number(n) => {
+                            ws.write_number(row_idx, col_idx, n.as_f64().unwrap_or(0.0))?;
+                        }
+                        Value::Bool(b) => {
+                            ws.write_boolean(row_idx, col_idx, *b)?;
+                        }
+                        _ => {
+                            ws.write_string(
+                                row_idx,
+                                col_idx,
+                                cell.as_str()
+                                    .unwrap_or(&cell.to_string().trim_matches('"').to_owned()),
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Write replaced / new sheets from "sheets" param.
+    if let Some(new_sheets) = args["sheets"].as_array() {
+        for sheet_def in new_sheets {
+            let name = sheet_def["name"].as_str().unwrap_or("Sheet");
+            let ws = workbook.add_worksheet();
+            ws.set_name(name)?;
+
+            if let Some(headers) = sheet_def["headers"].as_array() {
+                for (col, h) in headers.iter().enumerate() {
+                    ws.write_string_with_format(
+                        0,
+                        col as u16,
+                        h.as_str().unwrap_or(""),
+                        &header_fmt,
+                    )?;
+                }
+            }
+            if let Some(rows) = sheet_def["rows"].as_array() {
+                for (r, row) in rows.iter().enumerate() {
+                    if let Some(cells) = row.as_array() {
+                        for (c, cell) in cells.iter().enumerate() {
+                            let row_idx = (r + 1) as u32;
+                            let col_idx = c as u16;
+                            match cell {
+                                Value::Number(n) => {
+                                    ws.write_number(
+                                        row_idx,
+                                        col_idx,
+                                        n.as_f64().unwrap_or(0.0),
+                                    )?;
+                                }
+                                Value::Bool(b) => {
+                                    ws.write_boolean(row_idx, col_idx, *b)?;
+                                }
+                                _ => {
+                                    ws.write_string(
+                                        row_idx,
+                                        col_idx,
+                                        cell.as_str()
+                                            .unwrap_or(&cell.to_string().trim_matches('"').to_owned()),
+                                    )?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Handle append_rows for sheets that were newly created via "sheets" param
+    // (already written above for existing sheets).
+
+    workbook.save(path)?;
+    Ok(json!({
+        "edited": true,
+        "path": path.display().to_string(),
+        "format": "xlsx",
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Edit Word (.docx) — read existing + append/replace content
+// ---------------------------------------------------------------------------
+
+fn edit_word(args: &Value, path: &Path) -> Result<Value> {
+    use std::io::{Read as IoRead, Write};
+
+    let append_text = args["append"].as_str();
+    let replace_text = args["content"].as_str();
+
+    if append_text.is_none() && replace_text.is_none() {
+        return Err(anyhow!(
+            "edit_word: either `append` or `content` parameter required"
+        ));
+    }
+
+    if replace_text.is_some() {
+        // Full replacement: just create a new doc with the given content.
+        let title = args["title"].as_str().unwrap_or("");
+        let mut new_args = args.clone();
+        new_args["content"] = Value::String(replace_text.unwrap().to_owned());
+        if !title.is_empty() {
+            new_args["title"] = Value::String(title.to_owned());
+        }
+        create_word(&new_args, path)?;
+        return Ok(json!({
+            "edited": true,
+            "path": path.display().to_string(),
+            "format": "docx",
+            "mode": "replace",
+        }));
+    }
+
+    // Append mode: read existing document.xml from the zip, add paragraphs, repack.
+    let append_text = append_text.unwrap();
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| anyhow!("edit_word: cannot open '{}': {e}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| anyhow!("edit_word: invalid docx zip: {e}"))?;
+
+    // Read all entries into memory.
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        let name = entry.name().to_owned();
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf)?;
+        entries.push((name, buf));
+    }
+
+    // Build new paragraphs XML to append.
+    let mut new_paras = String::new();
+    for block in append_text.split("\n\n") {
+        let block = block.trim();
+        if block.is_empty() {
+            continue;
+        }
+        let escaped = xml_escape(block);
+        if block.starts_with("### ") {
+            let text = xml_escape(&block[4..]);
+            new_paras.push_str(&format!(
+                r#"<w:p><w:pPr><w:pStyle w:val="Heading3"/></w:pPr><w:r><w:rPr><w:b/></w:rPr><w:t>{text}</w:t></w:r></w:p>"#
+            ));
+        } else if block.starts_with("## ") {
+            let text = xml_escape(&block[3..]);
+            new_paras.push_str(&format!(
+                r#"<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:rPr><w:b/></w:rPr><w:t>{text}</w:t></w:r></w:p>"#
+            ));
+        } else if block.starts_with("# ") {
+            let text = xml_escape(&block[2..]);
+            new_paras.push_str(&format!(
+                r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:rPr><w:b/></w:rPr><w:t>{text}</w:t></w:r></w:p>"#
+            ));
+        } else {
+            new_paras.push_str(&format!(
+                r#"<w:p><w:r><w:t>{escaped}</w:t></w:r></w:p>"#
+            ));
+        }
+    }
+
+    // Rewrite the zip with modified document.xml.
+    let out_file = std::fs::File::create(path)?;
+    let mut writer = zip::ZipWriter::new(out_file);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    for (name, data) in &entries {
+        writer.start_file(name, opts)?;
+        if name == "word/document.xml" {
+            // Insert new paragraphs before the closing </w:body> tag.
+            let xml = String::from_utf8_lossy(data);
+            if let Some(pos) = xml.rfind("</w:body>") {
+                let (before, after) = xml.split_at(pos);
+                let modified = format!("{before}{new_paras}{after}");
+                writer.write_all(modified.as_bytes())?;
+            } else {
+                // Fallback: write as-is if structure not found.
+                writer.write_all(data)?;
+            }
+        } else {
+            writer.write_all(data)?;
+        }
+    }
+    writer.finish()?;
+
+    Ok(json!({
+        "edited": true,
+        "path": path.display().to_string(),
+        "format": "docx",
+        "mode": "append",
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Read document — extract text from xlsx/docx/pdf
+// ---------------------------------------------------------------------------
+
+fn read_doc(path: &Path) -> Result<Value> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    match ext.as_str() {
+        "xlsx" | "xls" => read_excel(path),
+        "docx" => read_docx(path),
+        "pdf" => read_pdf(path),
+        other => Err(anyhow!(
+            "read_doc: unsupported format '.{other}'. Supported: xlsx, docx, pdf"
+        )),
+    }
+}
+
+fn read_excel(path: &Path) -> Result<Value> {
+    use calamine::{Reader, open_workbook, Xlsx, Data};
+
+    let mut wb: Xlsx<_> = open_workbook(path)
+        .map_err(|e| anyhow!("read_doc: cannot open '{}': {e}", path.display()))?;
+
+    let sheet_names: Vec<String> = wb.sheet_names().to_vec();
+    let mut sheets_out = Vec::new();
+
+    for name in &sheet_names {
+        let range = wb
+            .worksheet_range(name)
+            .map_err(|e| anyhow!("read_doc: cannot read sheet '{name}': {e}"))?;
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        for row in range.rows() {
+            let cells: Vec<String> = row
+                .iter()
+                .map(|c| match c {
+                    Data::Empty => String::new(),
+                    Data::String(s) => s.clone(),
+                    Data::Float(f) => f.to_string(),
+                    Data::Int(i) => i.to_string(),
+                    Data::Bool(b) => b.to_string(),
+                    Data::DateTime(dt) => dt.to_string(),
+                    Data::DateTimeIso(s) => s.clone(),
+                    Data::DurationIso(s) => s.clone(),
+                    Data::Error(e) => format!("{e:?}"),
+                })
+                .collect();
+            rows.push(cells);
+        }
+        sheets_out.push(json!({
+            "name": name,
+            "rows": rows,
+            "row_count": rows.len(),
+        }));
+    }
+
+    Ok(json!({
+        "path": path.display().to_string(),
+        "format": "xlsx",
+        "sheets": sheets_out,
+    }))
+}
+
+fn read_docx(path: &Path) -> Result<Value> {
+    use std::io::Read as IoRead;
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| anyhow!("read_doc: cannot open '{}': {e}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| anyhow!("read_doc: invalid docx zip: {e}"))?;
+
+    let mut xml = String::new();
+    if let Ok(mut entry) = archive.by_name("word/document.xml") {
+        entry.read_to_string(&mut xml)?;
+    } else {
+        return Err(anyhow!("read_doc: word/document.xml not found in docx"));
+    }
+
+    // Extract text from <w:t> tags.
+    let mut text = String::new();
+
+    // Simple XML text extraction: find all <w:t ...>...</w:t> segments.
+    let mut remaining = xml.as_str();
+    while let Some(pos) = remaining.find("<w:p ").or_else(|| remaining.find("<w:p>")) {
+        remaining = &remaining[pos..];
+        // Find end of paragraph.
+        if let Some(end) = remaining.find("</w:p>") {
+            let para_xml = &remaining[..end];
+            let mut para_content = String::new();
+            // Extract <w:t> contents.
+            let mut inner = para_xml;
+            while let Some(t_start) = inner.find("<w:t").map(|p| {
+                // Skip to after the closing > of <w:t> or <w:t ...>
+                inner[p..].find('>').map(|g| p + g + 1)
+            }).flatten() {
+                inner = &inner[t_start..];
+                if let Some(t_end) = inner.find("</w:t>") {
+                    para_content.push_str(&inner[..t_end]);
+                    inner = &inner[t_end + 6..];
+                } else {
+                    break;
+                }
+            }
+            if !para_content.is_empty() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&para_content);
+            }
+            remaining = &remaining[end + 6..];
+        } else {
+            break;
+        }
+    }
+
+    // Unescape XML entities.
+    let text = text
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'");
+
+    Ok(json!({
+        "path": path.display().to_string(),
+        "format": "docx",
+        "text": text,
+        "length": text.len(),
+    }))
+}
+
+fn read_pdf(path: &Path) -> Result<Value> {
+    let text = pdf_extract::extract_text(path)
+        .map_err(|e| anyhow!("read_doc: pdf extract failed for '{}': {e}", path.display()))?;
+
+    Ok(json!({
+        "path": path.display().to_string(),
+        "format": "pdf",
+        "text": text,
+        "length": text.len(),
     }))
 }
 
