@@ -268,14 +268,16 @@ const ZH_TOOL_WEB_BROWSER: &str = r#"# web_browser 使用指南
 - 提取图片URL（过滤 UI 小图标，只取 naturalWidth > 200 的大图）：
   `action: "evaluate"`, `js: "(function(){var r=[];document.querySelectorAll('img').forEach(function(i){var s=i.src||i.dataset.src||'';if(s&&s.startsWith('http')&&i.naturalWidth>200)r.push(s);});document.querySelectorAll('*').forEach(function(e){var bg=getComputedStyle(e).backgroundImage;if(bg&&bg!=='none'&&e.offsetWidth>200){var m=bg.match(/url\\(\"?(https?[^\"\\)]+)/);if(m)r.push(m[1]);}});return JSON.stringify([...new Set(r)]);})()"`
 - 提取链接：`action: "evaluate"`, `js: "Array.from(document.querySelectorAll('a')).map(a=>({href:a.href,text:a.innerText}))"`
-- 下载图片：用 `exec` (curl -o /tmp/img.jpg "URL") 下载到本地，再用 send_file 发给用户
+- 下载图片/文件：用 `web_download` 下载（需要登录的资源加 use_browser_cookies=true），再用 send_file 发给用户
 - 截图：`action: "screenshot"` 截取当前页面
+- **重要**：生成图片/文件后，必须提取 URL → web_download 下载 → send_file 发给用户，不要只回复"已生成"
 
 ## 禁止事项
 - 不要跳过 open 直接操作
 - 不要使用过期的 ref（页面变化后必须重新 snapshot）
 - 不要在 about:blank 页面上操作
 - 不要在提交后立即提取结果，必须等待页面加载完成
+- 不要只说"图片已生成"而不下载发送给用户
 - 绝对不要编造图片 URL
 "#;
 
@@ -308,12 +310,14 @@ const EN_TOOL_WEB_BROWSER: &str = r#"# web_browser Usage Guide
 - Images (filter UI icons, only naturalWidth > 200):
   `action: "evaluate"`, `js: "(function(){var r=[];document.querySelectorAll('img').forEach(function(i){var s=i.src||i.dataset.src||'';if(s&&s.startsWith('http')&&i.naturalWidth>200)r.push(s);});return JSON.stringify([...new Set(r)]);})()"`
 - Links: `action: "evaluate"`, `js: "Array.from(document.querySelectorAll('a')).map(a=>({href:a.href,text:a.innerText}))"`
-- Download images: `exec` (curl -o /tmp/img.jpg "URL"), then send_file
+- Download images/files: use `web_download` (supports browser cookies via use_browser_cookies=true), then send_file
+- IMPORTANT: after generating images/files, always extract URL → web_download → send_file to user
 
 ## Never
 - Skip open and interact on about:blank
 - Use stale refs after page changes
 - Fabricate image URLs — only use URLs extracted from the page
+- Just reply "done" without actually downloading and sending the generated content to user
 "#;
 
 const EN_TOOL_EXEC: &str = r#"# exec Usage Guide
