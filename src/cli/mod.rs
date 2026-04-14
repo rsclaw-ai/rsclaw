@@ -32,6 +32,7 @@ pub mod sessions;
 pub mod setup;
 pub mod skills;
 pub mod system;
+pub mod tools;
 pub mod webhooks;
 
 pub use acp::{AcpCommand, AgentCommand};
@@ -69,6 +70,7 @@ pub use sessions::{CleanupArgs, SessionsCommand, SessionsListArgs};
 pub use setup::{ConfigureArgs, OnboardArgs, SetupArgs};
 pub use skills::SkillsCommand;
 pub use system::{HeartbeatCommand, SystemCommand};
+pub use tools::ToolsCommand;
 pub use webhooks::WebhooksCommand;
 
 // ---------------------------------------------------------------------------
@@ -197,6 +199,10 @@ pub enum Command {
     /// System utilities.
     #[command(subcommand)]
     System(SystemCommand),
+
+    /// External tool management (chromium, ffmpeg, etc.).
+    #[command(subcommand)]
+    Tools(ToolsCommand),
 
     /// Secrets management.
     #[command(subcommand)]

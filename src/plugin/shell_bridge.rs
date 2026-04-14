@@ -178,6 +178,7 @@ impl ShellBridgePlugin {
 
 /// Resolve the JS runtime binary path.
 ///
+/// Priority: ~/.rsclaw/tools/node/ > system PATH.
 /// Preference order: `bun` > `node` > `deno` (if the manifest doesn't specify).
 fn resolve_runtime(runtime: &str) -> Result<String> {
     let candidates = match runtime {
@@ -187,15 +188,39 @@ fn resolve_runtime(runtime: &str) -> Result<String> {
         other => vec![other],
     };
 
-    for candidate in candidates {
+    // 1. Check ~/.rsclaw/tools/node/ first
+    let tools_dir = crate::config::loader::base_dir().join("tools/node/bin");
+    if tools_dir.exists() {
+        for candidate in &candidates {
+            let bin = tools_dir.join(candidate);
+            if bin.exists() {
+                return Ok(bin.to_string_lossy().to_string());
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let tools_dir_win = crate::config::loader::base_dir().join("tools/node");
+        if tools_dir_win.exists() {
+            for candidate in &candidates {
+                let bin = tools_dir_win.join(format!("{candidate}.exe"));
+                if bin.exists() {
+                    return Ok(bin.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    // 2. System PATH
+    for candidate in &candidates {
         if which::which(candidate).is_ok() {
-            return Ok(candidate.to_owned());
+            return Ok(candidate.to_string());
         }
     }
 
     bail!(
         "no suitable JS runtime found for `{runtime}`. \
-         Install node, bun, or deno and ensure it is on PATH."
+         Run `rsclaw tools install node`, download from https://gitfast.io, or install node/bun/deno manually."
     )
 }
 

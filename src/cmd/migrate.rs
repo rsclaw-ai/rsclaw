@@ -316,6 +316,14 @@ fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()> {
             stats.errors += 1;
         }
     }
+    match openclaw::convert_heartbeat(&default_workspace, &rsclaw_default_workspace) {
+        Ok(true) => stats.workspace_files += 1,
+        Err(e) => {
+            warn_msg(&format!("failed to convert HEARTBEAT.md: {e}"));
+            stats.errors += 1;
+        }
+        _ => {}
+    }
     match openclaw::copy_skills(&default_workspace, &rsclaw_default_workspace) {
         Ok(n) => stats.skills += n,
         Err(e) => {
@@ -368,6 +376,14 @@ fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()> {
                     stats.errors += 1;
                 }
             }
+            match openclaw::convert_heartbeat(&src_workspace, &dst_workspace) {
+                Ok(true) => stats.workspace_files += 1,
+                Err(e) => {
+                    warn_msg(&format!("failed to convert HEARTBEAT.md for {agent_id}: {e}"));
+                    stats.errors += 1;
+                }
+                _ => {}
+            }
         }
     }
 
@@ -387,6 +403,14 @@ fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()> {
                             stats.errors += 1;
                         }
                     }
+                }
+                match openclaw::convert_heartbeat(&path, &dst) {
+                    Ok(true) => stats.workspace_files += 1,
+                    Err(e) => {
+                        warn_msg(&format!("failed to convert HEARTBEAT.md for {name}: {e}"));
+                        stats.errors += 1;
+                    }
+                    _ => {}
                 }
             }
         }

@@ -1,5 +1,6 @@
 "use client";
 
+import JSON5 from "json5";
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { ErrorBoundary } from "./error";
@@ -678,9 +679,9 @@ function ConfigEditorPage() {
   }, []);
 
   const buildRawFromFields = useCallback(() => {
-    // Parse existing config, overlay structured fields, re-serialize.
+    // Parse existing config (JSON5-safe), overlay structured fields, re-serialize.
     let cfg: any = {};
-    try { cfg = JSON.parse(rawConfig); } catch { cfg = {}; }
+    try { cfg = JSON5.parse(rawConfig); } catch { cfg = {}; }
 
     // Gateway fields
     if (!cfg.gateway) cfg.gateway = {};
@@ -1673,7 +1674,7 @@ function AgentManagerPage() {
     if (!invoke) return;
     try {
       const raw: string = await invoke("read_config_file");
-      const cfg = JSON.parse(raw || "{}");
+      const cfg = JSON5.parse(raw || "{}");
       // Auto-fix legacy string model fields in config
       let needsWrite = false;
       for (const a of (cfg.agents?.list || [])) {
@@ -1706,7 +1707,7 @@ function AgentManagerPage() {
           // Read config to extract providers and model aliases
           try {
             const raw: string = await invoke("read_config_file");
-            const cfg = JSON.parse(raw || "{}");
+            const cfg = JSON5.parse(raw || "{}");
             const models: string[] = [];
             const providers: { id: string; hasKey: boolean }[] = [];
             // Add model aliases from agents.defaults.models
@@ -1766,7 +1767,7 @@ function AgentManagerPage() {
       if (!invoke) throw new Error("Tauri not available");
       // Write agent config to JSON file
       const raw: string = await invoke("read_config_file");
-      const cfg = JSON.parse(raw || "{}");
+      const cfg = JSON5.parse(raw || "{}");
       if (!cfg.agents) cfg.agents = {};
       if (!cfg.agents.list) cfg.agents.list = [];
       // Migrate any legacy string model fields to { primary: "..." } format
@@ -1814,7 +1815,7 @@ function AgentManagerPage() {
       const invoke = isTauri ? tauriInvokeV2 : null;
       if (invoke) {
         const raw: string = await invoke("read_config_file");
-        const cfg = JSON.parse(raw || "{}");
+        const cfg = JSON5.parse(raw || "{}");
         if (cfg.agents?.list) {
           cfg.agents.list = cfg.agents.list.filter((a: any) => a.id !== id);
           await invoke("write_config", { content: JSON.stringify(cfg, null, 2) });
@@ -1866,7 +1867,7 @@ function AgentManagerPage() {
       const invoke = isTauri ? tauriInvokeV2 : null;
       if (invoke) {
         const raw = await invoke("read_config_file");
-        const cfg = JSON.parse(raw || "{}");
+        const cfg = JSON5.parse(raw || "{}");
         const agentCfg = (cfg.agents?.list || []).find((a: any) => a.id === agent.id);
         if (agentCfg) {
           if (agentCfg.name) setNewName(agentCfg.name);
@@ -2163,7 +2164,7 @@ function AgentManagerPage() {
                     const invoke = isTauri ? tauriInvokeV2 : null;
                     if (invoke) {
                       const raw: string = await invoke("read_config_file");
-                      const cfg = JSON.parse(raw || "{}");
+                      const cfg = JSON5.parse(raw || "{}");
                       const provConf = cfg?.models?.providers?.[provId] || {};
                       const apiKey = provConf.apiKey || "";
                       const baseUrl = provConf.baseUrl || undefined;
@@ -2483,7 +2484,7 @@ function SetupWizardPage() {
         let existing: any = {};
         try {
           const raw: string = await tauriInvoke("read_config_file");
-          existing = JSON.parse(raw || "{}");
+          existing = JSON5.parse(raw || "{}");
         } catch {}
         const merged = { ...newConfig };
         merged.gateway = { ...(existing.gateway || {}), ...(newConfig.gateway || {}) };
@@ -3293,7 +3294,7 @@ function TauriConfigPageInner() {
           setCfgPath(cp ? cp + "/rsclaw.json5" : "~/.rsclaw/rsclaw.json5");
           const content: string = await invoke("read_config_file");
           setRaw(content || "{}");
-          try { setConfig(JSON.parse(content || "{}")); } catch { setConfig({}); }
+          try { setConfig(JSON5.parse(content || "{}")); } catch { setConfig({}); }
         }
       } catch {}
       setLoading(false);
@@ -3381,7 +3382,7 @@ function TauriConfigPageInner() {
   };
 
   const handleSave = async () => {
-    try { JSON.parse(raw); } catch { toast.error(zh ? "JSON 格式错误" : "Invalid JSON"); return; }
+    try { JSON5.parse(raw); } catch { toast.error(zh ? "JSON5 格式错误" : "Invalid JSON5"); return; }
     setSaving(true);
     try {
       const invoke = isTauri ? tauriInvokeV2 : null;
@@ -3570,7 +3571,7 @@ function TauriConfigPageInner() {
               // Reload config to pick up token written by channel login command
               try {
                 const content: string = await tauriInvoke("read_config_file");
-                const updated = JSON.parse(content || "{}");
+                const updated = JSON5.parse(content || "{}");
                 setConfig(updated);
                 setRaw(JSON.stringify(updated, null, 2));
               } catch {}
@@ -4574,7 +4575,7 @@ function TauriConfigPageInner() {
             <textarea value={raw} spellCheck={false}
               onChange={(e) => {
                 setRaw(e.target.value); setDirty(true);
-                try { setConfig(JSON.parse(e.target.value)); setParseError(""); } catch { setParseError(zh ? "JSON \u683C\u5F0F\u9519\u8BEF" : "Invalid JSON"); }
+                try { setConfig(JSON5.parse(e.target.value)); setParseError(""); } catch { setParseError(zh ? "JSON5 \u683C\u5F0F\u9519\u8BEF" : "Invalid JSON5"); }
               }}
               style={{ width: "100%", height: "calc(100% - 50px)", background: V.bg1, border: `1px solid ${V.bd}`, borderRadius: 10, padding: "14px 16px", color: V.t0, fontFamily: V.mono, fontSize: 12, lineHeight: 1.6, outline: "none", resize: "none" }} />
             {parseError && <div style={{ fontSize: 11, color: V.red, marginTop: 6, padding: "6px 10px", background: V.rlo, border: `1px solid ${V.rbrd}`, borderRadius: 6 }}>{parseError}</div>}

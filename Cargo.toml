@@ -80,6 +80,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tokenizers = "0.21"
 qrcode = "0.14"
+xz2 = "0.1"
 zip = "2"
 rust_xlsxwriter = "0.83"
 docx-rs = "0.4"

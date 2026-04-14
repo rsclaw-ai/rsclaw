@@ -1,3 +1,4 @@
+import JSON5 from "json5";
 import { IconButton } from "./button";
 import { ErrorBoundary } from "./error";
 import styles from "./setup-wizard.module.scss";
@@ -123,7 +124,7 @@ export function SetupWizardPage() {
         let cfgLang: string | undefined;
         if (tauriInvoke) {
           const raw: string = await tauriInvoke("read_config_file");
-          const cfg = JSON.parse(raw);
+          const cfg = JSON5.parse(raw || "{}");
           cfgLang = cfg?.gateway?.language;
         } else {
           const res = await fetch("http://localhost:18888/api/v1/config");

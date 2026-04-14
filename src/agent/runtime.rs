@@ -3071,30 +3071,18 @@ impl AgentRuntime {
                                 && input != serde_json::Value::Object(Default::default())
                             {
                                 // Merge input: if last input is an empty object, replace;
-                                // if input is a string (partial args), try to merge.
+                                // if input is a string (partial args), concatenate.
+                                // Do NOT attempt real-time repair here — premature repair
+                                // converts the accumulator to an Object, causing subsequent
+                                // streaming chunks to be silently dropped (as_str() returns
+                                // None for Objects). Repair happens once at finalization.
                                 if last.2 == serde_json::Value::Object(Default::default()) {
                                     last.2 = input;
                                 } else if let (Some(existing), Some(new_str)) =
                                     (last.2.as_str(), input.as_str())
                                 {
-                                    // Merge the new delta and immediately try to repair.
-                                    // This handles cases where the model sends malformed JSON
-                                    // incrementally — repairing on each delta prevents garbage
-                                    // accumulation and catches fixable issues early.
                                     let merged = format!("{existing}{new_str}");
-                                    if let Some(repair) =
-                                        crate::agent::tool_call_repair::try_extract_usable_args(
-                                            &merged,
-                                        )
-                                    {
-                                        tracing::debug!(
-                                            repair_kind = ?repair.kind,
-                                            "streaming tool call: real-time repair succeeded"
-                                        );
-                                        last.2 = repair.args;
-                                    } else {
-                                        last.2 = serde_json::Value::String(merged);
-                                    }
+                                    last.2 = serde_json::Value::String(merged);
                                 }
                             }
                         }
@@ -3820,7 +3808,7 @@ impl AgentRuntime {
             "exec" => return self.tool_exec(args).await,
             "web_search" => return self.tool_web_search(args).await,
             "web_fetch" => return self.tool_web_fetch(args).await,
-            "web_browser" | "browser" => return self.tool_web_browser(args).await,
+            "web_browser" | "browser" => return self.tool_web_browser(ctx, args).await,
             "computer_use" => return self.tool_computer_use(args).await,
             "image" => return self.tool_image(args).await,
             "pdf" => return self.tool_pdf(args).await,
@@ -6103,7 +6091,7 @@ impl AgentRuntime {
         }
     }
 
-    async fn tool_web_browser(&self, args: Value) -> Result<Value> {
+    async fn tool_web_browser(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let action = args
             .get("action")
             .and_then(|v| v.as_str())
@@ -6142,12 +6130,29 @@ impl AgentRuntime {
             // If no session, initialize one.
             if guard.is_none() {
                 // Check Chrome availability
-                let chrome_path = wb_cfg
+                let chrome_path = match wb_cfg
                     .and_then(|b| b.chrome_path.clone())
                     .or_else(|| detect_chrome())
-                    .ok_or_else(|| anyhow!(
-                        "Chrome/Chromium not found. Install Chrome or set browser.chrome_path in config."
-                    ))?;
+                {
+                    Some(p) => p,
+                    None => {
+                        let msg = "Chrome/Chromium not found. Run `rsclaw tools install chromium`, download from https://gitfast.io, or set browser.chrome_path in config.";
+                        warn!("{}", msg);
+                        // Notify user via channel
+                        if let Some(ref tx) = self.notification_tx {
+                            let _ = tx.send(crate::channel::OutboundMessage {
+                                target_id: ctx.peer_id.clone(),
+                                is_group: false,
+                                text: format!("[tool missing] {}", msg),
+                                reply_to: None,
+                                images: vec![],
+                                files: vec![],
+                                channel: Some(ctx.channel.clone()),
+                            });
+                        }
+                        return Err(anyhow!(msg));
+                    }
+                };
 
                 // Check memory before launching
                 crate::browser::can_launch_chrome()?;
@@ -8456,7 +8461,24 @@ fn has_display() -> bool {
 }
 
 /// Detect Chrome/Chromium binary path.
+/// Priority: ~/.rsclaw/tools/ > system PATH > well-known locations.
 fn detect_chrome() -> Option<String> {
+    // 1. Check locally installed via `rsclaw tools install chromium` (highest priority)
+    let tools_dir = crate::config::loader::base_dir().join("tools/chromium");
+    if tools_dir.exists() {
+        #[cfg(target_os = "windows")]
+        let bin = tools_dir.join("chrome.exe");
+        #[cfg(target_os = "macos")]
+        let bin = tools_dir.join("Chromium.app/Contents/MacOS/Chromium");
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let bin = tools_dir.join("chrome");
+
+        if bin.exists() {
+            return Some(bin.to_string_lossy().to_string());
+        }
+    }
+
+    // 2. System well-known locations
     #[cfg(target_os = "macos")]
     {
         let app_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
@@ -8487,11 +8509,13 @@ fn detect_chrome() -> Option<String> {
         }
     }
 
+    // 3. Search PATH
     for name in &["google-chrome", "chromium", "chromium-browser", "chrome"] {
         if let Ok(path) = which::which(name) {
             return Some(path.to_string_lossy().to_string());
         }
     }
+
     None
 }
 

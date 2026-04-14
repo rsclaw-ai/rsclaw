@@ -1,11 +1,13 @@
 "use client";
 
+import JSON5 from "json5";
 import { useState, useEffect, useRef, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import { Path } from "../constant";
 import Locale, { getLang } from "../locales";
 import {
   getHealth,
+  getConfig,
   saveConfig,
   reloadConfig,
   wechatQrStart,
@@ -1679,7 +1681,7 @@ export function OnboardingPage() {
         // Check if config already has gateway.language set (e.g. from `rsclaw setup` CLI)
         try {
           const raw: string = await tauriInvoke("read_config_file");
-          const cfg = JSON.parse(raw);
+          const cfg = JSON5.parse(raw || "{}");
           const cfgLang: string | undefined = cfg?.gateway?.language;
           if (cfgLang && typeof cfgLang === "string" && cfgLang.trim()) {
             const mapped = CONFIG_TO_LANG[cfgLang.trim()];
@@ -1990,7 +1992,7 @@ export function OnboardingPage() {
             let loginCreds: Record<string, string> = {};
             try {
               const raw: string = await tauriInvoke("read_config_file");
-              const cfg = JSON.parse(raw || "{}");
+              const cfg = JSON5.parse(raw || "{}");
               const chCfg = cfg?.channels?.[channelId] || {};
               loginCreds = { ...chCfg };
             } catch {}
@@ -2141,13 +2143,20 @@ export function OnboardingPage() {
         let existing: any = {};
         try {
           const raw: string = await tauriInvoke("read_config_file");
-          existing = JSON.parse(raw || "{}");
+          existing = JSON5.parse(raw || "{}");
         } catch {}
         // Deep merge: existing config is base, new config overlays on top
         const merged = deepMerge(existing, newConfig);
         await tauriInvoke("write_config", { content: JSON.stringify(merged, null, 2) });
       } else {
-        await saveConfig({ raw: JSON.stringify(newConfig, null, 2) });
+        // Non-Tauri: fetch existing config, JSON5-parse, deep merge, save.
+        let existing: any = {};
+        try {
+          const data = await getConfig();
+          existing = JSON5.parse(data.raw || "{}");
+        } catch {}
+        const merged = deepMerge(existing, newConfig);
+        await saveConfig({ raw: JSON.stringify(merged, null, 2) });
       }
       // Re-read gateway URL and auth token from the merged config
       if (tauriInvoke) {

@@ -856,6 +856,92 @@ pub fn copy_workspace_files(
     Ok(count)
 }
 
+/// Convert OpenClaw's free-form HEARTBEAT.md to rsclaw's frontmatter format.
+///
+/// OpenClaw uses plain Markdown with schedule info in prose, e.g.:
+///   "每 30 分钟执行一次（交易时段 09:15-15:05）"
+///
+/// rsclaw expects YAML frontmatter:
+///   ---
+///   every: 30m
+///   active_hours: 09:15-15:05
+///   timezone: Asia/Shanghai
+///   ---
+///   <body>
+pub fn convert_heartbeat(src_workspace: &Path, dst_workspace: &Path) -> Result<bool> {
+    let src = src_workspace.join("HEARTBEAT.md");
+    if !src.is_file() {
+        return Ok(false);
+    }
+    let dst = dst_workspace.join("HEARTBEAT.md");
+    if dst.exists() {
+        debug!("HEARTBEAT.md: skipped (already exists)");
+        return Ok(false);
+    }
+
+    let raw = fs::read_to_string(&src)?;
+
+    // Already has frontmatter — copy as-is.
+    if raw.starts_with("---") {
+        std::fs::create_dir_all(dst_workspace)?;
+        fs::copy(&src, &dst)?;
+        debug!("HEARTBEAT.md: copied as-is (already has frontmatter)");
+        return Ok(true);
+    }
+
+    // Extract schedule from prose.
+    let every = extract_every(&raw).unwrap_or("30m".to_owned());
+    let active_hours = extract_active_hours(&raw);
+    let timezone = extract_timezone(&raw).unwrap_or("Asia/Shanghai".to_owned());
+
+    let mut frontmatter = format!("---\nevery: {every}\n");
+    if let Some(ref hours) = active_hours {
+        frontmatter.push_str(&format!("active_hours: {hours}\n"));
+    }
+    frontmatter.push_str(&format!("timezone: {timezone}\n---\n"));
+
+    std::fs::create_dir_all(dst_workspace)?;
+    fs::write(&dst, format!("{frontmatter}{raw}"))?;
+    debug!("HEARTBEAT.md: converted with every={every}, active_hours={active_hours:?}");
+    Ok(true)
+}
+
+/// Extract interval from Chinese/English prose.
+/// Matches patterns like "每 30 分钟", "every 5 minutes", "每5分钟", "每 1 小时".
+fn extract_every(text: &str) -> Option<String> {
+    let re = regex::Regex::new(
+        r"(?:每\s*(\d+)\s*(?:分钟|分|min)|every\s+(\d+)\s*(?:minutes?|mins?|m)\b|每\s*(\d+)\s*(?:小时|时|hour)|every\s+(\d+)\s*(?:hours?|h)\b|每\s*(\d+)\s*(?:秒|sec)|every\s+(\d+)\s*(?:seconds?|secs?|s)\b)"
+    ).ok()?;
+    let caps = re.captures(text)?;
+    // Minutes
+    if let Some(m) = caps.get(1).or(caps.get(2)) {
+        return Some(format!("{}m", m.as_str()));
+    }
+    // Hours
+    if let Some(m) = caps.get(3).or(caps.get(4)) {
+        return Some(format!("{}h", m.as_str()));
+    }
+    // Seconds
+    if let Some(m) = caps.get(5).or(caps.get(6)) {
+        return Some(format!("{}s", m.as_str()));
+    }
+    None
+}
+
+/// Extract active hours range like "09:15-15:05" from text.
+fn extract_active_hours(text: &str) -> Option<String> {
+    let re = regex::Regex::new(r"(\d{1,2}:\d{2})\s*[-–—]\s*(\d{1,2}:\d{2})").ok()?;
+    let caps = re.captures(text)?;
+    Some(format!("{}-{}", &caps[1], &caps[2]))
+}
+
+/// Extract timezone from text (e.g., "timezone: US/Eastern", "时区：Asia/Tokyo").
+fn extract_timezone(text: &str) -> Option<String> {
+    let re = regex::Regex::new(r"(?:timezone|时区)[：:]\s*([A-Za-z_/]+)").ok()?;
+    let caps = re.captures(text)?;
+    Some(caps[1].to_owned())
+}
+
 /// Copy installed skills directory.
 pub fn copy_skills(src_workspace: &Path, dst_workspace: &Path) -> Result<usize> {
     let src_skills = src_workspace.join("skills");

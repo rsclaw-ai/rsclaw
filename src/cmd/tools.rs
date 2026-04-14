@@ -1,0 +1,456 @@
+use anyhow::{bail, Result};
+use std::path::PathBuf;
+
+use super::style::*;
+use crate::cli::ToolsCommand;
+
+// ---------------------------------------------------------------------------
+// Mirror URL (Chinese users) / upstream fallback
+// ---------------------------------------------------------------------------
+
+const MIRROR_BASE: &str = "https://gitfast.io/tools";
+
+/// Manifest endpoint — returns JSON with versions and download URLs.
+const MANIFEST_URL: &str = "https://gitfast.io/tools/manifest.json";
+
+// ---------------------------------------------------------------------------
+// Tool definitions
+// ---------------------------------------------------------------------------
+
+struct ToolDef {
+    name: &'static str,
+    display: &'static str,
+    detect_cmd: &'static [&'static str],
+    local_bin: &'static str, // relative to tools_dir(), e.g. "chromium/chrome"
+}
+
+const TOOLS: &[ToolDef] = &[
+    ToolDef {
+        name: "chromium",
+        display: "Chromium (browser automation)",
+        detect_cmd: &["google-chrome", "chromium", "chromium-browser", "chrome"],
+        local_bin: "chromium",
+    },
+    ToolDef {
+        name: "ffmpeg",
+        display: "ffmpeg (audio/video processing)",
+        detect_cmd: &["ffmpeg"],
+        local_bin: "ffmpeg",
+    },
+    ToolDef {
+        name: "whisper-cpp",
+        display: "whisper.cpp (speech-to-text)",
+        detect_cmd: &["whisper-cli", "whisper", "whisper-cpp"],
+        local_bin: "whisper-cpp",
+    },
+    ToolDef {
+        name: "node",
+        display: "Node.js (plugin runtime)",
+        detect_cmd: &["node"],
+        local_bin: "node",
+    },
+];
+
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
+
+fn tools_dir() -> PathBuf {
+    crate::config::loader::base_dir().join("tools")
+}
+
+// ---------------------------------------------------------------------------
+// Detection
+// ---------------------------------------------------------------------------
+
+fn is_tool_in_path(def: &ToolDef) -> bool {
+    for cmd in def.detect_cmd {
+        if which::which(cmd).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_tool_installed_locally(def: &ToolDef) -> bool {
+    let dir = tools_dir().join(def.local_bin);
+    dir.exists()
+}
+
+fn tool_status(def: &ToolDef) -> &'static str {
+    if is_tool_installed_locally(def) {
+        "installed"
+    } else if is_tool_in_path(def) {
+        "system"
+    } else {
+        "missing"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+pub async fn cmd_tools(sub: ToolsCommand) -> Result<()> {
+    match sub {
+        ToolsCommand::List => { cmd_list(); Ok(()) }
+        ToolsCommand::Status => { cmd_status(); Ok(()) }
+        ToolsCommand::Install { name } => cmd_install(&name).await,
+    }
+}
+
+fn cmd_list() {
+    banner(&format!(
+        "rsclaw tools v{}",
+        env!("RSCLAW_BUILD_VERSION")
+    ));
+    println!();
+
+    let dir = tools_dir();
+    let mut found = false;
+
+    for def in TOOLS {
+        let local_dir = dir.join(def.local_bin);
+        if local_dir.exists() {
+            println!("  {}  {}", green("✓"), bold(def.name));
+            println!("    {}", dim(&local_dir.display().to_string()));
+            found = true;
+        }
+    }
+
+    if !found {
+        warn_msg("no tools installed locally");
+        println!();
+        println!("  Run: rsclaw tools install <name>");
+        println!("  Available: chromium, ffmpeg, whisper-cpp, node, all");
+    }
+}
+
+fn cmd_status() {
+    banner(&format!(
+        "rsclaw tools v{}",
+        env!("RSCLAW_BUILD_VERSION")
+    ));
+    println!();
+
+    for def in TOOLS {
+        let status = tool_status(def);
+        let (icon, label) = match status {
+            "system" => (green("✓"), green("system PATH")),
+            "installed" => (green("✓"), cyan("~/.rsclaw/tools")),
+            _ => (red("✗"), red("not found")),
+        };
+        println!("  {} {:<14} {}  {}", icon, bold(def.name), label, dim(def.display));
+    }
+
+    // Check if any missing
+    let missing: Vec<_> = TOOLS.iter().filter(|d| tool_status(d) == "missing").collect();
+    if !missing.is_empty() {
+        println!();
+        println!(
+            "  Install missing tools: {} or download from {}",
+            bold("rsclaw tools install <name>"),
+            cyan("https://gitfast.io"),
+        );
+    }
+}
+
+async fn cmd_install(name: &str) -> Result<()> {
+    let names: Vec<&str> = if name == "all" {
+        TOOLS.iter().map(|d| d.name).collect()
+    } else {
+        // Validate name
+        if !TOOLS.iter().any(|d| d.name == name) {
+            bail!(
+                "Unknown tool: {name}. Available: {}",
+                TOOLS
+                    .iter()
+                    .map(|d| d.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        vec![name]
+    };
+
+    // Fetch manifest from mirror
+    println!("Fetching tool manifest from {} ...", dim(MANIFEST_URL));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    let manifest: serde_json::Value = match client.get(MANIFEST_URL).send().await {
+        Ok(resp) if resp.status().is_success() => resp.json().await?,
+        Ok(resp) => bail!("manifest fetch failed: HTTP {}", resp.status()),
+        Err(e) => {
+            err_msg(&format!("Cannot reach mirror: {e}"));
+            println!();
+            println!("  Please download manually from: {}", bold("https://gitfast.io"));
+            println!("  Then extract to: {}", bold(&tools_dir().display().to_string()));
+            return Ok(());
+        }
+    };
+
+    let dir = tools_dir();
+    std::fs::create_dir_all(&dir)?;
+
+    let platform = detect_platform();
+    println!("Platform: {}", bold(platform));
+    println!();
+
+    for tool_name in &names {
+        let def = TOOLS.iter().find(|d| d.name == *tool_name).unwrap();
+
+        // Skip if already available
+        if is_tool_in_path(def) {
+            println!("  {} {} {}", green("✓"), bold(def.name), dim("(already in system PATH, skipping)"));
+            continue;
+        }
+        if is_tool_installed_locally(def) {
+            println!("  {} {} {}", green("✓"), bold(def.name), dim("(already installed, skipping)"));
+            continue;
+        }
+
+        let download_url = resolve_download_url(&manifest, tool_name, platform);
+        let Some(url) = download_url else {
+            warn_msg(&format!(
+                "{}: no download available for platform {platform}. Download from https://gitfast.io",
+                def.name
+            ));
+            continue;
+        };
+
+        println!("  Installing {} ...", bold(def.name));
+        println!("    {}", dim(&url));
+
+        let dest_dir = dir.join(def.local_bin);
+        std::fs::create_dir_all(&dest_dir)?;
+
+        match download_and_extract(&client, &url, &dest_dir).await {
+            Ok(()) => {
+                ok(&format!("{} installed to {}", def.name, dest_dir.display()));
+            }
+            Err(e) => {
+                err_msg(&format!("{}: {e}", def.name));
+                println!("    Download manually from: {}", bold("https://gitfast.io"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Platform detection
+// ---------------------------------------------------------------------------
+
+fn detect_platform() -> &'static str {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    match (os, arch) {
+        ("linux", "x86_64") => "linux-x64",
+        ("linux", "aarch64") => "linux-arm64",
+        ("macos", "x86_64") => "mac-x64",
+        ("macos", "aarch64") => "mac-arm64",
+        ("windows", "x86_64") => "win-x64",
+        _ => "unknown",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resolve download URL from manifest
+// ---------------------------------------------------------------------------
+
+fn resolve_download_url(
+    manifest: &serde_json::Value,
+    tool: &str,
+    platform: &str,
+) -> Option<String> {
+    // Try manifest.{tool}.downloads.{platform}
+    if let Some(url) = manifest
+        .get(tool)
+        .and_then(|t| t.get("downloads"))
+        .and_then(|d| d.get(platform))
+        .and_then(|v| v.as_str())
+    {
+        return Some(url.to_owned());
+    }
+
+    // Fallback: construct URL from mirror base + tool conventions
+    let section = manifest.get(tool)?;
+
+    match tool {
+        "chromium" => {
+            let rev = section.get("revision")?.as_str()?;
+            let filename = match platform {
+                "linux-x64" => "chromium-linux.zip",
+                "mac-x64" => "chromium-mac.zip",
+                "mac-arm64" => "chromium-mac-arm64.zip",
+                "win-x64" => "chromium-win64.zip",
+                _ => return None,
+            };
+            Some(format!("{MIRROR_BASE}/chromium/{rev}/{filename}"))
+        }
+        "ffmpeg" => {
+            let filename = match platform {
+                "linux-x64" => "ffmpeg-linux-x64.tar.xz",
+                "linux-arm64" => "ffmpeg-linux-arm64.tar.xz",
+                "win-x64" => "ffmpeg-win-x64.zip",
+                "mac-x64" | "mac-arm64" => "ffmpeg-mac-x64.zip",
+                _ => return None,
+            };
+            Some(format!("{MIRROR_BASE}/ffmpeg/{filename}"))
+        }
+        "whisper-cpp" => {
+            let ver = section.get("version")?.as_str()?;
+            // whisper.cpp release naming varies; manifest.downloads is preferred.
+            // Fallback: try common pattern
+            let filename = match platform {
+                "linux-x64" => format!("whisper-{ver}-bin-linux-x64.zip"),
+                "win-x64" => format!("whisper-{ver}-bin-x64.zip"),
+                _ => return None,
+            };
+            Some(format!("{MIRROR_BASE}/whisper-cpp/{ver}/{filename}"))
+        }
+        "node" => {
+            let ver = section.get("version")?.as_str()?;
+            let filename = match platform {
+                "linux-x64" => format!("node-linux-x64.tar.xz"),
+                "linux-arm64" => format!("node-linux-arm64.tar.xz"),
+                "mac-x64" => format!("node-mac-x64.tar.gz"),
+                "mac-arm64" => format!("node-mac-arm64.tar.gz"),
+                "win-x64" => format!("node-win-x64.zip"),
+                _ => return None,
+            };
+            Some(format!("{MIRROR_BASE}/node/{ver}/{filename}"))
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Download and extract archive
+// ---------------------------------------------------------------------------
+
+async fn download_and_extract(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &std::path::Path,
+) -> Result<()> {
+    let resp = client
+        .get(url)
+        .timeout(std::time::Duration::from_secs(600))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let bytes = resp.bytes().await?;
+    let size_mb = bytes.len() / 1_000_000;
+    println!("    Downloaded {}MB, extracting...", size_mb);
+
+    if url.ends_with(".zip") {
+        extract_zip(&bytes, dest)?;
+    } else if url.ends_with(".tar.xz") {
+        extract_tar_xz(&bytes, dest)?;
+    } else if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
+        extract_tar_gz(&bytes, dest)?;
+    } else {
+        // Unknown format — just save the raw file
+        let filename = url.rsplit('/').next().unwrap_or("download");
+        std::fs::write(dest.join(filename), &bytes)?;
+    }
+
+    Ok(())
+}
+
+fn extract_zip(data: &[u8], dest: &std::path::Path) -> Result<()> {
+    use std::io::{Cursor, Read};
+
+    let reader = Cursor::new(data);
+    let mut archive = zip::ZipArchive::new(reader)?;
+
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i)?;
+        let Some(name) = file.enclosed_name().map(|n| n.to_owned()) else {
+            continue;
+        };
+
+        // Strip the top-level directory (e.g. "chrome-linux64/chrome" → "chrome")
+        let components: Vec<_> = name.components().collect();
+        let rel_path = if components.len() > 1 {
+            components[1..].iter().collect::<PathBuf>()
+        } else {
+            name.clone()
+        };
+
+        let out_path = dest.join(&rel_path);
+
+        if file.is_dir() {
+            std::fs::create_dir_all(&out_path)?;
+        } else {
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf)?;
+            std::fs::write(&out_path, &buf)?;
+
+            // Preserve executable permission on Unix
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Some(mode) = file.unix_mode() {
+                    std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn extract_tar_xz(data: &[u8], dest: &std::path::Path) -> Result<()> {
+    use std::io::Cursor;
+
+    let xz_reader = xz2::read::XzDecoder::new(Cursor::new(data));
+    extract_tar(xz_reader, dest)
+}
+
+fn extract_tar_gz(data: &[u8], dest: &std::path::Path) -> Result<()> {
+    use std::io::Cursor;
+
+    let gz_reader = flate2::read::GzDecoder::new(Cursor::new(data));
+    extract_tar(gz_reader, dest)
+}
+
+fn extract_tar<R: std::io::Read>(reader: R, dest: &std::path::Path) -> Result<()> {
+    let mut archive = tar::Archive::new(reader);
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.to_owned();
+
+        // Strip top-level directory
+        let components: Vec<_> = path.components().collect();
+        let rel_path = if components.len() > 1 {
+            components[1..].iter().collect::<PathBuf>()
+        } else {
+            path.to_path_buf()
+        };
+
+        if rel_path.as_os_str().is_empty() {
+            continue;
+        }
+
+        let out_path = dest.join(&rel_path);
+
+        if entry.header().entry_type().is_dir() {
+            std::fs::create_dir_all(&out_path)?;
+        } else {
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            entry.unpack(&out_path)?;
+        }
+    }
+    Ok(())
+}

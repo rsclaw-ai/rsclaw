@@ -371,6 +371,18 @@ async fn transcribe_openai(
 
 /// Find whisper binary: `whisper-cli`, `whisper`, or `whisper.cpp`
 fn which_whisper() -> Option<String> {
+    // 1. Check ~/.rsclaw/tools/whisper-cpp/ first
+    let tools_dir = crate::config::loader::base_dir().join("tools/whisper-cpp");
+    if tools_dir.exists() {
+        for name in &["whisper-cli", "whisper", "main"] {
+            let bin = tools_dir.join(name);
+            if bin.exists() {
+                return Some(bin.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    // 2. System PATH
     for name in &["whisper-cli", "whisper", "whisper-cpp", "main"] {
         if let Ok(path) = which::which(name) {
             return Some(path.to_string_lossy().to_string());
@@ -451,7 +463,7 @@ fn find_whisper_model() -> Option<String> {
 
 async fn transcribe_local(audio_bytes: &[u8], file_name: &str) -> Result<String> {
     let whisper_bin = which_whisper()
-        .context("whisper CLI not found (install whisper.cpp: brew install whisper-cpp)")?;
+        .context("whisper CLI not found. Run `rsclaw tools install whisper-cpp`, download from https://gitfast.io, or `brew install whisper-cpp`")?;
 
     // Write audio to temp file
     let tmp_dir = std::env::temp_dir();
@@ -940,6 +952,22 @@ fn decode_audio_to_pcm_ext(audio_bytes: &[u8], file_ext: Option<&str>) -> Result
     decode_audio_ffmpeg(audio_bytes, ext)
 }
 
+/// Resolve ffmpeg binary: ~/.rsclaw/tools/ffmpeg/ first, then system PATH.
+fn which_ffmpeg() -> String {
+    let tools_bin = crate::config::loader::base_dir().join("tools/ffmpeg/ffmpeg");
+    if tools_bin.exists() {
+        return tools_bin.to_string_lossy().to_string();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let tools_exe = crate::config::loader::base_dir().join("tools/ffmpeg/ffmpeg.exe");
+        if tools_exe.exists() {
+            return tools_exe.to_string_lossy().to_string();
+        }
+    }
+    "ffmpeg".to_owned()
+}
+
 /// Fallback: use ffmpeg CLI to convert any audio/video to 16kHz mono WAV, then read PCM.
 fn decode_audio_ffmpeg(audio_bytes: &[u8], ext: &str) -> Result<Vec<f32>> {
     let tmp_dir = std::env::temp_dir();
@@ -948,8 +976,9 @@ fn decode_audio_ffmpeg(audio_bytes: &[u8], ext: &str) -> Result<Vec<f32>> {
     let wav_path = tmp_dir.join(format!("rsclaw_ff_{id}.wav"));
 
     std::fs::write(&input_path, audio_bytes)?;
-    info!(input = %input_path.display(), ext = %ext, bytes = audio_bytes.len(), "ffmpeg fallback: converting");
-    let output = std::process::Command::new("ffmpeg")
+    let ffmpeg_bin = which_ffmpeg();
+    info!(input = %input_path.display(), ext = %ext, bytes = audio_bytes.len(), bin = %ffmpeg_bin, "ffmpeg fallback: converting");
+    let output = std::process::Command::new(&ffmpeg_bin)
         .args([
             "-i", input_path.to_str().unwrap_or(""),
             "-ar", "16000", "-ac", "1", "-f", "wav",
@@ -1203,8 +1232,8 @@ async fn transcribe_candle(audio_bytes: &[u8]) -> Result<String> {
     if !model_dir.join("config.json").exists() {
         anyhow::bail!(
             "candle whisper model not found at {}\n\
-             Download with: huggingface-cli download openai/whisper-tiny --local-dir {}",
-            model_dir.display(),
+             Run: rsclaw models download whisper\n\
+             Or download from: https://gitfast.io",
             model_dir.display()
         );
     }
