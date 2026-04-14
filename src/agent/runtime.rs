@@ -2798,7 +2798,30 @@ impl AgentRuntime {
         let mut tool_images: Vec<String> = Vec::new();
         let mut tool_files: Vec<(String, String, String)> = Vec::new();
 
+        // Hard cap on iterations to prevent runaway loops (e.g. small models
+        // repeatedly calling the same tool). Loop detection catches pattern-based
+        // loops; this is the safety net for everything else.
+        const MAX_ITERATIONS: usize = 30;
+        let mut iteration = 0usize;
+
         loop {
+            iteration += 1;
+            if iteration > MAX_ITERATIONS {
+                warn!(
+                    session = %ctx.session_key,
+                    iterations = iteration,
+                    "agent_loop: hit max iteration limit, breaking out"
+                );
+                return Ok(AgentReply {
+                    text: "[error: agent reached maximum iteration limit. Please try a simpler request or start a new conversation.]".to_string(),
+                    is_empty: false,
+                    tool_calls: None,
+                    images: vec![],
+                    files: vec![],
+                    pending_analysis: None,
+                    was_preparse: false,
+                });
+            }
             // Apply legacy context pruning (hard clear / soft trim) as fallback.
             if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
                 apply_context_pruning(sess, pruning_cfg.as_ref());
@@ -8997,7 +9020,6 @@ fn build_system_prompt(
              - For code generation: write complete files, one module at a time.\n\
              - Use edit tool for small changes to existing files.\n\
              - For cron jobs: use the `cron` tool (action=list/add/remove). The `cron` tool is a first-class tool — always use it instead of trying to invoke a `cron` shell command.\n\
-             - To install tools (chromium/ffmpeg/node/python/sherpa-onnx), use `rsclaw tools install <name>` instead of brew/apt/winget.\n\
              - Never fabricate URLs or file paths — only use data from real sources.{tools_hint}\n\n\
              ## Self-Evolution — Auto Skill Creation\n\
              When you notice a task pattern repeating (>=3 similar requests), package it as a standard skill after completing the task:\n\

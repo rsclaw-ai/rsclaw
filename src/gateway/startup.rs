@@ -111,11 +111,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         let base_zh = base_dir.join("models/bge-base-zh");
         let zh = base_dir.join("models/bge-small-zh");
         let en = base_dir.join("models/bge-small-en");
-        if base_zh.join("config.json").exists() {
+        if base_zh.join("model.safetensors").exists() {
             base_zh
-        } else if zh.join("config.json").exists() {
+        } else if zh.join("model.safetensors").exists() {
             zh
-        } else if en.join("config.json").exists() {
+        } else if en.join("model.safetensors").exists() {
             en
         } else {
             // Auto-download BGE model in background (don't block startup).
@@ -297,7 +297,17 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                         warn!(channel = %ch_name, "no channel sender registered for notification");
                     }
                 } else {
-                    warn!("notification message has no channel field, cannot route");
+                    // No channel specified — send to first registered channel (default)
+                    let first = {
+                        let guard = senders.read().unwrap();
+                        guard.iter().next().map(|(k, v)| (k.clone(), v.clone()))
+                    };
+                    if let Some((ch_name, tx)) = first {
+                        info!(channel = %ch_name, "routing notification to default channel");
+                        let _ = tx.send(msg.clone()).await;
+                    } else {
+                        warn!("notification: no channels registered");
+                    }
                 }
             }
             info!("notification router ended");
