@@ -330,7 +330,6 @@ const EN_TOOL_WEB_SEARCH: &str = r#"# web_search Usage Guide
 - Always use web_search for information lookup — do NOT open a browser to visit search engines
 - If web_search fails, retry once with different keywords. Only fall back to web_browser if still empty
 - On empty results, change keywords — do NOT retry with the same query
-- When falling back to web_browser for search, use baidu.com (Chinese queries) or google.com — do NOT use bing.com (triggers CAPTCHA)
 "#;
 
 const ZH_TOOL_WEB_FETCH: &str = r#"# web_fetch 使用指南

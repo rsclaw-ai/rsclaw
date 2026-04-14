@@ -6102,58 +6102,88 @@ impl AgentRuntime {
 
         let bs = browser.as_mut().unwrap();
 
-        // Use Baidu (Chinese) or Google (others) as browser search fallback.
-        // Bing triggers CAPTCHA too aggressively.
+        // Try multiple search engines, auto-switch on CAPTCHA/empty results.
         let lang = self.config.raw.gateway.as_ref()
             .and_then(|g| g.language.as_deref())
             .unwrap_or("");
         let is_zh = lang.to_lowercase().starts_with("zh")
             || lang.to_lowercase().starts_with("chinese");
-        let (url, result_selector) = if is_zh {
-            (
-                format!("https://www.baidu.com/s?wd={}", urlencoding::encode(query)),
-                ".result.c-container",
-            )
+
+        // Engine list: (name, url_template, result_css, snippet_css)
+        let q = urlencoding::encode(query);
+        let engines: Vec<(&str, String, &str, &str)> = if is_zh {
+            vec![
+                ("baidu", format!("https://www.baidu.com/s?wd={q}"), ".result.c-container", "p, .c-abstract"),
+                ("sogou", format!("https://www.sogou.com/web?query={q}"), ".vrwrap, .rb", "p, .ft"),
+                ("bing", format!("https://cn.bing.com/search?q={q}"), ".b_algo", "p"),
+                ("google", format!("https://www.google.com/search?q={q}"), "div.g", "span.st, div[data-sncf]"),
+            ]
         } else {
-            (
-                format!("https://www.google.com/search?q={}", urlencoding::encode(query)),
-                "div.g",
-            )
+            vec![
+                ("google", format!("https://www.google.com/search?q={q}"), "div.g", "span.st, div[data-sncf]"),
+                ("bing", format!("https://www.bing.com/search?q={q}"), ".b_algo", "p"),
+                ("duckduckgo", format!("https://html.duckduckgo.com/html/?q={q}"), ".result", ".result__snippet"),
+            ]
         };
 
-        bs.execute("open", &json!({"url": url})).await?;
+        for (name, url, result_selector, snippet_selector) in &engines {
+            info!(engine = name, "browser_search: trying");
+            if let Err(e) = bs.execute("open", &json!({"url": url})).await {
+                warn!(engine = name, "browser_search: open failed: {e}");
+                continue;
+            }
+            let _ = bs.execute("wait", &json!({"target": "element", "value": *result_selector, "timeout": 8})).await;
 
-        // Wait for results to load.
-        let _ = bs.execute("wait", &json!({"target": "element", "value": result_selector, "timeout": 10})).await;
+            // Check for CAPTCHA: look for common challenge indicators
+            let captcha_js = r#"(function(){
+                var t = document.body ? document.body.innerText.toLowerCase() : '';
+                var hasCaptcha = t.includes('captcha') || t.includes('验证') || t.includes('robot')
+                    || t.includes('unusual traffic') || t.includes('人机验证')
+                    || document.querySelector('iframe[src*="captcha"]') !== null
+                    || document.querySelector('#captcha, .captcha, .g-recaptcha') !== null;
+                return hasCaptcha ? 'captcha' : 'ok';
+            })()"#;
+            let check = bs.execute("evaluate", &json!({"js": captcha_js})).await;
+            if let Ok(ref v) = check {
+                let status = v["result"].as_str().unwrap_or("");
+                if status == "captcha" {
+                    warn!(engine = name, "browser_search: CAPTCHA detected, trying next engine");
+                    continue;
+                }
+            }
 
-        // Extract search results via JS (generic: works for Baidu and Google).
-        let js = format!(r#"(function(){{
-            var results = [];
-            var items = document.querySelectorAll('{result_selector}');
-            for (var i = 0; i < Math.min(items.length, {limit}); i++) {{
-                var a = items[i].querySelector('a');
-                var p = items[i].querySelector('p, .c-abstract, span.st, div[data-sncf]');
-                if (a) {{
-                    results.push({{
-                        title: a.innerText || '',
-                        url: a.href || '',
-                        snippet: p ? p.innerText || '' : ''
-                    }});
+            // Extract results
+            let js = format!(r#"(function(){{
+                var results = [];
+                var items = document.querySelectorAll('{result_selector}');
+                for (var i = 0; i < Math.min(items.length, {limit}); i++) {{
+                    var a = items[i].querySelector('a');
+                    var p = items[i].querySelector('{snippet_selector}');
+                    if (a && a.href && !a.href.startsWith('javascript:')) {{
+                        results.push({{
+                            title: a.innerText || '',
+                            url: a.href || '',
+                            snippet: p ? p.innerText || '' : ''
+                        }});
+                    }}
                 }}
-            }}
-            return JSON.stringify(results);
-        }})()"#);
+                return JSON.stringify(results);
+            }})()"#);
 
-        let result = bs.execute("evaluate", &json!({"js": js})).await?;
-        let result_str = result["result"].as_str()
-            .or_else(|| result["result"].as_str())
-            .unwrap_or("[]");
-        let parsed: Vec<Value> = serde_json::from_str(
-            // result might be a JSON string or already parsed
-            if result_str.starts_with('[') { result_str } else { "[]" }
-        ).unwrap_or_default();
+            let result = bs.execute("evaluate", &json!({"js": js})).await?;
+            let result_str = result["result"].as_str().unwrap_or("[]");
+            let parsed: Vec<Value> = serde_json::from_str(
+                if result_str.starts_with('[') { result_str } else { "[]" }
+            ).unwrap_or_default();
 
-        Ok(parsed)
+            if !parsed.is_empty() {
+                info!(engine = name, count = parsed.len(), "browser_search: got results");
+                return Ok(parsed);
+            }
+            warn!(engine = name, "browser_search: no results, trying next engine");
+        }
+
+        Ok(vec![])
     }
 
     /// If summaryModel is configured and a prompt is provided, summarize
