@@ -2988,12 +2988,11 @@ impl AgentRuntime {
         let mut tool_files: Vec<(String, String, String)> = Vec::new();
 
         // Dynamic iteration limit based on task complexity.
-        // Simple tasks: 10 iterations. Browser/complex tasks: 50.
-        // Adjusted upward when web_browser or opencode tools are used.
-        const BASE_ITERATIONS: usize = 10;
+        // Default: 100 iterations. Complex tools (browser/opencode/exec): up to configured max.
+        const BASE_ITERATIONS: usize = 100;
         let configured_complex: usize = self.config.agents.defaults.max_iterations
             .map(|v| v as usize)
-            .unwrap_or(100);
+            .unwrap_or(500);
         let mut max_iterations = BASE_ITERATIONS;
         let mut iteration = 0usize;
 
@@ -3715,8 +3714,11 @@ impl AgentRuntime {
 
                 debug!(tool = %tool_name, "dispatching tool call");
 
-                // Upgrade iteration limit for complex tools
-                if matches!(tool_name.as_str(), "web_browser" | "opencode" | "claudecode") {
+                // Upgrade iteration limit when complex or multi-step tools are used.
+                if matches!(tool_name.as_str(),
+                    "web_browser" | "opencode" | "claudecode" | "agent"
+                    | "search_content" | "search_file" | "exec"
+                ) {
                     max_iterations = max_iterations.max(configured_complex);
                 }
 
