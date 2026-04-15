@@ -5217,7 +5217,8 @@ impl AgentRuntime {
                 for entry in entries.flatten() {
                     let p = entry.path();
                     if p.is_dir() {
-                        // Add both the dir itself and a bin/ subdirectory.
+                        // Add the dir itself, bin/, and node_modules/.bin/ subdirectories.
+                        extra_paths.push(p.join("node_modules").join(".bin"));
                         extra_paths.push(p.join("bin"));
                         extra_paths.push(p.clone());
                     }
@@ -9427,7 +9428,7 @@ fn build_system_prompt(
              - For documents (xlsx/docx/pdf/pptx): use the `doc` tool, not exec.\n\
              - For cron jobs: use the `cron` tool (action=list/add/remove).\n\
              - To install tools (python, node, ffmpeg, chrome, sherpa-onnx): use `exec` with `{rsclaw_exe} tools install <name>`. Do NOT download/install manually.\n\
-             - To install opencode: first ensure node is installed, then `exec` with `npm install -g opencode`.\n\
+             - To install opencode: first ensure node is installed, then `exec` with `npm install --prefix ~/.rsclaw/tools/opencode opencode` (binary lands in tools/opencode/node_modules/.bin/).\n\
              - If a tool call fails, do NOT retry with the same arguments. Try a different approach or inform the user.\n\
              - Never fabricate URLs or file paths."
                 .replace("{rsclaw_exe}", &std::env::current_exe()
