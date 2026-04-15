@@ -1644,10 +1644,48 @@ impl AgentRuntime {
                         )
                     }
                     "__CLEAR__" => {
+                        // Preserve a brief summary before clearing.
+                        let summary_msg = if let Some(msgs) = self.sessions.get(session_key) {
+                            if !msgs.is_empty() {
+                                let recent: Vec<&Message> = msgs.iter().rev().take(10).rev().collect();
+                                let mut parts = Vec::new();
+                                for m in &recent {
+                                    let role = match m.role {
+                                        crate::provider::Role::User => "User",
+                                        crate::provider::Role::Assistant => "Assistant",
+                                        _ => continue,
+                                    };
+                                    let text = match &m.content {
+                                        crate::provider::MessageContent::Text(s) => s.clone(),
+                                        crate::provider::MessageContent::Parts(ps) => ps.iter().filter_map(|p| {
+                                            if let crate::provider::ContentPart::Text { text } = p { Some(text.as_str()) } else { None }
+                                        }).collect::<Vec<_>>().join(" "),
+                                    };
+                                    if text.is_empty() { continue; }
+                                    let truncated = if text.chars().count() > 200 {
+                                        let idx = text.char_indices().nth(200).map(|(i, _)| i).unwrap_or(text.len());
+                                        format!("{}...", &text[..idx])
+                                    } else { text };
+                                    parts.push(format!("{role}: {truncated}"));
+                                }
+                                if parts.is_empty() { None } else {
+                                    Some(Message {
+                                        role: crate::provider::Role::System,
+                                        content: crate::provider::MessageContent::Text(
+                                            format!("[Session summary before /clear]\n{}", parts.join("\n"))
+                                        ),
+                                    })
+                                }
+                            } else { None }
+                        } else { None };
+
                         self.sessions.remove(session_key);
-                        // Also clear persisted session from redb.
                         if let Err(e) = self.store.db.delete_session(session_key) {
                             warn!("failed to clear persisted session: {e:#}");
+                        }
+                        // Re-inject summary so agent retains context.
+                        if let Some(msg) = summary_msg {
+                            self.sessions.insert(session_key.to_owned(), vec![msg]);
                         }
                         "Session cleared.".to_owned()
                     }
