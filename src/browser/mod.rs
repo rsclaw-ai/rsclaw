@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 const MIN_AVAILABLE_MEMORY: u64 = 200 * 1024 * 1024; // 200 MB
 
 /// Idle timeout: kill Chrome after this long without any tool call.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(1800); // 30 minutes
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 
 /// Global counter of active Chrome instances.
 static ACTIVE_INSTANCES: AtomicU32 = AtomicU32::new(0);
