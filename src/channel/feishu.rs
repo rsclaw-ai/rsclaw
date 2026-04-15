@@ -1429,7 +1429,15 @@ impl Channel for FeishuChannel {
                     else { "chat_id" };
                 let send_url = format!("{}/im/v1/messages?receive_id_type={id_type}", self.api_base());
                 let (msg_type, content) = if is_media {
-                    ("media", serde_json::json!({"file_key": file_key, "file_name": filename}).to_string())
+                    // Try to extract duration from MP4 header (moov/mvhd atom).
+                    let duration_ms = if mime.starts_with("video/") {
+                        mp4_duration_ms(path_or_url).unwrap_or(0)
+                    } else { 0 };
+                    let mut media_json = serde_json::json!({"file_key": file_key, "file_name": filename});
+                    if duration_ms > 0 {
+                        media_json["duration"] = serde_json::json!(duration_ms);
+                    }
+                    ("media", media_json.to_string())
                 } else {
                     ("file", serde_json::json!({"file_key": file_key}).to_string())
                 };
@@ -1727,4 +1735,74 @@ impl NotificationSink for FeishuNotifier {
 
         Box::pin(async move { self.send_text(&text).await })
     }
+}
+
+/// Extract duration in milliseconds from an MP4 file by parsing the moov/mvhd atom.
+/// Returns None if the file is not MP4 or parsing fails.
+fn mp4_duration_ms(path: &str) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let file_len = f.metadata().ok()?.len();
+    let mut pos: u64 = 0;
+
+    // Find moov atom.
+    let moov_start = loop {
+        if pos >= file_len { return None; }
+        f.seek(SeekFrom::Start(pos)).ok()?;
+        let mut header = [0u8; 8];
+        f.read_exact(&mut header).ok()?;
+        let size = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as u64;
+        let tag = &header[4..8];
+        if tag == b"moov" {
+            break pos;
+        }
+        if size < 8 { return None; }
+        pos += size;
+    };
+
+    // Find mvhd inside moov.
+    f.seek(SeekFrom::Start(moov_start + 8)).ok()?;
+    let mut moov_buf = [0u8; 8];
+    let moov_end = moov_start + {
+        f.seek(SeekFrom::Start(moov_start)).ok()?;
+        let mut h = [0u8; 4];
+        f.read_exact(&mut h).ok()?;
+        u32::from_be_bytes(h) as u64
+    };
+
+    let mut scan = moov_start + 8;
+    while scan < moov_end {
+        f.seek(SeekFrom::Start(scan)).ok()?;
+        f.read_exact(&mut moov_buf).ok()?;
+        let atom_size = u32::from_be_bytes([moov_buf[0], moov_buf[1], moov_buf[2], moov_buf[3]]) as u64;
+        if &moov_buf[4..8] == b"mvhd" {
+            // mvhd: version(1) + flags(3) + create(4) + modify(4) + timescale(4) + duration(4)
+            // version 1: create(8) + modify(8) + timescale(4) + duration(8)
+            let mut ver = [0u8; 1];
+            f.read_exact(&mut ver).ok()?;
+            if ver[0] == 0 {
+                let mut buf = [0u8; 16]; // skip create+modify (8), then timescale(4)+duration(4)
+                f.seek(SeekFrom::Start(scan + 8 + 1 + 3)).ok()?; // after version+flags
+                f.read_exact(&mut buf).ok()?;
+                let timescale = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+                let duration = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+                if timescale > 0 {
+                    return Some((duration as u64) * 1000 / (timescale as u64));
+                }
+            } else {
+                let mut buf = [0u8; 28]; // skip create+modify (16), then timescale(4)+duration(8)
+                f.seek(SeekFrom::Start(scan + 8 + 1 + 3)).ok()?;
+                f.read_exact(&mut buf).ok()?;
+                let timescale = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]);
+                let duration = u64::from_be_bytes([buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26], buf[27]]);
+                if timescale > 0 {
+                    return Some(duration * 1000 / (timescale as u64));
+                }
+            }
+            return None;
+        }
+        if atom_size < 8 { break; }
+        scan += atom_size;
+    }
+    None
 }
