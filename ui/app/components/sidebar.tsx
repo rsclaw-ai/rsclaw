@@ -500,12 +500,7 @@ export function SideBarContainer(props: {
       }}
     >
       {children}
-      <div
-        className={styles["sidebar-drag"]}
-        onPointerDown={(e) => onDragStart(e as any)}
-      >
-        <DragIcon />
-      </div>
+      {/* Sidebar drag handle disabled — fixed width layout */}
     </div>
   );
 }
