@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
 [![Binary Size](https://img.shields.io/badge/binary-~12MB-green)]()
 
-[English](README.md) | [中文](README_cn.md) | [日本語](README_ja.md) | [한국어](README_ko.md) | **ไทย** | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | [Русский](README_ru.md)
+[English](../../README.md) | [中文](README_cn.md) | [日本語](README_ja.md) | [한국어](README_ko.md) | **ไทย** | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | [Русский](README_ru.md)
 
 RsClaw คือการเขียนใหม่ทั้งหมดของ [OpenClaw](https://github.com/openclaw/openclaw) ด้วย Rust ให้โปรโตคอล AI Gateway แบบมัลติเอเจนต์เดียวกัน แต่เริ่มต้นเร็วขึ้น 10 เท่า ขนาดเล็กลง 10 เท่า และไม่พึ่งพา Node.js
 
@@ -57,7 +57,7 @@ macOS (x86_64, ARM64), Linux (x86_64, ARM64), Windows (x86_64, ARM64)
 
 ## เอกสาร
 
-เอกสารฉบับเต็มอยู่ที่ [README.md](README.md) (中文) หรือ [README_en.md](README_en.md) (English)
+เอกสารฉบับเต็มอยู่ที่ [README.md](../../README.md) (中文) หรือ [README_en.md](../../README.md) (English)
 
 ## สัญญาอนุญาต
 

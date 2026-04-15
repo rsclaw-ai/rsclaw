@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
 [![Binary Size](https://img.shields.io/badge/binary-~12MB-green)]()
 
-[English](README.md) | [中文](README_cn.md) | **日本語** | [한국어](README_ko.md) | [ไทย](README_th.md) | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | [Русский](README_ru.md)
+[English](../../README.md) | [中文](README_cn.md) | **日本語** | [한국어](README_ko.md) | [ไทย](README_th.md) | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | [Русский](README_ru.md)
 
 RsClaw は [OpenClaw](https://github.com/openclaw/openclaw) を Rust でフルスクラッチ再実装したもので、同じマルチエージェントAIゲートウェイプロトコルを提供しながら、10倍の起動速度、10倍のサイズ縮小、Node.js依存ゼロを実現しています。
 
@@ -80,7 +80,7 @@ macOS (x86_64, ARM64)、Linux (x86_64, ARM64)、Windows (x86_64, ARM64)
 
 ## ドキュメント
 
-詳細なドキュメントは [README.md](README.md)（中文）または [README_en.md](README_en.md)（English）をご覧ください。
+詳細なドキュメントは [README.md](../../README.md)（中文）または [README_en.md](../../README.md)（English）をご覧ください。
 
 ## ライセンス
 

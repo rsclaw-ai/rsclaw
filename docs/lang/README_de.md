@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
 [![Binary Size](https://img.shields.io/badge/binary-~12MB-green)]()
 
-[English](README.md) | [中文](README_cn.md) | [日本語](README_ja.md) | [한국어](README_ko.md) | [ไทย](README_th.md) | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | **Deutsch** | [Español](README_es.md) | [Русский](README_ru.md)
+[English](../../README.md) | [中文](README_cn.md) | [日本語](README_ja.md) | [한국어](README_ko.md) | [ไทย](README_th.md) | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | **Deutsch** | [Español](README_es.md) | [Русский](README_ru.md)
 
 RsClaw ist eine komplette Neuentwicklung von [OpenClaw](https://github.com/openclaw/openclaw) in Rust. Es bietet dasselbe Multi-Agenten-KI-Gateway-Protokoll mit 10x schnellerem Start, 10x kleinerem Footprint und ohne Node.js-Abhaengigkeit.
 
@@ -57,7 +57,7 @@ macOS (x86_64, ARM64), Linux (x86_64, ARM64), Windows (x86_64, ARM64)
 
 ## Dokumentation
 
-Vollstaendige Dokumentation in [README.md](README.md) (中文) oder [README_en.md](README_en.md) (English).
+Vollstaendige Dokumentation in [README.md](../../README.md) (中文) oder [README_en.md](../../README.md) (English).
 
 ## Lizenz
 
