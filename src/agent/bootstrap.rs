@@ -161,15 +161,31 @@ pub fn tool_prompts_for_system(base_dir: &Path, _lang: Option<&str>) -> String {
 
     let mut parts = Vec::new();
 
-    // web_browser: short summary + pointer to full guide
-    parts.push(format!(
-        "# web_browser\n\
-         - Flow: open → snapshot → interact with refs → re-snapshot\n\
-         - Login: prefer QR scan, screenshot and send to user\n\
-         - For search/static pages, prefer web_search / web_fetch first\n\
-         - Full guide: `{}/tools/web_browser/prompt.md`",
-        base_dir.display()
-    ));
+    // web_browser: inline the essential rules (small models won't read external files).
+    parts.push(
+        "# web_browser usage rules\n\
+         ## Core flow (MUST follow)\n\
+         1. `open` URL -> 2. `snapshot` to get refs (@e1, @e2...) -> 3. `click`/`fill` using refs -> 4. re-snapshot after changes\n\
+         - ALWAYS snapshot BEFORE interacting. Refs expire after page changes.\n\
+         - Use `ref` to click/fill, NOT `text` (ref is more reliable).\n\
+         ## Login handling\n\
+         - Look for QR code login first. Screenshot the QR and send to user via send_file.\n\
+         - Wait for user to scan (use `wait` or re-snapshot after delay).\n\
+         - Only try password/SMS login if no QR option exists.\n\
+         ## Form input\n\
+         - contenteditable: click to focus -> press Meta+a -> press Backspace -> fill/type content\n\
+         - Submit: prefer press Enter. If Enter doesn't work, click the submit button ref.\n\
+         - After submit: `wait` at least 15s for page to update before snapshot.\n\
+         ## Extracting results\n\
+         - After generation completes: extract URL via `evaluate` -> `web_download` -> `send_file` to user.\n\
+         - Do NOT just reply 'done' — always deliver the actual file/image to the user.\n\
+         ## Do NOT\n\
+         - Skip `open` and operate directly.\n\
+         - Use expired refs (re-snapshot after any page change).\n\
+         - Operate on about:blank.\n\
+         - Fabricate URLs or file paths."
+            .to_owned()
+    );
 
     // Other tools: inject directly (short prompts, always English for LLM)
     let short_tools: &[(&str, &str)] = &[
