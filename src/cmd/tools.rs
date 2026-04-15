@@ -146,7 +146,7 @@ pub async fn cmd_tools(sub: ToolsCommand) -> Result<()> {
 
 fn cmd_list() {
     banner(&format!(
-        "rsclaw tools v{}",
+        "rsclaw tools {}",
         env!("RSCLAW_BUILD_VERSION")
     ));
     println!();
@@ -167,13 +167,13 @@ fn cmd_list() {
         warn_msg("no tools installed locally");
         println!();
         println!("  Run: rsclaw tools install <name>");
-        println!("  Available: chromium, ffmpeg, whisper-cpp, node, all");
+        println!("  Available: chrome, ffmpeg, node, python, opencode, claude-code, all");
     }
 }
 
 fn cmd_status() {
     banner(&format!(
-        "rsclaw tools v{}",
+        "rsclaw tools {}",
         env!("RSCLAW_BUILD_VERSION")
     ));
     println!();
