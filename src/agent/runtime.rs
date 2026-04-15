@@ -4712,9 +4712,12 @@ impl AgentRuntime {
         //           detail until budget is exhausted. This ensures the most
         //           recent (and typically most relevant) context is preserved.
         let msgs_to_text = |msgs: &[Message]| -> String {
-            // Default 16K tokens input for compact LLM. User can override via
-            // compaction.maxTranscriptTokens in config.
-            let max_total_tokens: usize = cfg.max_transcript_tokens.unwrap_or(16_000);
+            // Default: 70% of context window (leave room for summary output +
+            // recent messages). User can override via compaction.maxTranscriptTokens.
+            let default_transcript = (context_tokens * 7 / 10).max(16_000);
+            let max_total_tokens: usize = cfg.max_transcript_tokens
+                .map(|t| t as usize)
+                .unwrap_or(default_transcript);
 
             // Render a single message. `detail` controls verbosity:
             //   2 = full (tool args + results)
@@ -4993,7 +4996,7 @@ impl AgentRuntime {
                 "You are a conversation summarizer. Produce a dense, accurate, \
                  structured summary. NEVER call tools. Text output only.".to_owned(),
             ),
-            max_tokens: Some(2048), // structured output needs more room
+            max_tokens: Some(4096), // structured output needs more room
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None,
