@@ -704,7 +704,7 @@ impl AgentRuntime {
                 // Wait for agent's reply and forward it (text + files) to user via notification.
                 match tokio::time::timeout(Duration::from_secs(300), reply_rx).await {
                     Ok(Ok(reply)) => {
-                        if (!reply.text.is_empty() || !reply.files.is_empty() || !reply.images.is_empty()) {
+                        if !reply.text.is_empty() || !reply.files.is_empty() || !reply.images.is_empty() {
                             if let Some(ref tx) = notif_tx_bg {
                                 let _ = tx.send(crate::channel::OutboundMessage {
                                     target_id: target_id_bg.clone(),
