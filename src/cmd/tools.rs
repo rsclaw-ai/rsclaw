@@ -128,7 +128,7 @@ pub async fn cmd_tools(sub: ToolsCommand) -> Result<()> {
     match sub {
         ToolsCommand::List => { cmd_list(); Ok(()) }
         ToolsCommand::Status => { cmd_status(); Ok(()) }
-        ToolsCommand::Install { name } => cmd_install(&name).await,
+        ToolsCommand::Install { name, force } => cmd_install(&name, force).await,
     }
 }
 
@@ -188,7 +188,7 @@ fn cmd_status() {
     }
 }
 
-async fn cmd_install(name: &str) -> Result<()> {
+async fn cmd_install(name: &str, force: bool) -> Result<()> {
     let names: Vec<&str> = if name == "all" {
         TOOLS.iter().map(|d| d.name).collect()
     } else {
@@ -234,12 +234,12 @@ async fn cmd_install(name: &str) -> Result<()> {
     for tool_name in &names {
         let def = TOOLS.iter().find(|d| d.name == *tool_name).unwrap();
 
-        // Skip if already available
-        if is_tool_in_path(def) {
+        // Skip if already available (unless --force)
+        if !force && is_tool_in_path(def) {
             println!("  {} {} {}", green("✓"), bold(def.name), dim("(already in system PATH, skipping)"));
             continue;
         }
-        if is_tool_installed_locally(def) {
+        if !force && is_tool_installed_locally(def) {
             println!("  {} {} {}", green("✓"), bold(def.name), dim("(already installed, skipping)"));
             continue;
         }

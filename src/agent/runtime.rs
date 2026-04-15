@@ -5209,6 +5209,27 @@ impl AgentRuntime {
             .unwrap_or(1800);
 
         let mut cmd = tokio::process::Command::new(shell);
+        // Prepend ~/.rsclaw/tools/* to PATH so locally installed tools are found first.
+        let tools_base = crate::config::loader::base_dir().join("tools");
+        if tools_base.exists() {
+            let mut extra_paths = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&tools_base) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        // Add both the dir itself and a bin/ subdirectory.
+                        extra_paths.push(p.join("bin"));
+                        extra_paths.push(p.clone());
+                    }
+                }
+            }
+            if !extra_paths.is_empty() {
+                let sys_path = std::env::var("PATH").unwrap_or_default();
+                let mut all: Vec<String> = extra_paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+                all.push(sys_path);
+                cmd.env("PATH", all.join(if cfg!(windows) { ";" } else { ":" }));
+            }
+        }
         cmd.args(&shell_args)
             .arg(command)
             .current_dir(&workspace)
