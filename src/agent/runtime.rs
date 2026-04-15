@@ -4311,6 +4311,7 @@ impl AgentRuntime {
                     "web_search" => limits.and_then(|l| l.web_search).unwrap_or(2000),
                     "web_fetch" => limits.and_then(|l| l.web_fetch).unwrap_or(5000),
                     "execute_command" | "exec" => limits.and_then(|l| l.exec).unwrap_or(3000),
+                    "cron" => usize::MAX, // No limit for cron list
                     _ => limits.and_then(|l| l.default).unwrap_or(3000),
                 };
                 let session_text = if result_text.len() > max_chars {
