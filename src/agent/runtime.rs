@@ -10537,7 +10537,22 @@ fn build_tool_list(
     // Document creation & editing tool.
     tools.push(ToolDef {
         name: "doc".to_owned(),
-        description: "Create, edit, and read Office documents. Actions: create_excel, create_word, create_pdf, create_ppt, edit_excel, edit_word, edit_pdf, read_doc. To edit PPT: use read_doc + create_ppt. edit_pdf supports replace_text (find/replace in content streams), delete_pages, and append_page. Files are relative to workspace.".to_owned(),
+        description: "Create, edit, and read documents. Use this for ALL document operations — do NOT use execute_command.\n\
+            Supported formats: xlsx, xls, docx, doc, pdf, pptx, ppt, txt, md, csv\n\
+            Actions:\n\
+            - read_doc: Read any document (xlsx/docx/pdf/pptx/txt/md/csv). Returns text content.\n\
+            - create_excel: Create xlsx with sheets [{name, headers, rows}]\n\
+            - create_word: Create docx with content (# for headings, blank lines for paragraphs)\n\
+            - create_pdf: Create PDF with content\n\
+            - create_ppt: Create pptx with slides [{title, body}]\n\
+            - edit_excel: Update sheets or append_rows to existing xlsx\n\
+            - edit_word: Replace content or append text to existing docx\n\
+            - edit_pdf: replace_text [{find,replace}], delete_pages [1,3]\n\
+            Tips:\n\
+            - For txt/md: use read_file/write_file instead (simpler)\n\
+            - For csv: use read_doc to read, create_excel to convert to xlsx\n\
+            - To edit PPT: read_doc first, then create_ppt with modified slides\n\
+            - After creating, use send_file to deliver to the user".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
