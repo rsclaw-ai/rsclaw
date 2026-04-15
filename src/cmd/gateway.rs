@@ -114,12 +114,25 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
                 println!("  {} Gateway already running (pid {pid})", yellow("[!]"));
                 return Ok(());
             }
+
+            // If a system service is installed, start via service manager
+            // instead of spawning a bare process (avoids dual-start conflicts).
+            if service_installed() {
+                println!("  {} Service detected, starting via service manager...", dim("[..]"));
+                if try_service_start() {
+                    println!("  {} Gateway started (via service)", green("[ok]"));
+                    kv("URL:", &detect_url());
+                    println!();
+                    return Ok(());
+                }
+                eprintln!("  {} Service start failed, falling back to direct start", yellow("[!]"));
+            }
+
             let child = spawn_gateway_bg()?;
             let pid = child.id();
-            let port = detect_port();
             println!("  {} Gateway started", green("[ok]"));
             kv("PID:", &format!("{pid}"));
-            kv("URL:", &format!("http://127.0.0.1:{port}"));
+            kv("URL:", &detect_url());
             println!();
             Ok(())
         }
@@ -138,20 +151,29 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
             match gateway_signal_stop() {
                 Ok(()) => {
                     println!("  {} Stopping...", dim("[..]"));
-                    // gateway_signal_stop already waits for exit; small extra
-                    // delay to let the port be released by the OS.
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 }
                 Err(_) => {
                     println!("  {} No running gateway found, starting fresh", dim("[..]"));
                 }
             }
+
+            // Prefer service manager for restart if installed.
+            if service_installed() {
+                if try_service_start() {
+                    println!("  {} Gateway restarted (via service)", green("[ok]"));
+                    kv("URL:", &detect_url());
+                    println!();
+                    return Ok(());
+                }
+                eprintln!("  {} Service start failed, falling back to direct start", yellow("[!]"));
+            }
+
             let child = spawn_gateway_bg()?;
             let pid = child.id();
-            let port = detect_port();
             println!("  {} Gateway restarted", green("[ok]"));
             kv("PID:", &format!("{pid}"));
-            kv("URL:", &format!("http://127.0.0.1:{port}"));
+            kv("URL:", &detect_url());
             println!();
             Ok(())
         }
@@ -262,6 +284,19 @@ fn detect_port() -> u16 {
         .unwrap_or(18888)
 }
 
+/// Build the gateway URL from config (bind_address + port).
+fn detect_url() -> String {
+    let cfg = config::load_quiet().ok();
+    let port = cfg.as_ref().map(|c| c.gateway.port).unwrap_or(18888);
+    let bind = cfg
+        .as_ref()
+        .and_then(|c| c.gateway.bind_address.as_deref())
+        .unwrap_or("127.0.0.1");
+    // 0.0.0.0 means "all interfaces" but for display use 127.0.0.1.
+    let display_host = if bind == "0.0.0.0" || bind == "::" { "127.0.0.1" } else { bind };
+    format!("http://{display_host}:{port}")
+}
+
 pub fn gateway_signal_stop() -> Result<()> {
     // Try service manager first (handles auto-restart properly).
     if try_service_stop() {
@@ -289,6 +324,96 @@ pub fn gateway_signal_stop() -> Result<()> {
     // Clean up PID file.
     let _ = std::fs::remove_file(gateway_pid_file());
     Ok(())
+}
+
+/// Check if gateway is installed as a system service.
+/// Returns true if the service unit/plist/sc entry exists (even if not running).
+fn service_installed() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = dirs_next::home_dir() {
+            let plist = home.join("Library/LaunchAgents/ai.rsclaw.gateway.plist");
+            if plist.exists() { return true; }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(home) = dirs_next::home_dir() {
+            let unit = home.join(".config/systemd/user/rsclaw-gateway.service");
+            if unit.exists() { return true; }
+        }
+        // Also check system-level.
+        let sys_unit = std::path::Path::new("/etc/systemd/system/rsclaw-gateway.service");
+        if sys_unit.exists() { return true; }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // sc query returns non-zero if service doesn't exist.
+        if let Ok(o) = std::process::Command::new("sc")
+            .args(["query", "rsclaw"])
+            .output()
+        {
+            // If output contains "SERVICE_NAME" then the service exists.
+            if String::from_utf8_lossy(&o.stdout).contains("SERVICE_NAME") {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Try to start gateway via service manager.
+/// Returns true if the service was started successfully.
+fn try_service_start() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = dirs_next::home_dir() {
+            let plist = home.join("Library/LaunchAgents/ai.rsclaw.gateway.plist");
+            if plist.exists() {
+                let status = std::process::Command::new("launchctl")
+                    .args(["load", "-w"])
+                    .arg(&plist)
+                    .status();
+                return status.map(|s| s.success()).unwrap_or(false);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Try user service first.
+        if let Some(home) = dirs_next::home_dir() {
+            let unit = home.join(".config/systemd/user/rsclaw-gateway.service");
+            if unit.exists() {
+                let status = std::process::Command::new("systemctl")
+                    .args(["--user", "start", "rsclaw-gateway"])
+                    .status();
+                return status.map(|s| s.success()).unwrap_or(false);
+            }
+        }
+        // System-level.
+        let sys_unit = std::path::Path::new("/etc/systemd/system/rsclaw-gateway.service");
+        if sys_unit.exists() {
+            let status = std::process::Command::new("systemctl")
+                .args(["start", "rsclaw-gateway"])
+                .status();
+            return status.map(|s| s.success()).unwrap_or(false);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let status = std::process::Command::new("sc")
+            .args(["start", "rsclaw"])
+            .status();
+        return status.map(|s| s.success()).unwrap_or(false);
+    }
+
+    #[allow(unreachable_code)]
+    false
 }
 
 /// Try to stop gateway via service manager (launchctl/systemctl).
