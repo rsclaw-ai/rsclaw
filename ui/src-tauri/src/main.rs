@@ -26,6 +26,18 @@ extern "C" fn handle_sigterm(_sig: libc::c_int) {
     SIGTERM_RECEIVED.store(true, Ordering::Relaxed);
 }
 
+/// Apply CREATE_NO_WINDOW on Windows to prevent console popups.
+#[cfg(target_os = "windows")]
+fn hide_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x08000000) // CREATE_NO_WINDOW
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd
+}
+
 fn run_rsclaw_command(args: &[&str]) -> Result<String, String> {
     // Try sidecar binary next to the executable first, then fall back to PATH.
     let exe_dir = std::env::current_exe()
@@ -36,8 +48,7 @@ fn run_rsclaw_command(args: &[&str]) -> Result<String, String> {
         let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw.exe" } else { "rsclaw" });
         eprintln!("[cmd] sidecar path: {} exists={}", sidecar.display(), sidecar.exists());
         if sidecar.exists() {
-            std::process::Command::new(&sidecar)
-                .args(args)
+            hide_window(std::process::Command::new(&sidecar).args(args))
                 .output()
                 .ok()
         } else {
@@ -60,11 +71,10 @@ fn run_rsclaw_command(args: &[&str]) -> Result<String, String> {
         }
         None => {
             // Fallback: try "rsclaw" from PATH.
-            let o = std::process::Command::new("rsclaw")
+            hide_window(&mut std::process::Command::new("rsclaw"))
                 .args(args)
                 .output()
-                .map_err(|e| format!("Failed to execute rsclaw: {}", e))?;
-            o
+                .map_err(|e| format!("Failed to execute rsclaw: {}", e))?
         }
     };
 
@@ -93,8 +103,7 @@ fn run_rsclaw_cli(args: Vec<String>) -> Result<String, String> {
     let (stdout, stderr, success) = match exe_dir.as_ref().and_then(|dir| {
         let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw.exe" } else { "rsclaw" });
         if sidecar.exists() {
-            std::process::Command::new(&sidecar)
-                .args(&str_args)
+            hide_window(std::process::Command::new(&sidecar).args(&str_args))
                 .output()
                 .ok()
         } else {
@@ -107,7 +116,7 @@ fn run_rsclaw_cli(args: Vec<String>) -> Result<String, String> {
             o.status.success(),
         ),
         None => {
-            let o = std::process::Command::new("rsclaw")
+            let o = hide_window(&mut std::process::Command::new("rsclaw"))
                 .args(&str_args)
                 .output()
                 .map_err(|e| format!("Failed to execute rsclaw: {}", e))?;
@@ -139,22 +148,26 @@ fn start_gateway() -> Result<String, String> {
     if let Some(dir) = &exe_dir {
         let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw.exe" } else { "rsclaw" });
         if sidecar.exists() {
-            std::process::Command::new(&sidecar)
-                .args(["gateway", "start"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .map_err(|e| format!("Failed to start gateway: {e}"))?;
+            hide_window(
+                std::process::Command::new(&sidecar)
+                    .args(["gateway", "start"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null()),
+            )
+            .spawn()
+            .map_err(|e| format!("Failed to start gateway: {e}"))?;
             return Ok("gateway starting (sidecar)".to_string());
         }
     }
     // Fallback: PATH
-    std::process::Command::new("rsclaw")
-        .args(["gateway", "start"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Failed to start gateway: {e}"))?;
+    hide_window(
+        std::process::Command::new("rsclaw")
+            .args(["gateway", "start"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .spawn()
+    .map_err(|e| format!("Failed to start gateway: {e}"))?;
     Ok("gateway starting (PATH)".to_string())
 }
 
