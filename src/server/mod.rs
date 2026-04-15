@@ -360,7 +360,12 @@ async fn send_message(
             .into_response();
     }
 
-    let reply = match tokio::time::timeout(Duration::from_secs(120), reply_rx).await {
+    // Default 600s (10 min) to match channel handlers; agent tool chains can be lengthy.
+    let timeout_secs = state.config.raw.agents.as_ref()
+        .and_then(|a| a.defaults.as_ref())
+        .and_then(|d| d.timeout_seconds)
+        .unwrap_or(600) as u64;
+    let reply = match tokio::time::timeout(Duration::from_secs(timeout_secs), reply_rx).await {
         Ok(Ok(r)) => r,
         Ok(Err(_)) => {
             return (
