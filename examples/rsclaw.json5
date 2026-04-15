@@ -1,0 +1,310 @@
+// rsclaw.json5 — Full annotated example configuration
+//
+// Copy to ~/.rsclaw/rsclaw.json5 and edit as needed.
+// JSON5: comments, trailing commas, unquoted keys are supported.
+// All string values support ${VAR} environment variable substitution.
+{
+  // =================================================================
+  // GATEWAY — HTTP server, networking, proxy
+  // =================================================================
+  gateway: {
+    port: 18888,                      // TCP port (default: 18888)
+    bind: "loopback",                 // "loopback", "all", or IP address
+    language: "Chinese",              // UI/prompt language: "English", "Chinese", etc.
+    processingTimeout: 120,           // Seconds before "Processing..." indicator (0=disabled)
+
+    // Authentication (optional)
+    // auth: {
+    //   mode: "token",
+    //   token: "${RSCLAW_AUTH_TOKEN}",
+    // },
+
+    // Global HTTP proxy for outbound requests
+    // proxy: "socks5://127.0.0.1:1080",
+    // proxyAllow: "*.openai.com,*.anthropic.com",  // Only proxy these domains
+    // proxyDeny: "*.qq.com,localhost",              // Never proxy these domains
+  },
+
+  // =================================================================
+  // MODELS — LLM provider registry
+  // =================================================================
+  models: {
+    providers: {
+      // --- International ---
+      // anthropic: {
+      //   apiKey: "${ANTHROPIC_API_KEY}",
+      // },
+      // openai: {
+      //   apiKey: "${OPENAI_API_KEY}",
+      // },
+      // gemini: {
+      //   apiKey: "${GEMINI_API_KEY}",
+      // },
+
+      // --- Chinese providers ---
+      // qwen: {
+      //   apiKey: "${DASHSCOPE_API_KEY}",
+      //   // baseUrl auto-detected: dashscope.aliyuncs.com/compatible-mode/v1
+      // },
+      // deepseek: {
+      //   apiKey: "${DEEPSEEK_API_KEY}",
+      // },
+      // doubao: {
+      //   apiKey: "${DOUBAO_API_KEY}",
+      //   baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
+      // },
+      // kimi: {
+      //   apiKey: "${MOONSHOT_API_KEY}",
+      // },
+      // zhipu: {
+      //   apiKey: "${ZHIPU_API_KEY}",
+      // },
+      // minimax: {
+      //   apiKey: "${MINIMAX_API_KEY}",
+      // },
+      // siliconflow: {
+      //   apiKey: "${SILICONFLOW_API_KEY}",
+      // },
+
+      // --- Local inference ---
+      // ollama: {
+      //   baseUrl: "http://localhost:11434",       // Without /v1 → native /api/chat
+      //   // baseUrl: "http://localhost:11434/v1",  // With /v1 → OpenAI-compatible
+      // },
+
+      // --- Routing services ---
+      // openrouter: {
+      //   apiKey: "${OPENROUTER_API_KEY}",
+      // },
+      // gaterouter: {
+      //   apiKey: "${GATEROUTER_API_KEY}",
+      // },
+    },
+
+    // Ordered fallback chain when primary model fails
+    // fallbacks: [
+    //   "qwen/qwen-plus",
+    //   "deepseek/deepseek-chat",
+    // ],
+  },
+
+  // =================================================================
+  // AGENTS — Agent definitions and defaults
+  // =================================================================
+  agents: {
+    defaults: {
+      model: {
+        primary: "qwen/qwen-turbo",
+      },
+      contextTokens: 64000,           // Max context window (used for compaction threshold)
+      timeoutSeconds: 600,            // Max seconds per turn (default: 600)
+      maxIterations: 100,             // Max tool-call iterations per turn
+      intermediateOutput: true,       // Send intermediate text during multi-step tool calls
+      // temperature: 0.7,            // LLM temperature (0=deterministic, 1+=creative)
+      // frequencyPenalty: 0.0,       // Penalize repeated tokens
+
+      // Session compaction (auto-compress when context gets large)
+      compaction: {
+        mode: "layered",              // "default", "safeguard", "layered"
+        keepRecentPairs: 5,           // Keep N recent user-assistant pairs uncompressed
+        extractFacts: true,           // Extract key facts to long-term memory on compaction
+        // model: "qwen/qwen-turbo",  // Model for summarization (default: same as primary)
+        // maxTranscriptTokens: null,  // Auto: 70% of contextTokens
+      },
+
+      thinking: {
+        level: "medium",              // "none", "low", "medium", "high"
+      },
+
+      // memory: {
+      //   enabled: true,
+      //   autoCapture: true,          // Auto-capture facts from conversations
+      //   autoRecall: true,           // Auto-recall relevant memories each turn
+      //   enableManagementTools: true, // Expose memory_search/memory_put/memory_delete
+      // },
+
+      // heartbeat: {
+      //   enabled: true,              // Periodic autonomous agent scanning
+      // },
+    },
+
+    list: [
+      {
+        id: "main",
+        default: true,
+        model: {
+          primary: "qwen/qwen-turbo",
+          // fallback: "deepseek/deepseek-chat",
+          toolset: "full",            // "minimal" (6), "standard" (12), "full" (all)
+        },
+        allowedCommands: "*",         // "*" = all tools, or "read|write|exec"
+        workspace: "~/.rsclaw/workspace",
+        // system: "You are a helpful AI assistant.",
+        // channels: [],              // Empty = all channels. ["telegram"] = only telegram.
+        // temperature: 0.7,
+      },
+      // {
+      //   id: "coder",
+      //   model: { primary: "deepseek/deepseek-chat", toolset: "full" },
+      //   allowedCommands: "read|write|exec|web_search|web_fetch",
+      //   workspace: "~/projects",
+      //   temperature: 0.2,
+      // },
+      // {
+      //   id: "researcher",
+      //   model: { primary: "openai/gpt-4o", toolset: "minimal" },
+      //   allowedCommands: "web_search|web_fetch|memory_search",
+      // },
+    ],
+
+    // Remote agents via A2A protocol
+    // external: [
+    //   {
+    //     id: "remote-agent",
+    //     url: "https://remote-gateway.example.com",
+    //     authToken: "${REMOTE_AGENT_TOKEN}",
+    //   },
+    // ],
+  },
+
+  // =================================================================
+  // CHANNELS — Messaging platform connections
+  // =================================================================
+  channels: {
+    // telegram: {
+    //   botToken: "${TELEGRAM_BOT_TOKEN}",
+    //   dmPolicy: "pairing",           // "open", "pairing", "allowlist", "disabled"
+    //   groupPolicy: "open",
+    // },
+    // feishu: {
+    //   appId: "cli_xxx",
+    //   appSecret: "${FEISHU_APP_SECRET}",
+    //   brand: "feishu",                // "feishu" or "lark"
+    //   connectionMode: "websocket",    // "websocket" or "webhook"
+    //   dmPolicy: "pairing",
+    // },
+    // dingtalk: {
+    //   appKey: "xxx",
+    //   appSecret: "${DINGTALK_APP_SECRET}",
+    //   dmPolicy: "pairing",
+    // },
+    // wechat: {
+    //   dmPolicy: "pairing",
+    //   // QR scan login via: rsclaw channels login wechat
+    // },
+    // wecom: {
+    //   botId: "xxx",
+    //   secret: "${WECOM_SECRET}",
+    // },
+    // discord: {
+    //   token: "${DISCORD_BOT_TOKEN}",
+    //   dmPolicy: "pairing",
+    //   groupPolicy: "allowlist",
+    //   groupAllowFrom: ["server-id"],
+    // },
+    // slack: {
+    //   botToken: "${SLACK_BOT_TOKEN}",
+    //   appToken: "${SLACK_APP_TOKEN}",
+    // },
+    // whatsapp: {
+    //   phoneNumberId: "${WHATSAPP_PHONE_NUMBER_ID}",
+    //   accessToken: "${WHATSAPP_ACCESS_TOKEN}",
+    // },
+    // matrix: {
+    //   homeserver: "https://matrix.org",
+    //   accessToken: "${MATRIX_ACCESS_TOKEN}",
+    //   userId: "@bot:matrix.org",
+    // },
+    // line: {
+    //   channelAccessToken: "${LINE_CHANNEL_TOKEN}",
+    //   channelSecret: "${LINE_CHANNEL_SECRET}",
+    // },
+    // zalo: {
+    //   accessToken: "${ZALO_ACCESS_TOKEN}",
+    //   oaSecret: "${ZALO_OA_SECRET}",
+    // },
+    // signal: {
+    //   phoneNumber: "+1234567890",
+    // },
+    // custom: [
+    //   {
+    //     id: "my-webhook",
+    //     type: "webhook",
+    //     replyUrl: "https://your-app.example.com/callback",
+    //   },
+    // ],
+  },
+
+  // =================================================================
+  // TOOLS — Tool configuration
+  // =================================================================
+  tools: {
+    exec: {
+      safety: false,                  // Enable exec safety rules (deny/confirm/allow patterns)
+      // timeoutSeconds: 1800,        // Exec command timeout (default: 30min)
+    },
+    upload: {
+      maxFileSize: 52428800,          // 50MB file size limit
+      maxTextChars: 20000,            // Max text chars extracted from files
+    },
+    webSearch: {
+      // provider: "duckduckgo",      // "duckduckgo", "brave", "google", "bing"
+      // braveApiKey: "${BRAVE_API_KEY}",
+    },
+    webBrowser: {
+      // headed: auto-detect,         // true=visible window, false=headless. Auto: headed on desktop
+      // profile: "rsclaw",           // "default"=system Chrome profile, "rsclaw"=isolated, unset=temp
+      // chromePath: "/path/to/chrome", // Auto-detected if not set
+    },
+  },
+
+  // =================================================================
+  // MEMORY — Long-term memory
+  // =================================================================
+  memory: {
+    // enabled: true,
+    recallTopK: 10,                   // Results per backend before fusion
+    recallFinalK: 5,                  // Final results after RRF fusion
+  },
+
+  // =================================================================
+  // MEMORY SEARCH — Embedding configuration
+  // =================================================================
+  // memorySearch: {
+  //   provider: "local",             // "local", "openai", "gemini", "voyage", "ollama"
+  //   model: "bge-small-zh",
+  //   local: {
+  //     modelDownloadUrl: "https://hf-mirror.com",  // Mirror for China
+  //   },
+  // },
+
+  // =================================================================
+  // CRON — Scheduled jobs
+  // =================================================================
+  // cron: {
+  //   enabled: true,
+  //   maxConcurrentRuns: 2,
+  //   jobs: [
+  //     {
+  //       id: "morning_briefing",
+  //       schedule: "0 8 * * 1-5",    // UTC cron expression
+  //       message: "Provide a morning briefing.",
+  //       agentId: "main",
+  //     },
+  //   ],
+  // },
+
+  // =================================================================
+  // SESSION — Conversation persistence
+  // =================================================================
+  // session: {
+  //   dmScope: "per-channel-peer",    // "main", "per-peer", "per-channel-peer"
+  // },
+
+  // =================================================================
+  // LOGGING
+  // =================================================================
+  // logging: {
+  //   level: "info",                  // "trace", "debug", "info", "warn", "error"
+  // },
+}
