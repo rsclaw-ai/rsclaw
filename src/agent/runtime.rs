@@ -6785,8 +6785,8 @@ $bitmap.Dispose()
 "#,
                         tmp_path_str
                     );
-                    tokio::process::Command::new("powershell")
-                        .args(["-NoProfile", "-Command", &script])
+                    powershell_hidden()
+                        .args(["-Command", &script])
                         .output()
                         .await
                 } else {
@@ -6872,8 +6872,8 @@ $dst.Save('{out_str}', $codec, $params)
 $g.Dispose(); $dst.Dispose(); $src.Dispose()
 "#
                     );
-                    tokio::process::Command::new("powershell")
-                        .args(["-NoProfile", "-Command", &script])
+                    powershell_hidden()
+                        .args(["-Command", &script])
                         .output()
                         .await
                         .map(|o| o.status.success())
@@ -7313,8 +7313,8 @@ public class WinHoldKey {{
                         .map_err(|e| anyhow!("cliclick: {e}"))?;
                     String::from_utf8_lossy(&output.stdout).trim().to_string()
                 } else if is_windows {
-                    let output = tokio::process::Command::new("powershell")
-                        .args(["-NoProfile", "-Command",
+                    let output = powershell_hidden()
+                        .args(["-Command",
                             "Add-Type -AssemblyName System.Windows.Forms; $p = [System.Windows.Forms.Cursor]::Position; \"$($p.X),$($p.Y)\""])
                         .output()
                         .await
@@ -7370,8 +7370,8 @@ public class WinHoldKey {{
                     let win = output2.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
                     if win.is_empty() { app } else { format!("{app} — {win}") }
                 } else if is_windows {
-                    let output = tokio::process::Command::new("powershell")
-                        .args(["-NoProfile", "-Command",
+                    let output = powershell_hidden()
+                        .args(["-Command",
                             "Add-Type @\"\nusing System;\nusing System.Runtime.InteropServices;\npublic class WinTitle {\n  [DllImport(\"user32.dll\")] static extern IntPtr GetForegroundWindow();\n  [DllImport(\"user32.dll\")] static extern int GetWindowText(IntPtr h, System.Text.StringBuilder s, int n);\n  public static string Get() {\n    var sb = new System.Text.StringBuilder(256);\n    GetWindowText(GetForegroundWindow(), sb, 256);\n    return sb.ToString();\n  }\n}\n\"@\n[WinTitle]::Get()"])
                         .output()
                         .await
@@ -7824,8 +7824,8 @@ $synth.Speak('{}')
 "#,
                 out_path_str, text
             );
-            let output = tokio::process::Command::new("powershell")
-                .args(["-NoProfile", "-Command", &script])
+            let output = powershell_hidden()
+                .args(["-Command", &script])
                 .output()
                 .await
                 .map_err(|e| anyhow!("tts: PowerShell SAPI failed: {e}"))?;
@@ -9937,7 +9937,7 @@ fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "computer_use".to_owned(),
-        description: "Control the computer desktop. Screenshots auto-resize for HiDPI and return scale factor for coordinate mapping. Works on macOS, Linux, and Windows (zero dependencies).".to_owned(),
+        description: "Control the computer desktop. ONLY use when the user EXPLICITLY asks to take a screenshot, click, type, or interact with the desktop. Do NOT call this tool just because the message mentions words like 'screenshot' or 'screen' in other contexts. Screenshots auto-resize for HiDPI and return scale factor for coordinate mapping.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -10990,4 +10990,24 @@ fn match_skills<'a>(
     }
 
     matched
+}
+
+/// Create a `tokio::process::Command` for PowerShell that hides the console window.
+/// On Windows, sets CREATE_NO_WINDOW and -WindowStyle Hidden so the user never
+/// sees a PowerShell flash. On other platforms, returns a plain command (for cross-compile).
+fn powershell_hidden() -> tokio::process::Command {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = tokio::process::Command::new("powershell");
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        cmd.arg("-NoProfile").arg("-WindowStyle").arg("Hidden");
+        cmd
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut cmd = tokio::process::Command::new("powershell");
+        cmd.arg("-NoProfile");
+        cmd
+    }
 }

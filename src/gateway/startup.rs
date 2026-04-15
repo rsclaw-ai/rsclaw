@@ -1088,9 +1088,19 @@ $g.CopyFromScreen(0,0,0,0,$b.Size)
 $b.Save('{tmp_s}')
 $g.Dispose();$b.Dispose()"#
             );
-            tokio::process::Command::new("powershell")
-                .args(["-NoProfile", "-Command", &script])
-                .status().await.map(|s| s.success()).unwrap_or(false)
+            {
+                #[cfg(target_os = "windows")]
+                let mut cmd = {
+                    use std::os::windows::process::CommandExt;
+                    let mut c = tokio::process::Command::new("powershell");
+                    c.creation_flags(0x08000000);
+                    c
+                };
+                #[cfg(not(target_os = "windows"))]
+                let mut cmd = tokio::process::Command::new("powershell");
+                cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+                    .status().await.map(|s| s.success()).unwrap_or(false)
+            }
         } else {
             tokio::process::Command::new("scrot")
                 .arg(&tmp_s).status().await.map(|s| s.success()).unwrap_or(false)
