@@ -1,6 +1,6 @@
 [package]
 name = "rsclaw"
-version = "2026.4.12"
+version = "2026.4.15"
 edition = "2024"
 rust-version = "1.91"
 description = "AI Automation Manager Compatible with OpenClaw"
