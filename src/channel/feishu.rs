@@ -280,17 +280,18 @@ fn markdown_to_feishu_post(text: &str) -> serde_json::Value {
 fn build_feishu_card(text: &str, brand: &str) -> serde_json::Value {
     let cleaned = text;
 
+    let title = if brand == "lark" {
+        "\u{1F980}rsclaw.ai | RsClaw AI Automation Butler"
+    } else {
+        "\u{1F980}rsclaw.ai | \u{8783}\u{87F9}AI\u{81EA}\u{52A8}\u{5316}\u{7BA1}\u{5BB6}"
+    };
     json!({
         "msg_type": "interactive",
         "card": {
             "schema": "2.0",
             "header": {
                 "title": {
-                    "content": if brand == "lark" {
-                        "\u{1F980}rsclaw.ai | Your AI Automation Manager"
-                    } else {
-                        "\u{1F980}rsclaw.ai | \u{8783}\u{87F9}AI\u{81EA}\u{52A8}\u{5316}\u{7BA1}\u{5BB6}"
-                    },
+                    "content": title,
                     "tag": "plain_text"
                 },
                 "template": "blue"
@@ -300,14 +301,6 @@ fn build_feishu_card(text: &str, brand: &str) -> serde_json::Value {
                     {
                         "tag": "markdown",
                         "content": cleaned.trim()
-                    },
-                    {
-                        "tag": "markdown",
-                        "content": if brand == "lark" {
-                            "---\n<font color='grey'>The Lobster crawls, the Crab(RsClaw) sweeps past.</font>"
-                        } else {
-                            "---\n<font color='grey'>\u{9F99}\u{867E}\u{8FD8}\u{5728}\u{722C}\u{FF0C}\u{8783}\u{87F9}(RsClaw)\u{5DF2}\u{7ECF}\u{6A2A}\u{7740}\u{51B2}\u{8FC7}\u{53BB}\u{4E86}\u{3002}\u{3002}\u{3002}</font>"
-                        }
                     }
                 ]
             }
