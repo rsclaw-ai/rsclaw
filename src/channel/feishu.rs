@@ -1372,16 +1372,24 @@ impl Channel for FeishuChannel {
                     Err(e) => { warn!("feishu: token error for file upload: {e}"); continue; }
                 };
 
-                // Determine file type for Feishu API.
-                let file_type = if mime.starts_with("video/") { "mp4" }
-                    else if mime.contains("pdf") { "pdf" }
+                // Feishu separates media (video/audio) from files (pdf/doc/xls).
+                let is_media = mime.starts_with("video/") || mime.starts_with("audio/");
+
+                let file_type = if is_media {
+                    if mime.starts_with("video/") { "mp4" } else { "mp3" }
+                } else if mime.contains("pdf") { "pdf" }
                     else if mime.contains("doc") { "doc" }
                     else if mime.contains("sheet") || mime.contains("xls") { "xls" }
                     else if mime.contains("ppt") || mime.contains("presentation") { "ppt" }
                     else { "stream" };
 
-                // Upload file to Feishu.
-                let upload_url = format!("{}/im/v1/files", self.api_base());
+                // Upload: media → /im/v1/images (type=file), files → /im/v1/files.
+                let upload_url = if is_media {
+                    format!("{}/im/v1/images", self.api_base())
+                } else {
+                    format!("{}/im/v1/files", self.api_base())
+                };
+
                 let part = match reqwest::multipart::Part::bytes(bytes)
                     .file_name(filename.clone())
                     .mime_str(mime)
@@ -1389,10 +1397,18 @@ impl Channel for FeishuChannel {
                     Ok(p) => p,
                     Err(e) => { warn!("feishu: multipart error: {e}"); continue; }
                 };
-                let form = reqwest::multipart::Form::new()
-                    .text("file_type", file_type.to_owned())
-                    .text("file_name", filename.clone())
-                    .part("file", part);
+
+                let form = if is_media {
+                    // Media upload uses "image" part name and image_type field.
+                    reqwest::multipart::Form::new()
+                        .text("image_type", "message".to_owned())
+                        .part("image", part)
+                } else {
+                    reqwest::multipart::Form::new()
+                        .text("file_type", file_type.to_owned())
+                        .text("file_name", filename.clone())
+                        .part("file", part)
+                };
 
                 let upload_resp = self.client
                     .post(&upload_url)
@@ -1401,28 +1417,38 @@ impl Channel for FeishuChannel {
                     .send()
                     .await;
 
-                let file_key = match upload_resp {
+                let resource_key = match upload_resp {
                     Ok(r) => match r.json::<serde_json::Value>().await {
                         Ok(body) => {
-                            if let Some(k) = body.pointer("/data/file_key").and_then(|v| v.as_str()) {
+                            // Media returns image_key, files return file_key.
+                            let key = if is_media {
+                                body.pointer("/data/image_key").and_then(|v| v.as_str())
+                            } else {
+                                body.pointer("/data/file_key").and_then(|v| v.as_str())
+                            };
+                            if let Some(k) = key {
                                 k.to_owned()
                             } else {
-                                warn!("feishu: file upload missing file_key: {body}");
+                                warn!("feishu: upload missing key: {body}");
                                 continue;
                             }
                         }
-                        Err(e) => { warn!("feishu: file upload parse error: {e}"); continue; }
+                        Err(e) => { warn!("feishu: upload parse error: {e}"); continue; }
                     },
-                    Err(e) => { warn!("feishu: file upload failed: {e}"); continue; }
+                    Err(e) => { warn!("feishu: upload failed: {e}"); continue; }
                 };
 
-                // Send file or media message.
+                // Send message: media uses msg_type=media + file_key, files use msg_type=file.
                 let id_type = if msg.target_id.starts_with("ou_") { "open_id" }
                     else if msg.target_id.starts_with("on_") { "union_id" }
                     else if msg.target_id.starts_with("oc_") { "chat_id" }
                     else { "chat_id" };
                 let send_url = format!("{}/im/v1/messages?receive_id_type={id_type}", self.api_base());
-                let (msg_type, content) = ("file", serde_json::json!({"file_key": file_key}).to_string());
+                let (msg_type, content) = if is_media {
+                    ("media", serde_json::json!({"file_key": resource_key, "file_name": filename}).to_string())
+                } else {
+                    ("file", serde_json::json!({"file_key": resource_key}).to_string())
+                };
 
                 let token2 = match self.get_token().await {
                     Ok(t) => t,
