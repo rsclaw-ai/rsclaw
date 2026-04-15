@@ -107,7 +107,7 @@ impl WeComChannel {
             bot_id: bot_id.into(),
             secret: secret.into(),
             ws_url: ws_url.unwrap_or_else(|| DEFAULT_WS_URL.to_owned()),
-            client: Client::builder()
+            client: crate::config::build_proxy_client()
                 .timeout(Duration::from_secs(60))
                 .build()
                 .expect("reqwest client"),

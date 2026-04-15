@@ -145,7 +145,7 @@ impl QQBotChannel {
             }),
             token_url: token_url_override.unwrap_or_else(|| TOKEN_URL.to_owned()),
             intents: intents.unwrap_or(DEFAULT_INTENTS),
-            client: Client::builder()
+            client: crate::config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("http client"),

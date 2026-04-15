@@ -495,7 +495,7 @@ impl MatrixChannel {
             homeserver: homeserver.into().trim_end_matches('/').to_owned(),
             access_token: access_token.into(),
             user_id: user_id.into(),
-            client: Client::builder()
+            client: crate::config::build_proxy_client()
                 .timeout(Duration::from_secs(60))
                 .build()
                 .expect("reqwest client"),

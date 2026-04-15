@@ -238,7 +238,7 @@ impl WeChatPersonalChannel {
         Self {
             base_url: ILINK_BASE_URL.to_owned(),
             bot_token,
-            client: Client::builder()
+            client: crate::config::build_proxy_client()
                 .timeout(Duration::from_millis(LONG_POLL_TIMEOUT_MS + 5000))
                 .build()
                 .expect("http client"),

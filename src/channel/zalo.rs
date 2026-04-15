@@ -83,7 +83,7 @@ impl ZaloChannel {
         Self {
             access_token: access_token.into(),
             api_base: api_base.unwrap_or_else(|| ZALO_API_BASE.to_owned()),
-            client: Client::builder()
+            client: crate::config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),

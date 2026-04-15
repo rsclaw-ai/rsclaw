@@ -129,7 +129,7 @@ impl DingTalkChannel {
             robot_code: robot_code.into(),
             api_base: api_base.unwrap_or_else(|| DINGTALK_API_BASE.to_owned()),
             oapi_base: oapi_base.unwrap_or_else(|| DINGTALK_OAPI_BASE.to_owned()),
-            client: Client::builder()
+            client: crate::config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),

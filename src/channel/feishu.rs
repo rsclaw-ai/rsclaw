@@ -360,7 +360,7 @@ impl FeishuChannel {
             app_secret: app_secret.into(),
             brand: "feishu".to_owned(),
             chat_ids,
-            client: Client::builder()
+            client: crate::config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
@@ -1037,7 +1037,7 @@ impl FeishuChannel {
         );
 
         // Use a longer timeout for file downloads (5 min)
-        let dl_client = reqwest::Client::builder()
+        let dl_client = crate::config::build_proxy_client()
             .timeout(Duration::from_secs(300))
             .build()
             .unwrap_or_else(|_| self.client.clone());

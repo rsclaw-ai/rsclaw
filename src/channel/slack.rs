@@ -52,7 +52,7 @@ impl SlackChannel {
             app_token,
             api_base: api_base
                 .unwrap_or_else(|| SLACK_API_BASE.to_owned()),
-            client: Client::builder()
+            client: crate::config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),

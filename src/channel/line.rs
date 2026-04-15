@@ -95,7 +95,7 @@ impl LineChannel {
             channel_access_token: channel_access_token.into(),
             api_base: base,
             api_data_base: data_base,
-            client: Client::builder()
+            client: crate::config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
