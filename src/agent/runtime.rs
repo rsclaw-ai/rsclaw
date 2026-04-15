@@ -443,6 +443,12 @@ impl AgentRuntime {
         let target_id_bg = target_id.clone();
         let channel_bg = channel_name.clone();
         let lang_bg = lang;
+        // Clone agent's own inbox for result injection after completion.
+        let self_tx = self.handle.tx.clone();
+        let self_session = ctx.session_key.clone();
+        let self_channel = ctx.channel.clone();
+        let self_peer_id = ctx.peer_id.clone();
+        let self_chat_id = ctx.chat_id.clone();
         tokio::spawn(async move {
             tracing::info!("tool_opencode: background task started");
             // Start event collection FIRST (in parallel with send_prompt)
@@ -506,7 +512,9 @@ impl AgentRuntime {
             // far. The events collected during execution are already in
             // `events`.
 
-            // Process the result
+            // Process the result — collect summary + files for both notification and agent re-inject.
+            let mut result_summary = String::new();
+            let mut result_files: Vec<(String, String, String)> = vec![];
             match send_result {
                 Ok(resp) => {
                     tracing::info!(
@@ -618,6 +626,10 @@ impl AgentRuntime {
                         ])
                     };
 
+                    // Store for agent re-inject after notification.
+                    result_summary = summary.clone();
+                    result_files = notif_files.clone();
+
                     // Send notification to user
                     tracing::debug!(
                         "tool_opencode: sending completion notification, summary_len={}, files={}",
@@ -663,6 +675,33 @@ impl AgentRuntime {
             // IMPORTANT: DON'T await event_collector - it runs forever waiting
             // for more events The collected events are already in
             // `events` variable
+
+            // Inject result back into main agent's inbox so it can act on the result
+            // (e.g. send_file). This triggers a new agent turn.
+            let file_paths: Vec<String> = result_files.iter().map(|(_, _, p)| p.clone()).collect();
+            let inject_text = if file_paths.is_empty() {
+                format!("[OpenCode completed] {}", if result_summary.is_empty() { "Task finished.".to_owned() } else { result_summary })
+            } else {
+                format!("[OpenCode completed] Files ready: {}. Please send them to the user with send_file.",
+                    file_paths.join(", "))
+            };
+            let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
+            let inject_msg = AgentMessage {
+                session_key: self_session,
+                text: inject_text,
+                channel: self_channel,
+                peer_id: self_peer_id,
+                chat_id: self_chat_id,
+                reply_tx,
+                extra_tools: vec![],
+                images: vec![],
+                files: vec![],
+            };
+            if self_tx.send(inject_msg).await.is_err() {
+                tracing::warn!("tool_opencode: failed to inject result back to agent inbox");
+            } else {
+                tracing::info!("tool_opencode: result injected back to agent");
+            }
         });
 
         Ok(serde_json::json!({
