@@ -439,12 +439,11 @@ fn resolve_download_url(
         "opencode" => {
             let ver = section.get("version")?.as_str()?;
             let filename = match platform {
-                "linux-x64" => format!("opencode-linux-x64.tar.gz"),
-                "linux-arm64" => format!("opencode-linux-arm64.tar.gz"),
-                "mac-x64" => format!("opencode-darwin-x64.zip"),
-                "mac-arm64" => format!("opencode-darwin-arm64.zip"),
-                "win-x64" => format!("opencode-windows-x64.zip"),
-                _ => return None,
+                "linux-x64" => "opencode-linux-x64.tar.gz",
+                "linux-arm64" => "opencode-linux-arm64.tar.gz",
+                "mac-x64" => "opencode-mac-x64.tar.gz",
+                "mac-arm64" => "opencode-mac-arm64.tar.gz",
+                _ => return None, // no Windows binary available
             };
             Some(format!("{MIRROR_BASE}/opencode/{ver}/{filename}"))
         }
