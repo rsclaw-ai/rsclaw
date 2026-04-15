@@ -1383,12 +1383,10 @@ impl Channel for FeishuChannel {
                     else if mime.contains("ppt") || mime.contains("presentation") { "ppt" }
                     else { "stream" };
 
-                // Upload: media → /im/v1/images (type=file), files → /im/v1/files.
-                let upload_url = if is_media {
-                    format!("{}/im/v1/images", self.api_base())
-                } else {
-                    format!("{}/im/v1/files", self.api_base())
-                };
+                // All files (including video/audio) upload to /im/v1/files.
+                // Video/audio use file_type "mp4"/"mp3" and send as msg_type "media".
+                // Documents use their respective file_type and send as msg_type "file".
+                let upload_url = format!("{}/im/v1/files", self.api_base());
 
                 let part = match reqwest::multipart::Part::bytes(bytes)
                     .file_name(filename.clone())
@@ -1397,18 +1395,10 @@ impl Channel for FeishuChannel {
                     Ok(p) => p,
                     Err(e) => { warn!("feishu: multipart error: {e}"); continue; }
                 };
-
-                let form = if is_media {
-                    // Media upload uses "image" part name and image_type field.
-                    reqwest::multipart::Form::new()
-                        .text("image_type", "message".to_owned())
-                        .part("image", part)
-                } else {
-                    reqwest::multipart::Form::new()
-                        .text("file_type", file_type.to_owned())
-                        .text("file_name", filename.clone())
-                        .part("file", part)
-                };
+                let form = reqwest::multipart::Form::new()
+                    .text("file_type", file_type.to_owned())
+                    .text("file_name", filename.clone())
+                    .part("file", part);
 
                 let upload_resp = self.client
                     .post(&upload_url)
@@ -1417,19 +1407,13 @@ impl Channel for FeishuChannel {
                     .send()
                     .await;
 
-                let resource_key = match upload_resp {
+                let file_key = match upload_resp {
                     Ok(r) => match r.json::<serde_json::Value>().await {
                         Ok(body) => {
-                            // Media returns image_key, files return file_key.
-                            let key = if is_media {
-                                body.pointer("/data/image_key").and_then(|v| v.as_str())
-                            } else {
-                                body.pointer("/data/file_key").and_then(|v| v.as_str())
-                            };
-                            if let Some(k) = key {
+                            if let Some(k) = body.pointer("/data/file_key").and_then(|v| v.as_str()) {
                                 k.to_owned()
                             } else {
-                                warn!("feishu: upload missing key: {body}");
+                                warn!("feishu: upload missing file_key: {body}");
                                 continue;
                             }
                         }
@@ -1438,16 +1422,16 @@ impl Channel for FeishuChannel {
                     Err(e) => { warn!("feishu: upload failed: {e}"); continue; }
                 };
 
-                // Send message: media uses msg_type=media + file_key, files use msg_type=file.
+                // Send: video/audio as "media", others as "file".
                 let id_type = if msg.target_id.starts_with("ou_") { "open_id" }
                     else if msg.target_id.starts_with("on_") { "union_id" }
                     else if msg.target_id.starts_with("oc_") { "chat_id" }
                     else { "chat_id" };
                 let send_url = format!("{}/im/v1/messages?receive_id_type={id_type}", self.api_base());
                 let (msg_type, content) = if is_media {
-                    ("media", serde_json::json!({"file_key": resource_key, "file_name": filename}).to_string())
+                    ("media", serde_json::json!({"file_key": file_key, "file_name": filename}).to_string())
                 } else {
-                    ("file", serde_json::json!({"file_key": resource_key}).to_string())
+                    ("file", serde_json::json!({"file_key": file_key}).to_string())
                 };
 
                 let token2 = match self.get_token().await {
