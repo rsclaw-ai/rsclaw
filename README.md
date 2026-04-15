@@ -33,7 +33,7 @@ cargo build --release
 Desktop app (.dmg / .msi / .deb): [Releases](https://github.com/rsclaw-ai/rsclaw/releases)
 
 ```bash
-# Fresh install
+# New install
 rsclaw setup      # initialize ~/.rsclaw/
 rsclaw onboard    # interactive wizard: provider, channels, etc.
 rsclaw start
