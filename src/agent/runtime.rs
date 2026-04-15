@@ -9522,7 +9522,9 @@ fn build_system_prompt(
              - For cron jobs: use the `cron` tool (action=list/add/remove).\n\
              - To install tools (python, node, ffmpeg, chrome, opencode, claude-code, sherpa-onnx): use `exec` with `{rsclaw_exe} tools install <name>`. Do NOT download/install manually.\n\
              - If a tool call fails, do NOT retry with the same arguments. Try a different approach or inform the user.\n\
-             - Never fabricate URLs or file paths."
+             - Never fabricate URLs or file paths.\n\
+             - When user asks about previous conversations, tasks, or anything you don't have context for, use `memory_search` to recall relevant information before answering.\n\
+             - At the start of a new session, if the user's first message references prior work, search memory first."
                 .replace("{rsclaw_exe}", &std::env::current_exe()
                     .map(|p| {
                         let s = p.to_string_lossy().to_string();
