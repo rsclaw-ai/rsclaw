@@ -200,7 +200,7 @@ pub enum Command {
     #[command(subcommand)]
     System(SystemCommand),
 
-    /// External tool management (chromium, ffmpeg, etc.).
+    /// External tool management (chrome, ffmpeg, opencode, etc.).
     #[command(subcommand)]
     Tools(ToolsCommand),
 

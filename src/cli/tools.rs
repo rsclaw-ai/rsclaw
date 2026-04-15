@@ -2,9 +2,9 @@ use clap::Subcommand;
 
 #[derive(Subcommand, Debug)]
 pub enum ToolsCommand {
-    /// Install a tool (chromium, ffmpeg, whisper-cpp, node, python, all).
+    /// Install a tool (chrome, ffmpeg, node, python, opencode, claude-code, all).
     Install {
-        /// Tool name: chromium, ffmpeg, whisper-cpp, node, python, all
+        /// Tool name: chrome, ffmpeg, node, python, opencode, claude-code, all
         name: String,
         /// Force reinstall even if already installed or in PATH.
         #[arg(long, short)]
