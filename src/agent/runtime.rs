@@ -2039,7 +2039,7 @@ impl AgentRuntime {
             {
                 // Group chat safety: block dangerous preparse commands (/run, /ls, /cat, etc.)
                 let is_group = session_key.contains(":group:");
-                if is_group && matches!(tool.as_str(), "exec" | "read" | "write") {
+                if is_group && matches!(tool.as_str(), "execute_command" | "exec" | "read_file" | "read" | "write_file" | "write") {
                     return Ok(AgentReply {
                         text: "[Blocked] Shell/file commands are not allowed in group chats for security.".to_owned(),
                         is_empty: false,
@@ -2632,7 +2632,7 @@ impl AgentRuntime {
             // Group chat safety: strip dangerous tools to prevent exec via LLM
             let is_group = session_key.contains(":group:");
             if is_group {
-                const GROUP_BLOCKED_TOOLS: &[&str] = &["exec", "read", "write", "computer_use"];
+                const GROUP_BLOCKED_TOOLS: &[&str] = &["execute_command", "exec", "read_file", "read", "write_file", "write", "computer_use"];
                 all.retain(|t| !GROUP_BLOCKED_TOOLS.contains(&t.name.as_str()));
             }
 
@@ -3717,7 +3717,7 @@ impl AgentRuntime {
                 // Upgrade iteration limit when complex or multi-step tools are used.
                 if matches!(tool_name.as_str(),
                     "web_browser" | "opencode" | "claudecode" | "agent"
-                    | "search_content" | "search_file" | "exec"
+                    | "search_content" | "search_file" | "execute_command" | "exec"
                 ) {
                     max_iterations = max_iterations.max(configured_complex);
                 }
@@ -3844,7 +3844,7 @@ impl AgentRuntime {
                 }
 
                 // Collect sendable file attachments from write/exec tool results.
-                if matches!(tool_name.as_str(), "write" | "exec") {
+                if matches!(tool_name.as_str(), "write_file" | "write" | "execute_command" | "exec") {
                     let workspace = self.handle.config.workspace.as_deref()
                         .or(self.config.agents.defaults.workspace.as_deref())
                         .map(expand_tilde)
@@ -3908,7 +3908,7 @@ impl AgentRuntime {
                 let max_chars = match tool_name.as_str() {
                     "web_search" => limits.and_then(|l| l.web_search).unwrap_or(2000),
                     "web_fetch" => limits.and_then(|l| l.web_fetch).unwrap_or(5000),
-                    "exec" => limits.and_then(|l| l.exec).unwrap_or(3000),
+                    "execute_command" | "exec" => limits.and_then(|l| l.exec).unwrap_or(3000),
                     _ => limits.and_then(|l| l.default).unwrap_or(3000),
                 };
                 let session_text = if result_text.len() > max_chars {
@@ -4099,10 +4099,10 @@ impl AgentRuntime {
                     "size": full.metadata().map(|m| m.len()).unwrap_or(0),
                 }));
             }
-            "read" => return self.tool_read(args).await,
-            "write" => return self.tool_write(args).await,
-            "exec" => return self.tool_exec(args).await,
-            "tool_install" => return self.tool_install(args).await,
+            "read_file" | "read" => return self.tool_read(args).await,
+            "write_file" | "write" => return self.tool_write(args).await,
+            "execute_command" | "exec" => return self.tool_exec(args).await,
+            "install_tool" | "tool_install" => return self.tool_install(args).await,
             "list_dir" => return self.tool_list_dir(args).await,
             "search_file" => return self.tool_search_file(args).await,
             "search_content" => return self.tool_search_content(args).await,
@@ -4111,10 +4111,10 @@ impl AgentRuntime {
             "web_download" => return self.tool_web_download(args).await,
             "web_browser" | "browser" => return self.tool_web_browser(ctx, args).await,
             "computer_use" => return self.tool_computer_use(args).await,
-            "image" => return self.tool_image(args).await,
+            "image_gen" | "image" => return self.tool_image(args).await,
             "pdf" => return self.tool_pdf(args).await,
-            "tts" => return self.tool_tts(args).await,
-            "message" => return self.tool_message(args).await,
+            "text_to_speech" | "tts" => return self.tool_tts(args).await,
+            "send_message" | "message" => return self.tool_message(args).await,
             "cron" => return self.tool_cron(args).await,
             "gateway" => return self.tool_gateway(args).await,
             "pairing" => return self.tool_pairing(args).await,
@@ -9600,13 +9600,13 @@ fn toolset_allowed_names(
     toolset: &str,
     custom_tools: Option<&Vec<String>>,
 ) -> Option<std::collections::HashSet<String>> {
-    const MINIMAL: &[&str] = &["exec", "read", "write", "send_file", "list_dir", "search_file", "search_content", "web_search", "web_fetch", "memory"];
-    const WEB: &[&str] = &["web_search", "web_fetch", "web_browser", "web_download", "read", "write", "list_dir", "search_file", "memory"];
-    const CODE: &[&str] = &["exec", "read", "write", "list_dir", "search_file", "search_content", "memory"];
+    const MINIMAL: &[&str] = &["execute_command", "read_file", "write_file", "send_file", "list_dir", "search_file", "search_content", "web_search", "web_fetch", "memory"];
+    const WEB: &[&str] = &["web_search", "web_fetch", "web_browser", "web_download", "read_file", "write_file", "list_dir", "search_file", "memory"];
+    const CODE: &[&str] = &["execute_command", "read_file", "write_file", "list_dir", "search_file", "search_content", "memory"];
     const STANDARD: &[&str] = &[
-        "exec",
-        "read",
-        "write",
+        "execute_command",
+        "read_file",
+        "write_file",
         "list_dir",
         "search_file",
         "search_content",
@@ -9614,7 +9614,7 @@ fn toolset_allowed_names(
         "web_fetch",
         "memory",
         "web_browser",
-        "image",
+        "image_gen",
         "channel",
         "cron",
         "computer_use",
@@ -9872,13 +9872,13 @@ fn build_system_prompt(
     {
         parts.push(
             "## Tool Usage Guidelines\n\
-             ### File Operations (use dedicated tools, NOT exec)\n\
-             - List directory contents: use `list_dir` (NOT exec ls/dir)\n\
-             - Find files by name: use `search_file` (NOT exec find)\n\
-             - Search file contents: use `search_content` (NOT exec grep)\n\
-             - Read file: use `read`. Write file: use `write`.\n\
-             - For documents (xlsx/docx/pdf/pptx): use the `doc` tool, not exec.\n\
-             - Reserve `exec` for system commands, package installs, and tasks that have no dedicated tool.\n\
+             ### File Operations (use dedicated tools, NOT execute_command)\n\
+             - List directory contents: use `list_dir` (NOT execute_command ls/dir)\n\
+             - Find files by name: use `search_file` (NOT execute_command find)\n\
+             - Search file contents: use `search_content` (NOT execute_command grep)\n\
+             - Read file: use `read_file`. Write/create file: use `write_file`.\n\
+             - For documents (xlsx/docx/pdf/pptx): use the `doc` tool, not execute_command.\n\
+             - Reserve `execute_command` for system commands and tasks that have no dedicated tool.\n\
              ### Web Operations\n\
              - When user asks to go to a specific site (e.g. 'go to douyin', 'open taobao'), use `web_browser` directly. Do NOT search first.\n\
              - For general questions or info lookup, use `web_search` first.\n\
@@ -9891,7 +9891,7 @@ fn build_system_prompt(
              - If a sub-agent times out, break the task into simpler steps and try with a smaller scope.\n\
              ### Other\n\
              - For cron jobs: use the `cron` tool (action=list/add/remove).\n\
-             - To install tools (python, node, ffmpeg, chrome, opencode, claude-code, sherpa-onnx): use `tool_install`. Do NOT download/install manually.\n\
+             - To install tools (python, node, ffmpeg, chrome, opencode, claude-code, sherpa-onnx): use `install_tool`. Do NOT download/install manually.\n\
              - When user asks about previous conversations, tasks, or anything you don't have context for, use `memory` to recall relevant information before answering.\n\
              - At the start of a new session, if the user's first message references prior work, search memory first."
                 .to_owned(),
@@ -10085,7 +10085,7 @@ fn build_tool_list(
         }),
     });
     tools.push(ToolDef {
-        name: "read".to_owned(),
+        name: "read_file".to_owned(),
         description: "Read a file from the agent workspace. Path is relative to workspace root."
             .to_owned(),
         parameters: json!({
@@ -10097,8 +10097,8 @@ fn build_tool_list(
         }),
     });
     tools.push(ToolDef {
-        name: "write".to_owned(),
-        description: "Write/create a file. Use this for ALL file creation and writing — do NOT use exec with notepad, echo, or any other editor/command to create files.\n\
+        name: "write_file".to_owned(),
+        description: "Write/create a file. Use this for ALL file creation and writing — do NOT use execute_command with notepad, echo, or any other editor/command to create files.\n\
             Creates parent directories as needed. Path is relative to workspace root.\n\
             Both 'path' and 'content' are required.".to_owned(),
         parameters: json!({
@@ -10125,7 +10125,7 @@ fn build_tool_list(
         }),
     });
     tools.push(ToolDef {
-        name: "exec".to_owned(),
+        name: "execute_command".to_owned(),
         description: if cfg!(target_os = "windows") {
             "Run a shell command (PowerShell) on Windows.\n\
              IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `tool_install`. Only use exec for commands that have no dedicated tool.\n\
@@ -10182,7 +10182,7 @@ fn build_tool_list(
 
     // Tool installer (structured alternative to exec rsclaw tools install).
     tools.push(ToolDef {
-        name: "tool_install".to_owned(),
+        name: "install_tool".to_owned(),
         description: "Install a tool/runtime. Available: python, node, ffmpeg, chrome, opencode, claude-code, sherpa-onnx.".to_owned(),
         parameters: json!({
             "type": "object",
@@ -10369,7 +10369,7 @@ fn build_tool_list(
     // --- New openclaw-compatible tools ---
 
     tools.push(ToolDef {
-        name: "image".to_owned(),
+        name: "image_gen".to_owned(),
         description: "Generate an image from a text description using an AI image model. Pass the user's original description as-is (preserve their language, do not translate).".to_owned(),
         parameters: json!({
             "type": "object",
@@ -10392,7 +10392,7 @@ fn build_tool_list(
         }),
     });
     tools.push(ToolDef {
-        name: "tts".to_owned(),
+        name: "text_to_speech".to_owned(),
         description: "Convert text to speech audio.".to_owned(),
         parameters: json!({
             "type": "object",
@@ -10404,7 +10404,7 @@ fn build_tool_list(
         }),
     });
     tools.push(ToolDef {
-        name: "message".to_owned(),
+        name: "send_message".to_owned(),
         description: "Send a message to a chat channel target (user or group).".to_owned(),
         parameters: json!({
             "type": "object",
@@ -11315,7 +11315,7 @@ mod tests {
         let tools = build_tool_list(&skills, None, "test-agent", &[]);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         for expected in &[
-            "memory", "session", "agent", "channel", "read", "write", "exec",
+            "memory", "session", "agent", "channel", "read_file", "write_file", "execute_command",
         ] {
             assert!(
                 names.contains(expected),
