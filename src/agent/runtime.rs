@@ -1266,34 +1266,10 @@ impl AgentRuntime {
             info!("clear_signal received, clearing all sessions");
 
             // Build summaries from existing sessions before clearing.
-            let mut summaries: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            let mut summary_msgs: Vec<(String, Message)> = Vec::new();
             for (key, messages) in &self.sessions {
-                if messages.is_empty() { continue; }
-                // Take last 10 messages and extract key points.
-                let recent: Vec<&Message> = messages.iter().rev().take(10).rev().collect();
-                let mut summary_parts = Vec::new();
-                for msg in &recent {
-                    let role = match msg.role {
-                        crate::provider::Role::User => "User",
-                        crate::provider::Role::Assistant => "Assistant",
-                        _ => continue,
-                    };
-                    // Extract text content, truncate to 200 chars.
-                    let text = match &msg.content {
-                        crate::provider::MessageContent::Text(s) => s.clone(),
-                        crate::provider::MessageContent::Parts(parts) => parts.iter().filter_map(|p| {
-                            if let crate::provider::ContentPart::Text { text } = p { Some(text.as_str()) } else { None }
-                        }).collect::<Vec<_>>().join(" "),
-                    };
-                    if text.is_empty() { continue; }
-                    let truncated = if text.chars().count() > 200 {
-                        let idx = text.char_indices().nth(200).map(|(i, _)| i).unwrap_or(text.len());
-                        format!("{}...", &text[..idx])
-                    } else { text };
-                    summary_parts.push(format!("{role}: {truncated}"));
-                }
-                if !summary_parts.is_empty() {
-                    summaries.insert(key.clone(), summary_parts.join("\n"));
+                if let Some(msg) = build_clear_summary(messages) {
+                    summary_msgs.push((key.clone(), msg));
                 }
             }
 
@@ -1304,14 +1280,8 @@ impl AgentRuntime {
                 let _ = self.store.db.delete_session(&key);
             }
 
-            // Re-inject summaries as a system message in each session.
-            for (key, summary) in summaries {
-                let msg = Message {
-                    role: crate::provider::Role::System,
-                    content: crate::provider::MessageContent::Text(
-                        format!("[Session summary before /clear]\n{summary}")
-                    ),
-                };
+            // Re-inject summaries so agent retains context.
+            for (key, msg) in summary_msgs {
                 self.sessions.insert(key, vec![msg]);
             }
         }
@@ -1644,80 +1614,53 @@ impl AgentRuntime {
                         )
                     }
                     "__CLEAR__" => {
-                        // Preserve a brief summary before clearing.
-                        let summary_msg = if let Some(msgs) = self.sessions.get(session_key) {
-                            if !msgs.is_empty() {
-                                let recent: Vec<&Message> = msgs.iter().rev().take(10).rev().collect();
-                                let mut parts = Vec::new();
-                                for m in &recent {
-                                    let role = match m.role {
-                                        crate::provider::Role::User => "User",
-                                        crate::provider::Role::Assistant => "Assistant",
-                                        _ => continue,
-                                    };
-                                    let text = match &m.content {
-                                        crate::provider::MessageContent::Text(s) => s.clone(),
-                                        crate::provider::MessageContent::Parts(ps) => ps.iter().filter_map(|p| {
-                                            if let crate::provider::ContentPart::Text { text } = p { Some(text.as_str()) } else { None }
-                                        }).collect::<Vec<_>>().join(" "),
-                                    };
-                                    if text.is_empty() { continue; }
-                                    let truncated = if text.chars().count() > 200 {
-                                        let idx = text.char_indices().nth(200).map(|(i, _)| i).unwrap_or(text.len());
-                                        format!("{}...", &text[..idx])
-                                    } else { text };
-                                    parts.push(format!("{role}: {truncated}"));
-                                }
-                                if parts.is_empty() { None } else {
-                                    Some(Message {
-                                        role: crate::provider::Role::System,
-                                        content: crate::provider::MessageContent::Text(
-                                            format!("[Session summary before /clear]\n{}", parts.join("\n"))
-                                        ),
-                                    })
-                                }
-                            } else { None }
-                        } else { None };
-
+                        let summary_msg = self.sessions.get(session_key)
+                            .and_then(|msgs| build_clear_summary(msgs));
                         self.sessions.remove(session_key);
                         if let Err(e) = self.store.db.delete_session(session_key) {
                             warn!("failed to clear persisted session: {e:#}");
                         }
-                        // Re-inject summary so agent retains context.
                         if let Some(msg) = summary_msg {
                             self.sessions.insert(session_key.to_owned(), vec![msg]);
                         }
                         "Session cleared.".to_owned()
                     }
                     "__COMPACT__" => {
-                        // Manual compaction: compress current session + save summary to memory.
+                        // Manual compaction: force compress + save summary to memory.
                         let model = self.resolve_model_name();
-                        self.compact_if_needed(session_key, &model).await;
+                        self.compact_force(session_key, &model).await;
                         // Extract summary from the compacted session for memory storage.
+                        // Look for the compaction-tagged System message specifically.
+                        const COMPACTION_TAG: &str = "[Conversation history compacted";
                         if let Some(msgs) = self.sessions.get(session_key) {
-                            // The first message after compaction is usually the summary.
                             let summary_text = msgs.iter().find_map(|m| {
                                 if m.role == crate::provider::Role::System {
-                                    match &m.content {
-                                        crate::provider::MessageContent::Text(s) => Some(s.clone()),
-                                        crate::provider::MessageContent::Parts(parts) => parts.iter().find_map(|p| {
-                                            if let crate::provider::ContentPart::Text { text } = p { Some(text.clone()) } else { None }
-                                        }),
-                                    }
+                                    let text = match &m.content {
+                                        crate::provider::MessageContent::Text(s) => s.clone(),
+                                        crate::provider::MessageContent::Parts(parts) => parts.iter().filter_map(|p| {
+                                            if let crate::provider::ContentPart::Text { text } = p { Some(text.as_str()) } else { None }
+                                        }).collect::<Vec<_>>().join(" "),
+                                    };
+                                    if text.starts_with(COMPACTION_TAG) { Some(text) } else { None }
                                 } else { None }
                             });
                             if let Some(summary) = summary_text {
-                                // Store to memory for cross-session recall.
                                 if let Some(ref mem) = self.memory {
-                                    let mem_text = format!("Session compaction summary:\n{}", &summary[..summary.len().min(2000)]);
+                                    // UTF-8 safe truncation.
+                                    let truncated: String = summary.chars().take(2000).collect();
+                                    let mem_text = format!("Session compaction summary:\n{truncated}");
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs() as i64)
+                                        .unwrap_or(0);
                                     let doc = crate::agent::memory::MemoryDoc {
                                         id: uuid::Uuid::new_v4().to_string(),
                                         scope: "global".to_owned(),
                                         kind: "summary".to_owned(),
                                         text: mem_text.clone(),
                                         vector: vec![],
-                                        created_at: 0,
-                                        accessed_at: 0,
+                                        created_at: now,
+                                        accessed_at: now,
                                         access_count: 0,
                                         importance: 0.7,
                                         tier: Default::default(),
@@ -1729,9 +1672,13 @@ impl AgentRuntime {
                                         Err(e) => warn!("compact: failed to save to memory: {e}"),
                                     }
                                 }
+                                "✓ Session compacted and saved to memory.".to_owned()
+                            } else {
+                                "✓ Session compacted (no summary to save).".to_owned()
                             }
+                        } else {
+                            "Nothing to compact.".to_owned()
                         }
-                        "✓ Session compacted and saved to memory.".to_owned()
                     }
                     "__ABORT__" => {
                         // Set abort flag for this session to interrupt running turn
@@ -4573,6 +4520,15 @@ impl AgentRuntime {
     /// verbatim and only summarises the older portion, so recent context is
     /// never lost.  Falls back to Default/Safeguard when configured.
     async fn compact_if_needed(&mut self, session_key: &str, model: &str) {
+        self.compact_inner(session_key, model, false).await;
+    }
+
+    /// Force compaction regardless of threshold (used by /compact).
+    async fn compact_force(&mut self, session_key: &str, model: &str) {
+        self.compact_inner(session_key, model, true).await;
+    }
+
+    async fn compact_inner(&mut self, session_key: &str, model: &str, force: bool) {
         use crate::config::schema::CompactionMode;
 
         // Use configured compaction settings, or sensible defaults.
@@ -4616,10 +4572,11 @@ impl AgentRuntime {
             token_trigger,
             turn_trigger,
             time_trigger,
+            force,
             "compaction check"
         );
 
-        if !token_trigger && !turn_trigger && !time_trigger {
+        if !force && !token_trigger && !turn_trigger && !time_trigger {
             // Increment turn counter only.
             self.compaction_state
                 .entry(session_key.to_owned())
@@ -10607,6 +10564,39 @@ fn msg_chars(m: &Message) -> usize {
             })
             .sum(),
     }
+}
+
+/// Build a summary Message from the last 10 user/assistant messages (for /clear).
+fn build_clear_summary(messages: &[Message]) -> Option<Message> {
+    if messages.is_empty() { return None; }
+    let recent: Vec<&Message> = messages.iter().rev().take(10).rev().collect();
+    let mut parts = Vec::new();
+    for m in &recent {
+        let role = match m.role {
+            crate::provider::Role::User => "User",
+            crate::provider::Role::Assistant => "Assistant",
+            _ => continue,
+        };
+        let text = match &m.content {
+            crate::provider::MessageContent::Text(s) => s.clone(),
+            crate::provider::MessageContent::Parts(ps) => ps.iter().filter_map(|p| {
+                if let crate::provider::ContentPart::Text { text } = p { Some(text.as_str()) } else { None }
+            }).collect::<Vec<_>>().join(" "),
+        };
+        if text.is_empty() { continue; }
+        let truncated = if text.chars().count() > 200 {
+            let idx = text.char_indices().nth(200).map(|(i, _)| i).unwrap_or(text.len());
+            format!("{}...", &text[..idx])
+        } else { text };
+        parts.push(format!("{role}: {truncated}"));
+    }
+    if parts.is_empty() { return None; }
+    Some(Message {
+        role: crate::provider::Role::System,
+        content: crate::provider::MessageContent::Text(
+            format!("[Session summary before /clear]\n{}", parts.join("\n"))
+        ),
+    })
 }
 
 /// CJK-aware token estimate for a message (used by compaction threshold).
