@@ -26,8 +26,8 @@ struct ToolDef {
 
 const TOOLS: &[ToolDef] = &[
     ToolDef {
-        name: "chromium",
-        display: "Chromium (browser automation)",
+        name: "chrome",
+        display: "Chrome for Testing (browser automation)",
         detect_cmd: &["google-chrome", "chromium", "chromium-browser", "chrome"],
         local_bin: "chromium",
     },
@@ -188,7 +188,18 @@ fn cmd_status() {
     }
 }
 
+/// Resolve tool name aliases (e.g. "chromium" → "chrome").
+fn resolve_tool_name(name: &str) -> &str {
+    match name {
+        "chromium" | "chromium-browser" | "google-chrome" => "chrome",
+        "python3" => "python",
+        "nodejs" => "node",
+        _ => name,
+    }
+}
+
 async fn cmd_install(name: &str, force: bool) -> Result<()> {
+    let name = resolve_tool_name(name);
     let names: Vec<&str> = if name == "all" {
         TOOLS.iter().map(|d| d.name).collect()
     } else {
@@ -315,7 +326,7 @@ fn resolve_download_url(
     let section = manifest.get(&manifest_key).or_else(|| manifest.get(tool))?;
 
     match tool {
-        "chromium" => {
+        "chrome" | "chromium" => {
             let ver = section.get("version")?.as_str()?;
             let filename = match platform {
                 "linux-x64" => "chrome-linux64.zip",

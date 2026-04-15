@@ -9426,7 +9426,7 @@ fn build_system_prompt(
              - After downloading, use `send_file` to send the file to the user.\n\
              - For documents (xlsx/docx/pdf/pptx): use the `doc` tool, not exec.\n\
              - For cron jobs: use the `cron` tool (action=list/add/remove).\n\
-             - To install tools (python, node, ffmpeg, chromium, sherpa-onnx): use `exec` with `{rsclaw_exe} tools install <name>`. Do NOT download/install manually.\n\
+             - To install tools (python, node, ffmpeg, chrome, sherpa-onnx): use `exec` with `{rsclaw_exe} tools install <name>`. Do NOT download/install manually.\n\
              - If a tool call fails, do NOT retry with the same arguments. Try a different approach or inform the user.\n\
              - Never fabricate URLs or file paths."
                 .replace("{rsclaw_exe}", &std::env::current_exe()
