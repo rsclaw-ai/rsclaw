@@ -6785,8 +6785,16 @@ $bitmap.Dispose()
 "#,
                         tmp_path_str
                     );
-                    tokio::process::Command::new("powershell")
-                        .args(["-NoProfile", "-Command", &script])
+                    #[cfg(target_os = "windows")]
+                    let mut cmd = {
+                        use std::os::windows::process::CommandExt;
+                        let mut c = tokio::process::Command::new("powershell");
+                        c.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                        c
+                    };
+                    #[cfg(not(target_os = "windows"))]
+                    let mut cmd = tokio::process::Command::new("powershell");
+                    cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
                         .output()
                         .await
                 } else {
