@@ -2007,9 +2007,28 @@ const SNAPSHOT_JS: &str = r#"(function(){
     var ariaLabel = el.getAttribute('aria-label') || '';
     var isEditable = el.isContentEditable && !el.parentElement.isContentEditable;
     var hasCursorPointer = style.cursor === 'pointer';
+    // Detect upload/dropzone areas.
+    var cls = (el.className || '').toString().toLowerCase();
+    var isUploadZone = (tag === 'input' && el.type === 'file')
+      || role === 'dropzone'
+      || cls.indexOf('upload') >= 0 || cls.indexOf('dropzone') >= 0 || cls.indexOf('drop-area') >= 0
+      || el.getAttribute('accept');
+    // Detect rich text editors (Draft.js, Quill, Slate, ProseMirror, TinyMCE, Tiptap).
+    var isRichEditor = isEditable && (
+      cls.indexOf('ql-editor') >= 0 || cls.indexOf('DraftEditor') >= 0
+      || cls.indexOf('slate-') >= 0 || cls.indexOf('ProseMirror') >= 0
+      || cls.indexOf('tiptap') >= 0 || cls.indexOf('mce-content') >= 0
+      || cls.indexOf('editor') >= 0 || cls.indexOf('rich-text') >= 0
+      || el.getAttribute('data-slate-editor') || el.getAttribute('data-contents')
+    );
+    // Detect chat input (textarea or editable near a send button).
+    var isChatInput = (tag === 'textarea' || isEditable) && (
+      cls.indexOf('chat') >= 0 || cls.indexOf('message') >= 0 || cls.indexOf('prompt') >= 0
+      || (el.getAttribute('placeholder') || '').match(/[\u8f93\u5165\u53d1\u9001]|send|type|message|ask|chat/i)
+    );
     var isInteractive = ['a','button','input','select','textarea','details','summary'].indexOf(tag) >= 0
       || INTERACTIVE_ROLES.indexOf(role) >= 0
-      || isEditable
+      || isEditable || isUploadZone
       || el.getAttribute('onclick') || el.getAttribute('tabindex')
       || (hasCursorPointer && (el.innerText||'').trim().length > 0);
     var isDisabled = el.disabled || el.getAttribute('aria-disabled') === 'true';
@@ -2020,13 +2039,19 @@ const SNAPSHOT_JS: &str = r#"(function(){
       el.setAttribute('data-ref', ref);
     }
     var label = '';
-    if (tag === 'a') label = 'link';
+    if (isUploadZone && tag === 'input') label = 'upload[file]';
+    else if (isUploadZone) label = 'upload-zone';
+    else if (tag === 'a') label = 'link';
     else if (tag === 'button' || role === 'button') label = 'button';
     else if (tag === 'input') label = 'input[' + (el.type||'text') + ']';
     else if (tag === 'select') label = 'select';
+    else if (isChatInput && tag === 'textarea') label = 'chat-input';
     else if (tag === 'textarea') label = 'textarea';
+    else if (isRichEditor) label = 'rich-editor';
+    else if (isChatInput && isEditable) label = 'chat-input';
     else if (isEditable) label = 'editable';
     else if (tag === 'img') label = 'img';
+    else if (tag === 'video') label = 'video';
     else if (tag === 'h1'||tag === 'h2'||tag === 'h3'||tag === 'h4'||tag === 'h5'||tag === 'h6') label = tag;
     else if (['nav','main','header','footer','aside','section','article','form'].indexOf(tag) >= 0) label = tag;
     else if (hasCursorPointer && isInteractive) label = 'clickable';
@@ -2059,6 +2084,12 @@ const SNAPSHOT_JS: &str = r#"(function(){
       if (tag === 'a' && el.href) {
         var href = el.href.length > 80 ? el.href.substring(0, 80) + '...' : el.href;
         extraStr += ' href="' + href + '"';
+      }
+      if (isUploadZone) {
+        var accept = el.getAttribute('accept') || '';
+        if (accept) extraStr += ' accept="' + accept + '"';
+        var multiple = el.hasAttribute('multiple');
+        if (multiple) extraStr += ' [multiple]';
       }
       if (tag === 'img') {
         extraStr = ' ' + (el.naturalWidth||el.width||0) + 'x' + (el.naturalHeight||el.height||0);

@@ -179,6 +179,21 @@ pub fn tool_prompts_for_system(base_dir: &Path, _lang: Option<&str>) -> String {
          ## Extracting results\n\
          - After generation completes: extract URL via `evaluate` -> `web_download` -> `send_file` to user.\n\
          - Do NOT just reply 'done' — always deliver the actual file/image to the user.\n\
+         ## Upload (images/videos)\n\
+         - Find the [upload-zone] or [upload[file]] ref in snapshot.\n\
+         - Use `upload` action with files parameter: {\"action\":\"upload\",\"ref\":\"@eN\",\"files\":[\"/path/to/file\"]}\n\
+         - If no upload ref visible, look for a button with text like 'upload/上传' and click it first to reveal the file input.\n\
+         - After upload, wait for processing (re-snapshot to check progress/completion).\n\
+         ## Rich text / Chat input\n\
+         - [rich-editor] or [chat-input]: click to focus -> type or fill content.\n\
+         - For chat (Open WebUI etc.): fill the [chat-input], then press Enter to send.\n\
+         - For rich editors (Douyin/WeChat/XHS backend): click [rich-editor] -> type content. Use press Enter for newlines if needed.\n\
+         ## Multi-step flows (publish, export, import)\n\
+         - After clicking a button, ALWAYS re-snapshot to see the next step (dialog, confirmation, loading).\n\
+         - Look for 'next/下一步', 'confirm/确认', 'publish/发布', 'submit/提交' buttons.\n\
+         - After final submit, wait 10-20s then re-snapshot to verify success.\n\
+         - For export: find 'export/导出/下载' button, click, wait for download or download link.\n\
+         - For import: find 'import/导入' button, click, then use upload for the file.\n\
          ## Do NOT\n\
          - Skip `open` and operate directly.\n\
          - Use expired refs (re-snapshot after any page change).\n\
