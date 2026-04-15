@@ -9,7 +9,7 @@
 use std::{
     collections::HashMap,
     sync::Arc,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize},
     time::Instant,
 };
 

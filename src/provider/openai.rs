@@ -155,8 +155,10 @@ impl LlmProvider for OpenAiProvider {
                 "openai: preparing LLM request"
             );
 
-            // Ollama: always use native /api/chat protocol
-            if self.is_ollama {
+            // Ollama: if base_url does NOT contain "/v1", use native /api/chat.
+            // If it has "/v1" (e.g. http://localhost:11434/v1), fall through to
+            // OpenAI-compatible /chat/completions path.
+            if self.is_ollama && !self.base_url.contains("/v1") {
                 return self.stream_ollama_native(&req).await;
             }
 

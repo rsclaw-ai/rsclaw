@@ -704,7 +704,7 @@ impl AgentRuntime {
                 // Wait for agent's reply and forward it (text + files) to user via notification.
                 match tokio::time::timeout(Duration::from_secs(300), reply_rx).await {
                     Ok(Ok(reply)) => {
-                        if (!reply.text.is_empty() || !reply.files.is_empty() || !reply.images.is_empty()) {
+                        if !reply.text.is_empty() || !reply.files.is_empty() || !reply.images.is_empty() {
                             if let Some(ref tx) = notif_tx_bg {
                                 let _ = tx.send(crate::channel::OutboundMessage {
                                     target_id: target_id_bg.clone(),
@@ -9036,8 +9036,8 @@ fn has_display() -> bool {
 /// Detect Chrome/Chromium binary path.
 /// Priority: ~/.rsclaw/tools/ > system PATH > well-known locations.
 fn detect_chrome() -> Option<String> {
-    // 1. Check locally installed via `rsclaw tools install chromium` (highest priority)
-    let tools_dir = crate::config::loader::base_dir().join("tools/chromium");
+    // 1. Check locally installed via `rsclaw tools install chrome` (highest priority)
+    let tools_dir = crate::config::loader::base_dir().join("tools/chrome");
     if tools_dir.exists() {
         #[cfg(target_os = "windows")]
         let bin = tools_dir.join("chrome.exe");

@@ -157,9 +157,7 @@ pub fn seed_workspace_with_lang(workspace: &Path, lang: Option<&str>) -> Result<
 /// Returns tool prompts for system prompt injection.
 /// web_browser: short summary only (full guide in prompt.md, model reads on demand).
 /// Other tools: injected directly (they're short enough).
-pub fn tool_prompts_for_system(base_dir: &Path, lang: Option<&str>) -> String {
-    let resolved = lang.map(crate::i18n::resolve_lang).unwrap_or("en");
-    let zh = resolved == "zh";
+pub fn tool_prompts_for_system(base_dir: &Path, _lang: Option<&str>) -> String {
 
     let mut parts = Vec::new();
 
