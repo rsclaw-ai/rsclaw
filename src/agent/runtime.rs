@@ -685,11 +685,11 @@ impl AgentRuntime {
                 format!("[OpenCode completed] Files ready: {}. Please send them to the user with send_file.",
                     file_paths.join(", "))
             };
-            let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
             let inject_msg = AgentMessage {
                 session_key: self_session,
                 text: inject_text,
-                channel: self_channel,
+                channel: self_channel.clone(),
                 peer_id: self_peer_id,
                 chat_id: self_chat_id,
                 reply_tx,
@@ -700,7 +700,28 @@ impl AgentRuntime {
             if self_tx.send(inject_msg).await.is_err() {
                 tracing::warn!("tool_opencode: failed to inject result back to agent inbox");
             } else {
-                tracing::info!("tool_opencode: result injected back to agent");
+                tracing::info!("tool_opencode: result injected back to agent, waiting for reply");
+                // Wait for agent's reply and forward it (text + files) to user via notification.
+                match tokio::time::timeout(Duration::from_secs(300), reply_rx).await {
+                    Ok(Ok(reply)) => {
+                        if (!reply.text.is_empty() || !reply.files.is_empty() || !reply.images.is_empty()) {
+                            if let Some(ref tx) = notif_tx_bg {
+                                let _ = tx.send(crate::channel::OutboundMessage {
+                                    target_id: target_id_bg.clone(),
+                                    is_group: false,
+                                    text: reply.text,
+                                    reply_to: None,
+                                    images: reply.images,
+                                    files: reply.files,
+                                    channel: Some(self_channel),
+                                });
+                                tracing::info!("tool_opencode: forwarded agent reply to user");
+                            }
+                        }
+                    }
+                    Ok(Err(_)) => tracing::warn!("tool_opencode: reply channel dropped"),
+                    Err(_) => tracing::warn!("tool_opencode: reply timed out after 300s"),
+                }
             }
         });
 
