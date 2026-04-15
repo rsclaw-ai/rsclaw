@@ -209,7 +209,7 @@ impl CustomWebhookChannel {
     ) -> Self {
         Self {
             cfg,
-            client: Client::builder()
+            client: crate::config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),

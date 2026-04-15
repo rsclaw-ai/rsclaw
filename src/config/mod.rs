@@ -76,3 +76,139 @@ pub fn load_from(path: std::path::PathBuf) -> Result<RuntimeConfig> {
     validator::validate(&runtime)?;
     Ok(runtime)
 }
+
+/// Resolve the proxy URL from env var (highest priority) or config.
+/// Returns None if no proxy is configured.
+pub fn resolve_proxy(config: &RuntimeConfig) -> Option<String> {
+    // RSCLAW_PROXY env var takes priority.
+    if let Ok(p) = std::env::var("RSCLAW_PROXY") {
+        let p = p.trim().to_owned();
+        if !p.is_empty() { return Some(p); }
+    }
+    // Fallback to config file.
+    config.raw.gateway.as_ref()
+        .and_then(|g| g.proxy.as_ref())
+        .filter(|p| !p.is_empty())
+        .cloned()
+}
+
+/// Resolve proxy allow list from env or config.
+fn resolve_proxy_allow(config: &RuntimeConfig) -> Option<String> {
+    if let Ok(v) = std::env::var("RSCLAW_PROXY_ALLOW") {
+        if !v.trim().is_empty() { return Some(v.trim().to_owned()); }
+    }
+    config.raw.gateway.as_ref()
+        .and_then(|g| g.proxy_allow.as_ref())
+        .filter(|v| !v.is_empty())
+        .cloned()
+}
+
+/// Resolve proxy deny list from env or config.
+fn resolve_proxy_deny(config: &RuntimeConfig) -> Option<String> {
+    if let Ok(v) = std::env::var("RSCLAW_PROXY_DENY") {
+        if !v.trim().is_empty() { return Some(v.trim().to_owned()); }
+    }
+    config.raw.gateway.as_ref()
+        .and_then(|g| g.proxy_deny.as_ref())
+        .filter(|v| !v.is_empty())
+        .cloned()
+}
+
+/// Check if a host matches a pattern (supports wildcards like *.openai.com).
+fn host_matches_pattern(host: &str, pattern: &str) -> bool {
+    let host = host.to_lowercase();
+    let pattern = pattern.trim().to_lowercase();
+    if pattern == "*" { return true; }
+    if pattern.starts_with("*.") {
+        let suffix = &pattern[1..]; // ".openai.com"
+        host.ends_with(suffix) || host == pattern[2..]
+    } else {
+        host == pattern || host.ends_with(&format!(".{pattern}"))
+    }
+}
+
+/// Check if a host matches any pattern in a comma-separated list.
+fn host_matches_any(host: &str, patterns: &str) -> bool {
+    patterns.split(',').any(|p| host_matches_pattern(host, p.trim()))
+}
+
+/// Apply proxy settings. Uses HTTP_PROXY/HTTPS_PROXY env vars for simple cases,
+/// or reqwest::Proxy::custom for allow/deny lists.
+/// Must be called early in gateway startup before HTTP clients are created.
+pub fn apply_proxy_env(config: &RuntimeConfig) {
+    let proxy_url = match resolve_proxy(config) {
+        Some(u) => u,
+        None => return,
+    };
+
+    let allow = resolve_proxy_allow(config);
+    let deny = resolve_proxy_deny(config);
+
+    // Build deny list: always include localhost + user deny list.
+    let mut deny_list = "localhost,127.0.0.1,::1".to_owned();
+    if let Some(ref d) = deny {
+        deny_list = format!("{deny_list},{d}");
+    }
+
+    if allow.is_none() || allow.as_deref() == Some("*") {
+        // Simple mode: proxy everything except deny list → use env vars.
+        // SAFETY: called once at startup before spawning threads.
+        unsafe {
+            std::env::set_var("HTTP_PROXY", &proxy_url);
+            std::env::set_var("HTTPS_PROXY", &proxy_url);
+            std::env::set_var("NO_PROXY", &deny_list);
+        }
+        tracing::info!(proxy = %proxy_url, deny = %deny_list, "global proxy configured (all domains)");
+    } else {
+        // Allow mode: only proxy matching domains.
+        // Do NOT set HTTP_PROXY env var — that would proxy ALL requests.
+        // Instead store the config globally. Channels that create their own
+        // reqwest::Client will NOT use the proxy (which is correct — only
+        // allowed domains should). The proxy is applied via build_proxy_client().
+        //
+        // For channels that DO need the proxy (e.g. wechat CDN upload),
+        // they should use build_proxy_client() or we inject the proxy at
+        // the point of use.
+        unsafe { std::env::set_var("NO_PROXY", &deny_list); }
+        PROXY_ALLOW.get_or_init(|| allow.clone().unwrap_or_default());
+        PROXY_DENY.get_or_init(|| deny_list.clone());
+        PROXY_URL.get_or_init(|| proxy_url.clone());
+        tracing::info!(proxy = %proxy_url, allow = ?allow, deny = %deny_list, "global proxy configured (allow-list mode, selective)");
+    }
+}
+
+static PROXY_ALLOW: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static PROXY_DENY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static PROXY_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Build a reqwest::Client that respects the proxy allow/deny lists.
+/// If an allow list is configured, only matching domains use the proxy.
+pub fn build_proxy_client() -> reqwest::ClientBuilder {
+    let mut builder = reqwest::Client::builder();
+
+    let allow = PROXY_ALLOW.get().map(|s| s.as_str()).unwrap_or("");
+    let proxy_url = PROXY_URL.get().map(|s| s.as_str()).unwrap_or("");
+
+    let deny = PROXY_DENY.get().map(|s| s.as_str()).unwrap_or("");
+
+    if !proxy_url.is_empty() && !allow.is_empty() && allow != "*" {
+        // Custom proxy: only route matching hosts through proxy.
+        let allow_owned = allow.to_owned();
+        let deny_owned = deny.to_owned();
+        let url_owned = proxy_url.to_owned();
+        let proxy = reqwest::Proxy::custom(move |url| {
+            let host = url.host_str().unwrap_or("");
+            // Deny list takes priority over allow list.
+            if !deny_owned.is_empty() && host_matches_any(host, &deny_owned) {
+                return None;
+            }
+            if host_matches_any(host, &allow_owned) {
+                Some(url_owned.clone())
+            } else {
+                None
+            }
+        });
+        builder = builder.proxy(proxy);
+    }
+    builder
+}

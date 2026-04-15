@@ -26,8 +26,8 @@ struct ToolDef {
 
 const TOOLS: &[ToolDef] = &[
     ToolDef {
-        name: "chromium",
-        display: "Chromium (browser automation)",
+        name: "chrome",
+        display: "Chrome for Testing (browser automation)",
         detect_cmd: &["google-chrome", "chromium", "chromium-browser", "chrome"],
         local_bin: "chromium",
     },
@@ -54,6 +54,18 @@ const TOOLS: &[ToolDef] = &[
         display: "sherpa-onnx (STT + TTS engine)",
         detect_cmd: &["sherpa-onnx-offline-tts", "sherpa-onnx-offline", "sherpa-onnx"],
         local_bin: "sherpa-onnx",
+    },
+    ToolDef {
+        name: "opencode",
+        display: "OpenCode (AI coding agent)",
+        detect_cmd: &["opencode"],
+        local_bin: "opencode",
+    },
+    ToolDef {
+        name: "claude-code",
+        display: "Claude Code (AI coding agent)",
+        detect_cmd: &["claude"],
+        local_bin: "claude-code",
     },
 ];
 
@@ -128,7 +140,7 @@ pub async fn cmd_tools(sub: ToolsCommand) -> Result<()> {
     match sub {
         ToolsCommand::List => { cmd_list(); Ok(()) }
         ToolsCommand::Status => { cmd_status(); Ok(()) }
-        ToolsCommand::Install { name } => cmd_install(&name).await,
+        ToolsCommand::Install { name, force } => cmd_install(&name, force).await,
     }
 }
 
@@ -188,7 +200,32 @@ fn cmd_status() {
     }
 }
 
-async fn cmd_install(name: &str) -> Result<()> {
+/// Resolve tool name aliases (e.g. "chromium" → "chrome").
+/// Find node binary: prefer locally installed, fallback to system PATH.
+fn find_node_binary(tools_dir: &std::path::Path) -> Option<String> {
+    // Check local tools dir first.
+    let local = tools_dir.join("node").join("bin").join("node");
+    if local.exists() { return Some(local.to_string_lossy().to_string()); }
+    // Windows variant.
+    let local_win = tools_dir.join("node").join("node.exe");
+    if local_win.exists() { return Some(local_win.to_string_lossy().to_string()); }
+    // System PATH.
+    which::which("node").ok().map(|p| p.to_string_lossy().to_string())
+}
+
+fn resolve_tool_name(name: &str) -> &str {
+    match name {
+        "chromium" | "chromium-browser" | "google-chrome" => "chrome",
+        "python3" => "python",
+        "nodejs" | "node.js" => "node",
+        "open-code" | "opencode-cli" => "opencode",
+        "claude" | "claude-agent" | "claudecode" => "claude-code",
+        _ => name,
+    }
+}
+
+async fn cmd_install(name: &str, force: bool) -> Result<()> {
+    let name = resolve_tool_name(name);
     let names: Vec<&str> = if name == "all" {
         TOOLS.iter().map(|d| d.name).collect()
     } else {
@@ -234,13 +271,40 @@ async fn cmd_install(name: &str) -> Result<()> {
     for tool_name in &names {
         let def = TOOLS.iter().find(|d| d.name == *tool_name).unwrap();
 
-        // Skip if already available
-        if is_tool_in_path(def) {
+        // Skip if already available (unless --force)
+        if !force && is_tool_in_path(def) {
             println!("  {} {} {}", green("✓"), bold(def.name), dim("(already in system PATH, skipping)"));
             continue;
         }
-        if is_tool_installed_locally(def) {
+        if !force && is_tool_installed_locally(def) {
             println!("  {} {} {}", green("✓"), bold(def.name), dim("(already installed, skipping)"));
+            continue;
+        }
+
+        // npm-based tools: install via npm --prefix instead of downloading binary.
+        let npm_package = match *tool_name {
+            "claude-code" => Some("@anthropic-ai/claude-code"),
+            _ => None,
+        };
+        if let Some(pkg) = npm_package {
+            let dest_dir = dir.join(def.local_bin);
+            std::fs::create_dir_all(&dest_dir)?;
+            println!("  Installing {} via npm ...", bold(def.name));
+            let node_bin = find_node_binary(&dir);
+            let npm_bin = node_bin.as_deref().map(|n| {
+                let p = std::path::Path::new(n).parent().unwrap_or(std::path::Path::new(""));
+                p.join("npm").to_string_lossy().to_string()
+            }).unwrap_or_else(|| "npm".to_owned());
+            let status = std::process::Command::new(&npm_bin)
+                .args(["install", "--prefix", &dest_dir.to_string_lossy(), pkg])
+                .status();
+            match status {
+                Ok(s) if s.success() => ok(&format!("{} installed to {}", def.name, dest_dir.display())),
+                Ok(s) => err_msg(&format!("{}: npm install exited with {s}", def.name)),
+                Err(e) => {
+                    err_msg(&format!("{}: npm not found ({e}). Install node first: rsclaw tools install node", def.name));
+                }
+            }
             continue;
         }
 
@@ -315,7 +379,7 @@ fn resolve_download_url(
     let section = manifest.get(&manifest_key).or_else(|| manifest.get(tool))?;
 
     match tool {
-        "chromium" => {
+        "chrome" | "chromium" => {
             let ver = section.get("version")?.as_str()?;
             let filename = match platform {
                 "linux-x64" => "chrome-linux64.zip",
@@ -371,6 +435,18 @@ fn resolve_download_url(
                 _ => return None,
             };
             Some(format!("{MIRROR_BASE}/sherpa-onnx/{ver}/{filename}"))
+        }
+        "opencode" => {
+            let ver = section.get("version")?.as_str()?;
+            let filename = match platform {
+                "linux-x64" => format!("opencode-linux-x64.tar.gz"),
+                "linux-arm64" => format!("opencode-linux-arm64.tar.gz"),
+                "mac-x64" => format!("opencode-darwin-x64.zip"),
+                "mac-arm64" => format!("opencode-darwin-arm64.zip"),
+                "win-x64" => format!("opencode-windows-x64.zip"),
+                _ => return None,
+            };
+            Some(format!("{MIRROR_BASE}/opencode/{ver}/{filename}"))
         }
         _ => None,
     }

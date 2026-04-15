@@ -113,7 +113,7 @@ impl Drop for AbortFlagGuard {
 /// allowedCommands).
 const READONLY_COMMANDS: &[&str] = &[
     "/help", "/version", "/status", "/health", "/uptime", "/models", "/ctx", "/btw", "/clear",
-    "/history", "/cron", "/abort",
+    "/compact", "/history", "/cron", "/abort",
 ];
 
 // ---------------------------------------------------------------------------
@@ -1260,14 +1260,29 @@ impl AgentRuntime {
         let session_key = session_key.as_str();
 
         // Check clear_signal: if /clear was issued via bypass, clear sessions now.
+        // Preserve a brief summary of each session so the agent retains key context.
         if self.handle.clear_signal.load(Ordering::SeqCst) {
             self.handle.clear_signal.store(false, Ordering::SeqCst);
             info!("clear_signal received, clearing all sessions");
+
+            // Build summaries from existing sessions before clearing.
+            let mut summary_msgs: Vec<(String, Message)> = Vec::new();
+            for (key, messages) in &self.sessions {
+                if let Some(msg) = build_clear_summary(messages) {
+                    summary_msgs.push((key.clone(), msg));
+                }
+            }
+
             self.sessions.clear();
             self.compaction_state.clear();
             // Also clear persisted sessions from redb
             for key in self.store.db.list_sessions().unwrap_or_default() {
                 let _ = self.store.db.delete_session(&key);
+            }
+
+            // Re-inject summaries so agent retains context.
+            for (key, msg) in summary_msgs {
+                self.sessions.insert(key, vec![msg]);
             }
         }
 
@@ -1531,7 +1546,13 @@ impl AgentRuntime {
             {
                 // Handle special directives
                 let reply_text = match response.as_str() {
-                    "__HELP__" => build_help_text_filtered(allowed),
+                    "__HELP__" => {
+                        let lang = self.config.raw.gateway.as_ref()
+                            .and_then(|g| g.language.as_deref())
+                            .map(crate::i18n::resolve_lang)
+                            .unwrap_or("en");
+                        build_help_text_filtered(allowed, lang)
+                    }
                     "__VERSION__" => format!("rsclaw {}", env!("RSCLAW_BUILD_VERSION")),
                     "__STATUS__" => {
                         let model = self.resolve_model_name();
@@ -1593,12 +1614,71 @@ impl AgentRuntime {
                         )
                     }
                     "__CLEAR__" => {
+                        let summary_msg = self.sessions.get(session_key)
+                            .and_then(|msgs| build_clear_summary(msgs));
                         self.sessions.remove(session_key);
-                        // Also clear persisted session from redb.
                         if let Err(e) = self.store.db.delete_session(session_key) {
                             warn!("failed to clear persisted session: {e:#}");
                         }
+                        if let Some(msg) = summary_msg {
+                            self.sessions.insert(session_key.to_owned(), vec![msg]);
+                        }
                         "Session cleared.".to_owned()
+                    }
+                    "__COMPACT__" => {
+                        // Manual compaction: force compress + save summary to memory.
+                        let model = self.resolve_model_name();
+                        self.compact_force(session_key, &model).await;
+                        // Extract summary from the compacted session for memory storage.
+                        // Look for the compaction-tagged System message specifically.
+                        const COMPACTION_TAG: &str = "[Conversation history compacted";
+                        if let Some(msgs) = self.sessions.get(session_key) {
+                            let summary_text = msgs.iter().find_map(|m| {
+                                if m.role == crate::provider::Role::System {
+                                    let text = match &m.content {
+                                        crate::provider::MessageContent::Text(s) => s.clone(),
+                                        crate::provider::MessageContent::Parts(parts) => parts.iter().filter_map(|p| {
+                                            if let crate::provider::ContentPart::Text { text } = p { Some(text.as_str()) } else { None }
+                                        }).collect::<Vec<_>>().join(" "),
+                                    };
+                                    if text.starts_with(COMPACTION_TAG) { Some(text) } else { None }
+                                } else { None }
+                            });
+                            if let Some(summary) = summary_text {
+                                if let Some(ref mem) = self.memory {
+                                    // UTF-8 safe truncation.
+                                    let truncated: String = summary.chars().take(2000).collect();
+                                    let mem_text = format!("Session compaction summary:\n{truncated}");
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs() as i64)
+                                        .unwrap_or(0);
+                                    let doc = crate::agent::memory::MemoryDoc {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        scope: "global".to_owned(),
+                                        kind: "summary".to_owned(),
+                                        text: mem_text.clone(),
+                                        vector: vec![],
+                                        created_at: now,
+                                        accessed_at: now,
+                                        access_count: 0,
+                                        importance: 0.7,
+                                        tier: Default::default(),
+                                        abstract_text: None,
+                                        overview_text: None,
+                                    };
+                                    match mem.lock().await.add(doc).await {
+                                        Ok(_) => info!("compact: summary saved to memory ({} chars)", mem_text.len()),
+                                        Err(e) => warn!("compact: failed to save to memory: {e}"),
+                                    }
+                                }
+                                "✓ Session compacted and saved to memory.".to_owned()
+                            } else {
+                                "✓ Session compacted (no summary to save).".to_owned()
+                            }
+                        } else {
+                            "Nothing to compact.".to_owned()
+                        }
                     }
                     "__ABORT__" => {
                         // Set abort flag for this session to interrupt running turn
@@ -3296,8 +3376,13 @@ impl AgentRuntime {
                         "streaming tool call: accumulated args (start and end)"
                     );
 
-                    // First, try direct parse (preserves if valid)
-                    let parsed = serde_json::from_str::<serde_json::Value>(&s);
+                    // First, try direct parse (preserves if valid).
+                    // If that fails, fix unescaped backslashes (Windows paths)
+                    // before falling through to repair.
+                    let parsed = serde_json::from_str::<serde_json::Value>(&s).or_else(|_| {
+                        let fixed = crate::agent::tool_call_repair::fix_json_backslashes(&s);
+                        serde_json::from_str::<serde_json::Value>(&fixed)
+                    });
                     match &parsed {
                         Ok(v) if v.is_object() => {
                             tracing::info!(
@@ -4305,7 +4390,7 @@ impl AgentRuntime {
             let pdf_bytes = tokio::fs::read(&full)
                 .await
                 .map_err(|e| anyhow!("read `{}`: {e}", full.display()))?;
-            let content = match pdf_extract::extract_text_from_mem(&pdf_bytes) {
+            let content = match crate::agent::doc::safe_extract_pdf_from_mem(&pdf_bytes) {
                 Ok(text) => text,
                 Err(e) => {
                     // Fallback to pdftotext CLI
@@ -4440,6 +4525,15 @@ impl AgentRuntime {
     /// verbatim and only summarises the older portion, so recent context is
     /// never lost.  Falls back to Default/Safeguard when configured.
     async fn compact_if_needed(&mut self, session_key: &str, model: &str) {
+        self.compact_inner(session_key, model, false).await;
+    }
+
+    /// Force compaction regardless of threshold (used by /compact).
+    async fn compact_force(&mut self, session_key: &str, model: &str) {
+        self.compact_inner(session_key, model, true).await;
+    }
+
+    async fn compact_inner(&mut self, session_key: &str, model: &str, force: bool) {
         use crate::config::schema::CompactionMode;
 
         // Use configured compaction settings, or sensible defaults.
@@ -4448,11 +4542,14 @@ impl AgentRuntime {
 
         // Multi-condition compaction trigger: token threshold OR turn count OR time
         // elapsed. Whichever fires first.
+        // Default threshold: 80% of configured context window, minimum 16000.
+        let context_tokens = self.config.agents.defaults.context_tokens.unwrap_or(64_000) as usize;
+        let default_threshold = (context_tokens * 4 / 5).max(16_000);
         let token_threshold = cfg
             .reserve_tokens_floor
             .map(|t| t as usize)
-            .unwrap_or(8_000);
-        let max_turns: u32 = 20;
+            .unwrap_or(default_threshold);
+        let max_turns: u32 = 60;
         let max_elapsed_secs: u64 = 30 * 60; // 30 minutes
 
         let total_tokens: usize = self
@@ -4480,10 +4577,11 @@ impl AgentRuntime {
             token_trigger,
             turn_trigger,
             time_trigger,
+            force,
             "compaction check"
         );
 
-        if !token_trigger && !turn_trigger && !time_trigger {
+        if !force && !token_trigger && !turn_trigger && !time_trigger {
             // Increment turn counter only.
             self.compaction_state
                 .entry(session_key.to_owned())
@@ -4614,9 +4712,12 @@ impl AgentRuntime {
         //           detail until budget is exhausted. This ensures the most
         //           recent (and typically most relevant) context is preserved.
         let msgs_to_text = |msgs: &[Message]| -> String {
-            // Default 16K tokens input for compact LLM. User can override via
-            // compaction.maxTranscriptTokens in config.
-            let max_total_tokens: usize = cfg.max_transcript_tokens.unwrap_or(16_000);
+            // Default: 70% of context window (leave room for summary output +
+            // recent messages). User can override via compaction.maxTranscriptTokens.
+            let default_transcript = (context_tokens * 7 / 10).max(16_000);
+            let max_total_tokens: usize = cfg.max_transcript_tokens
+                .map(|t| t as usize)
+                .unwrap_or(default_transcript);
 
             // Render a single message. `detail` controls verbosity:
             //   2 = full (tool args + results)
@@ -4895,7 +4996,7 @@ impl AgentRuntime {
                 "You are a conversation summarizer. Produce a dense, accurate, \
                  structured summary. NEVER call tools. Text output only.".to_owned(),
             ),
-            max_tokens: Some(2048), // structured output needs more room
+            max_tokens: Some(4096), // structured output needs more room
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None,
@@ -5203,6 +5304,28 @@ impl AgentRuntime {
             .unwrap_or(1800);
 
         let mut cmd = tokio::process::Command::new(shell);
+        // Prepend ~/.rsclaw/tools/* to PATH so locally installed tools are found first.
+        let tools_base = crate::config::loader::base_dir().join("tools");
+        if tools_base.exists() {
+            let mut extra_paths = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&tools_base) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        // Add the dir itself, bin/, and node_modules/.bin/ subdirectories.
+                        extra_paths.push(p.join("node_modules").join(".bin"));
+                        extra_paths.push(p.join("bin"));
+                        extra_paths.push(p.clone());
+                    }
+                }
+            }
+            if !extra_paths.is_empty() {
+                let sys_path = std::env::var("PATH").unwrap_or_default();
+                let mut all: Vec<String> = extra_paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+                all.push(sys_path);
+                cmd.env("PATH", all.join(if cfg!(windows) { ";" } else { ":" }));
+            }
+        }
         cmd.args(&shell_args)
             .arg(command)
             .current_dir(&workspace)
@@ -7623,7 +7746,7 @@ public class WinHoldKey {{
         let pdf_bytes = tokio::fs::read(&local_path)
             .await
             .map_err(|e| anyhow!("pdf: read failed: {e}"))?;
-        let text = match pdf_extract::extract_text_from_mem(&pdf_bytes) {
+        let text = match crate::agent::doc::safe_extract_pdf_from_mem(&pdf_bytes) {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("pdf-extract failed ({e}), trying pdftotext CLI");
@@ -8390,7 +8513,7 @@ fn expand_tilde(p: &str) -> std::path::PathBuf {
 async fn extract_file_text(filename: &str, bytes: &[u8]) -> Option<String> {
     let lower = filename.to_lowercase();
     if lower.ends_with(".pdf") {
-        match pdf_extract::extract_text_from_mem(bytes) {
+        match crate::agent::doc::safe_extract_pdf_from_mem(bytes) {
             Ok(text) => return Some(text),
             Err(_) => {}
         }
@@ -8939,6 +9062,43 @@ fn detect_chrome() -> Option<String> {
 
     #[cfg(target_os = "windows")]
     {
+        // Try Windows registry first (most reliable).
+        for key_path in &[
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+            r"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+        ] {
+            if let Ok(output) = std::process::Command::new("reg")
+                .args(["query", &format!(r"HKLM\{key_path}"), "/ve"])
+                .output()
+            {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // Parse "REG_SZ    C:\...\chrome.exe" from output
+                if let Some(line) = stdout.lines().find(|l| l.contains("REG_SZ")) {
+                    if let Some(path_str) = line.split("REG_SZ").nth(1) {
+                        let path_str = path_str.trim();
+                        if std::path::Path::new(path_str).exists() {
+                            return Some(path_str.to_owned());
+                        }
+                    }
+                }
+            }
+            // Also try HKCU (per-user installs)
+            if let Ok(output) = std::process::Command::new("reg")
+                .args(["query", &format!(r"HKCU\{key_path}"), "/ve"])
+                .output()
+            {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Some(line) = stdout.lines().find(|l| l.contains("REG_SZ")) {
+                    if let Some(path_str) = line.split("REG_SZ").nth(1) {
+                        let path_str = path_str.trim();
+                        if std::path::Path::new(path_str).exists() {
+                            return Some(path_str.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: well-known paths.
         let candidates = [
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
@@ -9225,154 +9385,117 @@ fn format_duration(d: std::time::Duration) -> String {
     }
 }
 
-fn build_help_text_filtered(allowed: &str) -> String {
+fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
     let full = allowed == "*";
+    let zh = lang == "zh";
     let has = |cmd: &str| -> bool {
-        if full {
-            return true;
-        }
+        if full { return true; }
         READONLY_COMMANDS.iter().any(|c| *c == cmd) || allowed.split('|').any(|a| a.trim() == cmd)
     };
 
-    let mut help = String::from("Available commands:\n\n");
+    let mut h = String::from(if zh { "可用命令：\n\n" } else { "Available commands:\n\n" });
 
-    // Shell & Files -- require /run, /ls etc.
     if has("/run") || has("/find") || has("/grep") {
-        help.push_str("Shell:\n");
+        h.push_str(if zh { "终端：\n" } else { "Shell:\n" });
         if has("/run") {
-            help.push_str("  /run <cmd>        Execute a shell command\n");
-            help.push_str("  $ <cmd>           Execute a shell command (shortcut)\n");
+            h.push_str(if zh { "  /run <命令>       执行终端命令\n  $ <命令>           执行终端命令（快捷方式）\n" } else { "  /run <cmd>        Execute a shell command\n  $ <cmd>           Execute a shell command (shortcut)\n" });
         }
-        if has("/find") {
-            help.push_str("  /find <pattern>   Find files by name\n");
-        }
-        if has("/grep") {
-            help.push_str("  /grep <pattern>   Search file contents\n");
-        }
-        help.push('\n');
+        if has("/find") { h.push_str(if zh { "  /find <模式>      按名称查找文件\n" } else { "  /find <pattern>   Find files by name\n" }); }
+        if has("/grep") { h.push_str(if zh { "  /grep <模式>      搜索文件内容\n" } else { "  /grep <pattern>   Search file contents\n" }); }
+        h.push('\n');
     }
 
     if has("/read") || has("/write") || has("/ls") {
-        help.push_str("Files:\n");
-        if has("/read") {
-            help.push_str("  /read <path>      Read a file\n");
-        }
-        if has("/write") {
-            help.push_str("  /write <path> <content>  Write to a file\n");
-        }
-        if has("/ls") {
-            help.push_str("  /ls [path]        List directory\n");
-        }
-        help.push('\n');
+        h.push_str(if zh { "文件：\n" } else { "Files:\n" });
+        if has("/read") { h.push_str(if zh { "  /read <路径>      读取文件\n" } else { "  /read <path>      Read a file\n" }); }
+        if has("/write") { h.push_str(if zh { "  /write <路径> <内容>  写入文件\n" } else { "  /write <path> <content>  Write to a file\n" }); }
+        if has("/ls") { h.push_str(if zh { "  /ls [路径]        列出目录\n" } else { "  /ls [path]        List directory\n" }); }
+        h.push('\n');
     }
 
     if has("/search") || has("/fetch") || has("/screenshot") || has("/ss") {
-        help.push_str("Search & Web:\n");
-        if has("/search") {
-            help.push_str("  /search <query>   Search the web\n");
-        }
-        if has("/fetch") {
-            help.push_str("  /fetch <url>      Fetch a web page\n");
-        }
-        if has("/screenshot") {
-            help.push_str("  /screenshot <url> Screenshot a web page\n");
-        }
-        if has("/ss") {
-            help.push_str("  /ss               Screenshot desktop\n");
-        }
-        help.push('\n');
+        h.push_str(if zh { "搜索与网页：\n" } else { "Search & Web:\n" });
+        if has("/search") { h.push_str(if zh { "  /search <关键词>  搜索网页\n" } else { "  /search <query>   Search the web\n" }); }
+        if has("/fetch") { h.push_str(if zh { "  /fetch <网址>     抓取网页内容\n" } else { "  /fetch <url>      Fetch a web page\n" }); }
+        if has("/screenshot") { h.push_str(if zh { "  /screenshot <网址> 网页截图\n" } else { "  /screenshot <url> Screenshot a web page\n" }); }
+        if has("/ss") { h.push_str(if zh { "  /ss               桌面截图\n" } else { "  /ss               Screenshot desktop\n" }); }
+        h.push('\n');
     }
 
     if has("/remember") || has("/recall") {
-        help.push_str("Memory:\n");
-        if has("/remember") {
-            help.push_str("  /remember <text>  Save to memory\n");
-        }
-        if has("/recall") {
-            help.push_str("  /recall <query>   Search memory\n");
-        }
-        help.push('\n');
+        h.push_str(if zh { "记忆：\n" } else { "Memory:\n" });
+        if has("/remember") { h.push_str(if zh { "  /remember <文本>  保存到记忆\n" } else { "  /remember <text>  Save to memory\n" }); }
+        if has("/recall") { h.push_str(if zh { "  /recall <关键词>  搜索记忆\n" } else { "  /recall <query>   Search memory\n" }); }
+        h.push('\n');
     }
 
-    // Always show /ctx and /btw (read-only commands)
-    help.push_str("Background Context:\n");
-    help.push_str("  /ctx <text>              Add persistent context\n");
-    help.push_str("  /ctx --ttl <N> <text>    Add context (expires in N turns)\n");
-    if full {
-        help.push_str("  /ctx --global <text>     Add global context (all sessions)\n");
-    }
-    help.push_str("  /ctx --list              List active context entries\n");
-    help.push_str("  /ctx --remove <id>       Remove entry by id\n");
-    help.push_str("  /ctx --clear             Clear all context for this session\n");
-    help.push('\n');
+    h.push_str(if zh { "背景上下文：\n" } else { "Background Context:\n" });
+    h.push_str(if zh { "  /ctx <文本>              添加持久上下文\n" } else { "  /ctx <text>              Add persistent context\n" });
+    h.push_str(if zh { "  /ctx --ttl <N> <文本>    添加上下文（N轮后过期）\n" } else { "  /ctx --ttl <N> <text>    Add context (expires in N turns)\n" });
+    if full { h.push_str(if zh { "  /ctx --global <文本>     添加全局上下文\n" } else { "  /ctx --global <text>     Add global context (all sessions)\n" }); }
+    h.push_str(if zh { "  /ctx --list              列出活跃上下文\n" } else { "  /ctx --list              List active context entries\n" });
+    h.push_str(if zh { "  /ctx --remove <id>       移除指定上下文\n" } else { "  /ctx --remove <id>       Remove entry by id\n" });
+    h.push_str(if zh { "  /ctx --clear             清除当前会话所有上下文\n" } else { "  /ctx --clear             Clear all context for this session\n" });
+    h.push('\n');
 
-    help.push_str("Side Query:\n");
-    help.push_str("  /btw <question>          Quick query (no tools, ephemeral)\n");
-    help.push('\n');
+    h.push_str(if zh { "快速提问：\n" } else { "Side Query:\n" });
+    h.push_str(if zh { "  /btw <问题>              快速查询（不调用工具）\n" } else { "  /btw <question>          Quick query (no tools, ephemeral)\n" });
+    h.push('\n');
 
     if full {
-        help.push_str("Tools (consolidated):\n");
-        help.push_str("  memory   search/get/put/delete long-term memory\n");
-        help.push_str("  session  send/list/history/status for sessions\n");
-        help.push_str("  agent    spawn/task/list/kill sub-agents\n");
-        help.push_str("  channel  send/reply/pin/delete across channels\n");
-        help.push('\n');
+        h.push_str(if zh { "工具（聚合）：\n" } else { "Tools (consolidated):\n" });
+        h.push_str(if zh { "  memory   搜索/获取/保存/删除长期记忆\n" } else { "  memory   search/get/put/delete long-term memory\n" });
+        h.push_str(if zh { "  session  发送/列表/历史/状态\n" } else { "  session  send/list/history/status for sessions\n" });
+        h.push_str(if zh { "  agent    创建/任务/列表/终止子智能体\n" } else { "  agent    spawn/task/list/kill sub-agents\n" });
+        h.push_str(if zh { "  channel  发送/回复/置顶/删除跨渠道消息\n" } else { "  channel  send/reply/pin/delete across channels\n" });
+        h.push('\n');
     }
 
-    help.push_str("System:\n");
-    help.push_str("  /status           Gateway status\n");
-    help.push_str("  /version          Show version\n");
-    help.push_str("  /models           List models\n");
-    if has("/model") {
-        help.push_str("  /model <name>     Switch model\n");
-    }
-    help.push_str("  /uptime           Show uptime\n");
-    help.push('\n');
+    h.push_str(if zh { "系统：\n" } else { "System:\n" });
+    h.push_str(if zh { "  /status           网关状态\n" } else { "  /status           Gateway status\n" });
+    h.push_str(if zh { "  /version          查看版本\n" } else { "  /version          Show version\n" });
+    h.push_str(if zh { "  /models           列出模型\n" } else { "  /models           List models\n" });
+    if has("/model") { h.push_str(if zh { "  /model <名称>     切换模型\n" } else { "  /model <name>     Switch model\n" }); }
+    h.push_str(if zh { "  /uptime           查看运行时长\n" } else { "  /uptime           Show uptime\n" });
+    h.push('\n');
 
-    help.push_str("Session:\n");
-    help.push_str("  /clear            Clear session\n");
-    help.push_str("  /abort            Abort running task\n");
-    if has("/reset") {
-        help.push_str("  /reset            Reset session\n");
-    }
-    help.push_str("  /history [n]      Show history\n");
-    if has("/sessions") {
-        help.push_str("  /sessions         List sessions\n");
-    }
-    help.push('\n');
+    h.push_str(if zh { "会话：\n" } else { "Session:\n" });
+    h.push_str(if zh { "  /clear            清除会话\n" } else { "  /clear            Clear session\n" });
+    h.push_str(if zh { "  /compact          压缩会话并保存记忆\n" } else { "  /compact          Compact session & save to memory\n" });
+    h.push_str(if zh { "  /abort            终止当前任务\n" } else { "  /abort            Abort running task\n" });
+    if has("/reset") { h.push_str(if zh { "  /reset            重置会话\n" } else { "  /reset            Reset session\n" }); }
+    h.push_str(if zh { "  /history [n]      查看历史\n" } else { "  /history [n]      Show history\n" });
+    if has("/sessions") { h.push_str(if zh { "  /sessions         列出会话\n" } else { "  /sessions         List sessions\n" }); }
+    h.push('\n');
 
-    help.push_str("Cron:\n");
-    help.push_str("  /cron list        List cron jobs\n");
-    help.push('\n');
+    h.push_str(if zh { "定时任务：\n" } else { "Cron:\n" });
+    h.push_str(if zh { "  /cron list        列出定时任务\n" } else { "  /cron list        List cron jobs\n" });
+    h.push('\n');
 
     if has("/send") {
-        help.push_str("Messaging:\n");
-        help.push_str("  /send <target> <msg>  Send a message\n");
-        help.push('\n');
+        h.push_str(if zh { "消息：\n" } else { "Messaging:\n" });
+        h.push_str(if zh { "  /send <目标> <消息>  发送消息\n" } else { "  /send <target> <msg>  Send a message\n" });
+        h.push('\n');
     }
 
     if has("/skill") {
-        help.push_str("Skill:\n");
-        help.push_str("  /skill install <name>\n");
-        help.push_str("  /skill list\n");
-        help.push_str("  /skill search <query>\n");
-        help.push('\n');
+        h.push_str(if zh { "技能：\n" } else { "Skill:\n" });
+        h.push_str("  /skill install <name>\n  /skill list\n  /skill search <query>\n");
+        h.push('\n');
     }
 
     if full {
-        help.push_str("Upload & Limits:\n");
-        help.push_str("  /get_upload_size           Show upload size limit\n");
-        help.push_str("  /set_upload_size <MB>      Set size limit (runtime)\n");
-        help.push_str("  /get_upload_chars          Show text char limit\n");
-        help.push_str("  /set_upload_chars <N>      Set char limit (runtime)\n");
-        help.push_str("  /config_upload_size <MB>   Set size limit (persistent)\n");
-        help.push_str("  /config_upload_chars <N>   Set char limit (persistent)\n");
-        help.push('\n');
+        h.push_str(if zh { "上传限制：\n" } else { "Upload & Limits:\n" });
+        h.push_str(if zh {
+            "  /get_upload_size           查看上传大小限制\n  /set_upload_size <MB>      设置大小限制\n  /get_upload_chars          查看文本字符限制\n  /set_upload_chars <N>      设置字符限制\n  /config_upload_size <MB>   持久化大小限制\n  /config_upload_chars <N>   持久化字符限制\n"
+        } else {
+            "  /get_upload_size           Show upload size limit\n  /set_upload_size <MB>      Set size limit (runtime)\n  /get_upload_chars          Show text char limit\n  /set_upload_chars <N>      Set char limit (runtime)\n  /config_upload_size <MB>   Set size limit (persistent)\n  /config_upload_chars <N>   Set char limit (persistent)\n"
+        });
+        h.push('\n');
     }
 
-    help.push_str("Type any message without / to chat with the AI agent.");
-
-    help
+    h.push_str(if zh { "直接输入消息即可与AI对话。" } else { "Type any message without / to chat with the AI agent." });
+    h
 }
 
 // ---------------------------------------------------------------------------
@@ -9437,9 +9560,18 @@ fn build_system_prompt(
              - After downloading, use `send_file` to send the file to the user.\n\
              - For documents (xlsx/docx/pdf/pptx): use the `doc` tool, not exec.\n\
              - For cron jobs: use the `cron` tool (action=list/add/remove).\n\
+             - To install tools (python, node, ffmpeg, chrome, opencode, claude-code, sherpa-onnx): use `exec` with `{rsclaw_exe} tools install <name>`. Do NOT download/install manually.\n\
              - If a tool call fails, do NOT retry with the same arguments. Try a different approach or inform the user.\n\
-             - Never fabricate URLs or file paths."
-                .to_owned(),
+             - Never fabricate URLs or file paths.\n\
+             - When user asks about previous conversations, tasks, or anything you don't have context for, use `memory_search` to recall relevant information before answering.\n\
+             - At the start of a new session, if the user's first message references prior work, search memory first."
+                .replace("{rsclaw_exe}", &std::env::current_exe()
+                    .map(|p| {
+                        let s = p.to_string_lossy().to_string();
+                        // Windows: wrap in quotes if path contains spaces.
+                        if cfg!(windows) && s.contains(' ') { format!("\"{s}\"") } else { s }
+                    })
+                    .unwrap_or_else(|_| "rsclaw".to_owned())),
         );
 
         // Inject tool-specific prompts (web_browser, exec) directly into system prompt.
@@ -9798,7 +9930,7 @@ fn build_tool_list(
                 "permissions":{"type": "array", "items": {"type": "string"}, "description": "Browser permissions to grant"},
                 "action_type":{"type": "string", "description": "Intercept action: block or mock"},
                 "body":       {"type": "string", "description": "Mock response body for network intercept"},
-                "headed":     {"type": "boolean", "description": "true=foreground (visible window), false=background (headless). Default: false"}
+                "headed":     {"type": "boolean", "description": "true=foreground (visible window), false=background (headless). Default: auto-detect based on display availability. Omit this field to use the default."}
             },
             "required": ["action"]
         }),
@@ -10474,6 +10606,39 @@ fn msg_chars(m: &Message) -> usize {
             })
             .sum(),
     }
+}
+
+/// Build a summary Message from the last 10 user/assistant messages (for /clear).
+fn build_clear_summary(messages: &[Message]) -> Option<Message> {
+    if messages.is_empty() { return None; }
+    let recent: Vec<&Message> = messages.iter().rev().take(10).rev().collect();
+    let mut parts = Vec::new();
+    for m in &recent {
+        let role = match m.role {
+            crate::provider::Role::User => "User",
+            crate::provider::Role::Assistant => "Assistant",
+            _ => continue,
+        };
+        let text = match &m.content {
+            crate::provider::MessageContent::Text(s) => s.clone(),
+            crate::provider::MessageContent::Parts(ps) => ps.iter().filter_map(|p| {
+                if let crate::provider::ContentPart::Text { text } = p { Some(text.as_str()) } else { None }
+            }).collect::<Vec<_>>().join(" "),
+        };
+        if text.is_empty() { continue; }
+        let truncated = if text.chars().count() > 200 {
+            let idx = text.char_indices().nth(200).map(|(i, _)| i).unwrap_or(text.len());
+            format!("{}...", &text[..idx])
+        } else { text };
+        parts.push(format!("{role}: {truncated}"));
+    }
+    if parts.is_empty() { return None; }
+    Some(Message {
+        role: crate::provider::Role::System,
+        content: crate::provider::MessageContent::Text(
+            format!("[Session summary before /clear]\n{}", parts.join("\n"))
+        ),
+    })
 }
 
 /// CJK-aware token estimate for a message (used by compaction threshold).

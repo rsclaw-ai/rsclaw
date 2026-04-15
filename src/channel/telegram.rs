@@ -190,7 +190,7 @@ impl TelegramChannel {
             token: token.into(),
             api_base: api_base
                 .unwrap_or_else(|| "https://api.telegram.org".to_owned()),
-            client: Client::builder()
+            client: crate::config::build_proxy_client()
                 .timeout(Duration::from_secs(35))
                 .build()
                 .expect("reqwest client"),

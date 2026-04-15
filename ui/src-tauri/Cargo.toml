@@ -22,6 +22,7 @@ tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 time = { version = "0.3", features = ["serde-well-known"] }
 tauri-plugin-notification = "2"
+tauri-plugin-single-instance = "2"
 json5 = "0.4"
 percent-encoding = "2.3.1"
 reqwest = { version = "0.11.18", features = ["json", "stream"] }

@@ -6,9 +6,13 @@
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
 [![Binary Size](https://img.shields.io/badge/binary-~12MB-green)]()
 
-**English** | [中文](README_cn.md) | [日本語](README_ja.md) | [한국어](README_ko.md) | [ไทย](README_th.md) | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | [Русский](README_ru.md)
+**English** | [中文](docs/lang/README_cn.md) | [日本語](docs/lang/README_ja.md) | [한국어](docs/lang/README_ko.md) | [ไทย](docs/lang/README_th.md) | [Tiếng Việt](docs/lang/README_vi.md) | [Français](docs/lang/README_fr.md) | [Deutsch](docs/lang/README_de.md) | [Español](docs/lang/README_es.md) | [Русский](docs/lang/README_ru.md)
 
 RsClaw (Crab AI) is an AI automation manager rebuilt from the ground up in Rust. It features native long-term memory, self-evolution, cross-platform desktop support, and one-click installation out of the box. With one-click OpenClaw migration, your existing configurations transfer seamlessly — stop OpenClaw, start RsClaw, and everything continues working immediately.
+
+<p align="center">
+  <img src="docs/images/preview-en.gif" alt="RsClaw Preview" width="800" />
+</p>
 
 ---
 

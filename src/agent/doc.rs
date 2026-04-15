@@ -16,6 +16,30 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
+// Safe PDF text extraction (catch_unwind to handle panics in pdf-extract)
+// ---------------------------------------------------------------------------
+
+/// Extract text from PDF file path, catching panics from malformed fonts.
+pub fn safe_extract_pdf_text(path: &Path) -> Result<String> {
+    let path_owned = path.to_path_buf();
+    match std::panic::catch_unwind(move || pdf_extract::extract_text(&path_owned)) {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(e)) => Err(anyhow!("pdf extract error: {e}")),
+        Err(_) => Err(anyhow!("pdf extract panicked (likely malformed font encoding)")),
+    }
+}
+
+/// Extract text from PDF bytes in memory, catching panics.
+pub fn safe_extract_pdf_from_mem(bytes: &[u8]) -> Result<String> {
+    let bytes_owned = bytes.to_vec();
+    match std::panic::catch_unwind(move || pdf_extract::extract_text_from_mem(&bytes_owned)) {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(e)) => Err(anyhow!("pdf extract error: {e}")),
+        Err(_) => Err(anyhow!("pdf extract panicked (likely malformed font encoding)")),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Font discovery for PDF generation
 // ---------------------------------------------------------------------------
 
@@ -1045,7 +1069,7 @@ fn read_docx(path: &Path) -> Result<Value> {
 }
 
 fn read_pdf(path: &Path) -> Result<Value> {
-    let text = pdf_extract::extract_text(path)
+    let text = safe_extract_pdf_text(path)
         .map_err(|e| anyhow!("read_doc: pdf extract failed for '{}': {e}", path.display()))?;
 
     Ok(json!({

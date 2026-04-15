@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
 [![Binary Size](https://img.shields.io/badge/binary-~12MB-green)]()
 
-[English](README.md) | [中文](README_cn.md) | [日本語](README_ja.md) | [한국어](README_ko.md) | [ไทย](README_th.md) | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | **Русский**
+[English](../../README.md) | [中文](README_cn.md) | [日本語](README_ja.md) | [한국어](README_ko.md) | [ไทย](README_th.md) | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | **Русский**
 
 RsClaw -- это полная переработка [OpenClaw](https://github.com/openclaw/openclaw) на Rust, предоставляющая тот же протокол мультиагентного ИИ-шлюза с 10-кратным ускорением запуска, 10-кратным уменьшением размера и нулевой зависимостью от Node.js.
 
@@ -57,7 +57,7 @@ macOS (x86_64, ARM64), Linux (x86_64, ARM64), Windows (x86_64, ARM64)
 
 ## Документация
 
-Полная документация в [README.md](README.md) (中文) или [README_en.md](README_en.md) (English).
+Полная документация в [README.md](../../README.md) (中文) или [README_en.md](../../README.md) (English).
 
 ## Лицензия
 

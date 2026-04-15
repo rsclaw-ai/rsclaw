@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
 [![Binary Size](https://img.shields.io/badge/binary-~12MB-green)]()
 
-[English](README.md) | [中文](README_cn.md) | [日本語](README_ja.md) | [한국어](README_ko.md) | [ไทย](README_th.md) | **Tiếng Việt** | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | [Русский](README_ru.md)
+[English](../../README.md) | [中文](README_cn.md) | [日本語](README_ja.md) | [한국어](README_ko.md) | [ไทย](README_th.md) | **Tiếng Việt** | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | [Русский](README_ru.md)
 
 RsClaw la ban viet lai hoan toan cua [OpenClaw](https://github.com/openclaw/openclaw) bang Rust, cung cap cung giao thuc AI Gateway da tac tu nhung khoi dong nhanh hon 10 lan, kich thuoc nho hon 10 lan va khong phu thuoc Node.js.
 
@@ -57,7 +57,7 @@ macOS (x86_64, ARM64), Linux (x86_64, ARM64), Windows (x86_64, ARM64)
 
 ## Tai lieu
 
-Tai lieu chi tiet tai [README.md](README.md) (中文) hoac [README_en.md](README_en.md) (English).
+Tai lieu chi tiet tai [README.md](../../README.md) (中文) hoac [README_en.md](../../README.md) (English).
 
 ## Giay phep
 

@@ -105,6 +105,21 @@ pub struct GatewayConfig {
     /// Provider-level user_agent overrides this. Default: "Mozilla/5.0 (compatible; rsclaw/1.0)".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
+    /// Global HTTP/SOCKS5 proxy URL (e.g. "http://127.0.0.1:7890", "socks5://proxy:1080").
+    /// Env var RSCLAW_PROXY overrides this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    /// Proxy allow list: only matching domains use the proxy.
+    /// Supports wildcards: "*.openai.com,api.anthropic.com,github.com"
+    /// "*" means all domains use proxy. Empty/unset = all (default).
+    /// Env var RSCLAW_PROXY_ALLOW overrides this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_allow: Option<String>,
+    /// Proxy deny list: matching domains bypass the proxy (added to NO_PROXY).
+    /// "localhost,127.0.0.1,192.168.*,10.*"
+    /// Env var RSCLAW_PROXY_DENY overrides this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_deny: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

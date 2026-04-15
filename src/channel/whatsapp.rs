@@ -104,7 +104,7 @@ impl WhatsAppChannel {
             phone_number_id: phone_number_id.into(),
             access_token: access_token.into(),
             api_base: api_base.unwrap_or_else(|| WHATSAPP_API_BASE.to_owned()),
-            client: Client::builder()
+            client: crate::config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),

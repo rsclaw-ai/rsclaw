@@ -360,7 +360,7 @@ impl FeishuChannel {
             app_secret: app_secret.into(),
             brand: "feishu".to_owned(),
             chat_ids,
-            client: Client::builder()
+            client: crate::config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
@@ -587,8 +587,15 @@ impl FeishuChannel {
 
         info!("feishu: WebSocket connected");
 
-        // 3. Read events
-        while let Some(msg) = read.next().await {
+        // 3. Read events with idle timeout (detect half-open connections).
+        // Feishu sends pings every ~30s; if we hear nothing for 90s, reconnect.
+        const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+        loop {
+            let msg = match tokio::time::timeout(WS_IDLE_TIMEOUT, read.next()).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) => { info!("feishu: WS stream ended"); break; }
+                Err(_) => { warn!("feishu: WS idle timeout ({}s), reconnecting", WS_IDLE_TIMEOUT.as_secs()); break; }
+            };
             match msg {
                 Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
                     info!(
@@ -1030,7 +1037,7 @@ impl FeishuChannel {
         );
 
         // Use a longer timeout for file downloads (5 min)
-        let dl_client = reqwest::Client::builder()
+        let dl_client = crate::config::build_proxy_client()
             .timeout(Duration::from_secs(300))
             .build()
             .unwrap_or_else(|_| self.client.clone());
@@ -1395,10 +1402,20 @@ impl Channel for FeishuChannel {
                     Ok(p) => p,
                     Err(e) => { warn!("feishu: multipart error: {e}"); continue; }
                 };
-                let form = reqwest::multipart::Form::new()
+                let mut form = reqwest::multipart::Form::new()
                     .text("file_type", file_type.to_owned())
                     .text("file_name", filename.clone())
                     .part("file", part);
+                // Add duration (ms) for video/audio uploads.
+                if is_media {
+                    let dur = if mime.starts_with("video/") {
+                        mp4_duration_ms(path_or_url).unwrap_or(0)
+                    } else { 0 };
+                    if dur > 0 {
+                        form = form.text("duration", dur.to_string());
+                        info!(duration_ms = dur, "feishu: uploading media with duration");
+                    }
+                }
 
                 let upload_resp = self.client
                     .post(&upload_url)
@@ -1429,14 +1446,7 @@ impl Channel for FeishuChannel {
                     else { "chat_id" };
                 let send_url = format!("{}/im/v1/messages?receive_id_type={id_type}", self.api_base());
                 let (msg_type, content) = if is_media {
-                    // Try to extract duration from MP4 header (moov/mvhd atom).
-                    let duration_ms = if mime.starts_with("video/") {
-                        mp4_duration_ms(path_or_url).unwrap_or(0)
-                    } else { 0 };
                     let mut media_json = serde_json::json!({"file_key": file_key, "file_name": filename});
-                    if duration_ms > 0 {
-                        media_json["duration"] = serde_json::json!(duration_ms);
-                    }
                     // Try to extract cover image via ffmpeg and upload as image_key.
                     if mime.starts_with("video/") {
                         let api = self.api_base().to_owned();
@@ -1444,7 +1454,9 @@ impl Channel for FeishuChannel {
                             media_json["image_key"] = serde_json::json!(cover_key);
                         }
                     }
-                    ("media", media_json.to_string())
+                    let s = media_json.to_string();
+                    info!(content = %s, "feishu: sending media message");
+                    ("media", s)
                 } else {
                     ("file", serde_json::json!({"file_key": file_key}).to_string())
                 };

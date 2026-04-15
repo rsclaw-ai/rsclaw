@@ -1,6 +1,6 @@
 [package]
 name = "rsclaw"
-version = "2026.4.12"
+version = "2026.4.15"
 edition = "2024"
 rust-version = "1.91"
 description = "AI Automation Manager Compatible with OpenClaw"
@@ -21,7 +21,7 @@ axum         = { version = "0.8", features = ["ws", "multipart"] }
 
 # HTTP client
 # TLS: use aws-lc-rs instead of ring for better cross-compilation (esp. Windows ARM64)
-reqwest      = { version = "0.12", features = ["json", "stream", "multipart", "blocking", "rustls-tls-webpki-roots-no-provider"], default-features = false }
+reqwest      = { version = "0.12", features = ["json", "stream", "multipart", "blocking", "rustls-tls-webpki-roots-no-provider", "socks"], default-features = false }
 rustls       = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 
 # Storage
@@ -86,7 +86,7 @@ rust_xlsxwriter = "0.83"
 calamine = "0.26"
 docx-rs = "0.4"
 genpdf = "0.2"
-pdf-extract = "0.7"
+pdf-extract = "0.10"
 base64 = "0.22"
 aes = "0.8"
 urlencoding = "2"

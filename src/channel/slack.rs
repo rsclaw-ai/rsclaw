@@ -52,7 +52,7 @@ impl SlackChannel {
             app_token,
             api_base: api_base
                 .unwrap_or_else(|| SLACK_API_BASE.to_owned()),
-            client: Client::builder()
+            client: crate::config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
@@ -154,7 +154,13 @@ impl SlackChannel {
         let (ws_stream, _) = connect_async(&url).await.context("Slack WS connect")?;
         let (mut write, mut read) = ws_stream.split();
 
-        while let Some(msg) = read.next().await {
+        const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+        loop {
+            let msg = match tokio::time::timeout(WS_IDLE_TIMEOUT, read.next()).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) => { info!("Slack: WS stream ended"); break; }
+                Err(_) => { warn!("Slack: WS idle timeout ({}s), reconnecting", WS_IDLE_TIMEOUT.as_secs()); bail!("Slack: idle timeout"); }
+            };
             let raw = match msg {
                 Ok(WsMessage::Text(s)) => s.to_string(),
                 Ok(WsMessage::Close(frame)) => {
@@ -374,7 +380,7 @@ fn slack_is_text_file(name: &str) -> bool {
 fn slack_process_file(filename: &str, bytes: &[u8]) -> String {
     let lower = filename.to_lowercase();
     if lower.ends_with(".pdf") {
-        if let Ok(text) = pdf_extract::extract_text_from_mem(bytes) {
+        if let Ok(text) = crate::agent::doc::safe_extract_pdf_from_mem(bytes) {
             return format!("[PDF: {filename}]\n{}", &text[..text.len().min(20000)]);
         }
         // Fallback to pdftotext CLI
