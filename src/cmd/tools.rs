@@ -446,8 +446,7 @@ fn resolve_download_url(
                 "win-x64" => format!("opencode-windows-x64.zip"),
                 _ => return None,
             };
-            // Download from GitHub releases, not our mirror.
-            Some(format!("https://github.com/anomalyco/opencode/releases/download/v{ver}/{filename}"))
+            Some(format!("{MIRROR_BASE}/opencode/{ver}/{filename}"))
         }
         _ => None,
     }
