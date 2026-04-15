@@ -3380,7 +3380,7 @@ impl AgentRuntime {
                     // If that fails, fix unescaped backslashes (Windows paths)
                     // before falling through to repair.
                     let parsed = serde_json::from_str::<serde_json::Value>(&s).or_else(|_| {
-                        let fixed = crate::agent::tool_call_repair::fix_json_backslashes_public(&s);
+                        let fixed = crate::agent::tool_call_repair::fix_json_backslashes(&s);
                         serde_json::from_str::<serde_json::Value>(&fixed)
                     });
                     match &parsed {

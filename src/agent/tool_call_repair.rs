@@ -13,16 +13,14 @@ use serde_json::Value;
 
 /// Fix unescaped backslashes inside JSON string values.
 ///
-/// In valid JSON, `\` must be followed by one of: `"`, `\`, `/`, `b`, `f`, `n`, `r`, `t`, `u`.
-/// Models often emit Windows paths like `C:\Users\user_I9hgADO70\AppData\...` with single
-/// backslashes, which causes serde_json to reject the input. This function doubles any `\`
-/// inside string values that is NOT followed by a valid JSON escape character.
-/// Public wrapper for use in runtime streaming finalization.
-pub fn fix_json_backslashes_public(raw: &str) -> String {
-    fix_json_backslashes(raw)
-}
-
-fn fix_json_backslashes(raw: &str) -> String {
+/// Models often emit Windows paths like `C:\Users\user_I9hgADO70\AppData\...`
+/// with single backslashes, which causes serde_json to reject the input.
+///
+/// Only preserves `\"`, `\\`, and complete `\uXXXX` (4 hex digits).
+/// All other `\X` sequences (including `\n`, `\t`, `\b` etc.) are doubled,
+/// since in the context of a failed JSON parse these are most likely
+/// Windows path separators, not control characters.
+pub fn fix_json_backslashes(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len() + 32);
     let mut in_string = false;
     let chars: Vec<char> = raw.chars().collect();
