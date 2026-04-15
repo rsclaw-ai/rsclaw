@@ -9930,7 +9930,7 @@ fn build_tool_list(
                 "permissions":{"type": "array", "items": {"type": "string"}, "description": "Browser permissions to grant"},
                 "action_type":{"type": "string", "description": "Intercept action: block or mock"},
                 "body":       {"type": "string", "description": "Mock response body for network intercept"},
-                "headed":     {"type": "boolean", "description": "true=foreground (visible window), false=background (headless). Default: false"}
+                "headed":     {"type": "boolean", "description": "true=foreground (visible window), false=background (headless). Default: auto-detect based on display availability. Omit this field to use the default."}
             },
             "required": ["action"]
         }),
