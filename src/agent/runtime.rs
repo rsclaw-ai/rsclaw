@@ -255,6 +255,9 @@ pub struct AgentRuntime {
     /// In-memory session alias cache: alias_key → canonical session_key.
     /// Loaded from redb on first use, avoids repeated DB lookups.
     session_aliases: std::collections::HashMap<String, String>,
+    /// Completed async task results: task_id → (session_key, result_json).
+    /// Background task agents write here; main agent checks at turn start.
+    pending_task_results: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
 }
 
 impl AgentRuntime {
@@ -312,6 +315,7 @@ impl AgentRuntime {
             started_at: std::time::Instant::now(),
             workspace_cache: None,
             btw_manager,
+            pending_task_results: Arc::new(std::sync::Mutex::new(Vec::new())),
             notification_tx,
             opencode_client: Arc::new(tokio::sync::OnceCell::new()),
             claudecode_client: Arc::new(tokio::sync::OnceCell::new()),
@@ -2986,6 +2990,33 @@ impl AgentRuntime {
 
         let mut tool_images: Vec<String> = Vec::new();
         let mut tool_files: Vec<(String, String, String)> = Vec::new();
+
+        // Inject completed async task results into the session.
+        {
+            let mut pending = self.pending_task_results.lock().unwrap_or_else(|e| e.into_inner());
+            let completed: Vec<(String, String, String)> = pending
+                .drain(..)
+                .filter(|(_, sk, _)| sk == &ctx.session_key)
+                .collect();
+            drop(pending);
+            if !completed.is_empty() {
+                if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
+                    for (task_id, _, result) in &completed {
+                        sess.push(Message {
+                            role: Role::System,
+                            content: MessageContent::Text(format!(
+                                "[async task {task_id} completed]\n{result}"
+                            )),
+                        });
+                    }
+                    info!(
+                        session = %ctx.session_key,
+                        count = completed.len(),
+                        "injected async task results"
+                    );
+                }
+            }
+        }
 
         // Dynamic iteration limit based on task complexity.
         // Default: 100 iterations. Complex tools (browser/opencode/exec): up to configured max.
@@ -5711,11 +5742,12 @@ impl AgentRuntime {
         }))
     }
 
-    /// One-shot task agent: spawn -> send message -> wait reply -> auto-cleanup.
+    /// One-shot task agent: spawn -> send message -> return immediately.
     ///
-    /// The task runs with a timeout but does NOT block the main agent's loop
-    /// when `async=true` is passed — in that case a background tokio task
-    /// handles the wait and the result is injected into the session later.
+    /// The task runs in the background. When the sub-agent completes, the
+    /// result is stored in `pending_task_results` and injected into the
+    /// main agent's session on the next turn. This ensures the main agent
+    /// is NEVER blocked by sub-agent work.
     async fn tool_agent_task(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let spawner = self
             .spawner
@@ -5763,7 +5795,7 @@ impl AgentRuntime {
                 image_fallbacks: None,
                 thinking: None,
                 tools_enabled: None,
-                toolset: Some(toolset_str),
+                toolset: Some(toolset_str.clone()),
                 tools: None,
                 context_tokens: None,
                 max_tokens: None,
@@ -5792,16 +5824,16 @@ impl AgentRuntime {
             warn!("agent_task: failed to write SOUL.md for {id}: {e:#}");
         }
 
-        // Send message and wait for reply.
+        // Send message to the task agent.
         let registry = self
             .agents
             .as_ref()
             .ok_or_else(|| anyhow!("agent_task: agent registry not available"))?;
         let target = registry.get(&id)?;
-        let session_key = format!("{}:task:{}", ctx.session_key, &uuid::Uuid::new_v4().to_string()[..8]);
+        let task_session = format!("{}:task:{short_id}", ctx.session_key);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
         let msg = AgentMessage {
-            session_key: session_key.clone(),
+            session_key: task_session,
             text: message.clone(),
             channel: format!("task:{}", ctx.agent_id),
             peer_id: ctx.agent_id.clone(),
@@ -5813,31 +5845,119 @@ impl AgentRuntime {
         };
         target.tx.send(msg).await.map_err(|_| anyhow!("agent_task: agent inbox closed"))?;
 
+        // Spawn background worker to wait for reply and store result.
+        // Main agent returns IMMEDIATELY — never blocked.
+        let pending = Arc::clone(&self.pending_task_results);
+        let session_key = ctx.session_key.clone();
+        let task_id = id.clone();
+        let agents = self.agents.as_ref().map(Arc::clone);
         let timeout_secs = self
             .config
             .agents
             .defaults
             .timeout_seconds
             .unwrap_or(DEFAULT_TIMEOUT_SECONDS as u32) as u64;
+        let task_timeout = timeout_secs.min(300); // up to 5 min for background tasks
 
-        // Shorter timeout for task agents (max 120s to avoid blocking too long).
-        let task_timeout = timeout_secs.min(120);
-        let reply = tokio::time::timeout(Duration::from_secs(task_timeout), reply_rx)
-            .await
-            .map_err(|_| {
-                // Cleanup on timeout
-                registry.remove_handle(&id);
-                let ws = ws_path.clone();
-                tokio::spawn(async move { let _ = tokio::fs::remove_dir_all(&ws).await; });
-                anyhow!("agent_task '{id}': timed out after {task_timeout}s. The sub-agent may lack the tools needed for this task. Try breaking the task into simpler steps or using a different toolset.")
-            })?
-            .map_err(|_| anyhow!("agent_task: reply channel dropped"))?;
+        tokio::spawn(async move {
+            let result_text = match tokio::time::timeout(
+                Duration::from_secs(task_timeout),
+                reply_rx,
+            ).await {
+                Ok(Ok(reply)) => reply.text,
+                Ok(Err(_)) => "[task agent channel closed unexpectedly]".to_owned(),
+                Err(_) => format!("[task {task_id} timed out after {task_timeout}s]"),
+            };
 
-        // Cleanup: remove from registry and delete workspace.
-        registry.remove_handle(&id);
-        let _ = tokio::fs::remove_dir_all(&ws_path).await;
+            // Store result for main agent to pick up.
+            if let Ok(mut guard) = pending.lock() {
+                guard.push((task_id.clone(), session_key, result_text));
+            }
 
-        Ok(json!({ "reply": reply.text }))
+            // Cleanup: remove agent from registry, delete workspace.
+            if let Some(reg) = agents {
+                reg.remove_handle(&task_id);
+            }
+            let _ = tokio::fs::remove_dir_all(&ws_path).await;
+            info!(task = %task_id, "async task agent completed and cleaned up");
+        });
+
+        Ok(json!({
+            "task_id": id,
+            "status": "dispatched",
+            "toolset": toolset_str,
+            "message": message,
+            "note": "Task is running in the background. Results will be available on your next turn. You can continue with other work."
+        }))
+    }
+
+    /// Send a message to a persistent (spawned) sub-agent. Non-blocking.
+    async fn tool_agent_send(&self, ctx: &RunContext, args: Value) -> Result<Value> {
+        let target_id = args["id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("agent_send: `id` required"))?
+            .to_owned();
+        let message = args["message"]
+            .as_str()
+            .ok_or_else(|| anyhow!("agent_send: `message` required"))?
+            .to_owned();
+
+        let registry = self
+            .agents
+            .as_ref()
+            .ok_or_else(|| anyhow!("agent_send: agent registry not available"))?;
+        let target = registry.get(&target_id)?;
+
+        let short_id = &uuid::Uuid::new_v4().to_string()[..8];
+        let send_session = format!("{}:send:{short_id}", ctx.session_key);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
+        let msg = AgentMessage {
+            session_key: send_session,
+            text: message.clone(),
+            channel: format!("send:{}", ctx.agent_id),
+            peer_id: ctx.agent_id.clone(),
+            chat_id: String::new(),
+            reply_tx,
+            extra_tools: vec![],
+            images: vec![],
+            files: vec![],
+        };
+        target.tx.send(msg).await.map_err(|_| anyhow!("agent_send: agent '{target_id}' inbox closed"))?;
+
+        // Background: wait for reply and store in pending results.
+        let pending = Arc::clone(&self.pending_task_results);
+        let session_key = ctx.session_key.clone();
+        let timeout_secs = self
+            .config
+            .agents
+            .defaults
+            .timeout_seconds
+            .unwrap_or(DEFAULT_TIMEOUT_SECONDS as u32) as u64;
+        let send_timeout = timeout_secs.min(300);
+        let send_id = format!("send-{target_id}-{short_id}");
+        let send_id_bg = send_id.clone();
+        let target_id_bg = target_id.clone();
+
+        tokio::spawn(async move {
+            let result_text = match tokio::time::timeout(
+                Duration::from_secs(send_timeout),
+                reply_rx,
+            ).await {
+                Ok(Ok(reply)) => reply.text,
+                Ok(Err(_)) => format!("[agent {target_id_bg} channel closed]"),
+                Err(_) => format!("[agent {target_id_bg} timed out after {send_timeout}s]"),
+            };
+            if let Ok(mut guard) = pending.lock() {
+                guard.push((send_id_bg, session_key, result_text));
+            }
+        });
+
+        Ok(json!({
+            "send_id": send_id,
+            "target": target_id,
+            "status": "sent",
+            "note": "Message sent to agent. Reply will be available on your next turn."
+        }))
     }
 
     async fn tool_agent_list(&self) -> Result<Value> {
@@ -8722,6 +8842,7 @@ impl AgentRuntime {
         match action {
             "spawn" => self.tool_agent_spawn(args).await,
             "task" => self.tool_agent_task(ctx, args).await,
+            "send" => self.tool_agent_send(ctx, args).await,
             "list" => self.tool_agent_list().await,
             "kill" => {
                 let id = args["id"]
@@ -10177,16 +10298,27 @@ fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "agent".to_owned(),
-        description: "Manage agents. Actions: spawn (persistent sub-agent), task (one-shot: spawn+send+wait+cleanup), list, kill. Sub-agents inherit platform/date/safety context automatically — only describe the ROLE in system prompt.".to_owned(),
+        description: "Manage sub-agents. You are the architect — delegate work, never block.\n\
+            Actions:\n\
+            - task: Fire-and-forget one-shot task. Returns immediately with task_id. Result delivered on your next turn.\n\
+            - spawn: Create a persistent sub-agent (survives across turns).\n\
+            - send: Send a message to a spawned sub-agent (async, result on next turn).\n\
+            - list: List all registered agents.\n\
+            - kill: Stop a sub-agent.\n\
+            Tips:\n\
+            - Use task for independent, parallelizable work. You can dispatch multiple tasks at once.\n\
+            - Always specify toolset matching the task (web for search, code for file ops).\n\
+            - After dispatching, tell the user what you delegated and continue with other work.\n\
+            - Check task results on your next response — they appear as [async task completed] messages.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "action":  {"type": "string", "enum": ["spawn", "task", "list", "kill"], "description": "Action to perform"},
-                "id":      {"type": "string", "description": "Agent ID (for spawn/kill)"},
+                "action":  {"type": "string", "enum": ["spawn", "task", "send", "list", "kill"], "description": "Action to perform"},
+                "id":      {"type": "string", "description": "Agent ID (for spawn/send/kill)"},
                 "model":   {"type": "string", "description": "Model string (for spawn/task)"},
-                "system":  {"type": "string", "description": "Role description for the agent (e.g. 'You are a web researcher. Search and summarize news.')"},
-                "message": {"type": "string", "description": "Task message to send (required for task action)"},
-                "toolset": {"type": "string", "enum": ["minimal", "standard", "web", "code", "full"], "description": "Tool access level. minimal=exec+read+write+search, web=search+fetch+browser, code=exec+read+write, standard=common tools, full=all. Default: standard."}
+                "system":  {"type": "string", "description": "Role description (for spawn/task)"},
+                "message": {"type": "string", "description": "Message to send (for task/send)"},
+                "toolset": {"type": "string", "enum": ["minimal", "standard", "web", "code", "full"], "description": "Tool access level. Default: standard."}
             },
             "required": ["action"]
         }),
