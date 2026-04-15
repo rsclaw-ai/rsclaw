@@ -4398,11 +4398,16 @@ impl AgentRuntime {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| "rsclaw".to_owned());
 
-        let output = tokio::process::Command::new(&exe)
-            .args(["tools", "install", name])
+        let mut cmd = tokio::process::Command::new(&exe);
+        cmd.args(["tools", "install", name])
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
+            .stderr(std::process::Stdio::piped());
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        let output = cmd.output()
             .await
             .map_err(|e| anyhow!("tool_install: failed to run: {e}"))?;
 
@@ -10093,9 +10098,9 @@ fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "write".to_owned(),
-        description: "Write content to a file in the agent workspace. Creates parent directories as needed. \
-            Both 'path' and 'content' parameters are required. \
-            Path is relative to workspace root (e.g., 'output.py', 'src/main.rs').".to_owned(),
+        description: "Write/create a file. Use this for ALL file creation and writing — do NOT use exec with notepad, echo, or any other editor/command to create files.\n\
+            Creates parent directories as needed. Path is relative to workspace root.\n\
+            Both 'path' and 'content' are required.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
