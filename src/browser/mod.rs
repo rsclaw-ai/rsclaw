@@ -1983,6 +1983,9 @@ const WAIT_ACTIONABLE_JS: &str = r#"function waitActionable(el,ms){return new Pr
 const SNAPSHOT_JS: &str = r#"(function(){
   var lines = [];
   var counter = 0;
+  var INTERACTIVE_ROLES = ['button','link','textbox','checkbox','radio','tab',
+    'menuitem','menuitemcheckbox','menuitemradio','switch','slider','combobox',
+    'searchbox','spinbutton','option','treeitem'];
   function walk(node, depth) {
     if (node.nodeType === 3) {
       var text = node.textContent.trim();
@@ -1996,13 +1999,22 @@ const SNAPSHOT_JS: &str = r#"(function(){
     var el = node;
     var tag = el.tagName.toLowerCase();
     if (tag === 'script' || tag === 'style' || tag === 'noscript') return;
+    // Skip hidden elements to reduce noise.
+    var style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return;
+    if (el.offsetWidth === 0 && el.offsetHeight === 0 && tag !== 'input') return;
     var role = el.getAttribute('role') || '';
     var ariaLabel = el.getAttribute('aria-label') || '';
+    var isEditable = el.isContentEditable && !el.parentElement.isContentEditable;
+    var hasCursorPointer = style.cursor === 'pointer';
     var isInteractive = ['a','button','input','select','textarea','details','summary'].indexOf(tag) >= 0
-      || role === 'button' || role === 'link' || role === 'textbox' || role === 'checkbox'
-      || el.getAttribute('onclick') || el.getAttribute('tabindex');
+      || INTERACTIVE_ROLES.indexOf(role) >= 0
+      || isEditable
+      || el.getAttribute('onclick') || el.getAttribute('tabindex')
+      || (hasCursorPointer && (el.innerText||'').trim().length > 0);
+    var isDisabled = el.disabled || el.getAttribute('aria-disabled') === 'true';
     var ref = '';
-    if (isInteractive) {
+    if (isInteractive && !isDisabled) {
       counter++;
       ref = '@e' + counter;
       el.setAttribute('data-ref', ref);
@@ -2013,9 +2025,11 @@ const SNAPSHOT_JS: &str = r#"(function(){
     else if (tag === 'input') label = 'input[' + (el.type||'text') + ']';
     else if (tag === 'select') label = 'select';
     else if (tag === 'textarea') label = 'textarea';
+    else if (isEditable) label = 'editable';
     else if (tag === 'img') label = 'img';
     else if (tag === 'h1'||tag === 'h2'||tag === 'h3'||tag === 'h4'||tag === 'h5'||tag === 'h6') label = tag;
     else if (['nav','main','header','footer','aside','section','article','form'].indexOf(tag) >= 0) label = tag;
+    else if (hasCursorPointer && isInteractive) label = 'clickable';
     else label = '';
 
     var text = ariaLabel || el.getAttribute('alt') || el.getAttribute('placeholder') || el.getAttribute('title') || '';
@@ -2023,16 +2037,37 @@ const SNAPSHOT_JS: &str = r#"(function(){
       var inner = el.innerText;
       if (inner) text = inner.split('\n')[0].substring(0, 100);
     }
+    // Find associated label for form inputs.
+    if (!text && el.id && (tag === 'input' || tag === 'select' || tag === 'textarea')) {
+      var lbl = document.querySelector('label[for="' + el.id + '"]');
+      if (lbl) text = lbl.innerText.substring(0, 80);
+    }
 
     if (label || ref) {
       var prefix = '  '.repeat(depth);
       var refStr = ref ? ' ' + ref : '';
+      var disStr = isDisabled ? ' [disabled]' : '';
       var textStr = text ? ' "' + text.substring(0, 100) + '"' : '';
-      var valueStr = '';
-      if ((tag === 'input' || tag === 'textarea') && el.value) {
-        valueStr = ' value="' + el.value.substring(0, 50) + '"';
+      var extraStr = '';
+      if ((tag === 'input' || tag === 'textarea' || isEditable) && (el.value || el.innerText)) {
+        var val = el.value || el.innerText;
+        extraStr = ' value="' + val.substring(0, 50) + '"';
       }
-      lines.push(prefix + '[' + label + ']' + refStr + textStr + valueStr);
+      if (tag === 'select' && el.selectedOptions && el.selectedOptions.length > 0) {
+        extraStr = ' selected="' + el.selectedOptions[0].text.substring(0, 50) + '"';
+      }
+      if (tag === 'a' && el.href) {
+        var href = el.href.length > 80 ? el.href.substring(0, 80) + '...' : el.href;
+        extraStr += ' href="' + href + '"';
+      }
+      if (tag === 'img') {
+        extraStr = ' ' + (el.naturalWidth||el.width||0) + 'x' + (el.naturalHeight||el.height||0);
+        if (el.src) {
+          var src = el.src.length > 60 ? el.src.substring(0, 60) + '...' : el.src;
+          extraStr += ' src="' + src + '"';
+        }
+      }
+      lines.push(prefix + '[' + label + ']' + refStr + disStr + textStr + extraStr);
     }
     if (tag === 'iframe') {
       try {
