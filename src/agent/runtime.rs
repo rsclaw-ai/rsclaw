@@ -295,7 +295,7 @@ impl AgentRuntime {
         let session_aliases = store.db.load_all_aliases().unwrap_or_default();
         let btw_manager = super::btw::BtwManager::new(Some(Arc::clone(&store.db)));
         let live_status = Arc::clone(&handle.live_status);
-        Self {
+        let rt = Self {
             handle,
             config,
             providers,
@@ -324,7 +324,29 @@ impl AgentRuntime {
             opencode_client: Arc::new(tokio::sync::OnceCell::new()),
             claudecode_client: Arc::new(tokio::sync::OnceCell::new()),
             session_aliases,
+        };
+
+        // Spawn a background task that periodically checks for idle browser
+        // sessions and drops them to release Chrome memory.  Runs every 60s.
+        {
+            let browser_handle = Arc::clone(&rt.browser);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    let mut guard = browser_handle.lock().await;
+                    if let Some(ref session) = *guard {
+                        if session.is_idle_expired() {
+                            tracing::info!("browser idle reaper: closing Chrome to free memory");
+                            *guard = None;
+                        }
+                    }
+                }
+            });
         }
+
+        rt
     }
 
     // -----------------------------------------------------------------------
@@ -1291,6 +1313,17 @@ impl AgentRuntime {
             // Re-inject summaries so agent retains context.
             for (key, msg) in summary_msgs {
                 self.sessions.insert(key, vec![msg]);
+            }
+        }
+
+        // Reclaim idle browser session (kills Chrome process) to free memory.
+        // Uses try_lock to avoid blocking if the browser is actively in use.
+        if let Ok(mut guard) = self.browser.try_lock() {
+            if let Some(ref session) = *guard {
+                if session.is_idle_expired() {
+                    info!("run_turn: browser idle timeout expired, closing Chrome to free memory");
+                    *guard = None;
+                }
             }
         }
 
@@ -5616,15 +5649,20 @@ impl AgentRuntime {
 
         tracing::info!(cwd = %workspace.display(), command = %command, "exec: executing");
 
-        // Timeout for exec commands (default 1800s = 30 min, matching openclaw).
-        let timeout_secs = self
+        // Timeout priority: tool call arg > config > default 30s.
+        // The model can pass a timeout parameter for long-running commands.
+        let config_timeout = self
             .config
             .ext
             .tools
             .as_ref()
             .and_then(|t| t.exec.as_ref())
             .and_then(|e| e.timeout_seconds)
-            .unwrap_or(1800);
+            .unwrap_or(30);
+        let timeout_secs = args["timeout"]
+            .as_u64()
+            .map(|t| t.min(300)) // cap at 5 min from model, config can go higher
+            .unwrap_or(config_timeout);
 
         let mut cmd = tokio::process::Command::new(shell);
         // Prepend ~/.rsclaw/tools/* to PATH so locally installed tools are found first.
@@ -5662,6 +5700,20 @@ impl AgentRuntime {
             const CREATE_NO_WINDOW: u32 = 0x08000000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
+        // Background mode: spawn and return immediately (for long-running services).
+        let background = args["background"].as_bool().unwrap_or(false);
+        if background {
+            let child = cmd.spawn()
+                .map_err(|e| anyhow!("exec background `{command}`: {e}"))?;
+            let pid = child.id().unwrap_or(0);
+            tracing::info!(command = %command, pid, "exec: started in background");
+            return Ok(json!({
+                "pid": pid,
+                "status": "running in background",
+                "note": "Process started. Use execute_command to check or kill it later (e.g. 'kill <pid>')."
+            }));
+        }
+
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             cmd.output()
@@ -5670,8 +5722,7 @@ impl AgentRuntime {
         .map_err(|_| {
             tracing::warn!(command = %command, timeout_secs, "exec: timed out");
             anyhow!(
-                "Command timed out after {} seconds. If this command is expected to take longer, re-run with a higher timeout via config.",
-                timeout_secs
+                "Command timed out after {timeout_secs}s. For long-running processes, use background=true."
             )
         })?
         .map_err(|e| anyhow!("exec `{command}`: {e}"))?;
@@ -10449,6 +10500,7 @@ fn build_tool_list(
              - Dates: Get-Date -Format 'yyyy-MM-dd'; [DateTimeOffset]::Now.ToUnixTimeSeconds()\n\
              - Do NOT wrap commands in extra cmd /c or powershell -Command layers.\n\
              - Do NOT use exec for destructive operations on personal directories (Desktop, Downloads, Documents).\n\
+             - For long-running processes (servers, watchers): use background=true to start without blocking.\n\
              - If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user."
                 .to_owned()
         } else if cfg!(target_os = "macos") {
@@ -10470,7 +10522,8 @@ fn build_tool_list(
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Shell command to execute. Must be valid for the current OS."},
-                "timeout": {"type": "integer", "description": "Timeout in seconds (default: 30, max: 300)"}
+                "timeout": {"type": "integer", "description": "Timeout in seconds (default: 30, max: 300)"},
+                "background": {"type": "boolean", "description": "Run in background (for servers/long-running processes). Returns PID immediately. Default: false."}
             },
             "required": ["command"]
         }),

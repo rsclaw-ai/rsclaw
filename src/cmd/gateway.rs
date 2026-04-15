@@ -120,12 +120,21 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
             if service_installed() {
                 println!("  {} Service detected, starting via service manager...", dim("[..]"));
                 if try_service_start() {
-                    println!("  {} Gateway started (via service)", green("[ok]"));
-                    kv("URL:", &detect_url());
-                    println!();
-                    return Ok(());
+                    // Verify the gateway actually started (service may load OK
+                    // but the binary may fail to run).
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    if let Some(pid) = gateway_read_pid() {
+                        if process_alive(pid) {
+                            println!("  {} Gateway started (via service, pid {pid})", green("[ok]"));
+                            kv("URL:", &detect_url());
+                            println!();
+                            return Ok(());
+                        }
+                    }
+                    eprintln!("  {} Service loaded but gateway not running, falling back to direct start", yellow("[!]"));
+                } else {
+                    eprintln!("  {} Service start failed, falling back to direct start", yellow("[!]"));
                 }
-                eprintln!("  {} Service start failed, falling back to direct start", yellow("[!]"));
             }
 
             let child = spawn_gateway_bg()?;
@@ -161,12 +170,19 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
             // Prefer service manager for restart if installed.
             if service_installed() {
                 if try_service_start() {
-                    println!("  {} Gateway restarted (via service)", green("[ok]"));
-                    kv("URL:", &detect_url());
-                    println!();
-                    return Ok(());
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    if let Some(pid) = gateway_read_pid() {
+                        if process_alive(pid) {
+                            println!("  {} Gateway restarted (via service, pid {pid})", green("[ok]"));
+                            kv("URL:", &detect_url());
+                            println!();
+                            return Ok(());
+                        }
+                    }
+                    eprintln!("  {} Service loaded but gateway not running, falling back to direct start", yellow("[!]"));
+                } else {
+                    eprintln!("  {} Service start failed, falling back to direct start", yellow("[!]"));
                 }
-                eprintln!("  {} Service start failed, falling back to direct start", yellow("[!]"));
             }
 
             let child = spawn_gateway_bg()?;
