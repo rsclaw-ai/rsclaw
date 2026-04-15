@@ -881,7 +881,7 @@ impl WeChatPersonalChannel {
                 .client
                 .post(cdn_url)
                 .header("Content-Type", "application/octet-stream")
-                .timeout(Duration::from_secs(30))
+                .timeout(Duration::from_secs(120))
                 .body(ciphertext.clone())
                 .send()
                 .await;
