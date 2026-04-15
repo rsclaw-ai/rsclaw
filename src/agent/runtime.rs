@@ -10120,16 +10120,38 @@ fn build_tool_list(
     tools.push(ToolDef {
         name: "exec".to_owned(),
         description: if cfg!(target_os = "windows") {
-            "Run a shell command on Windows. Shell: PowerShell. Use PowerShell syntax: Get-ChildItem, Get-Content, Get-Date, Where-Object, Select-Object. Example: Get-Date; Get-ChildItem | Select-Object -Last 5".to_owned()
+            "Run a shell command (PowerShell) on Windows.\n\
+             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `tool_install`. Only use exec for commands that have no dedicated tool.\n\
+             Use exec for: git operations, running scripts (node/python/cargo), system info (systeminfo, ipconfig, Get-Process), package management (npm/pip), process management (Start-Process, Stop-Process, taskkill).\n\
+             PowerShell tips:\n\
+             - Pipes: Get-Process | Sort-Object CPU -Descending | Select-Object -First 10\n\
+             - Network: Test-NetConnection host -Port 80; Invoke-WebRequest -Uri <url>\n\
+             - Text: (Get-Content file) -replace 'old','new'\n\
+             - Dates: Get-Date -Format 'yyyy-MM-dd'; [DateTimeOffset]::Now.ToUnixTimeSeconds()\n\
+             - Do NOT wrap commands in extra cmd /c or powershell -Command layers.\n\
+             - Do NOT use exec for destructive operations on personal directories (Desktop, Downloads, Documents).\n\
+             - If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user."
+                .to_owned()
         } else if cfg!(target_os = "macos") {
-            "Run a shell command on macOS. Shell: bash/zsh. Unix commands available (ls, cat, grep, tail).".to_owned()
+            "Run a shell command (bash/zsh) on macOS.\n\
+             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `tool_install`. Only use exec for commands that have no dedicated tool.\n\
+             Use exec for: git operations, running scripts (node/python/cargo), system info (uname, df, top), package management (brew/npm/pip), process management (ps, kill).\n\
+             Tips: Use `date +%s` for Unix timestamps (never calculate manually). Use `| head -n 20` to limit output.\n\
+             If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user."
+                .to_owned()
         } else {
-            "Run a shell command on Linux. Shell: bash/sh. Unix commands available (ls, cat, grep, tail).".to_owned()
+            "Run a shell command (bash/sh) on Linux.\n\
+             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `tool_install`. Only use exec for commands that have no dedicated tool.\n\
+             Use exec for: git operations, running scripts (node/python/cargo), system info (uname, df, top), package management (apt/npm/pip), process management (ps, kill).\n\
+             Tips: Use `date +%s` for Unix timestamps (never calculate manually). Use `| head -n 20` to limit output.\n\
+             If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user."
+                .to_owned()
         },
         parameters: json!({
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "Shell command to execute"}
+                "command": {"type": "string", "description": "Shell command to execute. Must be valid for the current OS."},
+                "timeout": {"type": "integer", "description": "Timeout in seconds (default: 30, max: 300)"}
             },
             "required": ["command"]
         }),
