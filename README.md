@@ -34,8 +34,9 @@ Desktop app (.dmg / .msi / .deb): [Releases](https://github.com/rsclaw-ai/rsclaw
 
 ```bash
 # First run
-rsclaw setup    # detects OpenClaw data, offers import
-rsclaw start    # start gateway
+rsclaw setup      # detects OpenClaw data, offers import
+rsclaw onboard    # interactive wizard: configure provider, channels, etc.
+rsclaw start      # start gateway
 ```
 
 ---
