@@ -20,9 +20,9 @@ Core responsibilities:
 src/          Rust backend (single crate, modular)
 ui/           Next.js 15 frontend + Tauri v1 desktop shell
 tests/        Integration tests (one file per module)
+scripts/      build scripts, orchestration pipelines, install scripts
 docs/         interfaces/ · ui-specs/ · adr/ · reviews/
 .claude/      roles/  ← sub-agent role definitions
-tools/      orchestration scripts for sub-agent pipelines
 ```
 
 ## Active Role System
@@ -36,16 +36,16 @@ without first checking the relevant role file in `.claude/roles/`.
 
 To activate a role:
 ```bash
-./tools/switch-role.sh <role>
+./scripts/switch-role.sh <role>
 # roles: architect · backend-dev · ui-dev · backend-tester
 #        ui-tester · reviewer · design-reviewer · qa-lead
 ```
 
 To run a full pipeline:
 ```bash
-./tools/parallel-feature.sh <feature-name>   # full dev cycle
-./tools/review-pipeline.sh <branch-name>     # review + QA gate only
-./tools/parallel-channels.sh <ch1> <ch2>     # multiple channels at once
+./scripts/parallel-feature.sh <feature-name>   # full dev cycle
+./scripts/review-pipeline.sh <branch-name>     # review + QA gate only
+./scripts/parallel-channels.sh <ch1> <ch2>     # multiple channels at once
 ```
 
 ## Non-Negotiable Rules (apply to every role)
