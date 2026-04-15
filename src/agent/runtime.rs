@@ -10281,11 +10281,13 @@ fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "web_browser".to_owned(),
-        description: "Control a web browser via CDP. Actions: open, snapshot, click, fill, type, \
-            select, check, uncheck, scroll, screenshot, pdf, back, forward, reload, \
-            get_text, get_url, get_title, wait, evaluate, cookies, press, set_viewport, \
-            dialog, state, network, new_tab, list_tabs, switch_tab, close_tab, \
-            highlight, clipboard, find, get_article, upload, context, emulate, diff, record".to_owned(),
+        description: "Control a web browser. Core workflow:\n\
+            1. `open` — navigate to a URL\n\
+            2. `snapshot` — get page content with interactive element refs (@e1, @e2...)\n\
+            3. `click` ref=@e1 / `fill` ref=@e2 text='...' — interact using refs from snapshot\n\
+            4. Re-snapshot after any page change to get updated refs\n\
+            Other actions: type, select, check, scroll, screenshot, pdf, press, back, forward, reload, wait, evaluate, cookies, get_text, get_url, get_title, find, get_article, upload, new_tab, switch_tab, close_tab.\n\
+            IMPORTANT: Always snapshot BEFORE clicking/filling. Element refs change after page updates.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
