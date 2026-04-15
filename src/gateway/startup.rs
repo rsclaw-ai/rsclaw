@@ -50,6 +50,9 @@ channel::{
 
 /// Start the full gateway. Blocks until shutdown (Ctrl-C).
 pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Result<()> {
+    // 0. Apply global proxy env vars before any HTTP clients are created.
+    crate::config::apply_proxy_env(&config);
+
     // 1. Resolve data directory — respects RSCLAW_BASE_DIR for --dev/--profile.
     let base_dir = crate::config::loader::base_dir();
     let data_dir = base_dir.join("var/data");

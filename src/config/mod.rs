@@ -76,3 +76,50 @@ pub fn load_from(path: std::path::PathBuf) -> Result<RuntimeConfig> {
     validator::validate(&runtime)?;
     Ok(runtime)
 }
+
+/// Resolve the proxy URL from env var (highest priority) or config.
+/// Returns None if no proxy is configured.
+pub fn resolve_proxy(config: &RuntimeConfig) -> Option<String> {
+    // RSCLAW_PROXY env var takes priority.
+    if let Ok(p) = std::env::var("RSCLAW_PROXY") {
+        let p = p.trim().to_owned();
+        if !p.is_empty() { return Some(p); }
+    }
+    // Fallback to config file.
+    config.raw.gateway.as_ref()
+        .and_then(|g| g.proxy.as_ref())
+        .filter(|p| !p.is_empty())
+        .cloned()
+}
+
+/// Check if a URL should bypass the proxy (localhost, 127.0.0.1, etc.).
+pub fn should_bypass_proxy(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    lower.contains("://localhost") || lower.contains("://127.0.0.1")
+        || lower.contains("://[::1]") || lower.contains("://0.0.0.0")
+}
+
+/// Apply proxy settings to standard environment variables so all reqwest clients
+/// (including those in channels) automatically use the proxy.
+/// Must be called early in gateway startup, before any HTTP clients are created.
+/// Sets HTTP_PROXY, HTTPS_PROXY, and NO_PROXY (to skip localhost).
+pub fn apply_proxy_env(config: &RuntimeConfig) {
+    if let Some(proxy_url) = resolve_proxy(config) {
+        // SAFETY: called once at startup before spawning threads.
+        unsafe {
+            std::env::set_var("HTTP_PROXY", &proxy_url);
+            std::env::set_var("HTTPS_PROXY", &proxy_url);
+        }
+        // Don't proxy localhost (ollama, local services).
+        let no_proxy = std::env::var("NO_PROXY").unwrap_or_default();
+        if !no_proxy.contains("localhost") {
+            let new_no_proxy = if no_proxy.is_empty() {
+                "localhost,127.0.0.1,::1".to_owned()
+            } else {
+                format!("{no_proxy},localhost,127.0.0.1,::1")
+            };
+            unsafe { std::env::set_var("NO_PROXY", &new_no_proxy); }
+        }
+        tracing::info!(proxy = %proxy_url, "global HTTP proxy configured via env");
+    }
+}
