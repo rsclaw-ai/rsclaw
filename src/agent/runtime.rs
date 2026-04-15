@@ -113,7 +113,7 @@ impl Drop for AbortFlagGuard {
 /// allowedCommands).
 const READONLY_COMMANDS: &[&str] = &[
     "/help", "/version", "/status", "/health", "/uptime", "/models", "/ctx", "/btw", "/clear",
-    "/history", "/cron", "/abort",
+    "/compact", "/history", "/cron", "/abort",
 ];
 
 // ---------------------------------------------------------------------------
@@ -1650,6 +1650,50 @@ impl AgentRuntime {
                             warn!("failed to clear persisted session: {e:#}");
                         }
                         "Session cleared.".to_owned()
+                    }
+                    "__COMPACT__" => {
+                        // Manual compaction: compress current session + save summary to memory.
+                        let model = self.resolve_model_name();
+                        self.compact_if_needed(session_key, &model).await;
+                        // Extract summary from the compacted session for memory storage.
+                        if let Some(msgs) = self.sessions.get(session_key) {
+                            // The first message after compaction is usually the summary.
+                            let summary_text = msgs.iter().find_map(|m| {
+                                if m.role == crate::provider::Role::System {
+                                    match &m.content {
+                                        crate::provider::MessageContent::Text(s) => Some(s.clone()),
+                                        crate::provider::MessageContent::Parts(parts) => parts.iter().find_map(|p| {
+                                            if let crate::provider::ContentPart::Text { text } = p { Some(text.clone()) } else { None }
+                                        }),
+                                    }
+                                } else { None }
+                            });
+                            if let Some(summary) = summary_text {
+                                // Store to memory for cross-session recall.
+                                if let Some(ref mem) = self.memory {
+                                    let mem_text = format!("Session compaction summary:\n{}", &summary[..summary.len().min(2000)]);
+                                    let doc = crate::agent::memory::MemoryDoc {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        scope: "global".to_owned(),
+                                        kind: "summary".to_owned(),
+                                        text: mem_text.clone(),
+                                        vector: vec![],
+                                        created_at: 0,
+                                        accessed_at: 0,
+                                        access_count: 0,
+                                        importance: 0.7,
+                                        tier: Default::default(),
+                                        abstract_text: None,
+                                        overview_text: None,
+                                    };
+                                    match mem.lock().await.add(doc).await {
+                                        Ok(_) => info!("compact: summary saved to memory ({} chars)", mem_text.len()),
+                                        Err(e) => warn!("compact: failed to save to memory: {e}"),
+                                    }
+                                }
+                            }
+                        }
+                        "✓ Session compacted and saved to memory.".to_owned()
                     }
                     "__ABORT__" => {
                         // Set abort flag for this session to interrupt running turn
@@ -9374,6 +9418,7 @@ fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
 
     h.push_str(if zh { "会话：\n" } else { "Session:\n" });
     h.push_str(if zh { "  /clear            清除会话\n" } else { "  /clear            Clear session\n" });
+    h.push_str(if zh { "  /compact          压缩会话并保存记忆\n" } else { "  /compact          Compact session & save to memory\n" });
     h.push_str(if zh { "  /abort            终止当前任务\n" } else { "  /abort            Abort running task\n" });
     if has("/reset") { h.push_str(if zh { "  /reset            重置会话\n" } else { "  /reset            Reset session\n" }); }
     h.push_str(if zh { "  /history [n]      查看历史\n" } else { "  /history [n]      Show history\n" });
