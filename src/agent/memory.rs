@@ -394,8 +394,11 @@ impl Embedder for LocalBgeEmbedder {
             }
         };
 
-        let ids: Vec<u32> = encoding.get_ids().to_vec();
-        let type_ids: Vec<u32> = encoding.get_type_ids().to_vec();
+        // BERT max_position_embeddings is 512 — truncate to avoid
+        // "index-select invalid index 512" panics.
+        const MAX_SEQ: usize = 512;
+        let ids: Vec<u32> = encoding.get_ids().iter().take(MAX_SEQ).copied().collect();
+        let type_ids: Vec<u32> = encoding.get_type_ids().iter().take(MAX_SEQ).copied().collect();
         let len = ids.len();
 
         let make_tensor = |data: Vec<u32>| -> Result<Tensor, candle_core::Error> {

@@ -110,6 +110,7 @@ tray-icon = { version = "0.21", optional = true }
 muda = { version = "0.16", optional = true }
 bzip2 = "0.6.1"
 lopdf = "0.34"
+glob = "0.3.3"
 
 [features]
 default = ["openclaw-migrate"]

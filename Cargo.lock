@@ -5622,6 +5622,7 @@ dependencies = [
  "fs2",
  "futures",
  "genpdf",
+ "glob",
  "hex",
  "hnsw_rs",
  "htmd",

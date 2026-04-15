@@ -158,6 +158,7 @@ async fn test_cron_job_runs() {
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
+                    was_preparse: false,
                 });
             }
         });
@@ -202,6 +203,7 @@ async fn test_cron_enable_disable() {
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
+                    was_preparse: false,
                 });
             }
         });

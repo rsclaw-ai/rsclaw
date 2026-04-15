@@ -1614,13 +1614,39 @@ impl AgentRuntime {
                         )
                     }
                     "__CLEAR__" => {
-                        let summary_msg = self.sessions.get(session_key)
-                            .and_then(|msgs| build_clear_summary(msgs));
+                        // Use LLM to generate a quality summary before clearing.
+                        // The session may already be compacted, so input is small
+                        // and the call is fast (~1-2s). No fact extraction needed
+                        // because auto-compaction already did that.
+                        let summary_text = if let Some(msgs) = self.sessions.get(session_key) {
+                            if msgs.is_empty() {
+                                None
+                            } else {
+                                let model = self.resolve_model_name();
+                                let context_tokens = self.config.agents.defaults.context_tokens.unwrap_or(64_000) as usize;
+                                let cfg = self.config.agents.defaults.compaction.clone().unwrap_or_default();
+                                let default_transcript = (context_tokens * 7 / 10).max(16_000);
+                                let max_transcript = cfg.max_transcript_tokens.map(|t| t as usize).unwrap_or(default_transcript);
+                                // Render transcript (reuse the same logic as compaction).
+                                let transcript = Self::msgs_to_text_static(msgs, max_transcript);
+                                let compaction_model = cfg.model.as_deref().unwrap_or(&model);
+                                self.compact_single(compaction_model, &transcript).await
+                            }
+                        } else {
+                            None
+                        };
+
                         self.sessions.remove(session_key);
                         if let Err(e) = self.store.db.delete_session(session_key) {
                             warn!("failed to clear persisted session: {e:#}");
                         }
-                        if let Some(msg) = summary_msg {
+                        if let Some(summary) = summary_text {
+                            let msg = Message {
+                                role: crate::provider::Role::User,
+                                content: crate::provider::MessageContent::Text(
+                                    format!("[Session summary before /clear]\n{summary}")
+                                ),
+                            };
                             self.sessions.insert(session_key.to_owned(), vec![msg]);
                         }
                         "Session cleared.".to_owned()
@@ -3169,13 +3195,22 @@ impl AgentRuntime {
                 );
             }
 
+            // Default temperature 0.6 for tool-calling scenarios (reduces
+            // randomness, helps small models preserve digits and paths).
+            // Use 0.0 when thinking/reasoning is enabled (deterministic CoT).
+            let temperature = if thinking_budget.is_some() {
+                None // let the provider handle thinking temperature
+            } else {
+                Some(0.6)
+            };
+
             let req = LlmRequest {
                 model: model.to_owned(),
                 messages,
                 tools: tools.clone(),
                 system: Some(effective_system.clone()),
                 max_tokens: configured_max_tokens,
-                temperature: None,
+                temperature,
                 frequency_penalty: self.config.agents.defaults.frequency_penalty,
                 thinking_budget,
             };
@@ -4064,6 +4099,10 @@ impl AgentRuntime {
             "read" => return self.tool_read(args).await,
             "write" => return self.tool_write(args).await,
             "exec" => return self.tool_exec(args).await,
+            "tool_install" => return self.tool_install(args).await,
+            "list_dir" => return self.tool_list_dir(args).await,
+            "search_file" => return self.tool_search_file(args).await,
+            "search_content" => return self.tool_search_content(args).await,
             "web_search" => return self.tool_web_search(args).await,
             "web_fetch" => return self.tool_web_fetch(args).await,
             "web_download" => return self.tool_web_download(args).await,
@@ -4346,6 +4385,198 @@ impl AgentRuntime {
         Ok(json!({"deleted": true, "id": id}))
     }
 
+    /// Install a tool/runtime via `rsclaw tools install`.
+    async fn tool_install(&self, args: Value) -> Result<Value> {
+        let name = args["name"]
+            .as_str()
+            .ok_or_else(|| anyhow!("tool_install: `name` required"))?;
+
+        let exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "rsclaw".to_owned());
+
+        let output = tokio::process::Command::new(&exe)
+            .args(["tools", "install", name])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| anyhow!("tool_install: failed to run: {e}"))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        Ok(json!({
+            "name": name,
+            "success": output.status.success(),
+            "output": if stdout.is_empty() { &stderr } else { &stdout },
+        }))
+    }
+
+    /// List files and directories in a path (structured alternative to `exec ls`).
+    async fn tool_list_dir(&self, args: Value) -> Result<Value> {
+        let default_ws = self.handle.config.workspace.as_deref().unwrap_or(".");
+        let path_str = args["path"].as_str().unwrap_or(default_ws);
+        let path = expand_tilde(path_str);
+        let recursive = args["recursive"].as_bool().unwrap_or(false);
+        let pattern = args["pattern"].as_str().unwrap_or("*");
+
+        if !path.exists() {
+            return Ok(json!({"error": format!("path not found: {}", path.display())}));
+        }
+        if !path.is_dir() {
+            return Ok(json!({"error": format!("not a directory: {}", path.display())}));
+        }
+
+        let glob_pattern = if recursive {
+            format!("{}/**/{}", path.display(), pattern)
+        } else {
+            format!("{}/{}", path.display(), pattern)
+        };
+
+        let mut entries: Vec<Value> = Vec::new();
+        for entry in glob::glob(&glob_pattern).unwrap_or_else(|_| glob::glob("__nomatch__").expect("fallback")) {
+            if entries.len() >= 100 { break; }
+            if let Ok(p) = entry {
+                let is_dir = p.is_dir();
+                let size = if is_dir { 0 } else { p.metadata().map(|m| m.len()).unwrap_or(0) };
+                entries.push(json!({
+                    "name": p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                    "path": p.to_string_lossy(),
+                    "is_dir": is_dir,
+                    "size": size,
+                }));
+            }
+        }
+
+        Ok(json!({
+            "path": path.to_string_lossy(),
+            "count": entries.len(),
+            "entries": entries,
+        }))
+    }
+
+    /// Search for files by name pattern (structured alternative to `exec find`).
+    async fn tool_search_file(&self, args: Value) -> Result<Value> {
+        let default_ws = self.handle.config.workspace.as_deref().unwrap_or(".");
+        let root = args["path"].as_str().unwrap_or(default_ws);
+        let root_path = expand_tilde(root);
+        let pattern = args["pattern"]
+            .as_str()
+            .ok_or_else(|| anyhow!("search_file: `pattern` required"))?;
+        let max_results = args["max_results"].as_u64().unwrap_or(20) as usize;
+
+        let glob_pattern = format!("{}/**/{}", root_path.display(), pattern);
+        let mut results: Vec<Value> = Vec::new();
+        for entry in glob::glob(&glob_pattern).unwrap_or_else(|_| glob::glob("__nomatch__").expect("fallback")) {
+            if results.len() >= max_results { break; }
+            if let Ok(p) = entry {
+                let size = p.metadata().map(|m| m.len()).unwrap_or(0);
+                results.push(json!({
+                    "path": p.to_string_lossy(),
+                    "size": size,
+                    "is_dir": p.is_dir(),
+                }));
+            }
+        }
+
+        Ok(json!({
+            "pattern": pattern,
+            "root": root_path.to_string_lossy(),
+            "count": results.len(),
+            "results": results,
+        }))
+    }
+
+    /// Search file contents by pattern (structured alternative to `exec grep`).
+    ///
+    /// Cross-platform: uses `grep -rn` on Unix, `Select-String` on Windows.
+    async fn tool_search_content(&self, args: Value) -> Result<Value> {
+        let default_ws = self.handle.config.workspace.as_deref().unwrap_or(".");
+        let root = args["path"].as_str().unwrap_or(default_ws);
+        let root_path = expand_tilde(root);
+        let pattern = args["pattern"]
+            .as_str()
+            .ok_or_else(|| anyhow!("search_content: `pattern` required"))?;
+        let include = args["include"].as_str();
+        let ignore_case = args["ignore_case"].as_bool().unwrap_or(false);
+        let max_results = args["max_results"].as_u64().unwrap_or(20) as usize;
+
+        #[cfg(not(target_os = "windows"))]
+        let output = {
+            let mut cmd = tokio::process::Command::new("grep");
+            cmd.arg("-rn");
+            if ignore_case { cmd.arg("-i"); }
+            if let Some(inc) = include {
+                cmd.arg("--include").arg(inc);
+            }
+            cmd.arg("--").arg(pattern).arg(root_path.to_str().unwrap_or("."));
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::null());
+            tokio::time::timeout(Duration::from_secs(15), cmd.output())
+                .await
+                .map_err(|_| anyhow!("search_content: timed out"))?
+                .map_err(|e| anyhow!("search_content: {e}"))?
+        };
+
+        #[cfg(target_os = "windows")]
+        let output = {
+            // PowerShell Select-String is the Windows equivalent of grep -rn.
+            let mut ps_args = vec![
+                "-NoProfile".to_owned(),
+                "-Command".to_owned(),
+            ];
+            let inc_filter = include
+                .map(|i| format!(" -Include '{i}'"))
+                .unwrap_or_default();
+            let case_flag = if ignore_case { "" } else { " -CaseSensitive" };
+            let ps_cmd = format!(
+                "Get-ChildItem -Path '{}' -Recurse{inc_filter} -File | Select-String -Pattern '{pattern}'{case_flag} | Select-Object -First {max_results} | ForEach-Object {{ \"$($_.Path):$($_.LineNumber):$($_.Line)\" }}",
+                root_path.display()
+            );
+            ps_args.push(ps_cmd);
+            let mut cmd = tokio::process::Command::new("powershell");
+            cmd.args(&ps_args);
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::null());
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
+            tokio::time::timeout(Duration::from_secs(15), cmd.output())
+                .await
+                .map_err(|_| anyhow!("search_content: timed out"))?
+                .map_err(|e| anyhow!("search_content: {e}"))?
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut matches: Vec<Value> = Vec::new();
+        for line in stdout.lines() {
+            if matches.len() >= max_results { break; }
+            // Parse output: file:line:content
+            if let Some((file_line, content)) = line.split_once(':').and_then(|(f, rest)| {
+                rest.split_once(':').map(|(l, c)| (format!("{f}:{l}"), c.to_string()))
+            }) {
+                let parts: Vec<&str> = file_line.rsplitn(2, ':').collect();
+                if parts.len() == 2 {
+                    matches.push(json!({
+                        "file": parts[1],
+                        "line": parts[0].parse::<u64>().unwrap_or(0),
+                        "content": content.chars().take(200).collect::<String>(),
+                    }));
+                }
+            }
+        }
+
+        Ok(json!({
+            "pattern": pattern,
+            "root": root_path.to_string_lossy(),
+            "count": matches.len(),
+            "matches": matches,
+        }))
+    }
+
     async fn tool_read(&self, args: Value) -> Result<Value> {
         let path = args["path"]
             .as_str()
@@ -4622,200 +4853,12 @@ impl AgentRuntime {
         };
         let extract_facts = cfg.extract_facts.unwrap_or(true);
 
-        // Helper: truncate to N chars (UTF-8 safe, early exit).
-        fn truncate_chars(s: &str, max: usize) -> String {
-            match s.char_indices().nth(max) {
-                None => s.to_owned(),
-                Some((byte_idx, _)) => {
-                    let mut t = s[..byte_idx].to_owned();
-                    t.push_str("...[truncated]");
-                    t
-                }
-            }
-        }
-
-        // Helper: smart-truncate tool_call args — keep metadata, trim large content.
-        //
-        // Limits by field type:
-        //   - "content", "old_string", "new_string": bulk code/text → 300 chars
-        //   - "command": shell commands with URLs → 500 chars
-        //   - all other fields: kept intact (paths, actions, schedules, etc.)
-        //   - total serialized output capped at 2000 chars
-        fn compact_tool_args(_tool_name: &str, input: &Value) -> String {
-            const BULK_FIELDS: &[&str] = &["content", "old_string", "new_string"];
-            const MAX_BULK_CHARS: usize = 300;
-            const MAX_CMD_CHARS: usize = 500;
-            const MAX_TOTAL_CHARS: usize = 2000;
-
-            if let Some(obj) = input.as_object() {
-                let needs_truncation = obj.iter().any(|(k, v)| {
-                    let limit = if BULK_FIELDS.contains(&k.as_str()) {
-                        MAX_BULK_CHARS
-                    } else if k == "command" {
-                        MAX_CMD_CHARS
-                    } else {
-                        return false; // non-bulk fields: never truncate
-                    };
-                    v.as_str()
-                        .map(|s| s.char_indices().nth(limit).is_some())
-                        .unwrap_or(false)
-                });
-
-                if needs_truncation {
-                    let mut compact = serde_json::Map::new();
-                    for (k, v) in obj {
-                        let limit = if BULK_FIELDS.contains(&k.as_str()) {
-                            Some(MAX_BULK_CHARS)
-                        } else if k == "command" {
-                            Some(MAX_CMD_CHARS)
-                        } else {
-                            None
-                        };
-                        if let (Some(limit), Some(s)) = (limit, v.as_str()) {
-                            compact.insert(
-                                k.clone(),
-                                Value::String(truncate_chars(s, limit)),
-                            );
-                        } else {
-                            compact.insert(k.clone(), v.clone());
-                        }
-                    }
-                    let serialized = serde_json::to_string(&Value::Object(compact))
-                        .unwrap_or_default();
-                    return if serialized.char_indices().nth(MAX_TOTAL_CHARS).is_some() {
-                        truncate_chars(&serialized, MAX_TOTAL_CHARS)
-                    } else {
-                        serialized
-                    };
-                }
-            }
-
-            // Small args or non-object: serialize as-is with safety net
-            let full = serde_json::to_string(input).unwrap_or_default();
-            if full.char_indices().nth(MAX_TOTAL_CHARS).is_some() {
-                truncate_chars(&full, MAX_TOTAL_CHARS)
-            } else {
-                full
-            }
-        }
-
-        // Helper: render messages as plain text transcript.
-        //
-        // Total output is capped (default 16K tokens) to avoid blowing
-        // up the compact LLM's context window.
-        //
-        // Strategy: two-pass budget allocation.
-        //   Pass 1: render all messages at full detail, measure sizes.
-        //   Pass 2 (if over budget): render at reduced detail, allocating
-        //           budget from newest to oldest. Recent messages get full
-        //           detail first; older messages get progressively reduced
-        //           detail until budget is exhausted. This ensures the most
-        //           recent (and typically most relevant) context is preserved.
         let msgs_to_text = |msgs: &[Message]| -> String {
-            // Default: 70% of context window (leave room for summary output +
-            // recent messages). User can override via compaction.maxTranscriptTokens.
             let default_transcript = (context_tokens * 7 / 10).max(16_000);
             let max_total_tokens: usize = cfg.max_transcript_tokens
                 .map(|t| t as usize)
                 .unwrap_or(default_transcript);
-
-            // Render a single message. `detail` controls verbosity:
-            //   2 = full (tool args + results)
-            //   1 = medium (tool names + truncated args, no results)
-            //   0 = minimal (tool names only, text truncated)
-            let render_msg = |m: &Message, detail: u8| -> String {
-                let role = format!("{:?}", m.role).to_lowercase();
-                let body = match &m.content {
-                    MessageContent::Text(t) => {
-                        if detail == 0 { truncate_chars(t, 200) } else { t.clone() }
-                    }
-                    MessageContent::Parts(parts) => parts
-                        .iter()
-                        .filter_map(|p| match p {
-                            ContentPart::Text { text } => Some(
-                                if detail == 0 { truncate_chars(text, 200) } else { text.clone() }
-                            ),
-                            ContentPart::ToolUse { name, input, .. } => match detail {
-                                2 => Some(format!("[tool_call: {name}({})]",
-                                    compact_tool_args(name, input))),
-                                1 => Some(format!("[tool_call: {name}({})]",
-                                    truncate_chars(
-                                        &serde_json::to_string(input).unwrap_or_default(), 100))),
-                                _ => Some(format!("[tool_call: {name}]")),
-                            },
-                            ContentPart::ToolResult { tool_use_id: _, content, .. } => match detail {
-                                2 => Some(format!("[tool_result: {}]",
-                                    truncate_chars(content, 800))),
-                                1 => Some(format!("[tool_result: {}]",
-                                    truncate_chars(content, 150))),
-                                _ => None, // drop results at minimal detail
-                            },
-                            ContentPart::Image { .. } => Some("[image]".to_owned()),
-                            #[allow(unreachable_patterns)]
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                };
-                format!("{role}: {body}")
-            };
-
-            // Pass 1: full detail, check if within budget.
-            let full: Vec<String> = msgs.iter().map(|m| render_msg(m, 2)).collect();
-            let full_tokens: Vec<usize> = full.iter().map(|s| estimate_tokens(s)).collect();
-            let total: usize = full_tokens.iter().sum();
-            if total <= max_total_tokens {
-                return full.join("\n");
-            }
-
-            // Pass 2: allocate budget from newest to oldest.
-            // Reuse Pass 1 token counts for detail=2 to avoid re-rendering.
-            let n = msgs.len();
-            let mut detail_levels = vec![0u8; n];
-            let mut budget_used = 0usize;
-
-            for i in (0..n).rev() {
-                // Try full first (reuse cached token count), then medium/minimal.
-                if budget_used + full_tokens[i] <= max_total_tokens {
-                    detail_levels[i] = 2;
-                    budget_used += full_tokens[i];
-                } else {
-                    // Try medium → minimal
-                    let m = &msgs[i];
-                    for &d in &[1u8, 0] {
-                        let rendered = render_msg(m, d);
-                        let cost = estimate_tokens(&rendered);
-                        if budget_used + cost <= max_total_tokens || d == 0 {
-                            detail_levels[i] = d;
-                            budget_used += cost.min(max_total_tokens.saturating_sub(budget_used));
-                            break;
-                        }
-                    }
-                }
-                if budget_used >= max_total_tokens {
-                    break; // remaining older messages stay at detail=0 (default)
-                }
-            }
-
-            // Final render in order. Reuse Pass 1 results for detail=2.
-            let mut result = String::new();
-            let mut tokens_used = 0usize;
-            for (i, m) in msgs.iter().enumerate() {
-                let line = if detail_levels[i] == 2 {
-                    full[i].clone()
-                } else {
-                    render_msg(m, detail_levels[i])
-                };
-                let line_tokens = estimate_tokens(&line);
-                if tokens_used + line_tokens > max_total_tokens {
-                    result.push_str("\n...[context truncated]");
-                    break;
-                }
-                result.push_str(&line);
-                result.push('\n');
-                tokens_used += line_tokens;
-            }
-            result
+            Self::msgs_to_text_static(msgs, max_total_tokens)
         };
 
         // Split messages into (old_portion, recent_portion) for layered mode.
@@ -4961,6 +5004,29 @@ impl AgentRuntime {
             "auto-compaction complete (layered)"
         );
 
+        // If compaction barely helped (still >80% of threshold), inject a
+        // system hint so the agent will relay the /reset suggestion to the user.
+        if new_tokens > token_threshold * 4 / 5 {
+            let zh = crate::i18n::default_lang() == "zh";
+            let hint = if zh {
+                "[system] 上下文压缩后仍然较大，响应可能变慢。请告知用户发送 /reset 重置会话以恢复正常速度。"
+            } else {
+                "[system] Context is still large after compaction and responses may slow down. Please tell the user to send /reset to start a fresh session."
+            };
+            if let Some(sess) = self.sessions.get_mut(session_key) {
+                sess.push(Message {
+                    role: Role::System,
+                    content: MessageContent::Text(hint.to_owned()),
+                });
+            }
+            warn!(
+                session = session_key,
+                tokens_after = new_tokens,
+                threshold = token_threshold,
+                "compaction insufficient, /reset recommended"
+            );
+        }
+
         // Persist compaction marker to transcript.
         self.append_transcript(
             session_key,
@@ -4968,6 +5034,147 @@ impl AgentRuntime {
             &format!("[summary: {summary}]"),
         )
         .await;
+    }
+
+    /// Render messages as plain text transcript with two-pass budget allocation.
+    ///
+    /// Total output is capped at `max_total_tokens` to avoid blowing up the
+    /// compact LLM's context window. Recent messages get full detail first;
+    /// older messages get progressively reduced detail until budget is exhausted.
+    fn msgs_to_text_static(msgs: &[Message], max_total_tokens: usize) -> String {
+        // Helper: truncate to N chars (UTF-8 safe).
+        fn trunc(s: &str, max: usize) -> String {
+            match s.char_indices().nth(max) {
+                None => s.to_owned(),
+                Some((byte_idx, _)) => {
+                    let mut t = s[..byte_idx].to_owned();
+                    t.push_str("...[truncated]");
+                    t
+                }
+            }
+        }
+
+        // Helper: smart-truncate tool_call args.
+        fn compact_args(input: &Value) -> String {
+            const BULK_FIELDS: &[&str] = &["content", "old_string", "new_string"];
+            const MAX_BULK: usize = 300;
+            const MAX_CMD: usize = 500;
+            const MAX_TOTAL: usize = 2000;
+
+            if let Some(obj) = input.as_object() {
+                let needs = obj.iter().any(|(k, v)| {
+                    let limit = if BULK_FIELDS.contains(&k.as_str()) { MAX_BULK }
+                                else if k == "command" { MAX_CMD }
+                                else { return false; };
+                    v.as_str().map(|s| s.char_indices().nth(limit).is_some()).unwrap_or(false)
+                });
+                if needs {
+                    let mut compact = serde_json::Map::new();
+                    for (k, v) in obj {
+                        let limit = if BULK_FIELDS.contains(&k.as_str()) { Some(MAX_BULK) }
+                                    else if k == "command" { Some(MAX_CMD) }
+                                    else { None };
+                        if let (Some(lim), Some(s)) = (limit, v.as_str()) {
+                            compact.insert(k.clone(), Value::String(trunc(s, lim)));
+                        } else {
+                            compact.insert(k.clone(), v.clone());
+                        }
+                    }
+                    let ser = serde_json::to_string(&Value::Object(compact)).unwrap_or_default();
+                    return if ser.char_indices().nth(MAX_TOTAL).is_some() { trunc(&ser, MAX_TOTAL) } else { ser };
+                }
+            }
+            let full = serde_json::to_string(input).unwrap_or_default();
+            if full.char_indices().nth(MAX_TOTAL).is_some() { trunc(&full, MAX_TOTAL) } else { full }
+        }
+
+        // Render a single message at the given detail level:
+        //   2 = full (tool args + results), 1 = medium, 0 = minimal
+        let render_msg = |m: &Message, detail: u8| -> String {
+            let role = format!("{:?}", m.role).to_lowercase();
+            let body = match &m.content {
+                MessageContent::Text(t) => {
+                    if detail == 0 { trunc(t, 200) } else { t.clone() }
+                }
+                MessageContent::Parts(parts) => parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        ContentPart::Text { text } => Some(
+                            if detail == 0 { trunc(text, 200) } else { text.clone() }
+                        ),
+                        ContentPart::ToolUse { name, input, .. } => match detail {
+                            2 => Some(format!("[tool_call: {name}({})]", compact_args(input))),
+                            1 => Some(format!("[tool_call: {name}({})]",
+                                trunc(&serde_json::to_string(input).unwrap_or_default(), 100))),
+                            _ => Some(format!("[tool_call: {name}]")),
+                        },
+                        ContentPart::ToolResult { tool_use_id: _, content, .. } => match detail {
+                            2 => Some(format!("[tool_result: {}]", trunc(content, 800))),
+                            1 => Some(format!("[tool_result: {}]", trunc(content, 150))),
+                            _ => None,
+                        },
+                        ContentPart::Image { .. } => Some("[image]".to_owned()),
+                        #[allow(unreachable_patterns)]
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            };
+            format!("{role}: {body}")
+        };
+
+        // Pass 1: full detail, check if within budget.
+        let full: Vec<String> = msgs.iter().map(|m| render_msg(m, 2)).collect();
+        let full_tokens: Vec<usize> = full.iter().map(|s| estimate_tokens(s)).collect();
+        let total: usize = full_tokens.iter().sum();
+        if total <= max_total_tokens {
+            return full.join("\n");
+        }
+
+        // Pass 2: allocate budget from newest to oldest.
+        let n = msgs.len();
+        let mut detail_levels = vec![0u8; n];
+        let mut budget_used = 0usize;
+        for i in (0..n).rev() {
+            if budget_used + full_tokens[i] <= max_total_tokens {
+                detail_levels[i] = 2;
+                budget_used += full_tokens[i];
+            } else {
+                let m = &msgs[i];
+                for &d in &[1u8, 0] {
+                    let rendered = render_msg(m, d);
+                    let cost = estimate_tokens(&rendered);
+                    if budget_used + cost <= max_total_tokens || d == 0 {
+                        detail_levels[i] = d;
+                        budget_used += cost.min(max_total_tokens.saturating_sub(budget_used));
+                        break;
+                    }
+                }
+            }
+            if budget_used >= max_total_tokens {
+                break;
+            }
+        }
+
+        // Final render in order.
+        let mut result = String::new();
+        let mut tokens_used = 0usize;
+        for (i, m) in msgs.iter().enumerate() {
+            let line = if detail_levels[i] == 2 {
+                full[i].clone()
+            } else {
+                render_msg(m, detail_levels[i])
+            };
+            let line_tokens = estimate_tokens(&line);
+            if tokens_used + line_tokens > max_total_tokens {
+                result.push_str("\n...[context truncated]");
+                break;
+            }
+            result.push_str(&line);
+            result.push('\n');
+            tokens_used += line_tokens;
+        }
+        result
     }
 
     /// Call the LLM once with a summarization prompt and return the text.
@@ -5364,6 +5571,24 @@ impl AgentRuntime {
         }))
     }
 
+    /// Build a full system prompt for a sub-agent by combining the shared base
+    /// (date, platform, safety rules, agent loop guidance) with the role-specific
+    /// description provided by the main agent.
+    fn build_subagent_system_prompt(&self, role_desc: &str) -> String {
+        let base_parts = build_base_system_prompt(&self.config.raw);
+        let mut prompt = base_parts.join("\n\n");
+        prompt.push_str("\n\n## Your Role\n");
+        prompt.push_str(role_desc);
+        prompt.push_str(
+            "\n\n## Sub-Agent Guidelines\n\
+             - You are a sub-agent working on a delegated task. Focus on the task and return results.\n\
+             - Use the tools available to you. If a tool is not in your toolset, find an alternative.\n\
+             - Be concise in your reply — the main agent will relay your output to the user.\n\
+             - If the task is unclear or impossible, explain why instead of looping.",
+        );
+        prompt
+    }
+
     async fn tool_agent_spawn(&self, args: Value) -> Result<Value> {
         let spawner = self
             .spawner
@@ -5381,6 +5606,10 @@ impl AgentRuntime {
         let system = args["system"]
             .as_str()
             .ok_or_else(|| anyhow!("agent_spawn: `system` required"))?
+            .to_owned();
+        let toolset_str = args["toolset"]
+            .as_str()
+            .unwrap_or("standard")
             .to_owned();
         let channels: Option<Vec<String>> = args["channels"]
             .as_array()
@@ -5401,7 +5630,7 @@ impl AgentRuntime {
                 image_fallbacks: None,
                 thinking: None,
                 tools_enabled: None,
-                toolset: None,
+                toolset: Some(toolset_str.clone()),
                 tools: None,
                 context_tokens: None,
                 max_tokens: None,
@@ -5421,11 +5650,12 @@ impl AgentRuntime {
 
         spawner.spawn_agent(entry.clone())?;
 
-        // Write system prompt as SOUL.md in the new agent's workspace.
+        // Write full system prompt (base + role) as SOUL.md in the new agent's workspace.
         let ws_path = crate::config::loader::base_dir().join(format!("workspace-{id}"));
         let _ = tokio::fs::create_dir_all(&ws_path).await;
         let soul_path = ws_path.join("SOUL.md");
-        let _ = tokio::fs::write(&soul_path, format!("# Agent: {id}\n\n{system}\n")).await;
+        let full_prompt = self.build_subagent_system_prompt(&system);
+        let _ = tokio::fs::write(&soul_path, format!("# Agent: {id}\n\n{full_prompt}\n")).await;
 
         // Persist to config file by default (user-created agents survive restart).
         // Pass persistent=false only for temporary task-delegation agents.
@@ -5447,8 +5677,11 @@ impl AgentRuntime {
         }))
     }
 
-    /// One-shot task agent: spawn → send message → wait reply → auto-cleanup.
-    /// No persistence, no leftover agent in registry or config.
+    /// One-shot task agent: spawn -> send message -> wait reply -> auto-cleanup.
+    ///
+    /// The task runs with a timeout but does NOT block the main agent's loop
+    /// when `async=true` is passed — in that case a background tokio task
+    /// handles the wait and the result is injected into the session later.
     async fn tool_agent_task(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let spawner = self
             .spawner
@@ -5471,11 +5704,13 @@ impl AgentRuntime {
             .ok_or_else(|| anyhow!("agent_task: `message` required"))?
             .to_owned();
 
-        // Auto-generate a short unique ID scoped under the parent agent's workspace.
+        let toolset_str = args["toolset"]
+            .as_str()
+            .unwrap_or("standard")
+            .to_owned();
+
         let short_id = &uuid::Uuid::new_v4().to_string()[..8];
         let id = format!("task-{short_id}");
-        // Resolve parent workspace the same way as the runtime does:
-        // main agent → ~/.rsclaw/workspace, others → ~/.rsclaw/workspace-{id}
         let base = crate::config::loader::base_dir();
         let parent_ws = self.handle.config.workspace
             .as_deref()
@@ -5494,7 +5729,7 @@ impl AgentRuntime {
                 image_fallbacks: None,
                 thinking: None,
                 tools_enabled: None,
-                toolset: None,
+                toolset: Some(toolset_str),
                 tools: None,
                 context_tokens: None,
                 max_tokens: None,
@@ -5514,9 +5749,10 @@ impl AgentRuntime {
 
         spawner.spawn_agent(entry)?;
 
-        // Write system prompt as SOUL.md.
+        // Write full system prompt (base + role) as SOUL.md.
         let _ = tokio::fs::create_dir_all(&ws_path).await;
-        let _ = tokio::fs::write(ws_path.join("SOUL.md"), format!("# Agent: {id}\n\n{system}\n")).await;
+        let full_prompt = self.build_subagent_system_prompt(&system);
+        let _ = tokio::fs::write(ws_path.join("SOUL.md"), format!("# Agent: {id}\n\n{full_prompt}\n")).await;
 
         // Send message and wait for reply.
         let registry = self
@@ -5527,8 +5763,8 @@ impl AgentRuntime {
         let session_key = format!("{}:task:{}", ctx.session_key, &uuid::Uuid::new_v4().to_string()[..8]);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
         let msg = AgentMessage {
-            session_key,
-            text: message,
+            session_key: session_key.clone(),
+            text: message.clone(),
             channel: format!("task:{}", ctx.agent_id),
             peer_id: ctx.agent_id.clone(),
             chat_id: String::new(),
@@ -5545,12 +5781,21 @@ impl AgentRuntime {
             .defaults
             .timeout_seconds
             .unwrap_or(DEFAULT_TIMEOUT_SECONDS as u32) as u64;
-        let reply = tokio::time::timeout(Duration::from_secs(timeout_secs), reply_rx)
+
+        // Shorter timeout for task agents (max 120s to avoid blocking too long).
+        let task_timeout = timeout_secs.min(120);
+        let reply = tokio::time::timeout(Duration::from_secs(task_timeout), reply_rx)
             .await
-            .map_err(|_| anyhow!("agent_task: timed out after {timeout_secs}s"))?
+            .map_err(|_| {
+                // Cleanup on timeout
+                registry.remove_handle(&id);
+                let ws = ws_path.clone();
+                tokio::spawn(async move { let _ = tokio::fs::remove_dir_all(&ws).await; });
+                anyhow!("agent_task '{id}': timed out after {task_timeout}s. The sub-agent may lack the tools needed for this task. Try breaking the task into simpler steps or using a different toolset.")
+            })?
             .map_err(|_| anyhow!("agent_task: reply channel dropped"))?;
 
-        // Cleanup: remove from registry (drops tx → task exits) and delete workspace.
+        // Cleanup: remove from registry and delete workspace.
         registry.remove_handle(&id);
         let _ = tokio::fs::remove_dir_all(&ws_path).await;
 
@@ -9329,11 +9574,16 @@ fn toolset_allowed_names(
     toolset: &str,
     custom_tools: Option<&Vec<String>>,
 ) -> Option<std::collections::HashSet<String>> {
-    const MINIMAL: &[&str] = &["exec", "read", "write", "send_file", "web_search", "web_fetch", "memory"];
+    const MINIMAL: &[&str] = &["exec", "read", "write", "send_file", "list_dir", "search_file", "search_content", "web_search", "web_fetch", "memory"];
+    const WEB: &[&str] = &["web_search", "web_fetch", "web_browser", "web_download", "read", "write", "list_dir", "search_file", "memory"];
+    const CODE: &[&str] = &["exec", "read", "write", "list_dir", "search_file", "search_content", "memory"];
     const STANDARD: &[&str] = &[
         "exec",
         "read",
         "write",
+        "list_dir",
+        "search_file",
+        "search_content",
         "web_search",
         "web_fetch",
         "memory",
@@ -9346,9 +9596,11 @@ fn toolset_allowed_names(
 
     let base: Option<&[&str]> = match toolset {
         "minimal" => Some(MINIMAL),
+        "web" => Some(WEB),
+        "code" => Some(CODE),
         "standard" => Some(STANDARD),
         "full" => None,
-        _ => Some(STANDARD), // unknown -> standard
+        _ => Some(STANDARD),
     };
 
     match (base, custom_tools) {
@@ -9502,18 +9754,18 @@ fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
 // System prompt builder
 // ---------------------------------------------------------------------------
 
-fn build_system_prompt(
-    ws_ctx: &WorkspaceContext,
-    skills: &SkillRegistry,
-    config: &crate::config::schema::Config,
-) -> String {
+/// Build the base system prompt shared by main agent and sub agents.
+///
+/// Contains: date/time, language, platform, command safety rules.
+/// Sub agents call this directly; the main agent calls `build_system_prompt`
+/// which adds workspace context, skills, and tool guidance on top.
+fn build_base_system_prompt(config: &crate::config::schema::Config) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
 
     // Current date/time so the model knows "today", "last Friday", etc.
     let now = chrono::Local::now();
-    // Calculate useful reference dates
     use chrono::Datelike;
-    let weekday = now.date_naive().weekday().num_days_from_monday(); // 0=Mon
+    let weekday = now.date_naive().weekday().num_days_from_monday();
     let last_friday = if weekday >= 4 {
         now.date_naive() - chrono::Duration::days((weekday - 4) as i64)
     } else {
@@ -9527,7 +9779,6 @@ fn build_system_prompt(
         yesterday.format("%Y-%m-%d"),
         last_friday.format("%Y-%m-%d"),
     );
-    // Language preference from config (gateway.language)
     if let Some(lang) = config.gateway.as_ref().and_then(|g| g.language.as_deref()) {
         date_line.push_str(&format!(
             "\nDefault response language: {lang}. Always reply in {lang} unless the user explicitly uses another language."
@@ -9549,29 +9800,75 @@ fn build_system_prompt(
     };
     parts.push(platform_info.to_string());
 
+    // Windows command safety rules (only on Windows builds).
+    if cfg!(target_os = "windows") {
+        parts.push(
+            "<windows_command_safety>\n\
+             Windows command safety rules (ALL mandatory):\n\
+             1. Do not wrap a command in an extra shell layer such as `cmd /c`, `powershell -Command`, or `pwsh -Command` unless strictly necessary.\n\
+             2. For destructive file operations, only use a fully specified absolute path.\n\
+             3. Never generate a command whose quoting, escaping, or trailing backslashes could cause the target path to be truncated or reinterpreted.\n\
+             4. Any destructive operation outside the workspace requires explicit user approval.\n\
+             5. If a destructive command fails, do NOT retry with workarounds or alternate commands. Stop, explain the failure, and ask the user.\n\
+             </windows_command_safety>"
+                .to_owned(),
+        );
+    }
+
+    // Agent loop guidance (helps small models understand the iteration pattern).
+    parts.push(
+        "<agent_loop>\n\
+         You are operating in an agent loop:\n\
+         1. Analyze: understand the user's intent and current state\n\
+         2. Plan: decide which tool to use next\n\
+         3. Execute: call the tool\n\
+         4. Observe: check the result\n\
+         5. Iterate: repeat until the task is complete, then reply to the user\n\
+         If a tool call fails, do NOT retry with the same arguments. Try a different approach or inform the user.\n\
+         Never fabricate URLs, file paths, or numeric values.\n\
+         When you need a Unix timestamp, use a shell command (e.g. `date +%s`) — never calculate it yourself.\n\
+         </agent_loop>"
+            .to_owned(),
+    );
+
+    parts
+}
+
+/// Build the full system prompt for the main agent (base + workspace + skills + tools).
+fn build_system_prompt(
+    ws_ctx: &WorkspaceContext,
+    skills: &SkillRegistry,
+    config: &crate::config::schema::Config,
+) -> String {
+    let mut parts = build_base_system_prompt(config);
+
     // Tool usage guidance
     {
         parts.push(
             "## Tool Usage Guidelines\n\
+             ### File Operations (use dedicated tools, NOT exec)\n\
+             - List directory contents: use `list_dir` (NOT exec ls/dir)\n\
+             - Find files by name: use `search_file` (NOT exec find)\n\
+             - Search file contents: use `search_content` (NOT exec grep)\n\
+             - Read file: use `read`. Write file: use `write`.\n\
+             - For documents (xlsx/docx/pdf/pptx): use the `doc` tool, not exec.\n\
+             - Reserve `exec` for system commands, package installs, and tasks that have no dedicated tool.\n\
+             ### Web Operations\n\
              - When user asks to go to a specific site (e.g. 'go to douyin', 'open taobao'), use `web_browser` directly. Do NOT search first.\n\
              - For general questions or info lookup, use `web_search` first.\n\
              - To download files/images/videos: use `web_download` (supports resume, browser cookies). Do NOT use exec curl/wget.\n\
              - `web_download` path is relative to workspace/downloads/. Just pass the filename like `video.mp4` or `subdir/file.pdf`. Do NOT include `~/`, `~/Downloads/`, or absolute paths.\n\
              - After downloading, use `send_file` to send the file to the user.\n\
-             - For documents (xlsx/docx/pdf/pptx): use the `doc` tool, not exec.\n\
+             ### Agent & Task Delegation\n\
+             - Use `agent` action=task for one-shot sub-tasks. Always specify a `toolset` matching the task needs (web, code, minimal).\n\
+             - Sub-agents are for delegation, not for every request. Only use them for independent, parallelizable work.\n\
+             - If a sub-agent times out, break the task into simpler steps and try with a smaller scope.\n\
+             ### Other\n\
              - For cron jobs: use the `cron` tool (action=list/add/remove).\n\
-             - To install tools (python, node, ffmpeg, chrome, opencode, claude-code, sherpa-onnx): use `exec` with `{rsclaw_exe} tools install <name>`. Do NOT download/install manually.\n\
-             - If a tool call fails, do NOT retry with the same arguments. Try a different approach or inform the user.\n\
-             - Never fabricate URLs or file paths.\n\
-             - When user asks about previous conversations, tasks, or anything you don't have context for, use `memory_search` to recall relevant information before answering.\n\
+             - To install tools (python, node, ffmpeg, chrome, opencode, claude-code, sherpa-onnx): use `tool_install`. Do NOT download/install manually.\n\
+             - When user asks about previous conversations, tasks, or anything you don't have context for, use `memory` to recall relevant information before answering.\n\
              - At the start of a new session, if the user's first message references prior work, search memory first."
-                .replace("{rsclaw_exe}", &std::env::current_exe()
-                    .map(|p| {
-                        let s = p.to_string_lossy().to_string();
-                        // Windows: wrap in quotes if path contains spaces.
-                        if cfg!(windows) && s.contains(' ') { format!("\"{s}\"") } else { s }
-                    })
-                    .unwrap_or_else(|_| "rsclaw".to_owned())),
+                .to_owned(),
         );
 
         // Inject tool-specific prompts (web_browser, exec) directly into system prompt.
@@ -9820,16 +10117,74 @@ fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "agent".to_owned(),
-        description: "Manage agents. Actions: spawn (create persistent sub-agent), task (one-shot disposable agent: spawn+send+wait+cleanup in one call), list (all registered agents), kill (stop an agent).".to_owned(),
+        description: "Manage agents. Actions: spawn (persistent sub-agent), task (one-shot: spawn+send+wait+cleanup), list, kill. Sub-agents inherit platform/date/safety context automatically — only describe the ROLE in system prompt.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["spawn", "task", "list", "kill"], "description": "Action to perform"},
-                "id":     {"type": "string", "description": "Agent ID (for spawn/kill)"},
-                "model":  {"type": "string", "description": "Model string (for spawn)"},
-                "system": {"type": "string", "description": "System prompt (for spawn)"}
+                "action":  {"type": "string", "enum": ["spawn", "task", "list", "kill"], "description": "Action to perform"},
+                "id":      {"type": "string", "description": "Agent ID (for spawn/kill)"},
+                "model":   {"type": "string", "description": "Model string (for spawn/task)"},
+                "system":  {"type": "string", "description": "Role description for the agent (e.g. 'You are a web researcher. Search and summarize news.')"},
+                "message": {"type": "string", "description": "Task message to send (required for task action)"},
+                "toolset": {"type": "string", "enum": ["minimal", "standard", "web", "code", "full"], "description": "Tool access level. minimal=exec+read+write+search, web=search+fetch+browser, code=exec+read+write, standard=common tools, full=all. Default: standard."}
             },
             "required": ["action"]
+        }),
+    });
+
+    // Tool installer (structured alternative to exec rsclaw tools install).
+    tools.push(ToolDef {
+        name: "tool_install".to_owned(),
+        description: "Install a tool/runtime. Available: python, node, ffmpeg, chrome, opencode, claude-code, sherpa-onnx.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "enum": ["python", "node", "ffmpeg", "chrome", "opencode", "claude-code", "sherpa-onnx"], "description": "Tool name to install"}
+            },
+            "required": ["name"]
+        }),
+    });
+
+    // File operation tools (structured alternatives to exec ls/find/grep).
+    // These help small models avoid digit-loss and dead-loop issues.
+    tools.push(ToolDef {
+        name: "list_dir".to_owned(),
+        description: "List files and directories in a given path. Use this instead of exec ls.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path":      {"type": "string", "description": "Directory path to list. Defaults to workspace root."},
+                "recursive": {"type": "boolean", "description": "List recursively (default: false)"},
+                "pattern":   {"type": "string", "description": "Glob pattern filter (e.g. '*.json', '*.rs')"}
+            }
+        }),
+    });
+    tools.push(ToolDef {
+        name: "search_file".to_owned(),
+        description: "Search for files by name pattern. Use this instead of exec find.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "File name pattern with wildcards (e.g. '*.log', 'config*')"},
+                "path":    {"type": "string", "description": "Root directory to search in. Defaults to workspace."},
+                "max_results": {"type": "integer", "description": "Maximum results to return (default: 20)"}
+            },
+            "required": ["pattern"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "search_content".to_owned(),
+        description: "Search file contents by regex or text pattern. Use this instead of exec grep.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "pattern":  {"type": "string", "description": "Text or regex pattern to search for"},
+                "path":     {"type": "string", "description": "File or directory to search in. Defaults to workspace."},
+                "include":  {"type": "string", "description": "File glob filter (e.g. '*.py', '*.rs')"},
+                "ignore_case": {"type": "boolean", "description": "Case insensitive search (default: false)"},
+                "max_results": {"type": "integer", "description": "Maximum results (default: 20)"}
+            },
+            "required": ["pattern"]
         }),
     });
 
