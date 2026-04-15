@@ -248,7 +248,7 @@ impl ChromeProcess {
             .ok_or_else(|| anyhow!("no stderr from Chrome process"))?;
         let mut reader = BufReader::new(stderr).lines();
 
-        let ws_url = time::timeout(Duration::from_secs(10), async {
+        let ws_url = time::timeout(Duration::from_secs(30), async {
             while let Some(line) = reader.next_line().await? {
                 debug!(line = %line, "chrome stderr");
                 if let Some(pos) = line.find("ws://") {
