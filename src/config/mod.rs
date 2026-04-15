@@ -168,23 +168,18 @@ pub fn apply_proxy_env(config: &RuntimeConfig) {
         tracing::info!(proxy = %proxy_url, deny = %deny_list, "global proxy configured (all domains)");
     } else {
         // Allow mode: only proxy matching domains.
-        // reqwest reads env vars at Client::build() time, so we set them and
-        // use NO_PROXY to block everything, then override with a custom proxy
-        // that checks the allow list. Unfortunately reqwest's env-based proxy
-        // can't do allow lists, so we store the config and channels should
-        // call build_proxy_client() instead of Client::new().
+        // Do NOT set HTTP_PROXY env var — that would proxy ALL requests.
+        // Instead store the config globally. Channels that create their own
+        // reqwest::Client will NOT use the proxy (which is correct — only
+        // allowed domains should). The proxy is applied via build_proxy_client().
         //
-        // Fallback: set env vars anyway — the allow list is a "best effort"
-        // filter. We set NO_PROXY to deny list and log the allow hint.
-        unsafe {
-            std::env::set_var("HTTP_PROXY", &proxy_url);
-            std::env::set_var("HTTPS_PROXY", &proxy_url);
-            std::env::set_var("NO_PROXY", &deny_list);
-        }
-        // Store allow list globally for build_proxy_client().
+        // For channels that DO need the proxy (e.g. wechat CDN upload),
+        // they should use build_proxy_client() or we inject the proxy at
+        // the point of use.
+        unsafe { std::env::set_var("NO_PROXY", &deny_list); }
         PROXY_ALLOW.get_or_init(|| allow.clone().unwrap_or_default());
         PROXY_URL.get_or_init(|| proxy_url.clone());
-        tracing::info!(proxy = %proxy_url, allow = ?allow, deny = %deny_list, "global proxy configured (allow-list mode)");
+        tracing::info!(proxy = %proxy_url, allow = ?allow, deny = %deny_list, "global proxy configured (allow-list mode, selective)");
     }
 }
 
