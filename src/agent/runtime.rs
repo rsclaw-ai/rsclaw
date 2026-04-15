@@ -1531,7 +1531,13 @@ impl AgentRuntime {
             {
                 // Handle special directives
                 let reply_text = match response.as_str() {
-                    "__HELP__" => build_help_text_filtered(allowed),
+                    "__HELP__" => {
+                        let lang = self.config.raw.gateway.as_ref()
+                            .and_then(|g| g.language.as_deref())
+                            .map(crate::i18n::resolve_lang)
+                            .unwrap_or("en");
+                        build_help_text_filtered(allowed, lang)
+                    }
                     "__VERSION__" => format!("rsclaw {}", env!("RSCLAW_BUILD_VERSION")),
                     "__STATUS__" => {
                         let model = self.resolve_model_name();
@@ -9225,154 +9231,116 @@ fn format_duration(d: std::time::Duration) -> String {
     }
 }
 
-fn build_help_text_filtered(allowed: &str) -> String {
+fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
     let full = allowed == "*";
+    let zh = lang == "zh";
     let has = |cmd: &str| -> bool {
-        if full {
-            return true;
-        }
+        if full { return true; }
         READONLY_COMMANDS.iter().any(|c| *c == cmd) || allowed.split('|').any(|a| a.trim() == cmd)
     };
 
-    let mut help = String::from("Available commands:\n\n");
+    let mut h = String::from(if zh { "可用命令：\n\n" } else { "Available commands:\n\n" });
 
-    // Shell & Files -- require /run, /ls etc.
     if has("/run") || has("/find") || has("/grep") {
-        help.push_str("Shell:\n");
+        h.push_str(if zh { "终端：\n" } else { "Shell:\n" });
         if has("/run") {
-            help.push_str("  /run <cmd>        Execute a shell command\n");
-            help.push_str("  $ <cmd>           Execute a shell command (shortcut)\n");
+            h.push_str(if zh { "  /run <命令>       执行终端命令\n  $ <命令>           执行终端命令（快捷方式）\n" } else { "  /run <cmd>        Execute a shell command\n  $ <cmd>           Execute a shell command (shortcut)\n" });
         }
-        if has("/find") {
-            help.push_str("  /find <pattern>   Find files by name\n");
-        }
-        if has("/grep") {
-            help.push_str("  /grep <pattern>   Search file contents\n");
-        }
-        help.push('\n');
+        if has("/find") { h.push_str(if zh { "  /find <模式>      按名称查找文件\n" } else { "  /find <pattern>   Find files by name\n" }); }
+        if has("/grep") { h.push_str(if zh { "  /grep <模式>      搜索文件内容\n" } else { "  /grep <pattern>   Search file contents\n" }); }
+        h.push('\n');
     }
 
     if has("/read") || has("/write") || has("/ls") {
-        help.push_str("Files:\n");
-        if has("/read") {
-            help.push_str("  /read <path>      Read a file\n");
-        }
-        if has("/write") {
-            help.push_str("  /write <path> <content>  Write to a file\n");
-        }
-        if has("/ls") {
-            help.push_str("  /ls [path]        List directory\n");
-        }
-        help.push('\n');
+        h.push_str(if zh { "文件：\n" } else { "Files:\n" });
+        if has("/read") { h.push_str(if zh { "  /read <路径>      读取文件\n" } else { "  /read <path>      Read a file\n" }); }
+        if has("/write") { h.push_str(if zh { "  /write <路径> <内容>  写入文件\n" } else { "  /write <path> <content>  Write to a file\n" }); }
+        if has("/ls") { h.push_str(if zh { "  /ls [路径]        列出目录\n" } else { "  /ls [path]        List directory\n" }); }
+        h.push('\n');
     }
 
     if has("/search") || has("/fetch") || has("/screenshot") || has("/ss") {
-        help.push_str("Search & Web:\n");
-        if has("/search") {
-            help.push_str("  /search <query>   Search the web\n");
-        }
-        if has("/fetch") {
-            help.push_str("  /fetch <url>      Fetch a web page\n");
-        }
-        if has("/screenshot") {
-            help.push_str("  /screenshot <url> Screenshot a web page\n");
-        }
-        if has("/ss") {
-            help.push_str("  /ss               Screenshot desktop\n");
-        }
-        help.push('\n');
+        h.push_str(if zh { "搜索与网页：\n" } else { "Search & Web:\n" });
+        if has("/search") { h.push_str(if zh { "  /search <关键词>  搜索网页\n" } else { "  /search <query>   Search the web\n" }); }
+        if has("/fetch") { h.push_str(if zh { "  /fetch <网址>     抓取网页内容\n" } else { "  /fetch <url>      Fetch a web page\n" }); }
+        if has("/screenshot") { h.push_str(if zh { "  /screenshot <网址> 网页截图\n" } else { "  /screenshot <url> Screenshot a web page\n" }); }
+        if has("/ss") { h.push_str(if zh { "  /ss               桌面截图\n" } else { "  /ss               Screenshot desktop\n" }); }
+        h.push('\n');
     }
 
     if has("/remember") || has("/recall") {
-        help.push_str("Memory:\n");
-        if has("/remember") {
-            help.push_str("  /remember <text>  Save to memory\n");
-        }
-        if has("/recall") {
-            help.push_str("  /recall <query>   Search memory\n");
-        }
-        help.push('\n');
+        h.push_str(if zh { "记忆：\n" } else { "Memory:\n" });
+        if has("/remember") { h.push_str(if zh { "  /remember <文本>  保存到记忆\n" } else { "  /remember <text>  Save to memory\n" }); }
+        if has("/recall") { h.push_str(if zh { "  /recall <关键词>  搜索记忆\n" } else { "  /recall <query>   Search memory\n" }); }
+        h.push('\n');
     }
 
-    // Always show /ctx and /btw (read-only commands)
-    help.push_str("Background Context:\n");
-    help.push_str("  /ctx <text>              Add persistent context\n");
-    help.push_str("  /ctx --ttl <N> <text>    Add context (expires in N turns)\n");
-    if full {
-        help.push_str("  /ctx --global <text>     Add global context (all sessions)\n");
-    }
-    help.push_str("  /ctx --list              List active context entries\n");
-    help.push_str("  /ctx --remove <id>       Remove entry by id\n");
-    help.push_str("  /ctx --clear             Clear all context for this session\n");
-    help.push('\n');
+    h.push_str(if zh { "背景上下文：\n" } else { "Background Context:\n" });
+    h.push_str(if zh { "  /ctx <文本>              添加持久上下文\n" } else { "  /ctx <text>              Add persistent context\n" });
+    h.push_str(if zh { "  /ctx --ttl <N> <文本>    添加上下文（N轮后过期）\n" } else { "  /ctx --ttl <N> <text>    Add context (expires in N turns)\n" });
+    if full { h.push_str(if zh { "  /ctx --global <文本>     添加全局上下文\n" } else { "  /ctx --global <text>     Add global context (all sessions)\n" }); }
+    h.push_str(if zh { "  /ctx --list              列出活跃上下文\n" } else { "  /ctx --list              List active context entries\n" });
+    h.push_str(if zh { "  /ctx --remove <id>       移除指定上下文\n" } else { "  /ctx --remove <id>       Remove entry by id\n" });
+    h.push_str(if zh { "  /ctx --clear             清除当前会话所有上下文\n" } else { "  /ctx --clear             Clear all context for this session\n" });
+    h.push('\n');
 
-    help.push_str("Side Query:\n");
-    help.push_str("  /btw <question>          Quick query (no tools, ephemeral)\n");
-    help.push('\n');
+    h.push_str(if zh { "快速提问：\n" } else { "Side Query:\n" });
+    h.push_str(if zh { "  /btw <问题>              快速查询（不调用工具）\n" } else { "  /btw <question>          Quick query (no tools, ephemeral)\n" });
+    h.push('\n');
 
     if full {
-        help.push_str("Tools (consolidated):\n");
-        help.push_str("  memory   search/get/put/delete long-term memory\n");
-        help.push_str("  session  send/list/history/status for sessions\n");
-        help.push_str("  agent    spawn/task/list/kill sub-agents\n");
-        help.push_str("  channel  send/reply/pin/delete across channels\n");
-        help.push('\n');
+        h.push_str(if zh { "工具（聚合）：\n" } else { "Tools (consolidated):\n" });
+        h.push_str(if zh { "  memory   搜索/获取/保存/删除长期记忆\n" } else { "  memory   search/get/put/delete long-term memory\n" });
+        h.push_str(if zh { "  session  发送/列表/历史/状态\n" } else { "  session  send/list/history/status for sessions\n" });
+        h.push_str(if zh { "  agent    创建/任务/列表/终止子智能体\n" } else { "  agent    spawn/task/list/kill sub-agents\n" });
+        h.push_str(if zh { "  channel  发送/回复/置顶/删除跨渠道消息\n" } else { "  channel  send/reply/pin/delete across channels\n" });
+        h.push('\n');
     }
 
-    help.push_str("System:\n");
-    help.push_str("  /status           Gateway status\n");
-    help.push_str("  /version          Show version\n");
-    help.push_str("  /models           List models\n");
-    if has("/model") {
-        help.push_str("  /model <name>     Switch model\n");
-    }
-    help.push_str("  /uptime           Show uptime\n");
-    help.push('\n');
+    h.push_str(if zh { "系统：\n" } else { "System:\n" });
+    h.push_str(if zh { "  /status           网关状态\n" } else { "  /status           Gateway status\n" });
+    h.push_str(if zh { "  /version          查看版本\n" } else { "  /version          Show version\n" });
+    h.push_str(if zh { "  /models           列出模型\n" } else { "  /models           List models\n" });
+    if has("/model") { h.push_str(if zh { "  /model <名称>     切换模型\n" } else { "  /model <name>     Switch model\n" }); }
+    h.push_str(if zh { "  /uptime           查看运行时长\n" } else { "  /uptime           Show uptime\n" });
+    h.push('\n');
 
-    help.push_str("Session:\n");
-    help.push_str("  /clear            Clear session\n");
-    help.push_str("  /abort            Abort running task\n");
-    if has("/reset") {
-        help.push_str("  /reset            Reset session\n");
-    }
-    help.push_str("  /history [n]      Show history\n");
-    if has("/sessions") {
-        help.push_str("  /sessions         List sessions\n");
-    }
-    help.push('\n');
+    h.push_str(if zh { "会话：\n" } else { "Session:\n" });
+    h.push_str(if zh { "  /clear            清除会话\n" } else { "  /clear            Clear session\n" });
+    h.push_str(if zh { "  /abort            终止当前任务\n" } else { "  /abort            Abort running task\n" });
+    if has("/reset") { h.push_str(if zh { "  /reset            重置会话\n" } else { "  /reset            Reset session\n" }); }
+    h.push_str(if zh { "  /history [n]      查看历史\n" } else { "  /history [n]      Show history\n" });
+    if has("/sessions") { h.push_str(if zh { "  /sessions         列出会话\n" } else { "  /sessions         List sessions\n" }); }
+    h.push('\n');
 
-    help.push_str("Cron:\n");
-    help.push_str("  /cron list        List cron jobs\n");
-    help.push('\n');
+    h.push_str(if zh { "定时任务：\n" } else { "Cron:\n" });
+    h.push_str(if zh { "  /cron list        列出定时任务\n" } else { "  /cron list        List cron jobs\n" });
+    h.push('\n');
 
     if has("/send") {
-        help.push_str("Messaging:\n");
-        help.push_str("  /send <target> <msg>  Send a message\n");
-        help.push('\n');
+        h.push_str(if zh { "消息：\n" } else { "Messaging:\n" });
+        h.push_str(if zh { "  /send <目标> <消息>  发送消息\n" } else { "  /send <target> <msg>  Send a message\n" });
+        h.push('\n');
     }
 
     if has("/skill") {
-        help.push_str("Skill:\n");
-        help.push_str("  /skill install <name>\n");
-        help.push_str("  /skill list\n");
-        help.push_str("  /skill search <query>\n");
-        help.push('\n');
+        h.push_str(if zh { "技能：\n" } else { "Skill:\n" });
+        h.push_str("  /skill install <name>\n  /skill list\n  /skill search <query>\n");
+        h.push('\n');
     }
 
     if full {
-        help.push_str("Upload & Limits:\n");
-        help.push_str("  /get_upload_size           Show upload size limit\n");
-        help.push_str("  /set_upload_size <MB>      Set size limit (runtime)\n");
-        help.push_str("  /get_upload_chars          Show text char limit\n");
-        help.push_str("  /set_upload_chars <N>      Set char limit (runtime)\n");
-        help.push_str("  /config_upload_size <MB>   Set size limit (persistent)\n");
-        help.push_str("  /config_upload_chars <N>   Set char limit (persistent)\n");
-        help.push('\n');
+        h.push_str(if zh { "上传限制：\n" } else { "Upload & Limits:\n" });
+        h.push_str(if zh {
+            "  /get_upload_size           查看上传大小限制\n  /set_upload_size <MB>      设置大小限制\n  /get_upload_chars          查看文本字符限制\n  /set_upload_chars <N>      设置字符限制\n  /config_upload_size <MB>   持久化大小限制\n  /config_upload_chars <N>   持久化字符限制\n"
+        } else {
+            "  /get_upload_size           Show upload size limit\n  /set_upload_size <MB>      Set size limit (runtime)\n  /get_upload_chars          Show text char limit\n  /set_upload_chars <N>      Set char limit (runtime)\n  /config_upload_size <MB>   Set size limit (persistent)\n  /config_upload_chars <N>   Set char limit (persistent)\n"
+        });
+        h.push('\n');
     }
 
-    help.push_str("Type any message without / to chat with the AI agent.");
-
-    help
+    h.push_str(if zh { "直接输入消息即可与AI对话。" } else { "Type any message without / to chat with the AI agent." });
+    h
 }
 
 // ---------------------------------------------------------------------------
