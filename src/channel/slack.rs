@@ -380,7 +380,7 @@ fn slack_is_text_file(name: &str) -> bool {
 fn slack_process_file(filename: &str, bytes: &[u8]) -> String {
     let lower = filename.to_lowercase();
     if lower.ends_with(".pdf") {
-        if let Ok(text) = pdf_extract::extract_text_from_mem(bytes) {
+        if let Ok(text) = crate::agent::doc::safe_extract_pdf_from_mem(bytes) {
             return format!("[PDF: {filename}]\n{}", &text[..text.len().min(20000)]);
         }
         // Fallback to pdftotext CLI

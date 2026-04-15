@@ -1402,10 +1402,20 @@ impl Channel for FeishuChannel {
                     Ok(p) => p,
                     Err(e) => { warn!("feishu: multipart error: {e}"); continue; }
                 };
-                let form = reqwest::multipart::Form::new()
+                let mut form = reqwest::multipart::Form::new()
                     .text("file_type", file_type.to_owned())
                     .text("file_name", filename.clone())
                     .part("file", part);
+                // Add duration (ms) for video/audio uploads.
+                if is_media {
+                    let dur = if mime.starts_with("video/") {
+                        mp4_duration_ms(path_or_url).unwrap_or(0)
+                    } else { 0 };
+                    if dur > 0 {
+                        form = form.text("duration", dur.to_string());
+                        info!(duration_ms = dur, "feishu: uploading media with duration");
+                    }
+                }
 
                 let upload_resp = self.client
                     .post(&upload_url)
@@ -1436,16 +1446,7 @@ impl Channel for FeishuChannel {
                     else { "chat_id" };
                 let send_url = format!("{}/im/v1/messages?receive_id_type={id_type}", self.api_base());
                 let (msg_type, content) = if is_media {
-                    // Try to extract duration from MP4 header (moov/mvhd atom).
-                    let duration_ms = if mime.starts_with("video/") {
-                        let d = mp4_duration_ms(path_or_url);
-                        info!(path = %path_or_url, duration = ?d, "feishu: mp4 duration extracted");
-                        d.unwrap_or(0)
-                    } else { 0 };
                     let mut media_json = serde_json::json!({"file_key": file_key, "file_name": filename});
-                    if duration_ms > 0 {
-                        media_json["duration"] = serde_json::json!(duration_ms.to_string());
-                    }
                     // Try to extract cover image via ffmpeg and upload as image_key.
                     if mime.starts_with("video/") {
                         let api = self.api_base().to_owned();

@@ -4305,7 +4305,7 @@ impl AgentRuntime {
             let pdf_bytes = tokio::fs::read(&full)
                 .await
                 .map_err(|e| anyhow!("read `{}`: {e}", full.display()))?;
-            let content = match pdf_extract::extract_text_from_mem(&pdf_bytes) {
+            let content = match crate::agent::doc::safe_extract_pdf_from_mem(&pdf_bytes) {
                 Ok(text) => text,
                 Err(e) => {
                     // Fallback to pdftotext CLI
@@ -7623,7 +7623,7 @@ public class WinHoldKey {{
         let pdf_bytes = tokio::fs::read(&local_path)
             .await
             .map_err(|e| anyhow!("pdf: read failed: {e}"))?;
-        let text = match pdf_extract::extract_text_from_mem(&pdf_bytes) {
+        let text = match crate::agent::doc::safe_extract_pdf_from_mem(&pdf_bytes) {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("pdf-extract failed ({e}), trying pdftotext CLI");
@@ -8390,7 +8390,7 @@ fn expand_tilde(p: &str) -> std::path::PathBuf {
 async fn extract_file_text(filename: &str, bytes: &[u8]) -> Option<String> {
     let lower = filename.to_lowercase();
     if lower.ends_with(".pdf") {
-        match pdf_extract::extract_text_from_mem(bytes) {
+        match crate::agent::doc::safe_extract_pdf_from_mem(bytes) {
             Ok(text) => return Some(text),
             Err(_) => {}
         }
