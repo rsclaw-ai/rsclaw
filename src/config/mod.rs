@@ -92,13 +92,6 @@ pub fn resolve_proxy(config: &RuntimeConfig) -> Option<String> {
         .cloned()
 }
 
-/// Check if a URL should bypass the proxy (localhost, 127.0.0.1, etc.).
-pub fn should_bypass_proxy(url: &str) -> bool {
-    let lower = url.to_lowercase();
-    lower.contains("://localhost") || lower.contains("://127.0.0.1")
-        || lower.contains("://[::1]") || lower.contains("://0.0.0.0")
-}
-
 /// Resolve proxy allow list from env or config.
 fn resolve_proxy_allow(config: &RuntimeConfig) -> Option<String> {
     if let Ok(v) = std::env::var("RSCLAW_PROXY_ALLOW") {
@@ -178,12 +171,14 @@ pub fn apply_proxy_env(config: &RuntimeConfig) {
         // the point of use.
         unsafe { std::env::set_var("NO_PROXY", &deny_list); }
         PROXY_ALLOW.get_or_init(|| allow.clone().unwrap_or_default());
+        PROXY_DENY.get_or_init(|| deny_list.clone());
         PROXY_URL.get_or_init(|| proxy_url.clone());
         tracing::info!(proxy = %proxy_url, allow = ?allow, deny = %deny_list, "global proxy configured (allow-list mode, selective)");
     }
 }
 
 static PROXY_ALLOW: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static PROXY_DENY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static PROXY_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Build a reqwest::Client that respects the proxy allow/deny lists.
@@ -194,12 +189,19 @@ pub fn build_proxy_client() -> reqwest::ClientBuilder {
     let allow = PROXY_ALLOW.get().map(|s| s.as_str()).unwrap_or("");
     let proxy_url = PROXY_URL.get().map(|s| s.as_str()).unwrap_or("");
 
+    let deny = PROXY_DENY.get().map(|s| s.as_str()).unwrap_or("");
+
     if !proxy_url.is_empty() && !allow.is_empty() && allow != "*" {
         // Custom proxy: only route matching hosts through proxy.
         let allow_owned = allow.to_owned();
+        let deny_owned = deny.to_owned();
         let url_owned = proxy_url.to_owned();
         let proxy = reqwest::Proxy::custom(move |url| {
             let host = url.host_str().unwrap_or("");
+            // Deny list takes priority over allow list.
+            if !deny_owned.is_empty() && host_matches_any(host, &deny_owned) {
+                return None;
+            }
             if host_matches_any(host, &allow_owned) {
                 Some(url_owned.clone())
             } else {

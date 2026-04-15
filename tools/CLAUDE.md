@@ -36,7 +36,7 @@ without first checking the relevant role file in `.claude/roles/`.
 
 To activate a role:
 ```bash
-./switch-role.sh <role>
+./tools/switch-role.sh <role>
 # roles: architect · backend-dev · ui-dev · backend-tester
 #        ui-tester · reviewer · design-reviewer · qa-lead
 ```

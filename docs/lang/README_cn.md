@@ -11,7 +11,7 @@
 螃蟹 AI（RsClaw）是基于 Rust 从零重构的 AI 自动化管家，拥有原生长期记忆与自我进化能力，全平台桌面版一键安装，开箱即用。支持 OpenClaw 一键迁移，原有配置无缝切换。
 
 <p align="center">
-  <img src="docs/images/preview-zh.gif" alt="RsClaw 预览" width="800" />
+  <img src="../images/preview-zh.gif" alt="RsClaw 预览" width="800" />
 </p>
 
 ---
