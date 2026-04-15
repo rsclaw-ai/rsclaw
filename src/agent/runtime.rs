@@ -3197,9 +3197,10 @@ impl AgentRuntime {
 
             // Default temperature 0.6 for tool-calling scenarios (reduces
             // randomness, helps small models preserve digits and paths).
-            // Use 0.0 when thinking/reasoning is enabled (deterministic CoT).
-            let temperature = if thinking_budget.is_some() {
-                None // let the provider handle thinking temperature
+            // For pure chat (no tools), leave as None (provider default, usually 1.0).
+            // For thinking/reasoning, leave as None (let provider handle CoT temperature).
+            let temperature = if thinking_budget.is_some() || tools.is_empty() {
+                None
             } else {
                 Some(0.6)
             };
@@ -4435,7 +4436,11 @@ impl AgentRuntime {
         };
 
         let mut entries: Vec<Value> = Vec::new();
-        for entry in glob::glob(&glob_pattern).unwrap_or_else(|_| glob::glob("__nomatch__").expect("fallback")) {
+        let entries_iter = match glob::glob(&glob_pattern) {
+            Ok(iter) => iter,
+            Err(e) => return Ok(json!({"error": format!("invalid pattern: {e}")})),
+        };
+        for entry in entries_iter {
             if entries.len() >= 100 { break; }
             if let Ok(p) = entry {
                 let is_dir = p.is_dir();
@@ -4468,7 +4473,11 @@ impl AgentRuntime {
 
         let glob_pattern = format!("{}/**/{}", root_path.display(), pattern);
         let mut results: Vec<Value> = Vec::new();
-        for entry in glob::glob(&glob_pattern).unwrap_or_else(|_| glob::glob("__nomatch__").expect("fallback")) {
+        let entries_iter = match glob::glob(&glob_pattern) {
+            Ok(iter) => iter,
+            Err(e) => return Ok(json!({"error": format!("invalid pattern: {e}")})),
+        };
+        for entry in entries_iter {
             if results.len() >= max_results { break; }
             if let Ok(p) = entry {
                 let size = p.metadata().map(|m| m.len()).unwrap_or(0);
@@ -4527,12 +4536,14 @@ impl AgentRuntime {
                 "-Command".to_owned(),
             ];
             let inc_filter = include
-                .map(|i| format!(" -Include '{i}'"))
+                .map(|i| format!(" -Include '{}'", i.replace('\'', "''")))
                 .unwrap_or_default();
             let case_flag = if ignore_case { "" } else { " -CaseSensitive" };
+            // Use TAB as separator to avoid conflicts with drive-letter colons in Windows paths.
             let ps_cmd = format!(
-                "Get-ChildItem -Path '{}' -Recurse{inc_filter} -File | Select-String -Pattern '{pattern}'{case_flag} | Select-Object -First {max_results} | ForEach-Object {{ \"$($_.Path):$($_.LineNumber):$($_.Line)\" }}",
-                root_path.display()
+                "Get-ChildItem -Path '{}' -Recurse{inc_filter} -File | Select-String -Pattern '{}'{case_flag} | Select-Object -First {max_results} | ForEach-Object {{ \"$($_.Path)\t$($_.LineNumber)\t$($_.Line)\" }}",
+                root_path.display(),
+                pattern.replace('\'', "''"), // escape single quotes for PowerShell
             );
             ps_args.push(ps_cmd);
             let mut cmd = tokio::process::Command::new("powershell");
@@ -4552,20 +4563,20 @@ impl AgentRuntime {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut matches: Vec<Value> = Vec::new();
+        // Windows uses TAB separator, Unix uses colon.
+        let sep = if cfg!(target_os = "windows") { '\t' } else { ':' };
         for line in stdout.lines() {
             if matches.len() >= max_results { break; }
-            // Parse output: file:line:content
-            if let Some((file_line, content)) = line.split_once(':').and_then(|(f, rest)| {
-                rest.split_once(':').map(|(l, c)| (format!("{f}:{l}"), c.to_string()))
-            }) {
-                let parts: Vec<&str> = file_line.rsplitn(2, ':').collect();
-                if parts.len() == 2 {
-                    matches.push(json!({
-                        "file": parts[1],
-                        "line": parts[0].parse::<u64>().unwrap_or(0),
-                        "content": content.chars().take(200).collect::<String>(),
-                    }));
-                }
+            // Parse: file<sep>line<sep>content
+            // On Unix with colons: handle drive-less paths (no ambiguity).
+            // On Windows with TABs: no ambiguity with path colons.
+            let parts: Vec<&str> = line.splitn(3, sep).collect();
+            if parts.len() == 3 {
+                matches.push(json!({
+                    "file": parts[0],
+                    "line": parts[1].parse::<u64>().unwrap_or(0),
+                    "content": parts[2].chars().take(200).collect::<String>(),
+                }));
             }
         }
 
@@ -5652,10 +5663,14 @@ impl AgentRuntime {
 
         // Write full system prompt (base + role) as SOUL.md in the new agent's workspace.
         let ws_path = crate::config::loader::base_dir().join(format!("workspace-{id}"));
-        let _ = tokio::fs::create_dir_all(&ws_path).await;
+        if let Err(e) = tokio::fs::create_dir_all(&ws_path).await {
+            warn!("agent_spawn: failed to create workspace for {id}: {e:#}");
+        }
         let soul_path = ws_path.join("SOUL.md");
         let full_prompt = self.build_subagent_system_prompt(&system);
-        let _ = tokio::fs::write(&soul_path, format!("# Agent: {id}\n\n{full_prompt}\n")).await;
+        if let Err(e) = tokio::fs::write(&soul_path, format!("# Agent: {id}\n\n{full_prompt}\n")).await {
+            warn!("agent_spawn: failed to write SOUL.md for {id}: {e:#}");
+        }
 
         // Persist to config file by default (user-created agents survive restart).
         // Pass persistent=false only for temporary task-delegation agents.
@@ -5750,9 +5765,13 @@ impl AgentRuntime {
         spawner.spawn_agent(entry)?;
 
         // Write full system prompt (base + role) as SOUL.md.
-        let _ = tokio::fs::create_dir_all(&ws_path).await;
+        if let Err(e) = tokio::fs::create_dir_all(&ws_path).await {
+            warn!("agent_task: failed to create workspace for {id}: {e:#}");
+        }
         let full_prompt = self.build_subagent_system_prompt(&system);
-        let _ = tokio::fs::write(ws_path.join("SOUL.md"), format!("# Agent: {id}\n\n{full_prompt}\n")).await;
+        if let Err(e) = tokio::fs::write(ws_path.join("SOUL.md"), format!("# Agent: {id}\n\n{full_prompt}\n")).await {
+            warn!("agent_task: failed to write SOUL.md for {id}: {e:#}");
+        }
 
         // Send message and wait for reply.
         let registry = self
