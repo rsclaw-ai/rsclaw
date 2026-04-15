@@ -2825,7 +2825,9 @@ impl AgentRuntime {
         // Simple tasks: 10 iterations. Browser/complex tasks: 50.
         // Adjusted upward when web_browser or opencode tools are used.
         const BASE_ITERATIONS: usize = 10;
-        const COMPLEX_ITERATIONS: usize = 50;
+        let configured_complex: usize = self.config.agents.defaults.max_iterations
+            .map(|v| v as usize)
+            .unwrap_or(100);
         let mut max_iterations = BASE_ITERATIONS;
         let mut iteration = 0usize;
 
@@ -3393,10 +3395,16 @@ impl AgentRuntime {
             // Send intermediate text to user immediately (progress feedback).
             // Model often says "好的，我来帮你搜索" before calling tools — send it now
             // instead of waiting for the entire turn to complete.
-            if !text_buf.is_empty() && !tool_calls.is_empty() {
+            let intermediate_enabled = self.config.agents.defaults.intermediate_output.unwrap_or(true);
+            if intermediate_enabled && !text_buf.is_empty() && !tool_calls.is_empty() {
                 if let Some(ref ntx) = self.notification_tx {
+                    let notif_target = if !ctx.chat_id.is_empty() {
+                        ctx.chat_id.clone()
+                    } else {
+                        ctx.peer_id.clone()
+                    };
                     let _ = ntx.send(crate::channel::OutboundMessage {
-                        target_id: String::new(),
+                        target_id: notif_target,
                         is_group: false,
                         text: text_buf.clone(),
                         reply_to: None,
@@ -3528,7 +3536,7 @@ impl AgentRuntime {
 
                 // Upgrade iteration limit for complex tools
                 if matches!(tool_name.as_str(), "web_browser" | "opencode" | "claudecode") {
-                    max_iterations = max_iterations.max(COMPLEX_ITERATIONS);
+                    max_iterations = max_iterations.max(configured_complex);
                 }
 
                 // Update live status: tool call starting.
@@ -6255,17 +6263,22 @@ impl AgentRuntime {
             .as_str()
             .ok_or_else(|| anyhow!("web_download: `path` required"))?;
 
-        // Resolve path: absolute or relative to workspace.
-        let pb = std::path::PathBuf::from(path_str);
-        let full = if pb.is_absolute() {
-            pb
-        } else {
-            let workspace = self.handle.config.workspace.as_deref()
-                .or(self.config.agents.defaults.workspace.as_deref())
-                .map(expand_tilde)
-                .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
-            workspace.join(path_str)
-        };
+        // Resolve path: always under workspace/downloads.
+        // Strip common prefixes that models hallucinate (~/Downloads/, ~/,  /workspace/).
+        let mut cleaned = path_str
+            .trim_start_matches("~/Downloads/")
+            .trim_start_matches("~/downloads/")
+            .trim_start_matches("~/")
+            .trim_start_matches("/workspace/")
+            .trim_start_matches("/");
+        if cleaned.is_empty() {
+            cleaned = "download";
+        }
+        let workspace = self.handle.config.workspace.as_deref()
+            .or(self.config.agents.defaults.workspace.as_deref())
+            .map(expand_tilde)
+            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+        let full = workspace.join("downloads").join(cleaned);
 
         // Ensure parent directory exists.
         if let Some(parent) = full.parent() {
@@ -6324,6 +6337,12 @@ impl AgentRuntime {
         if !cookie_header.is_empty() {
             req = req.header("Cookie", &cookie_header);
         }
+        // Set Referer from URL origin — many CDNs (douyin, etc.) require it.
+        if let Ok(parsed) = reqwest::Url::parse(url) {
+            if let Some(origin) = parsed.host_str() {
+                req = req.header("Referer", format!("{}://{}/", parsed.scheme(), origin));
+            }
+        }
         if existing_size > 0 {
             req = req.header("Range", format!("bytes={existing_size}-"));
         }
@@ -6333,6 +6352,15 @@ impl AgentRuntime {
 
         if !resp.status().is_success() && resp.status().as_u16() != 206 {
             bail!("web_download: HTTP {} for {url}", resp.status());
+        }
+
+        // Warn if response is HTML (likely a redirect/login page, not the actual file).
+        let content_type = resp.headers().get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase();
+        if content_type.contains("text/html") {
+            bail!("web_download: server returned HTML instead of file. The URL may require different cookies or is a redirect page. Content-Type: {content_type}");
         }
 
         let resumed = resp.status().as_u16() == 206;
@@ -6434,6 +6462,94 @@ impl AgentRuntime {
                 let bs = crate::browser::BrowserSession::start(&chrome_path, headed, profile.as_deref()).await?;
                 *guard = Some(bs);
             }
+        }
+
+        // Special action: capture_video — open page, inject interceptor, wait, collect video URLs.
+        if action == "capture_video" {
+            let url = args["url"].as_str().unwrap_or("");
+            if url.is_empty() {
+                bail!("capture_video: `url` required");
+            }
+            let wait_ms = args["wait_ms"].as_u64().unwrap_or(8000);
+
+            let mut browser = self.browser.lock().await;
+            let session = browser.as_mut().unwrap();
+
+            // 1. Inject interceptor BEFORE navigating (catches all requests from start).
+            let inject_js = r#"(function(){
+                window.__vUrls=[];
+                var xo=XMLHttpRequest.prototype.open;
+                XMLHttpRequest.prototype.open=function(m,u){
+                    if(u&&typeof u==='string'&&/video|mp4|m3u8|m4s|flv|playaddr|play_addr|pcdn|bilivideo/.test(u))
+                        window.__vUrls.push(u);
+                    return xo.apply(this,arguments);
+                };
+                var ff=window.fetch;
+                window.fetch=function(u){
+                    var s=typeof u==='string'?u:(u&&u.url||'');
+                    if(/video|mp4|m3u8|m4s|flv|playaddr|play_addr|pcdn|bilivideo/.test(s))
+                        window.__vUrls.push(s);
+                    return ff.apply(this,arguments);
+                };
+                return 'interceptor_ready';
+            })()"#;
+
+            // 2. Navigate to the video page.
+            session.execute("open", &json!({"url": url})).await?;
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+
+            // 3. Inject interceptor (page scripts may have already loaded, so also check performance).
+            let _ = session.execute("evaluate", &json!({"js": inject_js})).await;
+
+            // 4. Wait for video to load/play.
+            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+
+            // 5. Collect captured URLs + performance entries + video element src.
+            let collect_js = r#"(function(){
+                var urls = (window.__vUrls||[]).slice();
+                try {
+                    performance.getEntriesByType('resource').forEach(function(e){
+                        if(e.name && /video|mp4|m3u8|m4s|flv|playaddr|play_addr|pcdn|bilivideo/.test(e.name)
+                           && e.name.startsWith('http')
+                           && !/poster|cover|thumbnail|preview/.test(e.name))
+                            urls.push(e.name);
+                    });
+                } catch(e){}
+                document.querySelectorAll('video,source').forEach(function(el){
+                    var s = el.src || el.currentSrc || '';
+                    if(s && s.startsWith('http')) urls.push(s);
+                });
+                return JSON.stringify([...new Set(urls)]);
+            })()"#;
+
+            let result = session.execute("evaluate", &json!({"js": collect_js})).await?;
+            let urls_str = result["result"].as_str()
+                .or_else(|| result.as_str())
+                .unwrap_or("[]");
+
+            let urls: Vec<String> = serde_json::from_str(urls_str).unwrap_or_default();
+
+            // 6. If empty, try reload + re-collect.
+            if urls.is_empty() {
+                let _ = session.execute("evaluate", &json!({"js": "window.__vUrls=[];location.reload()"})).await;
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                let _ = session.execute("evaluate", &json!({"js": inject_js})).await;
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                let result2 = session.execute("evaluate", &json!({"js": collect_js})).await?;
+                let urls_str2 = result2["result"].as_str()
+                    .or_else(|| result2.as_str())
+                    .unwrap_or("[]");
+                let urls2: Vec<String> = serde_json::from_str(urls_str2).unwrap_or_default();
+                return Ok(json!({
+                    "video_urls": urls2,
+                    "hint": if urls2.is_empty() { "No video URLs found. The page may require login or the video is DRM-protected." } else { "Pick the URL containing mp4/playaddr for download." }
+                }));
+            }
+
+            return Ok(json!({
+                "video_urls": urls,
+                "hint": "Pick the URL containing mp4/playaddr for download. Use web_download with use_browser_cookies=true."
+            }));
         }
 
         // Now lock again for execute -- guard is dropped, avoiding borrow issues.
@@ -9256,9 +9372,10 @@ fn build_system_prompt(
             "## Tool Usage Guidelines\n\
              - When user asks to go to a specific site (e.g. 'go to douyin', 'open taobao'), use `web_browser` directly. Do NOT search first.\n\
              - For general questions or info lookup, use `web_search` first.\n\
+             - To download files/images/videos: use `web_download` (supports resume, browser cookies). Do NOT use exec curl/wget.\n\
+             - `web_download` path is relative to workspace/downloads/. Just pass the filename like `video.mp4` or `subdir/file.pdf`. Do NOT include `~/`, `~/Downloads/`, or absolute paths.\n\
+             - After downloading, use `send_file` to send the file to the user.\n\
              - For documents (xlsx/docx/pdf/pptx): use the `doc` tool, not exec.\n\
-             - For code generation: write complete files, one module at a time.\n\
-             - Use edit tool for small changes to existing files.\n\
              - For cron jobs: use the `cron` tool (action=list/add/remove).\n\
              - If a tool call fails, do NOT retry with the same arguments. Try a different approach or inform the user.\n\
              - Never fabricate URLs or file paths."

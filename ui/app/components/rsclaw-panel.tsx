@@ -3829,6 +3829,23 @@ function TauriConfigPageInner() {
                 <option value="0.8">{zh ? "强 (0.8)" : "Strong (0.8)"}</option>
               </select>
             </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "最大迭代次数" : "Max Iterations"} <span style={{ color: V.t3, fontWeight: 400 }}>(tool calls)</span></div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.maxIterations</div>
+              </div>
+              <input style={{ ...fInput, minWidth: 100 }} type="number" value={getVal("agents.defaults.maxIterations", 100)} onChange={(e) => updateConfig("agents.defaults.maxIterations", parseInt(e.target.value) || 100)} />
+            </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "中间输出" : "Intermediate Output"}</div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.intermediateOutput</div>
+              </div>
+              <select style={{ ...fSelect, minWidth: 100 }} value={getVal("agents.defaults.intermediateOutput", true) ? "true" : "false"} onChange={(e) => updateConfig("agents.defaults.intermediateOutput", e.target.value === "true")}>
+                <option value="true">{zh ? "开启" : "On"}</option>
+                <option value="false">{zh ? "关闭" : "Off"}</option>
+              </select>
+            </div>
             <div style={{ ...fieldRow, borderBottom: "none" }}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "深度思考" : "Deep Thinking"}</div>

@@ -182,6 +182,24 @@ impl ChromeProcess {
                     .join(profile_name)
             };
             std::fs::create_dir_all(&profile_dir).ok();
+            // Kill stale Chrome processes using this profile (e.g. after gateway restart).
+            let profile_str = profile_dir.to_string_lossy().to_string();
+            #[cfg(unix)]
+            {
+                let _ = std::process::Command::new("pkill")
+                    .args(["-9", "-f", &format!("user-data-dir={}", profile_str)])
+                    .output();
+                // Brief pause for processes to exit.
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            // Remove stale lock files from previous Chrome instances.
+            for lock_file in &["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+                let p = profile_dir.join(lock_file);
+                if p.exists() {
+                    std::fs::remove_file(&p).ok();
+                    info!(file = %p.display(), "removed stale Chrome lock file");
+                }
+            }
             (profile_dir, None)
         } else {
             let tmp = tempfile::tempdir()

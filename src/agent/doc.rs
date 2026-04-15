@@ -12,8 +12,56 @@
 
 use std::path::Path;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
+
+// ---------------------------------------------------------------------------
+// Font discovery for PDF generation
+// ---------------------------------------------------------------------------
+
+/// Try common font directories and naming patterns to find a usable font family.
+fn find_font_family() -> Option<genpdf::fonts::FontFamily<genpdf::fonts::FontData>> {
+    // Directories and font names to try, in order.
+    let candidates: &[(&str, &str)] = &[
+        // Linux
+        ("/usr/share/fonts/truetype/liberation", "LiberationSans"),
+        ("/usr/share/fonts/truetype/dejavu", "DejaVuSans"),
+        // macOS Supplemental (TTF, genpdf-compatible naming with space→hyphen)
+        // genpdf looks for {Name}-Regular.ttf so we need to create symlinks or
+        // load manually. Instead, try directories where fonts follow the pattern.
+        ("/usr/share/fonts", "LiberationSans"),
+    ];
+    for (dir, name) in candidates {
+        if let Ok(f) = genpdf::fonts::from_files(dir, name, None) {
+            return Some(f);
+        }
+    }
+    // macOS: load individual TTF files directly.
+    let mac_fonts: &[&str] = &[
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Courier New.ttf",
+        "/Library/Fonts/Arial Unicode.ttf",
+        "/System/Library/Fonts/Geneva.ttf",
+        "/System/Library/Fonts/Monaco.ttf",
+    ];
+    for path in mac_fonts {
+        if let Ok(data) = std::fs::read(path) {
+            if let Ok(fd) = genpdf::fonts::FontData::new(data, None) {
+                return Some(genpdf::fonts::FontFamily {
+                    regular: fd.clone(),
+                    bold: fd.clone(),
+                    italic: fd.clone(),
+                    bold_italic: fd,
+                });
+            }
+        }
+    }
+    // Windows
+    if let Ok(f) = genpdf::fonts::from_files("C:\\Windows\\Fonts", "arial", None) {
+        return Some(f);
+    }
+    None
+}
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -197,21 +245,8 @@ fn create_pdf(args: &Value, path: &Path) -> Result<Value> {
     let title = args["title"].as_str().unwrap_or("");
     let content = args["content"].as_str().unwrap_or("");
 
-    // Use genpdf with built-in Courier font (always available, no file needed).
-    let font =
-        genpdf::fonts::from_files("", "Courier", None).unwrap_or_else(|_| {
-            // Fallback: use the default font family.
-            genpdf::fonts::from_files("/usr/share/fonts/truetype/liberation", "LiberationSans", None)
-                .unwrap_or_else(|_| {
-                    // macOS fallback
-                    genpdf::fonts::from_files("/System/Library/Fonts", "Helvetica", None)
-                        .unwrap_or_else(|_| {
-                            // Last resort: Courier from macOS
-                            genpdf::fonts::from_files("/System/Library/Fonts", "Courier", None)
-                                .expect("no fonts available")
-                        })
-                })
-        });
+    // Try platform font directories. genpdf expects {Name}-Regular.ttf naming.
+    let font = find_font_family().context("no usable fonts found for PDF generation")?;
 
     let mut doc = genpdf::Document::new(font);
     doc.set_title(title);

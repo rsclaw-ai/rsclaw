@@ -1285,15 +1285,23 @@ fn is_fast_preparse(text: &str) -> bool {
 // Processing indicator — send with 3s timeout to avoid blocking
 // ---------------------------------------------------------------------------
 
-/// Returns the configured processing timeout duration (default 60s).
+/// Returns the configured processing timeout duration (default 120s).
 /// When set to 0, returns a very large duration (effectively disabled).
+/// When intermediateOutput is enabled, also disabled (intermediate text replaces this).
 fn processing_timeout(config: &RuntimeConfig) -> Duration {
+    let intermediate = config.raw.agents.as_ref()
+        .and_then(|a| a.defaults.as_ref())
+        .and_then(|d| d.intermediate_output)
+        .unwrap_or(true);
+    if intermediate {
+        return Duration::from_secs(86400);
+    }
     let secs = config
         .raw
         .gateway
         .as_ref()
         .and_then(|g| g.processing_timeout)
-        .unwrap_or(60);
+        .unwrap_or(120);
     if secs == 0 {
         Duration::from_secs(86400)
     } else {
@@ -5294,6 +5302,7 @@ fn start_feishu_if_configured(
                                         images.extend(extra_images);
                                         file_attachments.extend(extra_files);
                                     }
+                                    info!(user = %w_uid, text_start = %text.chars().take(20).collect::<String>(), "feishu: worker dispatching");
                                     let process_result = tokio::time::timeout(
                                         Duration::from_secs(172800), // 48 hours, matching OpenClaw default
                                         async {
@@ -5327,21 +5336,23 @@ fn start_feishu_if_configured(
                                         dm_scope,
                                     });
                                     let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+                                    let fs_target = if is_group { chat_id.clone() } else { chat_id.clone() };
                                     let msg = AgentMessage {
                                         session_key,
                                         text,
                                         channel: "feishu".to_string(),
                                         peer_id: sender_id.clone(),
-                                        chat_id: String::new(),
+                                        chat_id: fs_target.clone(),
                                         reply_tx,
                                         extra_tools: vec![],
                                         images,
                                         files: file_attachments,
                                     };
                                     if handle.tx.send(msg).await.is_err() {
+                                        error!(user = %sender_id, "feishu: agent channel closed, message dropped");
                                         return;
                                     }
-                                    let fs_target = if is_group { chat_id.clone() } else { chat_id.clone() };
+                                    info!(user = %sender_id, "feishu: message sent to agent, waiting for reply");
                                     let reply = tokio::select! {
                                         result = &mut reply_rx => result,
                                         _ = tokio::time::sleep(processing_timeout(&w_cfg)) => {
@@ -5468,12 +5479,13 @@ fn start_feishu_if_configured(
                                 return;
                             }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                            let fs_target2 = if is_group { chat_id.clone() } else { chat_id.clone() };
                             let msg = AgentMessage {
                                 session_key,
                                 text,
                                 channel: "feishu".to_string(),
                                 peer_id: sender_id,
-                                chat_id: String::new(),
+                                chat_id: fs_target2,
                                 reply_tx,
                                 extra_tools: vec![],
                                 images,
