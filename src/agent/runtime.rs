@@ -4116,7 +4116,7 @@ impl AgentRuntime {
 
                 debug!(tool = %tool_name, "dispatching tool call");
 
-                // Upgrade iteration limit when complex or multi-step tools are used.
+// Upgrade iteration limit when complex or multi-step tools are used.
                 if matches!(tool_name.as_str(),
                     "web_browser" | "opencode" | "claudecode" | "agent"
                     | "search_content" | "search_file" | "execute_command" | "exec"
