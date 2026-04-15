@@ -3376,8 +3376,13 @@ impl AgentRuntime {
                         "streaming tool call: accumulated args (start and end)"
                     );
 
-                    // First, try direct parse (preserves if valid)
-                    let parsed = serde_json::from_str::<serde_json::Value>(&s);
+                    // First, try direct parse (preserves if valid).
+                    // If that fails, fix unescaped backslashes (Windows paths)
+                    // before falling through to repair.
+                    let parsed = serde_json::from_str::<serde_json::Value>(&s).or_else(|_| {
+                        let fixed = crate::agent::tool_call_repair::fix_json_backslashes_public(&s);
+                        serde_json::from_str::<serde_json::Value>(&fixed)
+                    });
                     match &parsed {
                         Ok(v) if v.is_object() => {
                             tracing::info!(
@@ -9057,6 +9062,43 @@ fn detect_chrome() -> Option<String> {
 
     #[cfg(target_os = "windows")]
     {
+        // Try Windows registry first (most reliable).
+        for key_path in &[
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+            r"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+        ] {
+            if let Ok(output) = std::process::Command::new("reg")
+                .args(["query", &format!(r"HKLM\{key_path}"), "/ve"])
+                .output()
+            {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // Parse "REG_SZ    C:\...\chrome.exe" from output
+                if let Some(line) = stdout.lines().find(|l| l.contains("REG_SZ")) {
+                    if let Some(path_str) = line.split("REG_SZ").nth(1) {
+                        let path_str = path_str.trim();
+                        if std::path::Path::new(path_str).exists() {
+                            return Some(path_str.to_owned());
+                        }
+                    }
+                }
+            }
+            // Also try HKCU (per-user installs)
+            if let Ok(output) = std::process::Command::new("reg")
+                .args(["query", &format!(r"HKCU\{key_path}"), "/ve"])
+                .output()
+            {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Some(line) = stdout.lines().find(|l| l.contains("REG_SZ")) {
+                    if let Some(path_str) = line.split("REG_SZ").nth(1) {
+                        let path_str = path_str.trim();
+                        if std::path::Path::new(path_str).exists() {
+                            return Some(path_str.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: well-known paths.
         let candidates = [
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",

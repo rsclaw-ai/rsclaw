@@ -11,6 +11,80 @@
 use crate::provider::{ContentPart, Message, MessageContent, Role};
 use serde_json::Value;
 
+/// Fix unescaped backslashes inside JSON string values.
+///
+/// In valid JSON, `\` must be followed by one of: `"`, `\`, `/`, `b`, `f`, `n`, `r`, `t`, `u`.
+/// Models often emit Windows paths like `C:\Users\user_I9hgADO70\AppData\...` with single
+/// backslashes, which causes serde_json to reject the input. This function doubles any `\`
+/// inside string values that is NOT followed by a valid JSON escape character.
+/// Public wrapper for use in runtime streaming finalization.
+pub fn fix_json_backslashes_public(raw: &str) -> String {
+    fix_json_backslashes(raw)
+}
+
+fn fix_json_backslashes(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 32);
+    let mut in_string = false;
+    let chars: Vec<char> = raw.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    while i < len {
+        let c = chars[i];
+        if !in_string {
+            out.push(c);
+            if c == '"' {
+                in_string = true;
+            }
+            i += 1;
+            continue;
+        }
+        // Inside a JSON string value.
+        if c == '"' {
+            out.push(c);
+            in_string = false;
+            i += 1;
+            continue;
+        }
+        if c == '\\' {
+            let next = chars.get(i + 1).copied().unwrap_or('\0');
+            // Only preserve escapes that are unambiguously intentional:
+            //   \"  \\  — clearly not Windows paths
+            //   \uXXXX — only if followed by exactly 4 hex digits
+            // Everything else (\n \t \b \f \r \/ \A \U \L etc.) gets doubled,
+            // because in the context of a failed JSON parse, these are most
+            // likely Windows path separators, not control characters.
+            if next == '"' || next == '\\' {
+                out.push(c);
+                out.push(next);
+                i += 2;
+            } else if next == 'u'
+                && i + 5 < len
+                && chars[i + 2].is_ascii_hexdigit()
+                && chars[i + 3].is_ascii_hexdigit()
+                && chars[i + 4].is_ascii_hexdigit()
+                && chars[i + 5].is_ascii_hexdigit()
+            {
+                // Valid \uXXXX unicode escape — keep all 6 chars.
+                for j in 0..6 {
+                    out.push(chars[i + j]);
+                }
+                i += 6;
+            } else {
+                // Not a clearly intentional escape — double the backslash.
+                // Covers: \U \A \L \G \C \user (invalid \uXXXX)
+                //         \n \t \b \f \r (ambiguous in path context)
+                out.push('\\');
+                out.push('\\');
+                i += 1;
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 /// Result of extracting usable tool call arguments from potentially malformed input.
 #[derive(Debug)]
 pub struct ToolCallRepair {
@@ -181,10 +255,12 @@ pub fn try_extract_usable_args(raw: &str) -> Option<ToolCallRepair> {
     }
 
     // NEW: If JSON parsing failed but we found a valid JSON boundary, try to fix common issues
-    // This handles cases where model sends unescaped newlines in string values
+    // This handles unescaped newlines and Windows paths with single backslashes
     if !json_part.is_empty() {
-        // Try escaping common issues and re-parse
-        let fixed = json_part
+        // Fix unescaped backslashes inside JSON string values.
+        // In valid JSON, `\` must be followed by one of: " \ / b f n r t u
+        // Models often emit Windows paths like C:\Users\... with single backslashes.
+        let fixed = fix_json_backslashes(json_part)
             .replace('\n', "\\n")
             .replace('\r', "\\r")
             .replace('\t', "\\t");
