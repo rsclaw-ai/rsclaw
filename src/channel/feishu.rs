@@ -1437,6 +1437,13 @@ impl Channel for FeishuChannel {
                     if duration_ms > 0 {
                         media_json["duration"] = serde_json::json!(duration_ms);
                     }
+                    // Try to extract cover image via ffmpeg and upload as image_key.
+                    if mime.starts_with("video/") {
+                        let api = self.api_base().to_owned();
+                        if let Some(cover_key) = extract_and_upload_cover(path_or_url, &self.client, &api, &token).await {
+                            media_json["image_key"] = serde_json::json!(cover_key);
+                        }
+                    }
                     ("media", media_json.to_string())
                 } else {
                     ("file", serde_json::json!({"file_key": file_key}).to_string())
@@ -1735,6 +1742,53 @@ impl NotificationSink for FeishuNotifier {
 
         Box::pin(async move { self.send_text(&text).await })
     }
+}
+
+/// Extract a cover frame from video via ffmpeg, upload to Feishu images API, return image_key.
+/// Returns None if ffmpeg is not available or extraction fails.
+async fn extract_and_upload_cover(
+    video_path: &str,
+    client: &reqwest::Client,
+    api_base: &str,
+    token: &str,
+) -> Option<String> {
+    let cover_path = format!("{}.cover.jpg", video_path);
+    // Run ffmpeg to extract first frame at 1s.
+    let output = std::process::Command::new("ffmpeg")
+        .args(["-y", "-i", video_path, "-ss", "00:00:01", "-frames:v", "1", "-q:v", "2", &cover_path])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        // Retry at 0s (video might be shorter than 1s).
+        let _ = std::process::Command::new("ffmpeg")
+            .args(["-y", "-i", video_path, "-ss", "00:00:00", "-frames:v", "1", "-q:v", "2", &cover_path])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+    }
+    let cover_bytes = std::fs::read(&cover_path).ok()?;
+    // Clean up temp file.
+    let _ = std::fs::remove_file(&cover_path);
+    if cover_bytes.is_empty() { return None; }
+
+    // Upload to Feishu images API.
+    let part = reqwest::multipart::Part::bytes(cover_bytes)
+        .file_name("cover.jpg")
+        .mime_str("image/jpeg").ok()?;
+    let form = reqwest::multipart::Form::new()
+        .text("image_type", "message")
+        .part("image", part);
+    let upload_url = format!("{}/im/v1/images", api_base);
+    let resp = client.post(&upload_url)
+        .bearer_auth(token)
+        .multipart(form)
+        .send().await.ok()?;
+    let body: serde_json::Value = resp.json().await.ok()?;
+    let key = body.pointer("/data/image_key")?.as_str()?;
+    tracing::info!(image_key = %key, "feishu: video cover uploaded");
+    Some(key.to_owned())
 }
 
 /// Extract duration in milliseconds from an MP4 file by parsing the moov/mvhd atom.
