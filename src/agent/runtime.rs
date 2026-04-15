@@ -9937,7 +9937,7 @@ fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "computer_use".to_owned(),
-        description: "Control the computer desktop. Screenshots auto-resize for HiDPI and return scale factor for coordinate mapping. Works on macOS, Linux, and Windows (zero dependencies).".to_owned(),
+        description: "Control the computer desktop. ONLY use when the user EXPLICITLY asks to take a screenshot, click, type, or interact with the desktop. Do NOT call this tool just because the message mentions words like 'screenshot' or 'screen' in other contexts. Screenshots auto-resize for HiDPI and return scale factor for coordinate mapping.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
