@@ -425,17 +425,13 @@ fn try_service_stop() -> bool {
             .map(|h| h.join("Library/LaunchAgents/ai.rsclaw.gateway.plist"));
         if let Some(ref path) = plist {
             if path.exists() {
+                // Use unload (without -w) to stop without disabling auto-start.
                 let status = std::process::Command::new("launchctl")
-                    .args(["unload", "-w"])
+                    .args(["unload"])
                     .arg(path)
                     .status();
                 if let Ok(s) = status {
                     if s.success() {
-                        // Reload so it can be started again later.
-                        let _ = std::process::Command::new("launchctl")
-                            .args(["load", "-w"])
-                            .arg(path)
-                            .status();
                         return true;
                     }
                 }
@@ -447,25 +443,25 @@ fn try_service_stop() -> bool {
     {
         // Check if systemd service exists and is active.
         let is_active = std::process::Command::new("systemctl")
-            .args(["--user", "is-active", "rsclaw"])
+            .args(["--user", "is-active", "rsclaw-gateway"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
         if is_active {
             let status = std::process::Command::new("systemctl")
-                .args(["--user", "stop", "rsclaw"])
+                .args(["--user", "stop", "rsclaw-gateway"])
                 .status();
             return status.map(|s| s.success()).unwrap_or(false);
         }
         // Try system-level service too.
         let is_active = std::process::Command::new("systemctl")
-            .args(["is-active", "rsclaw"])
+            .args(["is-active", "rsclaw-gateway"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
         if is_active {
             let status = std::process::Command::new("systemctl")
-                .args(["stop", "rsclaw"])
+                .args(["stop", "rsclaw-gateway"])
                 .status();
             return status.map(|s| s.success()).unwrap_or(false);
         }

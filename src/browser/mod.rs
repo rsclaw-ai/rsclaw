@@ -2012,7 +2012,7 @@ const SNAPSHOT_JS: &str = r#"(function(){
     var isUploadZone = (tag === 'input' && el.type === 'file')
       || role === 'dropzone'
       || cls.indexOf('upload') >= 0 || cls.indexOf('dropzone') >= 0 || cls.indexOf('drop-area') >= 0
-      || el.getAttribute('accept');
+      || (tag === 'input' && el.getAttribute('accept'));
     // Detect rich text editors (Draft.js, Quill, Slate, ProseMirror, TinyMCE, Tiptap).
     var isRichEditor = isEditable && (
       cls.indexOf('ql-editor') >= 0 || cls.indexOf('DraftEditor') >= 0

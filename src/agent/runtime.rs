@@ -4590,10 +4590,11 @@ impl AgentRuntime {
                 .unwrap_or_default();
             let case_flag = if ignore_case { "" } else { " -CaseSensitive" };
             // Use TAB as separator to avoid conflicts with drive-letter colons in Windows paths.
+            // Escape single quotes in all interpolated values to prevent PowerShell injection.
+            let safe_path = root_path.display().to_string().replace('\'', "''");
+            let safe_pattern = pattern.replace('\'', "''");
             let ps_cmd = format!(
-                "Get-ChildItem -Path '{}' -Recurse{inc_filter} -File | Select-String -Pattern '{}'{case_flag} | Select-Object -First {max_results} | ForEach-Object {{ \"$($_.Path)\t$($_.LineNumber)\t$($_.Line)\" }}",
-                root_path.display(),
-                pattern.replace('\'', "''"), // escape single quotes for PowerShell
+                "Get-ChildItem -Path '{safe_path}' -Recurse{inc_filter} -File | Select-String -Pattern '{safe_pattern}'{case_flag} | Select-Object -First {max_results} | ForEach-Object {{ \"$($_.Path)\t$($_.LineNumber)\t$($_.Line)\" }}"
             );
             ps_args.push(ps_cmd);
             let mut cmd = tokio::process::Command::new("powershell");
@@ -10261,7 +10262,7 @@ fn build_tool_list(
         name: "execute_command".to_owned(),
         description: if cfg!(target_os = "windows") {
             "Run a shell command (PowerShell) on Windows.\n\
-             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `tool_install`. Only use exec for commands that have no dedicated tool.\n\
+             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`. Only use exec for commands that have no dedicated tool.\n\
              Use exec for: git operations, running scripts (node/python/cargo), system info (systeminfo, ipconfig, Get-Process), package management (npm/pip), process management (Start-Process, Stop-Process, taskkill).\n\
              PowerShell tips:\n\
              - Pipes: Get-Process | Sort-Object CPU -Descending | Select-Object -First 10\n\
@@ -10274,14 +10275,14 @@ fn build_tool_list(
                 .to_owned()
         } else if cfg!(target_os = "macos") {
             "Run a shell command (bash/zsh) on macOS.\n\
-             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `tool_install`. Only use exec for commands that have no dedicated tool.\n\
+             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`. Only use exec for commands that have no dedicated tool.\n\
              Use exec for: git operations, running scripts (node/python/cargo), system info (uname, df, top), package management (brew/npm/pip), process management (ps, kill).\n\
              Tips: Use `date +%s` for Unix timestamps (never calculate manually). Use `| head -n 20` to limit output.\n\
              If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user."
                 .to_owned()
         } else {
             "Run a shell command (bash/sh) on Linux.\n\
-             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `tool_install`. Only use exec for commands that have no dedicated tool.\n\
+             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`. Only use exec for commands that have no dedicated tool.\n\
              Use exec for: git operations, running scripts (node/python/cargo), system info (uname, df, top), package management (apt/npm/pip), process management (ps, kill).\n\
              Tips: Use `date +%s` for Unix timestamps (never calculate manually). Use `| head -n 20` to limit output.\n\
              If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user."
