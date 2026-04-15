@@ -10239,42 +10239,61 @@ fn build_tool_list(
     // Web tools.
     tools.push(ToolDef {
         name: "web_search".to_owned(),
-        description: "Search the web using a configurable search engine. Returns titles, URLs, and snippets.".to_owned(),
+        description: "Search the web for real-time information.\n\
+            When to use:\n\
+            - Questions beyond your knowledge cutoff or training data\n\
+            - Current events, recent updates, time-sensitive information\n\
+            - Latest documentation, API references, version-specific features\n\
+            - When unsure about facts — search BEFORE saying 'I don't know'\n\
+            Tips:\n\
+            - Be specific: include version numbers, dates, or exact terms\n\
+            - Use the current year (not past years) for latest docs\n\
+            - For Chinese content, search in Chinese for better results".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "query":    {"type": "string", "description": "Search query"},
-                "provider": {"type": "string", "description": "Search provider: duckduckgo, google, bing, brave. Leave empty to use the configured default."},
-                "limit":    {"type": "integer", "description": "Max results to return (default 5)"}
+                "query":    {"type": "string", "description": "Search query — be specific, include keywords and dates"},
+                "provider": {"type": "string", "description": "Search provider: duckduckgo, google, bing, brave. Leave empty for default."},
+                "limit":    {"type": "integer", "description": "Max results (default 5)"}
             },
             "required": ["query"]
         }),
     });
     tools.push(ToolDef {
         name: "web_fetch".to_owned(),
-        description: "Fetch a web page, convert HTML to Markdown, and extract content. \
-            Automatically falls back to browser rendering for JS-heavy pages. \
-            Results are cached for 15 minutes. If summaryModel is configured \
-            and prompt is provided, content is summarized by a secondary model.".to_owned(),
+        description: "Fetch a web page and convert to readable text/markdown.\n\
+            Use this to read documentation, articles, API docs, or any web content.\n\
+            - URL must be fully-formed (https://...)\n\
+            - HTTP auto-upgraded to HTTPS\n\
+            - Falls back to browser rendering for JS-heavy pages\n\
+            - Results cached 15 minutes\n\
+            - For large pages, use 'prompt' to extract specific information\n\
+            - This is read-only — does not modify anything\n\
+            - If content is behind login, use web_browser instead".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "url":    {"type": "string", "description": "URL to fetch (http auto-upgraded to https)"},
-                "prompt": {"type": "string", "description": "What to extract from the page (requires summaryModel config)"}
+                "url":    {"type": "string", "description": "Full URL to fetch (e.g. https://docs.example.com/api)"},
+                "prompt": {"type": "string", "description": "What to extract from the page (e.g. 'list all API endpoints')"}
             },
             "required": ["url"]
         }),
     });
     tools.push(ToolDef {
         name: "web_download".to_owned(),
-        description: "Download a file from URL to local path. Supports resume and browser cookies for authenticated downloads.".to_owned(),
+        description: "Download a file (image/video/document/archive) from URL to local path.\n\
+            - Supports resume for large files\n\
+            - Use use_browser_cookies=true for authenticated downloads (e.g. after logging in via web_browser)\n\
+            - Path is relative to workspace/downloads/ — just use filename like 'photo.jpg'\n\
+            - Do NOT use execute_command with curl/wget — always use this tool\n\
+            - After downloading, use send_file to deliver the file to the user".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "url":  {"type": "string", "description": "URL to download"},
-                "path": {"type": "string", "description": "Destination path (absolute or relative to workspace)"},
+                "url":  {"type": "string", "description": "Full URL to download"},
+                "path": {"type": "string", "description": "Destination filename (e.g. 'video.mp4', 'report.pdf'). Relative to workspace/downloads/."},
                 "cookies": {"type": "string", "description": "Cookie header string, e.g. 'session=abc; token=xyz'"},
-                "use_browser_cookies": {"type": "boolean", "description": "Auto-extract cookies from active browser session for this URL's domain"}
+                "use_browser_cookies": {"type": "boolean", "description": "Auto-extract cookies from active browser session for this URL's domain (use after web_browser login)"}
             },
             "required": ["url", "path"]
         }),
