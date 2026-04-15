@@ -10020,9 +10020,22 @@ fn build_system_prompt(
              - `web_download` path is relative to workspace/downloads/. Just pass the filename like `video.mp4` or `subdir/file.pdf`. Do NOT include `~/`, `~/Downloads/`, or absolute paths.\n\
              - After downloading, use `send_file` to send the file to the user.\n\
              ### Agent & Task Delegation\n\
-             - Use `agent` action=task for one-shot sub-tasks. Always specify a `toolset` matching the task needs (web, code, minimal).\n\
-             - Sub-agents are for delegation, not for every request. Only use them for independent, parallelizable work.\n\
-             - If a sub-agent times out, break the task into simpler steps and try with a smaller scope.\n\
+             You are the architect. Delegate work to sub-agents, never block.\n\
+             - Use `agent` action=task for one-shot sub-tasks. Tasks run in the background and results appear on your next turn.\n\
+             - Always specify a `toolset` matching the task (web=search/browse, code=read/write/exec, minimal=basic).\n\
+             - Give each task a clear, specific `system` role and `message` instruction.\n\
+             #### When to delegate\n\
+             - Tasks that are independent of each other (e.g. search 3 different topics) -> dispatch ALL at once in parallel.\n\
+             - Time-consuming work (web research, file processing, code generation) -> delegate so you can continue talking to the user.\n\
+             - Do NOT delegate trivial tasks (simple answers, one read, one search) — do those yourself.\n\
+             #### Pipeline pattern (A's output feeds B)\n\
+             - Step 1: Dispatch all independent tasks in parallel.\n\
+             - Step 2: On your next turn, collect results from [async task completed] messages.\n\
+             - Step 3: If further work depends on those results, dispatch new tasks with the collected data.\n\
+             - Step 4: Synthesize final results and reply to the user.\n\
+             #### Error handling\n\
+             - If a task times out, try with a simpler scope or do it yourself.\n\
+             - If a task returns an error, explain to the user and offer alternatives.\n\
              ### Other\n\
              - For cron jobs: use the `cron` tool (action=list/add/remove).\n\
              - To install tools (python, node, ffmpeg, chrome, opencode, claude-code, sherpa-onnx): use `install_tool`. Do NOT download/install manually.\n\
