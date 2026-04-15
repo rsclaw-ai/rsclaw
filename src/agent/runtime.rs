@@ -1260,14 +1260,59 @@ impl AgentRuntime {
         let session_key = session_key.as_str();
 
         // Check clear_signal: if /clear was issued via bypass, clear sessions now.
+        // Preserve a brief summary of each session so the agent retains key context.
         if self.handle.clear_signal.load(Ordering::SeqCst) {
             self.handle.clear_signal.store(false, Ordering::SeqCst);
             info!("clear_signal received, clearing all sessions");
+
+            // Build summaries from existing sessions before clearing.
+            let mut summaries: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            for (key, messages) in &self.sessions {
+                if messages.is_empty() { continue; }
+                // Take last 10 messages and extract key points.
+                let recent: Vec<&Message> = messages.iter().rev().take(10).rev().collect();
+                let mut summary_parts = Vec::new();
+                for msg in &recent {
+                    let role = match msg.role {
+                        crate::provider::Role::User => "User",
+                        crate::provider::Role::Assistant => "Assistant",
+                        _ => continue,
+                    };
+                    // Extract text content, truncate to 200 chars.
+                    let text = match &msg.content {
+                        crate::provider::MessageContent::Text(s) => s.clone(),
+                        crate::provider::MessageContent::Parts(parts) => parts.iter().filter_map(|p| {
+                            if let crate::provider::ContentPart::Text { text } = p { Some(text.as_str()) } else { None }
+                        }).collect::<Vec<_>>().join(" "),
+                    };
+                    if text.is_empty() { continue; }
+                    let truncated = if text.chars().count() > 200 {
+                        let idx = text.char_indices().nth(200).map(|(i, _)| i).unwrap_or(text.len());
+                        format!("{}...", &text[..idx])
+                    } else { text };
+                    summary_parts.push(format!("{role}: {truncated}"));
+                }
+                if !summary_parts.is_empty() {
+                    summaries.insert(key.clone(), summary_parts.join("\n"));
+                }
+            }
+
             self.sessions.clear();
             self.compaction_state.clear();
             // Also clear persisted sessions from redb
             for key in self.store.db.list_sessions().unwrap_or_default() {
                 let _ = self.store.db.delete_session(&key);
+            }
+
+            // Re-inject summaries as a system message in each session.
+            for (key, summary) in summaries {
+                let msg = Message {
+                    role: crate::provider::Role::System,
+                    content: crate::provider::MessageContent::Text(
+                        format!("[Session summary before /clear]\n{summary}")
+                    ),
+                };
+                self.sessions.insert(key, vec![msg]);
             }
         }
 
