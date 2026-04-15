@@ -736,9 +736,13 @@ impl DingTalkChannel {
         // Skip the first immediate tick.
         ping_timer.tick().await;
 
+        // Idle timeout: if no message received for 90s, reconnect.
+        let mut idle_deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+
         loop {
             tokio::select! {
                 msg = read.next() => {
+                    idle_deadline = tokio::time::Instant::now() + Duration::from_secs(90);
                     match msg {
                         Some(Ok(WsMessage::Text(text))) => {
                             debug!(text_len = text.len(), preview = &text[..text.len().min(200)], "DingTalk: WS text frame received");
@@ -822,6 +826,10 @@ impl DingTalkChannel {
                         warn!("DingTalk: failed to send ping, reconnecting");
                         break;
                     }
+                }
+                _ = tokio::time::sleep_until(idle_deadline) => {
+                    warn!("DingTalk: WS idle timeout (90s), reconnecting");
+                    break;
                 }
             }
         }

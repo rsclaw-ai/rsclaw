@@ -154,7 +154,13 @@ impl SlackChannel {
         let (ws_stream, _) = connect_async(&url).await.context("Slack WS connect")?;
         let (mut write, mut read) = ws_stream.split();
 
-        while let Some(msg) = read.next().await {
+        const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+        loop {
+            let msg = match tokio::time::timeout(WS_IDLE_TIMEOUT, read.next()).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) => { info!("Slack: WS stream ended"); break; }
+                Err(_) => { warn!("Slack: WS idle timeout ({}s), reconnecting", WS_IDLE_TIMEOUT.as_secs()); bail!("Slack: idle timeout"); }
+            };
             let raw = match msg {
                 Ok(WsMessage::Text(s)) => s.to_string(),
                 Ok(WsMessage::Close(frame)) => {
