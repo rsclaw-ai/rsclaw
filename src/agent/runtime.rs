@@ -4543,11 +4543,14 @@ impl AgentRuntime {
 
         // Multi-condition compaction trigger: token threshold OR turn count OR time
         // elapsed. Whichever fires first.
+        // Default threshold: 80% of configured context window, minimum 16000.
+        let context_tokens = self.config.agents.defaults.context_tokens.unwrap_or(64_000) as usize;
+        let default_threshold = (context_tokens * 4 / 5).max(16_000);
         let token_threshold = cfg
             .reserve_tokens_floor
             .map(|t| t as usize)
-            .unwrap_or(8_000);
-        let max_turns: u32 = 20;
+            .unwrap_or(default_threshold);
+        let max_turns: u32 = 60;
         let max_elapsed_secs: u64 = 30 * 60; // 30 minutes
 
         let total_tokens: usize = self
