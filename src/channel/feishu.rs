@@ -587,8 +587,15 @@ impl FeishuChannel {
 
         info!("feishu: WebSocket connected");
 
-        // 3. Read events
-        while let Some(msg) = read.next().await {
+        // 3. Read events with idle timeout (detect half-open connections).
+        // Feishu sends pings every ~30s; if we hear nothing for 90s, reconnect.
+        const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+        loop {
+            let msg = match tokio::time::timeout(WS_IDLE_TIMEOUT, read.next()).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) => { info!("feishu: WS stream ended"); break; }
+                Err(_) => { warn!("feishu: WS idle timeout ({}s), reconnecting", WS_IDLE_TIMEOUT.as_secs()); break; }
+            };
             match msg {
                 Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
                     info!(
@@ -1431,11 +1438,13 @@ impl Channel for FeishuChannel {
                 let (msg_type, content) = if is_media {
                     // Try to extract duration from MP4 header (moov/mvhd atom).
                     let duration_ms = if mime.starts_with("video/") {
-                        mp4_duration_ms(path_or_url).unwrap_or(0)
+                        let d = mp4_duration_ms(path_or_url);
+                        info!(path = %path_or_url, duration = ?d, "feishu: mp4 duration extracted");
+                        d.unwrap_or(0)
                     } else { 0 };
                     let mut media_json = serde_json::json!({"file_key": file_key, "file_name": filename});
                     if duration_ms > 0 {
-                        media_json["duration"] = serde_json::json!(duration_ms);
+                        media_json["duration"] = serde_json::json!(duration_ms.to_string());
                     }
                     // Try to extract cover image via ffmpeg and upload as image_key.
                     if mime.starts_with("video/") {
@@ -1444,7 +1453,9 @@ impl Channel for FeishuChannel {
                             media_json["image_key"] = serde_json::json!(cover_key);
                         }
                     }
-                    ("media", media_json.to_string())
+                    let s = media_json.to_string();
+                    info!(content = %s, "feishu: sending media message");
+                    ("media", s)
                 } else {
                     ("file", serde_json::json!({"file_key": file_key}).to_string())
                 };
