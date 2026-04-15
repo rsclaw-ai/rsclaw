@@ -55,6 +55,18 @@ const TOOLS: &[ToolDef] = &[
         detect_cmd: &["sherpa-onnx-offline-tts", "sherpa-onnx-offline", "sherpa-onnx"],
         local_bin: "sherpa-onnx",
     },
+    ToolDef {
+        name: "opencode",
+        display: "OpenCode (AI coding agent)",
+        detect_cmd: &["opencode"],
+        local_bin: "opencode",
+    },
+    ToolDef {
+        name: "claude-code",
+        display: "Claude Code (AI coding agent)",
+        detect_cmd: &["claude"],
+        local_bin: "claude-code",
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -189,11 +201,25 @@ fn cmd_status() {
 }
 
 /// Resolve tool name aliases (e.g. "chromium" → "chrome").
+/// Find node binary: prefer locally installed, fallback to system PATH.
+fn find_node_binary(tools_dir: &std::path::Path) -> Option<String> {
+    // Check local tools dir first.
+    let local = tools_dir.join("node").join("bin").join("node");
+    if local.exists() { return Some(local.to_string_lossy().to_string()); }
+    // Windows variant.
+    let local_win = tools_dir.join("node").join("node.exe");
+    if local_win.exists() { return Some(local_win.to_string_lossy().to_string()); }
+    // System PATH.
+    which::which("node").ok().map(|p| p.to_string_lossy().to_string())
+}
+
 fn resolve_tool_name(name: &str) -> &str {
     match name {
         "chromium" | "chromium-browser" | "google-chrome" => "chrome",
         "python3" => "python",
         "nodejs" | "node.js" => "node",
+        "open-code" | "opencode-cli" => "opencode",
+        "claude" | "claude-agent" | "claudecode" => "claude-code",
         _ => name,
     }
 }
@@ -252,6 +278,33 @@ async fn cmd_install(name: &str, force: bool) -> Result<()> {
         }
         if !force && is_tool_installed_locally(def) {
             println!("  {} {} {}", green("✓"), bold(def.name), dim("(already installed, skipping)"));
+            continue;
+        }
+
+        // npm-based tools: install via npm --prefix instead of downloading binary.
+        let npm_package = match *tool_name {
+            "claude-code" => Some("@anthropic-ai/claude-code"),
+            _ => None,
+        };
+        if let Some(pkg) = npm_package {
+            let dest_dir = dir.join(def.local_bin);
+            std::fs::create_dir_all(&dest_dir)?;
+            println!("  Installing {} via npm ...", bold(def.name));
+            let node_bin = find_node_binary(&dir);
+            let npm_bin = node_bin.as_deref().map(|n| {
+                let p = std::path::Path::new(n).parent().unwrap_or(std::path::Path::new(""));
+                p.join("npm").to_string_lossy().to_string()
+            }).unwrap_or_else(|| "npm".to_owned());
+            let status = std::process::Command::new(&npm_bin)
+                .args(["install", "--prefix", &dest_dir.to_string_lossy(), pkg])
+                .status();
+            match status {
+                Ok(s) if s.success() => ok(&format!("{} installed to {}", def.name, dest_dir.display())),
+                Ok(s) => err_msg(&format!("{}: npm install exited with {s}", def.name)),
+                Err(e) => {
+                    err_msg(&format!("{}: npm not found ({e}). Install node first: rsclaw tools install node", def.name));
+                }
+            }
             continue;
         }
 
@@ -382,6 +435,19 @@ fn resolve_download_url(
                 _ => return None,
             };
             Some(format!("{MIRROR_BASE}/sherpa-onnx/{ver}/{filename}"))
+        }
+        "opencode" => {
+            let ver = section.get("version")?.as_str()?;
+            let filename = match platform {
+                "linux-x64" => format!("opencode-linux-x64.tar.gz"),
+                "linux-arm64" => format!("opencode-linux-arm64.tar.gz"),
+                "mac-x64" => format!("opencode-darwin-x64.zip"),
+                "mac-arm64" => format!("opencode-darwin-arm64.zip"),
+                "win-x64" => format!("opencode-windows-x64.zip"),
+                _ => return None,
+            };
+            // Download from GitHub releases, not our mirror.
+            Some(format!("https://github.com/anomalyco/opencode/releases/download/v{ver}/{filename}"))
         }
         _ => None,
     }
