@@ -29,7 +29,7 @@ const TOOLS: &[ToolDef] = &[
         name: "chrome",
         display: "Chrome for Testing (browser automation)",
         detect_cmd: &["google-chrome", "chromium", "chromium-browser", "chrome"],
-        local_bin: "chromium",
+        local_bin: "chrome",
     },
     ToolDef {
         name: "ffmpeg",
@@ -388,7 +388,7 @@ fn resolve_download_url(
                 "win-x64" => "chrome-win64.zip",
                 _ => return None,
             };
-            Some(format!("{MIRROR_BASE}/chromium/{ver}/{filename}"))
+            Some(format!("{MIRROR_BASE}/chrome/{ver}/{filename}"))
         }
         "ffmpeg" => {
             let filename = match platform {

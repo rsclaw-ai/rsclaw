@@ -9036,8 +9036,8 @@ fn has_display() -> bool {
 /// Detect Chrome/Chromium binary path.
 /// Priority: ~/.rsclaw/tools/ > system PATH > well-known locations.
 fn detect_chrome() -> Option<String> {
-    // 1. Check locally installed via `rsclaw tools install chromium` (highest priority)
-    let tools_dir = crate::config::loader::base_dir().join("tools/chromium");
+    // 1. Check locally installed via `rsclaw tools install chrome` (highest priority)
+    let tools_dir = crate::config::loader::base_dir().join("tools/chrome");
     if tools_dir.exists() {
         #[cfg(target_os = "windows")]
         let bin = tools_dir.join("chrome.exe");
