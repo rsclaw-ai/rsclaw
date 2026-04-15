@@ -33,14 +33,14 @@ cargo build --release
 Desktop app (.dmg / .msi / .deb): [Releases](https://github.com/rsclaw-ai/rsclaw/releases)
 
 ```bash
+# Migrate from OpenClaw
+rsclaw setup      # detects OpenClaw data, offers import
+rsclaw start      # config already imported, ready to go
+
 # New install
 rsclaw setup      # initialize ~/.rsclaw/
 rsclaw onboard    # interactive wizard: provider, channels, etc.
 rsclaw start
-
-# Migrate from OpenClaw
-rsclaw setup      # detects OpenClaw data, offers import
-rsclaw start      # config already imported, ready to go
 ```
 
 ---
