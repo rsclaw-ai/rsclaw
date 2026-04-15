@@ -193,7 +193,7 @@ fn resolve_tool_name(name: &str) -> &str {
     match name {
         "chromium" | "chromium-browser" | "google-chrome" => "chrome",
         "python3" => "python",
-        "nodejs" => "node",
+        "nodejs" | "node.js" => "node",
         _ => name,
     }
 }
