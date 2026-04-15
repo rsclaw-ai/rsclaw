@@ -3343,7 +3343,19 @@ impl AgentRuntime {
                             }
                         }
                     }
-                    StreamEvent::Done { .. } => {}
+                    StreamEvent::Done { usage } => {
+                        // Update context token count with real usage from LLM if available.
+                        if let Some(ref u) = usage {
+                            let real_tokens = (u.input + u.output) as usize;
+                            self.handle.last_ctx_tokens.store(real_tokens, std::sync::atomic::Ordering::Relaxed);
+                            debug!(
+                                session = %ctx.session_key,
+                                input_tokens = u.input,
+                                output_tokens = u.output,
+                                "LLM usage (from provider)"
+                            );
+                        }
+                    }
                     StreamEvent::Error(e) => {
                         return Err(anyhow!("LLM stream error: {e}"));
                     }
