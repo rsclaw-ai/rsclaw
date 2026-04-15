@@ -258,6 +258,9 @@ pub struct AgentRuntime {
     /// Completed async task results: task_id → (session_key, result_json).
     /// Background task agents write here; main agent checks at turn start.
     pending_task_results: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+    /// Sessions in voice mode: auto-TTS reply when user sent voice.
+    /// Set when audio attachment detected, cleared by "/text" command.
+    voice_mode_sessions: std::collections::HashSet<String>,
 }
 
 impl AgentRuntime {
@@ -316,6 +319,7 @@ impl AgentRuntime {
             workspace_cache: None,
             btw_manager,
             pending_task_results: Arc::new(std::sync::Mutex::new(Vec::new())),
+            voice_mode_sessions: std::collections::HashSet::new(),
             notification_tx,
             opencode_client: Arc::new(tokio::sync::OnceCell::new()),
             claudecode_client: Arc::new(tokio::sync::OnceCell::new()),
@@ -1726,7 +1730,20 @@ impl AgentRuntime {
                         let key = self.resolve_session_key(session_key).to_owned();
                         self.sessions.remove(&key);
                         let _ = self.store.db.delete_session(&key);
+                        self.voice_mode_sessions.remove(&key);
                         "Session reset.".to_owned()
+                    }
+                    "__TEXT_MODE__" => {
+                        self.voice_mode_sessions.remove(session_key);
+                        let zh = crate::i18n::default_lang() == "zh";
+                        if zh { "已切换到文字回复模式。".to_owned() }
+                        else { "Switched to text reply mode.".to_owned() }
+                    }
+                    "__VOICE_MODE__" => {
+                        self.voice_mode_sessions.insert(session_key.to_owned());
+                        let zh = crate::i18n::default_lang() == "zh";
+                        if zh { "已切换到语音回复模式。".to_owned() }
+                        else { "Switched to voice reply mode.".to_owned() }
                     }
                     s if s.starts_with("__HISTORY__:") => {
                         let n: usize = s
@@ -2249,6 +2266,15 @@ impl AgentRuntime {
         let files = regular_files;
 
         if !media_files.is_empty() {
+            // Auto-enable voice mode when user sends audio (not video).
+            let has_audio = media_files.iter().any(|f|
+                crate::channel::is_audio_attachment(&f.mime_type, &f.filename)
+                && !crate::channel::is_video_attachment(&f.mime_type, &f.filename)
+            );
+            if has_audio {
+                self.voice_mode_sessions.insert(session_key.to_owned());
+                debug!(session = session_key, "voice mode enabled (audio attachment detected)");
+            }
             let mut transcriptions = Vec::new();
             for mf in &media_files {
                 if let Some(t) = extract_audio_text(&mf.data, &mf.filename.to_lowercase()).await {
@@ -2908,6 +2934,34 @@ impl AgentRuntime {
 
         // Tick ctx TTL counters after each turn.
         self.btw_manager.tick_turn(session_key).await;
+
+        // Auto-TTS: if session is in voice mode, generate audio for the reply.
+        let mut reply = reply;
+        if self.voice_mode_sessions.contains(session_key)
+            && !reply.text.is_empty()
+            && !reply.is_empty
+            && !reply.was_preparse
+        {
+            match self.generate_tts_audio(&reply.text).await {
+                Ok(audio_path) => {
+                    let mime = if audio_path.ends_with(".wav") { "audio/wav" }
+                        else if audio_path.ends_with(".mp3") { "audio/mpeg" }
+                        else { "audio/wav" };
+                    reply.files.push((
+                        std::path::Path::new(&audio_path)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "reply.wav".to_owned()),
+                        mime.to_owned(),
+                        audio_path,
+                    ));
+                    debug!(session = session_key, "auto-TTS audio attached to reply");
+                }
+                Err(e) => {
+                    warn!(session = session_key, "auto-TTS failed: {e:#}");
+                }
+            }
+        }
 
         // Plugin hook: after_turn (AGENTS.md §20).
         self.fire_hook(
@@ -4156,7 +4210,7 @@ impl AgentRuntime {
             "computer_use" => return self.tool_computer_use(args).await,
             "image_gen" | "image" => return self.tool_image(args).await,
             "pdf" => return self.tool_pdf(args).await,
-            "text_to_speech" | "tts" => return self.tool_tts(args).await,
+            "text_to_voice" | "text_to_speech" | "tts" => return self.tool_tts(args).await,
             "send_message" | "message" => return self.tool_message(args).await,
             "cron" => return self.tool_cron(args).await,
             "gateway" => return self.tool_gateway(args).await,
@@ -8184,6 +8238,115 @@ public class WinHoldKey {{
         }))
     }
 
+    /// Generate TTS audio from text. Prefers sherpa-onnx, falls back to system TTS.
+    /// Returns the path to the generated audio file.
+    async fn generate_tts_audio(&self, text: &str) -> Result<String> {
+        // Truncate long text for TTS (avoid very long audio).
+        let tts_text = if text.chars().count() > 500 {
+            let idx = text.char_indices().nth(500).map(|(i, _)| i).unwrap_or(text.len());
+            &text[..idx]
+        } else {
+            text
+        };
+
+        let out_path = std::env::temp_dir().join(format!(
+            "rsclaw_tts_{}.wav",
+            chrono::Utc::now().timestamp_millis()
+        ));
+        let out_str = out_path.to_string_lossy().to_string();
+
+        // Try sherpa-onnx first (installed via `rsclaw tools install sherpa-onnx`).
+        let sherpa_bin = crate::config::loader::base_dir()
+            .join("tools")
+            .join("sherpa-onnx")
+            .join("bin")
+            .join(if cfg!(target_os = "windows") { "sherpa-onnx-offline-tts.exe" } else { "sherpa-onnx-offline-tts" });
+
+        if sherpa_bin.exists() {
+            let model_dir = crate::config::loader::base_dir()
+                .join("tools")
+                .join("sherpa-onnx")
+                .join("models")
+                .join("tts");
+            // Look for any VITS model config.
+            let model_config = model_dir.join("model.onnx");
+            if model_config.exists() {
+                let mut cmd = tokio::process::Command::new(&sherpa_bin);
+                cmd.args([
+                    "--vits-model", model_config.to_str().unwrap_or(""),
+                    "--vits-tokens", model_dir.join("tokens.txt").to_str().unwrap_or(""),
+                    "--output-filename", &out_str,
+                    "--vits-length-scale", "1.0",
+                    tts_text,
+                ]);
+                #[cfg(target_os = "windows")]
+                {
+                    use std::os::windows::process::CommandExt;
+                    cmd.creation_flags(0x08000000);
+                }
+                let output = cmd.output().await;
+                if let Ok(o) = output {
+                    if o.status.success() && out_path.exists() {
+                        return Ok(out_str);
+                    }
+                }
+                // Fall through to system TTS if sherpa-onnx failed.
+            }
+        }
+
+        // Fallback: system TTS (same as tool_tts).
+        #[cfg(target_os = "macos")]
+        {
+            let output = tokio::process::Command::new("say")
+                .args(["-o", &out_str, tts_text])
+                .output()
+                .await
+                .map_err(|e| anyhow!("auto-tts: say failed: {e}"))?;
+            if !output.status.success() {
+                return Err(anyhow!("auto-tts: say exit code {}", output.status));
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let safe_text = tts_text.replace('\'', "''");
+            let script = format!(
+                "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.SetOutputToWaveFile('{}'); $s.Speak('{}')",
+                out_str.replace('\'', "''"), safe_text
+            );
+            let output = powershell_hidden()
+                .args(["-Command", &script])
+                .output()
+                .await
+                .map_err(|e| anyhow!("auto-tts: SAPI failed: {e}"))?;
+            if !output.status.success() {
+                return Err(anyhow!("auto-tts: SAPI exit code {}", output.status));
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let result = tokio::process::Command::new("espeak")
+                .args(["-w", &out_str, tts_text])
+                .output()
+                .await;
+            match result {
+                Ok(o) if o.status.success() => {}
+                _ => {
+                    tokio::process::Command::new("pico2wave")
+                        .args(["-w", &out_str, "--", tts_text])
+                        .output()
+                        .await
+                        .map_err(|e| anyhow!("auto-tts: no TTS engine available: {e}"))?;
+                }
+            }
+        }
+
+        if out_path.exists() {
+            Ok(out_str)
+        } else {
+            Err(anyhow!("auto-tts: output file not created"))
+        }
+    }
+
     async fn tool_tts(&self, args: Value) -> Result<Value> {
         let text = args["text"]
             .as_str()
@@ -9876,6 +10039,8 @@ fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
     h.push_str(if zh { "  /compact          压缩会话并保存记忆\n" } else { "  /compact          Compact session & save to memory\n" });
     h.push_str(if zh { "  /abort            终止当前任务\n" } else { "  /abort            Abort running task\n" });
     if has("/reset") { h.push_str(if zh { "  /reset            重置会话\n" } else { "  /reset            Reset session\n" }); }
+    h.push_str(if zh { "  /voice            语音回复模式\n" } else { "  /voice            Voice reply mode\n" });
+    h.push_str(if zh { "  /text             文字回复模式\n" } else { "  /text             Text reply mode\n" });
     h.push_str(if zh { "  /history [n]      查看历史\n" } else { "  /history [n]      Show history\n" });
     if has("/sessions") { h.push_str(if zh { "  /sessions         列出会话\n" } else { "  /sessions         List sessions\n" }); }
     h.push('\n');
@@ -10571,7 +10736,7 @@ fn build_tool_list(
         }),
     });
     tools.push(ToolDef {
-        name: "text_to_speech".to_owned(),
+        name: "text_to_voice".to_owned(),
         description: "Convert text to speech audio.".to_owned(),
         parameters: json!({
             "type": "object",
