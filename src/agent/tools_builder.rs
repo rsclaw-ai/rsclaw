@@ -678,5 +678,15 @@ pub(crate) fn build_tool_list(
         }
     }
 
+    // Inject `additionalProperties: false` and `$schema` into every tool's
+    // parameters object. This enables constrained decoding in Ollama/vLLM,
+    // which dramatically reduces digit-loss on small models (9b).
+    for tool in &mut tools {
+        if let Some(obj) = tool.parameters.as_object_mut() {
+            obj.entry("additionalProperties").or_insert(json!(false));
+            obj.entry("$schema").or_insert(json!("http://json-schema.org/draft-07/schema#"));
+        }
+    }
+
     tools
 }
