@@ -12,7 +12,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 impl super::runtime::AgentRuntime {
-    pub(crate) async fn tool_cron(&self, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_cron(&self, args: Value, ctx: &super::runtime::RunContext) -> Result<Value> {
         let action = args["action"]
             .as_str()
             .ok_or_else(|| anyhow!("cron: `action` required"))?;
@@ -69,6 +69,18 @@ impl super::runtime::AgentRuntime {
                 job["payload"] = json!({"kind": "systemEvent", "text": message});
                 if let Some(n) = name {
                     job["name"] = json!(n);
+                }
+
+                // Auto-set delivery to the originating channel+peer when not explicitly specified.
+                let channel = &ctx.channel;
+                let peer_id = &ctx.peer_id;
+                if !channel.is_empty() && channel != "system" && channel != "cron" && !peer_id.is_empty() {
+                    job["delivery"] = json!({
+                        "channel": channel,
+                        "to": peer_id,
+                        "mode": "always"
+                    });
+                    debug!(channel, peer_id, "cron add: auto-set delivery to originating channel");
                 }
 
                 jobs.push(job);

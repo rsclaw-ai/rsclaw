@@ -118,7 +118,8 @@ pub(crate) fn build_tool_list(
             "type": "object",
             "properties": {
                 "path":    {"type": "string", "description": "Relative file path within the workspace (REQUIRED). Example: 'output.py'"},
-                "content": {"type": "string", "description": "File content to write (REQUIRED). MUST preserve all numbers, dates, and specific values from the user's message exactly as given."}
+                "content": {"type": "string", "description": "File content to write (REQUIRED). MUST preserve all numbers, dates, and specific values from the user's message exactly as given."},
+                "explanation": {"type": "string", "description": "Brief explanation of what you are creating and why, to help organize your thoughts before writing content."}
             },
             "required": ["path", "content"]
         }),
@@ -181,18 +182,17 @@ pub(crate) fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "agent".to_owned(),
-        description: "Manage sub-agents. You are the architect — delegate work, never block.\n\
+        description: "Manage agents. You are the architect — delegate work, never block.\n\
             Actions:\n\
-            - task: Fire-and-forget one-shot task. Returns immediately with task_id. Result delivered on your next turn.\n\
-            - spawn: Create a persistent sub-agent (survives across turns).\n\
-            - send: Send a message to a spawned sub-agent (async, result on next turn).\n\
+            - task: Create a temporary agent for a one-shot task. Returns immediately with task_id. The agent runs independently and delivers results when done.\n\
+            - spawn: Create a persistent agent (survives across turns).\n\
+            - send: Send a message to an existing agent (async, result delivered when done).\n\
             - list: List all registered agents.\n\
-            - kill: Stop a sub-agent.\n\
+            - kill: Stop an agent.\n\
             Tips:\n\
             - Use task for independent, parallelizable work. You can dispatch multiple tasks at once.\n\
             - Always specify toolset matching the task (web for search, code for file ops).\n\
-            - After dispatching, tell the user what you delegated and continue with other work.\n\
-            - Check task results on your next response — they appear as [async task completed] messages.".to_owned(),
+            - After dispatching, tell the user what you delegated and continue with other work.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -229,7 +229,7 @@ pub(crate) fn build_tool_list(
             "type": "object",
             "properties": {
                 "path":      {"type": "string", "description": "Directory path to list. Defaults to workspace root."},
-                "recursive": {"type": "boolean", "description": "List recursively (default: false)"},
+                "recursive": {"type": "boolean", "description": "If true, list all files in subdirectories recursively. Default: false."},
                 "pattern":   {"type": "string", "description": "Glob pattern filter (e.g. '*.json', '*.rs')"}
             }
         }),
@@ -256,7 +256,7 @@ pub(crate) fn build_tool_list(
                 "pattern":  {"type": "string", "description": "Text or regex pattern to search for"},
                 "path":     {"type": "string", "description": "File or directory to search in. Defaults to workspace."},
                 "include":  {"type": "string", "description": "File glob filter (e.g. '*.py', '*.rs')"},
-                "ignore_case": {"type": "boolean", "description": "Case insensitive search (default: false)"},
+                "ignore_case": {"type": "boolean", "description": "If true, match case-insensitively. Default: false."},
                 "max_results": {"type": "integer", "description": "Maximum results (default: 20)"}
             },
             "required": ["pattern"]
@@ -573,7 +573,8 @@ pub(crate) fn build_tool_list(
             "properties": {
                 "path":    {"type": "string", "description": "File path, e.g. 'report.docx'"},
                 "content": {"type": "string", "description": "Document content. Use # for headings, - for lists, blank lines for paragraphs."},
-                "title":   {"type": "string", "description": "Document title (optional, displayed at top)"}
+                "title":   {"type": "string", "description": "Document title (optional, displayed at top)"},
+                "explanation": {"type": "string", "description": "Brief explanation of what you are creating and why, to help organize your thoughts before writing content."}
             },
             "required": ["path", "content"]
         }),
@@ -586,7 +587,8 @@ pub(crate) fn build_tool_list(
             "properties": {
                 "path":    {"type": "string", "description": "File path, e.g. 'report.pdf'"},
                 "content": {"type": "string", "description": "Document content. Use # for headings, - for lists, blank lines for paragraphs."},
-                "title":   {"type": "string", "description": "Document title (optional, displayed at top)"}
+                "title":   {"type": "string", "description": "Document title (optional, displayed at top)"},
+                "explanation": {"type": "string", "description": "Brief explanation of what you are creating and why, to help organize your thoughts before writing content."}
             },
             "required": ["path", "content"]
         }),
@@ -600,11 +602,12 @@ pub(crate) fn build_tool_list(
                 "path":   {"type": "string", "description": "File path, e.g. 'data.xlsx'"},
                 "sheets": {"type": "array", "description": "Sheets: [{name, headers: [str], rows: [[value]]}]",
                     "items": {"type": "object", "properties": {
-                        "name":    {"type": "string"},
-                        "headers": {"type": "array", "items": {"type": "string"}},
-                        "rows":    {"type": "array", "items": {"type": "array"}}
+                        "name":    {"type": "string", "description": "Sheet name (tab label in the spreadsheet)."},
+                        "headers": {"type": "array", "items": {"type": "string"}, "description": "Column header labels for the first row."},
+                        "rows":    {"type": "array", "items": {"type": "array"}, "description": "Data rows, each an array of cell values in column order."}
                     }}
-                }
+                },
+                "explanation": {"type": "string", "description": "Brief explanation of what you are creating and why, to help organize your thoughts before writing content."}
             },
             "required": ["path", "sheets"]
         }),
@@ -618,10 +621,11 @@ pub(crate) fn build_tool_list(
                 "path":   {"type": "string", "description": "File path, e.g. 'deck.pptx'"},
                 "slides": {"type": "array", "description": "Slides: [{title, body}]",
                     "items": {"type": "object", "properties": {
-                        "title": {"type": "string"},
-                        "body":  {"type": "string"}
+                        "title": {"type": "string", "description": "Slide title displayed at the top."},
+                        "body":  {"type": "string", "description": "Slide body text. Use newlines to separate bullet points."}
                     }}
-                }
+                },
+                "explanation": {"type": "string", "description": "Brief explanation of what you are creating and why, to help organize your thoughts before writing content."}
             },
             "required": ["path", "slides"]
         }),
@@ -639,10 +643,26 @@ pub(crate) fn build_tool_list(
                 "path":    {"type": "string", "description": "File path"},
                 "content": {"type": "string", "description": "For edit_word: replacement content"},
                 "append":  {"type": "string", "description": "For edit_word: text to append"},
-                "sheets":  {"type": "array", "description": "For edit_excel: [{name, headers, rows}]"},
-                "append_rows": {"description": "For edit_excel: {sheet, rows}"},
-                "replacements": {"type": "array", "description": "For edit_pdf: [{find, replace}]"},
-                "delete_pages": {"type": "array", "description": "For edit_pdf: page numbers to delete"}
+                "sheets":  {"type": "array", "description": "For edit_excel: [{name, headers, rows}]",
+                    "items": {"type": "object", "properties": {
+                        "name":    {"type": "string", "description": "Sheet name (tab label in the spreadsheet)."},
+                        "headers": {"type": "array", "items": {"type": "string"}, "description": "Column header labels for the first row."},
+                        "rows":    {"type": "array", "items": {"type": "array"}, "description": "Data rows, each an array of cell values in column order."}
+                    }}
+                },
+                "append_rows": {"type": "array", "description": "For edit_excel: append rows to an existing sheet without replacing it.",
+                    "items": {"type": "object", "properties": {
+                        "sheet": {"type": "string", "description": "Name of the existing sheet to append to."},
+                        "rows":  {"type": "array", "items": {"type": "array"}, "description": "Rows to append, each an array of cell values."}
+                    }}
+                },
+                "replacements": {"type": "array", "description": "For edit_pdf: [{find, replace}]",
+                    "items": {"type": "object", "properties": {
+                        "find":    {"type": "string", "description": "Text string to find in the PDF."},
+                        "replace": {"type": "string", "description": "Replacement text."}
+                    }}
+                },
+                "delete_pages": {"type": "array", "description": "For edit_pdf: 1-indexed page numbers to delete", "items": {"type": "integer"}}
             },
             "required": ["action", "path"]
         }),

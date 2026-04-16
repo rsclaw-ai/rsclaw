@@ -2284,10 +2284,15 @@ impl AgentRuntime {
         // Inject completed async task results into the session.
         {
             let mut pending = self.pending_task_results.lock().unwrap_or_else(|e| e.into_inner());
-            let completed: Vec<(String, String, String)> = pending
-                .drain(..)
-                .filter(|(_, sk, _)| sk == &ctx.session_key)
-                .collect();
+            let mut completed = Vec::new();
+            pending.retain(|(tid, sk, result)| {
+                if sk == &ctx.session_key {
+                    completed.push((tid.clone(), sk.clone(), result.clone()));
+                    false // remove from pending
+                } else {
+                    true // keep for other sessions
+                }
+            });
             drop(pending);
             if !completed.is_empty() {
                 if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
@@ -3563,7 +3568,7 @@ impl AgentRuntime {
             "pdf" => return self.tool_pdf(args).await,
             "text_to_voice" | "text_to_speech" | "tts" => return self.tool_tts(args).await,
             "send_message" | "message" => return self.tool_message(args).await,
-            "cron" => return self.tool_cron(args).await,
+            "cron" => return self.tool_cron(args, ctx).await,
             "gateway" => return self.tool_gateway(args).await,
             "pairing" => return self.tool_pairing(args).await,
             "doc" => return self.tool_doc(args).await,

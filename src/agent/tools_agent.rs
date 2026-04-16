@@ -232,13 +232,17 @@ impl AgentRuntime {
         };
         target.tx.send(msg).await.map_err(|_| anyhow!("agent_task: agent inbox closed"))?;
 
-        // Spawn background worker to wait for reply and store result.
-        // Main agent returns IMMEDIATELY — never blocked.
+        // Spawn background worker to wait for reply, store result, then wake
+        // the parent agent so it can process and respond to the user.
         let pending = Arc::clone(&self.pending_task_results);
+        let self_handle = Arc::clone(&self.handle);
+        let notification_tx = self.notification_tx.clone();
         let session_key = ctx.session_key.clone();
+        let channel = ctx.channel.clone();
+        let peer_id = ctx.peer_id.clone();
+        let chat_id = ctx.chat_id.clone();
         let task_id = id.clone();
         let agents = self.agents.as_ref().map(Arc::clone);
-        let self_handle = Arc::clone(&self.handle);
         let timeout_secs = self
             .config
             .agents
@@ -257,26 +261,50 @@ impl AgentRuntime {
                 Err(_) => format!("[task {task_id} timed out after {task_timeout}s]"),
             };
 
-            // Store result for main agent to pick up.
+            // Store result for main agent to pick up when run_turn fires.
             if let Ok(mut guard) = pending.lock() {
                 guard.push((task_id.clone(), session_key.clone(), result_text));
             }
 
-            // Proactively wake the parent agent so it processes the result
-            // without waiting for the next user message.
-            let (wake_tx, _) = tokio::sync::oneshot::channel::<AgentReply>();
+            // Wake the parent agent so it processes the result and responds.
+            // The reply_tx is hooked up to notification_tx so the agent's
+            // response gets delivered back to the user via the original channel.
+            let (wake_tx, wake_rx) = tokio::sync::oneshot::channel::<AgentReply>();
             let wake_msg = AgentMessage {
                 session_key: session_key.clone(),
-                text: format!("[async task {task_id} completed — check results]"),
-                channel: "system".to_string(),
-                peer_id: "system".to_string(),
-                chat_id: String::new(),
+                text: format!("[async task {task_id} completed]"),
+                channel: channel.clone(),
+                peer_id: peer_id.clone(),
+                chat_id: chat_id.clone(),
                 reply_tx: wake_tx,
                 extra_tools: vec![],
                 images: vec![],
                 files: vec![],
             };
-            let _ = self_handle.tx.send(wake_msg).await;
+            if let Err(e) = self_handle.tx.send(wake_msg).await {
+                warn!(task_id, "failed to wake parent agent: {e}");
+            } else {
+                // Deliver the agent's reply to the user via the originating channel.
+                if let Ok(reply) = wake_rx.await {
+                    if !reply.text.is_empty() {
+                        if let Some(ref ntx) = notification_tx {
+                            let target = if !chat_id.is_empty() { chat_id } else { peer_id };
+                            if !target.is_empty() && !channel.is_empty() && channel != "system" && channel != "cron" {
+                                let _ = ntx.send(crate::channel::OutboundMessage {
+                                    target_id: target,
+                                    is_group: false,
+                                    text: reply.text,
+                                    reply_to: None,
+                                    images: reply.images.clone(),
+                                    files: reply.files.clone(),
+                                    channel: Some(channel),
+                                });
+                            }
+                        }
+                    }
+                    info!(task = %task_id, "async task: agent replied to user");
+                }
+            }
 
             // Cleanup: remove agent from registry, delete workspace.
             if let Some(reg) = agents {
@@ -328,10 +356,14 @@ impl AgentRuntime {
         };
         target.tx.send(msg).await.map_err(|_| anyhow!("agent_send: agent '{target_id}' inbox closed"))?;
 
-        // Background: wait for reply and store in pending results.
+        // Background: wait for reply, store result, then wake parent agent.
         let pending = Arc::clone(&self.pending_task_results);
         let self_handle = Arc::clone(&self.handle);
+        let notification_tx = self.notification_tx.clone();
         let session_key = ctx.session_key.clone();
+        let channel = ctx.channel.clone();
+        let peer_id = ctx.peer_id.clone();
+        let chat_id = ctx.chat_id.clone();
         let timeout_secs = self
             .config
             .agents
@@ -356,20 +388,40 @@ impl AgentRuntime {
                 guard.push((send_id_bg.clone(), session_key.clone(), result_text));
             }
 
-            // Proactively wake the parent agent so it processes the result.
-            let (wake_tx, _) = tokio::sync::oneshot::channel::<AgentReply>();
+            // Wake parent agent to process result and respond to user.
+            let (wake_tx, wake_rx) = tokio::sync::oneshot::channel::<AgentReply>();
             let wake_msg = AgentMessage {
                 session_key: session_key.clone(),
-                text: format!("[async send {send_id_bg} completed — check results]"),
-                channel: "system".to_string(),
-                peer_id: "system".to_string(),
-                chat_id: String::new(),
+                text: format!("[async send {send_id_bg} completed]"),
+                channel: channel.clone(),
+                peer_id: peer_id.clone(),
+                chat_id: chat_id.clone(),
                 reply_tx: wake_tx,
                 extra_tools: vec![],
                 images: vec![],
                 files: vec![],
             };
-            let _ = self_handle.tx.send(wake_msg).await;
+            if let Err(e) = self_handle.tx.send(wake_msg).await {
+                warn!(send_id = %send_id_bg, "failed to wake parent agent: {e}");
+            } else if let Ok(reply) = wake_rx.await {
+                if !reply.text.is_empty() {
+                    if let Some(ref ntx) = notification_tx {
+                        let target = if !chat_id.is_empty() { chat_id } else { peer_id };
+                        if !target.is_empty() && !channel.is_empty() && channel != "system" && channel != "cron" {
+                            let _ = ntx.send(crate::channel::OutboundMessage {
+                                target_id: target,
+                                is_group: false,
+                                text: reply.text,
+                                reply_to: None,
+                                images: reply.images.clone(),
+                                files: reply.files.clone(),
+                                channel: Some(channel),
+                            });
+                        }
+                    }
+                    info!(send_id = %send_id_bg, "async send: agent replied to user");
+                }
+            }
         });
 
         Ok(json!({

@@ -1090,7 +1090,7 @@ async fn send_delivery(
                 d
             }
             None => {
-                debug!(job_id = %job.id, "cron: no delivery configured, skipping notification");
+                info!(job_id = %job.id, name = ?job.name, "cron: no delivery configured, result discarded. Set delivery on the job or configure default_delivery in cron config.");
                 return Ok(());
             }
         },
