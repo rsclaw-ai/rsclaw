@@ -50,6 +50,7 @@ pub struct LiveStatus {
 }
 
 use super::{
+    exec_pool::ExecPool,
     loop_detection::LoopDetector,
     memory::{MemoryDoc, MemoryStore},
     registry::{AgentHandle, AgentMessage, AgentRegistry, AgentReply},
@@ -194,6 +195,8 @@ pub struct RunContext {
     pub peer_id: String,
     /// Chat/conversation ID for sending intermediate progress messages.
     pub chat_id: String,
+    /// Background exec pool for polling task results.
+    pub exec_pool: Arc<ExecPool>,
     pub loop_detector: LoopDetector,
     /// Whether the current turn includes images.
     pub has_images: bool,
@@ -261,6 +264,8 @@ pub struct AgentRuntime {
     /// Sessions in voice mode: auto-TTS reply when user sent voice.
     /// Set when audio attachment detected, cleared by "/text" command.
     voice_mode_sessions: std::collections::HashSet<String>,
+    /// Background exec pool — runs long commands without blocking the agent loop.
+    exec_pool: Arc<ExecPool>,
 }
 
 impl AgentRuntime {
@@ -295,6 +300,15 @@ impl AgentRuntime {
         let session_aliases = store.db.load_all_aliases().unwrap_or_default();
         let btw_manager = super::btw::BtwManager::new(Some(Arc::clone(&store.db)));
         let live_status = Arc::clone(&handle.live_status);
+        // Get max_concurrent from config, default to 4
+        let max_concurrent = config
+            .ext
+            .tools
+            .as_ref()
+            .and_then(|t| t.exec.as_ref())
+            .and_then(|e| e.max_concurrent)
+            .unwrap_or(4);
+        let exec_pool = ExecPool::new(max_concurrent);
         let rt = Self {
             handle,
             config,
@@ -324,6 +338,7 @@ impl AgentRuntime {
             opencode_client: Arc::new(tokio::sync::OnceCell::new()),
             claudecode_client: Arc::new(tokio::sync::OnceCell::new()),
             session_aliases,
+            exec_pool,
         };
 
         // Spawn a background task that periodically checks for idle browser
@@ -2122,6 +2137,7 @@ impl AgentRuntime {
                             channel: channel.to_owned(),
                             peer_id: peer_id.to_owned(),
                             chat_id: String::new(),
+                            exec_pool: Arc::clone(&self.exec_pool),
                             loop_detector: crate::agent::loop_detection::LoopDetector::default(),
                             has_images: false,
                             user_msg_with_images: None,
@@ -2843,6 +2859,7 @@ impl AgentRuntime {
             channel: channel.to_owned(),
             peer_id: peer_id.to_owned(),
             chat_id: String::new(),
+            exec_pool: Arc::clone(&self.exec_pool),
             loop_detector: {
                 let ld_cfg = self
                     .config
@@ -2880,6 +2897,192 @@ impl AgentRuntime {
             },
             parse_error_count: 0,
         };
+
+        // Check for pending exec results from background tasks started in previous turns.
+        let pending_results = self.exec_pool.collect_pending_for_session(session_key).await;
+        if !pending_results.is_empty() {
+            tracing::info!(
+                session_key = %session_key,
+                count = pending_results.len(),
+                task_ids = ?pending_results.iter().map(|r| &r.task_id).collect::<Vec<_>>(),
+                "exec_pool: collected pending results for session"
+            );
+
+            // Collect all tool_use_ids currently in session history
+            let session_tool_ids: std::collections::HashSet<String> = {
+                let sess = self.sessions.get(session_key);
+                if let Some(sess) = sess {
+                    sess.iter()
+                        .filter_map(|m| {
+                            if m.role == Role::Assistant {
+                                match &m.content {
+                                    MessageContent::Parts(parts) => {
+                                        Some(parts.iter().filter_map(|p| {
+                                            if let ContentPart::ToolUse { id, .. } = p {
+                                                Some(id.clone())
+                                            } else {
+                                                None
+                                            }
+                                        }).collect::<Vec<_>>())
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                        .flatten()
+                        .collect()
+                } else {
+                    std::collections::HashSet::new()
+                }
+            };
+            tracing::debug!(
+                session_key = %session_key,
+                tool_ids = ?session_tool_ids,
+                "exec_pool: existing ToolUse IDs in session history"
+            );
+
+            // Find existing "running" ToolResults to replace with final results
+            // (exec tool returns {status: "running"} immediately, then injects final result later)
+            let running_tool_result_ids: std::collections::HashSet<String> = {
+                let sess = self.sessions.get(session_key);
+                if let Some(sess) = sess {
+                    sess.iter()
+                        .filter_map(|m| {
+                            if m.role == Role::Tool {
+                                match &m.content {
+                                    MessageContent::Parts(parts) => {
+                                        for p in parts {
+                                            if let ContentPart::ToolResult { tool_use_id, content, .. } = p {
+                                                // Check if this is a "running" status result
+                                                if content.contains("\"status\": \"running\"") {
+                                                    tracing::debug!(
+                                                        tool_use_id = %tool_use_id,
+                                                        content_preview = %content.chars().take(100).collect::<String>(),
+                                                        "exec_pool: found running status ToolResult to replace"
+                                                    );
+                                                    return Some(tool_use_id.clone());
+                                                }
+                                            }
+                                        }
+                                        None
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                } else {
+                    std::collections::HashSet::new()
+                }
+            };
+            tracing::info!(
+                session_key = %session_key,
+                running_ids = ?running_tool_result_ids,
+                "exec_pool: running status ToolResult IDs to potentially replace"
+            );
+
+            if let Some(sess) = self.sessions.get_mut(session_key) {
+                // Remove existing "running" ToolResults for the same tool_call_ids
+                let ids_to_replace: std::collections::HashSet<String> = pending_results
+                    .iter()
+                    .map(|r| r.tool_call_id.clone())
+                    .filter(|id| running_tool_result_ids.contains(id))
+                    .collect();
+
+                if !ids_to_replace.is_empty() {
+                    tracing::info!(
+                        session_key = %session_key,
+                        ids = ?ids_to_replace,
+                        "removing running status ToolResults before injecting final results"
+                    );
+                    // Retain messages that are NOT ToolResult with running status for these ids
+                    sess.retain(|m| {
+                        if m.role == Role::Tool {
+                            match &m.content {
+                                MessageContent::Parts(parts) => {
+                                    for p in parts {
+                                        if let ContentPart::ToolResult { tool_use_id, content, .. } = p {
+                                            if ids_to_replace.contains(tool_use_id) && content.contains("\"status\": \"running\"") {
+                                                return false; // remove this message
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        true // keep all other messages
+                    });
+                }
+
+                for result in pending_results {
+                    let tool_call_id = result.tool_call_id.clone();
+
+                    tracing::info!(
+                        task_id = %result.task_id,
+                        tool_call_id = %tool_call_id,
+                        command = %result.command,
+                        exit_code = ?result.exit_code,
+                        stdout_len = result.stdout.len(),
+                        stderr_len = result.stderr.len(),
+                        in_history = session_tool_ids.contains(&tool_call_id),
+                        "exec_pool: injecting result into session"
+                    );
+
+                    // If ToolUse is not in history, inject a synthetic one first
+                    if !session_tool_ids.contains(&tool_call_id) {
+                        tracing::warn!(
+                            task_id = %result.task_id,
+                            tool_call_id = %tool_call_id,
+                            command = %result.command,
+                            "exec_pool: ToolUse not found in history, injecting synthetic ToolUse"
+                        );
+                        // Inject synthetic ToolUse (assistant message)
+                        sess.push(Message {
+                            role: Role::Assistant,
+                            content: MessageContent::Parts(vec![
+                                ContentPart::ToolUse {
+                                    id: tool_call_id.clone(),
+                                    name: "exec".to_owned(),
+                                    input: serde_json::json!({
+                                        "command": result.command,
+                                        "_synthetic": true,
+                                        "_note": "Background exec from previous session (ToolUse reconstructed for context)"
+                                    }),
+                                },
+                            ]),
+                        });
+                    }
+
+                    let is_error = result.exit_code.map(|c| c != 0).unwrap_or(true);
+                    let content = serde_json::json!({
+                        "exit_code": result.exit_code,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                    }).to_string();
+                    tracing::debug!(
+                        tool_call_id = %tool_call_id,
+                        is_error = is_error,
+                        content_len = content.len(),
+                        "exec_pool: pushing ToolResult message"
+                    );
+                    sess.push(Message {
+                        role: Role::Tool,
+                        content: MessageContent::Parts(vec![
+                            crate::provider::ContentPart::ToolResult {
+                                tool_use_id: tool_call_id,
+                                content,
+                                is_error: Some(is_error),
+                            },
+                        ]),
+                    });
+                }
+            }
+        }
 
         // On-demand skill injection: match user text against skill
         // descriptions and inject full prompt for relevant skills.
@@ -4231,7 +4434,7 @@ impl AgentRuntime {
             }
             "read_file" | "read" => return self.tool_read(args).await,
             "write_file" | "write" => return self.tool_write(args).await,
-            "execute_command" | "exec" => return self.tool_exec(args).await,
+            "execute_command" | "exec" => return self.tool_exec(ctx, _id, args).await,
             "install_tool" | "tool_install" => return self.tool_install(args).await,
             "list_dir" => return self.tool_list_dir(args).await,
             "search_file" => return self.tool_search_file(args).await,
@@ -5507,8 +5710,32 @@ impl AgentRuntime {
         }
     }
 
-    async fn tool_exec(&self, args: Value) -> Result<Value> {
-        tracing::debug!(?args, "tool_exec called");
+    async fn tool_exec(&self, ctx: &RunContext, tool_call_id: &str, args: Value) -> Result<Value> {
+        tracing::info!(
+            session_key = %ctx.session_key,
+            tool_call_id = %tool_call_id,
+            args = ?args,
+            "tool_exec: called"
+        );
+
+        // Check if this is a poll request for an existing task
+        if let Some(task_id) = args["task_id"].as_str() {
+            tracing::info!(
+                session_key = %ctx.session_key,
+                task_id = %task_id,
+                "tool_exec: polling existing task"
+            );
+            return self.exec_poll_task(task_id).await;
+        }
+
+        // Get wait parameter - if true, execute synchronously and block until completion
+        let wait = args["wait"].as_bool().unwrap_or(false);
+        tracing::debug!(
+            session_key = %ctx.session_key,
+            wait = wait,
+            "tool_exec: wait parameter"
+        );
+
         // Accept both "command" (rsclaw native) and "cmd"+"args" (preparse/openclaw format).
         let command = if let Some(cmd) = args["command"].as_str() {
             cmd.to_owned()
@@ -5538,7 +5765,7 @@ impl AgentRuntime {
                 format!("{cmd} {cmd_args}")
             }
         } else {
-            bail!("exec: `command` required");
+            bail!("exec: `command` required (or use `task_id` to poll an existing task)");
         };
         let command = command.as_str();
 
@@ -5647,24 +5874,30 @@ impl AgentRuntime {
             }
         }
 
-        tracing::info!(cwd = %workspace.display(), command = %command, "exec: executing");
+        tracing::info!(cwd = %workspace.display(), command = %command, "exec: spawning in background");
 
-        // Timeout priority: tool call arg > config > default 30s.
-        // The model can pass a timeout parameter for long-running commands.
-        let config_timeout = self
+        // Timeout for exec commands (default 1800s = 30 min, matching openclaw).
+        let timeout_secs = self
             .config
             .ext
             .tools
             .as_ref()
             .and_then(|t| t.exec.as_ref())
             .and_then(|e| e.timeout_seconds)
-            .unwrap_or(30);
-        let timeout_secs = args["timeout"]
-            .as_u64()
-            .map(|t| t.min(300)) // cap at 5 min from model, config can go higher
-            .unwrap_or(config_timeout);
+            .unwrap_or(1800);
 
-        let mut cmd = tokio::process::Command::new(shell);
+        // Generate unique task ID
+        let task_id = format!(
+            "exec-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().to_string()[..8].to_owned()
+        );
+
+        // If wait=true, execute synchronously and return result immediately
+        if wait {
+            tracing::info!(cwd = %workspace.display(), command = %command, task_id = %task_id, "exec: executing synchronously (wait=true)");
+
+            let mut cmd = tokio::process::Command::new(shell);
         // Prepend ~/.rsclaw/tools/* to PATH so locally installed tools are found first.
         let tools_base = crate::config::loader::base_dir().join("tools");
         if tools_base.exists() {
@@ -5700,20 +5933,6 @@ impl AgentRuntime {
             const CREATE_NO_WINDOW: u32 = 0x08000000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
-        // Background mode: spawn and return immediately (for long-running services).
-        let background = args["background"].as_bool().unwrap_or(false);
-        if background {
-            let child = cmd.spawn()
-                .map_err(|e| anyhow!("exec background `{command}`: {e}"))?;
-            let pid = child.id().unwrap_or(0);
-            tracing::info!(command = %command, pid, "exec: started in background");
-            return Ok(json!({
-                "pid": pid,
-                "status": "running in background",
-                "note": "Process started. Use execute_command to check or kill it later (e.g. 'kill <pid>')."
-            }));
-        }
-
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             cmd.output()
@@ -5722,7 +5941,8 @@ impl AgentRuntime {
         .map_err(|_| {
             tracing::warn!(command = %command, timeout_secs, "exec: timed out");
             anyhow!(
-                "Command timed out after {timeout_secs}s. For long-running processes, use background=true."
+                "Command timed out after {} seconds. If this command is expected to take longer, re-run with a higher timeout via config.",
+                timeout_secs
             )
         })?
         .map_err(|e| anyhow!("exec `{command}`: {e}"))?;
@@ -5731,11 +5951,234 @@ impl AgentRuntime {
         let stderr = String::from_utf8_lossy(&output.stderr);
         tracing::info!(cwd = %workspace.display(), command = %command, exit_code = ?output.status.code(), stdout_len = stdout.len(), stderr_len = stderr.len(), "exec: done");
 
-        Ok(json!({
+        return Ok(json!({
+            "task_id": task_id,
             "exit_code": output.status.code(),
             "stdout": stdout,
             "stderr": stderr,
+        }));
+        }
+
+        // Otherwise, spawn in background without blocking
+        tracing::info!(
+            cwd = %workspace.display(),
+            command = %command,
+            task_id = %task_id,
+            timeout_secs = timeout_secs,
+            shell = shell,
+            "exec: spawning background task"
+        );
+
+        // Clone for the spawned task
+        let exec_pool = Arc::clone(&self.exec_pool);
+        let session_key_spawn = ctx.session_key.clone();
+        let tool_call_id_owned = tool_call_id.to_owned();
+        let command_owned = command.to_owned();
+        let workspace_clone = workspace.clone();
+        let shell_owned = shell.to_owned();
+        let shell_args_owned = shell_args.clone();
+        let task_id_clone = task_id.clone();
+
+        tracing::debug!(
+            task_id = %task_id_clone,
+            session_key = %session_key_spawn,
+            tool_call_id = %tool_call_id_owned,
+            "exec: cloned variables for background spawn"
+        );
+
+        // Spawn the command in background without blocking
+        tokio::spawn(async move {
+            tracing::info!(
+                task_id = %task_id_clone,
+                command = %command_owned,
+                "exec_background: spawned task started executing"
+            );
+            let started_at = std::time::Instant::now();
+
+            let exit_code;
+            let stdout;
+            let stderr;
+
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x08000000;
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    tokio::process::Command::new(&shell_owned)
+                        .args(&shell_args_owned)
+                        .arg(&command_owned)
+                        .current_dir(&workspace_clone)
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .kill_on_drop(true)
+                        .output()
+                )
+                .await
+                {
+                    Ok(Ok(output)) => {
+                        exit_code = output.status.code();
+                        stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                        stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                        tracing::info!(
+                            task_id = %task_id_clone,
+                            command = %command_owned,
+                            exit_code = ?exit_code,
+                            stdout_len = stdout.len(),
+                            stderr_len = stderr.len(),
+                            "exec background completed"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        exit_code = None;
+                        stdout = String::new();
+                        stderr = format!("spawn error: {}", e);
+                        tracing::error!(task_id = %task_id_clone, "exec background spawn failed: {}", e);
+                    }
+                    Err(_) => {
+                        exit_code = None;
+                        stdout = String::new();
+                        stderr = format!("timed out after {} seconds", timeout_secs);
+                        tracing::warn!(task_id = %task_id_clone, timeout_secs, "exec background timed out");
+                    }
+                };
+            }
+            #[cfg(not(windows))]
+            {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    tokio::process::Command::new(&shell_owned)
+                        .args(&shell_args_owned)
+                        .arg(&command_owned)
+                        .current_dir(&workspace_clone)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .kill_on_drop(true)
+                        .output()
+                )
+                .await
+                {
+                    Ok(Ok(output)) => {
+                        exit_code = output.status.code();
+                        stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                        stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                        tracing::info!(
+                            task_id = %task_id_clone,
+                            command = %command_owned,
+                            exit_code = ?exit_code,
+                            stdout_len = stdout.len(),
+                            stderr_len = stderr.len(),
+                            "exec background completed"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        exit_code = None;
+                        stdout = String::new();
+                        stderr = format!("spawn error: {}", e);
+                        tracing::error!(task_id = %task_id_clone, "exec background spawn failed: {}", e);
+                    }
+                    Err(_) => {
+                        exit_code = None;
+                        stdout = String::new();
+                        stderr = format!("timed out after {} seconds", timeout_secs);
+                        tracing::warn!(task_id = %task_id_clone, timeout_secs, "exec background timed out");
+                    }
+                };
+            }
+
+            let completed_at = std::time::Instant::now();
+            let elapsed_ms = (completed_at - started_at).as_millis();
+
+            // Store the result for collection on next turn (or poll)
+            tracing::info!(
+                task_id = %task_id_clone,
+                session_key = %session_key_spawn,
+                tool_call_id = %tool_call_id_owned,
+                exit_code = ?exit_code,
+                elapsed_ms = elapsed_ms,
+                "exec_background: storing result in pending queue"
+            );
+            let exec_result = super::exec_pool::ExecResult {
+                task_id: task_id_clone.clone(),
+                tool_call_id: tool_call_id_owned,
+                command: command_owned,
+                exit_code,
+                stdout,
+                stderr,
+                started_at,
+                completed_at,
+            };
+            exec_pool.add_pending_for_session(session_key_spawn, exec_result).await;
+        });
+
+        tracing::info!(
+            task_id = %task_id,
+            session_key = %ctx.session_key,
+            "exec: background task spawned, returning task_id"
+        );
+        let hint = format!("To get result: call exec with the task_id to poll. Example: exec {{\"task_id\": \"{}\"}}", task_id);
+        Ok(json!({
+            "exec_task_id": task_id,
+            "status": "running",
+            "message": "Command started in background. Use exec with task_id to poll status.",
+            "hint": hint
         }))
+    }
+
+    /// Poll the status of a background exec task.
+    /// This is NON-BLOCKING - just checks if result is available.
+    async fn exec_poll_task(&self, task_id: &str) -> Result<Value> {
+        tracing::info!(task_id = %task_id, "exec_poll: checking task status");
+
+        // Check if task is still running
+        let is_running = self.exec_pool.is_running(task_id).await;
+        tracing::debug!(task_id = %task_id, is_running = is_running, "exec_poll: is_running check result");
+
+        if is_running {
+            tracing::info!(task_id = %task_id, "exec_poll: task still running, returning running status");
+            return Ok(json!({
+                "task_id": task_id,
+                "status": "running",
+                "message": "Task is still running. Poll again later to get the result when ready."
+            }));
+        }
+
+        // Try to collect the result
+        tracing::debug!(task_id = %task_id, "exec_poll: task not running, attempting to collect result");
+        let result = self.exec_pool.try_collect_by_task(task_id).await;
+
+        match result {
+            Some(res) => {
+                tracing::info!(
+                    task_id = %task_id,
+                    tool_call_id = %res.tool_call_id,
+                    command = %res.command,
+                    exit_code = ?res.exit_code,
+                    stdout_len = res.stdout.len(),
+                    stderr_len = res.stderr.len(),
+                    elapsed_ms = (res.completed_at - res.started_at).as_millis(),
+                    "exec_poll: task completed, returning result"
+                );
+                Ok(json!({
+                    "task_id": task_id,
+                    "status": "completed",
+                    "exit_code": res.exit_code,
+                    "stdout": res.stdout,
+                    "stderr": res.stderr,
+                }))
+            }
+            None => {
+                // Task not found - might have been collected already or never existed
+                Ok(json!({
+                    "task_id": task_id,
+                    "status": "not_found",
+                    "message": "Task not found. It may have already been collected (check previous messages) or never existed."
+                }))
+            }
+        }
     }
 
     /// Build a full system prompt for a sub-agent by combining the shared base
@@ -10500,7 +10943,8 @@ fn build_tool_list(
              - Dates: Get-Date -Format 'yyyy-MM-dd'; [DateTimeOffset]::Now.ToUnixTimeSeconds()\n\
              - Do NOT wrap commands in extra cmd /c or powershell -Command layers.\n\
              - Do NOT use exec for destructive operations on personal directories (Desktop, Downloads, Documents).\n\
-             - For long-running processes (servers, watchers): use background=true to start without blocking.\n\
+             - For long-running processes (servers, watchers): use wait=false (default) to start without blocking.\n\
+             - After starting a background task, poll for results using task_id parameter.\n\
              - If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user."
                 .to_owned()
         } else if cfg!(target_os = "macos") {
@@ -10522,10 +10966,10 @@ fn build_tool_list(
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Shell command to execute. Must be valid for the current OS."},
-                "timeout": {"type": "integer", "description": "Timeout in seconds (default: 30, max: 300)"},
-                "background": {"type": "boolean", "description": "Run in background (for servers/long-running processes). Returns PID immediately. Default: false."}
+                "wait": {"type": "boolean", "description": "If true, block until command completes and return result immediately. If false (default), run in background and return task_id. Use wait=true when you need the result to decide next steps."},
+                "task_id": {"type": "string", "description": "Task ID to poll/check status (from a previous background exec). Returns result if completed, or 'running' status if still in progress."}
             },
-            "required": ["command"]
+            "required": []
         }),
     });
     tools.push(ToolDef {
