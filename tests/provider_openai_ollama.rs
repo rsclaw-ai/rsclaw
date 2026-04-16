@@ -82,7 +82,8 @@ async fn non_reasoning_model_routes_to_v1_completions() {
     init_tls();
     let server = MockServer::start().await;
 
-    // Mount on /v1/chat/completions (OpenAI-compatible path)
+    // Mount on /v1/chat/completions (OpenAI-compatible path).
+    // Provider gets base_url with /v1 suffix so it uses the OAI-compat path.
     let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi from llama\"},\"index\":0}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}]}\n\ndata: [DONE]\n\n";
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -94,7 +95,7 @@ async fn non_reasoning_model_routes_to_v1_completions() {
         .mount(&server)
         .await;
 
-    let provider = OpenAiProvider::ollama(&server.uri(), None);
+    let provider = OpenAiProvider::ollama(format!("{}/v1", server.uri()), None);
     let stream = provider
         .stream(simple_request("llama3:8b"))
         .await

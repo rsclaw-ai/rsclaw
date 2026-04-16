@@ -155,7 +155,7 @@ pub fn openai_sse_body(events: &[OpenAiEvent]) -> String {
 pub async fn mount_openai_stream(server: &MockServer, events: &[OpenAiEvent]) {
     let body = openai_sse_body(events);
     Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
+        .and(path("/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(body)
@@ -175,7 +175,7 @@ pub async fn mount_openai_json(server: &MockServer, content: &str) {
         }]
     });
     Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
+        .and(path("/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(&body)
