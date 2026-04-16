@@ -19,7 +19,7 @@ pub(crate) fn toolset_allowed_names(
     custom_tools: Option<&Vec<String>>,
 ) -> Option<std::collections::HashSet<String>> {
     const MINIMAL: &[&str] = &["execute_command", "read_file", "write_file", "send_file", "list_dir", "search_file", "search_content", "web_search", "web_fetch", "memory"];
-    const WEB: &[&str] = &["web_search", "web_fetch", "web_browser", "web_download", "read_file", "write_file", "list_dir", "search_file", "memory"];
+    const WEB: &[&str] = &["web_search", "web_fetch", "web_download", "read_file", "write_file", "list_dir", "search_file", "memory"];
     const CODE: &[&str] = &["execute_command", "read_file", "write_file", "list_dir", "search_file", "search_content", "memory"];
     const STANDARD: &[&str] = &[
         "execute_command",
@@ -332,6 +332,7 @@ pub(crate) fn build_tool_list(
             2. `snapshot` — get page content with interactive element refs (@e1, @e2...)\n\
             3. `click` ref=@e1 / `fill` ref=@e2 text='...' — interact using refs from snapshot\n\
             4. Re-snapshot after any page change to get updated refs\n\
+            Quick search: `search` — auto-find search box on ANY site, fill text, submit, return results. Use this for site-specific searches (Douyin, Taobao, JD, etc.).\n\
             Other actions: type, select, check, scroll, screenshot, pdf, press, back, forward, reload, wait, evaluate, cookies, get_text, get_url, get_title, find, get_article, upload, new_tab, switch_tab, close_tab.\n\
             IMPORTANT: Always snapshot BEFORE clicking/filling. Element refs change after page updates.".to_owned(),
         parameters: json!({
@@ -344,7 +345,8 @@ pub(crate) fn build_tool_list(
                     "wait", "evaluate", "cookies", "press", "set_viewport",
                     "dialog", "state", "network", "new_tab", "list_tabs",
                     "switch_tab", "close_tab", "highlight", "clipboard", "find",
-                    "get_article", "upload", "context", "emulate", "diff", "record"
+                    "get_article", "upload", "context", "emulate", "diff", "record",
+                    "search"
                 ]},
                 "url":        {"type": "string", "description": "URL for open/navigate"},
                 "ref":        {"type": "string", "description": "Element ref like @e3 from snapshot"},

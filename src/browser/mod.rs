@@ -727,6 +727,7 @@ impl BrowserSession {
             "emulate" => self.cmd_emulate(args).await,
             "diff" => self.cmd_diff(args).await,
             "record" => self.cmd_record(args).await,
+            "search" => self.cmd_search(args).await,
             other => Err(anyhow!("web_browser: unsupported action `{other}`")),
         };
 
@@ -1956,6 +1957,169 @@ impl BrowserSession {
             }
             _ => Err(anyhow!("record: use start/stop/status"))
         }
+    }
+
+    /// Universal site search: navigate to a URL, auto-detect search input,
+    /// fill query text, submit, and return the page text.
+    ///
+    /// Works on any site (Douyin, Taobao, JD, Xiaohongshu, Baidu, Google, etc.)
+    /// by probing common search input patterns.
+    async fn cmd_search(&mut self, args: &Value) -> Result<Value> {
+        let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        let text = args.get("text").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("search: `text` required"))?;
+        let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(15);
+
+        // Navigate to the target site if URL provided.
+        if !url.is_empty() {
+            self.cmd_open(&json!({"url": url})).await?;
+            // Wait for page to be interactive.
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+
+        let escaped_text = escape_js_string(text);
+
+        // Auto-detect search input, fill, and submit.
+        let search_js = format!(r#"(function() {{
+            // Priority-ordered selectors for search inputs.
+            var selectors = [
+                'input[type="search"]',
+                'input[name="q"]',
+                'input[name="query"]',
+                'input[name="keyword"]',
+                'input[name="wd"]',
+                'input[name="search"]',
+                'input[name="kw"]',
+                'input[name="key"]',
+                'input[name="text"]',
+                'input[aria-label*="search" i]',
+                'input[aria-label*="搜索" i]',
+                'input[placeholder*="search" i]',
+                'input[placeholder*="搜索" i]',
+                'input[placeholder*="查找" i]',
+                'input[placeholder*="输入" i]',
+                'textarea[name="q"]',
+                'textarea[name="query"]',
+                'input[type="text"][class*="search" i]',
+                'input[type="text"][id*="search" i]',
+                'input[type="text"][class*="query" i]',
+                'input[type="text"][id*="query" i]',
+                'input[type="text"][id*="kw"]',
+                'input[type="text"]'
+            ];
+
+            var input = null;
+            for (var i = 0; i < selectors.length; i++) {{
+                var el = document.querySelector(selectors[i]);
+                if (el && el.offsetParent !== null) {{
+                    input = el;
+                    break;
+                }}
+            }}
+
+            if (!input) {{
+                return JSON.stringify({{ok: false, error: 'no search input found'}});
+            }}
+
+            // Focus and fill.
+            input.focus();
+            input.value = '';
+            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value'
+            )?.set || Object.getOwnPropertyDescriptor(
+                window.HTMLTextAreaElement.prototype, 'value'
+            )?.set;
+            if (nativeInputValueSetter) {{
+                nativeInputValueSetter.call(input, '{escaped_text}');
+            }} else {{
+                input.value = '{escaped_text}';
+            }}
+            input.dispatchEvent(new Event('input', {{bubbles: true}}));
+            input.dispatchEvent(new Event('change', {{bubbles: true}}));
+
+            // Try to find and click submit button.
+            var submitted = false;
+            var btnSelectors = [
+                'button[type="submit"]',
+                'input[type="submit"]',
+                'button[class*="search" i]',
+                'button[class*="submit" i]',
+                'button[aria-label*="search" i]',
+                'button[aria-label*="搜索" i]',
+                'a[class*="search" i][href*="search"]',
+                '.search-btn',
+                '.btn-search',
+                '#search-btn',
+                '#su'
+            ];
+
+            // Also check buttons near the input.
+            var form = input.closest('form');
+            if (form) {{
+                var formBtn = form.querySelector('button, input[type="submit"]');
+                if (formBtn) {{
+                    formBtn.click();
+                    submitted = true;
+                }}
+            }}
+
+            if (!submitted) {{
+                for (var j = 0; j < btnSelectors.length; j++) {{
+                    var btn = document.querySelector(btnSelectors[j]);
+                    if (btn && btn.offsetParent !== null) {{
+                        btn.click();
+                        submitted = true;
+                        break;
+                    }}
+                }}
+            }}
+
+            // Fallback: press Enter on the input.
+            if (!submitted) {{
+                input.dispatchEvent(new KeyboardEvent('keydown', {{key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true}}));
+                input.dispatchEvent(new KeyboardEvent('keyup', {{key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true}}));
+                // Also try form submit.
+                if (form) {{
+                    try {{ form.submit(); }} catch(e) {{}}
+                }}
+            }}
+
+            return JSON.stringify({{ok: true, submitted: submitted, selector: input.tagName + (input.name ? '[name=' + input.name + ']' : '')}});
+        }})()"#);
+
+        let result = self.cdp.send("Runtime.evaluate", json!({
+            "expression": search_js,
+            "returnByValue": true,
+        })).await?;
+
+        let result_str = result["result"]["value"].as_str().unwrap_or("{}");
+        let parsed: Value = serde_json::from_str(result_str).unwrap_or_default();
+
+        if parsed["ok"].as_bool() != Some(true) {
+            let err = parsed["error"].as_str().unwrap_or("unknown error");
+            return Ok(json!({"action": "search", "ok": false, "error": err}));
+        }
+
+        // Wait for results page to load.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(timeout),
+            self.cdp.wait_event("Page.loadEventFired", timeout),
+        ).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // Return page text content.
+        let page_text = self.cmd_get_text().await?;
+        let page_url = self.cmd_get_url().await?;
+        let page_title = self.cmd_get_title().await?;
+
+        Ok(json!({
+            "action": "search",
+            "ok": true,
+            "url": page_url["url"],
+            "title": page_title["title"],
+            "text": page_text["text"],
+            "input": parsed["selector"],
+        }))
     }
 }
 
