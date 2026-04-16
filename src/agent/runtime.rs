@@ -2437,11 +2437,11 @@ impl AgentRuntime {
         }
 
         // Dynamic iteration limit based on task complexity.
-        // Default: 100 iterations. Complex tools (browser/opencode/exec): up to configured max.
-        const BASE_ITERATIONS: usize = 100;
+        // Default: 15 iterations. Complex tools (browser/opencode/exec): up to configured max.
+        const BASE_ITERATIONS: usize = 20;
         let configured_complex: usize = self.config.agents.defaults.max_iterations
             .map(|v| v as usize)
-            .unwrap_or(500);
+            .unwrap_or(50);
         let mut max_iterations = BASE_ITERATIONS;
         let mut iteration = 0usize;
 
