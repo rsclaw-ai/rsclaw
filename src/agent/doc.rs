@@ -227,6 +227,13 @@ fn create_word(args: &Value, path: &Path) -> Result<Value> {
     let title = args["title"].as_str().unwrap_or("");
     let content = args["content"].as_str().unwrap_or("");
 
+    if content.is_empty() && title.is_empty() {
+        return Ok(json!({
+            "error": "create_word requires 'content' parameter. Please provide the text content to write into the document.",
+            "hint": "Retry with: {\"action\": \"create_word\", \"path\": \"file.docx\", \"content\": \"your text here\"}"
+        }));
+    }
+
     let mut docx = Docx::new();
 
     // Title paragraph.
@@ -289,6 +296,13 @@ fn create_word(args: &Value, path: &Path) -> Result<Value> {
 fn create_pdf(args: &Value, path: &Path) -> Result<Value> {
     let title = args["title"].as_str().unwrap_or("");
     let content = args["content"].as_str().unwrap_or("");
+
+    if content.is_empty() && title.is_empty() {
+        return Ok(json!({
+            "error": "create_pdf requires 'content' parameter. Please provide the text content to write into the document.",
+            "hint": "Retry with: {\"action\": \"create_pdf\", \"path\": \"file.pdf\", \"content\": \"your text here\"}"
+        }));
+    }
 
     // Try platform font directories. genpdf expects {Name}-Regular.ttf naming.
     let font = find_font_family().context("no usable fonts found for PDF generation")?;
