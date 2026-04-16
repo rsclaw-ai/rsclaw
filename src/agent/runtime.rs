@@ -779,7 +779,9 @@ impl AgentRuntime {
         Ok(serde_json::json!({
             "output": crate::i18n::t_fmt("acp_queued", lang, &[("name", "OpenCode")]),
             "status": "submitted",
-            "session_id": session_id_clone
+            "session_id": session_id_clone,
+            "message": "Task submitted to OpenCode. It is running in background. DO NOT submit again - wait for the completion notification. You can continue with other tasks while waiting.",
+            "note": "The result will be delivered automatically when OpenCode completes. No need to poll or resubmit."
         }))
     }
 
@@ -1241,7 +1243,9 @@ impl AgentRuntime {
         Ok(serde_json::json!({
             "output": crate::i18n::t_fmt("acp_queued", lang, &[("name", "Claude Code")]),
             "status": "submitted",
-            "session_id": session_id_clone
+            "session_id": session_id_clone,
+            "message": "Task submitted to Claude Code. It is running in background. DO NOT submit again - wait for the completion notification. You can continue with other tasks while waiting.",
+            "note": "The result will be delivered automatically when Claude Code completes. No need to poll or resubmit."
         }))
     }
 
