@@ -19,15 +19,37 @@ pub(crate) fn detect_chrome() -> Option<String> {
     // 1. Check locally installed via `rsclaw tools install chrome` (highest priority)
     let tools_dir = crate::config::loader::base_dir().join("tools/chrome");
     if tools_dir.exists() {
-        #[cfg(target_os = "windows")]
-        let bin = tools_dir.join("chrome.exe");
+        // Try multiple known app bundle names (Chrome for Testing, Chromium, etc.)
         #[cfg(target_os = "macos")]
-        let bin = tools_dir.join("Chromium.app/Contents/MacOS/Chromium");
+        {
+            let candidates = [
+                "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "Chromium.app/Contents/MacOS/Chromium",
+                "Google Chrome.app/Contents/MacOS/Google Chrome",
+            ];
+            for name in &candidates {
+                let bin = tools_dir.join(name);
+                if bin.exists() {
+                    return Some(bin.to_string_lossy().to_string());
+                }
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let candidates = ["chrome.exe", "Google Chrome for Testing.exe"];
+            for name in &candidates {
+                let bin = tools_dir.join(name);
+                if bin.exists() {
+                    return Some(bin.to_string_lossy().to_string());
+                }
+            }
+        }
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        let bin = tools_dir.join("chrome");
-
-        if bin.exists() {
-            return Some(bin.to_string_lossy().to_string());
+        {
+            let bin = tools_dir.join("chrome");
+            if bin.exists() {
+                return Some(bin.to_string_lossy().to_string());
+            }
         }
     }
 
