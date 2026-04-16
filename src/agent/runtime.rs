@@ -8969,24 +8969,30 @@ $synth.Speak('{}')
             .as_str()
             .ok_or_else(|| anyhow!("cron: `action` required"))?;
 
-        let cron_dir = crate::config::loader::base_dir();
-        let cron_path = cron_dir.join("cron").join("jobs.json");
+        // Use the same path resolution as CLI cron commands (for write operations)
+        let _cron_path = crate::cron::resolve_cron_store_path();
 
         match action {
             "list" => {
-                let jobs = read_cron_jobs(&cron_path).await;
-                // Add 1-based index to each job for easier reference by LLMs
-                let jobs_with_index: Vec<Value> = jobs
+                // Use load_cron_jobs() to check multiple paths (same as CLI)
+                let jobs = crate::cron::load_cron_jobs();
+                // Return simplified list to avoid truncation in IM channels
+                let jobs_summary: Vec<Value> = jobs
                     .iter()
                     .enumerate()
                     .map(|(i, j)| {
-                        let mut indexed = j.clone();
-                        indexed["_index"] = json!(i + 1);
-                        indexed
+                        json!({
+                            "_index": i + 1,
+                            "id": j.id,
+                            "name": j.name.as_deref().unwrap_or(""),
+                            "enabled": j.enabled,
+                            "schedule": j.schedule.expr(),
+                            "agent_id": j.agent_id,
+                        })
                     })
                     .collect();
                 Ok(
-                    json!({"jobs": jobs_with_index, "hint": "Use index number (#1, #2, etc.) for removal to avoid ID truncation issues"}),
+                    json!({"jobs": jobs_summary, "count": jobs.len(), "hint": "Use index number (#1, #2, etc.) for edit/remove to avoid ID truncation issues"}),
                 )
             }
             "add" => {
@@ -9000,31 +9006,47 @@ $synth.Speak('{}')
                 let tz = args["tz"].as_str();
                 let agent_id = args["agent_id"].as_str().or(args["agentId"].as_str());
 
-                let mut jobs = read_cron_jobs(&cron_path).await;
+                // Use load_cron_jobs() to get existing jobs
+                let jobs = crate::cron::load_cron_jobs();
 
                 let now_ms = Utc::now().timestamp_millis() as u64;
                 let id = Uuid::new_v4().to_string();
-                let mut job = json!({
-                    "id": id,
-                    "agentId": agent_id.unwrap_or("main"),
-                    "enabled": true,
-                    "createdAtMs": now_ms,
-                    "updatedAtMs": now_ms,
-                });
-                // Schedule: use nested format if tz provided, flat otherwise.
-                if let Some(tz_val) = tz {
-                    job["schedule"] = json!({"kind": "cron", "expr": schedule, "tz": tz_val});
-                } else {
-                    job["schedule"] = json!({"kind": "cron", "expr": schedule});
-                }
-                // Payload in OpenClaw format.
-                job["payload"] = json!({"kind": "systemEvent", "text": message});
-                if let Some(n) = name {
-                    job["name"] = json!(n);
-                }
+                let job = crate::cron::CronJob {
+                    id: id.clone(),
+                    name: name.map(|n| n.to_owned()),
+                    agent_id: agent_id.unwrap_or("main").to_owned(),
+                    session_key: None,
+                    enabled: true,
+                    schedule: if let Some(tz_val) = tz {
+                        crate::cron::CronSchedule::Nested {
+                            kind: Some("cron".to_owned()),
+                            expr: schedule.to_owned(),
+                            tz: Some(tz_val.to_owned()),
+                        }
+                    } else {
+                        crate::cron::CronSchedule::Nested {
+                            kind: Some("cron".to_owned()),
+                            expr: schedule.to_owned(),
+                            tz: None,
+                        }
+                    },
+                    payload: Some(crate::cron::CronPayload::Structured {
+                        kind: Some("systemEvent".to_owned()),
+                        text: Some(message.to_owned()),
+                        timeout_seconds: None,
+                    }),
+                    message: Some(message.to_owned()),
+                    delivery: None,
+                    session_target: None,
+                    wake_mode: None,
+                    state: None,
+                    created_at_ms: Some(now_ms),
+                    updated_at_ms: Some(now_ms),
+                };
 
-                jobs.push(job);
-                write_cron_jobs(&cron_path, &jobs).await?;
+                let mut jobs_vec = jobs;
+                jobs_vec.push(job);
+                crate::cron::save_cron_jobs(&jobs_vec)?;
 
                 // Notify gateway to reload cron jobs
                 let port = self.config.gateway.port;
@@ -9041,7 +9063,8 @@ $synth.Speak('{}')
                 Ok(json!({"added": id, "schedule": schedule, "message": message}))
             }
             "remove" => {
-                let mut jobs = read_cron_jobs(&cron_path).await;
+                // Use load_cron_jobs() to get existing jobs
+                let mut jobs = crate::cron::load_cron_jobs();
 
                 // Support both `id` and `index` parameters (prefer index for reliability)
                 let removed_job = if let Some(index) = args["index"].as_u64() {
@@ -9055,16 +9078,16 @@ $synth.Speak('{}')
                         ));
                     }
                     let job = jobs.remove(idx - 1);
-                    write_cron_jobs(&cron_path, &jobs).await?;
-                    job
+                    crate::cron::save_cron_jobs(&jobs)?;
+                    serde_json::to_value(&job).unwrap_or_default()
                 } else if let Some(id) = args["id"].as_str() {
                     let before = jobs.len();
-                    jobs.retain(|j| j["id"].as_str() != Some(id));
+                    jobs.retain(|j| j.id != id);
                     let removed = before - jobs.len();
                     if removed == 0 {
                         return Err(anyhow!("cron remove: job not found with id={}", id));
                     }
-                    write_cron_jobs(&cron_path, &jobs).await?;
+                    crate::cron::save_cron_jobs(&jobs)?;
                     json!({"id": id, "count": removed})
                 } else {
                     return Err(anyhow!(
@@ -9088,7 +9111,8 @@ $synth.Speak('{}')
             }
             "enable" | "disable" => {
                 let enabled = action == "enable";
-                let mut jobs = read_cron_jobs(&cron_path).await;
+                // Use load_cron_jobs() to get existing jobs
+                let mut jobs = crate::cron::load_cron_jobs();
 
                 let idx = if let Some(index) = args["index"].as_u64() {
                     let idx = index as usize;
@@ -9100,7 +9124,7 @@ $synth.Speak('{}')
                     }
                     idx - 1
                 } else if let Some(id) = args["id"].as_str() {
-                    match jobs.iter().position(|j| j["id"].as_str() == Some(id)) {
+                    match jobs.iter().position(|j| j.id == id) {
                         Some(pos) => pos,
                         None => return Err(anyhow!("cron {}: job not found with id={}", action, id)),
                     }
@@ -9111,10 +9135,10 @@ $synth.Speak('{}')
                     ));
                 };
 
-                let id = jobs[idx]["id"].as_str().unwrap_or("?").to_string();
-                jobs[idx]["enabled"] = json!(enabled);
-                jobs[idx]["updatedAtMs"] = json!(Utc::now().timestamp_millis() as u64);
-                write_cron_jobs(&cron_path, &jobs).await?;
+                let job_id = jobs[idx].id.clone();
+                jobs[idx].enabled = enabled;
+                jobs[idx].updated_at_ms = Some(Utc::now().timestamp_millis() as u64);
+                crate::cron::save_cron_jobs(&jobs)?;
 
                 // Notify gateway to reload cron jobs
                 let port = self.config.gateway.port;
@@ -9128,10 +9152,11 @@ $synth.Speak('{}')
                     debug!(err = %e, "cron {}: failed to notify gateway reload", action);
                 }
 
-                Ok(json!({action: id}))
+                Ok(json!({action: job_id}))
             }
             "edit" => {
-                let mut jobs = read_cron_jobs(&cron_path).await;
+                // Use load_cron_jobs() to get existing jobs
+                let mut jobs = crate::cron::load_cron_jobs();
 
                 let idx = if let Some(index) = args["index"].as_u64() {
                     let idx = index as usize;
@@ -9143,7 +9168,7 @@ $synth.Speak('{}')
                     }
                     idx - 1
                 } else if let Some(id) = args["id"].as_str() {
-                    match jobs.iter().position(|j| j["id"].as_str() == Some(id)) {
+                    match jobs.iter().position(|j| j.id == id) {
                         Some(pos) => pos,
                         None => return Err(anyhow!("cron edit: job not found with id={}", id)),
                     }
@@ -9153,26 +9178,39 @@ $synth.Speak('{}')
                     ));
                 };
 
-                let id = jobs[idx]["id"].as_str().unwrap_or("?").to_string();
+                let job_id = jobs[idx].id.clone();
                 if let Some(schedule) = args["schedule"].as_str() {
                     let tz = args["tz"].as_str();
                     if let Some(tz_val) = tz {
-                        jobs[idx]["schedule"] = json!({"kind": "cron", "expr": schedule, "tz": tz_val});
+                        jobs[idx].schedule = crate::cron::CronSchedule::Nested {
+                            kind: Some("cron".to_owned()),
+                            expr: schedule.to_owned(),
+                            tz: Some(tz_val.to_owned()),
+                        };
                     } else {
-                        jobs[idx]["schedule"] = json!({"kind": "cron", "expr": schedule});
+                        jobs[idx].schedule = crate::cron::CronSchedule::Nested {
+                            kind: Some("cron".to_owned()),
+                            expr: schedule.to_owned(),
+                            tz: None,
+                        };
                     }
                 }
                 if let Some(message) = args["message"].as_str() {
-                    jobs[idx]["payload"] = json!({"kind": "systemEvent", "text": message});
+                    jobs[idx].payload = Some(crate::cron::CronPayload::Structured {
+                        kind: Some("systemEvent".to_owned()),
+                        text: Some(message.to_owned()),
+                        timeout_seconds: None,
+                    });
+                    jobs[idx].message = Some(message.to_owned());
                 }
                 if let Some(name) = args["name"].as_str() {
-                    jobs[idx]["name"] = json!(name);
+                    jobs[idx].name = Some(name.to_owned());
                 }
                 if let Some(agent_id) = args["agentId"].as_str().or(args["agent_id"].as_str()) {
-                    jobs[idx]["agentId"] = json!(agent_id);
+                    jobs[idx].agent_id = agent_id.to_owned();
                 }
-                jobs[idx]["updatedAtMs"] = json!(Utc::now().timestamp_millis() as u64);
-                write_cron_jobs(&cron_path, &jobs).await?;
+                jobs[idx].updated_at_ms = Some(Utc::now().timestamp_millis() as u64);
+                crate::cron::save_cron_jobs(&jobs)?;
 
                 // Notify gateway to reload cron jobs
                 let port = self.config.gateway.port;
@@ -9186,44 +9224,13 @@ $synth.Speak('{}')
                     debug!(err = %e, "cron edit: failed to notify gateway reload");
                 }
 
-                Ok(json!({"edited": id}))
+                Ok(json!({"edited": job_id}))
             }
             other => Err(anyhow!(
                 "cron: unsupported action `{other}` (list, add, edit, remove, enable, disable)"
             )),
         }
     }
-}
-
-/// Read cron jobs from the OpenClaw-compatible jobs.json file.
-/// Handles both bare array `[...]` and wrapped `{"version":1,"jobs":[...]}` formats.
-async fn read_cron_jobs(path: &std::path::Path) -> Vec<Value> {
-    let data = tokio::fs::read_to_string(path)
-        .await
-        .unwrap_or_else(|_| "[]".to_owned());
-    // Try wrapped format first.
-    if let Ok(wrapper) = serde_json::from_str::<Value>(&data) {
-        if let Some(jobs) = wrapper.get("jobs").and_then(|v| v.as_array()) {
-            return jobs.clone();
-        }
-        // Fall through to try as bare array.
-        if let Some(arr) = wrapper.as_array() {
-            return arr.clone();
-        }
-    }
-    Vec::new()
-}
-
-/// Write cron jobs in OpenClaw-compatible format: {"version":1,"jobs":[...]}.
-async fn write_cron_jobs(path: &std::path::Path, jobs: &[Value]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-    let wrapper = json!({"version": 1, "jobs": jobs});
-    tokio::fs::write(path, serde_json::to_string_pretty(&wrapper)?)
-        .await
-        .map_err(|e| anyhow!("cron: failed to write jobs: {e}"))?;
-    Ok(())
 }
 
 impl AgentRuntime {
