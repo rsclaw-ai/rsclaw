@@ -111,7 +111,7 @@ impl MemoryDoc {
         let base_half_life: f32 = 30.0;
         let importance_mod: f32 = 1.5;
         let effective_hl = base_half_life * (importance_mod * self.importance).exp().min(10.0);
-        let lambda = 0.693_147_2_f32 / effective_hl; // ln(2)
+        let lambda = std::f32::consts::LN_2 / effective_hl;
         let recency = (-lambda * age_days.powf(beta)).exp();
 
         // Frequency component
