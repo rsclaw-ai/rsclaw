@@ -110,12 +110,15 @@ pub(crate) fn build_tool_list(
         name: "write_file".to_owned(),
         description: "Write/create a file. Use this for ALL file creation and writing — do NOT use execute_command with notepad, echo, or any other editor/command to create files.\n\
             Creates parent directories as needed. Path is relative to workspace root.\n\
-            Both 'path' and 'content' are required.".to_owned(),
+            Both 'path' and 'content' are required.\n\
+            CRITICAL: When writing user-provided content, copy it EXACTLY character-by-character. \
+            Never omit, rephrase, or regenerate numbers, dates, addresses, names, or any specific values. \
+            If the user said '135号168栋', the content MUST contain '135号168栋' exactly.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "path":    {"type": "string", "description": "Relative file path within the workspace (REQUIRED). Example: 'output.py'"},
-                "content": {"type": "string", "description": "File content to write (REQUIRED)."}
+                "content": {"type": "string", "description": "File content to write (REQUIRED). MUST preserve all numbers, dates, and specific values from the user's message exactly as given."}
             },
             "required": ["path", "content"]
         }),
