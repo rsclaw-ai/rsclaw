@@ -61,6 +61,10 @@
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
       "timestampUrl": ""
+    },
+    "nsis": {
+      "languages": ["SimpChinese", "English", "TradChinese", "Japanese", "Korean", "French", "German", "Spanish", "Russian", "Thai"],
+      "displayLanguageSelector": false
     }
   },
   "plugins": {
