@@ -6,8 +6,11 @@
 //!   - `session`     — session key derivation + dmScope isolation
 //!   - `hot_reload`  — config file watcher + change event broadcasting
 
+pub mod channels;
 pub mod hot_reload;
 pub mod live_config;
+pub mod preparse;
+pub mod providers;
 pub mod router;
 pub mod session;
 pub mod startup;
