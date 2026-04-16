@@ -97,9 +97,30 @@ pub async fn handle(args: &Value, full_path: &Path) -> Result<Value> {
         .ok_or_else(|| anyhow!("doc: `action` required"))?
         .to_owned();
 
+    // Auto-correct file extension based on action to prevent format mismatch
+    // (e.g. model calls create_word with .txt path → fix to .docx).
+    let path = {
+        let expected_ext = match action.as_str() {
+            "create_excel" | "edit_excel" => Some("xlsx"),
+            "create_word" | "edit_word" => Some("docx"),
+            "create_pdf" | "edit_pdf" => Some("pdf"),
+            "create_ppt" => Some("pptx"),
+            _ => None,
+        };
+        if let Some(ext) = expected_ext {
+            let current = full_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !current.eq_ignore_ascii_case(ext) {
+                full_path.with_extension(ext)
+            } else {
+                full_path.to_path_buf()
+            }
+        } else {
+            full_path.to_path_buf()
+        }
+    };
+
     // All crate operations are synchronous — run on blocking pool.
     let args = args.clone();
-    let path = full_path.to_path_buf();
 
     let result = tokio::task::spawn_blocking(move || match action.as_str() {
         "create_excel" => create_excel(&args, &path),
