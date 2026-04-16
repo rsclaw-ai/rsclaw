@@ -6037,7 +6037,7 @@ impl AgentRuntime {
         // Register task as running BEFORE spawning so is_running() works correctly
         self.exec_pool.register_running(task_id.clone()).await;
 
-        // Clone for the spawned task
+        // Clone for the spawned task - including agent inbox for proactive notification
         let exec_pool = Arc::clone(&self.exec_pool);
         let session_key_spawn = ctx.session_key.clone();
         let tool_call_id_owned = tool_call_id.to_owned();
@@ -6046,6 +6046,11 @@ impl AgentRuntime {
         let shell_owned = shell.to_owned();
         let shell_args_owned = shell_args.clone();
         let task_id_clone = task_id.clone();
+        // Clone agent inbox for proactive result injection
+        let agent_tx = self.handle.tx.clone();
+        let agent_channel = ctx.channel.clone();
+        let agent_peer_id = ctx.peer_id.clone();
+        let agent_chat_id = ctx.chat_id.clone();
 
         tracing::debug!(
             task_id = %task_id_clone,
@@ -6175,17 +6180,73 @@ impl AgentRuntime {
             let exec_result = super::exec_pool::ExecResult {
                 task_id: task_id_clone.clone(),
                 tool_call_id: tool_call_id_owned,
-                command: command_owned,
+                command: command_owned.clone(),
                 exit_code,
-                stdout,
-                stderr,
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
                 started_at,
                 completed_at,
             };
             // Store with session key for automatic injection on next turn
-            exec_pool.add_pending_for_session(session_key_spawn, exec_result.clone()).await;
-            // Also store with task_id key for polling
+            exec_pool.add_pending_for_session(session_key_spawn.clone(), exec_result.clone()).await;
+            // Also store with task_id key for polling (optional)
             exec_pool.add_pending_for_task(&task_id_clone, exec_result).await;
+
+            // PROACTIVE NOTIFICATION: Inject result message into main agent inbox
+            // This triggers a new turn to process the result immediately, no polling needed!
+            tracing::info!(
+                task_id = %task_id_clone,
+                session_key = %session_key_spawn,
+                "exec_background: injecting result into agent inbox for proactive processing"
+            );
+            // Build a concise result summary for injection
+            let result_summary = if exit_code == Some(0) {
+                format!(
+                    "[Background exec completed] task_id={}\ncommand: {}\nexit_code: 0\nstdout ({} chars):\n{}",
+                    task_id_clone,
+                    command_owned,
+                    stdout.len(),
+                    if stdout.len() > 2000 { &stdout[..stdout.char_indices().nth(2000).map(|(i, _)| i).unwrap_or(stdout.len())] } else { &stdout }
+                )
+            } else {
+                format!(
+                    "[Background exec completed] task_id={}\ncommand: {}\nexit_code: {}\nstderr: {}\nstdout: {}",
+                    task_id_clone,
+                    command_owned,
+                    exit_code.unwrap_or(-1),
+                    stderr,
+                    stdout
+                )
+            };
+            // Send to agent inbox - triggers run_turn to process result
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
+            let inject_msg = AgentMessage {
+                session_key: session_key_spawn,
+                text: result_summary,
+                channel: agent_channel,
+                peer_id: agent_peer_id,
+                chat_id: agent_chat_id,
+                reply_tx,
+                extra_tools: vec![],
+                images: vec![],
+                files: vec![],
+            };
+            if agent_tx.send(inject_msg).await.is_ok() {
+                tracing::info!(
+                    task_id = %task_id_clone,
+                    "exec_background: result injected to agent inbox, waiting for processing"
+                );
+                // Wait for agent to process (optional - we just want to trigger the turn)
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    reply_rx
+                ).await;
+            } else {
+                tracing::warn!(
+                    task_id = %task_id_clone,
+                    "exec_background: failed to inject result to agent inbox"
+                );
+            }
         });
 
         tracing::info!(
@@ -6193,12 +6254,13 @@ impl AgentRuntime {
             session_key = %ctx.session_key,
             "exec: background task spawned, returning task_id"
         );
-        let hint = format!("To get result: call exec with the task_id to poll. Example: exec {{\"task_id\": \"{}\"}}", task_id);
+        // NO POLLING NEEDED - result will be proactively injected when task completes
+        // LLM should just continue with other work, result will appear automatically
         Ok(json!({
             "exec_task_id": task_id,
-            "status": "running",
-            "message": "Command started in background. Use exec with task_id to poll status.",
-            "hint": hint
+            "status": "submitted",
+            "message": "Command started in background. Result will be delivered automatically when task completes - no polling needed. Continue with other tasks or wait for the result notification.",
+            "note": "DO NOT poll this task_id. The result will be injected into your next turn automatically."
         }))
     }
 
