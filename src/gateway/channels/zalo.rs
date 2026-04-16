@@ -1,0 +1,380 @@
+use std::{sync::Arc, time::Duration};
+
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
+
+use crate::{
+    agent::{AgentMessage, AgentRegistry},
+    channel::{Channel, OutboundMessage},
+    config::runtime::RuntimeConfig,
+    gateway::session::{MessageKind, SessionKeyParams, derive_session_key},
+};
+
+use super::super::preparse::{
+    btw_direct_call, is_fast_preparse, processing_timeout, send_processing,
+    try_preparse_locally,
+};
+use super::super::startup::handle_pending_analysis;
+use super::default_dm_scope;
+
+pub(crate) fn start_zalo_if_configured(
+    config: &RuntimeConfig,
+    registry: Arc<AgentRegistry>,
+    manager: &mut crate::channel::ChannelManager,
+    zalo_slot: Arc<tokio::sync::OnceCell<Arc<crate::channel::zalo::ZaloChannel>>>,
+    dm_enforcers: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
+    >,
+    redb_store: Arc<crate::store::redb_store::RedbStore>,
+    _channel_senders: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
+    >,
+) {
+    use crate::channel::zalo::ZaloChannel;
+
+    let Some(zalo_cfg) = &config.channel.channels.zalo else {
+        return;
+    };
+    if !zalo_cfg.base.enabled.unwrap_or(true) {
+        return;
+    }
+
+    // Load dmPolicy from config (Zalo is DM-only, no group policy needed).
+    let dm_policy = zalo_cfg
+        .base
+        .dm_policy
+        .clone()
+        .unwrap_or(crate::config::schema::DmPolicy::Pairing);
+    let allow_from: Vec<String> = zalo_cfg.base.allow_from.clone().unwrap_or_default();
+
+    let enforcer = Arc::new(
+        crate::channel::DmPolicyEnforcer::new(dm_policy, allow_from)
+            .with_persistence("zalo", Arc::clone(&redb_store)),
+    );
+    if let Ok(mut enforcers) = dm_enforcers.write() {
+        enforcers.insert("zalo".to_owned(), Arc::clone(&enforcer));
+    }
+
+    // Collect (account_name, access_token) pairs.
+    let mut zalo_accounts: Vec<(String, String)> = Vec::new();
+
+    // Legacy: single token at top level.
+    if let Some(token) = zalo_cfg
+        .access_token
+        .as_ref()
+        .and_then(|t| t.as_plain())
+        .map(str::to_owned)
+        .or_else(|| std::env::var("ZALO_ACCESS_TOKEN").ok())
+    {
+        zalo_accounts.push(("default".to_owned(), token));
+    }
+
+    // Multi-account: channels.zalo.accounts.<name>.accessToken
+    if let Some(accts) = &zalo_cfg.accounts {
+        for (name, acct) in accts {
+            if let Some(t) = acct.get("accessToken").and_then(|v| v.as_str()) {
+                if !zalo_accounts.iter().any(|(_, et)| et == t) {
+                    zalo_accounts.push((name.clone(), t.to_owned()));
+                }
+            }
+        }
+    }
+
+    if zalo_accounts.is_empty() {
+        warn!("ZALO access_token not set, zalo disabled");
+        return;
+    }
+
+    for (acct_name, access_token) in zalo_accounts {
+        let acct_for_log = acct_name.clone();
+        let enforcer = Arc::clone(&enforcer);
+        let reg = Arc::clone(&registry);
+        let cfg_arc = Arc::new(config.clone());
+        let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
+
+        // Per-user inbound queue for Zalo.
+        type ZaloItem = (String, String, Vec<crate::agent::registry::ImageAttachment>);
+        let zalo_user_queues: Arc<
+            tokio::sync::Mutex<std::collections::HashMap<String, mpsc::Sender<ZaloItem>>>,
+        > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+        let on_message = Arc::new(
+            move |sender_id: String,
+                  text: String,
+                  images: Vec<crate::agent::registry::ImageAttachment>| {
+                let reg = Arc::clone(&reg);
+                let cfg = Arc::clone(&cfg_arc);
+                let tx = out_tx.clone();
+                let enforcer = Arc::clone(&enforcer);
+                let queues = Arc::clone(&zalo_user_queues);
+                tokio::spawn(async move {
+                    // DM policy check (Zalo is DM-only).
+                    {
+                        use crate::channel::PolicyResult;
+                        match enforcer.check(&sender_id).await {
+                            PolicyResult::Allow => {}
+                            PolicyResult::Deny => {
+                                debug!(peer_id = %sender_id, "zalo DM rejected by policy");
+                                return;
+                            }
+                            PolicyResult::SendPairingCode(code) => {
+                                let _ = tx
+                                    .send(OutboundMessage {
+                                        target_id: sender_id.clone(),
+                                        is_group: false,
+                                        text: crate::i18n::t_fmt(
+                                            "pairing_required",
+                                            crate::i18n::default_lang(),
+                                            &[("code", &code)],
+                                        ),
+                                        reply_to: None,
+                                        images: vec![],
+                                        channel: None,
+
+                    files: vec![],                                    })
+                                    .await;
+                                return;
+                            }
+                            PolicyResult::PairingQueueFull => {
+                                let _ = tx
+                                    .send(OutboundMessage {
+                                        target_id: sender_id.clone(),
+                                        is_group: false,
+                                        text: crate::i18n::t(
+                                            "pairing_queue_full",
+                                            crate::i18n::default_lang(),
+                                        )
+                                        .to_owned(),
+                                        reply_to: None,
+                                        images: vec![],
+                                        channel: None,
+
+                    files: vec![],                                    })
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+                    // Get or create a per-user queue.
+                    let user_tx = {
+                        let mut map = queues.lock().await;
+                        let needs_create = match map.get(&sender_id) {
+                            Some(existing) if !existing.is_closed() => false,
+                            Some(_) => {
+                                map.remove(&sender_id);
+                                true
+                            }
+                            None => true,
+                        };
+                        if needs_create {
+                            let (utx, mut urx) = mpsc::channel::<ZaloItem>(32);
+                            map.insert(sender_id.clone(), utx.clone());
+                            let w_reg = Arc::clone(&reg);
+                            let w_cfg = Arc::clone(&cfg);
+                            let w_tx = tx.clone();
+                            let w_uid = sender_id.clone();
+                            tokio::spawn(async move {
+                                while let Some((mut text, sender_id, mut images)) = urx.recv().await {
+                                    // Debounce: wait briefly then drain queued messages.
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    while let Ok((extra_text, _, extra_images)) = urx.try_recv() {
+                                        if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
+                                            text.push('\n');
+                                            text.push_str(&extra_text);
+                                        }
+                                        images.extend(extra_images);
+                                    }
+                                    let process_result = tokio::time::timeout(
+                                    Duration::from_secs(600),
+                                    async {
+                                let handle = match w_reg.route("zalo") {
+                                    Ok(h) => h,
+                                    Err(e) => { error!("zalo route: {e:#}"); return; }
+                                };
+                                let dm_scope = default_dm_scope(&w_cfg);
+                                let session_key = derive_session_key(&SessionKeyParams {
+                                    agent_id: handle.id.clone(),
+                                    kind: MessageKind::DirectMessage { account_id: None },
+                                    channel: "zalo".to_string(),
+                                    peer_id: sender_id.clone(),
+                                    dm_scope,
+                                });
+                                let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+                                let msg = AgentMessage {
+                                    session_key,
+                                    text,
+                                    channel: "zalo".to_string(),
+                                    peer_id: sender_id.clone(),
+                                    chat_id: String::new(),
+                                    reply_tx,
+                                    extra_tools: vec![],
+                                    images,
+                                    files: vec![],
+                                };
+                                if handle.tx.send(msg).await.is_err() {
+                                    return;
+                                }
+                                let reply = tokio::select! {
+                                    result = &mut reply_rx => result,
+                                    _ = tokio::time::sleep(processing_timeout(&w_cfg)) => {
+                                        send_processing(&w_tx, sender_id.clone(), false, &w_cfg).await;
+                                        reply_rx.await
+                                    }
+                                };
+                                if let Ok(r) = reply {
+                                    let pending = r.pending_analysis;
+                                    if !r.is_empty {
+                                        let _ = w_tx
+                                            .send(OutboundMessage {
+                                                target_id: sender_id.clone(),
+                                                is_group: false,
+                                                text: r.text,
+                                                reply_to: None,
+                                                images: r.images,
+                                                files: r.files,
+                                                channel: None,                                            })
+                                            .await;
+                                    }
+                                    if let Some(analysis) = pending {
+                                        handle_pending_analysis(
+                                            analysis, Arc::clone(&handle), &w_tx,
+                                            sender_id, false, &w_cfg,
+                                        ).await;
+                                    }
+                                }
+                                    }
+                                ).await;
+                                    if process_result.is_err() {
+                                        warn!(user = %w_uid, "zalo: message processing timed out (600s), skipping to next");
+                                    }
+                                }
+                                debug!(user = %w_uid, "zalo: per-user worker stopped");
+                            });
+                            utx
+                        } else {
+                            map.get(&sender_id).unwrap().clone()
+                        }
+                    };
+                    // /btw bypass: spawn directly, skip the per-user queue
+                    if text.starts_with("/btw ") || text.starts_with("/BTW ") {
+                        let reg = Arc::clone(&reg);
+                        let tx = tx.clone();
+                        let cfg = Arc::clone(&cfg);
+                        let question = text[5..].to_owned();
+                        let sender_id = sender_id.clone();
+                        tokio::spawn(async move {
+                            let handle = match reg.route("zalo") {
+                                Ok(h) => h,
+                                Err(_) => return,
+                            };
+                            if let Some(reply_text) = btw_direct_call(
+                                &question,
+                                &handle.live_status,
+                                &handle.providers,
+                                &cfg,
+                            )
+                            .await
+                            {
+                                let _ = tx
+                                    .send(OutboundMessage {
+                                        target_id: sender_id,
+                                        is_group: false,
+                                        text: format!("[/btw] {}", reply_text),
+                                        reply_to: None,
+                                        images: vec![],
+                                        channel: None,
+
+                    files: vec![],                                    })
+                                    .await;
+                            }
+                        });
+                        return;
+                    }
+                    // Fast preparse bypass: local commands skip per-user queue
+                    if is_fast_preparse(&text) {
+                        let reg = Arc::clone(&reg);
+                        let tx = tx.clone();
+                        let cfg = Arc::clone(&cfg);
+                        let sender_id = sender_id.clone();
+                        tokio::spawn(async move {
+                            let handle = match reg.route("zalo") {
+                                Ok(h) => h,
+                                Err(_) => return,
+                            };
+                            let dm_scope = default_dm_scope(&cfg);
+                            let session_key = derive_session_key(&SessionKeyParams {
+                                agent_id: handle.id.clone(),
+                                kind: MessageKind::DirectMessage { account_id: None },
+                                channel: "zalo".to_string(),
+                                peer_id: sender_id.clone(),
+                                dm_scope,
+                            });
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                                reply.target_id = sender_id.clone();
+                                reply.is_group = false;
+                                if !reply.text.is_empty() || !reply.images.is_empty() {
+                                    let _ = tx.send(reply).await;
+                                }
+                                return;
+                            }
+                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                            let msg = AgentMessage {
+                                session_key,
+                                text,
+                                channel: "zalo".to_string(),
+                                peer_id: sender_id.clone(),
+                                chat_id: String::new(),
+                                reply_tx,
+                                extra_tools: vec![],
+                                images,
+                                files: vec![],
+                            };
+                            if handle.tx.send(msg).await.is_err() {
+                                return;
+                            }
+                            if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
+                                if !r.is_empty {
+                                    let _ = tx.send(OutboundMessage {
+                                        target_id: sender_id,
+                                        is_group: false,
+                                        text: r.text,
+                                        reply_to: None,
+                                        images: r.images,
+                                        files: r.files,
+                                        channel: None,
+                                    }).await;
+                                }
+                            }
+                        });
+                        return;
+                    }
+                    if let Err(e) = user_tx.try_send((text, sender_id.clone(), images)) {
+                        warn!(user = %sender_id, error = %e, "zalo: user queue full, dropping message");
+                    }
+                });
+            },
+        );
+
+        let zalo = Arc::new(ZaloChannel::with_api_base(
+            access_token,
+            zalo_cfg.api_base.clone(),
+            on_message,
+        ));
+        let _ = zalo_slot.set(Arc::clone(&zalo));
+        let zalo_send = Arc::clone(&zalo);
+        tokio::spawn(async move {
+            while let Some(msg) = out_rx.recv().await {
+                if let Err(e) = zalo_send.send(msg).await {
+                    error!("zalo send: {e:#}");
+                }
+            }
+        });
+        let _ = manager.register(Arc::clone(&zalo) as Arc<dyn Channel>);
+        tokio::spawn(async move {
+            if let Err(e) = zalo.run().await {
+                error!("zalo channel: {e:#}");
+            }
+        });
+        info!(account = %acct_for_log, "zalo channel started (webhook mode)");
+    } // end for zalo_accounts
+}
