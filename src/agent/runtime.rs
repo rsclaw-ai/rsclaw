@@ -5969,6 +5969,9 @@ impl AgentRuntime {
             "exec: spawning background task"
         );
 
+        // Register task as running BEFORE spawning so is_running() works correctly
+        self.exec_pool.register_running(task_id.clone()).await;
+
         // Clone for the spawned task
         let exec_pool = Arc::clone(&self.exec_pool);
         let session_key_spawn = ctx.session_key.clone();
@@ -6092,6 +6095,9 @@ impl AgentRuntime {
             let completed_at = std::time::Instant::now();
             let elapsed_ms = (completed_at - started_at).as_millis();
 
+            // Unregister task (no longer running) BEFORE storing result
+            exec_pool.unregister_running(&task_id_clone).await;
+
             // Store the result for collection on next turn (or poll)
             tracing::info!(
                 task_id = %task_id_clone,
@@ -6111,7 +6117,10 @@ impl AgentRuntime {
                 started_at,
                 completed_at,
             };
-            exec_pool.add_pending_for_session(session_key_spawn, exec_result).await;
+            // Store with session key for automatic injection on next turn
+            exec_pool.add_pending_for_session(session_key_spawn, exec_result.clone()).await;
+            // Also store with task_id key for polling
+            exec_pool.add_pending_for_task(&task_id_clone, exec_result).await;
         });
 
         tracing::info!(
