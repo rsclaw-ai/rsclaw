@@ -4,14 +4,14 @@
 
 [![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Binary Size](https://img.shields.io/badge/binary-~12MB-green)]()
+[![Binary Size](https://img.shields.io/badge/binary-~15MB-green)]()
 
 **中文** | [English](../../README.md) | [日本語](README_ja.md) | [한국어](README_ko.md) | [ไทย](README_th.md) | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | [Русский](README_ru.md)
 
 螃蟹 AI（RsClaw）是基于 Rust 从零重构的 AI 自动化管家，拥有原生长期记忆与自我进化能力，全平台桌面版一键安装，开箱即用。支持 OpenClaw 一键迁移，原有配置无缝切换。
 
 <p align="center">
-  <img src="../images/preview-zh.gif" alt="RsClaw 预览" width="800" />
+  <img src="../images/cn.gif" alt="RsClaw 预览" width="800" />
 </p>
 
 ---

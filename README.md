@@ -11,7 +11,7 @@
 RsClaw (Crab AI / 螃蟹AI自动化管家) is your personal AI butler — a single 15MB binary that connects all your messaging apps to AI agents. It manages your tasks, browses the web, remembers conversations, and runs 24/7 on your desktop or server. Built from scratch in Rust with one-click OpenClaw migration.
 
 <p align="center">
-  <img src="docs/images/preview-en.gif" alt="RsClaw Preview" width="800" />
+  <img src="docs/images/en.gif" alt="RsClaw Preview" width="800" />
 </p>
 
 ---

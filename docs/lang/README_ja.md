@@ -4,11 +4,16 @@
 
 [![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Binary Size](https://img.shields.io/badge/binary-~12MB-green)]()
+[![Binary Size](https://img.shields.io/badge/binary-~15MB-green)]()
 
 [English](../../README.md) | [中文](README_cn.md) | **日本語** | [한국어](README_ko.md) | [ไทย](README_th.md) | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | [Русский](README_ru.md)
 
 RsClaw は [OpenClaw](https://github.com/openclaw/openclaw) を Rust でフルスクラッチ再実装したもので、同じマルチエージェントAIゲートウェイプロトコルを提供しながら、10倍の起動速度、10倍のサイズ縮小、Node.js依存ゼロを実現しています。
+
+
+<p align="center">
+  <img src="../images/en.gif" alt="RsClaw Preview" width="800" />
+</p>
 
 ---
 

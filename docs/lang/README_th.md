@@ -4,11 +4,16 @@
 
 [![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Binary Size](https://img.shields.io/badge/binary-~12MB-green)]()
+[![Binary Size](https://img.shields.io/badge/binary-~15MB-green)]()
 
 [English](../../README.md) | [中文](README_cn.md) | [日本語](README_ja.md) | [한국어](README_ko.md) | **ไทย** | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | [Русский](README_ru.md)
 
 RsClaw คือการเขียนใหม่ทั้งหมดของ [OpenClaw](https://github.com/openclaw/openclaw) ด้วย Rust ให้โปรโตคอล AI Gateway แบบมัลติเอเจนต์เดียวกัน แต่เริ่มต้นเร็วขึ้น 10 เท่า ขนาดเล็กลง 10 เท่า และไม่พึ่งพา Node.js
+
+
+<p align="center">
+  <img src="../images/en.gif" alt="RsClaw Preview" width="800" />
+</p>
 
 ---
 
