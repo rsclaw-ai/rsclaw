@@ -420,9 +420,10 @@ fn create_pdf(args: &Value, path: &Path) -> Result<Value> {
         std::fs::write(&tmp_html, &html)?;
         let result = std::process::Command::new(&chrome)
             .args([
-                "--headless",
+                "--headless=new",
                 "--disable-gpu",
                 "--no-sandbox",
+                "--no-pdf-header-footer",
                 "--print-to-pdf-no-header",
                 &format!("--print-to-pdf={}", path.display()),
                 &format!("file://{}", tmp_html.display()),
@@ -1267,7 +1268,8 @@ fn build_html_for_pdf(title: &str, content: &str) -> String {
     let mut html = String::from(
         r#"<!DOCTYPE html><html><head><meta charset='utf-8'>
 <style>
-  @page { margin: 2cm 2.5cm; }
+  @page { margin: 2cm 2.5cm; size: A4; }
+  @page { @top-left { content: none; } @top-right { content: none; } @bottom-left { content: none; } @bottom-right { content: none; } }
   body {
     font-family: -apple-system, "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", system-ui, sans-serif;
     font-size: 13px; line-height: 1.9; color: #333;
