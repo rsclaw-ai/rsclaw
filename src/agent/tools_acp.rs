@@ -140,6 +140,11 @@ impl AgentRuntime {
         let self_channel = ctx.channel.clone();
         let self_peer_id = ctx.peer_id.clone();
         let self_chat_id = ctx.chat_id.clone();
+        // Extract configurable reply timeout BEFORE spawn (config read needs self, can't be inside spawn)
+        let reply_timeout_secs = self.config.ext.tools.as_ref()
+            .and_then(|t| t.acp.as_ref())
+            .and_then(|a| a.reply_timeout_seconds)
+            .unwrap_or(300);
         tokio::spawn(async move {
             tracing::info!("tool_opencode: background task started");
             // Start event collection FIRST (in parallel with send_prompt)
@@ -393,7 +398,8 @@ impl AgentRuntime {
             } else {
                 tracing::info!("tool_opencode: result injected back to agent, waiting for reply");
                 // Wait for agent's reply and forward it (text + files) to user via notification.
-                match tokio::time::timeout(Duration::from_secs(300), reply_rx).await {
+                // Timeout value extracted before spawn (see reply_timeout_secs variable)
+                match tokio::time::timeout(Duration::from_secs(reply_timeout_secs), reply_rx).await {
                     Ok(Ok(reply)) => {
                         if !reply.text.is_empty() || !reply.files.is_empty() || !reply.images.is_empty() {
                             if let Some(ref tx) = notif_tx_bg {
@@ -411,7 +417,7 @@ impl AgentRuntime {
                         }
                     }
                     Ok(Err(_)) => tracing::warn!("tool_opencode: reply channel dropped"),
-                    Err(_) => tracing::warn!("tool_opencode: reply timed out after 300s"),
+                    Err(_) => tracing::warn!("tool_opencode: reply timed out after {}s", reply_timeout_secs),
                 }
             }
         });
@@ -419,7 +425,9 @@ impl AgentRuntime {
         Ok(serde_json::json!({
             "output": crate::i18n::t_fmt("acp_queued", lang, &[("name", "OpenCode")]),
             "status": "submitted",
-            "session_id": session_id_clone
+            "session_id": session_id_clone,
+            "message": "Task submitted to OpenCode. It is running in background. DO NOT submit again - wait for the completion notification. You can continue with other tasks while waiting.",
+            "note": "The result will be delivered automatically when OpenCode completes. No need to poll or resubmit."
         }))
     }
 
@@ -605,6 +613,17 @@ impl AgentRuntime {
         let target_id_bg = target_id.clone();
         let channel_bg = channel_name.clone();
         let lang_bg = lang;
+        // Clone agent's own inbox for result injection after completion.
+        let self_tx = self.handle.tx.clone();
+        let self_session = ctx.session_key.clone();
+        let self_channel = ctx.channel.clone();
+        let self_peer_id = ctx.peer_id.clone();
+        let self_chat_id = ctx.chat_id.clone();
+        // Extract configurable reply timeout BEFORE spawn (config read needs self, can't be inside spawn)
+        let reply_timeout_secs = self.config.ext.tools.as_ref()
+            .and_then(|t| t.acp.as_ref())
+            .and_then(|a| a.reply_timeout_seconds)
+            .unwrap_or(300);
         tokio::spawn(async move {
             // Start event collection FIRST (in parallel with send_prompt)
             let mut event_rx = client.subscribe_events();
@@ -758,7 +777,7 @@ impl AgentRuntime {
                                 .unwrap_or(result_content.len());
                             crate::i18n::t_fmt("acp_truncated", lang_bg, &[("content", &result_content[..cutoff])])
                         } else {
-                            result_content
+                            result_content.clone()
                         };
                         crate::i18n::t_fmt("acp_done_result", lang_bg, &[
                             ("status", status_icon), ("name", "Claude Code"),
@@ -774,6 +793,10 @@ impl AgentRuntime {
                             ("status", status_icon), ("name", "Claude Code"),
                         ])
                     };
+
+                    // Store for agent re-inject after notification.
+                    let result_summary = summary.clone();
+                    let result_files = notif_files.clone();
 
                     // Send notification to user
                     tracing::debug!(
@@ -800,6 +823,54 @@ impl AgentRuntime {
                     } else {
                         tracing::warn!("tool_claudecode: no notification channel available");
                     }
+
+                    // Inject result back into main agent's inbox so it can act on the result
+                    let file_paths: Vec<String> = result_files.iter().map(|(_, _, p)| p.clone()).collect();
+                    let inject_text = if file_paths.is_empty() {
+                        format!("[Claude Code completed] {}", if result_summary.is_empty() { "Task finished.".to_owned() } else { result_summary })
+                    } else {
+                        format!("[Claude Code completed] Files ready: {}. Please send them to the user with send_file.",
+                            file_paths.join(", "))
+                    };
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
+                    let inject_msg = AgentMessage {
+                        session_key: self_session,
+                        text: inject_text,
+                        channel: self_channel.clone(),
+                        peer_id: self_peer_id,
+                        chat_id: self_chat_id,
+                        reply_tx,
+                        extra_tools: vec![],
+                        images: vec![],
+                        files: vec![],
+                    };
+                    if self_tx.send(inject_msg).await.is_err() {
+                        tracing::warn!("tool_claudecode: failed to inject result back to agent inbox");
+                    } else {
+                        tracing::info!("tool_claudecode: result injected back to agent, waiting for reply");
+                        // Wait for agent's reply and forward it (text + files) to user via notification.
+                        // Timeout value extracted before spawn (see reply_timeout_secs variable)
+                        match tokio::time::timeout(Duration::from_secs(reply_timeout_secs), reply_rx).await {
+                            Ok(Ok(reply)) => {
+                                if !reply.text.is_empty() || !reply.files.is_empty() || !reply.images.is_empty() {
+                                    if let Some(ref tx) = notif_tx_bg {
+                                        let _ = tx.send(crate::channel::OutboundMessage {
+                                            target_id: target_id_bg.clone(),
+                                            is_group: false,
+                                            text: reply.text,
+                                            reply_to: None,
+                                            images: reply.images,
+                                            files: reply.files,
+                                            channel: Some(self_channel),
+                                        });
+                                        tracing::info!("tool_claudecode: forwarded agent reply to user");
+                                    }
+                                }
+                            }
+                            Ok(Err(_)) => tracing::warn!("tool_claudecode: reply channel dropped"),
+                            Err(_) => tracing::warn!("tool_claudecode: reply timed out after {}s", reply_timeout_secs),
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::error!("tool_claudecode: send_prompt failed: {}", e);
@@ -822,7 +893,9 @@ impl AgentRuntime {
         Ok(serde_json::json!({
             "output": crate::i18n::t_fmt("acp_queued", lang, &[("name", "Claude Code")]),
             "status": "submitted",
-            "session_id": session_id_clone
+            "session_id": session_id_clone,
+            "message": "Task submitted to Claude Code. It is running in background. DO NOT submit again - wait for the completion notification. You can continue with other tasks while waiting.",
+            "note": "The result will be delivered automatically when Claude Code completes. No need to poll or resubmit."
         }))
     }
 }
