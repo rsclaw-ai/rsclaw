@@ -23,7 +23,12 @@ pub mod runtime;
 pub mod security;
 pub mod spawner;
 pub mod tool_call_repair;
+pub mod tools_acp;
 pub mod tools_builder;
+pub mod tools_computer;
+pub mod tools_file;
+pub mod tools_misc;
+pub mod tools_web;
 pub mod web_parsers;
 pub mod workspace;
 

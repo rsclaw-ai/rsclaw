@@ -140,9 +140,10 @@ fn opencode_tool_dispatch_exists() {
         "opencode tool should be dispatched in runtime"
     );
 
+    let acp_source = include_str!("../src/agent/tools_acp.rs");
     assert!(
-        source.contains("async fn tool_opencode"),
-        "tool_opencode method should exist"
+        acp_source.contains("async fn tool_opencode"),
+        "tool_opencode method should exist in tools_acp.rs"
     );
 }
 
@@ -174,7 +175,7 @@ fn provider_config_has_user_agent_field() {
 #[test]
 fn opencode_tool_calls_acp_client() {
     // Verify tool_opencode implementation uses AcpClient
-    let source = include_str!("../src/agent/runtime.rs");
+    let source = include_str!("../src/agent/tools_acp.rs");
 
     assert!(
         source.contains("crate::acp::client::AcpClient"),
@@ -206,7 +207,7 @@ fn opencode_tool_calls_acp_client() {
 #[test]
 fn opencode_tool_handles_session_id() {
     // Verify that session_id parameter is handled
-    let source = include_str!("../src/agent/runtime.rs");
+    let source = include_str!("../src/agent/tools_acp.rs");
 
     assert!(
         source.contains("session_id"),
