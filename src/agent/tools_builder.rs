@@ -561,62 +561,88 @@ pub(crate) fn build_tool_list(
         }),
     });
 
-    // Document creation & editing tool.
+    // Document tools — split into simple independent tools for better small-model compatibility.
+    // Formatting note injected into content-bearing tools.
+    let doc_fmt_hint = " Structure content professionally: use # headings, - bullet lists, blank lines between sections. For notices/reports: add title, organize into sections.";
+
     tools.push(ToolDef {
-        name: "doc".to_owned(),
-        description: "Create, edit, and read documents. Use this for ALL document operations — do NOT use execute_command.\n\
-            Supported formats: xlsx, xls, docx, doc, pdf, pptx, ppt, txt, md, csv\n\
-            Actions:\n\
-            - read_doc: Read any document (xlsx/docx/pdf/pptx/txt/md/csv). Returns text content.\n\
-            - create_excel: Create xlsx with sheets [{name, headers, rows}]\n\
-            - create_word: Create docx with content (# for headings, blank lines for paragraphs)\n\
-            - create_pdf: Create PDF with content\n\
-            - create_ppt: Create pptx with slides [{title, body}]\n\
-            - edit_excel: Update sheets or append_rows to existing xlsx\n\
-            - edit_word: Replace content or append text to existing docx\n\
-            - edit_pdf: replace_text [{find,replace}], delete_pages [1,3]\n\
-            Formatting:\n\
-            - ALWAYS structure content professionally before writing. Never dump raw user text as-is.\n\
-            - Use # headings, bullet lists (- item), and separate sections with blank lines.\n\
-            - For meeting notices, reports, memos: add a title, organize into sections (e.g. time/location/attendees), use tables for tabular data.\n\
-            - For create_excel: extract structured data into columns (e.g. name + phone -> two columns), add meaningful headers.\n\
-            - For create_word/create_pdf: use markdown-style formatting (# Heading, ## Subheading, - list item).\n\
-            Tips:\n\
-            - For txt/md: use read_file/write_file instead (simpler)\n\
-            - For csv: use read_doc to read, create_excel to convert to xlsx\n\
-            - To edit PPT: read_doc first, then create_ppt with modified slides\n\
-            - After creating, use send_file to deliver ALL created files to the user in the same turn".to_owned(),
+        name: "create_docx".to_owned(),
+        description: format!("Create a Word document (.docx).{doc_fmt_hint} After creating, use send_file to deliver."),
         parameters: json!({
             "type": "object",
             "properties": {
-                "action":  {"type": "string", "enum": ["create_excel", "create_word", "create_pdf", "create_ppt", "edit_excel", "edit_word", "edit_pdf", "read_doc"], "description": "Action to perform"},
-                "path":    {"type": "string", "description": "File path relative to workspace, e.g. 'report.xlsx'"},
-                "title":   {"type": "string", "description": "Document title (optional, for word/pdf)"},
-                "sheets":  {"type": "array", "description": "For create_excel/edit_excel: [{name, headers: [str], rows: [[value]]}]. For edit_excel, matching sheet names replace existing sheets; new names add sheets.",
+                "path":    {"type": "string", "description": "File path, e.g. 'report.docx'"},
+                "content": {"type": "string", "description": "Document content. Use # for headings, - for lists, blank lines for paragraphs."},
+                "title":   {"type": "string", "description": "Document title (optional, displayed at top)"}
+            },
+            "required": ["path", "content"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "create_pdf".to_owned(),
+        description: format!("Create a PDF document.{doc_fmt_hint} After creating, use send_file to deliver."),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path":    {"type": "string", "description": "File path, e.g. 'report.pdf'"},
+                "content": {"type": "string", "description": "Document content. Use # for headings, - for lists, blank lines for paragraphs."},
+                "title":   {"type": "string", "description": "Document title (optional, displayed at top)"}
+            },
+            "required": ["path", "content"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "create_xlsx".to_owned(),
+        description: "Create an Excel spreadsheet (.xlsx). Extract structured data into columns with meaningful headers. After creating, use send_file to deliver.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path":   {"type": "string", "description": "File path, e.g. 'data.xlsx'"},
+                "sheets": {"type": "array", "description": "Sheets: [{name, headers: [str], rows: [[value]]}]",
                     "items": {"type": "object", "properties": {
                         "name":    {"type": "string"},
                         "headers": {"type": "array", "items": {"type": "string"}},
                         "rows":    {"type": "array", "items": {"type": "array"}}
                     }}
-                },
-                "append_rows": {"description": "For edit_excel: append rows to existing sheet. Either {sheet, rows: [[value]]} or [{sheet, rows}]"},
-                "content": {"type": "string", "description": "For create_word/create_pdf: text content. For edit_word: replacement content (replaces entire document). Paragraphs separated by blank lines. Lines starting with # are headings."},
-                "append":  {"type": "string", "description": "For edit_word: text to append to existing document. Paragraphs separated by blank lines. Lines starting with # are headings."},
-                "replacements": {"type": "array", "description": "For edit_pdf replace_text: [{find: 'old', replace: 'new'}]. Works on raw PDF content streams — may not work for text split across operators.",
-                    "items": {"type": "object", "properties": {
-                        "find":    {"type": "string"},
-                        "replace": {"type": "string"}
-                    }}
-                },
-                "delete_pages": {"type": "array", "description": "For edit_pdf: 1-indexed page numbers to delete, e.g. [1, 3]",
-                    "items": {"type": "integer"}
-                },
-                "slides":  {"type": "array", "description": "For create_ppt: [{title, body}]",
+                }
+            },
+            "required": ["path", "sheets"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "create_pptx".to_owned(),
+        description: "Create a PowerPoint presentation (.pptx). After creating, use send_file to deliver.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path":   {"type": "string", "description": "File path, e.g. 'deck.pptx'"},
+                "slides": {"type": "array", "description": "Slides: [{title, body}]",
                     "items": {"type": "object", "properties": {
                         "title": {"type": "string"},
                         "body":  {"type": "string"}
                     }}
                 }
+            },
+            "required": ["path", "slides"]
+        }),
+    });
+    // Keep doc tool for read/edit operations (less frequently used by small models).
+    tools.push(ToolDef {
+        name: "doc".to_owned(),
+        description: "Read or edit existing documents.\n\
+            Actions: read_doc (xlsx/docx/pdf), edit_excel, edit_word, edit_pdf.\n\
+            For CREATING new documents, use create_docx/create_pdf/create_xlsx/create_pptx instead.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "action":  {"type": "string", "enum": ["read_doc", "edit_excel", "edit_word", "edit_pdf"], "description": "Action to perform"},
+                "path":    {"type": "string", "description": "File path"},
+                "content": {"type": "string", "description": "For edit_word: replacement content"},
+                "append":  {"type": "string", "description": "For edit_word: text to append"},
+                "sheets":  {"type": "array", "description": "For edit_excel: [{name, headers, rows}]"},
+                "append_rows": {"description": "For edit_excel: {sheet, rows}"},
+                "replacements": {"type": "array", "description": "For edit_pdf: [{find, replace}]"},
+                "delete_pages": {"type": "array", "description": "For edit_pdf: page numbers to delete"}
             },
             "required": ["action", "path"]
         }),

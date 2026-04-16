@@ -3567,6 +3567,26 @@ impl AgentRuntime {
             "gateway" => return self.tool_gateway(args).await,
             "pairing" => return self.tool_pairing(args).await,
             "doc" => return self.tool_doc(args).await,
+            "create_docx" => {
+                let mut a = args.clone();
+                a["action"] = serde_json::json!("create_word");
+                return self.tool_doc(a).await;
+            }
+            "create_pdf" => {
+                let mut a = args.clone();
+                a["action"] = serde_json::json!("create_pdf");
+                return self.tool_doc(a).await;
+            }
+            "create_xlsx" => {
+                let mut a = args.clone();
+                a["action"] = serde_json::json!("create_excel");
+                return self.tool_doc(a).await;
+            }
+            "create_pptx" => {
+                let mut a = args.clone();
+                a["action"] = serde_json::json!("create_ppt");
+                return self.tool_doc(a).await;
+            }
             "opencode" => return self.tool_opencode(ctx, args).await,
             "claudecode" => return self.tool_claudecode(ctx, args).await,
             _ => {}
