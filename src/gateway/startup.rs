@@ -467,6 +467,16 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     };
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
 
+    // Start browser pool idle reaper (checks every 60s).
+    tokio::spawn(async {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            crate::browser::pool::BrowserPool::global().reap_if_idle().await;
+        }
+    });
+
     let bind_addr = resolve_bind_addr(&config);
     info!("starting HTTP server on {bind_addr}");
 

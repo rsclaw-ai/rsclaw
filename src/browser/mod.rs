@@ -4,6 +4,8 @@
 //! Chrome process, connects via WebSocket, and exposes actions such as
 //! navigate, snapshot (accessibility-like tree), click, fill, screenshot, etc.
 
+pub mod pool;
+
 use std::{
     collections::HashMap,
     sync::{
@@ -150,14 +152,14 @@ pub fn can_launch_chrome() -> Result<()> {
 // ChromeProcess -- launch and manage a headless Chrome instance
 // ---------------------------------------------------------------------------
 
-struct ChromeProcess {
+pub(crate) struct ChromeProcess {
     child: tokio::process::Child,
     ws_url: String,
     _tmp_dir: Option<tempfile::TempDir>,
 }
 
 impl ChromeProcess {
-    async fn launch(chrome_path: &str, headed: bool, profile: Option<&str>) -> Result<Self> {
+    pub(crate) async fn launch(chrome_path: &str, headed: bool, profile: Option<&str>) -> Result<Self> {
         can_launch_chrome()?;
 
         // Resolve user-data-dir: named profile or temp dir.
@@ -280,7 +282,7 @@ impl ChromeProcess {
     }
 
     /// Extract the debugging port from the ws URL.
-    fn port(&self) -> Result<u16> {
+    pub(crate) fn port(&self) -> Result<u16> {
         // ws://127.0.0.1:PORT/devtools/browser/...
         let url = &self.ws_url;
         let after_host = url
@@ -346,7 +348,7 @@ impl Drop for ChromeProcess {
 // CdpClient -- WebSocket CDP transport
 // ---------------------------------------------------------------------------
 
-struct CdpClient {
+pub(crate) struct CdpClient {
     ws_url: String,
     ws_tx: mpsc::UnboundedSender<String>,
     pending: Arc<Mutex<HashMap<u32, oneshot::Sender<Value>>>>,
@@ -355,7 +357,7 @@ struct CdpClient {
 }
 
 impl CdpClient {
-    async fn connect(ws_url: &str) -> Result<Self> {
+    pub(crate) async fn connect(ws_url: &str) -> Result<Self> {
         let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url)
             .await
             .map_err(|e| anyhow!("CDP WebSocket connect failed: {e}"))?;
@@ -419,7 +421,7 @@ impl CdpClient {
     }
 
     /// Send a CDP command and wait for the matching response.
-    async fn send(&self, method: &str, params: Value) -> Result<Value> {
+    pub(crate) async fn send(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let msg = json!({
             "id": id,
@@ -450,7 +452,7 @@ impl CdpClient {
     }
 
     /// Wait for a specific event, with timeout.
-    async fn wait_event(&self, event_method: &str, timeout_secs: u64) -> Result<Value> {
+    pub(crate) async fn wait_event(&self, event_method: &str, timeout_secs: u64) -> Result<Value> {
         let deadline = time::Instant::now() + Duration::from_secs(timeout_secs);
         let mut rx = self.events_rx.lock().await;
         loop {

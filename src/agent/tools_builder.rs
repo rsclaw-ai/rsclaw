@@ -79,13 +79,13 @@ pub(crate) fn build_tool_list(
     // Built-in tools — consolidated (32+ tools -> ~13 unified tools).
     tools.push(ToolDef {
         name: "memory".to_owned(),
-        description: "Manage long-term memory. Actions: search (semantic search), get (by ID), put (store new), delete (remove by ID).".to_owned(),
+        description: "Manage long-term memory. Actions: search (semantic search), get (by ID), put (store new).".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["search", "get", "put", "delete"], "description": "Action to perform"},
+                "action": {"type": "string", "enum": ["search", "get", "put"], "description": "Action to perform"},
                 "query":  {"type": "string", "description": "Search query (for search action)"},
-                "id":     {"type": "string", "description": "Memory document ID (for get/delete)"},
+                "id":     {"type": "string", "description": "Memory document ID (for get)"},
                 "text":   {"type": "string", "description": "Content to store (for put action)"},
                 "scope":  {"type": "string", "description": "Scope filter (optional)"},
                 "kind":   {"type": "string", "description": "Document kind: note, fact, summary, or remember. Use 'remember' ONLY when the user explicitly asks to remember/memorize something."},

@@ -688,51 +688,30 @@ impl AgentRuntime {
 
     /// Use web_browser to fetch JS-rendered page content via get_article.
     pub(crate) async fn browser_get_article(&self, url: &str) -> Result<(String, String)> {
-        let mut browser = self.browser.lock().await;
+        let tab = crate::browser::pool::BrowserPool::global().acquire_tab().await?;
+        tab.navigate(url).await?;
 
-        // Ensure browser session exists.
-        if browser.is_none() {
-            let wb_cfg = self.config.ext.tools.as_ref()
-                .and_then(|t| t.web_browser.as_ref());
-            let chrome_path = wb_cfg
-                .and_then(|b| b.chrome_path.clone())
-                .or_else(|| detect_chrome())
-                .ok_or_else(|| anyhow!("Chrome not found for SPA fallback"))?;
-            crate::browser::can_launch_chrome()?;
-            let headed = wb_cfg.and_then(|b| b.headed).unwrap_or_else(has_display);
-            let profile = wb_cfg.and_then(|b| b.profile.clone());
-            *browser = Some(crate::browser::BrowserSession::start(&chrome_path, headed, profile.as_deref()).await?);
-        }
-
-        let bs = browser.as_mut().unwrap();
-        bs.execute("open", &json!({"url": url})).await?;
-        let article = bs.execute("get_article", &json!({})).await?;
-
-        let title = article["title"].as_str().unwrap_or("").to_owned();
-        let text = article["text"].as_str().unwrap_or("").to_owned();
+        // Wait for content to load, then extract article text.
+        let _ = tab.wait_for_selector("article, main, .content, body", 10).await;
+        let js = r#"(function(){
+            var el = document.querySelector('article') || document.querySelector('main')
+                || document.querySelector('.content') || document.body;
+            var title = document.title || '';
+            var text = el ? el.innerText || '' : '';
+            return JSON.stringify({title: title, text: text});
+        })()"#;
+        let result = tab.evaluate(js).await?;
+        let result_str = result.as_str().unwrap_or("{}");
+        let parsed: Value = serde_json::from_str(result_str).unwrap_or_default();
+        let title = parsed["title"].as_str().unwrap_or("").to_owned();
+        let text = parsed["text"].as_str().unwrap_or("").to_owned();
         Ok((title, text))
     }
 
-    /// Browser-based search fallback: open a search engine in the browser,
-    /// extract results from the rendered page. Bypasses CAPTCHA since it uses
-    /// a real browser session.
+    /// Browser-based search fallback: open a search engine in the shared browser pool,
+    /// extract results from the rendered page. Uses a pooled tab (not per-agent Chrome).
     pub(crate) async fn browser_search(&self, query: &str, limit: usize) -> Result<Vec<Value>> {
-        let mut browser = self.browser.lock().await;
-
-        if browser.is_none() {
-            let wb_cfg = self.config.ext.tools.as_ref()
-                .and_then(|t| t.web_browser.as_ref());
-            let chrome_path = wb_cfg
-                .and_then(|b| b.chrome_path.clone())
-                .or_else(|| detect_chrome())
-                .ok_or_else(|| anyhow!("Chrome not found for browser search fallback"))?;
-            crate::browser::can_launch_chrome()?;
-            let headed = wb_cfg.and_then(|b| b.headed).unwrap_or_else(has_display);
-            let profile = wb_cfg.and_then(|b| b.profile.clone());
-            *browser = Some(crate::browser::BrowserSession::start(&chrome_path, headed, profile.as_deref()).await?);
-        }
-
-        let bs = browser.as_mut().unwrap();
+        let tab = crate::browser::pool::BrowserPool::global().acquire_tab().await?;
 
         // Try multiple search engines, auto-switch on CAPTCHA/empty results.
         let lang = self.config.raw.gateway.as_ref()
@@ -760,11 +739,11 @@ impl AgentRuntime {
 
         for (name, url, result_selector, snippet_selector) in &engines {
             info!(engine = name, "browser_search: trying");
-            if let Err(e) = bs.execute("open", &json!({"url": url})).await {
+            if let Err(e) = tab.navigate(url).await {
                 warn!(engine = name, "browser_search: open failed: {e}");
                 continue;
             }
-            let _ = bs.execute("wait", &json!({"target": "element", "value": *result_selector, "timeout": 8})).await;
+            let _ = tab.wait_for_selector(result_selector, 8).await;
 
             // Check for CAPTCHA: look for common challenge indicators
             let captcha_js = r#"(function(){
@@ -775,9 +754,8 @@ impl AgentRuntime {
                     || document.querySelector('#captcha, .captcha, .g-recaptcha') !== null;
                 return hasCaptcha ? 'captcha' : 'ok';
             })()"#;
-            let check = bs.execute("evaluate", &json!({"js": captcha_js})).await;
-            if let Ok(ref v) = check {
-                let status = v["result"].as_str().unwrap_or("");
+            if let Ok(v) = tab.evaluate(captcha_js).await {
+                let status = v.as_str().unwrap_or("");
                 if status == "captcha" {
                     warn!(engine = name, "browser_search: CAPTCHA detected, trying next engine");
                     continue;
@@ -802,19 +780,21 @@ impl AgentRuntime {
                 return JSON.stringify(results);
             }})()"#);
 
-            let result = bs.execute("evaluate", &json!({"js": js})).await?;
-            let result_str = result["result"].as_str().unwrap_or("[]");
-            let parsed: Vec<Value> = serde_json::from_str(
-                if result_str.starts_with('[') { result_str } else { "[]" }
-            ).unwrap_or_default();
+            if let Ok(result) = tab.evaluate(&js).await {
+                let result_str = result.as_str().unwrap_or("[]");
+                let parsed: Vec<Value> = serde_json::from_str(
+                    if result_str.starts_with('[') { result_str } else { "[]" }
+                ).unwrap_or_default();
 
-            if !parsed.is_empty() {
-                info!(engine = name, count = parsed.len(), "browser_search: got results");
-                return Ok(parsed);
+                if !parsed.is_empty() {
+                    info!(engine = name, count = parsed.len(), "browser_search: got results");
+                    return Ok(parsed);
+                }
             }
             warn!(engine = name, "browser_search: no results, trying next engine");
         }
 
+        // Tab is automatically closed when dropped.
         Ok(vec![])
     }
 
