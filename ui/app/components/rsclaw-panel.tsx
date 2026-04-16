@@ -32,7 +32,7 @@ import {
   wechatQrStatus,
   GATEWAY_URL,
   setGatewayUrl,
-  setAuthToken,
+  setAuthToken as setApiAuthToken,
   testProviderKey,
   listProviderModels,
 } from "../lib/rsclaw-api";
@@ -548,7 +548,7 @@ function ConfigEditorPage() {
     const pt = extractVal(raw, "processingTimeout");
     if (pt) setProcessingTimeout(parseInt(pt, 10) || 120);
     const at = extractVal(raw, "authToken");
-    if (at) setAuthToken(at);
+    if (at) { setAuthToken(at); setApiAuthToken(at); }
 
     // Agent defaults
     const am = extractVal(raw, "model");
@@ -867,7 +867,7 @@ function ConfigEditorPage() {
             <div style={fieldSub}>API authentication token</div>
           </div>
           <input style={fieldInput} type="password" value={authToken} placeholder="(not set)"
-            onChange={(e) => { setAuthToken(e.target.value); markDirty(); }} />
+            onChange={(e) => { setAuthToken(e.target.value); setApiAuthToken(e.target.value); markDirty(); }} />
         </div>
       </div>
       <div style={sectionCard}>
@@ -5304,7 +5304,7 @@ export function RsClawPanel() {
           const gw: any = await tauriInvoke("get_gateway_port");
           if (gw?.url) {
             setGatewayUrl(gw.url);
-            if (gw.token) setAuthToken(gw.token);
+            if (gw.token) { setAuthToken(gw.token); setApiAuthToken(gw.token); }
           }
         }
       } catch {}
