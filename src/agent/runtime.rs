@@ -5941,7 +5941,9 @@ impl AgentRuntime {
 
         tracing::info!(cwd = %workspace.display(), command = %command, "exec: spawning in background");
 
-        // Timeout for exec commands (default 1800s = 30 min, matching openclaw).
+        // Timeout for exec commands.
+        // Default: 3600s = 1 hour. Longer than main agent loop (30min) but shorter than opencode (no timeout).
+        // This gives background tasks enough time while main agent can handle the timeout gracefully.
         let timeout_secs = self
             .config
             .ext
@@ -5949,7 +5951,7 @@ impl AgentRuntime {
             .as_ref()
             .and_then(|t| t.exec.as_ref())
             .and_then(|e| e.timeout_seconds)
-            .unwrap_or(1800);
+            .unwrap_or(3600);
 
         // Generate unique task ID
         let task_id = format!(

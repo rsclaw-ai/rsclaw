@@ -250,8 +250,12 @@
     },
     exec: {
       safety: false,                  // Enable exec safety rules (deny/confirm/allow patterns)
-      // timeoutSeconds: 1800,        // Exec command timeout (default: 30min)
+      // timeoutSeconds: 3600,        // Exec command timeout (default: 1 hour, longer than main agent)
     },
+    // ACP tools (OpenCode, Claude Code) timeout settings
+    // acp: {
+    //   replyTimeoutSeconds: 300,    // Wait for main agent to process result (default: 5 min)
+    // },
     upload: {
       maxFileSize: 52428800,          // 50MB file size limit
       maxTextChars: 20000,            // Max text chars extracted from files
