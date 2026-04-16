@@ -184,7 +184,7 @@ pub(crate) fn build_tool_list(
         name: "agent".to_owned(),
         description: "Manage agents. You are the architect — delegate work, never block.\n\
             Actions:\n\
-            - task: Create a temporary agent for a one-shot task. Returns immediately with task_id. The agent runs independently and delivers results when done.\n\
+            - task: Create a task agent for a one-shot job. Returns immediately with task_id. The task agent runs independently and delivers results when done.\n\
             - spawn: Create a persistent agent (survives across turns).\n\
             - send: Send a message to an existing agent (async, result delivered when done).\n\
             - list: List all registered agents.\n\

@@ -33,11 +33,13 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 /// Global counter of active Chrome instances.
 static ACTIVE_INSTANCES: AtomicU32 = AtomicU32::new(0);
 
-/// Compute max Chrome instances based on total system memory.
-/// Rule: 1 instance per 2 GB, minimum 1.
+/// Compute max Chrome instances based on available memory.
+/// Rule: (available - 500MB reserve) / 1GB, minimum 1.
 fn max_instances() -> u32 {
-    let total = total_system_memory_bytes();
-    ((total / (2 * 1024 * 1024 * 1024)) as u32).max(1)
+    let available = available_memory_bytes();
+    let reserve = 500 * 1024 * 1024; // 500MB for system
+    let usable = available.saturating_sub(reserve);
+    ((usable / (1024 * 1024 * 1024)) as u32).max(1)
 }
 
 /// Get total system physical memory in bytes.

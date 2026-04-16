@@ -1744,6 +1744,20 @@ impl AgentRuntime {
         // Build system prompt.
         let mut system_prompt = build_system_prompt(&ws_ctx, &self.skills, &self.config.raw);
 
+        // Detect parallelism keywords in user message and inject task-agent hint.
+        {
+            let lower = text.to_lowercase();
+            let parallel_keywords = ["并行", "并发", "最快", "同时", "parallel", "concurrent", "fastest", "simultaneously", "分别"];
+            if parallel_keywords.iter().any(|kw| lower.contains(kw)) {
+                system_prompt.push_str(
+                    "\n\n[PARALLEL HINT] The user wants parallel execution. \
+                     Use `agent` action=task to dispatch MULTIPLE task agents AT ONCE \
+                     (one task per independent sub-job). Do NOT execute them yourself sequentially. \
+                     Each task agent runs independently and results are delivered when done."
+                );
+            }
+        }
+
         // DEBUG: dump full system prompt to file for inspection
         if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
             let dump_path = crate::config::loader::base_dir().join("debug_system_prompt.txt");

@@ -569,6 +569,12 @@ async fn patch_agent(
 }
 
 async fn delete_agent(State(_state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    if id == "main" {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "cannot delete the main agent" })),
+        ).into_response();
+    }
     let result: Result<(), anyhow::Error> = (|| {
         let (path, mut val) = load_config_json()?;
         let list = val

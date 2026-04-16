@@ -1038,11 +1038,21 @@ impl AgentRuntime {
             }
 
             // Determine headed mode: per-request `headed` param overrides config.
+            // Task agents (non-main) always use headless to save resources.
             let wb_cfg = self.config.ext.tools.as_ref()
                 .and_then(|t| t.web_browser.as_ref());
-            let config_headed = wb_cfg.and_then(|b| b.headed).unwrap_or_else(has_display);
+            let is_main = self.handle.id == "main";
+            let config_headed = if is_main {
+                wb_cfg.and_then(|b| b.headed).unwrap_or_else(has_display)
+            } else {
+                false // task agents always headless
+            };
             let request_headed = args.get("headed").and_then(|v| v.as_bool());
-            let headed = request_headed.unwrap_or(config_headed);
+            let headed = if is_main {
+                request_headed.unwrap_or(config_headed)
+            } else {
+                false // task agents cannot override to headed
+            };
             let profile = wb_cfg.and_then(|b| b.profile.clone());
 
             // If headed mode changed, restart the session.

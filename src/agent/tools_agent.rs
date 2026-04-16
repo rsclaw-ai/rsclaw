@@ -110,7 +110,7 @@ impl AgentRuntime {
         }
 
         // Persist to config file by default (user-created agents survive restart).
-        // Pass persistent=false only for temporary task-delegation agents.
+        // Pass persistent=false for task agents (one-shot, destroyed after completion).
         let persistent = args["persistent"].as_bool().unwrap_or(true);
         if persistent {
             if let Err(e) = persist_agent_to_config(&entry).await {
