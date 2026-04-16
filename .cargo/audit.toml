@@ -1,0 +1,36 @@
+# Ignored advisories — indirect dependencies, will fix when upstream releases patches.
+# Review periodically with `cargo audit`.
+
+[advisories]
+ignore = [
+    "RUSTSEC-2020-0020",   # stb_truetype — indirect via genpdf
+    "RUSTSEC-2020-0056",   # instant — unmaintained, indirect via gtk
+    "RUSTSEC-2020-0144",   # atty — unmaintained, indirect via clap v3
+    "RUSTSEC-2021-0139",   # ansi_term — unmaintained
+    "RUSTSEC-2021-0140",   # atk/atk-sys — unmaintained, indirect via gtk
+    "RUSTSEC-2021-0145",   # atk — unmaintained
+    "RUSTSEC-2021-0153",   # number_prefix — unmaintained
+    "RUSTSEC-2024-0370",   # glib — unmaintained
+    "RUSTSEC-2024-0375",   # paste — soundness issue
+    "RUSTSEC-2024-0384",   # backoff — unmaintained
+    "RUSTSEC-2024-0412",   # gtk — unmaintained
+    "RUSTSEC-2024-0413",   # gtk-sys — unmaintained
+    "RUSTSEC-2024-0415",   # gdk — unmaintained
+    "RUSTSEC-2024-0416",   # gdk-sys — unmaintained
+    "RUSTSEC-2024-0418",   # gtk3-macros — unmaintained
+    "RUSTSEC-2024-0419",   # encoding — unmaintained
+    "RUSTSEC-2024-0420",   # lzw — unmaintained
+    "RUSTSEC-2024-0429",   # bincode — unmaintained v1
+    "RUSTSEC-2024-0436",   # lru — unsound
+    "RUSTSEC-2025-0012",   # matrix-sdk-crypto
+    "RUSTSEC-2025-0041",   # matrix-sdk-base
+    "RUSTSEC-2025-0065",   # matrix-sdk-base power_level panic
+    "RUSTSEC-2025-0119",   # indirect dep
+    "RUSTSEC-2025-0135",   # indirect dep
+    "RUSTSEC-2025-0141",   # indirect dep
+    "RUSTSEC-2026-0002",   # indirect dep
+    "RUSTSEC-2026-0009",   # indirect dep
+    "RUSTSEC-2026-0097",   # indirect dep
+    "RUSTSEC-2026-0098",   # indirect dep
+    "RUSTSEC-2026-0099",   # indirect dep
+]
