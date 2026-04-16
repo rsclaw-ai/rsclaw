@@ -575,11 +575,17 @@ pub(crate) fn build_tool_list(
             - edit_excel: Update sheets or append_rows to existing xlsx\n\
             - edit_word: Replace content or append text to existing docx\n\
             - edit_pdf: replace_text [{find,replace}], delete_pages [1,3]\n\
+            Formatting:\n\
+            - ALWAYS structure content professionally before writing. Never dump raw user text as-is.\n\
+            - Use # headings, bullet lists (- item), and separate sections with blank lines.\n\
+            - For meeting notices, reports, memos: add a title, organize into sections (e.g. time/location/attendees), use tables for tabular data.\n\
+            - For create_excel: extract structured data into columns (e.g. name + phone -> two columns), add meaningful headers.\n\
+            - For create_word/create_pdf: use markdown-style formatting (# Heading, ## Subheading, - list item).\n\
             Tips:\n\
             - For txt/md: use read_file/write_file instead (simpler)\n\
             - For csv: use read_doc to read, create_excel to convert to xlsx\n\
             - To edit PPT: read_doc first, then create_ppt with modified slides\n\
-            - After creating, use send_file to deliver to the user".to_owned(),
+            - After creating, use send_file to deliver ALL created files to the user in the same turn".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
