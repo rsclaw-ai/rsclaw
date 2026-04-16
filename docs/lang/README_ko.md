@@ -4,11 +4,18 @@
 
 [![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Binary Size](https://img.shields.io/badge/binary-~12MB-green)]()
+[![Binary Size](https://img.shields.io/badge/binary-~15MB-green)]()
 
 [English](../../README.md) | [中文](README_cn.md) | [日本語](README_ja.md) | **한국어** | [ไทย](README_th.md) | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | [Русский](README_ru.md)
 
 RsClaw는 [OpenClaw](https://github.com/openclaw/openclaw)를 Rust로 완전히 새로 작성한 것으로, 동일한 멀티에이전트 AI 게이트웨이 프로토콜을 제공하면서 10배 빠른 시작, 10배 작은 크기, Node.js 의존성 제로를 달성했습니다.
+
+
+<p align="center">
+  <img src="../images/en.gif" alt="RsClaw Preview" width="800" />
+</p>
+
+💬 [Join Community](https://rsclaw.ai/en/community) — WeChat / Feishu / QQ / Telegram
 
 ---
 

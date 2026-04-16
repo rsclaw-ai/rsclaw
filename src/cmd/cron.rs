@@ -150,7 +150,7 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("cron job '{id}' not found"))?;
 
             // Open the jobs.json file in editor
-            let jobs_file = config::loader::base_dir().join("cron").join("jobs.json");
+            let jobs_file = config::loader::base_dir().join("cron.json5");
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| {
                 if cfg!(windows) { "notepad".to_owned() } else { "vi".to_owned() }
             });
