@@ -121,7 +121,7 @@ async fn http_error_401() {
     init_tls();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
+        .and(path("/chat/completions"))
         .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
         .mount(&server)
         .await;
@@ -137,7 +137,7 @@ async fn http_error_429() {
     init_tls();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
+        .and(path("/chat/completions"))
         .respond_with(ResponseTemplate::new(429).set_body_string("Rate limited"))
         .mount(&server)
         .await;
@@ -153,7 +153,7 @@ async fn http_error_500() {
     init_tls();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
+        .and(path("/chat/completions"))
         .respond_with(ResponseTemplate::new(500).set_body_string("Internal error"))
         .mount(&server)
         .await;
