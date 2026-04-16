@@ -78,7 +78,7 @@ pub fn anthropic_sse_body(events: &[AnthropicEvent]) -> String {
 pub async fn mount_anthropic_stream(server: &MockServer, events: &[AnthropicEvent]) {
     let body = anthropic_sse_body(events);
     Mock::given(method("POST"))
-        .and(path("/v1/messages"))
+        .and(path("/messages"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(body)
