@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
 
 import styles from "./settings.module.scss";
 
@@ -144,6 +144,29 @@ export function Settings() {
 
   const accessStore = useAccessStore();
 
+  // Auto-start at login (Tauri only)
+  const [autoStart, setAutoStart] = useState(false);
+  const [autoStartLoading, setAutoStartLoading] = useState(true);
+  useEffect(() => {
+    let cancelled = false;
+    import("../utils/tauri").then(({ isTauri, invoke }) => {
+      if (!isTauri || cancelled) { setAutoStartLoading(false); return; }
+      invoke("get_auto_start").then((v: any) => {
+        if (!cancelled) setAutoStart(!!v);
+      }).catch(() => {}).finally(() => { if (!cancelled) setAutoStartLoading(false); });
+    }).catch(() => setAutoStartLoading(false));
+    return () => { cancelled = true; };
+  }, []);
+  const toggleAutoStart = useCallback(async () => {
+    try {
+      const { isTauri, invoke } = await import("../utils/tauri");
+      if (!isTauri) return;
+      const next = !autoStart;
+      await invoke("set_auto_start", { enable: next });
+      setAutoStart(next);
+    } catch {}
+  }, [autoStart]);
+
   useEffect(() => {
     checkUpdate();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -248,6 +271,19 @@ export function Settings() {
               />
             )}
           </ListItem>
+
+          {!autoStartLoading && (
+            <ListItem
+              title={Locale.RsClawSettings.AutoStart}
+              subTitle={Locale.RsClawSettings.AutoStartSub}
+            >
+              <input
+                type="checkbox"
+                checked={autoStart}
+                onChange={toggleAutoStart}
+              />
+            </ListItem>
+          )}
         </List>
 
         <List>

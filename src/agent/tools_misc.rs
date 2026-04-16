@@ -763,7 +763,15 @@ $synth.Speak('{}')
             "search" => self.tool_memory_search(args).await,
             "get" => self.tool_memory_get(args).await,
             "put" => self.tool_memory_put(ctx, args).await,
-            "delete" => self.tool_memory_delete(args).await,
+            "delete" => {
+                // Memory deletion only allowed from internal channels (meditation/cron).
+                // User conversations cannot delete memories — use /memory clear command instead.
+                let ch = &ctx.channel;
+                if ch != "system" && ch != "cron" && ch != "heartbeat" {
+                    bail!("memory delete is not available in conversations. Use the /memory clear command instead.")
+                }
+                self.tool_memory_delete(args).await
+            }
             _ => bail!("memory: unknown action '{action}' (search, get, put, delete)"),
         }
     }

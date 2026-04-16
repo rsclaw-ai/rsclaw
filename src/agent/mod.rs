@@ -13,6 +13,7 @@ pub mod collaboration;
 pub mod compaction;
 pub mod context_mgr;
 pub mod doc;
+pub mod exec_pool;
 pub mod loop_detection;
 pub mod memory;
 pub mod permission;

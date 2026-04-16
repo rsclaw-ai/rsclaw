@@ -32,7 +32,7 @@ import {
   wechatQrStatus,
   GATEWAY_URL,
   setGatewayUrl,
-  setAuthToken,
+  setAuthToken as setApiAuthToken,
   testProviderKey,
   listProviderModels,
 } from "../lib/rsclaw-api";
@@ -548,7 +548,7 @@ function ConfigEditorPage() {
     const pt = extractVal(raw, "processingTimeout");
     if (pt) setProcessingTimeout(parseInt(pt, 10) || 120);
     const at = extractVal(raw, "authToken");
-    if (at) setAuthToken(at);
+    if (at) { setAuthToken(at); setApiAuthToken(at); }
 
     // Agent defaults
     const am = extractVal(raw, "model");
@@ -867,7 +867,7 @@ function ConfigEditorPage() {
             <div style={fieldSub}>API authentication token</div>
           </div>
           <input style={fieldInput} type="password" value={authToken} placeholder="(not set)"
-            onChange={(e) => { setAuthToken(e.target.value); markDirty(); }} />
+            onChange={(e) => { setAuthToken(e.target.value); setApiAuthToken(e.target.value); markDirty(); }} />
         </div>
       </div>
       <div style={sectionCard}>
@@ -4618,6 +4618,7 @@ interface CronJob {
   enabled: boolean;
   schedule?: { kind: string; expr: string; tz?: string };
   payload?: { kind: string; text?: string };
+  delivery?: { channel?: string; to?: string; mode?: string };
   sessionKey?: string;
   sessionTarget?: string;
   last_run?: string;
@@ -4656,7 +4657,7 @@ function CronTaskPage() {
   const [cronEnabled, setCronEnabled] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [editJob, setEditJob] = useState<CronJob | null>(null);
-  const [form, setForm] = useState({ name: "", schedule: "", message: "", agentId: "", enabled: true });
+  const [form, setForm] = useState({ name: "", schedule: "", message: "", agentId: "", enabled: true, deliveryChannel: "", deliveryTo: "", deliveryMode: "always" });
   const [agents, setAgents] = useState<{ id: string; name?: string }[]>([]);
   const [runningId, setRunningId] = useState<string | null>(null);
 
@@ -4694,6 +4695,9 @@ function CronTaskPage() {
           schedule: { kind: "cron", expr: form.schedule, tz: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC" },
           payload: { kind: "systemEvent", text: form.message },
         };
+        if (form.deliveryChannel && form.deliveryTo) {
+          jobObj.delivery = { channel: form.deliveryChannel, to: form.deliveryTo, mode: form.deliveryMode || "always" };
+        }
         let updated: any[];
         if (editJob) {
           const idx = existing.findIndex((j: any) => j.id === editJob.id);
@@ -4752,12 +4756,12 @@ function CronTaskPage() {
 
   const openEdit = (job: CronJob) => {
     setEditJob(job);
-    setForm({ name: job.name, schedule: job.schedule?.expr || "", message: job.payload?.text || "", agentId: job.agentId || "", enabled: job.enabled });
+    setForm({ name: job.name, schedule: job.schedule?.expr || "", message: job.payload?.text || "", agentId: job.agentId || "", enabled: job.enabled, deliveryChannel: job.delivery?.channel || "", deliveryTo: job.delivery?.to || "", deliveryMode: job.delivery?.mode || "always" });
     setShowForm(true);
   };
   const openNew = () => {
     setEditJob(null);
-    setForm({ name: "", schedule: "", message: "", agentId: agents[0]?.id || "", enabled: true });
+    setForm({ name: "", schedule: "", message: "", agentId: agents[0]?.id || "", enabled: true, deliveryChannel: "", deliveryTo: "", deliveryMode: "always" });
     setShowForm(true);
   };
 
@@ -4769,7 +4773,7 @@ function CronTaskPage() {
       <div style={{ padding: "24px 28px 0", display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexShrink: 0 }}>
         <div>
           <div style={{ fontSize: 20, fontWeight: 700, color: V2.t0, letterSpacing: -0.4 }}>{zh ? "\u5B9A\u65F6\u4EFB\u52A1" : "Cron Tasks"}</div>
-          <div style={{ fontSize: 11, color: V2.t3, fontFamily: V2.mono, marginTop: 3 }}>~/.rsclaw/cron/jobs.json</div>
+          <div style={{ fontSize: 11, color: V2.t3, fontFamily: V2.mono, marginTop: 3 }}>~/.rsclaw/cron.json5</div>
         </div>
         <button onClick={openNew} style={{ padding: "8px 16px", borderRadius: 9, border: "none", background: V2.or, color: "#fff", fontSize: 12, fontWeight: 700, boxShadow: "0 2px 8px rgba(249,115,22,.28)", cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}>
           <span>+</span> {zh ? "\u65B0\u5EFA\u4EFB\u52A1" : "New Task"}
@@ -4878,10 +4882,28 @@ function CronTaskPage() {
                   {agents.map((a) => <option key={a.id} value={a.id}>{a.name || a.id}</option>)}
                 </select>
               </div>
-              <div style={{ marginBottom: 0 }}>
+              <div style={{ marginBottom: 14 }}>
                 <div style={{ fontSize: 10, color: "#2e2c3a", letterSpacing: 0.4, marginBottom: 5, fontFamily: "'JetBrains Mono', monospace" }}>{zh ? "\u89E6\u53D1\u6D88\u606F" : "TRIGGER MESSAGE"}</div>
                 <textarea value={form.message} onChange={(e) => setForm({ ...form, message: e.target.value })} rows={3}
                   style={{ width: "100%", padding: "8px 10px", borderRadius: 7, border: "1px solid rgba(255,255,255,.09)", background: "#1f2126", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none", resize: "vertical", minHeight: 72 }} />
+              </div>
+              <div style={{ marginBottom: 0 }}>
+                <div style={{ fontSize: 10, color: "#2e2c3a", letterSpacing: 0.4, marginBottom: 5, fontFamily: "'JetBrains Mono', monospace" }}>{zh ? "\u7ED3\u679C\u63A8\u9001" : "DELIVERY"} <span style={{ color: "#4a4858" }}>({zh ? "\u53EF\u9009" : "optional"})</span></div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <select value={form.deliveryChannel} onChange={(e) => setForm({ ...form, deliveryChannel: e.target.value })}
+                    style={{ flex: 1, padding: "8px 10px", borderRadius: 7, border: "1px solid rgba(255,255,255,.09)", background: "#1f2126", color: "#eceaf4", fontSize: 11, outline: "none", cursor: "pointer" }}>
+                    <option value="">{zh ? "\u65E0\u63A8\u9001" : "No delivery"}</option>
+                    <option value="feishu">{zh ? "\u98DE\u4E66" : "Feishu"}</option>
+                    <option value="telegram">Telegram</option>
+                    <option value="wechat">{zh ? "\u5FAE\u4FE1" : "WeChat"}</option>
+                    <option value="dingtalk">{zh ? "\u9489\u9489" : "DingTalk"}</option>
+                    <option value="discord">Discord</option>
+                    <option value="slack">Slack</option>
+                    <option value="qq">QQ</option>
+                  </select>
+                  <input value={form.deliveryTo} onChange={(e) => setForm({ ...form, deliveryTo: e.target.value })} placeholder={zh ? "\u76EE\u6807 ID (\u7528\u6237/\u7FA4)" : "Target ID (user/group)"}
+                    style={{ flex: 2, padding: "8px 10px", borderRadius: 7, border: "1px solid rgba(255,255,255,.09)", background: "#1f2126", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11, outline: "none" }} />
+                </div>
               </div>
             </div>
             <div style={{ padding: "0 22px 20px", display: "flex", justifyContent: "flex-end", gap: 8 }}>
@@ -5282,7 +5304,7 @@ export function RsClawPanel() {
           const gw: any = await tauriInvoke("get_gateway_port");
           if (gw?.url) {
             setGatewayUrl(gw.url);
-            if (gw.token) setAuthToken(gw.token);
+            if (gw.token) { setApiAuthToken(gw.token); }
           }
         }
       } catch {}

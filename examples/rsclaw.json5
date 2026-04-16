@@ -239,6 +239,15 @@
   // TOOLS — Tool configuration
   // =================================================================
   tools: {
+    // Loop detection — prevent runaway tool call loops
+    loopDetection: {
+      enabled: true,                  // Enable loop detection (default: true)
+      window: 25,                     // Sliding window size (last N tool calls)
+      threshold: 10,                  // Default warning threshold
+      overrides: {
+        cron: 5,                      // cron: warning=5, critical=15 (default: 2,3)
+      },
+    },
     exec: {
       safety: false,                  // Enable exec safety rules (deny/confirm/allow patterns)
       // timeoutSeconds: 1800,        // Exec command timeout (default: 30min)

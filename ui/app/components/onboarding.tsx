@@ -1753,6 +1753,10 @@ export function OnboardingPage() {
       }
       setTimeout(() => {
         markSetupComplete();
+        // Enable auto-start after successful migration
+        import("../utils/tauri").then(({ isTauri, invoke }) => {
+          if (isTauri) invoke("set_auto_start", { enable: true }).catch(() => {});
+        }).catch(() => {});
         // Reload to ensure auth token is picked up by all modules
         window.location.href = "/";
       }, 2000);
@@ -2212,13 +2216,21 @@ export function OnboardingPage() {
     }
   };
 
+  const enableAutoStart = () => {
+    import("../utils/tauri").then(({ isTauri, invoke }) => {
+      if (isTauri) invoke("set_auto_start", { enable: true }).catch(() => {});
+    }).catch(() => {});
+  };
+
   const finish = () => {
     markSetupComplete();
+    enableAutoStart();
     window.location.href = "/";
   };
 
   const skipAll = () => {
     markSetupComplete();
+    enableAutoStart();
     window.location.href = "/#/rsclaw-panel";
   };
 

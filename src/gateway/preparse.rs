@@ -236,12 +236,19 @@ $g.Dispose();$b.Dispose()"#
     }
     // /cron — list cron jobs (reads from disk)
     if lower == "/cron" || lower == "/cron list" {
-        let jobs_path = crate::config::loader::base_dir().join("cron/jobs.json");
+        let jobs_path = crate::config::loader::base_dir().join("cron.json5");
         let reply = match tokio::fs::read_to_string(&jobs_path).await {
             Ok(content) => {
-                match serde_json::from_str::<Vec<serde_json::Value>>(&content) {
-                    Ok(jobs) if jobs.is_empty() => "No cron jobs configured.".to_owned(),
-                    Ok(jobs) => {
+                let parsed: Option<Vec<serde_json::Value>> = json5::from_str::<serde_json::Value>(&content)
+                    .or_else(|_| serde_json::from_str(&content))
+                    .ok()
+                    .and_then(|v| {
+                        v.get("jobs").and_then(|j| j.as_array().cloned())
+                            .or_else(|| v.as_array().cloned())
+                    });
+                match parsed {
+                    Some(jobs) if jobs.is_empty() => "No cron jobs configured.".to_owned(),
+                    Some(jobs) => {
                         let mut lines = vec!["Cron jobs:".to_owned()];
                         for job in &jobs {
                             let id = job.get("id").and_then(|v| v.as_str()).unwrap_or("?");
@@ -261,7 +268,7 @@ $g.Dispose();$b.Dispose()"#
                         }
                         lines.join("\n")
                     }
-                    Err(_) => "No cron jobs configured.".to_owned(),
+                    None => "No cron jobs configured.".to_owned(),
                 }
             }
             Err(_) => "No cron jobs configured.".to_owned(),

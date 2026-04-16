@@ -407,7 +407,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // Create cron reload broadcast channel (used to notify CronRunner of new jobs)
     let (cron_reload_tx, _cron_reload_rx) = tokio::sync::broadcast::channel::<()>(16);
 
-    // Start cron runner — jobs loaded from base_dir/cron/jobs.json
+    // Start cron runner — jobs loaded from base_dir/cron.json5
     {
         let cron_cfg = config.ops.cron.clone().unwrap_or_else(|| {
             crate::config::schema::CronConfig {
@@ -464,8 +464,19 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         dm_enforcers: Arc::clone(&dm_enforcers),
         custom_webhooks: Arc::clone(&custom_webhooks),
         cron_reload: cron_reload_tx,
+        notification_tx: notification_tx.clone(),
     };
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
+
+    // Start browser pool idle reaper (checks every 60s).
+    tokio::spawn(async {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            crate::browser::pool::BrowserPool::global().reap_if_idle().await;
+        }
+    });
 
     let bind_addr = resolve_bind_addr(&config);
     info!("starting HTTP server on {bind_addr}");

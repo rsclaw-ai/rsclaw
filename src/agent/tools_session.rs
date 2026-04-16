@@ -30,9 +30,9 @@ impl AgentRuntime {
             .as_ref()
             .ok_or_else(|| anyhow!("sessions_send: agent registry not available"))?;
 
-        // Resolve target: if agentId given, send to that agent; otherwise use
-        // session_key to find an agent.
-        let target_id = agent_id.unwrap_or(&ctx.agent_id);
+        // Resolve target: agentId is required to avoid accidentally sending to self.
+        let target_id = agent_id
+            .ok_or_else(|| anyhow!("sessions_send: `agentId` required (specify which agent to send to)"))?;
         let target = registry
             .get(target_id)
             .map_err(|_| anyhow!("sessions_send: agent `{target_id}` not found"))?;

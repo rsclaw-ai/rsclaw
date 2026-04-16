@@ -888,6 +888,8 @@ const en: LocaleType = {
     AgentDefault: "default",
     AgentLoading: "Loading...",
     AgentLoadFailed: "Failed to load agent list",
+    AutoStart: "Launch at Login",
+    AutoStartSub: "Automatically start RsClaw when you log in",
   },
 
   GatewayControl: {

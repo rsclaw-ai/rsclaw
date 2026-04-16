@@ -19,7 +19,7 @@ pub(crate) fn toolset_allowed_names(
     custom_tools: Option<&Vec<String>>,
 ) -> Option<std::collections::HashSet<String>> {
     const MINIMAL: &[&str] = &["execute_command", "read_file", "write_file", "send_file", "list_dir", "search_file", "search_content", "web_search", "web_fetch", "memory"];
-    const WEB: &[&str] = &["web_search", "web_fetch", "web_browser", "web_download", "read_file", "write_file", "list_dir", "search_file", "memory"];
+    const WEB: &[&str] = &["web_search", "web_fetch", "web_download", "read_file", "write_file", "list_dir", "search_file", "memory"];
     const CODE: &[&str] = &["execute_command", "read_file", "write_file", "list_dir", "search_file", "search_content", "memory"];
     const STANDARD: &[&str] = &[
         "execute_command",
@@ -79,13 +79,13 @@ pub(crate) fn build_tool_list(
     // Built-in tools — consolidated (32+ tools -> ~13 unified tools).
     tools.push(ToolDef {
         name: "memory".to_owned(),
-        description: "Manage long-term memory. Actions: search (semantic search), get (by ID), put (store new), delete (remove by ID).".to_owned(),
+        description: "Manage long-term memory. Actions: search (semantic search), get (by ID), put (store new).".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["search", "get", "put", "delete"], "description": "Action to perform"},
+                "action": {"type": "string", "enum": ["search", "get", "put"], "description": "Action to perform"},
                 "query":  {"type": "string", "description": "Search query (for search action)"},
-                "id":     {"type": "string", "description": "Memory document ID (for get/delete)"},
+                "id":     {"type": "string", "description": "Memory document ID (for get)"},
                 "text":   {"type": "string", "description": "Content to store (for put action)"},
                 "scope":  {"type": "string", "description": "Scope filter (optional)"},
                 "kind":   {"type": "string", "description": "Document kind: note, fact, summary, or remember. Use 'remember' ONLY when the user explicitly asks to remember/memorize something."},
@@ -110,12 +110,16 @@ pub(crate) fn build_tool_list(
         name: "write_file".to_owned(),
         description: "Write/create a file. Use this for ALL file creation and writing — do NOT use execute_command with notepad, echo, or any other editor/command to create files.\n\
             Creates parent directories as needed. Path is relative to workspace root.\n\
-            Both 'path' and 'content' are required.".to_owned(),
+            Both 'path' and 'content' are required.\n\
+            CRITICAL: When writing user-provided content, copy it EXACTLY character-by-character. \
+            Never omit, rephrase, or regenerate numbers, dates, addresses, names, or any specific values. \
+            If the user said '135号168栋', the content MUST contain '135号168栋' exactly.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "path":    {"type": "string", "description": "Relative file path within the workspace (REQUIRED). Example: 'output.py'"},
-                "content": {"type": "string", "description": "File content to write (REQUIRED)."}
+                "content": {"type": "string", "description": "File content to write (REQUIRED). MUST preserve all numbers, dates, and specific values from the user's message exactly as given."},
+                "explanation": {"type": "string", "description": "Brief explanation of what you are creating and why, to help organize your thoughts before writing content."}
             },
             "required": ["path", "content"]
         }),
@@ -147,7 +151,7 @@ pub(crate) fn build_tool_list(
              - Dates: Get-Date -Format 'yyyy-MM-dd'; [DateTimeOffset]::Now.ToUnixTimeSeconds()\n\
              - Do NOT wrap commands in extra cmd /c or powershell -Command layers.\n\
              - Do NOT use exec for destructive operations on personal directories (Desktop, Downloads, Documents).\n\
-             - For long-running processes (servers, watchers): use background=true to start without blocking.\n\
+             - Commands run in background by default (wait=false). Use wait=true only for short commands where you need the output immediately.\n\
              - If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user."
                 .to_owned()
         } else if cfg!(target_os = "macos") {
@@ -170,25 +174,25 @@ pub(crate) fn build_tool_list(
             "properties": {
                 "command": {"type": "string", "description": "Shell command to execute. Must be valid for the current OS."},
                 "timeout": {"type": "integer", "description": "Timeout in seconds (default: 30, max: 300)"},
-                "background": {"type": "boolean", "description": "Run in background (for servers/long-running processes). Returns PID immediately. Default: false."}
+                "wait": {"type": "boolean", "description": "If true, wait for the command to finish and return output. If false (default), run in background and return a task_id. Results are delivered on your next turn."},
+                "task_id": {"type": "string", "description": "Poll a previously started background task by its task_id."}
             },
-            "required": ["command"]
+            "required": []
         }),
     });
     tools.push(ToolDef {
         name: "agent".to_owned(),
-        description: "Manage sub-agents. You are the architect — delegate work, never block.\n\
+        description: "Manage agents. You are the architect — delegate work, never block.\n\
             Actions:\n\
-            - task: Fire-and-forget one-shot task. Returns immediately with task_id. Result delivered on your next turn.\n\
-            - spawn: Create a persistent sub-agent (survives across turns).\n\
-            - send: Send a message to a spawned sub-agent (async, result on next turn).\n\
+            - task: Create a task agent for a one-shot job. Returns immediately with task_id. The task agent runs independently and delivers results when done.\n\
+            - spawn: Create a persistent agent (survives across turns).\n\
+            - send: Send a message to an existing agent (async, result delivered when done).\n\
             - list: List all registered agents.\n\
-            - kill: Stop a sub-agent.\n\
+            - kill: Stop an agent.\n\
             Tips:\n\
             - Use task for independent, parallelizable work. You can dispatch multiple tasks at once.\n\
             - Always specify toolset matching the task (web for search, code for file ops).\n\
-            - After dispatching, tell the user what you delegated and continue with other work.\n\
-            - Check task results on your next response — they appear as [async task completed] messages.".to_owned(),
+            - After dispatching, tell the user what you delegated and continue with other work.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -225,7 +229,7 @@ pub(crate) fn build_tool_list(
             "type": "object",
             "properties": {
                 "path":      {"type": "string", "description": "Directory path to list. Defaults to workspace root."},
-                "recursive": {"type": "boolean", "description": "List recursively (default: false)"},
+                "recursive": {"type": "boolean", "description": "If true, list all files in subdirectories recursively. Default: false."},
                 "pattern":   {"type": "string", "description": "Glob pattern filter (e.g. '*.json', '*.rs')"}
             }
         }),
@@ -252,7 +256,7 @@ pub(crate) fn build_tool_list(
                 "pattern":  {"type": "string", "description": "Text or regex pattern to search for"},
                 "path":     {"type": "string", "description": "File or directory to search in. Defaults to workspace."},
                 "include":  {"type": "string", "description": "File glob filter (e.g. '*.py', '*.rs')"},
-                "ignore_case": {"type": "boolean", "description": "Case insensitive search (default: false)"},
+                "ignore_case": {"type": "boolean", "description": "If true, match case-insensitively. Default: false."},
                 "max_results": {"type": "integer", "description": "Maximum results (default: 20)"}
             },
             "required": ["pattern"]
@@ -328,6 +332,7 @@ pub(crate) fn build_tool_list(
             2. `snapshot` — get page content with interactive element refs (@e1, @e2...)\n\
             3. `click` ref=@e1 / `fill` ref=@e2 text='...' — interact using refs from snapshot\n\
             4. Re-snapshot after any page change to get updated refs\n\
+            Quick search: `search` — auto-find search box on ANY site, fill text, submit, return results. Use this for site-specific searches (Douyin, Taobao, JD, etc.).\n\
             Other actions: type, select, check, scroll, screenshot, pdf, press, back, forward, reload, wait, evaluate, cookies, get_text, get_url, get_title, find, get_article, upload, new_tab, switch_tab, close_tab.\n\
             IMPORTANT: Always snapshot BEFORE clicking/filling. Element refs change after page updates.".to_owned(),
         parameters: json!({
@@ -340,7 +345,8 @@ pub(crate) fn build_tool_list(
                     "wait", "evaluate", "cookies", "press", "set_viewport",
                     "dialog", "state", "network", "new_tab", "list_tabs",
                     "switch_tab", "close_tab", "highlight", "clipboard", "find",
-                    "get_article", "upload", "context", "emulate", "diff", "record"
+                    "get_article", "upload", "context", "emulate", "diff", "record",
+                    "search"
                 ]},
                 "url":        {"type": "string", "description": "URL for open/navigate"},
                 "ref":        {"type": "string", "description": "Element ref like @e3 from snapshot"},
@@ -557,56 +563,108 @@ pub(crate) fn build_tool_list(
         }),
     });
 
-    // Document creation & editing tool.
+    // Document tools — split into simple independent tools for better small-model compatibility.
+    // Formatting note injected into content-bearing tools.
+    let doc_fmt_hint = " Structure content professionally: use # headings, - bullet lists, blank lines between sections. For notices/reports: add title, organize into sections.";
+
     tools.push(ToolDef {
-        name: "doc".to_owned(),
-        description: "Create, edit, and read documents. Use this for ALL document operations — do NOT use execute_command.\n\
-            Supported formats: xlsx, xls, docx, doc, pdf, pptx, ppt, txt, md, csv\n\
-            Actions:\n\
-            - read_doc: Read any document (xlsx/docx/pdf/pptx/txt/md/csv). Returns text content.\n\
-            - create_excel: Create xlsx with sheets [{name, headers, rows}]\n\
-            - create_word: Create docx with content (# for headings, blank lines for paragraphs)\n\
-            - create_pdf: Create PDF with content\n\
-            - create_ppt: Create pptx with slides [{title, body}]\n\
-            - edit_excel: Update sheets or append_rows to existing xlsx\n\
-            - edit_word: Replace content or append text to existing docx\n\
-            - edit_pdf: replace_text [{find,replace}], delete_pages [1,3]\n\
-            Tips:\n\
-            - For txt/md: use read_file/write_file instead (simpler)\n\
-            - For csv: use read_doc to read, create_excel to convert to xlsx\n\
-            - To edit PPT: read_doc first, then create_ppt with modified slides\n\
-            - After creating, use send_file to deliver to the user".to_owned(),
+        name: "create_docx".to_owned(),
+        description: format!("Create a Word document (.docx).{doc_fmt_hint} After creating, use send_file to deliver."),
         parameters: json!({
             "type": "object",
             "properties": {
-                "action":  {"type": "string", "enum": ["create_excel", "create_word", "create_pdf", "create_ppt", "edit_excel", "edit_word", "edit_pdf", "read_doc"], "description": "Action to perform"},
-                "path":    {"type": "string", "description": "File path relative to workspace, e.g. 'report.xlsx'"},
-                "title":   {"type": "string", "description": "Document title (optional, for word/pdf)"},
-                "sheets":  {"type": "array", "description": "For create_excel/edit_excel: [{name, headers: [str], rows: [[value]]}]. For edit_excel, matching sheet names replace existing sheets; new names add sheets.",
+                "path":    {"type": "string", "description": "File path, e.g. 'report.docx'"},
+                "content": {"type": "string", "description": "Document content. Use # for headings, - for lists, blank lines for paragraphs."},
+                "title":   {"type": "string", "description": "Document title (optional, displayed at top)"},
+                "explanation": {"type": "string", "description": "Brief explanation of what you are creating and why, to help organize your thoughts before writing content."}
+            },
+            "required": ["path", "content"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "create_pdf".to_owned(),
+        description: format!("Create a PDF document.{doc_fmt_hint} After creating, use send_file to deliver."),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path":    {"type": "string", "description": "File path, e.g. 'report.pdf'"},
+                "content": {"type": "string", "description": "Document content. Use # for headings, - for lists, blank lines for paragraphs."},
+                "title":   {"type": "string", "description": "Document title (optional, displayed at top)"},
+                "explanation": {"type": "string", "description": "Brief explanation of what you are creating and why, to help organize your thoughts before writing content."}
+            },
+            "required": ["path", "content"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "create_xlsx".to_owned(),
+        description: "Create an Excel spreadsheet (.xlsx). Extract structured data into columns with meaningful headers. After creating, use send_file to deliver.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path":   {"type": "string", "description": "File path, e.g. 'data.xlsx'"},
+                "sheets": {"type": "array", "description": "Sheets: [{name, headers: [str], rows: [[value]]}]",
                     "items": {"type": "object", "properties": {
-                        "name":    {"type": "string"},
-                        "headers": {"type": "array", "items": {"type": "string"}},
-                        "rows":    {"type": "array", "items": {"type": "array"}}
+                        "name":    {"type": "string", "description": "Sheet name (tab label in the spreadsheet)."},
+                        "headers": {"type": "array", "items": {"type": "string"}, "description": "Column header labels for the first row."},
+                        "rows":    {"type": "array", "items": {"type": "array"}, "description": "Data rows, each an array of cell values in column order."}
                     }}
                 },
-                "append_rows": {"description": "For edit_excel: append rows to existing sheet. Either {sheet, rows: [[value]]} or [{sheet, rows}]"},
-                "content": {"type": "string", "description": "For create_word/create_pdf: text content. For edit_word: replacement content (replaces entire document). Paragraphs separated by blank lines. Lines starting with # are headings."},
-                "append":  {"type": "string", "description": "For edit_word: text to append to existing document. Paragraphs separated by blank lines. Lines starting with # are headings."},
-                "replacements": {"type": "array", "description": "For edit_pdf replace_text: [{find: 'old', replace: 'new'}]. Works on raw PDF content streams — may not work for text split across operators.",
+                "explanation": {"type": "string", "description": "Brief explanation of what you are creating and why, to help organize your thoughts before writing content."}
+            },
+            "required": ["path", "sheets"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "create_pptx".to_owned(),
+        description: "Create a PowerPoint presentation (.pptx). After creating, use send_file to deliver.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path":   {"type": "string", "description": "File path, e.g. 'deck.pptx'"},
+                "slides": {"type": "array", "description": "Slides: [{title, body}]",
                     "items": {"type": "object", "properties": {
-                        "find":    {"type": "string"},
-                        "replace": {"type": "string"}
+                        "title": {"type": "string", "description": "Slide title displayed at the top."},
+                        "body":  {"type": "string", "description": "Slide body text. Use newlines to separate bullet points."}
                     }}
                 },
-                "delete_pages": {"type": "array", "description": "For edit_pdf: 1-indexed page numbers to delete, e.g. [1, 3]",
-                    "items": {"type": "integer"}
-                },
-                "slides":  {"type": "array", "description": "For create_ppt: [{title, body}]",
+                "explanation": {"type": "string", "description": "Brief explanation of what you are creating and why, to help organize your thoughts before writing content."}
+            },
+            "required": ["path", "slides"]
+        }),
+    });
+    // Keep doc tool for read/edit operations (less frequently used by small models).
+    tools.push(ToolDef {
+        name: "doc".to_owned(),
+        description: "Read or edit existing documents.\n\
+            Actions: read_doc (xlsx/docx/pdf), edit_excel, edit_word, edit_pdf.\n\
+            For CREATING new documents, use create_docx/create_pdf/create_xlsx/create_pptx instead.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "action":  {"type": "string", "enum": ["read_doc", "edit_excel", "edit_word", "edit_pdf"], "description": "Action to perform"},
+                "path":    {"type": "string", "description": "File path"},
+                "content": {"type": "string", "description": "For edit_word: replacement content"},
+                "append":  {"type": "string", "description": "For edit_word: text to append"},
+                "sheets":  {"type": "array", "description": "For edit_excel: [{name, headers, rows}]",
                     "items": {"type": "object", "properties": {
-                        "title": {"type": "string"},
-                        "body":  {"type": "string"}
+                        "name":    {"type": "string", "description": "Sheet name (tab label in the spreadsheet)."},
+                        "headers": {"type": "array", "items": {"type": "string"}, "description": "Column header labels for the first row."},
+                        "rows":    {"type": "array", "items": {"type": "array"}, "description": "Data rows, each an array of cell values in column order."}
                     }}
-                }
+                },
+                "append_rows": {"type": "array", "description": "For edit_excel: append rows to an existing sheet without replacing it.",
+                    "items": {"type": "object", "properties": {
+                        "sheet": {"type": "string", "description": "Name of the existing sheet to append to."},
+                        "rows":  {"type": "array", "items": {"type": "array"}, "description": "Rows to append, each an array of cell values."}
+                    }}
+                },
+                "replacements": {"type": "array", "description": "For edit_pdf: [{find, replace}]",
+                    "items": {"type": "object", "properties": {
+                        "find":    {"type": "string", "description": "Text string to find in the PDF."},
+                        "replace": {"type": "string", "description": "Replacement text."}
+                    }}
+                },
+                "delete_pages": {"type": "array", "description": "For edit_pdf: 1-indexed page numbers to delete", "items": {"type": "integer"}}
             },
             "required": ["action", "path"]
         }),
@@ -671,6 +729,16 @@ pub(crate) fn build_tool_list(
                     .clone()
                     .unwrap_or_else(|| Value::Object(Default::default())),
             });
+        }
+    }
+
+    // Inject `additionalProperties: false` and `$schema` into every tool's
+    // parameters object. This enables constrained decoding in Ollama/vLLM,
+    // which dramatically reduces digit-loss on small models (9b).
+    for tool in &mut tools {
+        if let Some(obj) = tool.parameters.as_object_mut() {
+            obj.entry("additionalProperties").or_insert(json!(false));
+            obj.entry("$schema").or_insert(json!("http://json-schema.org/draft-07/schema#"));
         }
     }
 
