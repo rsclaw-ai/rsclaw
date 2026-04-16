@@ -2750,6 +2750,31 @@ impl AgentRuntime {
                                 {
                                     let merged = format!("{existing}{new_str}");
                                     last.2 = serde_json::Value::String(merged);
+                                } else if last.2.is_string() {
+                                    // Accumulator is String but chunk is Number/Bool/etc.
+                                    // llamacpp sends digits as Number tokens during streaming.
+                                    // Convert to string and append.
+                                    let fragment = match &input {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        serde_json::Value::Number(n) => n.to_string(),
+                                        serde_json::Value::Bool(b) => b.to_string(),
+                                        serde_json::Value::Null => "null".to_owned(),
+                                        other => serde_json::to_string(other).unwrap_or_default(),
+                                    };
+                                    let existing = last.2.as_str().unwrap_or("");
+                                    last.2 = serde_json::Value::String(format!("{existing}{fragment}"));
+                                } else if let Some(new_str) = input.as_str() {
+                                    // Last is Object but new chunk is String — convert.
+                                    let existing_str = serde_json::to_string(&last.2).unwrap_or_default();
+                                    last.2 = serde_json::Value::String(format!("{existing_str}{new_str}"));
+                                } else {
+                                    // Last resort: convert both to string.
+                                    let existing_str = serde_json::to_string(&last.2).unwrap_or_default();
+                                    let fragment = serde_json::to_string(&input).unwrap_or_default();
+                                    last.2 = serde_json::Value::String(format!("{existing_str}{fragment}"));
+                                    tracing::debug!(
+                                        "streaming tool call: merged non-string types as strings"
+                                    );
                                 }
                             }
                         }
