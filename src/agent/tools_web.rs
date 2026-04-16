@@ -721,8 +721,10 @@ impl AgentRuntime {
             || lang.to_lowercase().starts_with("chinese");
 
         // Engine list: (name, url_template, result_css, snippet_css)
+        // Round-robin start index to distribute concurrent searches across engines,
+        // avoiding CAPTCHA triggers from hitting the same engine simultaneously.
         let q = urlencoding::encode(query);
-        let engines: Vec<(&str, String, &str, &str)> = if is_zh {
+        let mut engines: Vec<(&str, String, &str, &str)> = if is_zh {
             vec![
                 ("baidu", format!("https://www.baidu.com/s?wd={q}"), ".result.c-container", "p, .c-abstract"),
                 ("sogou", format!("https://www.sogou.com/web?query={q}"), ".vrwrap, .rb", "p, .ft"),
@@ -736,6 +738,9 @@ impl AgentRuntime {
                 ("duckduckgo", format!("https://html.duckduckgo.com/html/?q={q}"), ".result", ".result__snippet"),
             ]
         };
+        let rotation = crate::browser::pool::BrowserPool::global().next_engine_index() as usize;
+        let len = engines.len();
+        engines.rotate_left(rotation % len);
 
         for (name, url, result_selector, snippet_selector) in &engines {
             info!(engine = name, "browser_search: trying");

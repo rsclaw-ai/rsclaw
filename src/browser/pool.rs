@@ -40,8 +40,12 @@ pub struct BrowserPool {
     tab_semaphore: Arc<Semaphore>,
     /// Chrome binary path (resolved once).
     chrome_path: Mutex<Option<String>>,
+    /// Chrome profile name (shares cookies with headed browser).
+    profile: Mutex<Option<String>>,
     /// Last activity timestamp (for idle reaping).
     last_activity: AtomicU64,
+    /// Counter for round-robin engine selection.
+    engine_counter: std::sync::atomic::AtomicU32,
 }
 
 /// Internal: a Chrome process with its debug port.
@@ -68,7 +72,9 @@ impl BrowserPool {
             chrome: Mutex::new(None),
             tab_semaphore: Arc::new(Semaphore::new(MAX_TABS_PER_INSTANCE)),
             chrome_path: Mutex::new(None),
+            profile: Mutex::new(None),
             last_activity: AtomicU64::new(now_ms()),
+            engine_counter: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -164,13 +170,34 @@ impl BrowserPool {
 
         can_launch_chrome()?;
 
-        // Launch headless Chrome (always headless for the pool).
-        let process = ChromeProcess::launch(&chrome_path, false, None).await?;
+        // Resolve profile (shares cookies with the headed browser).
+        let profile = {
+            let mut profile_guard = self.profile.lock().await;
+            if profile_guard.is_none() {
+                let config_path = crate::config::loader::base_dir().join("rsclaw.json5");
+                let cfg_profile = crate::config::loader::load_json5(&config_path)
+                    .ok()
+                    .and_then(|c| c.tools)
+                    .and_then(|t| t.web_browser)
+                    .and_then(|b| b.profile);
+                *profile_guard = cfg_profile;
+            }
+            profile_guard.clone()
+        };
+
+        // Launch headless Chrome with shared profile (for cookies/session).
+        let process = ChromeProcess::launch(&chrome_path, false, profile.as_deref()).await?;
         let port = process.port()?;
-        info!(port, "pool: shared headless Chrome launched");
+        info!(port, profile = ?profile, "pool: shared headless Chrome launched");
 
         *guard = Some(PooledChrome { process, port });
         Ok(port)
+    }
+
+    /// Get the next engine index for round-robin engine selection.
+    /// This ensures concurrent searches use different engines to avoid CAPTCHA.
+    pub fn next_engine_index(&self) -> u32 {
+        self.engine_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Update last activity timestamp.
