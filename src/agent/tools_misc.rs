@@ -1,376 +1,523 @@
-//! Miscellaneous tool handlers — agent management, messaging, sessions,
-//! cron, gateway, pairing, doc, and consolidated dispatch.
+//! Miscellaneous tool handlers — image generation, TTS, messaging, gateway,
+//! pairing, and memory consolidated dispatch.
 //!
 //! These are `impl AgentRuntime` methods extracted from `runtime.rs` for
 //! maintainability. They compile as a split impl block.
 
-use std::sync::Arc;
-use std::time::Duration;
-
 use anyhow::{Result, anyhow, bail};
-use chrono::Utc;
 use serde_json::{Value, json};
-use tracing::{debug, info, warn};
-use uuid::Uuid;
 
-use super::prompt_builder::build_base_system_prompt;
-use super::registry::{AgentMessage, AgentReply};
-use super::runtime::{expand_tilde, persist_agent_to_config, AgentRuntime, RunContext, DEFAULT_TIMEOUT_SECONDS};
+use super::platform::powershell_hidden;
+use super::runtime::{AgentRuntime, RunContext};
 
 impl AgentRuntime {
-    // -------------------------------------------------------------------
-    // Agent-related tools
-    // -------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Image generation
+    // -----------------------------------------------------------------------
 
-    /// Build a full system prompt for a sub-agent by combining the shared base
-    /// (date, platform, safety rules, agent loop guidance) with the role-specific
-    /// description provided by the main agent.
-    fn build_subagent_system_prompt(&self, role_desc: &str) -> String {
-        let base_parts = build_base_system_prompt(&self.config.raw);
-        let mut prompt = base_parts.join("\n\n");
-        prompt.push_str("\n\n## Your Role\n");
-        prompt.push_str(role_desc);
-        prompt.push_str(
-            "\n\n## Sub-Agent Guidelines\n\
-             - You are a sub-agent working on a delegated task. Focus on the task and return results.\n\
-             - Use the tools available to you. If a tool is not in your toolset, find an alternative.\n\
-             - Be concise in your reply — the main agent will relay your output to the user.\n\
-             - If the task is unclear or impossible, explain why instead of looping.",
-        );
-        prompt
-    }
-
-    async fn tool_agent_spawn(&self, args: Value) -> Result<Value> {
-        let spawner = self
-            .spawner
-            .as_ref()
-            .ok_or_else(|| anyhow!("agent_spawn: spawner not available"))?;
-
-        let id = args["id"]
+    pub(crate) async fn tool_image(&self, args: Value) -> Result<Value> {
+        let prompt = args["prompt"]
             .as_str()
-            .ok_or_else(|| anyhow!("agent_spawn: `id` required"))?
-            .to_owned();
-        let model = args["model"].as_str()
-            .filter(|s| !s.is_empty() && *s != "default")
-            .unwrap_or(&self.resolve_model_name())
-            .to_owned();
-        let system = args["system"]
-            .as_str()
-            .ok_or_else(|| anyhow!("agent_spawn: `system` required"))?
-            .to_owned();
-        let toolset_str = args["toolset"]
-            .as_str()
-            .unwrap_or("standard")
-            .to_owned();
-        let channels: Option<Vec<String>> = args["channels"]
-            .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_owned())).collect());
+            .ok_or_else(|| anyhow!("image: `prompt` required"))?;
 
-        use crate::config::schema::{AgentEntry, ModelConfig};
-
-        let entry = AgentEntry {
-            id: id.clone(),
-            default: Some(false),
-            workspace: Some(crate::config::loader::path_to_forward_slash(
-                &crate::config::loader::base_dir().join(format!("workspace-{id}")),
-            )),
-            model: Some(ModelConfig {
-                primary: Some(model),
-                fallbacks: None,
-                image: None,
-                image_fallbacks: None,
-                thinking: None,
-                tools_enabled: None,
-                toolset: Some(toolset_str.clone()),
-                tools: None,
-                context_tokens: None,
-                max_tokens: None,
-            }),
-            lane: None,
-            lane_concurrency: None,
-            group_chat: None,
-            channels: channels.clone(),
-            name: None,
-            agent_dir: None,
-            system: None,
-            commands: None,
-            allowed_commands: None,
-            opencode: None,
-            claudecode: None,
-        };
-
-        spawner.spawn_agent(entry.clone())?;
-
-        // Write full system prompt (base + role) as SOUL.md in the new agent's workspace.
-        let ws_path = crate::config::loader::base_dir().join(format!("workspace-{id}"));
-        if let Err(e) = tokio::fs::create_dir_all(&ws_path).await {
-            warn!("agent_spawn: failed to create workspace for {id}: {e:#}");
-        }
-        let soul_path = ws_path.join("SOUL.md");
-        let full_prompt = self.build_subagent_system_prompt(&system);
-        if let Err(e) = tokio::fs::write(&soul_path, format!("# Agent: {id}\n\n{full_prompt}\n")).await {
-            warn!("agent_spawn: failed to write SOUL.md for {id}: {e:#}");
-        }
-
-        // Persist to config file by default (user-created agents survive restart).
-        // Pass persistent=false only for temporary task-delegation agents.
-        let persistent = args["persistent"].as_bool().unwrap_or(true);
-        if persistent {
-            if let Err(e) = persist_agent_to_config(&entry).await {
-                warn!("agent_spawn: failed to persist to config: {e:#}");
-            }
-        }
-
-        let needs_restart = persistent && channels.is_some();
-        Ok(json!({
-            "spawned": id,
-            "model": args["model"],
-            "persistent": persistent,
-            "channels": channels,
-            "needs_restart": needs_restart,
-            "status": if needs_restart { "saved — restart gateway to bind channels" } else { "ready" }
-        }))
-    }
-
-    /// One-shot task agent: spawn -> send message -> return immediately.
-    ///
-    /// The task runs in the background. When the sub-agent completes, the
-    /// result is stored in `pending_task_results` and injected into the
-    /// main agent's session on the next turn. This ensures the main agent
-    /// is NEVER blocked by sub-agent work.
-    async fn tool_agent_task(&self, ctx: &RunContext, args: Value) -> Result<Value> {
-        let spawner = self
-            .spawner
-            .as_ref()
-            .ok_or_else(|| anyhow!("agent_task: spawner not available"))?;
-
-        let model = args["model"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&self.resolve_model_name())
-            .to_owned();
-
-        let system = args["system"]
-            .as_str()
-            .ok_or_else(|| anyhow!("agent_task: `system` required"))?
-            .to_owned();
-
-        let message = args["message"]
-            .as_str()
-            .ok_or_else(|| anyhow!("agent_task: `message` required"))?
-            .to_owned();
-
-        let toolset_str = args["toolset"]
-            .as_str()
-            .unwrap_or("standard")
-            .to_owned();
-
-        let short_id = &uuid::Uuid::new_v4().to_string()[..8];
-        let id = format!("task-{short_id}");
-        let base = crate::config::loader::base_dir();
-        let parent_ws = self.handle.config.workspace
-            .as_deref()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| base.join("workspace"));
-        let ws_path = parent_ws.join(format!("task-{short_id}"));
-        use crate::config::schema::{AgentEntry, ModelConfig};
-        let entry = AgentEntry {
-            id: id.clone(),
-            default: Some(false),
-            workspace: Some(crate::config::loader::path_to_forward_slash(&ws_path)),
-            model: Some(ModelConfig {
-                primary: Some(model),
-                fallbacks: None,
-                image: None,
-                image_fallbacks: None,
-                thinking: None,
-                tools_enabled: None,
-                toolset: Some(toolset_str.clone()),
-                tools: None,
-                context_tokens: None,
-                max_tokens: None,
-            }),
-            lane: None,
-            lane_concurrency: None,
-            group_chat: None,
-            channels: None,
-            name: None,
-            agent_dir: None,
-            system: None,
-            commands: None,
-            allowed_commands: None,
-            opencode: None,
-            claudecode: None,
-        };
-
-        spawner.spawn_agent(entry)?;
-
-        // Write full system prompt (base + role) as SOUL.md.
-        if let Err(e) = tokio::fs::create_dir_all(&ws_path).await {
-            warn!("agent_task: failed to create workspace for {id}: {e:#}");
-        }
-        let full_prompt = self.build_subagent_system_prompt(&system);
-        if let Err(e) = tokio::fs::write(ws_path.join("SOUL.md"), format!("# Agent: {id}\n\n{full_prompt}\n")).await {
-            warn!("agent_task: failed to write SOUL.md for {id}: {e:#}");
-        }
-
-        // Send message to the task agent.
-        let registry = self
-            .agents
-            .as_ref()
-            .ok_or_else(|| anyhow!("agent_task: agent registry not available"))?;
-        let target = registry.get(&id)?;
-        let task_session = format!("{}:task:{short_id}", ctx.session_key);
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
-        let msg = AgentMessage {
-            session_key: task_session,
-            text: message.clone(),
-            channel: format!("task:{}", ctx.agent_id),
-            peer_id: ctx.agent_id.clone(),
-            chat_id: String::new(),
-            reply_tx,
-            extra_tools: vec![],
-            images: vec![],
-            files: vec![],
-        };
-        target.tx.send(msg).await.map_err(|_| anyhow!("agent_task: agent inbox closed"))?;
-
-        // Spawn background worker to wait for reply and store result.
-        // Main agent returns IMMEDIATELY — never blocked.
-        let pending = Arc::clone(&self.pending_task_results);
-        let session_key = ctx.session_key.clone();
-        let task_id = id.clone();
-        let agents = self.agents.as_ref().map(Arc::clone);
-        let timeout_secs = self
+        // Check user-configured image model: agents.defaults.model.image
+        let user_image_model = self
+            .handle
             .config
-            .agents
-            .defaults
-            .timeout_seconds
-            .unwrap_or(DEFAULT_TIMEOUT_SECONDS as u32) as u64;
-        let task_timeout = timeout_secs.min(300); // up to 5 min for background tasks
-
-        tokio::spawn(async move {
-            let result_text = match tokio::time::timeout(
-                Duration::from_secs(task_timeout),
-                reply_rx,
-            ).await {
-                Ok(Ok(reply)) => reply.text,
-                Ok(Err(_)) => "[task agent channel closed unexpectedly]".to_owned(),
-                Err(_) => format!("[task {task_id} timed out after {task_timeout}s]"),
-            };
-
-            // Store result for main agent to pick up.
-            if let Ok(mut guard) = pending.lock() {
-                guard.push((task_id.clone(), session_key, result_text));
-            }
-
-            // Cleanup: remove agent from registry, delete workspace.
-            if let Some(reg) = agents {
-                reg.remove_handle(&task_id);
-            }
-            let _ = tokio::fs::remove_dir_all(&ws_path).await;
-            info!(task = %task_id, "async task agent completed and cleaned up");
-        });
-
-        Ok(json!({
-            "task_id": id,
-            "status": "dispatched",
-            "toolset": toolset_str,
-            "message": message,
-            "note": "Task is running in the background. Results will be available on your next turn. You can continue with other work."
-        }))
-    }
-
-    /// Send a message to a persistent (spawned) sub-agent. Non-blocking.
-    async fn tool_agent_send(&self, ctx: &RunContext, args: Value) -> Result<Value> {
-        let target_id = args["id"]
-            .as_str()
-            .ok_or_else(|| anyhow!("agent_send: `id` required"))?
-            .to_owned();
-        let message = args["message"]
-            .as_str()
-            .ok_or_else(|| anyhow!("agent_send: `message` required"))?
-            .to_owned();
-
-        let registry = self
-            .agents
+            .model
             .as_ref()
-            .ok_or_else(|| anyhow!("agent_send: agent registry not available"))?;
-        let target = registry.get(&target_id)?;
+            .and_then(|m| m.image.as_deref())
+            .or_else(|| {
+                self.config
+                    .agents
+                    .defaults
+                    .model
+                    .as_ref()
+                    .and_then(|m| m.image.as_deref())
+            })
+            .map(|s| s.to_owned());
 
-        let short_id = &uuid::Uuid::new_v4().to_string()[..8];
-        let send_session = format!("{}:send:{short_id}", ctx.session_key);
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
-        let msg = AgentMessage {
-            session_key: send_session,
-            text: message.clone(),
-            channel: format!("send:{}", ctx.agent_id),
-            peer_id: ctx.agent_id.clone(),
-            chat_id: String::new(),
-            reply_tx,
-            extra_tools: vec![],
-            images: vec![],
-            files: vec![],
+        // Resolve provider — from image model config or current chat model
+        let resolve_model = user_image_model.clone().unwrap_or_else(|| self.resolve_model_name());
+        let (prov_name, user_model_id) = {
+            crate::provider::registry::ProviderRegistry::parse_model(&resolve_model)
         };
-        target.tx.send(msg).await.map_err(|_| anyhow!("agent_send: agent '{target_id}' inbox closed"))?;
+        let (base_url, _auth_style) = crate::provider::defaults::resolve_base_url(prov_name);
 
-        // Background: wait for reply and store in pending results.
-        let pending = Arc::clone(&self.pending_task_results);
-        let session_key = ctx.session_key.clone();
-        let timeout_secs = self
+        let default_size = match prov_name {
+            _ => "2048x2048",
+        };
+        let size = args["size"].as_str().unwrap_or(default_size);
+
+        // Also check provider config for api_key and base_url overrides
+        let cfg_key = self
             .config
-            .agents
-            .defaults
-            .timeout_seconds
-            .unwrap_or(DEFAULT_TIMEOUT_SECONDS as u32) as u64;
-        let send_timeout = timeout_secs.min(300);
-        let send_id = format!("send-{target_id}-{short_id}");
-        let send_id_bg = send_id.clone();
-        let target_id_bg = target_id.clone();
+            .model
+            .models
+            .as_ref()
+            .and_then(|m| m.providers.get(prov_name))
+            .and_then(|p| p.api_key.as_ref())
+            .and_then(|k| k.as_plain().map(str::to_owned));
+        let cfg_url = self
+            .config
+            .model
+            .models
+            .as_ref()
+            .and_then(|m| m.providers.get(prov_name))
+            .and_then(|p| p.base_url.clone());
 
-        tokio::spawn(async move {
-            let result_text = match tokio::time::timeout(
-                Duration::from_secs(send_timeout),
-                reply_rx,
-            ).await {
-                Ok(Ok(reply)) => reply.text,
-                Ok(Err(_)) => format!("[agent {target_id_bg} channel closed]"),
-                Err(_) => format!("[agent {target_id_bg} timed out after {send_timeout}s]"),
-            };
-            if let Ok(mut guard) = pending.lock() {
-                guard.push((send_id_bg, session_key, result_text));
+        // Providers with image generation support
+        let image_providers = ["doubao", "bytedance", "openai", "qwen", "minimax", "gemini"];
+        let (img_url, img_key, img_prov) = if image_providers.contains(&prov_name) {
+            let url = cfg_url.unwrap_or(base_url);
+            let key = cfg_key
+                .or_else(|| std::env::var(format!("{}_API_KEY", prov_name.to_uppercase())).ok())
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+            (url, key, prov_name)
+        } else {
+            // Current provider doesn't support images — try doubao, qwen, openai
+            let fallback = [("doubao", "ARK_API_KEY"), ("qwen", "DASHSCOPE_API_KEY"), ("minimax", "MINIMAX_API_KEY"), ("gemini", "GEMINI_API_KEY"), ("openai", "OPENAI_API_KEY")];
+            let mut found = None;
+            for (fb_prov, fb_env) in fallback {
+                let fb_cfg = self
+                    .config
+                    .model
+                    .models
+                    .as_ref()
+                    .and_then(|m| m.providers.get(fb_prov));
+                let fb_key = fb_cfg
+                    .and_then(|p| p.api_key.as_ref())
+                    .and_then(|k| k.as_plain().map(str::to_owned))
+                    .or_else(|| std::env::var(fb_env).ok());
+                if let Some(key) = fb_key {
+                    let fb_url = fb_cfg
+                        .and_then(|p| p.base_url.clone())
+                        .unwrap_or_else(|| crate::provider::defaults::resolve_base_url(fb_prov).0);
+                    found = Some((fb_url, Some(key), fb_prov));
+                    break;
+                }
             }
-        });
+            found.unwrap_or_else(|| (cfg_url.unwrap_or(base_url), None, prov_name))
+        };
+        let Some(api_key) = img_key else {
+            return Ok(json!({
+                "error": "AI image generation requires doubao, qwen, minimax, gemini, or openai provider with API key. No image-capable provider configured."
+            }));
+        };
+
+        let image_model = args["model"].as_str()
+            .or_else(|| if !user_model_id.is_empty() { Some(user_model_id) } else { None })
+            .unwrap_or_else(|| match img_prov {
+                "doubao" | "bytedance" => "doubao-seedream-5-0-260128",
+                "openai" => "dall-e-3",
+                "qwen" => "qwen-image-2.0-pro",
+                "minimax" => "image-01",
+                "gemini" => "gemini-3-pro-image-preview",
+                _ => "dall-e-3",
+            });
+
+        // Resolve User-Agent: provider config -> gateway config -> default
+        let img_ua = self.config.model.models.as_ref()
+            .and_then(|m| m.providers.get(img_prov))
+            .and_then(|p| p.user_agent.as_deref())
+            .or_else(|| self.config.gateway.user_agent.as_deref())
+            .unwrap_or(crate::provider::DEFAULT_USER_AGENT);
+        let client = reqwest::Client::builder()
+            .user_agent(img_ua)
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap_or_default();
+
+        tracing::info!(provider = img_prov, model = image_model, size = size, ua = img_ua, "tool_image: generating");
+
+        // Provider-specific API formats
+        let is_qwen = img_prov == "qwen";
+        let is_minimax = img_prov == "minimax";
+        let is_gemini = img_prov == "gemini";
+        let (resp_status, resp_body) = if is_qwen {
+            let qwen_size = size.replace('x', "*");
+            let resp = client
+                .post("https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation")
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(&json!({
+                    "model": image_model,
+                    "input": { "messages": [{ "role": "user", "content": [{ "text": prompt }] }] },
+                    "parameters": { "size": qwen_size, "n": 1, "watermark": false }
+                }))
+                .send().await
+                .map_err(|e| anyhow!("image: request failed: {e}"))?;
+            let st = resp.status();
+            let body: Value = resp
+                .json()
+                .await
+                .map_err(|e| anyhow!("image: parse error: {e}"))?;
+            (st, body)
+        } else if is_minimax {
+            // Minimax: /v1/image_generation, aspect_ratio instead of size
+            // Supported: "1:1", "16:9", "9:16", "4:3", "3:4", "2:3", "3:2"
+            let aspect = if size.contains('x') {
+                let parts: Vec<&str> = size.split('x').collect();
+                if parts.len() == 2 {
+                    let w = parts[0].parse::<f32>().unwrap_or(1024.0);
+                    let h = parts[1].parse::<f32>().unwrap_or(1024.0);
+                    let ratio = w / h.max(1.0);
+                    let candidates = [
+                        (1.0_f32, "1:1"),
+                        (16.0 / 9.0, "16:9"),
+                        (9.0 / 16.0, "9:16"),
+                        (4.0 / 3.0, "4:3"),
+                        (3.0 / 4.0, "3:4"),
+                        (3.0 / 2.0, "3:2"),
+                        (2.0 / 3.0, "2:3"),
+                    ];
+                    candidates
+                        .iter()
+                        .min_by(|a, b| {
+                            (a.0 - ratio)
+                                .abs()
+                                .partial_cmp(&(b.0 - ratio).abs())
+                                .unwrap()
+                        })
+                        .map(|c| c.1)
+                        .unwrap_or("1:1")
+                        .to_owned()
+                } else {
+                    "1:1".to_owned()
+                }
+            } else {
+                "1:1".to_owned()
+            };
+            let url = format!("{}/image_generation", img_url.trim_end_matches('/'));
+            let resp = client.post(&url)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(&json!({ "model": image_model, "prompt": prompt, "aspect_ratio": aspect, "response_format": "url" }))
+                .send().await
+                .map_err(|e| anyhow!("image: request failed: {e}"))?;
+            let st = resp.status();
+            let body: Value = resp
+                .json()
+                .await
+                .map_err(|e| anyhow!("image: parse error: {e}"))?;
+            (st, body)
+        } else if is_gemini {
+            // Gemini: generateContent with responseModalities: ["IMAGE"]
+            // Map size to aspect ratio for Gemini
+            let aspect = if size.contains('x') {
+                let parts: Vec<&str> = size.split('x').collect();
+                if parts.len() == 2 {
+                    let w = parts[0].parse::<u32>().unwrap_or(2048);
+                    let h = parts[1].parse::<u32>().unwrap_or(2048);
+                    if w == h { "1:1" } else if w > h { "16:9" } else { "9:16" }
+                } else { "1:1" }
+            } else { "1:1" };
+            let gemini_base = img_url.trim_end_matches('/');
+            let url = format!("{gemini_base}/models/{image_model}:generateContent?key={api_key}");
+            let resp = client.post(&url)
+                .json(&json!({
+                    "contents": [{ "parts": [{ "text": prompt }] }],
+                    "generationConfig": {
+                        "responseModalities": ["TEXT", "IMAGE"],
+                        "imageConfig": { "aspectRatio": aspect }
+                    }
+                }))
+                .send().await
+                .map_err(|e| anyhow!("image: gemini request failed: {e}"))?;
+            let st = resp.status();
+            let body: Value = resp.json().await.map_err(|e| anyhow!("image: gemini parse error: {e}"))?;
+            (st, body)
+        } else {
+            let url = format!("{}/images/generations", img_url.trim_end_matches('/'));
+            let resp = client.post(&url)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(&json!({ "model": image_model, "prompt": prompt, "size": size, "n": 1, "response_format": "url" }))
+                .send().await
+                .map_err(|e| anyhow!("image: request failed: {e}"))?;
+            let st = resp.status();
+            let body: Value = resp
+                .json()
+                .await
+                .map_err(|e| anyhow!("image: parse error: {e}"))?;
+            (st, body)
+        };
+
+        if !resp_status.is_success() {
+            let err_msg = resp_body["error"]["message"]
+                .as_str()
+                .or_else(|| resp_body["message"].as_str())
+                .unwrap_or("unknown error");
+            return Err(anyhow!("image: API error: {err_msg}"));
+        }
+
+        // Extract image URL/base64 — different response formats per provider
+        // Gemini returns inline base64 directly, others return URLs
+        if is_gemini {
+            // Gemini: candidates[0].content.parts[] — find the inlineData part
+            #[allow(unused_imports)]
+            use base64::Engine;
+            let parts = resp_body.pointer("/candidates/0/content/parts")
+                .and_then(|v| v.as_array());
+            if let Some(parts) = parts {
+                for part in parts {
+                    if let Some(inline) = part.get("inlineData") {
+                        let mime = inline.get("mimeType").and_then(|v| v.as_str()).unwrap_or("image/png");
+                        if let Some(b64_data) = inline.get("data").and_then(|v| v.as_str()) {
+                            let data_uri = format!("data:{mime};base64,{b64_data}");
+                            return Ok(json!({
+                                "url": data_uri,
+                                "revised_prompt": prompt
+                            }));
+                        }
+                    }
+                }
+            }
+            return Err(anyhow!("image: no image data in Gemini response"));
+        }
+
+        let img_url_str = if is_qwen {
+            resp_body
+                .pointer("/output/choices/0/message/content/0/image")
+                .and_then(|v| v.as_str())
+        } else if is_minimax {
+            // minimax: data.image_base64[0] (base64) or data.image_urls[0] (url)
+            resp_body.pointer("/data/image_urls/0").and_then(|v| v.as_str())
+                .or_else(|| resp_body.pointer("/data/image_base64/0").and_then(|v| v.as_str()))
+        } else {
+            resp_body.pointer("/data/0/url").and_then(|v| v.as_str())
+        };
+
+        let Some(img_url_str) = img_url_str else {
+            return Err(anyhow!("image: no image URL in response"));
+        };
+
+        // Download image and convert to data URI
+        use base64::Engine;
+        let image_result = match reqwest::Client::new()
+            .get(img_url_str)
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => match r.bytes().await {
+                Ok(bytes) => {
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    format!("data:image/png;base64,{b64}")
+                }
+                Err(e) => return Err(anyhow!("image: download failed: {e}")),
+            },
+            Ok(r) => return Err(anyhow!("image: download returned {}", r.status())),
+            Err(e) => return Err(anyhow!("image: download error: {e}")),
+        };
+
+        let revised = resp_body
+            .pointer("/data/0/revised_prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
 
         Ok(json!({
-            "send_id": send_id,
-            "target": target_id,
-            "status": "sent",
-            "note": "Message sent to agent. Reply will be available on your next turn."
+            "url": image_result,
+            "revised_prompt": revised,
+            "size": size,
+            "model": image_model
         }))
     }
 
-    async fn tool_agent_list(&self) -> Result<Value> {
-        let agents = match &self.agents {
-            Some(reg) => reg
-                .all()
-                .iter()
-                .map(|h| {
-                    json!({
-                        "id": h.id,
-                        "model": h.config.model.as_ref()
-                            .and_then(|m| m.primary.as_deref())
-                            .unwrap_or("unknown"),
-                    })
-                })
-                .collect::<Vec<_>>(),
-            None => vec![],
+    // -----------------------------------------------------------------------
+    // TTS (text-to-speech)
+    // -----------------------------------------------------------------------
+
+    /// Generate TTS audio from text. Prefers sherpa-onnx, falls back to system TTS.
+    /// Returns the path to the generated audio file.
+    pub(crate) async fn generate_tts_audio(&self, text: &str) -> Result<String> {
+        // Truncate long text for TTS (avoid very long audio).
+        let tts_text = if text.chars().count() > 500 {
+            let idx = text.char_indices().nth(500).map(|(i, _)| i).unwrap_or(text.len());
+            &text[..idx]
+        } else {
+            text
         };
-        Ok(json!({"agents": agents}))
+
+        let out_path = std::env::temp_dir().join(format!(
+            "rsclaw_tts_{}.wav",
+            chrono::Utc::now().timestamp_millis()
+        ));
+        let out_str = out_path.to_string_lossy().to_string();
+
+        // Try sherpa-onnx first (installed via `rsclaw tools install sherpa-onnx`).
+        let sherpa_bin = crate::config::loader::base_dir()
+            .join("tools")
+            .join("sherpa-onnx")
+            .join("bin")
+            .join(if cfg!(target_os = "windows") { "sherpa-onnx-offline-tts.exe" } else { "sherpa-onnx-offline-tts" });
+
+        if sherpa_bin.exists() {
+            let model_dir = crate::config::loader::base_dir()
+                .join("tools")
+                .join("sherpa-onnx")
+                .join("models")
+                .join("tts");
+            // Look for any VITS model config.
+            let model_config = model_dir.join("model.onnx");
+            if model_config.exists() {
+                let mut cmd = tokio::process::Command::new(&sherpa_bin);
+                cmd.args([
+                    "--vits-model", model_config.to_str().unwrap_or(""),
+                    "--vits-tokens", model_dir.join("tokens.txt").to_str().unwrap_or(""),
+                    "--output-filename", &out_str,
+                    "--vits-length-scale", "1.0",
+                    tts_text,
+                ]);
+                #[cfg(target_os = "windows")]
+                {
+                    use std::os::windows::process::CommandExt;
+                    cmd.creation_flags(0x08000000);
+                }
+                let output = cmd.output().await;
+                if let Ok(o) = output {
+                    if o.status.success() && out_path.exists() {
+                        return Ok(out_str);
+                    }
+                }
+                // Fall through to system TTS if sherpa-onnx failed.
+            }
+        }
+
+        // Fallback: system TTS (same as tool_tts).
+        #[cfg(target_os = "macos")]
+        {
+            let output = tokio::process::Command::new("say")
+                .args(["-o", &out_str, tts_text])
+                .output()
+                .await
+                .map_err(|e| anyhow!("auto-tts: say failed: {e}"))?;
+            if !output.status.success() {
+                return Err(anyhow!("auto-tts: say exit code {}", output.status));
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let safe_text = tts_text.replace('\'', "''");
+            let script = format!(
+                "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.SetOutputToWaveFile('{}'); $s.Speak('{}')",
+                out_str.replace('\'', "''"), safe_text
+            );
+            let output = powershell_hidden()
+                .args(["-Command", &script])
+                .output()
+                .await
+                .map_err(|e| anyhow!("auto-tts: SAPI failed: {e}"))?;
+            if !output.status.success() {
+                return Err(anyhow!("auto-tts: SAPI exit code {}", output.status));
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let result = tokio::process::Command::new("espeak")
+                .args(["-w", &out_str, tts_text])
+                .output()
+                .await;
+            match result {
+                Ok(o) if o.status.success() => {}
+                _ => {
+                    tokio::process::Command::new("pico2wave")
+                        .args(["-w", &out_str, "--", tts_text])
+                        .output()
+                        .await
+                        .map_err(|e| anyhow!("auto-tts: no TTS engine available: {e}"))?;
+                }
+            }
+        }
+
+        if out_path.exists() {
+            Ok(out_str)
+        } else {
+            Err(anyhow!("auto-tts: output file not created"))
+        }
+    }
+
+    pub(crate) async fn tool_tts(&self, args: Value) -> Result<Value> {
+        let text = args["text"]
+            .as_str()
+            .ok_or_else(|| anyhow!("tts: `text` required"))?;
+        let voice = args["voice"].as_str().unwrap_or("default");
+
+        let out_path = std::env::temp_dir().join(format!(
+            "rsclaw_tts_{}{}",
+            chrono::Utc::now().timestamp_millis(),
+            if cfg!(target_os = "windows") {
+                ".wav"
+            } else {
+                ".aiff"
+            }
+        ));
+        let out_path_str = out_path.to_string_lossy().to_string();
+
+        let is_macos = cfg!(target_os = "macos");
+        let is_windows = cfg!(target_os = "windows");
+
+        if is_macos {
+            let mut cmd = tokio::process::Command::new("say");
+            if voice != "default" {
+                cmd.args(["-v", voice]);
+            }
+            cmd.args(["-o", &out_path_str, text]);
+            let output = cmd
+                .output()
+                .await
+                .map_err(|e| anyhow!("tts: `say` command failed: {e}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(anyhow!("tts: say failed: {stderr}"));
+            }
+        } else if is_windows {
+            let script = format!(
+                r#"
+Add-Type -AssemblyName System.Speech
+$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+$synth.SetOutputToWaveFile('{}')
+$synth.Speak('{}')
+"#,
+                out_path_str, text
+            );
+            let output = powershell_hidden()
+                .args(["-Command", &script])
+                .output()
+                .await
+                .map_err(|e| anyhow!("tts: PowerShell SAPI failed: {e}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(anyhow!("tts: SAPI failed: {stderr}"));
+            }
+        } else {
+            let espeak_result = tokio::process::Command::new("espeak")
+                .args(["-w", &out_path_str, text])
+                .output()
+                .await;
+            match espeak_result {
+                Ok(o) if o.status.success() => {}
+                _ => {
+                    let output = tokio::process::Command::new("pico2wave")
+                        .args(["-w", &out_path_str, "--", text])
+                        .output()
+                        .await
+                        .map_err(|e| anyhow!("tts: neither espeak nor pico2wave available: {e}"))?;
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        return Err(anyhow!("tts: pico2wave failed: {stderr}"));
+                    }
+                }
+            }
+        }
+
+        Ok(json!({
+            "audio_file": out_path_str,
+            "voice": voice,
+            "chars": text.len()
+        }))
     }
 
     // -------------------------------------------------------------------
-    // Messaging / session tools
+    // Messaging
     // -------------------------------------------------------------------
 
     pub(crate) async fn tool_message(&self, args: Value) -> Result<Value> {
@@ -415,368 +562,8 @@ impl AgentRuntime {
         }
     }
 
-    pub(crate) async fn tool_cron(&self, args: Value) -> Result<Value> {
-        let action = args["action"]
-            .as_str()
-            .ok_or_else(|| anyhow!("cron: `action` required"))?;
-
-        let cron_dir = crate::config::loader::base_dir();
-        let cron_path = cron_dir.join("cron").join("jobs.json");
-
-        match action {
-            "list" => {
-                let jobs = read_cron_jobs(&cron_path).await;
-                // Add 1-based index to each job for easier reference by LLMs
-                let jobs_with_index: Vec<Value> = jobs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, j)| {
-                        let mut indexed = j.clone();
-                        indexed["_index"] = json!(i + 1);
-                        indexed
-                    })
-                    .collect();
-                Ok(
-                    json!({"jobs": jobs_with_index, "hint": "Use index number (#1, #2, etc.) for removal to avoid ID truncation issues"}),
-                )
-            }
-            "add" => {
-                let schedule = args["schedule"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("cron add: `schedule` required"))?;
-                let message = args["message"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("cron add: `message` required"))?;
-                let name = args["name"].as_str();
-                let tz = args["tz"].as_str();
-                let agent_id = args["agent_id"].as_str().or(args["agentId"].as_str());
-
-                let mut jobs = read_cron_jobs(&cron_path).await;
-
-                let now_ms = Utc::now().timestamp_millis() as u64;
-                let id = Uuid::new_v4().to_string();
-                let mut job = json!({
-                    "id": id,
-                    "agentId": agent_id.unwrap_or("main"),
-                    "enabled": true,
-                    "createdAtMs": now_ms,
-                    "updatedAtMs": now_ms,
-                });
-                // Schedule: use nested format if tz provided, flat otherwise.
-                if let Some(tz_val) = tz {
-                    job["schedule"] = json!({"kind": "cron", "expr": schedule, "tz": tz_val});
-                } else {
-                    job["schedule"] = json!({"kind": "cron", "expr": schedule});
-                }
-                // Payload in OpenClaw format.
-                job["payload"] = json!({"kind": "systemEvent", "text": message});
-                if let Some(n) = name {
-                    job["name"] = json!(n);
-                }
-
-                jobs.push(job);
-                write_cron_jobs(&cron_path, &jobs).await?;
-
-                // Notify gateway to reload cron jobs
-                let port = self.config.gateway.port;
-                let client = reqwest::Client::new();
-                if let Err(e) = client
-                    .post(format!("http://127.0.0.1:{port}/api/v1/cron/reload"))
-                    .timeout(Duration::from_secs(3))
-                    .send()
-                    .await
-                {
-                    debug!(err = %e, "cron add: failed to notify gateway reload");
-                }
-
-                Ok(json!({"added": id, "schedule": schedule, "message": message}))
-            }
-            "remove" => {
-                let mut jobs = read_cron_jobs(&cron_path).await;
-
-                // Support both `id` and `index` parameters (prefer index for reliability)
-                let removed_job = if let Some(index) = args["index"].as_u64() {
-                    // 1-based index
-                    let idx = index as usize;
-                    if idx == 0 || idx > jobs.len() {
-                        return Err(anyhow!(
-                            "cron remove: invalid index {} (valid: 1-{})",
-                            index,
-                            jobs.len()
-                        ));
-                    }
-                    let job = jobs.remove(idx - 1);
-                    write_cron_jobs(&cron_path, &jobs).await?;
-                    job
-                } else if let Some(id) = args["id"].as_str() {
-                    let before = jobs.len();
-                    jobs.retain(|j| j["id"].as_str() != Some(id));
-                    let removed = before - jobs.len();
-                    if removed == 0 {
-                        return Err(anyhow!("cron remove: job not found with id={}", id));
-                    }
-                    write_cron_jobs(&cron_path, &jobs).await?;
-                    json!({"id": id, "count": removed})
-                } else {
-                    return Err(anyhow!(
-                        "cron remove: `index` or `id` required (index is preferred)"
-                    ));
-                };
-
-                // Notify gateway to reload cron jobs
-                let port = self.config.gateway.port;
-                let client = reqwest::Client::new();
-                if let Err(e) = client
-                    .post(format!("http://127.0.0.1:{port}/api/v1/cron/reload"))
-                    .timeout(Duration::from_secs(3))
-                    .send()
-                    .await
-                {
-                    debug!(err = %e, "cron remove: failed to notify gateway reload");
-                }
-
-                Ok(json!({"removed": removed_job}))
-            }
-            "enable" | "disable" => {
-                let enabled = action == "enable";
-                let mut jobs = read_cron_jobs(&cron_path).await;
-
-                let idx = if let Some(index) = args["index"].as_u64() {
-                    let idx = index as usize;
-                    if idx == 0 || idx > jobs.len() {
-                        return Err(anyhow!(
-                            "cron {}: invalid index {} (valid: 1-{})",
-                            action, index, jobs.len()
-                        ));
-                    }
-                    idx - 1
-                } else if let Some(id) = args["id"].as_str() {
-                    match jobs.iter().position(|j| j["id"].as_str() == Some(id)) {
-                        Some(pos) => pos,
-                        None => return Err(anyhow!("cron {}: job not found with id={}", action, id)),
-                    }
-                } else {
-                    return Err(anyhow!(
-                        "cron {}: `index` or `id` required (index is preferred)",
-                        action
-                    ));
-                };
-
-                let id = jobs[idx]["id"].as_str().unwrap_or("?").to_string();
-                jobs[idx]["enabled"] = json!(enabled);
-                jobs[idx]["updatedAtMs"] = json!(Utc::now().timestamp_millis() as u64);
-                write_cron_jobs(&cron_path, &jobs).await?;
-
-                // Notify gateway to reload cron jobs
-                let port = self.config.gateway.port;
-                let client = reqwest::Client::new();
-                if let Err(e) = client
-                    .post(format!("http://127.0.0.1:{port}/api/v1/cron/reload"))
-                    .timeout(Duration::from_secs(3))
-                    .send()
-                    .await
-                {
-                    debug!(err = %e, "cron {}: failed to notify gateway reload", action);
-                }
-
-                Ok(json!({action: id}))
-            }
-            "edit" => {
-                let mut jobs = read_cron_jobs(&cron_path).await;
-
-                let idx = if let Some(index) = args["index"].as_u64() {
-                    let idx = index as usize;
-                    if idx == 0 || idx > jobs.len() {
-                        return Err(anyhow!(
-                            "cron edit: invalid index {} (valid: 1-{})",
-                            index, jobs.len()
-                        ));
-                    }
-                    idx - 1
-                } else if let Some(id) = args["id"].as_str() {
-                    match jobs.iter().position(|j| j["id"].as_str() == Some(id)) {
-                        Some(pos) => pos,
-                        None => return Err(anyhow!("cron edit: job not found with id={}", id)),
-                    }
-                } else {
-                    return Err(anyhow!(
-                        "cron edit: `index` or `id` required (index is preferred)"
-                    ));
-                };
-
-                let id = jobs[idx]["id"].as_str().unwrap_or("?").to_string();
-                if let Some(schedule) = args["schedule"].as_str() {
-                    let tz = args["tz"].as_str();
-                    if let Some(tz_val) = tz {
-                        jobs[idx]["schedule"] = json!({"kind": "cron", "expr": schedule, "tz": tz_val});
-                    } else {
-                        jobs[idx]["schedule"] = json!({"kind": "cron", "expr": schedule});
-                    }
-                }
-                if let Some(message) = args["message"].as_str() {
-                    jobs[idx]["payload"] = json!({"kind": "systemEvent", "text": message});
-                }
-                if let Some(name) = args["name"].as_str() {
-                    jobs[idx]["name"] = json!(name);
-                }
-                if let Some(agent_id) = args["agentId"].as_str().or(args["agent_id"].as_str()) {
-                    jobs[idx]["agentId"] = json!(agent_id);
-                }
-                jobs[idx]["updatedAtMs"] = json!(Utc::now().timestamp_millis() as u64);
-                write_cron_jobs(&cron_path, &jobs).await?;
-
-                // Notify gateway to reload cron jobs
-                let port = self.config.gateway.port;
-                let client = reqwest::Client::new();
-                if let Err(e) = client
-                    .post(format!("http://127.0.0.1:{port}/api/v1/cron/reload"))
-                    .timeout(Duration::from_secs(3))
-                    .send()
-                    .await
-                {
-                    debug!(err = %e, "cron edit: failed to notify gateway reload");
-                }
-
-                Ok(json!({"edited": id}))
-            }
-            other => Err(anyhow!(
-                "cron: unsupported action `{other}` (list, add, edit, remove, enable, disable)"
-            )),
-        }
-    }
-
     // -------------------------------------------------------------------
-    // Session tools
-    // -------------------------------------------------------------------
-
-    async fn tool_sessions_send(&self, ctx: &RunContext, args: Value) -> Result<Value> {
-        let message = args["message"]
-            .as_str()
-            .ok_or_else(|| anyhow!("sessions_send: `message` required"))?
-            .to_owned();
-        let agent_id = args["agentId"]
-            .as_str()
-            .or_else(|| args["agent_id"].as_str());
-        let session_key = args["sessionKey"]
-            .as_str()
-            .or_else(|| args["session_key"].as_str());
-
-        let registry = self
-            .agents
-            .as_ref()
-            .ok_or_else(|| anyhow!("sessions_send: agent registry not available"))?;
-
-        // Resolve target: if agentId given, send to that agent; otherwise use
-        // session_key to find an agent.
-        let target_id = agent_id.unwrap_or(&ctx.agent_id);
-        let target = registry
-            .get(target_id)
-            .map_err(|_| anyhow!("sessions_send: agent `{target_id}` not found"))?;
-
-        let child_session = session_key
-            .map(|s| s.to_owned())
-            .unwrap_or_else(|| format!("{}:send:{}", ctx.session_key, Uuid::new_v4()));
-
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
-        let msg = AgentMessage {
-            session_key: child_session.clone(),
-            text: message,
-            channel: format!("sessions_send:{}", ctx.agent_id),
-            peer_id: ctx.agent_id.clone(),
-            chat_id: String::new(),
-            reply_tx,
-            extra_tools: vec![],
-            images: vec![],
-            files: vec![],
-        };
-
-        target
-            .tx
-            .send(msg)
-            .await
-            .map_err(|_| anyhow!("sessions_send: agent `{target_id}` inbox closed"))?;
-
-        let timeout_secs = self
-            .config
-            .agents
-            .defaults
-            .timeout_seconds
-            .unwrap_or(DEFAULT_TIMEOUT_SECONDS as u32) as u64;
-
-        let reply = tokio::time::timeout(Duration::from_secs(timeout_secs), reply_rx)
-            .await
-            .map_err(|_| anyhow!("sessions_send: timed out after {timeout_secs}s"))?
-            .map_err(|_| anyhow!("sessions_send: reply channel dropped"))?;
-
-        Ok(json!({
-            "session_key": child_session,
-            "agent_id": target_id,
-            "reply": reply.text
-        }))
-    }
-
-    async fn tool_sessions_list(&self) -> Result<Value> {
-        let sessions = self.store.db.list_sessions()?;
-        let list: Vec<Value> = sessions
-            .iter()
-            .filter_map(|key| {
-                let meta = self.store.db.get_session_meta(key).ok().flatten();
-                Some(json!({
-                    "session_key": key,
-                    "message_count": meta.as_ref().map(|m| m.message_count).unwrap_or(0),
-                    "last_active": meta.as_ref().map(|m| m.last_active).unwrap_or(0),
-                    "created_at": meta.as_ref().map(|m| m.created_at).unwrap_or(0),
-                }))
-            })
-            .collect();
-        Ok(json!({"sessions": list, "count": list.len()}))
-    }
-
-    async fn tool_sessions_history(&self, args: Value) -> Result<Value> {
-        let session_key = args["sessionKey"]
-            .as_str()
-            .or_else(|| args["session_key"].as_str())
-            .ok_or_else(|| anyhow!("sessions_history: `sessionKey` required"))?;
-        let limit = args["limit"].as_u64().unwrap_or(50) as usize;
-
-        let messages = self.store.db.load_messages(session_key)?;
-        let total = messages.len();
-        let truncated: Vec<&Value> = messages.iter().rev().take(limit).collect();
-
-        Ok(json!({
-            "session_key": session_key,
-            "messages": truncated,
-            "total": total,
-            "returned": truncated.len()
-        }))
-    }
-
-    async fn tool_session_status(&self, ctx: &RunContext, args: Value) -> Result<Value> {
-        let session_key = args["sessionKey"]
-            .as_str()
-            .or_else(|| args["session_key"].as_str())
-            .unwrap_or(&ctx.session_key);
-
-        let meta = self.store.db.get_session_meta(session_key)?;
-
-        match meta {
-            Some(m) => Ok(json!({
-                "session_key": session_key,
-                "message_count": m.message_count,
-                "last_active": m.last_active,
-                "created_at": m.created_at,
-                "active": true
-            })),
-            None => Ok(json!({
-                "session_key": session_key,
-                "active": false,
-                "note": "session not found or no metadata"
-            })),
-        }
-    }
-
-    // -------------------------------------------------------------------
-    // Gateway / pairing / doc tools
+    // Gateway / pairing tools
     // -------------------------------------------------------------------
 
     pub(crate) async fn tool_gateway(&self, args: Value) -> Result<Value> {
@@ -872,6 +659,14 @@ impl AgentRuntime {
         }
     }
 
+    // -------------------------------------------------------------------
+    // Consolidated memory tool handler
+    // -------------------------------------------------------------------
+
+    // -------------------------------------------------------------------
+    // Document & PDF
+    // -------------------------------------------------------------------
+
     pub(crate) async fn tool_doc(&self, args: Value) -> Result<Value> {
         let path_str = args["path"]
             .as_str()
@@ -883,7 +678,7 @@ impl AgentRuntime {
             .workspace
             .as_deref()
             .or(self.config.agents.defaults.workspace.as_deref())
-            .map(expand_tilde)
+            .map(super::runtime::expand_tilde)
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
 
         let pb = std::path::PathBuf::from(path_str);
@@ -895,8 +690,71 @@ impl AgentRuntime {
         super::doc::handle(&args, &full).await
     }
 
+    pub(crate) async fn tool_pdf(&self, args: Value) -> Result<Value> {
+        let path = args["path"]
+            .as_str()
+            .ok_or_else(|| anyhow!("pdf: `path` required"))?;
+
+        // If URL, download to temp file first.
+        let local_path = if path.starts_with("http://") || path.starts_with("https://") {
+            let tmp = std::env::temp_dir().join("rsclaw_pdf_download.pdf");
+            let client = reqwest::Client::new();
+            let bytes = client
+                .get(path)
+                .send()
+                .await
+                .map_err(|e| anyhow!("pdf: download failed: {e}"))?
+                .bytes()
+                .await
+                .map_err(|e| anyhow!("pdf: download read failed: {e}"))?;
+            tokio::fs::write(&tmp, &bytes)
+                .await
+                .map_err(|e| anyhow!("pdf: write temp file failed: {e}"))?;
+            tmp
+        } else {
+            std::path::PathBuf::from(path)
+        };
+
+        // Pure Rust PDF extraction, with pdftotext CLI fallback.
+        let pdf_bytes = tokio::fs::read(&local_path)
+            .await
+            .map_err(|e| anyhow!("pdf: read failed: {e}"))?;
+        let text = match crate::agent::doc::safe_extract_pdf_from_mem(&pdf_bytes) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("pdf-extract failed ({e}), trying pdftotext CLI");
+                let output = tokio::process::Command::new("pdftotext")
+                    .args([local_path.to_str().unwrap_or(""), "-"])
+                    .output()
+                    .await
+                    .map_err(|e2| anyhow!("pdf: extraction failed: {e}, pdftotext: {e2}"))?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(anyhow!("pdf: extraction failed: {e}, pdftotext: {stderr}"));
+                }
+                String::from_utf8_lossy(&output.stdout).into_owned()
+            }
+        };
+        // Truncate to 100k chars to avoid blowing up context.
+        let truncated = if text.len() > 100_000 {
+            let mut end = 100_000usize;
+            while end < text.len() && !text.is_char_boundary(end) {
+                end += 1;
+            }
+            format!("{}...\n[truncated at 100000 chars]", &text[..end])
+        } else {
+            text
+        };
+
+        Ok(json!({
+            "path": path,
+            "text": truncated,
+            "chars": truncated.len()
+        }))
+    }
+
     // -------------------------------------------------------------------
-    // Consolidated tool handlers
+    // Consolidated memory tool handler
     // -------------------------------------------------------------------
 
     pub(crate) async fn tool_memory_consolidated(&self, ctx: &RunContext, args: Value) -> Result<Value> {
@@ -910,37 +768,46 @@ impl AgentRuntime {
         }
     }
 
-    pub(crate) async fn tool_session_consolidated(&self, ctx: &RunContext, args: Value) -> Result<Value> {
-        let action = args["action"].as_str().unwrap_or("list");
-        match action {
-            "send" => self.tool_sessions_send(ctx, args).await,
-            "list" => self.tool_sessions_list().await,
-            "history" => self.tool_sessions_history(args).await,
-            "status" => self.tool_session_status(ctx, args).await,
-            _ => bail!("session: unknown action '{action}' (send, list, history, status)"),
+    // -------------------------------------------------------------------
+    // Tool installer
+    // -------------------------------------------------------------------
+
+    /// Install a tool/runtime via `rsclaw tools install`.
+    pub(crate) async fn tool_install(&self, args: Value) -> Result<Value> {
+        let name = args["name"]
+            .as_str()
+            .ok_or_else(|| anyhow!("tool_install: `name` required"))?;
+
+        let exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "rsclaw".to_owned());
+
+        let mut cmd = tokio::process::Command::new(&exe);
+        cmd.args(["tools", "install", name])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         }
+        let output = cmd.output()
+            .await
+            .map_err(|e| anyhow!("tool_install: failed to run: {e}"))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        Ok(json!({
+            "name": name,
+            "success": output.status.success(),
+            "output": if stdout.is_empty() { &stderr } else { &stdout },
+        }))
     }
 
-    pub(crate) async fn tool_agent_consolidated(&self, ctx: &RunContext, args: Value) -> Result<Value> {
-        let action = args["action"].as_str().unwrap_or("list");
-        match action {
-            "spawn" => self.tool_agent_spawn(args).await,
-            "task" => self.tool_agent_task(ctx, args).await,
-            "send" => self.tool_agent_send(ctx, args).await,
-            "list" => self.tool_agent_list().await,
-            "kill" => {
-                let id = args["id"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("agent kill: `id` required"))?;
-                Ok(json!({
-                    "action": "kill",
-                    "id": id,
-                    "note": "agent termination not yet implemented; agent will stop on next idle timeout"
-                }))
-            }
-            _ => bail!("agent: unknown action '{action}' (spawn, task, list, kill)"),
-        }
-    }
+    // -------------------------------------------------------------------
+    // Channel consolidated + actions
+    // -------------------------------------------------------------------
 
     pub(crate) async fn tool_channel_consolidated(&self, args: Value) -> Result<Value> {
         let channel_type = args["channel"].as_str().unwrap_or("unknown").to_owned();
@@ -975,39 +842,4 @@ impl AgentRuntime {
             )
         }))
     }
-}
-
-// ---------------------------------------------------------------------------
-// Cron helpers (file-based job storage)
-// ---------------------------------------------------------------------------
-
-/// Read cron jobs from the OpenClaw-compatible jobs.json file.
-/// Handles both bare array `[...]` and wrapped `{"version":1,"jobs":[...]}` formats.
-async fn read_cron_jobs(path: &std::path::Path) -> Vec<Value> {
-    let data = tokio::fs::read_to_string(path)
-        .await
-        .unwrap_or_else(|_| "[]".to_owned());
-    // Try wrapped format first.
-    if let Ok(wrapper) = serde_json::from_str::<Value>(&data) {
-        if let Some(jobs) = wrapper.get("jobs").and_then(|v| v.as_array()) {
-            return jobs.clone();
-        }
-        // Fall through to try as bare array.
-        if let Some(arr) = wrapper.as_array() {
-            return arr.clone();
-        }
-    }
-    Vec::new()
-}
-
-/// Write cron jobs in OpenClaw-compatible format: {"version":1,"jobs":[...]}.
-async fn write_cron_jobs(path: &std::path::Path, jobs: &[Value]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-    let wrapper = json!({"version": 1, "jobs": jobs});
-    tokio::fs::write(path, serde_json::to_string_pretty(&wrapper)?)
-        .await
-        .map_err(|e| anyhow!("cron: failed to write jobs: {e}"))?;
-    Ok(())
 }

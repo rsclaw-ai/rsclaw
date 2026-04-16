@@ -1,6 +1,6 @@
 //! File/exec-related tool methods extracted from `runtime.rs`.
 //!
-//! Contains: `tool_install`, `tool_list_dir`, `tool_search_file`,
+//! Contains: `tool_list_dir`, `tool_search_file`,
 //! `tool_search_content`, `tool_read`, `tool_write`, `tool_exec`.
 
 use std::time::Duration;
@@ -12,39 +12,6 @@ use super::runtime::expand_tilde;
 use super::security::{check_file_content_safety, check_read_safety, check_write_safety};
 
 impl super::runtime::AgentRuntime {
-    /// Install a tool/runtime via `rsclaw tools install`.
-    pub(crate) async fn tool_install(&self, args: Value) -> Result<Value> {
-        let name = args["name"]
-            .as_str()
-            .ok_or_else(|| anyhow!("tool_install: `name` required"))?;
-
-        let exe = std::env::current_exe()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "rsclaw".to_owned());
-
-        let mut cmd = tokio::process::Command::new(&exe);
-        cmd.args(["tools", "install", name])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        }
-        let output = cmd.output()
-            .await
-            .map_err(|e| anyhow!("tool_install: failed to run: {e}"))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-        Ok(json!({
-            "name": name,
-            "success": output.status.success(),
-            "output": if stdout.is_empty() { &stderr } else { &stdout },
-        }))
-    }
-
     /// List files and directories in a path (structured alternative to `exec ls`).
     pub(crate) async fn tool_list_dir(&self, args: Value) -> Result<Value> {
         let default_ws = self.handle.config.workspace.as_deref().unwrap_or(".");
