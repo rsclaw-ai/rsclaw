@@ -52,6 +52,8 @@ pub struct AgentHandle {
     pub last_ctx_tokens: Arc<AtomicUsize>,
     /// Signal to clear all sessions (set by /clear bypass, consumed by runtime).
     pub clear_signal: Arc<AtomicBool>,
+    /// Shared memory store for this agent (used by meditation heartbeat).
+    pub memory: Option<Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>>,
 }
 
 /// An image attachment sent by the user.
@@ -236,6 +238,7 @@ impl AgentRegistry {
                     session_count: Arc::new(AtomicUsize::new(0)),
                     last_ctx_tokens: Arc::new(AtomicUsize::new(0)),
                     clear_signal: Arc::new(AtomicBool::new(false)),
+                    memory: None, // populated by agent runtime after memory store opens
                 });
                 inner.agents.insert(entry.id.clone(), handle);
                 receivers.insert(entry.id.clone(), rx);

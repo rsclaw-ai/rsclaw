@@ -13,7 +13,7 @@
 
 use std::{path::Path, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use hnsw_rs::{hnsw::Hnsw, prelude::DistCosine};
 use tracing::{debug, info, warn};
 
@@ -91,6 +91,9 @@ pub struct MemoryDoc {
     /// P3/L1: Key-points overview (2-3 lines).
     #[serde(default)]
     pub overview_text: Option<String>,
+    /// Freeform tags for lifecycle tracking (e.g. "crystallized", "merged").
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 impl MemoryDoc {
@@ -137,13 +140,17 @@ impl MemoryDoc {
     }
 
     /// P1: Evaluate whether this doc should be promoted/demoted between tiers.
-    pub fn evaluate_tier_transition(&mut self) {
+    ///
+    /// Returns `true` if the doc was just promoted to [`MemDocTier::Core`]
+    /// (used by the crystallization loop to detect skill candidates).
+    pub fn evaluate_tier_transition(&mut self) -> bool {
+        let was_core = self.tier == MemDocTier::Core;
         let score = self.relevance_score();
 
         // Promote to Core: access_count >= 10 AND importance >= 0.8
         if self.access_count >= 10 && self.importance >= 0.8 {
             self.tier = MemDocTier::Core;
-            return;
+            return !was_core;
         }
 
         // Demote to Peripheral: relevance_score < 0.15 OR (age > 60 days AND access_count < 3)
@@ -154,7 +161,7 @@ impl MemoryDoc {
         let age_days = ((now - self.created_at).max(0) as f32) / 86_400.0;
         if score < 0.15 || (age_days > 60.0 && self.access_count < 3) {
             self.tier = MemDocTier::Peripheral;
-            return;
+            return false;
         }
 
         // Promote to Working: access_count >= 3 AND relevance_score >= 0.4
@@ -163,6 +170,7 @@ impl MemoryDoc {
                 self.tier = MemDocTier::Working;
             }
         }
+        false
     }
 
     /// Touch this doc on access: update timestamp, bump count, evaluate tier.
@@ -1006,6 +1014,143 @@ impl MemoryStore {
 
     pub fn embed_dim(&self) -> i32 {
         self.embed_dim
+    }
+
+    // -----------------------------------------------------------------------
+    // Organic-evolution helpers
+    // -----------------------------------------------------------------------
+
+    /// Synchronous lookup by ID (in-memory only, no I/O).
+    pub fn get_sync(&self, id: &str) -> Option<&MemoryDoc> {
+        self.docs.iter().find(|d| !d.id.is_empty() && d.id == id)
+    }
+
+    /// Adjust the importance score of a memory document by `delta`, clamping
+    /// to \[0.01, 1.0\].  Persists the change to redb and re-evaluates tier.
+    ///
+    /// Returns the new importance value, or `None` if the doc was not found.
+    pub async fn adjust_importance(&mut self, id: &str, delta: f32) -> Result<Option<f32>> {
+        let idx = match self.docs.iter().position(|d| d.id == id) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let doc = &mut self.docs[idx];
+        doc.importance = (doc.importance + delta).clamp(0.01, 1.0);
+        doc.evaluate_tier_transition();
+        self.persist_doc(idx)?;
+        Ok(Some(self.docs[idx].importance))
+    }
+
+    /// Find memory documents whose cosine similarity to `doc_id` exceeds
+    /// `threshold`.  Returns pairs of `(MemoryDoc, similarity)` sorted by
+    /// similarity descending, excluding the source doc itself and deleted docs.
+    pub fn find_near_duplicates(
+        &self,
+        doc_id: &str,
+        scope: Option<&str>,
+        threshold: f32,
+    ) -> Result<Vec<(MemoryDoc, f32)>> {
+        let src_idx = self
+            .docs
+            .iter()
+            .position(|d| d.id == doc_id)
+            .ok_or_else(|| anyhow!("doc not found: {doc_id}"))?;
+        let src_vec = &self.docs[src_idx].vector;
+        if src_vec.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let neighbours = self.hnsw.search(src_vec, 50, 64);
+        let mut pairs: Vec<(MemoryDoc, f32)> = Vec::new();
+        for n in neighbours {
+            let idx = n.d_id;
+            if idx >= self.docs.len() || idx == src_idx {
+                continue;
+            }
+            let doc = &self.docs[idx];
+            if doc.id.is_empty() {
+                continue;
+            }
+            if let Some(s) = scope {
+                if doc.scope != s {
+                    continue;
+                }
+            }
+            let sim = cosine_similarity(src_vec, &doc.vector);
+            if sim >= threshold {
+                pairs.push((doc.clone(), sim));
+            }
+        }
+        pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(pairs)
+    }
+
+    /// Return all non-deleted docs in the given tier and scope.
+    pub fn find_by_tier(&self, tier: &MemDocTier, scope: Option<&str>) -> Vec<&MemoryDoc> {
+        self.docs
+            .iter()
+            .filter(|d| {
+                !d.id.is_empty()
+                    && d.tier == *tier
+                    && scope.map_or(true, |s| d.scope == s)
+            })
+            .collect()
+    }
+
+    /// Add a tag to a memory document (idempotent). Persists to redb.
+    ///
+    /// Returns `true` if the tag was newly added, `false` if already present
+    /// or the doc was not found.
+    pub async fn tag_doc(&mut self, id: &str, tag: &str) -> Result<bool> {
+        let idx = match self.docs.iter().position(|d| d.id == id) {
+            Some(i) => i,
+            None => return Ok(false),
+        };
+        let doc = &mut self.docs[idx];
+        let tag_owned = tag.to_owned();
+        if doc.tags.contains(&tag_owned) {
+            return Ok(false);
+        }
+        doc.tags.push(tag_owned);
+        self.persist_doc(idx)?;
+        Ok(true)
+    }
+
+    /// Persist in-memory changes to an existing doc back to redb.
+    fn persist_doc(&self, idx: usize) -> Result<()> {
+        let doc = &self.docs[idx];
+        let serialized = serialize_doc(doc)?;
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(REDB_TABLE)?;
+            table.insert(doc.id.as_str(), serialized.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vector math helpers
+// ---------------------------------------------------------------------------
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0_f32;
+    let mut norm_a = 0.0_f32;
+    let mut norm_b = 0.0_f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom < f32::EPSILON {
+        0.0
+    } else {
+        dot / denom
     }
 }
 

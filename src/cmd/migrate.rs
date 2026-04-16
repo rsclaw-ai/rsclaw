@@ -527,6 +527,7 @@ fn import_memories_to_redb(
             tier: Default::default(),
             abstract_text: None,
             overview_text: None,
+            tags: vec![],
         };
 
         let json_bytes = serde_json::to_vec(&doc)?;

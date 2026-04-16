@@ -11,6 +11,7 @@
 //!   - `LockFile`       — `.clawhub/lock.json` read/write
 
 pub mod clawhub;
+pub mod crystallizer;
 pub mod loader;
 pub mod manifest;
 pub mod runner;

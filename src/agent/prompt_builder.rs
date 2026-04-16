@@ -289,14 +289,13 @@ pub(crate) fn build_system_prompt(
         }
 
         parts.push(
-            "## Self-Evolution — Auto Skill Creation\n\
-             When you notice a task pattern repeating (>=3 similar requests), package it as a standard skill after completing the task:\n\
-             1. Create SKILL.md in workspace/skills/<slug>/ (keep it under 100 lines)\n\
-             2. Frontmatter: name, description, version (no extra fields like author/tags/category)\n\
-             3. Body: trigger conditions + key execution steps only (no verbose examples, error tables, or version history)\n\
-             4. Record in memory (memory_put) to avoid duplicates\n\
-             5. Inform the user\n\
-             IMPORTANT: Skills must be concise. Only list the essential steps, not every possible detail."
+            "## Self-Evolution\n\
+             The system automatically learns from your interactions:\n\
+             - Memories that prove useful gain importance and survive longer.\n\
+             - When a pattern is recalled often enough it is promoted to Core tier.\n\
+             - Clusters of related Core memories are automatically crystallized into reusable Skills.\n\
+             - A periodic meditation cycle deduplicates and cleans up stale memories.\n\
+             You can still manually create skills in workspace/skills/<slug>/SKILL.md if needed."
                 .to_owned(),
         );
     }
