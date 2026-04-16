@@ -383,6 +383,7 @@ impl AgentRuntime {
 
             let pair: [&str; 2] = if is_zh {
                 // Chinese: random 2 from 4 free Chinese-friendly providers.
+                #[allow(clippy::useless_vec)]
                 let mut pool = vec!["bing-free", "baidu-free", "sogou-free"];
                 use rand::seq::SliceRandom;
                 pool.shuffle(&mut rand::rng());
