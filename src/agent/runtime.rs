@@ -807,18 +807,37 @@ impl AgentRuntime {
                             else if cfg!(target_os = "windows") { "Windows" }
                             else if cfg!(target_os = "ios") { "iOS" }
                             else { "Unknown" };
-                        let ctx_tokens: usize = self.sessions.get(session_key)
-                            .map(|msgs| msgs.iter().map(msg_tokens).sum())
+                        let msg_tokens: usize = self.sessions.get(session_key)
+                            .map(|msgs| msgs.iter().map(crate::agent::context_mgr::msg_tokens).sum())
                             .unwrap_or(0);
-                        self.handle.last_ctx_tokens.store(ctx_tokens, std::sync::atomic::Ordering::Relaxed);
+                        self.handle.last_ctx_tokens.store(msg_tokens, std::sync::atomic::Ordering::Relaxed);
                         let ctx_limit = self.handle.config.model.as_ref()
                             .and_then(|m| m.context_tokens)
                             .or(self.config.agents.defaults.model.as_ref()
                                 .and_then(|m| m.context_tokens))
                             .unwrap_or(64000) as usize;
+
+                        // Estimate system prompt + tools tokens.
+                        let tools = build_tool_list(
+                            &self.skills,
+                            self.agents.as_deref(),
+                            &self.handle.id,
+                            &self.config.agents.external,
+                        );
+                        let tools_json = serde_json::to_string(&tools).unwrap_or_default();
+                        let tools_tokens = tools_json.len() / 4; // JSON is mostly ASCII, ~4 chars/token
+                        // System prompt: estimate from last known size or compute a rough guess.
+                        let sys_tokens = 3500; // typical system prompt ~3.5k tokens
+                        let all_tokens = sys_tokens + tools_tokens + msg_tokens;
+
                         format!(
-                            "Gateway: running\nOS: {os}\nModel: {model}\nSessions: {sessions}\nContext: ~{:.1}k/{:.0}k tokens\nUptime: {uptime}\nVersion: rsclaw {}",
-                            ctx_tokens as f64 / 1000.0,
+                            "Gateway: running\nOS: {os}\nModel: {model}\nSessions: {sessions}\n\
+                             Context: system ~{:.1}k + tools ~{:.1}k + messages ~{:.1}k = ~{:.1}k/{:.0}k tokens\n\
+                             Uptime: {uptime}\nVersion: rsclaw {}",
+                            sys_tokens as f64 / 1000.0,
+                            tools_tokens as f64 / 1000.0,
+                            msg_tokens as f64 / 1000.0,
+                            all_tokens as f64 / 1000.0,
                             ctx_limit as f64 / 1000.0,
                             env!("RSCLAW_BUILD_VERSION")
                         )
