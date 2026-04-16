@@ -965,6 +965,17 @@ impl AgentRuntime {
         let target_id_bg = target_id.clone();
         let channel_bg = channel_name.clone();
         let lang_bg = lang;
+        // Clone agent's own inbox for result injection after completion.
+        let self_tx = self.handle.tx.clone();
+        let self_session = ctx.session_key.clone();
+        let self_channel = ctx.channel.clone();
+        let self_peer_id = ctx.peer_id.clone();
+        let self_chat_id = ctx.chat_id.clone();
+        // Extract configurable reply timeout BEFORE spawn (self is borrowed, cannot be used inside spawn)
+        let reply_timeout_secs = self.config.ext.tools.as_ref()
+            .and_then(|t| t.acp.as_ref())
+            .and_then(|a| a.reply_timeout_seconds)
+            .unwrap_or(300);
         tokio::spawn(async move {
             // Start event collection FIRST (in parallel with send_prompt)
             let mut event_rx = client.subscribe_events();
@@ -1144,10 +1155,10 @@ impl AgentRuntime {
                         match tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
-                            text: summary,
+                            text: summary.clone(),
                             reply_to: None,
                             images: vec![],
-                            files: notif_files,
+                            files: notif_files.clone(),
                             channel: Some(channel_bg.clone()),
                         }) {
                             Ok(_) => {
@@ -1159,6 +1170,54 @@ impl AgentRuntime {
                         }
                     } else {
                         tracing::warn!("tool_claudecode: no notification channel available");
+                    }
+
+                    // Inject result back into main agent's inbox so it can act on the result
+                    let file_paths: Vec<String> = notif_files.iter().map(|(_, _, p)| p.clone()).collect();
+                    let inject_text = if file_paths.is_empty() {
+                        format!("[Claude Code completed] {}", if summary.is_empty() { "Task finished.".to_owned() } else { summary })
+                    } else {
+                        format!("[Claude Code completed] Files ready: {}. Please send them to the user with send_file.",
+                            file_paths.join(", "))
+                    };
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
+                    let inject_msg = AgentMessage {
+                        session_key: self_session,
+                        text: inject_text,
+                        channel: self_channel.clone(),
+                        peer_id: self_peer_id,
+                        chat_id: self_chat_id,
+                        reply_tx,
+                        extra_tools: vec![],
+                        images: vec![],
+                        files: vec![],
+                    };
+                    if self_tx.send(inject_msg).await.is_err() {
+                        tracing::warn!("tool_claudecode: failed to inject result back to agent inbox");
+                    } else {
+                        tracing::info!("tool_claudecode: result injected back to agent, waiting for reply");
+                        // Wait for agent's reply and forward it (text + files) to user via notification.
+                        // Timeout value extracted before spawn (see reply_timeout_secs variable)
+                        match tokio::time::timeout(Duration::from_secs(reply_timeout_secs), reply_rx).await {
+                            Ok(Ok(reply)) => {
+                                if !reply.text.is_empty() || !reply.files.is_empty() || !reply.images.is_empty() {
+                                    if let Some(ref tx) = notif_tx_bg {
+                                        let _ = tx.send(crate::channel::OutboundMessage {
+                                            target_id: target_id_bg.clone(),
+                                            is_group: false,
+                                            text: reply.text,
+                                            reply_to: None,
+                                            images: reply.images,
+                                            files: reply.files,
+                                            channel: Some(self_channel),
+                                        });
+                                        tracing::info!("tool_claudecode: forwarded agent reply to user");
+                                    }
+                                }
+                            }
+                            Ok(Err(_)) => tracing::warn!("tool_claudecode: reply channel dropped"),
+                            Err(_) => tracing::warn!("tool_claudecode: reply timed out after {}s", reply_timeout_secs),
+                        }
                     }
                 }
                 Err(e) => {
