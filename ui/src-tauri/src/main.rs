@@ -519,14 +519,11 @@ fn channel_login_qr() -> Result<Option<String>, String> {
     Ok(Some(format!("data:image/png;base64,{}", b64)))
 }
 
-/// Write cron jobs to ~/.rsclaw/cron/jobs.json
+/// Write cron jobs to ~/.rsclaw/cron.json5
 #[tauri::command]
 fn save_cron_jobs(content: String) -> Result<(), String> {
     let home = dirs::home_dir().ok_or("no home dir")?;
-    let path = home.join(".rsclaw").join("cron").join("jobs.json");
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    let path = home.join(".rsclaw").join("cron.json5");
     std::fs::write(&path, &content).map_err(|e| e.to_string())?;
 
     // Notify running gateway to reload cron jobs (non-blocking, no deps).
@@ -560,16 +557,16 @@ fn get_gateway_port_number() -> u64 {
         .unwrap_or(18888)
 }
 
-/// Read cron jobs from ~/.rsclaw/cron/jobs.json
+/// Read cron jobs from ~/.rsclaw/cron.json5
 #[tauri::command]
 fn get_cron_jobs() -> Result<serde_json::Value, String> {
     let home = dirs::home_dir().ok_or("no home dir")?;
-    let path = home.join(".rsclaw").join("cron").join("jobs.json");
+    let path = home.join(".rsclaw").join("cron.json5");
     if !path.exists() {
         return Ok(serde_json::json!({ "jobs": [] }));
     }
     let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let val: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::json!({ "jobs": [] }));
+    let val: serde_json::Value = json5::from_str(&raw).unwrap_or(serde_json::json!({ "jobs": [] }));
     Ok(val)
 }
 

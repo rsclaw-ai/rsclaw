@@ -4769,7 +4769,7 @@ function CronTaskPage() {
       <div style={{ padding: "24px 28px 0", display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexShrink: 0 }}>
         <div>
           <div style={{ fontSize: 20, fontWeight: 700, color: V2.t0, letterSpacing: -0.4 }}>{zh ? "\u5B9A\u65F6\u4EFB\u52A1" : "Cron Tasks"}</div>
-          <div style={{ fontSize: 11, color: V2.t3, fontFamily: V2.mono, marginTop: 3 }}>~/.rsclaw/cron/jobs.json</div>
+          <div style={{ fontSize: 11, color: V2.t3, fontFamily: V2.mono, marginTop: 3 }}>~/.rsclaw/cron.json5</div>
         </div>
         <button onClick={openNew} style={{ padding: "8px 16px", borderRadius: 9, border: "none", background: V2.or, color: "#fff", fontSize: 12, fontWeight: 700, boxShadow: "0 2px 8px rgba(249,115,22,.28)", cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}>
           <span>+</span> {zh ? "\u65B0\u5EFA\u4EFB\u52A1" : "New Task"}
