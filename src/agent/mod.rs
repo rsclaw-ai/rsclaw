@@ -11,6 +11,7 @@ pub mod bootstrap;
 pub mod doc;
 pub mod btw;
 pub mod collaboration;
+pub mod exec_pool;
 pub mod loop_detection;
 pub mod memory;
 pub mod permission;
@@ -23,6 +24,7 @@ pub mod workspace;
 
 pub use bootstrap::{seed_tools, seed_workspace, seed_workspace_with_lang};
 pub use collaboration::CollabMode;
+pub use exec_pool::ExecPool;
 pub use loop_detection::LoopDetector;
 pub use memory::{MemoryDoc, MemoryStore};
 pub use permission::{
