@@ -8976,23 +8976,18 @@ $synth.Speak('{}')
             "list" => {
                 // Use load_cron_jobs() to check multiple paths (same as CLI)
                 let jobs = crate::cron::load_cron_jobs();
-                // Return simplified list to avoid truncation in IM channels
-                let jobs_summary: Vec<Value> = jobs
+                // Return full job details with 1-based index
+                let jobs_with_index: Vec<Value> = jobs
                     .iter()
                     .enumerate()
                     .map(|(i, j)| {
-                        json!({
-                            "_index": i + 1,
-                            "id": j.id,
-                            "name": j.name.as_deref().unwrap_or(""),
-                            "enabled": j.enabled,
-                            "schedule": j.schedule.expr(),
-                            "agent_id": j.agent_id,
-                        })
+                        let mut indexed = serde_json::to_value(j).unwrap_or_default();
+                        indexed["_index"] = json!(i + 1);
+                        indexed
                     })
                     .collect();
                 Ok(
-                    json!({"jobs": jobs_summary, "count": jobs.len(), "hint": "Use index number (#1, #2, etc.) for edit/remove to avoid ID truncation issues"}),
+                    json!({"jobs": jobs_with_index, "count": jobs.len(), "hint": "Use index number (#1, #2, etc.) for edit/remove to avoid ID truncation issues"}),
                 )
             }
             "add" => {

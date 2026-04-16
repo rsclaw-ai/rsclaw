@@ -219,7 +219,7 @@ pub fn platform_chunk_limit(channel: &str) -> usize {
         "slack" => 3000,
         "wecom" => 4096,
         "mattermost" => 4000,
-        "feishu" => 4000,
+        "feishu" => 30_000,  // Feishu supports long messages in cards (actual limit ~32KB)
         "dingtalk" => 20_000,
         "qq" => 4096,
         "line" => 5000,
