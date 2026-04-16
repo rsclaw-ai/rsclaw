@@ -14,7 +14,10 @@ use super::security::{check_file_content_safety, check_read_safety, check_write_
 impl super::runtime::AgentRuntime {
     /// List files and directories in a path (structured alternative to `exec ls`).
     pub(crate) async fn tool_list_dir(&self, args: Value) -> Result<Value> {
-        let default_ws = self.handle.config.workspace.as_deref().unwrap_or(".");
+        let fallback_ws = crate::config::loader::base_dir().join("workspace");
+        let default_ws = self.handle.config.workspace.as_deref()
+            .or(self.config.agents.defaults.workspace.as_deref())
+            .unwrap_or(fallback_ws.to_str().unwrap_or("."));
         let path_str = args["path"].as_str().unwrap_or(default_ws);
         let path = expand_tilde(path_str);
         let recursive = args["recursive"].as_bool().unwrap_or(false);
@@ -61,7 +64,10 @@ impl super::runtime::AgentRuntime {
 
     /// Search for files by name pattern (structured alternative to `exec find`).
     pub(crate) async fn tool_search_file(&self, args: Value) -> Result<Value> {
-        let default_ws = self.handle.config.workspace.as_deref().unwrap_or(".");
+        let fallback_ws = crate::config::loader::base_dir().join("workspace");
+        let default_ws = self.handle.config.workspace.as_deref()
+            .or(self.config.agents.defaults.workspace.as_deref())
+            .unwrap_or(fallback_ws.to_str().unwrap_or("."));
         let root = args["path"].as_str().unwrap_or(default_ws);
         let root_path = expand_tilde(root);
         let pattern = args["pattern"]
@@ -99,7 +105,10 @@ impl super::runtime::AgentRuntime {
     ///
     /// Cross-platform: uses `grep -rn` on Unix, `Select-String` on Windows.
     pub(crate) async fn tool_search_content(&self, args: Value) -> Result<Value> {
-        let default_ws = self.handle.config.workspace.as_deref().unwrap_or(".");
+        let fallback_ws = crate::config::loader::base_dir().join("workspace");
+        let default_ws = self.handle.config.workspace.as_deref()
+            .or(self.config.agents.defaults.workspace.as_deref())
+            .unwrap_or(fallback_ws.to_str().unwrap_or("."));
         let root = args["path"].as_str().unwrap_or(default_ws);
         let root_path = expand_tilde(root);
         let pattern = args["pattern"]
