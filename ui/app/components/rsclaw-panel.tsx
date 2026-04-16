@@ -5304,7 +5304,7 @@ export function RsClawPanel() {
           const gw: any = await tauriInvoke("get_gateway_port");
           if (gw?.url) {
             setGatewayUrl(gw.url);
-            if (gw.token) { setAuthToken(gw.token); setApiAuthToken(gw.token); }
+            if (gw.token) { setApiAuthToken(gw.token); }
           }
         }
       } catch {}
