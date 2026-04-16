@@ -696,7 +696,8 @@ impl AcpClient {
                 "terminal": true
             }
         });
-        let resp = self.rpc(methods::INITIALIZE, params).await?;
+        // Use no_timeout for initialize - agent startup may take long (model download, etc)
+        let resp = self.rpc_no_timeout(methods::INITIALIZE, params).await?;
         tracing::debug!(response = ?resp, "ACP initialize response");
         let result = resp
             .get("result")
@@ -737,7 +738,8 @@ impl AcpClient {
             tracing::warn!("create_session: no model provided, will use agent default");
         }
 
-        let resp = self.rpc(methods::SESSION_NEW, params).await?;
+        // Use no_timeout for session creation - may take time to load MCP servers, etc
+        let resp = self.rpc_no_timeout(methods::SESSION_NEW, params).await?;
         tracing::debug!(response = ?resp, "ACP session/new response");
         let result = resp
             .get("result")
