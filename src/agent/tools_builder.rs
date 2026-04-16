@@ -147,7 +147,7 @@ pub(crate) fn build_tool_list(
              - Dates: Get-Date -Format 'yyyy-MM-dd'; [DateTimeOffset]::Now.ToUnixTimeSeconds()\n\
              - Do NOT wrap commands in extra cmd /c or powershell -Command layers.\n\
              - Do NOT use exec for destructive operations on personal directories (Desktop, Downloads, Documents).\n\
-             - For long-running processes (servers, watchers): use background=true to start without blocking.\n\
+             - Commands run in background by default (wait=false). Use wait=true only for short commands where you need the output immediately.\n\
              - If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user."
                 .to_owned()
         } else if cfg!(target_os = "macos") {
@@ -170,9 +170,10 @@ pub(crate) fn build_tool_list(
             "properties": {
                 "command": {"type": "string", "description": "Shell command to execute. Must be valid for the current OS."},
                 "timeout": {"type": "integer", "description": "Timeout in seconds (default: 30, max: 300)"},
-                "background": {"type": "boolean", "description": "Run in background (for servers/long-running processes). Returns PID immediately. Default: false."}
+                "wait": {"type": "boolean", "description": "If true, wait for the command to finish and return output. If false (default), run in background and return a task_id. Results are delivered on your next turn."},
+                "task_id": {"type": "string", "description": "Poll a previously started background task by its task_id."}
             },
-            "required": ["command"]
+            "required": []
         }),
     });
     tools.push(ToolDef {

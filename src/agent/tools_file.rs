@@ -356,9 +356,48 @@ impl super::runtime::AgentRuntime {
         Ok(json!({"written": true, "path": path, "bytes": content.len()}))
     }
 
+    /// Poll a background exec task by task_id.
+    async fn exec_poll_task(&self, task_id: &str) -> Result<Value> {
+        // Check if still running
+        if self.exec_pool.is_running(task_id).await {
+            return Ok(json!({
+                "task_id": task_id,
+                "status": "running",
+                "message": "Task is still running. Poll again later."
+            }));
+        }
+        // Try to collect result
+        if let Some(result) = self.exec_pool.try_collect_by_task(task_id).await {
+            let is_error = result.exit_code.map(|c| c != 0).unwrap_or(true);
+            return Ok(json!({
+                "task_id": task_id,
+                "status": "completed",
+                "exit_code": result.exit_code,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "is_error": is_error,
+            }));
+        }
+        Ok(json!({
+            "task_id": task_id,
+            "status": "not_found",
+            "message": "No running or completed task with this ID. It may have already been collected."
+        }))
+    }
+
     /// Execute a shell command with timeout, safety checks, and sandbox support.
-    pub(crate) async fn tool_exec(&self, args: Value) -> Result<Value> {
+    ///
+    /// Supports background execution via `wait=false` (default). When running
+    /// in background mode, returns a `task_id` that can be polled with
+    /// `task_id` parameter.
+    pub(crate) async fn tool_exec(&self, ctx: &super::runtime::RunContext, tool_call_id: &str, args: Value) -> Result<Value> {
         tracing::debug!(?args, "tool_exec called");
+
+        // Poll existing task
+        if let Some(task_id) = args["task_id"].as_str() {
+            return self.exec_poll_task(task_id).await;
+        }
+        let wait = args["wait"].as_bool().unwrap_or(false);
         // Accept both "command" (rsclaw native) and "cmd"+"args" (preparse/openclaw format).
         let command = if let Some(cmd) = args["command"].as_str() {
             cmd.to_owned()
@@ -550,41 +589,97 @@ impl super::runtime::AgentRuntime {
             const CREATE_NO_WINDOW: u32 = 0x08000000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
-        // Background mode: spawn and return immediately (for long-running services).
-        let background = args["background"].as_bool().unwrap_or(false);
-        if background {
-            let child = cmd.spawn()
-                .map_err(|e| anyhow!("exec background `{command}`: {e}"))?;
-            let pid = child.id().unwrap_or(0);
-            tracing::info!(command = %command, pid, "exec: started in background");
-            return Ok(json!({
-                "pid": pid,
-                "status": "running in background",
-                "note": "Process started. Use execute_command to check or kill it later (e.g. 'kill <pid>')."
-            }));
-        }
+        let task_id = uuid::Uuid::new_v4().to_string();
 
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            cmd.output()
-        )
-        .await
-        .map_err(|_| {
-            tracing::warn!(command = %command, timeout_secs, "exec: timed out");
-            anyhow!(
-                "Command timed out after {timeout_secs}s. For long-running processes, use background=true."
+        if wait {
+            // Synchronous execution — wait for result.
+            let output = tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                cmd.output()
             )
-        })?
-        .map_err(|e| anyhow!("exec `{command}`: {e}"))?;
+            .await
+            .map_err(|_| {
+                tracing::warn!(command = %command, timeout_secs, "exec: timed out");
+                anyhow!(
+                    "Command timed out after {timeout_secs}s. Use wait=false (default) for long-running commands."
+                )
+            })?
+            .map_err(|e| anyhow!("exec `{command}`: {e}"))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::info!(cwd = %workspace.display(), command = %command, exit_code = ?output.status.code(), stdout_len = stdout.len(), stderr_len = stderr.len(), "exec: done");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::info!(cwd = %workspace.display(), command = %command, exit_code = ?output.status.code(), stdout_len = stdout.len(), stderr_len = stderr.len(), "exec: done");
 
-        Ok(json!({
-            "exit_code": output.status.code(),
-            "stdout": stdout,
-            "stderr": stderr,
-        }))
+            Ok(json!({
+                "task_id": task_id,
+                "exit_code": output.status.code(),
+                "stdout": stdout,
+                "stderr": stderr,
+            }))
+        } else {
+            // Background execution — spawn and return task_id immediately.
+            // The result will be collected by exec_pool on the next turn.
+            let pool = std::sync::Arc::clone(&ctx.exec_pool);
+            let session_key = ctx.session_key.clone();
+            let tool_call_id_owned = tool_call_id.to_owned();
+            let command_owned = command.to_owned();
+
+            tracing::info!(task_id = %task_id, command = %command, "exec: spawning background task");
+
+            let tid = task_id.clone();
+            tokio::spawn(async move {
+                let started_at = std::time::Instant::now();
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    cmd.output()
+                )
+                .await;
+
+                let (exit_code, stdout, stderr) = match result {
+                    Ok(Ok(output)) => {
+                        let exit_code = output.status.code();
+                        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                        (exit_code, stdout, stderr)
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(task_id = %tid, "exec background spawn failed: {}", e);
+                        (None, String::new(), format!("spawn error: {}", e))
+                    }
+                    Err(_) => {
+                        tracing::warn!(task_id = %tid, timeout_secs, "exec background timed out");
+                        (None, String::new(), format!("timed out after {} seconds", timeout_secs))
+                    }
+                };
+
+                let completed_at = std::time::Instant::now();
+                tracing::info!(
+                    task_id = %tid,
+                    exit_code = ?exit_code,
+                    stdout_len = stdout.len(),
+                    stderr_len = stderr.len(),
+                    "exec background completed"
+                );
+
+                let exec_result = super::exec_pool::ExecResult {
+                    task_id: tid,
+                    tool_call_id: tool_call_id_owned,
+                    command: command_owned,
+                    exit_code,
+                    stdout,
+                    stderr,
+                    started_at,
+                    completed_at,
+                };
+
+                pool.add_pending_for_session(session_key, exec_result).await;
+            });
+
+            Ok(json!({
+                "task_id": task_id,
+                "status": "running",
+                "message": "Command started in background. Results will be delivered on your next turn, or poll with task_id."
+            }))
+        }
     }
 }
