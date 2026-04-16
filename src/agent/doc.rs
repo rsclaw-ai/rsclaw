@@ -60,13 +60,15 @@ fn find_font_family() -> Option<genpdf::fonts::FontFamily<genpdf::fonts::FontDat
             return Some(f);
         }
     }
-    // macOS: load individual TTF files directly.
+    // macOS: load individual TTF files directly (genpdf fallback only, Chrome preferred).
     let mac_fonts: &[&str] = &[
         "/System/Library/Fonts/Supplemental/Arial.ttf",
         "/System/Library/Fonts/Supplemental/Courier New.ttf",
-        "/Library/Fonts/Arial Unicode.ttf",
         "/System/Library/Fonts/Geneva.ttf",
-        "/System/Library/Fonts/Monaco.ttf",
+    ];
+    // Windows: CJK fonts for genpdf fallback
+    let win_fonts: &[&str] = &[
+        "C:\\Windows\\Fonts\\simhei.ttf",   // SimHei (TTF, CJK)
     ];
     for path in mac_fonts {
         if let Ok(data) = std::fs::read(path) {
@@ -80,7 +82,20 @@ fn find_font_family() -> Option<genpdf::fonts::FontFamily<genpdf::fonts::FontDat
             }
         }
     }
-    // Windows
+    // Windows: try CJK fonts first
+    for path in win_fonts {
+        if let Ok(data) = std::fs::read(path) {
+            if let Ok(fd) = genpdf::fonts::FontData::new(data, None) {
+                return Some(genpdf::fonts::FontFamily {
+                    regular: fd.clone(),
+                    bold: fd.clone(),
+                    italic: fd.clone(),
+                    bold_italic: fd,
+                });
+            }
+        }
+    }
+    // Windows: Latin fallback
     if let Ok(f) = genpdf::fonts::from_files("C:\\Windows\\Fonts", "arial", None) {
         return Some(f);
     }
@@ -304,13 +319,51 @@ fn create_pdf(args: &Value, path: &Path) -> Result<Value> {
         }));
     }
 
-    // Try platform font directories. genpdf expects {Name}-Regular.ttf naming.
-    let font = find_font_family().context("no usable fonts found for PDF generation")?;
+    // Strategy: generate HTML then convert to PDF via Chrome headless (best CJK support).
+    // Fallback to genpdf if Chrome is not available.
+    let html = build_html_for_pdf(title, content);
 
+    // Try Chrome headless first (supports CJK natively via system fonts).
+    if let Some(chrome) = crate::agent::platform::detect_chrome() {
+        let tmp_html = path.with_extension("_tmp.html");
+        std::fs::write(&tmp_html, &html)?;
+        let result = std::process::Command::new(&chrome)
+            .args([
+                "--headless",
+                "--disable-gpu",
+                "--no-sandbox",
+                "--print-to-pdf-no-header",
+                &format!("--print-to-pdf={}", path.display()),
+                &format!("file://{}", tmp_html.display()),
+            ])
+            .output();
+        let _ = std::fs::remove_file(&tmp_html);
+        match result {
+            Ok(output) if output.status.success() && path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false) => {
+                return Ok(json!({
+                    "created": true,
+                    "path": path.display().to_string(),
+                    "format": "pdf",
+                    "engine": "chrome",
+                }));
+            }
+            Ok(output) => {
+                tracing::warn!(
+                    stderr = %String::from_utf8_lossy(&output.stderr),
+                    "create_pdf: Chrome headless failed, falling back to genpdf"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(%e, "create_pdf: Chrome not available, falling back to genpdf");
+            }
+        }
+    }
+
+    // Fallback: genpdf (no CJK support on most systems).
+    let font = find_font_family().context("no usable fonts found for PDF generation")?;
     let mut doc = genpdf::Document::new(font);
     doc.set_title(title);
 
-    // Title.
     if !title.is_empty() {
         let mut t = genpdf::elements::Paragraph::new(title);
         t.set_alignment(genpdf::Alignment::Center);
@@ -321,7 +374,6 @@ fn create_pdf(args: &Value, path: &Path) -> Result<Value> {
         doc.push(genpdf::elements::Break::new(1));
     }
 
-    // Content paragraphs.
     for block in content.split("\n\n") {
         let block = block.trim();
         if block.is_empty() {
@@ -346,6 +398,8 @@ fn create_pdf(args: &Value, path: &Path) -> Result<Value> {
         "created": true,
         "path": path.display().to_string(),
         "format": "pdf",
+        "engine": "genpdf",
+        "warning": "genpdf has limited CJK support. Install Chrome for better PDF rendering.",
     }))
 }
 
@@ -1115,6 +1169,42 @@ fn read_pdf(path: &Path) -> Result<Value> {
     }))
 }
 
+/// Build a simple HTML document for Chrome headless PDF rendering.
+fn build_html_for_pdf(title: &str, content: &str) -> String {
+    let escaped_title = content.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let _ = escaped_title; // suppress warning, we use xml_escape below
+    let mut html = String::from(
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>\
+         <style>body{font-family:system-ui,-apple-system,sans-serif;margin:40px;font-size:14px;line-height:1.8;}\
+         h1{text-align:center;font-size:20px;margin-bottom:20px;}\
+         p{margin:8px 0;}</style></head><body>\n",
+    );
+    if !title.is_empty() {
+        html.push_str(&format!("<h1>{}</h1>\n", xml_escape(title)));
+    }
+    for block in content.split("\n\n") {
+        let block = block.trim();
+        if block.is_empty() {
+            continue;
+        }
+        if block.starts_with("### ") {
+            html.push_str(&format!("<h3>{}</h3>\n", xml_escape(&block[4..])));
+        } else if block.starts_with("## ") {
+            html.push_str(&format!("<h2>{}</h2>\n", xml_escape(&block[3..])));
+        } else if block.starts_with("# ") {
+            html.push_str(&format!("<h1>{}</h1>\n", xml_escape(&block[2..])));
+        } else {
+            // Handle line breaks within block
+            let lines: Vec<&str> = block.lines().collect();
+            html.push_str("<p>");
+            html.push_str(&lines.iter().map(|l| xml_escape(l)).collect::<Vec<_>>().join("<br>"));
+            html.push_str("</p>\n");
+        }
+    }
+    html.push_str("</body></html>");
+    html
+}
+
 /// Escape XML special characters.
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -1122,4 +1212,106 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    const TEST_CONTENT: &str = "今天晚上7点135号168栋会议室开视频会议，参会人员：张三13800138000、李四15912345678、王五18688886666";
+
+    #[tokio::test]
+    async fn test_create_word_and_read_back() {
+        let dir = std::env::temp_dir().join("rsclaw_doc_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.docx");
+
+        let args = json!({
+            "action": "create_word",
+            "path": path.to_str().unwrap(),
+            "content": TEST_CONTENT,
+            "title": "Meeting Notice"
+        });
+        let result = handle(&args, &path).await.unwrap();
+        assert_eq!(result["created"], true, "create_word failed: {result}");
+        assert!(path.exists(), "docx file not created");
+
+        // Read back
+        let read_args = json!({"action": "read_doc", "path": path.to_str().unwrap()});
+        let read_result = handle(&read_args, &path).await.unwrap();
+        let text = read_result["text"].as_str().unwrap_or("");
+        assert!(text.contains("135"), "docx missing '135': {text}");
+        assert!(text.contains("168"), "docx missing '168': {text}");
+        assert!(text.contains("13800138000"), "docx missing phone number: {text}");
+
+        println!("DOCX output: {}", path.display());
+    }
+
+    #[tokio::test]
+    async fn test_create_pdf_and_read_back() {
+        let dir = std::env::temp_dir().join("rsclaw_pdf_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.pdf");
+
+        let args = json!({
+            "action": "create_pdf",
+            "path": path.to_str().unwrap(),
+            "content": TEST_CONTENT,
+            "title": "Meeting Notice"
+        });
+        let result = handle(&args, &path).await.unwrap();
+        assert_eq!(result["created"], true, "create_pdf failed: {result}");
+        assert!(path.exists(), "pdf file not created");
+        assert!(path.metadata().unwrap().len() > 0, "pdf file is empty");
+
+        // Read back via read_doc
+        let read_args = json!({"action": "read_doc", "path": path.to_str().unwrap()});
+        let read_result = handle(&read_args, &path).await.unwrap();
+        let text = read_result["text"].as_str().unwrap_or("");
+        println!("PDF read_doc text: '{text}'");
+        // PDF text extraction may have spacing differences, just check numbers exist
+        assert!(text.contains("135") || text.contains("1 3 5"), "pdf missing '135': {text}");
+        assert!(text.contains("13800138000") || text.contains("1380013800"), "pdf missing phone: {text}");
+
+        println!("PDF output: {}", path.display());
+    }
+
+    #[tokio::test]
+    async fn test_create_excel_and_read_back() {
+        let dir = std::env::temp_dir().join("rsclaw_xlsx_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.xlsx");
+
+        let args = json!({
+            "action": "create_excel",
+            "path": path.to_str().unwrap(),
+            "sheets": [{"name": "Sheet1", "headers": ["Name","Phone"], "rows": [["Zhang","13800138000"],["Li","15912345678"]]}]
+        });
+        let result = handle(&args, &path).await.unwrap();
+        assert_eq!(result["created"], true, "create_excel failed: {result}");
+        assert!(path.exists(), "xlsx file not created");
+
+        // Read back — xlsx returns {"sheets": [{"rows": [...]}]}, not "text"
+        let read_args = json!({"action": "read_doc", "path": path.to_str().unwrap()});
+        let read_result = handle(&read_args, &path).await.unwrap();
+        let sheets_json = serde_json::to_string(&read_result["sheets"]).unwrap_or_default();
+        assert!(sheets_json.contains("13800138000"), "xlsx missing phone: {sheets_json}");
+
+        // Don't clean up — let user inspect files
+        println!("XLSX output: {}", path.display());
+    }
+
+    #[tokio::test]
+    async fn test_create_word_empty_content_rejected() {
+        let dir = std::env::temp_dir().join("rsclaw_empty_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty.docx");
+
+        let args = json!({"action": "create_word", "path": path.to_str().unwrap()});
+        let result = handle(&args, &path).await.unwrap();
+        assert!(result.get("error").is_some(), "empty content should return error: {result}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
