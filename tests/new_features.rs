@@ -109,12 +109,12 @@ fn opencode_tooldef_in_tool_list() {
     // Check that opencode tool definition is present in runtime.rs
     // This tests the static definition by searching for it in the source
 
-    let source = include_str!("../src/agent/runtime.rs");
+    let source = include_str!("../src/agent/tools_builder.rs");
 
     // Check that opencode tool is defined
     assert!(
         source.contains(r#"name: "opencode".to_owned()"#),
-        "opencode tool should be defined in runtime.rs"
+        "opencode tool should be defined in tools_builder.rs"
     );
 
     // Check that it has the correct description
@@ -123,16 +123,10 @@ fn opencode_tooldef_in_tool_list() {
         "opencode tool should mention OpenCode"
     );
 
-    // Check that it has prompt parameter
+    // Check that it has task parameter
     assert!(
-        source.contains(r#""prompt""#),
-        "opencode tool should have prompt parameter"
-    );
-
-    // Check that it has session_id parameter
-    assert!(
-        source.contains(r#""session_id""#),
-        "opencode tool should have session_id parameter"
+        source.contains(r#""task""#),
+        "opencode tool should have task parameter"
     );
 }
 

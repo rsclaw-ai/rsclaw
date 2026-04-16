@@ -8,17 +8,23 @@
 //!   - `collaboration`  — Sequential / Parallel / Orchestrated collab modes
 
 pub mod bootstrap;
-pub mod doc;
 pub mod btw;
 pub mod collaboration;
+pub mod context_mgr;
+pub mod doc;
 pub mod loop_detection;
 pub mod memory;
 pub mod permission;
+pub mod platform;
 pub mod preparse;
+pub mod prompt_builder;
 pub mod registry;
 pub mod runtime;
+pub mod security;
 pub mod spawner;
 pub mod tool_call_repair;
+pub mod tools_builder;
+pub mod web_parsers;
 pub mod workspace;
 
 pub use bootstrap::{seed_tools, seed_workspace, seed_workspace_with_lang};
