@@ -494,6 +494,11 @@ impl AgentRuntime {
         let self_channel = ctx.channel.clone();
         let self_peer_id = ctx.peer_id.clone();
         let self_chat_id = ctx.chat_id.clone();
+        // Extract configurable reply timeout BEFORE spawn (self is borrowed, cannot be used inside spawn)
+        let reply_timeout_secs = self.config.ext.tools.as_ref()
+            .and_then(|t| t.acp.as_ref())
+            .and_then(|a| a.reply_timeout_seconds)
+            .unwrap_or(300);
         tokio::spawn(async move {
             tracing::info!("tool_opencode: background task started");
             // Start event collection FIRST (in parallel with send_prompt)
@@ -747,7 +752,8 @@ impl AgentRuntime {
             } else {
                 tracing::info!("tool_opencode: result injected back to agent, waiting for reply");
                 // Wait for agent's reply and forward it (text + files) to user via notification.
-                match tokio::time::timeout(Duration::from_secs(300), reply_rx).await {
+                // Timeout value extracted before spawn (see reply_timeout_secs variable)
+                match tokio::time::timeout(Duration::from_secs(reply_timeout_secs), reply_rx).await {
                     Ok(Ok(reply)) => {
                         if !reply.text.is_empty() || !reply.files.is_empty() || !reply.images.is_empty() {
                             if let Some(ref tx) = notif_tx_bg {
@@ -765,7 +771,7 @@ impl AgentRuntime {
                         }
                     }
                     Ok(Err(_)) => tracing::warn!("tool_opencode: reply channel dropped"),
-                    Err(_) => tracing::warn!("tool_opencode: reply timed out after 300s"),
+                    Err(_) => tracing::warn!("tool_opencode: reply timed out after {}s", reply_timeout_secs),
                 }
             }
         });
