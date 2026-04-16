@@ -179,7 +179,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/status", get(status))
         .route("/config/reload", post(config_reload))
         .route("/config", get(get_config).put(save_config))
+        .route("/cron", get(cron_list).post(cron_create))
         .route("/cron/reload", post(cron_reload))
+        .route("/cron/{id}", get(cron_get).put(cron_update).delete(cron_delete))
+        .route("/cron/{id}/trigger", post(cron_trigger))
+        .route("/cron/{id}/history", get(cron_history))
         .route("/channels/pair", post(channels_pair))
         .route("/channels/unpair", post(channels_unpair))
         .route("/channels/pairings", get(list_pairings))
@@ -709,6 +713,295 @@ async fn cron_reload(State(state): State<AppState>) -> impl IntoResponse {
         )
             .into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cron CRUD API
+// ---------------------------------------------------------------------------
+
+/// Helper: resolve the cron.json5 path.
+fn cron_jobs_path() -> std::path::PathBuf {
+    crate::cron::resolve_cron_store_path()
+}
+
+/// Helper: load jobs from cron.json5 (json5 parser for comment support).
+async fn cron_load_jobs() -> Vec<serde_json::Value> {
+    let path = cron_jobs_path();
+    let raw = match tokio::fs::read_to_string(&path).await {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let parsed: serde_json::Value = json5::from_str(&raw)
+        .or_else(|_| serde_json::from_str(&raw))
+        .unwrap_or_default();
+    if let Some(jobs) = parsed.get("jobs").and_then(|v| v.as_array()) {
+        return jobs.clone();
+    }
+    if let Some(arr) = parsed.as_array() {
+        return arr.clone();
+    }
+    Vec::new()
+}
+
+/// Helper: save jobs to file and notify CronRunner to reload.
+async fn cron_save_and_reload(
+    jobs: &[serde_json::Value],
+    reload_tx: &broadcast::Sender<()>,
+) -> Result<(), String> {
+    let path = cron_jobs_path();
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("create cron dir: {e}"))?;
+    }
+    let json = serde_json::to_string_pretty(jobs).map_err(|e| format!("serialize: {e}"))?;
+    tokio::fs::write(&path, json)
+        .await
+        .map_err(|e| format!("write jobs.json: {e}"))?;
+    let _ = reload_tx.send(());
+    Ok(())
+}
+
+/// GET /api/v1/cron — list all cron jobs.
+async fn cron_list() -> impl IntoResponse {
+    let jobs = cron_load_jobs().await;
+    Json(serde_json::json!({"jobs": jobs}))
+}
+
+/// GET /api/v1/cron/:id — get a single cron job.
+async fn cron_get(Path(id): Path<String>) -> Response {
+    let jobs = cron_load_jobs().await;
+    match jobs.iter().find(|j| j["id"].as_str() == Some(&id)) {
+        Some(job) => (StatusCode::OK, Json(job.clone())).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "job not found"})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/v1/cron — create a new cron job.
+async fn cron_create(
+    State(state): State<AppState>,
+    Json(mut body): Json<serde_json::Value>,
+) -> Response {
+    let id = body["id"]
+        .as_str()
+        .map(|s| s.to_owned())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    body["id"] = serde_json::json!(id);
+    if body.get("enabled").is_none() {
+        body["enabled"] = serde_json::json!(true);
+    }
+    if body.get("agent_id").is_none() && body.get("agentId").is_none() {
+        body["agent_id"] = serde_json::json!("main");
+    }
+    // Normalize schedule: accept both flat string and nested object
+    if let Some(sched) = body.get("schedule").and_then(|s| s.as_str()).map(|s| s.to_owned()) {
+        let tz = body.get("timezone").and_then(|t| t.as_str()).map(|t| t.to_owned());
+        if let Some(tz) = tz {
+            body["schedule"] = serde_json::json!({"kind": "cron", "expr": sched, "tz": tz});
+        } else {
+            body["schedule"] = serde_json::json!(sched);
+        }
+        // Remove timezone since it's now in the schedule object
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("timezone");
+        }
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    body["created_at_ms"] = serde_json::json!(now_ms);
+    body["updated_at_ms"] = serde_json::json!(now_ms);
+
+    let mut jobs = cron_load_jobs().await;
+    // Prevent duplicate IDs
+    if jobs.iter().any(|j| j["id"].as_str() == Some(&id)) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "job with this id already exists"})),
+        )
+            .into_response();
+    }
+    jobs.push(body.clone());
+
+    match cron_save_and_reload(&jobs, &state.cron_reload).await {
+        Ok(()) => (StatusCode::CREATED, Json(body)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// PUT /api/v1/cron/:id — update (patch) a cron job.
+async fn cron_update(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let mut jobs = cron_load_jobs().await;
+    let idx = match jobs.iter().position(|j| j["id"].as_str() == Some(&id)) {
+        Some(i) => i,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "job not found"})),
+            )
+                .into_response()
+        }
+    };
+
+    // Merge fields from body into existing job
+    if let Some(existing) = jobs[idx].as_object_mut() {
+        if let Some(patch) = body.as_object() {
+            for (k, v) in patch {
+                // Normalize schedule string + timezone
+                if k == "schedule" {
+                    if let Some(sched) = v.as_str() {
+                        let tz = patch
+                            .get("timezone")
+                            .and_then(|t| t.as_str())
+                            .or_else(|| existing.get("schedule").and_then(|s| s["tz"].as_str()));
+                        if let Some(tz) = tz {
+                            existing.insert(
+                                k.clone(),
+                                serde_json::json!({"kind": "cron", "expr": sched, "tz": tz}),
+                            );
+                        } else {
+                            existing.insert(k.clone(), serde_json::json!(sched));
+                        }
+                        continue;
+                    }
+                }
+                if k == "timezone" {
+                    continue; // handled with schedule
+                }
+                existing.insert(k.clone(), v.clone());
+            }
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            existing.insert("updated_at_ms".to_owned(), serde_json::json!(now_ms));
+        }
+    }
+
+    let updated = jobs[idx].clone();
+    match cron_save_and_reload(&jobs, &state.cron_reload).await {
+        Ok(()) => (StatusCode::OK, Json(updated)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/v1/cron/:id — delete a cron job.
+async fn cron_delete(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let mut jobs = cron_load_jobs().await;
+    let before = jobs.len();
+    jobs.retain(|j| j["id"].as_str() != Some(&id));
+    if jobs.len() == before {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "job not found"})),
+        )
+            .into_response();
+    }
+
+    match cron_save_and_reload(&jobs, &state.cron_reload).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"deleted": true}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/v1/cron/:id/trigger — manually trigger a cron job.
+async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let jobs = cron_load_jobs().await;
+    let job = match jobs.iter().find(|j| j["id"].as_str() == Some(&id)) {
+        Some(j) => j,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "job not found"})),
+            )
+                .into_response()
+        }
+    };
+
+    let message = job["message"]
+        .as_str()
+        .or_else(|| job["payload"]["text"].as_str())
+        .unwrap_or("")
+        .to_owned();
+    let agent_id = job["agent_id"]
+        .as_str()
+        .or_else(|| job["agentId"].as_str())
+        .unwrap_or("main");
+
+    // Send message to the agent via registry
+    if let Ok(handle) = state.agents.get(agent_id) {
+        let session_key = format!("cron:{}", id);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let msg = crate::agent::AgentMessage {
+            session_key,
+            text: message,
+            channel: "cron".to_string(),
+            peer_id: format!("cron:{id}"),
+            chat_id: String::new(),
+            reply_tx,
+            extra_tools: vec![],
+            images: vec![],
+            files: vec![],
+        };
+        if handle.tx.send(msg).await.is_ok() {
+            // Don't block waiting for reply — fire and forget
+            tokio::spawn(async move {
+                let _ = reply_rx.await;
+            });
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({"triggered": true, "job_id": id})),
+            )
+                .into_response();
+        }
+    }
+
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"error": "failed to send to agent"})),
+    )
+        .into_response()
+}
+
+/// GET /api/v1/cron/:id/history — get run history for a cron job.
+async fn cron_history(Path(id): Path<String>) -> impl IntoResponse {
+    // Read run log from data dir
+    let log_dir = crate::config::loader::base_dir()
+        .join("var")
+        .join("data")
+        .join("cron");
+    let log_file = log_dir.join(format!("{id}.log.json"));
+    let entries: Vec<serde_json::Value> = match tokio::fs::read_to_string(&log_file).await {
+        Ok(raw) => {
+            // File may contain one JSON object per line (JSONL)
+            raw.lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
+        }
+        Err(_) => Vec::new(),
+    };
+    Json(serde_json::json!({"job_id": id, "runs": entries}))
 }
 
 async fn channels_pair(

@@ -879,6 +879,8 @@ const cn = {
     AgentDefault: "默认",
     AgentLoading: "加载中...",
     AgentLoadFailed: "无法获取智能体列表",
+    AutoStart: "开机启动",
+    AutoStartSub: "登录时自动启动 RsClaw",
   },
 
   GatewayControl: {

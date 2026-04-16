@@ -1230,13 +1230,30 @@ pub async fn read_jobs_from_file(cron_dir: PathBuf) -> Result<Vec<CronJob>> {
 /// Respects RSCLAW_BASE_DIR env var (same as other rsclaw data).
 pub fn resolve_cron_store_path() -> PathBuf {
     let base = crate::config::loader::base_dir();
-    base.join("cron").join("jobs.json")
+    base.join("cron.json5")
 }
 
-/// Load cron jobs from the cron store file (openclaw-compatible path).
+/// Load cron jobs from the cron store file.
+/// Auto-migrates legacy `cron/jobs.json` to `cron.json5` if needed.
 /// Returns an empty list if no file exists.
 pub fn load_cron_jobs() -> Vec<CronJob> {
     let source = resolve_cron_store_path();
+
+    // Auto-migrate legacy cron/jobs.json -> cron.json5
+    if !source.exists() {
+        let base = crate::config::loader::base_dir();
+        let legacy = base.join("cron").join("jobs.json");
+        if legacy.exists() {
+            info!(from = %legacy.display(), to = %source.display(), "migrating legacy cron/jobs.json to cron.json5");
+            if let Err(e) = std::fs::copy(&legacy, &source) {
+                warn!(err = %e, "failed to migrate legacy cron/jobs.json");
+            } else {
+                // Remove legacy file and empty directory
+                let _ = std::fs::remove_file(&legacy);
+                let _ = std::fs::remove_dir(base.join("cron"));
+            }
+        }
+    }
 
     if !source.exists() {
         return Vec::new();

@@ -238,6 +238,7 @@ impl AgentRuntime {
         let session_key = ctx.session_key.clone();
         let task_id = id.clone();
         let agents = self.agents.as_ref().map(Arc::clone);
+        let self_handle = Arc::clone(&self.handle);
         let timeout_secs = self
             .config
             .agents
@@ -258,8 +259,24 @@ impl AgentRuntime {
 
             // Store result for main agent to pick up.
             if let Ok(mut guard) = pending.lock() {
-                guard.push((task_id.clone(), session_key, result_text));
+                guard.push((task_id.clone(), session_key.clone(), result_text));
             }
+
+            // Proactively wake the parent agent so it processes the result
+            // without waiting for the next user message.
+            let (wake_tx, _) = tokio::sync::oneshot::channel::<AgentReply>();
+            let wake_msg = AgentMessage {
+                session_key: session_key.clone(),
+                text: format!("[async task {task_id} completed — check results]"),
+                channel: "system".to_string(),
+                peer_id: "system".to_string(),
+                chat_id: String::new(),
+                reply_tx: wake_tx,
+                extra_tools: vec![],
+                images: vec![],
+                files: vec![],
+            };
+            let _ = self_handle.tx.send(wake_msg).await;
 
             // Cleanup: remove agent from registry, delete workspace.
             if let Some(reg) = agents {
@@ -313,6 +330,7 @@ impl AgentRuntime {
 
         // Background: wait for reply and store in pending results.
         let pending = Arc::clone(&self.pending_task_results);
+        let self_handle = Arc::clone(&self.handle);
         let session_key = ctx.session_key.clone();
         let timeout_secs = self
             .config
@@ -335,8 +353,23 @@ impl AgentRuntime {
                 Err(_) => format!("[agent {target_id_bg} timed out after {send_timeout}s]"),
             };
             if let Ok(mut guard) = pending.lock() {
-                guard.push((send_id_bg, session_key, result_text));
+                guard.push((send_id_bg.clone(), session_key.clone(), result_text));
             }
+
+            // Proactively wake the parent agent so it processes the result.
+            let (wake_tx, _) = tokio::sync::oneshot::channel::<AgentReply>();
+            let wake_msg = AgentMessage {
+                session_key: session_key.clone(),
+                text: format!("[async send {send_id_bg} completed — check results]"),
+                channel: "system".to_string(),
+                peer_id: "system".to_string(),
+                chat_id: String::new(),
+                reply_tx: wake_tx,
+                extra_tools: vec![],
+                images: vec![],
+                files: vec![],
+            };
+            let _ = self_handle.tx.send(wake_msg).await;
         });
 
         Ok(json!({

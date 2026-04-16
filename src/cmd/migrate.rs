@@ -422,12 +422,10 @@ fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()> {
         import_memories_to_redb(&memory_entries, rsclaw_dir, &mut stats)?;
     }
 
-    // --- Copy cron jobs (direct file copy, format is now 100% compatible) ---
+    // --- Copy cron jobs (openclaw cron/jobs.json -> rsclaw cron.json5) ---
     let cron_src = openclaw_dir.join("cron/jobs.json");
     if cron_src.is_file() {
-        let cron_dst_dir = rsclaw_dir.join("cron");
-        std::fs::create_dir_all(&cron_dst_dir)?;
-        let cron_dst = cron_dst_dir.join("jobs.json");
+        let cron_dst = rsclaw_dir.join("cron.json5");
         if !cron_dst.exists() {
             std::fs::copy(&cron_src, &cron_dst)?;
             // Count jobs for stats.
@@ -439,7 +437,7 @@ fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()> {
                 item("*", &format!("{count} cron job(s) migrated"));
             }
         } else {
-            item(" ", "cron/jobs.json already exists, skipping");
+            item(" ", "cron.json5 already exists, skipping");
         }
     }
 

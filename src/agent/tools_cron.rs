@@ -18,7 +18,7 @@ impl super::runtime::AgentRuntime {
             .ok_or_else(|| anyhow!("cron: `action` required"))?;
 
         let cron_dir = crate::config::loader::base_dir();
-        let cron_path = cron_dir.join("cron").join("jobs.json");
+        let cron_path = cron_dir.join("cron.json5");
 
         match action {
             "list" => {
@@ -247,30 +247,28 @@ impl super::runtime::AgentRuntime {
 // Cron helpers (file-based job storage)
 // ---------------------------------------------------------------------------
 
-/// Read cron jobs from the OpenClaw-compatible jobs.json file.
+/// Read cron jobs from cron.json5.
 /// Handles both bare array `[...]` and wrapped `{"version":1,"jobs":[...]}` formats.
+/// Parses with json5 for comment support.
 pub(crate) async fn read_cron_jobs(path: &std::path::Path) -> Vec<Value> {
     let data = tokio::fs::read_to_string(path)
         .await
         .unwrap_or_else(|_| "[]".to_owned());
-    // Try wrapped format first.
-    if let Ok(wrapper) = serde_json::from_str::<Value>(&data) {
-        if let Some(jobs) = wrapper.get("jobs").and_then(|v| v.as_array()) {
-            return jobs.clone();
-        }
-        // Fall through to try as bare array.
-        if let Some(arr) = wrapper.as_array() {
-            return arr.clone();
-        }
+    // Parse with json5 (falls back to serde_json).
+    let wrapper: Value = json5::from_str(&data)
+        .or_else(|_| serde_json::from_str(&data))
+        .unwrap_or(Value::Array(vec![]));
+    if let Some(jobs) = wrapper.get("jobs").and_then(|v| v.as_array()) {
+        return jobs.clone();
+    }
+    if let Some(arr) = wrapper.as_array() {
+        return arr.clone();
     }
     Vec::new()
 }
 
-/// Write cron jobs in OpenClaw-compatible format: {"version":1,"jobs":[...]}.
+/// Write cron jobs as JSON (readable by json5 parser).
 pub(crate) async fn write_cron_jobs(path: &std::path::Path, jobs: &[Value]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
     let wrapper = json!({"version": 1, "jobs": jobs});
     tokio::fs::write(path, serde_json::to_string_pretty(&wrapper)?)
         .await

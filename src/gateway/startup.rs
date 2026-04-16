@@ -407,7 +407,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // Create cron reload broadcast channel (used to notify CronRunner of new jobs)
     let (cron_reload_tx, _cron_reload_rx) = tokio::sync::broadcast::channel::<()>(16);
 
-    // Start cron runner — jobs loaded from base_dir/cron/jobs.json
+    // Start cron runner — jobs loaded from base_dir/cron.json5
     {
         let cron_cfg = config.ops.cron.clone().unwrap_or_else(|| {
             crate::config::schema::CronConfig {
