@@ -464,6 +464,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         dm_enforcers: Arc::clone(&dm_enforcers),
         custom_webhooks: Arc::clone(&custom_webhooks),
         cron_reload: cron_reload_tx,
+        notification_tx: notification_tx.clone(),
     };
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
 

@@ -99,6 +99,8 @@ pub struct AppState {
     >,
     /// Broadcast channel to notify CronRunner to reload jobs from file.
     pub cron_reload: broadcast::Sender<()>,
+    /// Notification sender — routes OutboundMessage to the correct channel.
+    pub notification_tx: broadcast::Sender<crate::channel::OutboundMessage>,
 }
 
 // AgentEvent is defined in crate::events to avoid circular deps with agent.
@@ -955,7 +957,8 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
         .or_else(|| job["agentId"].as_str())
         .unwrap_or("main");
 
-    // Send message to the agent via registry
+    // Send message to the agent via registry.
+    // After the agent replies, deliver the result through the job's delivery channel.
     if let Ok(handle) = state.agents.get(agent_id) {
         let session_key = format!("cron:{}", id);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -971,9 +974,28 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
             files: vec![],
         };
         if handle.tx.send(msg).await.is_ok() {
-            // Don't block waiting for reply — fire and forget
+            // Deliver agent reply through the job's delivery config.
+            let delivery_channel = job["delivery"]["channel"].as_str().map(|s| s.to_owned());
+            let delivery_to = job["delivery"]["to"].as_str().map(|s| s.to_owned());
+            let ntx = state.notification_tx.clone();
+            let job_id = id.clone();
             tokio::spawn(async move {
-                let _ = reply_rx.await;
+                if let Ok(reply) = reply_rx.await {
+                    if !reply.text.is_empty() {
+                        if let (Some(ch), Some(to)) = (delivery_channel, delivery_to) {
+                            let _ = ntx.send(crate::channel::OutboundMessage {
+                                target_id: to,
+                                is_group: false,
+                                text: reply.text,
+                                reply_to: None,
+                                images: reply.images.clone(),
+                                files: reply.files.clone(),
+                                channel: Some(ch),
+                            });
+                            tracing::info!(job_id = %job_id, "cron trigger: delivered reply to channel");
+                        }
+                    }
+                }
             });
             return (
                 StatusCode::OK,
