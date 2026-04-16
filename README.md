@@ -14,6 +14,8 @@ RsClaw (Crab AI / 螃蟹AI自动化管家) is your personal AI butler — a sing
   <img src="docs/images/en.gif" alt="RsClaw Preview" width="800" />
 </p>
 
+💬 [Join Community](https://rsclaw.ai/en/community) — WeChat / Feishu / QQ / Telegram
+
 ---
 
 ## Install

@@ -14,6 +14,8 @@
   <img src="../images/cn.gif" alt="RsClaw 预览" width="800" />
 </p>
 
+💬 [加入用户交流群](https://rsclaw.ai/community) — 微信 / 飞书 / QQ / Telegram
+
 ---
 
 ## 从 OpenClaw 迁移

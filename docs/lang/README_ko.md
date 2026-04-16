@@ -15,6 +15,8 @@ RsClaw는 [OpenClaw](https://github.com/openclaw/openclaw)를 Rust로 완전히 
   <img src="../images/en.gif" alt="RsClaw Preview" width="800" />
 </p>
 
+💬 [Join Community](https://rsclaw.ai/en/community) — WeChat / Feishu / QQ / Telegram
+
 ---
 
 ## 주요 기능

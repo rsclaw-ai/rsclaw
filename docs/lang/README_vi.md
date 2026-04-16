@@ -15,6 +15,8 @@ RsClaw la ban viet lai hoan toan cua [OpenClaw](https://github.com/openclaw/open
   <img src="../images/en.gif" alt="RsClaw Preview" width="800" />
 </p>
 
+💬 [Join Community](https://rsclaw.ai/en/community) — WeChat / Feishu / QQ / Telegram
+
 ---
 
 ## Tinh nang chinh

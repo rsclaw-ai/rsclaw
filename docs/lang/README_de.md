@@ -15,6 +15,8 @@ RsClaw ist eine komplette Neuentwicklung von [OpenClaw](https://github.com/openc
   <img src="../images/en.gif" alt="RsClaw Preview" width="800" />
 </p>
 
+💬 [Join Community](https://rsclaw.ai/en/community) — WeChat / Feishu / QQ / Telegram
+
 ---
 
 ## Hauptmerkmale

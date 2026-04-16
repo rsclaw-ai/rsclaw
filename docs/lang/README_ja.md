@@ -15,6 +15,8 @@ RsClaw は [OpenClaw](https://github.com/openclaw/openclaw) を Rust でフル�
   <img src="../images/en.gif" alt="RsClaw Preview" width="800" />
 </p>
 
+💬 [Join Community](https://rsclaw.ai/en/community) — WeChat / Feishu / QQ / Telegram
+
 ---
 
 ## 主な特徴
