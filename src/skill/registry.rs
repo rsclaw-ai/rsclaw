@@ -150,46 +150,46 @@ async fn search_clawhub(
 async fn search_skillhub(
     client: &Client,
     search_url: &str,
-    index_url: &str,
+    _index_url: &str,
     query: &str,
 ) -> Vec<SearchResult> {
-    // Try search API first.
-    let url = format!("{}?q={}", search_url, url_encode(query));
-    if let Ok(resp) = client.get(&url).send().await {
-        if resp.status().is_success() {
-            if let Ok(body) = resp.json::<serde_json::Value>().await {
-                let results = parse_standard_response(&body, "skillhub");
-                if !results.is_empty() {
-                    return results;
-                }
-            }
-        }
-    }
+    // skillhub.cn API: GET /api/skills?keyword=<q>&page=1&pageSize=20
+    // Response: { code: 0, data: { skills: [...], total: N } }
+    let url = format!(
+        "{}?keyword={}&page=1&pageSize=20",
+        search_url,
+        url_encode(query)
+    );
+    let Ok(resp) = client.get(&url).send().await else { return vec![] };
+    if !resp.status().is_success() { return vec![]; }
+    let Ok(body) = resp.json::<serde_json::Value>().await else { return vec![] };
 
-    // Fallback: full index with client-side keyword filter.
-    if let Ok(resp) = client.get(index_url).send().await {
-        if resp.status().is_success() {
-            if let Ok(body) = resp.json::<serde_json::Value>().await {
-                let q = query.to_lowercase();
-                return body
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter(|item| {
-                                let slug = item["slug"].as_str().or_else(|| item["name"].as_str()).unwrap_or("");
-                                let desc = item["summary"].as_str().or_else(|| item["description"].as_str()).unwrap_or("");
-                                slug.to_lowercase().contains(&q) || desc.to_lowercase().contains(&q)
-                            })
-                            .take(10)
-                            .map(|item| to_result(item, "skillhub"))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-            }
-        }
-    }
+    // Unwrap {code:0, data:{skills:[...]}} envelope.
+    let arr = body
+        .get("data")
+        .and_then(|d| d.get("skills"))
+        .and_then(|v| v.as_array());
 
-    vec![]
+    let Some(arr) = arr else { return vec![] };
+
+    arr.iter()
+        .map(|item| {
+            let desc = item["description_zh"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| item["description"].as_str())
+                .map(|s| s.to_owned());
+            SearchResult {
+                slug: item["slug"].as_str().unwrap_or("unknown").to_owned(),
+                version: item["version"].as_str().map(|s| s.to_owned()),
+                description: desc,
+                downloads: item["downloads"].as_u64(),
+                installs: item["installs"].as_u64(),
+                stars: item["stars"].as_u64(),
+                registry: "skillhub".to_owned(),
+            }
+        })
+        .collect()
 }
 
 async fn search_skillsh(client: &Client, query: &str) -> Vec<SearchResult> {

@@ -295,10 +295,10 @@ api_base     = "https://clawhub.ai/api"
 
 [skill_registries.skillhub]
 label        = "SkillHub"
-index_url    = "https://skillhub.cn/skills.json"
-download_url = "https://skillhub.cn/skills/{slug}.zip"
-search_url   = "https://skillhub.cn/search"
-primary_download_url = "https://skillhub.cn/download"
+search_url   = "https://api.skillhub.cn/api/skills"
+download_url = "https://api.skillhub.cn/api/v1/skills/{slug}/files"
+index_url    = "https://api.skillhub.cn/api/skills?pageSize=200"
+primary_download_url = "https://api.skillhub.cn/api/v1/skills"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Exec Safety Rules
