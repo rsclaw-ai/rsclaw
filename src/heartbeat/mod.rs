@@ -168,18 +168,23 @@ pub struct HeartbeatRunner {
     store: Arc<HeartbeatStore>,
     /// Tracks which agents already have a running heartbeat loop.
     active: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Shared memory store (used by meditation heartbeat type).
+    memory: Option<Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>>,
 }
 
 impl HeartbeatRunner {
+    /// Create a new heartbeat runner.
     pub fn new(
         registry: Arc<AgentRegistry>,
         data_dir: &Path,
+        memory: Option<Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>>,
     ) -> Self {
         let state_path = data_dir.join("heartbeat").join("state.json");
         Self {
             registry,
             store: Arc::new(HeartbeatStore::new(state_path)),
             active: std::sync::Mutex::new(std::collections::HashSet::new()),
+            memory,
         }
     }
 
@@ -345,15 +350,10 @@ impl HeartbeatRunner {
     /// Delegates to [`meditation::meditate`] to perform dedup, conflict
     /// resolution, and crystallized-memory cleanup on the agent's memory store.
     async fn run_meditation(&self, agent_id: &str) -> Result<()> {
-        let handle = self
-            .registry
-            .get(agent_id)
-            .map_err(|e| anyhow!("agent not found: {e:#}"))?;
-
-        let mem = match handle.memory.as_ref() {
+        let mem = match self.memory.as_ref() {
             Some(m) => m,
             None => {
-                info!(agent_id, "meditation: agent has no memory store, skipping");
+                info!(agent_id, "meditation: no memory store available, skipping");
                 return Ok(());
             }
         };
