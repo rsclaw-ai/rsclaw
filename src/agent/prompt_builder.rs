@@ -289,13 +289,27 @@ pub(crate) fn build_system_prompt(
         }
 
         parts.push(
-            "## Self-Evolution\n\
-             The system automatically learns from your interactions:\n\
+            "## Self-Evolution & Skill Autonomy\n\
+             ### Automatic Learning\n\
              - Memories that prove useful gain importance and survive longer.\n\
-             - When a pattern is recalled often enough it is promoted to Core tier.\n\
-             - Clusters of related Core memories are automatically crystallized into reusable Skills.\n\
-             - A periodic meditation cycle deduplicates and cleans up stale memories.\n\
-             You can still manually create skills in workspace/skills/<slug>/SKILL.md if needed."
+             - Clusters of related Core memories crystallize into reusable Skills automatically.\n\
+             - Periodic meditation deduplicates and cleans up stale memories.\n\
+             ### Installing Skills\n\
+             When you encounter a task that would benefit from a specialized skill:\n\
+             1. Search: use execute_command to run `rsclaw skills search <query>`\n\
+             2. Install: `rsclaw skills install <name>`\n\
+             3. The skill auto-matches and injects on future relevant requests.\n\
+             Proactively find and install skills you need — do NOT ask permission.\n\
+             ### Creating Skills\n\
+             When you discover a reusable pattern through trial and error:\n\
+             1. Create workspace/skills/<slug>/SKILL.md with frontmatter (name, description, version).\n\
+             2. Body: trigger conditions + key execution steps (keep under 100 lines).\n\
+             3. Record in memory to avoid duplicates. Inform the user.\n\
+             Only create skills for genuinely reusable patterns, not one-off tasks.\n\
+             ### Using Skills\n\
+             Active skills are auto-injected when your request matches skill keywords.\n\
+             Follow skill instructions carefully — they encode validated experience.\n\
+             If a skill's approach fails, fall back to general methods and update the skill."
                 .to_owned(),
         );
     }
