@@ -333,13 +333,14 @@ pub(crate) fn build_tool_list(
             3. `click` ref=@e1 / `fill` ref=@e2 text='...' — interact using refs from snapshot\n\
             4. Re-snapshot after any page change to get updated refs\n\
             Quick search: `search` — auto-find search box on ANY site, fill text, submit, return results. Use this for site-specific searches (Douyin, Taobao, JD, etc.).\n\
+            `clickAt` ref=@e1 or x=100 y=200 — real mouse click via CDP (for file dialogs, anti-bot sites).\n\
             Other actions: type, select, check, scroll, screenshot, pdf, press, back, forward, reload, wait, evaluate, cookies, get_text, get_url, get_title, find, get_article, upload, new_tab, switch_tab, close_tab.\n\
             IMPORTANT: Always snapshot BEFORE clicking/filling. Element refs change after page updates.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "action":     {"type": "string", "enum": [
-                    "open", "navigate", "snapshot", "click", "fill", "type",
+                    "open", "navigate", "snapshot", "click", "clickAt", "fill", "type",
                     "select", "check", "uncheck", "scroll", "screenshot", "pdf",
                     "back", "forward", "reload", "get_text", "get_url", "get_title",
                     "wait", "evaluate", "cookies", "press", "set_viewport",
@@ -350,6 +351,8 @@ pub(crate) fn build_tool_list(
                 ]},
                 "url":        {"type": "string", "description": "URL for open/navigate"},
                 "ref":        {"type": "string", "description": "Element ref like @e3 from snapshot"},
+                "x":          {"type": "number", "description": "X pixel coordinate for clickAt"},
+                "y":          {"type": "number", "description": "Y pixel coordinate for clickAt"},
                 "text":       {"type": "string", "description": "Text for fill/type/click-by-text/clipboard/dialog"},
                 "value":      {"type": "string", "description": "Value for select, or sub-action for cookies/state/dialog/network/clipboard/context/emulate/diff/record"},
                 "key":        {"type": "string", "description": "Key name for press (Enter, Tab, Escape, etc.)"},

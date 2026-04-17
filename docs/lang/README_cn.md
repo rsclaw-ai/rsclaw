@@ -1,6 +1,6 @@
 # RsClaw
 
-**支持 OpenClaw 一键迁移的 AI 自动化管家，自带长期记忆，永不健忘。**
+**AI 自动化管家 — 单文件，13 消息通道，15 LLM 提供商，原生长期记忆，自我进化，A2A 跨机编排，分布式 Agent 调度，浏览器自动化，纯 Rust 构建。**
 
 [![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
@@ -8,7 +8,7 @@
 
 **中文** | [English](../../README.md) | [日本語](README_ja.md) | [한국어](README_ko.md) | [ไทย](README_th.md) | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | [Русский](README_ru.md)
 
-螃蟹 AI（RsClaw）是基于 Rust 从零重构的 AI 自动化管家，拥有原生长期记忆与自我进化能力，全平台桌面版一键安装，开箱即用。支持 OpenClaw 一键迁移，原有配置无缝切换。
+螃蟹 AI（RsClaw）是你的个人 AI 自动化管家。15MB 单文件原生可执行程序，连接 13 种消息通道与 AI 智能体 — 处理任务、浏览网页、全天候管理对话。永不遗忘上下文，越用越智能，跨机器协调分布式 Agent。支持 OpenClaw 一键迁移，零 Node.js 依赖。
 
 <p align="center">
   <img src="../images/cn.gif" alt="RsClaw 预览" width="800" />
@@ -323,7 +323,7 @@ sudo xattr -rd com.apple.quarantine /Applications/RsClaw.app
 git clone https://github.com/rsclaw-ai/rsclaw.git
 cd rsclaw
 cargo build --release
-# 二进制文件位于 ./target/release/rsclaw（~12MB）
+# 二进制文件位于 ./target/release/rsclaw
 ```
 
 ### 本地交叉编译

@@ -206,6 +206,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let mcp_registry = Arc::new(crate::mcp::McpRegistry::new());
     spawn_mcp_servers(&config, Arc::clone(&mcp_registry)).await;
 
+    // Clone memory before passing to agent tasks so heartbeat can also use it.
+    let heartbeat_memory = memory.clone();
+
     spawn_agent_tasks(
         receivers,
         Arc::clone(&registry),
@@ -321,6 +324,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         let runner = std::sync::Arc::new(crate::heartbeat::HeartbeatRunner::new(
             Arc::clone(&registry),
             &data_dir,
+            heartbeat_memory,
         ));
         runner.run();
         info!("heartbeat runner started");

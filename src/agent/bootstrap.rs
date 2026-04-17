@@ -97,6 +97,127 @@ const ZH_USER: &str = "\
 ";
 
 // ---------------------------------------------------------------------------
+// Heartbeat defaults (shared between zh/en — frontmatter is language-neutral)
+// ---------------------------------------------------------------------------
+
+const HEARTBEAT_DEFAULT: &str = "\
+---
+every: 30m
+active_hours: 09:00-22:00
+timezone: Asia/Shanghai
+---
+
+# Heartbeat Checklist
+
+- Check pending tasks and report progress
+- Review recent alerts or anomalies
+- If nothing to report, reply HEARTBEAT_OK
+";
+
+const HEARTBEAT_MEDITATE: &str = "\
+---
+every: 6h
+type: meditate
+active_hours: 02:00-06:00
+timezone: Asia/Shanghai
+---
+
+Memory maintenance: deduplicate near-identical memories, clean up crystallized sources.
+";
+
+// ---------------------------------------------------------------------------
+// Platform rule seed files (site-rules/)
+// ---------------------------------------------------------------------------
+
+const SITE_DOUYIN: &str = "\
+---
+domain: creator.douyin.com
+aliases: [douyin, tiktok-cn]
+updated: 2026-04-17
+---
+## Platform
+- Creator backend: https://creator.douyin.com/creator-micro/content/upload
+- Video publish: upload redirects to publish page (v1 or v2 route)
+- Note publish: image upload -> separate publish page
+
+## Effective Patterns
+- Title: contenteditable div, max 30 chars
+- Description: `.zone-container[contenteditable=\"true\"]`
+- Publish button: `button:has-text(\"publish\")` or `button:has-text(\"send\")`
+- Scheduled publish: radio button for scheduled, then date picker
+- Tags: input with # prefix, press space after each tag
+
+## Known Issues
+- Anti-bot: strict detection, prefer GUI interaction over URL construction
+- Two different publish page versions (v1/v2) with different layouts
+- Video cover auto-selection may be required before publish enabled
+- QR login: scan in Douyin app, cookies persist across sessions
+";
+
+const SITE_KUAISHOU: &str = "\
+---
+domain: cp.kuaishou.com
+aliases: [kuaishou, kwai]
+updated: 2026-04-17
+---
+## Platform
+- Creator backend: https://cp.kuaishou.com/article/publish/video
+- Uses Ant Design UI components
+
+## Effective Patterns
+- Date picker: `.ant-picker-input` for scheduled publish
+- Time format: YYYY-MM-DD HH:MM:SS (with seconds)
+- Publish flow: upload -> fill form -> publish
+
+## Known Issues
+- Tutorial overlay (Joyride) blocks interaction on first visit, must dismiss
+- Guide overlay: `div[id^=\"react-joyride-step\"]` -> find skip/close button
+";
+
+const SITE_XIAOHONGSHU: &str = "\
+---
+domain: creator.xiaohongshu.com
+aliases: [xiaohongshu, xhs, little-red-book]
+updated: 2026-04-17
+---
+## Platform
+- Video: https://creator.xiaohongshu.com/publish/publish?target=video
+- Note/images: ?target=image (up to 30 images per note)
+- Success page: URL matches **/publish/success?**
+
+## Effective Patterns
+- Upload then fill title, description, tags
+- Success detection: wait for redirect to success URL
+
+## Known Issues
+- Very strict anti-crawl, always use web_browser (not web_fetch)
+- xsec_token mechanism in URLs, do not manually construct URLs
+- QR login: switch to QR panel first (click switch image element)
+";
+
+const SITE_BILIBILI: &str = "\
+---
+domain: www.bilibili.com
+aliases: [bilibili, b-site]
+updated: 2026-04-17
+---
+## Platform
+- Video upload via biliup CLI tool (Rust binary, not browser)
+- Install: `rsclaw tools install biliup` or download from GitHub
+
+## Effective Patterns
+- Login: `biliup login` (interactive QR code in terminal)
+- Upload: `biliup upload <file> --title <t> --desc <d> --tid <category> --tags t1,t2`
+- Category ID (tid) is required: e.g. 249 for lifestyle
+- Credential refresh: `biliup renew`
+
+## Known Issues
+- Browser automation not recommended (complex anti-bot)
+- biliup binary auto-downloads for current platform
+- Cookie files stored at cookies/bilibili_<account>.json
+";
+
+// ---------------------------------------------------------------------------
 // Seeding logic
 // ---------------------------------------------------------------------------
 
@@ -127,6 +248,8 @@ pub fn seed_workspace_with_lang(workspace: &Path, lang: Option<&str>) -> Result<
             ("IDENTITY.md", ZH_IDENTITY),
             ("AGENTS.md", ZH_AGENTS),
             ("USER.md", ZH_USER),
+            ("HEARTBEAT.md", HEARTBEAT_DEFAULT),
+            ("HEARTBEAT-meditate.md", HEARTBEAT_MEDITATE),
         ]
     } else {
         &[
@@ -134,6 +257,8 @@ pub fn seed_workspace_with_lang(workspace: &Path, lang: Option<&str>) -> Result<
             ("IDENTITY.md", EN_IDENTITY),
             ("AGENTS.md", EN_AGENTS),
             ("USER.md", EN_USER),
+            ("HEARTBEAT.md", HEARTBEAT_DEFAULT),
+            ("HEARTBEAT-meditate.md", HEARTBEAT_MEDITATE),
         ]
     };
 
@@ -143,6 +268,24 @@ pub fn seed_workspace_with_lang(workspace: &Path, lang: Option<&str>) -> Result<
         if !path.exists() {
             std::fs::write(&path, content)?;
             info!(file = %path.display(), "seeded workspace file");
+            created += 1;
+        }
+    }
+
+    // Seed site-rules (platform experience for organic evolution).
+    let rules_dir = workspace.join("site-rules");
+    let site_rules: &[(&str, &str)] = &[
+        ("douyin.md", SITE_DOUYIN),
+        ("kuaishou.md", SITE_KUAISHOU),
+        ("xiaohongshu.md", SITE_XIAOHONGSHU),
+        ("bilibili.md", SITE_BILIBILI),
+    ];
+    std::fs::create_dir_all(&rules_dir)?;
+    for (name, content) in site_rules {
+        let path = rules_dir.join(name);
+        if !path.exists() {
+            std::fs::write(&path, content)?;
+            info!(file = %path.display(), "seeded site rule");
             created += 1;
         }
     }
@@ -161,44 +304,79 @@ pub fn tool_prompts_for_system(base_dir: &Path, _lang: Option<&str>) -> String {
 
     let mut parts = Vec::new();
 
-    // web_browser: inline the essential rules (small models won't read external files).
+    // Web browsing strategy: goal-driven philosophy + tool selection + operations.
     parts.push(
-        "# web_browser usage rules\n\
-         ## Core flow (MUST follow)\n\
-         1. `open` URL -> 2. `snapshot` to get refs (@e1, @e2...) -> 3. `click`/`fill` using refs -> 4. re-snapshot after changes\n\
+        "# Web Browsing Strategy\n\
+         \n\
+         ## Philosophy: Goal-Driven, Not Step-Driven\n\
+         1. Define success: what counts as done?\n\
+         2. Choose starting point: most likely direct path to goal.\n\
+         3. Verify progress: each result is evidence. Not progressing? Change direction.\n\
+         4. Complete: stop when criteria met. Don't over-operate.\n\
+         \n\
+         ## Tool Selection\n\
+         | Need | Tool |\n\
+         |------|------|\n\
+         | Search/discover info | web_search |\n\
+         | Read known URL (static) | web_fetch |\n\
+         | Login required, interactive, anti-crawl | web_browser |\n\
+         | Form submission, file upload, dynamic pages | web_browser |\n\
+         \n\
+         ## web_browser Core Flow\n\
+         1. `open` URL -> 2. `snapshot` (get refs @e1...) -> 3. interact via refs -> 4. re-snapshot\n\
          - ALWAYS snapshot BEFORE interacting. Refs expire after page changes.\n\
-         - Use `ref` to click/fill, NOT `text` (ref is more reliable).\n\
-         ## Login handling\n\
-         - Look for QR code login first. Screenshot the QR and send to user via send_file.\n\
-         - Wait for user to scan (use `wait` or re-snapshot after delay).\n\
-         - Only try password/SMS login if no QR option exists.\n\
-         ## Form input\n\
-         - contenteditable: click to focus -> press Meta+a -> press Backspace -> fill/type content\n\
+         - Use `ref` for click/fill (more reliable than text selectors).\n\
+         \n\
+         ## Actions\n\
+         - click: JS el.click(). Fast, works for most buttons/links.\n\
+         - clickAt: Real mouse event via CDP. Use for: file dialogs, anti-bot sites, elements that ignore JS click.\n\
+         - fill: Type text into input fields. contenteditable: click focus -> press Meta+a -> Backspace -> fill.\n\
+         - press: Keyboard events. Enter to submit, Tab to navigate between fields.\n\
+         - upload: Set files on <input type=file>. Find [upload-zone] ref in snapshot. If hidden, click 'upload' button first.\n\
+         - evaluate: Run arbitrary JS for DOM operations, data extraction, complex interactions.\n\
+         - search: Auto-detect search box on any site, fill query, submit.\n\
+         - screenshot: Capture visible page or specific element as image.\n\
+         - network sniff: Discover all media resources (images/videos/audio) on the page. Filter by type: {\"action\":\"network\",\"value\":\"sniff\",\"text\":\"image\"}. Use 'all' for everything.\n\
+         \n\
+         ## Login Handling\n\
+         - In headed mode, user's Chrome carries existing login sessions for most sites.\n\
+         - Try to access content first. Only report login needed if content is truly inaccessible.\n\
+         - QR code login: screenshot the QR -> send_file to user -> wait for confirmation -> refresh.\n\
+         - SMS/password login: only if no QR option exists.\n\
+         \n\
+         ## Form Input & Submission\n\
+         - Regular input: fill with ref.\n\
+         - contenteditable / rich-editor: click to focus -> press Meta+a -> Backspace -> fill/type content.\n\
          - Submit: prefer press Enter. If Enter doesn't work, click the submit button ref.\n\
-         - After submit: `wait` at least 15s for page to update before snapshot.\n\
-         ## Extracting results\n\
-         - After generation completes: extract URL via `evaluate` -> `web_download` -> `send_file` to user.\n\
-         - Do NOT just reply 'done' — always deliver the actual file/image to the user.\n\
-         ## Upload (images/videos)\n\
-         - Find the [upload-zone] or [upload[file]] ref in snapshot.\n\
-         - Use `upload` action with files parameter: {\"action\":\"upload\",\"ref\":\"@eN\",\"files\":[\"/path/to/file\"]}\n\
-         - If no upload ref visible, look for a button with text like 'upload/上传' and click it first to reveal the file input.\n\
-         - After upload, wait for processing (re-snapshot to check progress/completion).\n\
-         ## Rich text / Chat input\n\
-         - [rich-editor] or [chat-input]: click to focus -> type or fill content.\n\
-         - For chat (Open WebUI etc.): fill the [chat-input], then press Enter to send.\n\
-         - For rich editors (Douyin/WeChat/XHS backend): click [rich-editor] -> type content. Use press Enter for newlines if needed.\n\
-         ## Multi-step flows (publish, export, import)\n\
-         - After clicking a button, ALWAYS re-snapshot to see the next step (dialog, confirmation, loading).\n\
-         - Look for 'next/下一步', 'confirm/确认', 'publish/发布', 'submit/提交' buttons.\n\
-         - After final submit, wait 10-20s then re-snapshot to verify success.\n\
-         - For export: find 'export/导出/下载' button, click, wait for download or download link.\n\
-         - For import: find 'import/导入' button, click, then use upload for the file.\n\
+         - After submit: wait 15s+ then re-snapshot to verify.\n\
+         \n\
+         ## Upload & Publish Flows\n\
+         - Find [upload-zone] or [upload[file]] ref -> upload action with files parameter.\n\
+         - If no upload ref visible, click 'upload' button first to reveal file input.\n\
+         - Multi-step: after each click, re-snapshot to see next step (dialog, confirmation, loading).\n\
+         - Look for next/confirm/publish/submit buttons.\n\
+         - Final submit: wait 10-20s, re-snapshot to verify success.\n\
+         \n\
+         ## Extracting Results\n\
+         - Extract URLs via `evaluate` -> `web_download` -> `send_file` to user.\n\
+         - Do NOT just reply 'done' — always deliver the actual file/image.\n\
+         - Images: filter by naturalWidth > 200 to skip UI icons.\n\
+         \n\
+         ## Anti-Detection\n\
+         - Prefer GUI interaction (click/fill) over URL construction on strict platforms.\n\
+         - Links from page interaction are reliable; manually built URLs may lack required params.\n\
+         - Platform error messages ('not found') may be access issues, not real errors.\n\
+         - Short-time bulk operations (rapid tab opens) may trigger anti-crawl.\n\
+         \n\
+         ## Site Experience\n\
+         When operating on a known site, check workspace/site-rules/ for existing rules and recall memories.\n\
+         After successful operations, store the experience as memory or update site-rules for future use.\n\
+         \n\
          ## Do NOT\n\
-         - Skip `open` and operate directly.\n\
+         - Skip `open` and operate on about:blank.\n\
          - Use expired refs (re-snapshot after any page change).\n\
-         - Operate on about:blank.\n\
-         - Fabricate URLs or file paths."
+         - Fabricate URLs or file paths.\n\
+         - Retry the same failing approach — change direction."
             .to_owned()
     );
 
@@ -338,11 +516,40 @@ const EN_TOOL_WEB_BROWSER: &str = r#"# web_browser Usage Guide
 
 const EN_TOOL_EXEC: &str = r#"# exec Usage Guide
 
-- Only execute commands when the user explicitly asks
-- Detect OS first (macOS/Linux/Windows) before running platform-specific commands
-- If a command fails, do NOT retry the same command — try a different approach or inform the user
-- Windows: use PowerShell. macOS/Linux: use bash
-- Never run dangerous commands (rm -rf, format, disable firewall, etc.)
+## Tool Mastery — Choose the Right Tool
+| Task | Best Tool |
+|------|-----------|
+| File/text ops, pipes, system info | bash/zsh (macOS/Linux) or PowerShell (Windows) |
+| Data processing (CSV/JSON/API) | Python (`python3 -c "..."` or write script) |
+| Web API, quick HTTP, scraping | Node.js (`node -e "..."`) or Python |
+| Package install | pip/npm, or `install_tool` for system tools |
+| Multi-line complex logic | Write to file first, then execute |
+
+## Execution Tips
+- Check if a tool is installed before using (`which python3`, `which node`)
+- Use `install_tool` for system tools (python, node, ffmpeg, chrome)
+- Use pip/npm for language-specific packages
+- Use `| head -n 20` or `| tail -n 20` to limit large output
+- Long tasks: use wait=false (background). Short tasks needing output: wait=true
+- If a command fails, do NOT retry same args — try a different approach
+- Never run dangerous commands (rm -rf /, format, disable firewall)
+
+## Python Quick Patterns
+- One-liner: `python3 -c "import json; print(json.dumps({'key':'val'}))"`
+- Script: write to /tmp/script.py, then `python3 /tmp/script.py`
+- Packages: `pip install pandas requests` then use
+
+## Node.js Quick Patterns
+- One-liner: `node -e "console.log(JSON.stringify({key:'val'}))"`
+- fetch (Node 18+): `node -e "fetch('https://api.example.com').then(r=>r.json()).then(console.log)"`
+- Packages: `npm install -g <pkg>` or `npx <pkg>`
+
+## Shell Quick Patterns
+- Find files: `find . -name "*.py" -mtime -7`
+- Text processing: `grep -r "pattern" . | head -20`
+- JSON: `cat file.json | python3 -m json.tool`
+- Network: `curl -s https://api.example.com | python3 -m json.tool`
+- Process: `ps aux | grep <name>`, `kill <pid>`
 "#;
 
 // -- web_search / web_fetch prompts -----------------------------------------

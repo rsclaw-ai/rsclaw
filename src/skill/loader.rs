@@ -52,8 +52,8 @@ impl SkillRegistry {
         self.skills.is_empty()
     }
 
-    /// Insert or overwrite a skill entry (used by loader).
-    fn insert(&mut self, manifest: SkillManifest) {
+    /// Insert or overwrite a skill entry.
+    pub fn insert(&mut self, manifest: SkillManifest) {
         self.skills.insert(manifest.name.clone(), manifest);
     }
 }

@@ -147,6 +147,7 @@ impl MemorySlot for MemoryStoreSlot {
                 tier: Default::default(),
                 abstract_text: None,
                 overview_text: None,
+                tags: vec![],
             };
             self.inner.lock().await.add(doc).await?;
             Ok(id)

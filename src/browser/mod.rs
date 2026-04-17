@@ -283,19 +283,7 @@ impl ChromeProcess {
 
     /// Extract the debugging port from the ws URL.
     pub(crate) fn port(&self) -> Result<u16> {
-        // ws://127.0.0.1:PORT/devtools/browser/...
-        let url = &self.ws_url;
-        let after_host = url
-            .find("127.0.0.1:")
-            .map(|i| i + "127.0.0.1:".len())
-            .ok_or_else(|| anyhow!("cannot parse port from ws URL: {url}"))?;
-        let end = url[after_host..]
-            .find('/')
-            .unwrap_or(url.len() - after_host);
-        let port_str = &url[after_host..after_host + end];
-        port_str
-            .parse::<u16>()
-            .map_err(|e| anyhow!("invalid port in ws URL: {e}"))
+        parse_port_from_ws_url(&self.ws_url)
     }
 }
 
@@ -342,6 +330,50 @@ impl Drop for ChromeProcess {
         ACTIVE_INSTANCES.fetch_sub(1, Ordering::Relaxed);
         debug!("Chrome instance dropped, active={}", ACTIVE_INSTANCES.load(Ordering::Relaxed));
     }
+}
+
+/// Parse the port number from a Chrome DevTools WebSocket URL.
+/// Expects format: `ws://127.0.0.1:PORT/devtools/...`
+fn parse_port_from_ws_url(url: &str) -> Result<u16> {
+    let after_host = url
+        .find("127.0.0.1:")
+        .map(|i| i + "127.0.0.1:".len())
+        .ok_or_else(|| anyhow!("cannot parse port from ws URL: {url}"))?;
+    let end = url[after_host..]
+        .find('/')
+        .unwrap_or(url.len() - after_host);
+    let port_str = &url[after_host..after_host + end];
+    port_str
+        .parse::<u16>()
+        .map_err(|e| anyhow!("invalid port in ws URL: {e}"))
+}
+
+/// Try to connect to an already-running Chrome with remote debugging.
+/// Probes the given ports and returns the browser WebSocket URL if found.
+pub(crate) async fn detect_existing_chrome(ports: &[u16]) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .ok()?;
+
+    for &port in ports {
+        let url = format!("http://127.0.0.1:{port}/json/version");
+        debug!(port, "probing for existing Chrome remote debugging");
+        match client.get(&url).send().await {
+            Ok(resp) => {
+                if let Ok(body) = resp.json::<Value>().await {
+                    if let Some(ws_url) = body.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) {
+                        debug!(port, ws_url, "found existing Chrome with remote debugging");
+                        return Some(ws_url.to_owned());
+                    }
+                }
+            }
+            Err(e) => {
+                debug!(port, error = %e, "no Chrome remote debugging on this port");
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -485,8 +517,11 @@ impl CdpClient {
 
 /// A live browser session backed by a headless Chrome process and CDP.
 pub struct BrowserSession {
-    /// Chrome process handle (killed on drop).
-    chrome: ChromeProcess,
+    /// Chrome process handle (killed on drop). None when connected to external Chrome.
+    chrome: Option<ChromeProcess>,
+    /// Remote debugging port extracted from the browser WS URL.
+    /// Used for CDP discovery when `chrome` is None (external Chrome).
+    debug_port: u16,
     cdp: CdpClient,
     /// @eN -> data-ref string mapping (kept in sync with snapshot).
     refs: HashMap<String, String>,
@@ -516,7 +551,8 @@ impl BrowserSession {
     /// Launch Chrome, discover the default page target, and connect CDP.
     pub async fn start(chrome_path: &str, headed: bool, profile: Option<&str>) -> Result<Self> {
         let chrome = ChromeProcess::launch(chrome_path, headed, profile).await?;
-        let cdp = Self::connect_cdp(&chrome).await?;
+        let port = chrome.port()?;
+        let cdp = Self::connect_cdp_by_port(port).await?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -524,7 +560,8 @@ impl BrowserSession {
             .as_secs();
 
         Ok(Self {
-            chrome,
+            chrome: Some(chrome),
+            debug_port: port,
             cdp,
             refs: HashMap::new(),
             ref_counter: 0,
@@ -540,10 +577,63 @@ impl BrowserSession {
         })
     }
 
-    /// Connect CDP to a Chrome process's page target.
-    /// Retries discovery up to 10 times (headed mode can be slow to initialize).
-    async fn connect_cdp(chrome: &ChromeProcess) -> Result<CdpClient> {
-        let port = chrome.port()?;
+    /// Connect to an existing Chrome instance (user's daily browser).
+    /// Does NOT launch or own a Chrome process -- will not kill it on drop.
+    pub(crate) async fn connect_existing(browser_ws_url: &str) -> Result<Self> {
+        // Extract port from browser WS URL (ws://127.0.0.1:PORT/devtools/browser/...)
+        let port = parse_port_from_ws_url(browser_ws_url)?;
+
+        // Connect browser-level CDP to create a new tab.
+        let browser_cdp = CdpClient::connect(browser_ws_url).await?;
+        let result = browser_cdp.send("Target.createTarget", json!({"url": "about:blank"})).await?;
+        let target_id = result.get("targetId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("Target.createTarget did not return targetId"))?;
+        debug!(target_id, "created new tab in external Chrome");
+
+        // Discover the new tab's webSocketDebuggerUrl from /json endpoint.
+        let discovery_url = format!("http://127.0.0.1:{port}/json");
+        let targets: Vec<Value> = reqwest::get(&discovery_url).await?.json().await?;
+        let tab_ws_url = targets.iter()
+            .find(|t| t["id"].as_str() == Some(target_id))
+            .and_then(|t| t["webSocketDebuggerUrl"].as_str())
+            .ok_or_else(|| anyhow!("new tab {} not found in /json target list", target_id))?
+            .to_owned();
+
+        // Connect CDP to the tab.
+        let cdp = CdpClient::connect(&tab_ws_url).await?;
+        cdp.send("Page.enable", json!({})).await?;
+        cdp.send("DOM.enable", json!({})).await?;
+        cdp.send("Runtime.enable", json!({})).await?;
+        cdp.send("Network.enable", json!({})).await?;
+        cdp.send("Target.setDiscoverTargets", json!({"discover": true})).await?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        Ok(Self {
+            chrome: None,
+            debug_port: port,
+            cdp,
+            refs: HashMap::new(),
+            ref_counter: 0,
+            chrome_path: String::new(),
+            headed: true,
+            profile: None,
+            pending_dialog: None,
+            blocked_urls: Vec::new(),
+            intercept_rules: Vec::new(),
+            last_activity: Arc::new(AtomicU64::new(now)),
+            before_screenshot: None,
+            recording: None,
+        })
+    }
+
+    /// Connect CDP to a Chrome process's page target by port.
+    /// Retries discovery up to 20 times (headed mode can be slow to initialize).
+    async fn connect_cdp_by_port(port: u16) -> Result<CdpClient> {
         let discovery_url = format!("http://127.0.0.1:{port}/json");
 
         let mut page_target: Option<Value> = None;
@@ -567,7 +657,7 @@ impl BrowserSession {
             }
         }
         let page_target = page_target
-            .ok_or_else(|| anyhow!("no page target found in CDP target list after 10 attempts"))?;
+            .ok_or_else(|| anyhow!("no page target found in CDP target list after 20 attempts"))?;
 
         let page_ws_url = page_target["webSocketDebuggerUrl"]
             .as_str()
@@ -586,8 +676,12 @@ impl BrowserSession {
     }
 
     /// Check if Chrome is still alive. Returns false if the process exited.
+    /// For external Chrome (chrome is None), always returns true (we do not own it).
     pub fn is_alive(&mut self) -> bool {
-        matches!(self.chrome.child.try_wait(), Ok(None))
+        match self.chrome {
+            Some(ref mut chrome) => matches!(chrome.child.try_wait(), Ok(None)),
+            None => true,
+        }
     }
 
     /// Check idle timeout: returns true if session has been idle too long.
@@ -601,13 +695,61 @@ impl BrowserSession {
     }
 
     /// Restart the Chrome process (e.g. after crash or idle expiry).
+    /// For external Chrome (chrome is None), only reconnects CDP.
     async fn restart(&mut self) -> Result<()> {
         warn!("restarting Chrome browser session");
-        // Drop old chrome (kills process via Drop)
-        let new_chrome = ChromeProcess::launch(&self.chrome_path, self.headed, self.profile.as_deref()).await?;
-        let new_cdp = Self::connect_cdp(&new_chrome).await?;
-        self.chrome = new_chrome;
-        self.cdp = new_cdp;
+        if self.chrome.is_some() {
+            // Drop old chrome (kills process via Drop) and launch new one.
+            let new_chrome = ChromeProcess::launch(&self.chrome_path, self.headed, self.profile.as_deref()).await?;
+            let port = new_chrome.port()?;
+            let new_cdp = Self::connect_cdp_by_port(port).await?;
+            self.debug_port = port;
+            self.chrome = Some(new_chrome);
+            self.cdp = new_cdp;
+        } else {
+            // External Chrome: create a fresh tab (don't hijack user's existing tabs).
+            let browser_ws = format!(
+                "ws://127.0.0.1:{}/devtools/browser",
+                self.debug_port
+            );
+            // Try to get the full browser ws URL from /json/version.
+            let version_url = format!("http://127.0.0.1:{}/json/version", self.debug_port);
+            let browser_ws_url = match reqwest::Client::new()
+                .get(&version_url)
+                .timeout(Duration::from_secs(3))
+                .send()
+                .await
+            {
+                Ok(resp) => resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| v["webSocketDebuggerUrl"].as_str().map(String::from))
+                    .unwrap_or(browser_ws),
+                Err(_) => browser_ws,
+            };
+            let browser_cdp = CdpClient::connect(&browser_ws_url).await?;
+            let create = browser_cdp.send("Target.createTarget", json!({"url": "about:blank"})).await?;
+            let target_id = create["targetId"]
+                .as_str()
+                .ok_or_else(|| anyhow!("restart: no targetId from Target.createTarget"))?;
+            // browser_cdp intentionally dropped here — we only needed it for Target.createTarget.
+            drop(browser_cdp);
+
+            let discovery = format!("http://127.0.0.1:{}/json", self.debug_port);
+            let targets: Vec<serde_json::Value> = reqwest::get(&discovery).await?.json().await?;
+            let tab_ws = targets
+                .iter()
+                .find(|t| t["id"].as_str() == Some(target_id))
+                .and_then(|t| t["webSocketDebuggerUrl"].as_str())
+                .ok_or_else(|| anyhow!("restart: new tab ws URL not found"))?;
+            let new_cdp = CdpClient::connect(tab_ws).await?;
+            new_cdp.send("Page.enable", json!({})).await?;
+            new_cdp.send("DOM.enable", json!({})).await?;
+            new_cdp.send("Runtime.enable", json!({})).await?;
+            new_cdp.send("Network.enable", json!({})).await?;
+            self.cdp = new_cdp;
+        }
         self.refs.clear();
         self.ref_counter = 0;
         Ok(())
@@ -693,6 +835,7 @@ impl BrowserSession {
             "open" | "navigate" => self.cmd_open(args).await,
             "snapshot" => self.cmd_snapshot().await,
             "click" => self.cmd_click(args).await,
+            "clickAt" | "click_at" => self.cmd_click_at(args).await,
             "fill" | "type" => self.cmd_fill(args).await,
             "select" => self.cmd_select(args).await,
             "check" => self.cmd_check(args, true).await,
@@ -903,6 +1046,94 @@ impl BrowserSession {
         }
 
         Ok(json!({ "action": "click", "ref": eref, "text": format!("Clicked {}", eref.or(text_sel).unwrap_or("element")) }))
+    }
+
+    /// Dispatch a real mouse click via CDP `Input.dispatchMouseEvent`.
+    ///
+    /// Accepts either a `ref` (element reference from snapshot, e.g. "@e5")
+    /// or explicit `x`/`y` pixel coordinates. When a ref is provided the
+    /// element's bounding rect is queried and its center is used.
+    ///
+    /// Three low-level mouse events are sent with small delays to mimic a
+    /// genuine user click: mouseMoved, mousePressed, mouseReleased.
+    async fn cmd_click_at(&self, args: &Value) -> Result<Value> {
+        let eref = args.get("ref").and_then(|v| v.as_str());
+        let explicit_x = args.get("x").and_then(|v| v.as_f64());
+        let explicit_y = args.get("y").and_then(|v| v.as_f64());
+
+        let (x, y) = if let Some(eref) = eref {
+            // Resolve element ref to center coordinates via getBoundingClientRect.
+            let js = format!(
+                r#"(function(){{
+                    {FIND_REF_JS}
+                    var el = findRef('{eref}');
+                    if (!el) return JSON.stringify({{"error": "NOT_FOUND"}});
+                    el.scrollIntoView({{block:'center'}});
+                    var r = el.getBoundingClientRect();
+                    return JSON.stringify({{
+                        "x": Math.round(r.left + r.width / 2),
+                        "y": Math.round(r.top + r.height / 2)
+                    }});
+                }})()"#,
+                FIND_REF_JS = FIND_REF_JS,
+                eref = escape_js_string(eref),
+            );
+
+            let result = self.cdp.send("Runtime.evaluate", json!({
+                "expression": js,
+                "returnByValue": true,
+            })).await?;
+            let raw = result
+                .get("result")
+                .and_then(|r| r.get("value"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("clickAt: failed to evaluate element position"))?;
+            let parsed: Value = serde_json::from_str(raw)
+                .map_err(|e| anyhow!("clickAt: failed to parse position JSON: {e}"))?;
+
+            if parsed.get("error").is_some() {
+                bail!("clickAt: element {eref} not found (run snapshot first)");
+            }
+
+            let cx = parsed.get("x").and_then(|v| v.as_f64())
+                .ok_or_else(|| anyhow!("clickAt: missing x in bounding rect result"))?;
+            let cy = parsed.get("y").and_then(|v| v.as_f64())
+                .ok_or_else(|| anyhow!("clickAt: missing y in bounding rect result"))?;
+            (cx, cy)
+        } else if let (Some(x), Some(y)) = (explicit_x, explicit_y) {
+            (x, y)
+        } else {
+            bail!("clickAt: `ref` or both `x` and `y` required");
+        };
+
+        // Dispatch three CDP mouse events with small delays to mimic a real click.
+        self.cdp.send("Input.dispatchMouseEvent", json!({
+            "type": "mouseMoved",
+            "x": x,
+            "y": y,
+        })).await?;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        self.cdp.send("Input.dispatchMouseEvent", json!({
+            "type": "mousePressed",
+            "x": x,
+            "y": y,
+            "button": "left",
+            "clickCount": 1,
+        })).await?;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        self.cdp.send("Input.dispatchMouseEvent", json!({
+            "type": "mouseReleased",
+            "x": x,
+            "y": y,
+            "button": "left",
+            "clickCount": 1,
+        })).await?;
+
+        Ok(json!({"action": "clickAt", "x": x, "y": y}))
     }
 
     async fn cmd_fill(&self, args: &Value) -> Result<Value> {
@@ -1439,7 +1670,7 @@ impl BrowserSession {
     }
 
     async fn cmd_list_tabs(&self) -> Result<Value> {
-        let port = self.chrome.port()?;
+        let port = self.debug_port;
         let url = format!("http://127.0.0.1:{port}/json");
         let targets: Vec<Value> = reqwest::get(&url).await?.json().await?;
         let tabs: Vec<Value> = targets.iter()
@@ -1459,7 +1690,7 @@ impl BrowserSession {
 
         self.cdp.send("Target.activateTarget", json!({"targetId": target_id})).await?;
 
-        let port = self.chrome.port()?;
+        let port = self.debug_port;
         let url = format!("http://127.0.0.1:{port}/json");
         let targets: Vec<Value> = reqwest::get(&url).await?.json().await?;
         let target = targets.iter()
@@ -1487,7 +1718,7 @@ impl BrowserSession {
 
         // Detect if this is the active tab by checking the current CDP ws_url.
         // If closing the active tab, switch to another tab first.
-        let port = self.chrome.port()?;
+        let port = self.debug_port;
         let url = format!("http://127.0.0.1:{port}/json");
         let targets: Vec<Value> = reqwest::get(&url).await?.json().await?;
         let is_active = targets.iter().any(|t| {
@@ -1627,7 +1858,55 @@ impl BrowserSession {
                 let _ = self.cdp.send("Fetch.disable", json!({})).await;
                 Ok(json!({"action": "network", "text": "All intercept rules cleared"}))
             }
-            _ => Err(anyhow!("network: unknown sub-action (use requests/block/unblock/intercept/clear_intercepts)"))
+            "sniff" | "resources" => {
+                // Discover all media resources on the page: images, videos, audio,
+                // fonts, and XHR/fetch URLs — combines DOM scanning with performance API.
+                let filter = args.get("text").and_then(|v| v.as_str()).unwrap_or("all");
+                let js = format!(r#"(function() {{
+  var r = {{}};
+  // DOM: images
+  document.querySelectorAll('img,picture source').forEach(function(el){{
+    var s = el.src || el.dataset.src || el.currentSrc || el.getAttribute('srcset') || '';
+    if(s && s.startsWith('http')) {{ r[s] = r[s] || {{type:'image',tag:el.tagName}}; }}
+  }});
+  // DOM: videos
+  document.querySelectorAll('video,video source').forEach(function(el){{
+    var s = el.src || el.dataset.src || el.getAttribute('src') || '';
+    if(s && s.startsWith('http')) {{ r[s] = r[s] || {{type:'video',tag:el.tagName}}; }}
+  }});
+  // DOM: audio
+  document.querySelectorAll('audio,audio source').forEach(function(el){{
+    var s = el.src || el.dataset.src || '';
+    if(s && s.startsWith('http')) {{ r[s] = r[s] || {{type:'audio',tag:el.tagName}}; }}
+  }});
+  // DOM: stylesheets and scripts
+  document.querySelectorAll('link[rel=stylesheet]').forEach(function(el){{
+    if(el.href) {{ r[el.href] = r[el.href] || {{type:'css'}}; }}
+  }});
+  // Performance API: XHR/fetch/other resources
+  performance.getEntriesByType('resource').forEach(function(e){{
+    if(!r[e.name]) {{
+      var t = e.initiatorType || 'other';
+      if(t==='xmlhttprequest'||t==='fetch') t='xhr';
+      r[e.name] = {{type:t,size:e.transferSize||0}};
+    }}
+  }});
+  // Filter
+  var filter = '{filter}';
+  var entries = Object.entries(r);
+  if(filter !== 'all') {{
+    entries = entries.filter(function(kv){{ return kv[1].type === filter; }});
+  }}
+  return JSON.stringify(entries.map(function(kv){{
+    return {{url:kv[0],type:kv[1].type,tag:kv[1].tag||'',size:kv[1].size||0}};
+  }}));
+}})()"#);
+                let result = self.eval_js(&js).await?;
+                let resources: Value = serde_json::from_str(&result).unwrap_or(json!([]));
+                let count = resources.as_array().map(|a| a.len()).unwrap_or(0);
+                Ok(json!({"action":"network","sub":"sniff","filter":filter,"count":count,"resources":resources}))
+            }
+            _ => Err(anyhow!("network: unknown sub-action (use requests/sniff/block/unblock/intercept/clear_intercepts)"))
         }
     }
 

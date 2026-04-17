@@ -1076,10 +1076,27 @@ impl AgentRuntime {
                     }
                 };
 
-                // Check memory before launching
-                crate::browser::can_launch_chrome()?;
-
-                let bs = crate::browser::BrowserSession::start(&chrome_path, headed, profile.as_deref()).await?;
+                let bs = if headed {
+                    // Try connecting to user's existing Chrome first.
+                    let default_ports: Vec<u16> = vec![9222, 9223];
+                    let ports = wb_cfg
+                        .and_then(|b| b.remote_debug_ports.as_ref())
+                        .unwrap_or(&default_ports);
+                    if let Some(ws_url) = crate::browser::detect_existing_chrome(ports).await {
+                        info!("connecting to user Chrome (remote debugging)");
+                        crate::browser::BrowserSession::connect_existing(&ws_url).await?
+                    } else {
+                        // No existing Chrome found, launch with visible window
+                        // using RsClaw's own profile (not user's default — that
+                        // would conflict with any running Chrome).
+                        crate::browser::can_launch_chrome()?;
+                        crate::browser::BrowserSession::start(&chrome_path, true, profile.as_deref()).await?
+                    }
+                } else {
+                    // Headless mode.
+                    crate::browser::can_launch_chrome()?;
+                    crate::browser::BrowserSession::start(&chrome_path, false, profile.as_deref()).await?
+                };
                 *guard = Some(bs);
             }
         }

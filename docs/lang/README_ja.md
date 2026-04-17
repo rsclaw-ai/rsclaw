@@ -1,6 +1,6 @@
 # RsClaw
 
-**AI Automation Manager with One-Click OpenClaw Migration & Native Long-Term Memory.**
+**Your AI Automation Butler — one binary, 13 channels, 15 LLM providers, native long-term memory, self-evolution, A2A cross-machine orchestration, distributed agent scheduling, browser automation, all in pure Rust.**
 
 [![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
