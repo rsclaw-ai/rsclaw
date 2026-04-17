@@ -33,14 +33,6 @@ fn validate_gateway(cfg: &RuntimeConfig) -> Result<()> {
             "gateway port < 1024 may require elevated privileges"
         );
     }
-    if cfg.gateway.auth_token_is_plaintext {
-        warn!(
-            "gateway.auth.token is set as a plaintext string in the config file. \
-             This is a security risk — use a SecretRef instead, e.g.: \
-             {{ source: \"env\", id: \"RSCLAW_AUTH_TOKEN\" }}. \
-             See agents.md §23 for details."
-        );
-    }
     Ok(())
 }
 
