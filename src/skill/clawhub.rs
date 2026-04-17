@@ -17,6 +17,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
+pub use crate::skill::registry::SearchResult;
+
 // ---------------------------------------------------------------------------
 // Lock file
 // ---------------------------------------------------------------------------
@@ -163,17 +165,6 @@ struct ClawhubOwnerData {
     handle: Option<String>,
 }
 
-/// Search result from clawhub.
-#[derive(Debug, Clone)]
-pub struct SearchResult {
-    pub slug: String,
-    pub version: Option<String>,
-    pub description: Option<String>,
-    pub downloads: Option<u64>,
-    pub installs: Option<u64>,
-    pub stars: Option<u64>,
-}
-
 /// Normalized skill metadata.
 #[derive(Debug, Clone)]
 pub struct SkillMeta {
@@ -192,6 +183,8 @@ pub struct ClawhubClient {
     client: Client,
     base_url: String,
     token: Option<String>,
+    /// Gateway language setting — "cn" variants use skillhub instead of clawhub.
+    language: Option<String>,
 }
 
 impl ClawhubClient {
@@ -204,7 +197,14 @@ impl ClawhubClient {
                 .expect("reqwest client"),
             base_url: CLAWHUB_API_BASE.to_owned(),
             token,
+            language: None,
         }
+    }
+
+    /// Set the gateway language so the client can pick the right registry set.
+    pub fn with_language(mut self, language: Option<String>) -> Self {
+        self.language = language;
+        self
     }
 
     /// Override the base URL (for testing).
@@ -213,7 +213,16 @@ impl ClawhubClient {
             client: Client::new(),
             base_url: base_url.into(),
             token: std::env::var("CLAWHUB_TOKEN").ok(),
+            language: None,
         }
+    }
+
+    /// Returns true if the gateway is configured for Chinese locale.
+    fn is_cn(&self) -> bool {
+        self.language.as_deref().map(|l| {
+            let l = l.to_lowercase();
+            l.starts_with("zh") || l.starts_with("cn") || l == "chinese"
+        }).unwrap_or(false)
     }
 
     /// Fetch skill metadata by slug.
@@ -254,50 +263,6 @@ impl ClawhubClient {
             author: raw.owner.and_then(|o| o.handle),
             download_url: format!("{}/v1/download?slug={}", self.base_url, raw.skill.slug),
         })
-    }
-
-    /// Search for skills on clawhub.
-    pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
-        let url = format!("{}/v1/search?q={}", self.base_url, query);
-        let mut req = self.client.get(&url);
-        if let Some(ref token) = self.token {
-            req = req.bearer_auth(token);
-        }
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("search clawhub for '{query}'"))?;
-        if !resp.status().is_success() {
-            anyhow::bail!("clawhub search returned {}", resp.status());
-        }
-        let body: serde_json::Value = resp.json().await.context("parse search response")?;
-        let results = body
-            .get("skills")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .map(|item| SearchResult {
-                        slug: item["slug"]
-                            .as_str()
-                            .unwrap_or("unknown")
-                            .to_owned(),
-                        version: item["version"].as_str().map(|s| s.to_owned()),
-                        description: item["summary"]
-                            .as_str()
-                            .or_else(|| item["description"].as_str())
-                            .map(|s| s.to_owned()),
-                        downloads: item["downloads"].as_u64()
-                            .or_else(|| item["download_count"].as_u64()),
-                        installs: item["installs"].as_u64()
-                            .or_else(|| item["install_count"].as_u64()),
-                        stars: item["stars"].as_u64()
-                            .or_else(|| item["favorites"].as_u64())
-                            .or_else(|| item["star_count"].as_u64()),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(results)
     }
 
     /// Download and install a skill into `install_dir`.
@@ -485,90 +450,35 @@ impl ClawhubClient {
         Ok(locked)
     }
 
-    /// Search with fallback: clawhub -> skillhub.
+    /// Search registries concurrently and merge results ranked by installs.
+    ///
+    /// CN locale: skills.sh + skillhub in parallel.
+    /// Other:     skills.sh + clawhub.ai in parallel.
     pub async fn search_with_fallback(&self, query: &str) -> Result<Vec<SearchResult>> {
-        // Try clawhub first
-        match self.search(query).await {
-            Ok(results) if !results.is_empty() => return Ok(results),
-            _ => {}
-        }
+        use crate::skill::registry::{Registry, search_concurrent};
 
-        // Fallback: skillhub search API
         let sh = skillhub_urls();
-        debug!(query, "searching skillhub");
-        let url = format!("{}?q={}", sh.search, urlencoding_encode(query));
-        let resp = self.client.get(&url).send().await;
-        if let Ok(resp) = resp
-            && resp.status().is_success()
-        {
-            if let Ok(body) = resp.json::<serde_json::Value>().await {
-                let results: Vec<SearchResult> = body
-                    .get("skills")
-                    .or_else(|| body.get("results"))
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .map(|item| SearchResult {
-                                slug: item["slug"]
-                                    .as_str()
-                                    .or_else(|| item["name"].as_str())
-                                    .unwrap_or("unknown")
-                                    .to_owned(),
-                                version: item["version"].as_str().map(|s| s.to_owned()),
-                                description: item["summary"]
-                                    .as_str()
-                                    .or_else(|| item["description"].as_str())
-                                    .map(|s| s.to_owned()),
-                                downloads: item["downloads"].as_u64()
-                                    .or_else(|| item["download_count"].as_u64()),
-                                installs: item["installs"].as_u64()
-                                    .or_else(|| item["install_count"].as_u64()),
-                                stars: item["stars"].as_u64()
-                                    .or_else(|| item["favorites"].as_u64())
-                                    .or_else(|| item["star_count"].as_u64()),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if !results.is_empty() {
-                    return Ok(results);
-                }
-            }
-        }
+        let registries: Vec<Registry> = if self.is_cn() {
+            vec![
+                Registry::Skillsh { client: self.client.clone() },
+                Registry::Skillhub {
+                    client: self.client.clone(),
+                    search_url: sh.search.clone(),
+                    index_url: sh.index.clone(),
+                },
+            ]
+        } else {
+            vec![
+                Registry::Skillsh { client: self.client.clone() },
+                Registry::Clawhub {
+                    client: self.client.clone(),
+                    api_base: self.base_url.clone(),
+                    token: self.token.clone(),
+                },
+            ]
+        };
 
-        // Last resort: try skillhub index (full skill list)
-        let resp = self.client.get(&sh.index).send().await;
-        if let Ok(resp) = resp
-            && resp.status().is_success()
-        {
-            if let Ok(body) = resp.json::<serde_json::Value>().await {
-                let query_lower = query.to_lowercase();
-                let results: Vec<SearchResult> = body
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter(|item| {
-                                let slug = item["slug"].as_str().or_else(|| item["name"].as_str()).unwrap_or("");
-                                let desc = item["summary"].as_str().or_else(|| item["description"].as_str()).unwrap_or("");
-                                slug.to_lowercase().contains(&query_lower) || desc.to_lowercase().contains(&query_lower)
-                            })
-                            .take(10)
-                            .map(|item| SearchResult {
-                                slug: item["slug"].as_str().or_else(|| item["name"].as_str()).unwrap_or("unknown").to_owned(),
-                                version: item["version"].as_str().map(|s| s.to_owned()),
-                                description: item["summary"].as_str().or_else(|| item["description"].as_str()).map(|s| s.to_owned()),
-                                downloads: item["downloads"].as_u64().or_else(|| item["download_count"].as_u64()),
-                                installs: item["installs"].as_u64().or_else(|| item["install_count"].as_u64()),
-                                stars: item["stars"].as_u64().or_else(|| item["favorites"].as_u64()),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                return Ok(results);
-            }
-        }
-
-        Ok(vec![])
+        Ok(search_concurrent(&registries, query).await)
     }
 }
 

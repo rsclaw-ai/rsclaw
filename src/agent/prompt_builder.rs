@@ -307,10 +307,31 @@ pub(crate) fn build_system_prompt(
              3. The skill auto-matches and injects on future relevant requests.\n\
              Proactively find and install skills you need — do NOT ask permission.\n\
              ### Creating Skills\n\
-             When you discover a reusable pattern through trial and error:\n\
-             1. Create workspace/skills/<slug>/SKILL.md with frontmatter (name, description, version).\n\
-             2. Body: trigger conditions + key execution steps (keep under 100 lines).\n\
-             3. Record in memory to avoid duplicates. Inform the user.\n\
+             When you discover a genuinely reusable pattern, create a skill following the\n\
+             Anthropic skill-creator standard (same format used by skills.sh):\n\
+             \n\
+             Directory layout:\n\
+               workspace/skills/<slug>/\n\
+                 SKILL.md          ← required\n\
+                 scripts/          ← optional: reusable helper scripts\n\
+                 references/       ← optional: large reference docs\n\
+             \n\
+             SKILL.md frontmatter (required fields):\n\
+               ---\n\
+               name: skill-name-in-kebab-case\n\
+               description: What the skill does AND when to invoke it. Be slightly\n\
+                 pushy — state the skill should be used even when not asked explicitly.\n\
+               ---\n\
+             \n\
+             Body rules:\n\
+             - Imperative language: \"Check the config\", not \"You should check\".\n\
+             - Explain WHY each step matters, not just what to do.\n\
+             - Include an Input/Output example where it helps.\n\
+             - Under 500 lines; reference scripts/ or references/ for heavy content.\n\
+             - Do NOT use ALL-CAPS MUST/NEVER; explain reasoning instead.\n\
+             \n\
+             After creating the skill: run `rsclaw skills list` to confirm it loaded.\n\
+             Record in memory to avoid duplicates. Inform the user.\n\
              Only create skills for genuinely reusable patterns, not one-off tasks.\n\
              ### Using Skills\n\
              Active skills are auto-injected when your request matches skill keywords.\n\

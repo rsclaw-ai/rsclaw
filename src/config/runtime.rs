@@ -52,6 +52,8 @@ pub struct GatewayRuntime {
     pub channel_max_restarts_per_hour: u32,
     /// Global default User-Agent for LLM provider requests. Provider-level overrides this.
     pub user_agent: Option<String>,
+    /// Default response language (e.g. "Chinese", "English"). Affects registry selection.
+    pub language: Option<String>,
 }
 
 /// Agent list, per-agent defaults, bindings.  Registry rebuild required on
@@ -182,6 +184,7 @@ impl IntoRuntime for Config {
                     .unwrap_or(30),
                 channel_max_restarts_per_hour: gw.channel_max_restarts_per_hour.unwrap_or(10),
                 user_agent: gw.user_agent.clone(),
+                language: gw.language.clone(),
             },
             agents: AgentsRuntime {
                 defaults: agents_cfg.defaults.unwrap_or_default(),

@@ -7,6 +7,7 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
     let config = config::load_quiet()?;
     let global_dir = skill::default_global_skills_dir().unwrap_or_default();
     let registry = skill::load_skills(&global_dir, None, config.ext.skills.as_ref())?;
+    let language = config.gateway.language.clone();
     match sub {
         SkillsCommand::List => {
             let mut skills: Vec<_> = registry.all().collect();
@@ -74,7 +75,7 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
             }
         }
         SkillsCommand::Install { name } => {
-            let client = skill::clawhub::ClawhubClient::new();
+            let client = skill::clawhub::ClawhubClient::new().with_language(language.clone());
             print!("Installing '{}'... ", cyan(&name));
             let locked = client.install_with_fallback(&name, &global_dir).await?;
             println!(
@@ -100,7 +101,7 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
             println!("Uninstalled '{}'.", cyan(&name));
         }
         SkillsCommand::Search { query } => {
-            let client = skill::clawhub::ClawhubClient::new();
+            let client = skill::clawhub::ClawhubClient::new().with_language(language.clone());
             match client.search_with_fallback(&query).await {
                 Ok(results) => {
                     if results.is_empty() {
@@ -111,38 +112,37 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
                         });
                         if has_stats {
                             println!(
-                                "{:<24} {:<10} {:>10} {:>10} {:>8}  {}",
-                                bold("NAME"), bold("VERSION"),
-                                bold("DOWNLOADS"), bold("INSTALLS"), bold("STARS"),
+                                "{:<36} {:>10} {:>8}  {:<12}  {}",
+                                bold("NAME"),
+                                bold("INSTALLS"), bold("STARS"),
+                                bold("REGISTRY"),
                                 bold("DESCRIPTION"),
                             );
                         } else {
                             println!(
-                                "{:<24} {:<10}  {}",
-                                bold("NAME"), bold("VERSION"), bold("DESCRIPTION"),
+                                "{:<36}  {:<12}  {}",
+                                bold("NAME"), bold("REGISTRY"), bold("DESCRIPTION"),
                             );
                         }
                         for r in &results {
                             let desc = r.description.as_deref().unwrap_or("-");
-                            // Truncate long descriptions (char-safe)
-                            let desc: String = if desc.chars().count() > 80 {
-                                desc.chars().take(77).collect::<String>() + "..."
+                            let desc: String = if desc.chars().count() > 60 {
+                                desc.chars().take(57).collect::<String>() + "..."
                             } else {
                                 desc.to_string()
                             };
-                            let ver = r.version.as_deref().unwrap_or("-");
+                            let reg = r.registry.as_str();
                             if has_stats {
-                                let dl = r.downloads.map(format_count).unwrap_or_else(|| "-".into());
                                 let inst = r.installs.map(format_count).unwrap_or_else(|| "-".into());
                                 let stars = r.stars.map(format_count).unwrap_or_else(|| "-".into());
                                 println!(
-                                    "{:<24} {:<10} {:>10} {:>10} {:>8}  {}",
-                                    cyan(&r.slug), dim(ver), dl, inst, stars, desc,
+                                    "{:<36} {:>10} {:>8}  {:<12}  {}",
+                                    cyan(&r.slug), inst, stars, dim(reg), desc,
                                 );
                             } else {
                                 println!(
-                                    "{:<24} {:<10}  {}",
-                                    cyan(&r.slug), dim(ver), desc,
+                                    "{:<36}  {:<12}  {}",
+                                    cyan(&r.slug), dim(reg), desc,
                                 );
                             }
                         }
@@ -157,7 +157,7 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
             }
         }
         SkillsCommand::Update { name } => {
-            let client = skill::clawhub::ClawhubClient::new();
+            let client = skill::clawhub::ClawhubClient::new().with_language(language.clone());
             let lock = skill::clawhub::LockFile::read(&global_dir).unwrap_or_default();
 
             let slugs: Vec<String> = if let Some(name) = name {
