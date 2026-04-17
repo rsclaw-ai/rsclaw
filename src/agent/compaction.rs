@@ -218,6 +218,7 @@ impl AgentRuntime {
                                 tier: Default::default(),
                                 abstract_text: None,
                                 overview_text: None,
+                                tags: vec![],
                             };
                             let _ = guard.add(doc).await;
                         }

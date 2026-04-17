@@ -1,3 +1,4 @@
+pub mod meditation;
 pub mod schedule;
 pub mod state;
 
@@ -12,6 +13,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
 
+/// Type of heartbeat action.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum HeartbeatType {
+    /// Send the content as a message to the agent.
+    #[default]
+    Message,
+    /// Run a meditation cycle on the agent's memory store.
+    Meditate,
+}
+
 /// Parsed representation of a HEARTBEAT.md file.
 #[derive(Debug, Clone)]
 pub struct HeartbeatSpec {
@@ -19,6 +30,8 @@ pub struct HeartbeatSpec {
     pub active_hours: Option<(NaiveTime, NaiveTime)>,
     pub timezone: Tz,
     pub content: String,
+    /// The type of heartbeat action (message or meditate).
+    pub spec_type: HeartbeatType,
 }
 
 /// Parse a HEARTBEAT.md string (frontmatter + body) into a [`HeartbeatSpec`].
@@ -56,6 +69,7 @@ pub fn parse_heartbeat_md(raw: &str) -> Result<HeartbeatSpec> {
     let mut every_raw: Option<String> = None;
     let mut active_hours_raw: Option<String> = None;
     let mut timezone_raw: Option<String> = None;
+    let mut type_raw: Option<String> = None;
 
     for line in fm_text.lines() {
         let line = line.trim();
@@ -69,6 +83,7 @@ pub fn parse_heartbeat_md(raw: &str) -> Result<HeartbeatSpec> {
                 "every" => every_raw = Some(val),
                 "active_hours" => active_hours_raw = Some(val),
                 "timezone" | "tz" => timezone_raw = Some(val),
+                "type" | "kind" => type_raw = Some(val),
                 _ => {} // ignore unknown keys
             }
         }
@@ -90,11 +105,17 @@ pub fn parse_heartbeat_md(raw: &str) -> Result<HeartbeatSpec> {
         None => chrono_tz::Asia::Shanghai,
     };
 
+    let spec_type = match type_raw.as_deref() {
+        Some("meditate" | "meditation") => HeartbeatType::Meditate,
+        _ => HeartbeatType::Message,
+    };
+
     Ok(HeartbeatSpec {
         every,
         active_hours,
         timezone,
         content,
+        spec_type,
     })
 }
 
@@ -147,18 +168,23 @@ pub struct HeartbeatRunner {
     store: Arc<HeartbeatStore>,
     /// Tracks which agents already have a running heartbeat loop.
     active: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Shared memory store (used by meditation heartbeat type).
+    memory: Option<Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>>,
 }
 
 impl HeartbeatRunner {
+    /// Create a new heartbeat runner.
     pub fn new(
         registry: Arc<AgentRegistry>,
         data_dir: &Path,
+        memory: Option<Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>>,
     ) -> Self {
         let state_path = data_dir.join("heartbeat").join("state.json");
         Self {
             registry,
             store: Arc::new(HeartbeatStore::new(state_path)),
             active: std::sync::Mutex::new(std::collections::HashSet::new()),
+            memory,
         }
     }
 
@@ -276,8 +302,14 @@ impl HeartbeatRunner {
                 continue;
             }
 
-            // Send heartbeat message to agent.
-            match self.send_heartbeat(agent_id, &state_key, &spec.content).await {
+            // Execute heartbeat action based on type.
+            let result = match spec.spec_type {
+                HeartbeatType::Message => {
+                    self.send_heartbeat(agent_id, &state_key, &spec.content).await
+                }
+                HeartbeatType::Meditate => self.run_meditation(agent_id).await,
+            };
+            match result {
                 Ok(()) => {
                     hb_state.record_success();
                 }
@@ -311,6 +343,34 @@ impl HeartbeatRunner {
                 None
             }
         }
+    }
+
+    /// Run a meditation cycle for the given agent.
+    ///
+    /// Delegates to [`meditation::meditate`] to perform dedup, conflict
+    /// resolution, and crystallized-memory cleanup on the agent's memory store.
+    async fn run_meditation(&self, agent_id: &str) -> Result<()> {
+        let mem = match self.memory.as_ref() {
+            Some(m) => m,
+            None => {
+                info!(agent_id, "meditation: no memory store available, skipping");
+                return Ok(());
+            }
+        };
+
+        let scope = format!("agent:{agent_id}");
+        let config = meditation::MeditationConfig::default();
+        let mut store = mem.lock().await;
+        let report = meditation::meditate(&mut store, &scope, &config).await?;
+
+        info!(
+            agent_id,
+            merged = report.duplicates_merged,
+            cleaned = report.crystallized_cleaned,
+            processed = report.total_processed,
+            "meditation cycle complete"
+        );
+        Ok(())
     }
 
     /// Send a heartbeat message to the agent and wait for reply.

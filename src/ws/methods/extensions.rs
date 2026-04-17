@@ -108,6 +108,7 @@ pub async fn memory_store(ctx: MethodCtx) -> MethodResult {
         tier: Default::default(),
         abstract_text: None,
         overview_text: None,
+        tags: vec![],
     };
     mem.add(doc)
         .await

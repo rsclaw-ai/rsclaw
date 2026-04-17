@@ -207,6 +207,10 @@ pub struct RunContext {
     pub user_msg_with_images: Option<Message>,
     /// Count of consecutive tool parse errors in this turn.
     pub parse_error_count: usize,
+    /// Memory doc IDs recalled during this turn (auto-recall + tool_memory_search).
+    pub recalled_memory_ids: std::collections::HashSet<String>,
+    /// Whether a loop-detection warning was triggered during this turn.
+    pub loop_warning_triggered: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -953,6 +957,7 @@ impl AgentRuntime {
                                         tier: Default::default(),
                                         abstract_text: None,
                                         overview_text: None,
+                                        tags: vec![],
                                     };
                                     match mem.lock().await.add(doc).await {
                                         Ok(_) => info!("compact: summary saved to memory ({} chars)", mem_text.len()),
@@ -1347,6 +1352,8 @@ impl AgentRuntime {
                             has_images: false,
                             user_msg_with_images: None,
                             parse_error_count: 0,
+                            recalled_memory_ids: std::collections::HashSet::new(),
+                            loop_warning_triggered: false,
                         },
                         "",
                         &tool,
@@ -1784,6 +1791,9 @@ impl AgentRuntime {
             tracing::info!(path = %dump_path.display(), len = system_prompt.len(), "dumped system prompt");
         }
 
+        // Loop A (organic evolution): collect recalled memory IDs for feedback.
+        let mut auto_recalled_ids = std::collections::HashSet::<String>::new();
+
         // Auto-Recall (AGENTS.md §31): hybrid vector+BM25 recall before prompt.
         if let Some(ref mem) = self.memory
             && !text.trim().is_empty()
@@ -1807,7 +1817,19 @@ impl AgentRuntime {
                 .search(text, Some(&scope), recall_top_k)
                 .unwrap_or_default();
             // 3. Fuse with Reciprocal Rank Fusion (k=60), return top final_k.
+            let vec_count = vec_hits.len();
+            let bm25_count = bm25_hits.len();
             let results = rrf_fuse(vec_hits, bm25_hits, recall_final_k);
+            tracing::debug!(
+                vec_count,
+                bm25_count,
+                fused = results.len(),
+                "auto-recall results"
+            );
+            // Loop A (organic evolution): track recalled memory IDs for feedback.
+            for doc in &results {
+                auto_recalled_ids.insert(doc.id.clone());
+            }
             if !results.is_empty() {
                 let now_ts = chrono::Utc::now().timestamp();
                 let mem_block = format!(
@@ -2115,6 +2137,8 @@ impl AgentRuntime {
                 None
             },
             parse_error_count: 0,
+            recalled_memory_ids: auto_recalled_ids,
+            loop_warning_triggered: false,
         };
 
         // On-demand skill injection: match user text against skill
@@ -2166,6 +2190,112 @@ impl AgentRuntime {
         // Append to JSONL transcript (AGENTS.md §20 step 11).
         self.append_transcript(session_key, text, &reply.text).await;
 
+        // Loop A (organic evolution): adjust importance of recalled memories
+        // based on the outcome of this turn.
+        tracing::debug!(
+            recalled_count = ctx.recalled_memory_ids.len(),
+            loop_warning = ctx.loop_warning_triggered,
+            reply_empty = reply.is_empty,
+            "evolution: feedback check"
+        );
+        if let Some(ref mem) = self.memory
+            && !ctx.recalled_memory_ids.is_empty()
+        {
+            let signal = Self::infer_outcome_signal(&reply, &ctx, channel);
+            tracing::debug!(signal, recalled = ctx.recalled_memory_ids.len(), "evolution: applying feedback");
+            if signal.abs() > f32::EPSILON {
+                let mut store = mem.lock().await;
+                for mem_id in &ctx.recalled_memory_ids {
+                    if let Err(e) = store.adjust_importance(mem_id, signal).await {
+                        tracing::debug!(mem_id, "evolution feedback adjust: {e:#}");
+                    }
+                }
+            }
+        }
+
+        // Loop B (organic evolution): check if any recalled memory just promoted
+        // to Core, and if so, spawn a background crystallization attempt.
+        if let Some(ref mem) = self.memory
+            && !ctx.recalled_memory_ids.is_empty()
+        {
+            let store = mem.lock().await;
+            let candidates: Vec<String> = ctx
+                .recalled_memory_ids
+                .iter()
+                .filter(|id| {
+                    store
+                        .get_sync(id)
+                        .map(|d| {
+                            d.tier == crate::agent::memory::MemDocTier::Core
+                                && !d.tags.iter().any(|t| t == "crystallized")
+                        })
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            drop(store);
+
+            if !candidates.is_empty() {
+                let mem_clone = Arc::clone(mem);
+                let ws_dir = self
+                    .handle
+                    .config
+                    .workspace
+                    .as_deref()
+                    .or(self.config.agents.defaults.workspace.as_deref())
+                    .map(crate::agent::runtime::expand_tilde)
+                    .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+                let skills_dir = ws_dir.join("skills");
+                let scope = format!("agent:{}", self.handle.id);
+                tokio::spawn(async move {
+                    for doc_id in candidates {
+                        let mut store = mem_clone.lock().await;
+                        match crate::skill::crystallizer::find_cluster(&store, &doc_id, &scope) {
+                            Ok(Some(cluster)) => {
+                                let prompt =
+                                    crate::skill::crystallizer::build_distill_prompt(&cluster);
+                                // Tag all cluster docs as crystallized (even without
+                                // LLM distillation) to prevent repeated attempts.
+                                let ids: Vec<String> =
+                                    cluster.iter().map(|d| d.id.clone()).collect();
+                                for id in &ids {
+                                    if let Err(e) = store.tag_doc(id, "crystallized").await {
+                                        tracing::debug!(id, "tag_doc failed: {e:#}");
+                                    }
+                                }
+                                drop(store);
+                                // Write a draft skill with the prompt as content.
+                                // A future version can use an LLM to distill it.
+                                let slug = crate::skill::crystallizer::slugify(
+                                    &prompt.lines().next().unwrap_or("auto-skill"),
+                                );
+                                match crate::skill::crystallizer::write_skill(
+                                    &skills_dir,
+                                    &slug,
+                                    &prompt,
+                                ) {
+                                    Ok(path) => {
+                                        tracing::info!(
+                                            ?path,
+                                            "crystallized {} memories into skill",
+                                            ids.len()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("skill crystallization write failed: {e:#}");
+                                    }
+                                }
+                            }
+                            Ok(None) => {} // not enough related memories yet
+                            Err(e) => {
+                                tracing::debug!(doc_id, "crystallization check failed: {e:#}");
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
         // Auto-Capture (AGENTS.md §31): persist user message as memory note.
         if let Some(ref mem) = self.memory
             && text.len() > 20
@@ -2186,6 +2316,7 @@ impl AgentRuntime {
                 tier: Default::default(),
                 abstract_text: None,
                 overview_text: None,
+                tags: vec![],
             };
             let _ = mem.lock().await.add(doc).await;
             // Also index in tantivy BM25 for hybrid search.
@@ -2755,6 +2886,7 @@ impl AgentRuntime {
                                 tracing::warn!(tool = %name, params = ?input, "{}", warning_msg);
                                 // Store warning to inject into tool result (so LLM sees it)
                                 loop_warnings.insert(id.clone(), warning_msg);
+                                ctx.loop_warning_triggered = true;
                             }
                             tool_calls.push((id, name, input));
                         } else if !id.is_empty() && name.is_empty() {
@@ -3245,6 +3377,16 @@ impl AgentRuntime {
                         // Record result for progress-aware loop detection.
                         // Same args + different results = making progress, not a loop.
                         ctx.loop_detector.record_result(&v);
+                        // Loop A: capture recalled memory IDs from search results.
+                        if tool_name == "memory" || tool_name == "memory_search" {
+                            if let Some(results) = v.get("results").and_then(|r| r.as_array()) {
+                                for item in results {
+                                    if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
+                                        ctx.recalled_memory_ids.insert(id.to_owned());
+                                    }
+                                }
+                            }
+                        }
                         // Extract images from tool result to avoid passing large
                         // base64 back to LLM. Check "image" (screenshot) and "url" (image gen).
                         let img_data = v.get("image").and_then(|i| i.as_str()).or_else(|| {
@@ -3415,6 +3557,22 @@ impl AgentRuntime {
                 // Inject loop detection warning if present (so LLM sees it and can stop)
                 let session_text = if let Some(warning) = loop_warnings.get(&tool_id) {
                     format!("[LOOP WARNING] {}\n\n{}", warning, session_text)
+                } else {
+                    session_text
+                };
+
+                // Result sufficiency hint: when a tool returns substantial content
+                // after 3+ iterations, nudge the LLM to stop if the result looks complete.
+                let session_text = if iteration >= 3
+                    && !session_text.contains("\"error\"")
+                    && !session_text.contains("_do_not_retry")
+                    && session_text.len() > 500
+                    && !session_text.contains("[LOOP WARNING]")
+                {
+                    format!(
+                        "{session_text}\n\n[HINT: This result contains substantial content. \
+                         If it answers the user's question, reply directly without further tool calls.]"
+                    )
                 } else {
                     session_text
                 };
@@ -3758,6 +3916,41 @@ impl AgentRuntime {
     }
 
     // -----------------------------------------------------------------------
+    // Organic evolution helpers
+    // -----------------------------------------------------------------------
+
+    /// Infer an outcome signal from the completed turn.
+    ///
+    /// Returns a value in \[-0.3, 0.3\]: positive = helpful, negative = unhelpful.
+    /// Used by Loop A to adjust importance of recalled memories.
+    fn infer_outcome_signal(reply: &AgentReply, ctx: &RunContext, channel: &str) -> f32 {
+        // Internal channels produce no signal.
+        if matches!(channel, "heartbeat" | "system" | "cron") {
+            return 0.0;
+        }
+
+        let mut signal = 0.0_f32;
+
+        // Negative signals.
+        if reply.is_empty {
+            signal -= 0.1;
+        }
+        if ctx.loop_warning_triggered {
+            signal -= 0.15;
+        }
+
+        // Positive signals.
+        if !reply.is_empty && reply.text.len() > 100 {
+            signal += 0.05;
+        }
+        if !reply.is_empty && !ctx.loop_warning_triggered {
+            signal += 0.05;
+        }
+
+        signal.clamp(-0.3, 0.3)
+    }
+
+    // -----------------------------------------------------------------------
     // Built-in tool implementations
     // -----------------------------------------------------------------------
 
@@ -3828,6 +4021,7 @@ impl AgentRuntime {
                 tier: Default::default(),
                 abstract_text: None,
                 overview_text: None,
+                tags: vec![],
             })
             .await?;
         drop(store);
@@ -4228,6 +4422,7 @@ fn rrf_fuse(
                         tier: Default::default(),
                         abstract_text: None,
                         overview_text: None,
+                        tags: vec![],
                     },
                 )
             });

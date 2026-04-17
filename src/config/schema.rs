@@ -1392,6 +1392,8 @@ pub struct WebBrowserConfig {
     /// other string = named profile directory under ~/.rsclaw/browser-profiles/.
     /// If not set, uses a temporary profile (no cookies/history).
     pub profile: Option<String>,
+    /// Ports to probe for existing Chrome with remote debugging (default: [9222, 9223]).
+    pub remote_debug_ports: Option<Vec<u16>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

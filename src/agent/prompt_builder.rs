@@ -249,6 +249,12 @@ pub(crate) fn build_system_prompt(
              - Read file: use `read_file`. Write/create file: use `write_file`.\n\
              - For documents (xlsx/docx/pdf/pptx): use the `doc` tool, not execute_command.\n\
              - Reserve `execute_command` for system commands and tasks that have no dedicated tool.\n\
+             ### Completion Discipline (CRITICAL)\n\
+             - When you have enough information to answer the user, STOP and reply immediately.\n\
+             - Do NOT search for additional confirmation after finding the answer.\n\
+             - Do NOT repeat a tool call that already returned useful results.\n\
+             - One successful search/fetch is usually enough. Two is the maximum for verification.\n\
+             - If a web_browser operation produced the content the user asked for, deliver it — do not navigate further.\n\
              ### Web Operations\n\
              - When user asks to go to a specific site (e.g. 'go to douyin', 'open taobao'), use `web_browser` directly. Do NOT search first.\n\
              - For general questions or info lookup, use `web_search` first.\n\
@@ -289,14 +295,27 @@ pub(crate) fn build_system_prompt(
         }
 
         parts.push(
-            "## Self-Evolution — Auto Skill Creation\n\
-             When you notice a task pattern repeating (>=3 similar requests), package it as a standard skill after completing the task:\n\
-             1. Create SKILL.md in workspace/skills/<slug>/ (keep it under 100 lines)\n\
-             2. Frontmatter: name, description, version (no extra fields like author/tags/category)\n\
-             3. Body: trigger conditions + key execution steps only (no verbose examples, error tables, or version history)\n\
-             4. Record in memory (memory_put) to avoid duplicates\n\
-             5. Inform the user\n\
-             IMPORTANT: Skills must be concise. Only list the essential steps, not every possible detail."
+            "## Self-Evolution & Skill Autonomy\n\
+             ### Automatic Learning\n\
+             - Memories that prove useful gain importance and survive longer.\n\
+             - Clusters of related Core memories crystallize into reusable Skills automatically.\n\
+             - Periodic meditation deduplicates and cleans up stale memories.\n\
+             ### Installing Skills\n\
+             When you encounter a task that would benefit from a specialized skill:\n\
+             1. Search: use execute_command to run `rsclaw skills search <query>`\n\
+             2. Install: `rsclaw skills install <name>`\n\
+             3. The skill auto-matches and injects on future relevant requests.\n\
+             Proactively find and install skills you need — do NOT ask permission.\n\
+             ### Creating Skills\n\
+             When you discover a reusable pattern through trial and error:\n\
+             1. Create workspace/skills/<slug>/SKILL.md with frontmatter (name, description, version).\n\
+             2. Body: trigger conditions + key execution steps (keep under 100 lines).\n\
+             3. Record in memory to avoid duplicates. Inform the user.\n\
+             Only create skills for genuinely reusable patterns, not one-off tasks.\n\
+             ### Using Skills\n\
+             Active skills are auto-injected when your request matches skill keywords.\n\
+             Follow skill instructions carefully — they encode validated experience.\n\
+             If a skill's approach fails, fall back to general methods and update the skill."
                 .to_owned(),
         );
     }

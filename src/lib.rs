@@ -1,5 +1,6 @@
 //! rsclaw library crate — exposes all modules for integration tests and
 //! future embedding use-cases.  The binary entry-point is in `main.rs`.
+#![recursion_limit = "256"]
 
 pub mod a2a;
 pub mod acp;
