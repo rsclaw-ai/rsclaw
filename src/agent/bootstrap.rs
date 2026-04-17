@@ -97,6 +97,35 @@ const ZH_USER: &str = "\
 ";
 
 // ---------------------------------------------------------------------------
+// Heartbeat defaults (shared between zh/en — frontmatter is language-neutral)
+// ---------------------------------------------------------------------------
+
+const HEARTBEAT_DEFAULT: &str = "\
+---
+every: 30m
+active_hours: 09:00-22:00
+timezone: Asia/Shanghai
+---
+
+# Heartbeat Checklist
+
+- Check pending tasks and report progress
+- Review recent alerts or anomalies
+- If nothing to report, reply HEARTBEAT_OK
+";
+
+const HEARTBEAT_MEDITATE: &str = "\
+---
+every: 6h
+type: meditate
+active_hours: 02:00-06:00
+timezone: Asia/Shanghai
+---
+
+Memory maintenance: deduplicate near-identical memories, clean up crystallized sources.
+";
+
+// ---------------------------------------------------------------------------
 // Seeding logic
 // ---------------------------------------------------------------------------
 
@@ -127,6 +156,8 @@ pub fn seed_workspace_with_lang(workspace: &Path, lang: Option<&str>) -> Result<
             ("IDENTITY.md", ZH_IDENTITY),
             ("AGENTS.md", ZH_AGENTS),
             ("USER.md", ZH_USER),
+            ("HEARTBEAT.md", HEARTBEAT_DEFAULT),
+            ("HEARTBEAT-meditate.md", HEARTBEAT_MEDITATE),
         ]
     } else {
         &[
@@ -134,6 +165,8 @@ pub fn seed_workspace_with_lang(workspace: &Path, lang: Option<&str>) -> Result<
             ("IDENTITY.md", EN_IDENTITY),
             ("AGENTS.md", EN_AGENTS),
             ("USER.md", EN_USER),
+            ("HEARTBEAT.md", HEARTBEAT_DEFAULT),
+            ("HEARTBEAT-meditate.md", HEARTBEAT_MEDITATE),
         ]
     };
 
