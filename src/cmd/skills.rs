@@ -76,16 +76,25 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
         }
         SkillsCommand::Install { name } => {
             let client = skill::clawhub::ClawhubClient::new().with_language(language.clone());
-            print!("Installing '{}'... ", cyan(&name));
-            let locked = client.install_with_fallback(&name, &global_dir).await?;
-            println!(
-                "{}",
-                green(&format!(
-                    "v{} -> {}",
-                    locked.version,
-                    locked.install_dir.display()
-                ))
+            // Check if already installed before printing "Installing".
+            let dir_name = name.rsplit_once('@').map(|(_, s)| s).unwrap_or(
+                name.rsplit('/').next().unwrap_or(&name)
             );
+            let already = skill::clawhub::ClawhubClient::check_installed(&global_dir, dir_name);
+            if already {
+                print!("Checking '{}'... ", cyan(&name));
+            } else {
+                print!("Installing '{}'... ", cyan(&name));
+            }
+            let locked = client.install_with_fallback(&name, &global_dir).await?;
+            if already {
+                println!("{}", dim(&format!("already up to date (v{})", locked.version)));
+            } else {
+                println!(
+                    "{}",
+                    green(&format!("v{} -> {}", locked.version, locked.install_dir.display()))
+                );
+            }
         }
         SkillsCommand::Uninstall { name } => {
             let skill_dir = global_dir.join(&name);

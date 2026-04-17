@@ -332,8 +332,36 @@ impl ClawhubClient {
         Ok(locked)
     }
 
+    /// Returns true if `dir_name` is already installed with a valid SKILL.md checksum.
+    pub fn check_installed(skills_dir: &Path, dir_name: &str) -> bool {
+        Self::find_installed(skills_dir, dir_name).is_some()
+    }
+
+    /// Check the lock file for an existing install and return it if the SKILL.md
+    /// checksum still matches (i.e. nothing changed on disk).
+    fn find_installed(skills_dir: &Path, dir_name: &str) -> Option<LockedSkill> {
+        let lock = LockFile::read(skills_dir).ok()?;
+        // Match by dir name (last component of slug).
+        let locked = lock.skills.values().find(|l| {
+            l.install_dir
+                .file_name()
+                .map(|n| n == dir_name)
+                .unwrap_or(false)
+        })?;
+        // Verify the SKILL.md on disk still has the recorded checksum.
+        let skill_md = locked.install_dir.join("SKILL.md");
+        if skill_md.exists() {
+            if let Ok(current) = sha256_file(&skill_md) {
+                if current == locked.checksum {
+                    return Some(locked.clone());
+                }
+            }
+        }
+        None
+    }
+
     /// Install with fallback: clawhub -> skillhub.
-    /// Also supports direct URL and GitHub repo installs.
+    /// Also supports skills.sh `owner/repo@skill`, direct URLs, and GitHub repos.
     pub async fn install_with_fallback(
         &self,
         spec: &str,
@@ -344,8 +372,21 @@ impl ClawhubClient {
             return self.install_from_url(spec, skills_dir).await;
         }
 
-        // 2. GitHub repo (owner/repo format with no dots)
-        if spec.contains('/') && !spec.contains('.') && !spec.starts_with("@") {
+        // 2. skills.sh format: owner/repo@skill-id
+        if let Some(at_pos) = spec.find('@') {
+            let repo_part = &spec[..at_pos];   // "owner/repo"
+            let skill_id  = &spec[at_pos + 1..]; // "skill-id"
+            if repo_part.contains('/') && !skill_id.is_empty() {
+                let parts: Vec<&str> = repo_part.splitn(2, '/').collect();
+                if parts.len() == 2 {
+                    info!(spec, "resolving as skills.sh owner/repo@skill");
+                    return self.install_from_skillsh(parts[0], parts[1], skill_id, skills_dir).await;
+                }
+            }
+        }
+
+        // 3. GitHub repo (owner/repo format with no dots)
+        if spec.contains('/') && !spec.contains('.') {
             let url = format!("https://github.com/{}/archive/refs/heads/main.tar.gz", spec);
             info!(spec, url = %url, "resolving as GitHub repo");
             return self.install_from_url(&url, skills_dir).await.map(|mut l| {
@@ -387,6 +428,106 @@ impl ClawhubClient {
         bail!("skill `{spec}` not found on clawhub or skillhub")
     }
 
+    /// Install a skill from skills.sh using their JSON file API.
+    ///
+    /// `GET https://skills.sh/api/download/<owner>/<repo>/<skill>`
+    /// returns `{ files: [{path, contents}], hash }` — files are written directly.
+    async fn install_from_skillsh(
+        &self,
+        owner: &str,
+        repo: &str,
+        skill_id: &str,
+        skills_dir: &Path,
+    ) -> Result<LockedSkill> {
+        let url = format!(
+            "https://skills.sh/api/download/{}/{}/{}",
+            urlencoding_encode(owner),
+            urlencoding_encode(repo),
+            urlencoding_encode(skill_id),
+        );
+
+        debug!(url, "downloading from skills.sh");
+
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("skills.sh returned {status}: {body}");
+        }
+
+        let body: serde_json::Value = resp.json().await.context("parse skills.sh response")?;
+
+        // Skip install if the remote hash matches what is already on disk.
+        if let Some(remote_hash) = body.get("hash").and_then(|v| v.as_str()) {
+            if let Some(existing) = Self::find_installed(skills_dir, skill_id) {
+                let short_hash = &remote_hash[..8.min(remote_hash.len())];
+                if existing.version == short_hash {
+                    debug!(skill_id, version = short_hash, "already up to date, skipping");
+                    return Ok(existing);
+                }
+                debug!(skill_id, "remote hash differs, updating");
+            }
+        }
+
+        let files = body
+            .get("files")
+            .and_then(|v| v.as_array())
+            .with_context(|| format!("no 'files' array in skills.sh response for {skill_id}"))?;
+
+        let install_dir = skills_dir.join(skill_id);
+        std::fs::create_dir_all(&install_dir)
+            .with_context(|| format!("create {}", install_dir.display()))?;
+
+        for file in files {
+            let path = file["path"].as_str().unwrap_or("SKILL.md");
+            let contents = file["contents"].as_str().unwrap_or("");
+
+            let dest = install_dir.join(path);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&dest, contents)
+                .with_context(|| format!("write {}", dest.display()))?;
+        }
+
+        let skill_md = install_dir.join("SKILL.md");
+        let checksum = if skill_md.exists() {
+            sha256_file(&skill_md)?
+        } else {
+            String::new()
+        };
+
+        // Use the hash from the API response as version if available.
+        let version = body
+            .get("hash")
+            .and_then(|v| v.as_str())
+            .map(|h| h[..8.min(h.len())].to_owned()) // first 8 chars of hash
+            .unwrap_or_else(|| "latest".to_owned());
+
+        let slug = format!("{owner}/{repo}@{skill_id}");
+        let locked = LockedSkill {
+            slug: slug.clone(),
+            version,
+            resolved_at: Utc::now(),
+            source: SkillSource::Skillhub, // closest semantic match for skills.sh
+            checksum,
+            install_dir,
+        };
+
+        let mut lock = LockFile::read(skills_dir).unwrap_or_default();
+        lock.skills.insert(slug, locked.clone());
+        lock.updated = Some(Utc::now());
+        lock.write(skills_dir)?;
+
+        Ok(locked)
+    }
+
     /// Install a skill from a direct URL (tar.gz or zip).
     async fn install_from_url(&self, url: &str, skills_dir: &Path) -> Result<LockedSkill> {
         // Derive dir name from URL: prefer ?slug= param, then path segment
@@ -406,6 +547,12 @@ impl ClawhubClient {
             .trim_end_matches(".tgz")
             .trim_end_matches(".zip");
         let install_dir = skills_dir.join(dir_name);
+
+        // Skip re-download if the skill is already installed and SKILL.md matches.
+        if let Some(existing) = Self::find_installed(skills_dir, dir_name) {
+            debug!(dir_name, "already installed and up to date, skipping");
+            return Ok(existing);
+        }
 
         debug!(url, dir = %install_dir.display(), "installing skill from URL");
 
