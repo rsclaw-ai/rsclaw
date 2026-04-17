@@ -1086,9 +1086,11 @@ impl AgentRuntime {
                         info!("connecting to user Chrome (remote debugging)");
                         crate::browser::BrowserSession::connect_existing(&ws_url).await?
                     } else {
-                        // No existing Chrome found, launch with visible window.
+                        // No existing Chrome found, launch with visible window
+                        // using RsClaw's own profile (not user's default — that
+                        // would conflict with any running Chrome).
                         crate::browser::can_launch_chrome()?;
-                        crate::browser::BrowserSession::start(&chrome_path, true, Some("default")).await?
+                        crate::browser::BrowserSession::start(&chrome_path, true, profile.as_deref()).await?
                     }
                 } else {
                     // Headless mode.
