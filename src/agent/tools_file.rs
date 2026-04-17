@@ -15,7 +15,11 @@ impl super::runtime::AgentRuntime {
     /// List files and directories in a path (structured alternative to `exec ls`).
     pub(crate) async fn tool_list_dir(&self, args: Value) -> Result<Value> {
         let fallback_ws = crate::config::loader::base_dir().join("workspace");
-        let default_ws = self.handle.config.workspace.as_deref()
+        let default_ws = self
+            .handle
+            .config
+            .workspace
+            .as_deref()
             .or(self.config.agents.defaults.workspace.as_deref())
             .unwrap_or(fallback_ws.to_str().unwrap_or("."));
         let path_str = args["path"].as_str().unwrap_or(default_ws);
@@ -42,10 +46,16 @@ impl super::runtime::AgentRuntime {
             Err(e) => return Ok(json!({"error": format!("invalid pattern: {e}")})),
         };
         for entry in entries_iter {
-            if entries.len() >= 100 { break; }
+            if entries.len() >= 100 {
+                break;
+            }
             if let Ok(p) = entry {
                 let is_dir = p.is_dir();
-                let size = if is_dir { 0 } else { p.metadata().map(|m| m.len()).unwrap_or(0) };
+                let size = if is_dir {
+                    0
+                } else {
+                    p.metadata().map(|m| m.len()).unwrap_or(0)
+                };
                 entries.push(json!({
                     "name": p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
                     "path": p.to_string_lossy(),
@@ -65,7 +75,11 @@ impl super::runtime::AgentRuntime {
     /// Search for files by name pattern (structured alternative to `exec find`).
     pub(crate) async fn tool_search_file(&self, args: Value) -> Result<Value> {
         let fallback_ws = crate::config::loader::base_dir().join("workspace");
-        let default_ws = self.handle.config.workspace.as_deref()
+        let default_ws = self
+            .handle
+            .config
+            .workspace
+            .as_deref()
             .or(self.config.agents.defaults.workspace.as_deref())
             .unwrap_or(fallback_ws.to_str().unwrap_or("."));
         let root = args["path"].as_str().unwrap_or(default_ws);
@@ -82,7 +96,9 @@ impl super::runtime::AgentRuntime {
             Err(e) => return Ok(json!({"error": format!("invalid pattern: {e}")})),
         };
         for entry in entries_iter {
-            if results.len() >= max_results { break; }
+            if results.len() >= max_results {
+                break;
+            }
             if let Ok(p) = entry {
                 let size = p.metadata().map(|m| m.len()).unwrap_or(0);
                 results.push(json!({
@@ -106,7 +122,11 @@ impl super::runtime::AgentRuntime {
     /// Cross-platform: uses `grep -rn` on Unix, `Select-String` on Windows.
     pub(crate) async fn tool_search_content(&self, args: Value) -> Result<Value> {
         let fallback_ws = crate::config::loader::base_dir().join("workspace");
-        let default_ws = self.handle.config.workspace.as_deref()
+        let default_ws = self
+            .handle
+            .config
+            .workspace
+            .as_deref()
             .or(self.config.agents.defaults.workspace.as_deref())
             .unwrap_or(fallback_ws.to_str().unwrap_or("."));
         let root = args["path"].as_str().unwrap_or(default_ws);
@@ -122,11 +142,15 @@ impl super::runtime::AgentRuntime {
         let output = {
             let mut cmd = tokio::process::Command::new("grep");
             cmd.arg("-rn");
-            if ignore_case { cmd.arg("-i"); }
+            if ignore_case {
+                cmd.arg("-i");
+            }
             if let Some(inc) = include {
                 cmd.arg("--include").arg(inc);
             }
-            cmd.arg("--").arg(pattern).arg(root_path.to_str().unwrap_or("."));
+            cmd.arg("--")
+                .arg(pattern)
+                .arg(root_path.to_str().unwrap_or("."));
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::null());
             tokio::time::timeout(Duration::from_secs(15), cmd.output())
@@ -138,10 +162,7 @@ impl super::runtime::AgentRuntime {
         #[cfg(target_os = "windows")]
         let output = {
             // PowerShell Select-String is the Windows equivalent of grep -rn.
-            let mut ps_args = vec![
-                "-NoProfile".to_owned(),
-                "-Command".to_owned(),
-            ];
+            let mut ps_args = vec!["-NoProfile".to_owned(), "-Command".to_owned()];
             let inc_filter = include
                 .map(|i| format!(" -Include '{}'", i.replace('\'', "''")))
                 .unwrap_or_default();
@@ -172,9 +193,15 @@ impl super::runtime::AgentRuntime {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut matches: Vec<Value> = Vec::new();
         // Windows uses TAB separator, Unix uses colon.
-        let sep = if cfg!(target_os = "windows") { '\t' } else { ':' };
+        let sep = if cfg!(target_os = "windows") {
+            '\t'
+        } else {
+            ':'
+        };
         for line in stdout.lines() {
-            if matches.len() >= max_results { break; }
+            if matches.len() >= max_results {
+                break;
+            }
             // Parse: file<sep>line<sep>content
             // On Unix with colons: handle drive-less paths (no ambiguity).
             // On Windows with TABs: no ambiguity with path colons.
@@ -399,7 +426,12 @@ impl super::runtime::AgentRuntime {
     /// Supports background execution via `wait=false` (default). When running
     /// in background mode, returns a `task_id` that can be polled with
     /// `task_id` parameter.
-    pub(crate) async fn tool_exec(&self, ctx: &super::runtime::RunContext, tool_call_id: &str, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_exec(
+        &self,
+        ctx: &super::runtime::RunContext,
+        tool_call_id: &str,
+        args: Value,
+    ) -> Result<Value> {
         tracing::debug!(?args, "tool_exec called");
 
         // Poll existing task
@@ -582,7 +614,10 @@ impl super::runtime::AgentRuntime {
             }
             if !extra_paths.is_empty() {
                 let sys_path = std::env::var("PATH").unwrap_or_default();
-                let mut all: Vec<String> = extra_paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+                let mut all: Vec<String> = extra_paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect();
                 all.push(sys_path);
                 cmd.env("PATH", all.join(if cfg!(windows) { ";" } else { ":" }));
             }
@@ -651,7 +686,7 @@ impl super::runtime::AgentRuntime {
                 let started_at = std::time::Instant::now();
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
-                    cmd.output()
+                    cmd.output(),
                 )
                 .await;
 
@@ -668,7 +703,11 @@ impl super::runtime::AgentRuntime {
                     }
                     Err(_) => {
                         tracing::warn!(task_id = %tid, timeout_secs, "exec background timed out");
-                        (None, String::new(), format!("timed out after {} seconds", timeout_secs))
+                        (
+                            None,
+                            String::new(),
+                            format!("timed out after {} seconds", timeout_secs),
+                        )
                     }
                 };
 
@@ -696,13 +735,18 @@ impl super::runtime::AgentRuntime {
                 };
 
                 // Store for next turn collection
-                pool.add_pending_for_session(session_key.clone(), exec_result).await;
+                pool.add_pending_for_session(session_key.clone(), exec_result)
+                    .await;
 
                 // Proactive injection: send result directly to agent inbox
                 // This triggers immediate processing without waiting for next user message
                 let result_summary = if exit_code == Some(0) {
                     let truncated = if stdout.chars().count() > 3000 {
-                        let cutoff = stdout.char_indices().nth(3000).map(|(i, _)| i).unwrap_or(stdout.len());
+                        let cutoff = stdout
+                            .char_indices()
+                            .nth(3000)
+                            .map(|(i, _)| i)
+                            .unwrap_or(stdout.len());
                         &stdout[..cutoff]
                     } else {
                         &stdout
@@ -714,7 +758,11 @@ impl super::runtime::AgentRuntime {
                 } else {
                     format!(
                         "[Background exec completed] task_id={}\ncommand: {}\nexit_code: {}\nstderr: {}\nstdout: {}",
-                        tid, command_owned, exit_code.unwrap_or(-1), stderr, stdout
+                        tid,
+                        command_owned,
+                        exit_code.unwrap_or(-1),
+                        stderr,
+                        stdout
                     )
                 };
 
@@ -742,8 +790,10 @@ impl super::runtime::AgentRuntime {
             });
 
             Ok(json!({
-                "task_id": task_id,
                 "status": "submitted",
+                "command": command,
+                "_loop_key": format!("exec_background:{}", command),  // Fixed key for loop detection (excludes task_id)
+                "task_id": task_id,
                 "message": "Command started in background. Result will be delivered automatically on your next turn. DO NOT poll - just continue with other tasks.",
                 "note": "No polling needed. The result appears in your next turn automatically."
             }))

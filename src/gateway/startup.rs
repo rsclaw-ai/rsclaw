@@ -12,15 +12,11 @@ use tracing::{debug, error, info, warn};
 use crate::{
     MemoryTier,
     agent::{
-        AgentMessage, AgentRegistry, AgentReply, AgentRuntime, AgentSpawner,
-        MemoryStore, PendingAnalysis,
+        AgentMessage, AgentRegistry, AgentReply, AgentRuntime, AgentSpawner, MemoryStore,
+        PendingAnalysis,
     },
     channel::OutboundMessage,
-    config::{
-        self,
-        runtime::RuntimeConfig,
-        schema::BindMode,
-    },
+    config::{self, runtime::RuntimeConfig, schema::BindMode},
     cron::CronRunner,
     gateway::{
         LiveConfig,
@@ -52,7 +48,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     // 1b. Seed tool prompts if not present.
     {
-        let lang = config.raw.gateway.as_ref().and_then(|g| g.language.as_deref());
+        let lang = config
+            .raw
+            .gateway
+            .as_ref()
+            .and_then(|g| g.language.as_deref());
         if let Err(e) = crate::agent::bootstrap::seed_tools(&base_dir, lang) {
             warn!("failed to seed tool prompts: {e:#}");
         }
@@ -115,14 +115,22 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         } else {
             // Auto-download BGE model in background (don't block startup).
             let target_dir = zh; // default to small-zh
-            let cfg_lang = config.raw.gateway.as_ref().and_then(|g| g.language.as_deref()).map(str::to_owned);
-            let i18n_lang = crate::i18n::resolve_lang(cfg_lang.as_deref().unwrap_or("en")).to_owned();
+            let cfg_lang = config
+                .raw
+                .gateway
+                .as_ref()
+                .and_then(|g| g.language.as_deref())
+                .map(str::to_owned);
+            let i18n_lang =
+                crate::i18n::resolve_lang(cfg_lang.as_deref().unwrap_or("en")).to_owned();
             let search_cfg_clone = search_cfg.cloned();
             let dl_dir = target_dir.clone();
             let ntx = notification_tx.clone();
             tokio::spawn(async move {
                 info!("BGE embedding model not found, downloading in background...");
-                match download_bge_model(&dl_dir, search_cfg_clone.as_ref(), cfg_lang.as_deref()).await {
+                match download_bge_model(&dl_dir, search_cfg_clone.as_ref(), cfg_lang.as_deref())
+                    .await
+                {
                     Ok(()) => {
                         info!("BGE model downloaded. Notifying user to restart.");
                         let _ = ntx.send(crate::channel::OutboundMessage {
@@ -140,7 +148,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                         let _ = ntx.send(crate::channel::OutboundMessage {
                             target_id: String::new(),
                             is_group: false,
-                            text: crate::i18n::t_fmt("bge_model_download_failed", &i18n_lang, &[("error", &format!("{e:#}"))]),
+                            text: crate::i18n::t_fmt(
+                                "bge_model_download_failed",
+                                &i18n_lang,
+                                &[("error", &format!("{e:#}"))],
+                            ),
                             reply_to: None,
                             images: vec![],
                             files: vec![],
@@ -206,8 +218,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let mcp_registry = Arc::new(crate::mcp::McpRegistry::new());
     spawn_mcp_servers(&config, Arc::clone(&mcp_registry)).await;
 
-    // Clone memory before passing to agent tasks so heartbeat can also use it.
+    // Clone memory before passing to agent tasks so heartbeat and cron can also use it.
     let heartbeat_memory = memory.clone();
+    let cron_memory = memory.clone();
 
     spawn_agent_tasks(
         receivers,
@@ -216,7 +229,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Arc::clone(&store),
         Arc::clone(&skills),
         Arc::clone(&providers),
-        memory,
+        memory, // This move is intentional - agent tasks need the original
         event_tx.clone(),
         Some(Arc::clone(&spawner)),
         Some(Arc::clone(&plugins)),
@@ -413,16 +426,19 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     // Start cron runner — jobs loaded from base_dir/cron.json5
     {
-        let cron_cfg = config.ops.cron.clone().unwrap_or_else(|| {
-            crate::config::schema::CronConfig {
-                enabled: Some(true),
-                max_concurrent_runs: None,
-                session_retention: None,
-                run_log: None,
-                jobs: None,
-                default_delivery: None,
-            }
-        });
+        let cron_cfg =
+            config
+                .ops
+                .cron
+                .clone()
+                .unwrap_or_else(|| crate::config::schema::CronConfig {
+                    enabled: Some(true),
+                    max_concurrent_runs: None,
+                    session_retention: None,
+                    run_log: None,
+                    jobs: None,
+                    default_delivery: None,
+                });
         let cron_enabled = cron_cfg.enabled.unwrap_or(true);
 
         // Load jobs from openclaw-compatible path
@@ -441,6 +457,17 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 Arc::clone(&channel_manager),
                 cron_data_dir,
                 cron_reload_tx.clone(),
+                // Additional dependencies for direct AgentRuntime creation
+                Arc::clone(&config),
+                Arc::clone(&providers),
+                Arc::clone(&skills),
+                Arc::clone(&store),
+                cron_memory,
+                event_tx.clone(),
+                Some(Arc::clone(&spawner)),
+                Some(Arc::clone(&plugins)),
+                Some(Arc::clone(&mcp_registry)),
+                Some(notification_tx.clone()),
             );
             tokio::spawn(async move {
                 if let Err(e) = runner.run().await {
@@ -478,7 +505,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            crate::browser::pool::BrowserPool::global().reap_if_idle().await;
+            crate::browser::pool::BrowserPool::global()
+                .reap_if_idle()
+                .await;
         }
     });
 
@@ -503,9 +532,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
         if let Ok(resp) = resp {
             if let Ok(release) = resp.json::<serde_json::Value>().await {
-                let latest_raw = release["tag_name"]
-                    .as_str()
-                    .unwrap_or("");
+                let latest_raw = release["tag_name"].as_str().unwrap_or("");
                 let current_raw = env!("RSCLAW_BUILD_VERSION");
                 // Extract bare version: "2026.4.1 (abc123)" -> "2026.4.1",
                 // "2026.4.1-beta" -> "2026.4.1".
@@ -551,7 +578,6 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let _ = std::fs::remove_file(&pid_file);
     result
 }
-
 
 // ---------------------------------------------------------------------------
 // Agent task spawning
@@ -804,7 +830,8 @@ pub(crate) async fn handle_pending_analysis(
                 images: vec![],
                 channel: None,
 
-                    files: vec![],            })
+                files: vec![],
+            })
             .await;
         return;
     }
@@ -818,7 +845,8 @@ pub(crate) async fn handle_pending_analysis(
                     reply_to: None,
                     images: r.images,
                     files: r.files,
-                    channel: None,                })
+                    channel: None,
+                })
                 .await;
         }
         Ok(Ok(_)) => {} // empty reply, nothing to send
@@ -832,7 +860,8 @@ pub(crate) async fn handle_pending_analysis(
                     images: vec![],
                     channel: None,
 
-                    files: vec![],                })
+                    files: vec![],
+                })
                 .await;
         }
         Err(_) => {
@@ -845,7 +874,8 @@ pub(crate) async fn handle_pending_analysis(
                     images: vec![],
                     channel: None,
 
-                    files: vec![],                })
+                    files: vec![],
+                })
                 .await;
         }
     }
@@ -886,7 +916,11 @@ async fn download_bge_model(
                     .to_lowercase()
                     .contains("zh")
             });
-        let host = if is_zh { "https://hf-mirror.com" } else { "https://huggingface.co" };
+        let host = if is_zh {
+            "https://hf-mirror.com"
+        } else {
+            "https://huggingface.co"
+        };
         format!("{host}/{repo}/resolve/main")
     };
 
@@ -918,7 +952,10 @@ async fn download_bge_model(
             }
 
             // Check if partial file exists for resume.
-            let existing_len = tokio::fs::metadata(&partial).await.map(|m| m.len()).unwrap_or(0);
+            let existing_len = tokio::fs::metadata(&partial)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
 
             let mut req = client.get(&url);
             if existing_len > 0 {
@@ -944,7 +981,10 @@ async fn download_bge_model(
 
             // Stream to partial file (append if resuming).
             let mut file = if existing_len > 0 && status.as_u16() == 206 {
-                tokio::fs::OpenOptions::new().append(true).open(&partial).await?
+                tokio::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&partial)
+                    .await?
             } else {
                 tokio::fs::File::create(&partial).await?
             };

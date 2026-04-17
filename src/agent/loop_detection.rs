@@ -39,7 +39,13 @@ fn stable_stringify(value: &serde_json::Value) -> String {
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::String(s) => format!("\"{}\"", escape_json_string(s)),
         serde_json::Value::Array(arr) => {
-            format!("[{}]", arr.iter().map(stable_stringify).collect::<Vec<_>>().join(","))
+            format!(
+                "[{}]",
+                arr.iter()
+                    .map(stable_stringify)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
         }
         serde_json::Value::Object(obj) => {
             let keys: Vec<_> = obj.keys().collect();
@@ -215,7 +221,11 @@ impl LoopDetector {
     ///
     /// Progress detection: same args + different results = making progress.
     /// Only count as "loop" when same args AND same results (no progress).
-    pub fn check_with_params(&mut self, tool_name: &str, params: &serde_json::Value) -> LoopCheckResult {
+    pub fn check_with_params(
+        &mut self,
+        tool_name: &str,
+        params: &serde_json::Value,
+    ) -> LoopCheckResult {
         let args_hash = hash_tool_call(tool_name, params);
 
         // Add to history (result_hash will be set later via record_result)
@@ -301,14 +311,27 @@ impl LoopDetector {
     /// This is a backwards-compat wrapper that constructs an empty params value.
     /// Prefer `check_with_params` for proper argument hashing.
     pub fn check(&mut self, tool_name: &str) -> LoopCheckResult {
-        self.check_with_params(tool_name, &serde_json::Value::Object(serde_json::Map::new()))
+        self.check_with_params(
+            tool_name,
+            &serde_json::Value::Object(serde_json::Map::new()),
+        )
     }
 
     /// Record the result hash for the most recent tool call.
     /// Used for no-progress detection (same call, same result = stuck).
+    ///
+    /// If result contains `_loop_key` field, uses that for hashing instead of
+    /// the full result. This allows tools to provide a stable key that excludes
+    /// dynamic fields (like task_id) for proper loop detection.
     pub fn record_result(&mut self, result: &serde_json::Value) {
         if let Some(last) = self.history.back_mut() {
-            let result_str = stable_stringify(result);
+            // Use _loop_key if present, otherwise use full result
+            let result_str =
+                if let Some(loop_key) = result.get("_loop_key").and_then(|v| v.as_str()) {
+                    loop_key.to_owned()
+                } else {
+                    stable_stringify(result)
+                };
             last.result_hash = Some(format!("{}", simple_hash(&result_str)));
         }
     }
@@ -361,8 +384,8 @@ mod tests {
         // With dual thresholds: warn=3, crit=5
         // count >= warning_threshold triggers Warning, count >= critical triggers Critical
         let mut d = LoopDetector::with_dual_thresholds(10, 3, 5);
-        assert!(is_ok(&d.check("read")));     // count=1
-        assert!(is_ok(&d.check("read")));     // count=2
+        assert!(is_ok(&d.check("read"))); // count=1
+        assert!(is_ok(&d.check("read"))); // count=2
         assert!(is_warning(&d.check("read"))); // count=3 >= warn(3)
         assert!(is_warning(&d.check("read"))); // count=4
         assert!(is_critical(&d.check("read"))); // count=5 >= crit(5)
@@ -372,8 +395,8 @@ mod tests {
     fn single_threshold_constructor_sets_critical_above() {
         // LoopDetector::new with threshold=3 sets warning=3, critical=4
         let mut d = LoopDetector::new(10, 3);
-        assert!(is_ok(&d.check("exec")));      // count=1
-        assert!(is_ok(&d.check("exec")));      // count=2
+        assert!(is_ok(&d.check("exec"))); // count=1
+        assert!(is_ok(&d.check("exec"))); // count=2
         assert!(is_warning(&d.check("exec"))); // count=3 >= warn(3)
         assert!(is_critical(&d.check("exec"))); // count=4 >= crit(4)
     }
@@ -473,10 +496,10 @@ mod tests {
         let mut d = LoopDetector::with_dual_thresholds(10, 3, 5);
         let params = serde_json::json!({"command": "ls -la"});
 
-        assert!(is_ok(&d.check_with_params("exec", &params)));       // count=1
-        assert!(is_ok(&d.check_with_params("exec", &params)));       // count=2
-        assert!(is_warning(&d.check_with_params("exec", &params)));  // count=3 >= warn(3)
-        assert!(is_warning(&d.check_with_params("exec", &params)));  // count=4
+        assert!(is_ok(&d.check_with_params("exec", &params))); // count=1
+        assert!(is_ok(&d.check_with_params("exec", &params))); // count=2
+        assert!(is_warning(&d.check_with_params("exec", &params))); // count=3 >= warn(3)
+        assert!(is_warning(&d.check_with_params("exec", &params))); // count=4
         assert!(is_critical(&d.check_with_params("exec", &params))); // count=5 >= crit(5)
     }
 
@@ -540,10 +563,10 @@ mod tests {
         let params = serde_json::json!({"command": "ls"});
 
         // Call 1-2: same params, same result = stuck
-        assert!(is_ok(&d.check_with_params("exec", &params)));       // count=1
+        assert!(is_ok(&d.check_with_params("exec", &params))); // count=1
         d.record_result(&serde_json::json!({"stdout": "same_output"}));
 
-        assert!(is_ok(&d.check_with_params("exec", &params)));       // count=2
+        assert!(is_ok(&d.check_with_params("exec", &params))); // count=2
         d.record_result(&serde_json::json!({"stdout": "same_output"}));
 
         // Call 3: count=3 >= warn(3) = warning
@@ -600,9 +623,9 @@ mod tests {
         // Don't call record_result
 
         // Another call (previous still has result_hash=None)
-        assert!(is_ok(&d.check_with_params("exec", &params)));       // count=2
-        assert!(is_warning(&d.check_with_params("exec", &params)));  // count=3 >= warn(3)
-        assert!(is_warning(&d.check_with_params("exec", &params)));  // count=4
+        assert!(is_ok(&d.check_with_params("exec", &params))); // count=2
+        assert!(is_warning(&d.check_with_params("exec", &params))); // count=3 >= warn(3)
+        assert!(is_warning(&d.check_with_params("exec", &params))); // count=4
         assert!(is_critical(&d.check_with_params("exec", &params))); // count=5 >= crit(5)
     }
 }

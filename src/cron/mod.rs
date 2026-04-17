@@ -14,18 +14,26 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, Semaphore};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::{Semaphore, broadcast};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use crate::{
-    agent::{AgentMessage, AgentRegistry},
+    agent::{AgentMessage, AgentRegistry, AgentReply, AgentRuntime},
     channel::{ChannelManager, OutboundMessage},
-    config::schema::{CronConfig, CronDelivery, CronJobConfig},
+    config::{
+        runtime::RuntimeConfig,
+        schema::{CronConfig, CronDelivery, CronJobConfig},
+    },
+    events::AgentEvent,
+    plugin::PluginRegistry,
+    provider::registry::ProviderRegistry,
+    skill::SkillRegistry,
+    store::Store,
 };
 
 // ---------------------------------------------------------------------------
@@ -115,7 +123,10 @@ impl CronSchedule {
             CronSchedule::Nested { expr, tz, .. } => {
                 crate::cron::compute_next_run_from_expr(expr, from_ms, tz.as_deref())
             }
-            CronSchedule::Every { every_ms, anchor_ms } => {
+            CronSchedule::Every {
+                every_ms,
+                anchor_ms,
+            } => {
                 let every_ms = every_ms.unwrap_or(0);
                 if every_ms == 0 {
                     return None;
@@ -252,7 +263,10 @@ impl From<&CronJobConfig> for CronJob {
         Self {
             id: cfg.id.clone(),
             name: cfg.name.clone(),
-            agent_id: cfg.agent_id.clone().unwrap_or_else(|| "default".to_string()),
+            agent_id: cfg
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
             session_key,
             enabled: cfg.enabled.unwrap_or(true),
             schedule,
@@ -280,7 +294,10 @@ struct CronStore {
 
 impl Default for CronStore {
     fn default() -> Self {
-        Self { version: 1, jobs: Vec::new() }
+        Self {
+            version: 1,
+            jobs: Vec::new(),
+        }
     }
 }
 
@@ -313,9 +330,21 @@ pub struct CronRunner {
     semaphore: Arc<Semaphore>,
     default_delivery: Option<CronDelivery>,
     reload_tx: broadcast::Sender<()>,
+    /// Dependencies for creating temporary AgentRuntime instances.
+    config: Arc<RuntimeConfig>,
+    providers: Arc<ProviderRegistry>,
+    skills: Arc<SkillRegistry>,
+    store: Arc<Store>,
+    memory: Option<Arc<tokio::sync::Mutex<crate::agent::MemoryStore>>>,
+    event_tx: broadcast::Sender<AgentEvent>,
+    spawner: Option<Arc<crate::agent::AgentSpawner>>,
+    plugins: Option<Arc<PluginRegistry>>,
+    mcp: Option<Arc<crate::mcp::McpRegistry>>,
+    notification_tx: Option<broadcast::Sender<OutboundMessage>>,
 }
 
 impl CronRunner {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: &CronConfig,
         jobs: Vec<CronJob>,
@@ -323,6 +352,17 @@ impl CronRunner {
         channels: Arc<ChannelManager>,
         data_dir: PathBuf,
         reload_tx: broadcast::Sender<()>,
+        // Additional dependencies for direct AgentRuntime creation
+        runtime_config: Arc<RuntimeConfig>,
+        providers: Arc<ProviderRegistry>,
+        skills: Arc<SkillRegistry>,
+        store: Arc<Store>,
+        memory: Option<Arc<tokio::sync::Mutex<crate::agent::MemoryStore>>>,
+        event_tx: broadcast::Sender<AgentEvent>,
+        spawner: Option<Arc<crate::agent::AgentSpawner>>,
+        plugins: Option<Arc<PluginRegistry>>,
+        mcp: Option<Arc<crate::mcp::McpRegistry>>,
+        notification_tx: Option<broadcast::Sender<OutboundMessage>>,
     ) -> Self {
         let run_log_dir = data_dir.join("cron");
         let store_path = data_dir.join("cron_store.json");
@@ -336,6 +376,16 @@ impl CronRunner {
             semaphore: Arc::new(Semaphore::new(4)),
             default_delivery: config.default_delivery.clone(),
             reload_tx,
+            config: runtime_config,
+            providers,
+            skills,
+            store,
+            memory,
+            event_tx,
+            spawner,
+            plugins,
+            mcp,
+            notification_tx,
         }
     }
 
@@ -387,7 +437,11 @@ impl CronRunner {
         info!(
             total = jobs.len(),
             enabled = enabled_count,
-            next_wake = jobs.iter().filter_map(|j| j.state.as_ref().and_then(|s| s.next_run_at_ms)).min().unwrap_or(0),
+            next_wake = jobs
+                .iter()
+                .filter_map(|j| j.state.as_ref().and_then(|s| s.next_run_at_ms))
+                .min()
+                .unwrap_or(0),
             "cron scheduler started"
         );
 
@@ -399,7 +453,9 @@ impl CronRunner {
 
         let runner = self.clone();
         let timer_handle = tokio::spawn(async move {
-            runner.timer_loop(jobs, running_clone, semaphore, reload_rx).await;
+            runner
+                .timer_loop(jobs, running_clone, semaphore, reload_rx)
+                .await;
         });
 
         tokio::signal::ctrl_c().await?;
@@ -436,9 +492,15 @@ impl CronRunner {
                 .min();
 
             // DEBUG: log next_wake to diagnose early firing
-            debug!(next_wake = next_wake.unwrap_or(0), now_ms, "cron: timer tick");
+            debug!(
+                next_wake = next_wake.unwrap_or(0),
+                now_ms, "cron: timer tick"
+            );
             if next_wake.map(|t| t <= now_ms).unwrap_or(false) {
-                warn!(next_wake = next_wake.unwrap_or(0), now_ms, "cron: next_wake is in the past!");
+                warn!(
+                    next_wake = next_wake.unwrap_or(0),
+                    now_ms, "cron: next_wake is in the past!"
+                );
             }
 
             let delay_ms = match next_wake {
@@ -488,7 +550,8 @@ impl CronRunner {
                 let file_count = new_jobs.len();
 
                 // Debug: check if disabled job is in new_jobs
-                let disabled_in_file: Vec<_> = new_jobs.iter()
+                let disabled_in_file: Vec<_> = new_jobs
+                    .iter()
                     .filter(|j| !j.enabled)
                     .map(|j| (&j.id, j.enabled))
                     .collect();
@@ -497,7 +560,8 @@ impl CronRunner {
                 jobs = self.merge_jobs(&jobs, new_jobs, now_ms);
 
                 // Debug: check enabled state after merge
-                let disabled_after_merge: Vec<_> = jobs.iter()
+                let disabled_after_merge: Vec<_> = jobs
+                    .iter()
                     .filter(|j| !j.enabled)
                     .map(|j| (&j.id, j.enabled))
                     .collect();
@@ -506,7 +570,12 @@ impl CronRunner {
                 if let Err(e) = self.save_store(&jobs).await {
                     warn!(err = %e, "cron: failed to save store after reload");
                 }
-                info!(old_count, new_count = jobs.len(), file_count, "cron jobs reloaded");
+                info!(
+                    old_count,
+                    new_count = jobs.len(),
+                    file_count,
+                    "cron jobs reloaded"
+                );
                 continue;
             }
 
@@ -520,18 +589,23 @@ impl CronRunner {
                             .and_then(|s| s.next_run_at_ms)
                             .map(|t| t <= now_ms)
                             .unwrap_or(false)
-                        && j.state
-                            .as_ref()
-                            .and_then(|s| s.running_at_ms)
-                            .is_none()
+                        && j.state.as_ref().and_then(|s| s.running_at_ms).is_none()
                 })
                 .map(|j| j.id.clone())
                 .collect();
 
             // Debug: log enabled state of all jobs that are due but shouldn't fire
             if !due.is_empty() {
-                let disabled_due: Vec<_> = jobs.iter()
-                    .filter(|j| !j.enabled && j.state.as_ref().and_then(|s| s.next_run_at_ms).map(|t| t <= now_ms).unwrap_or(false))
+                let disabled_due: Vec<_> = jobs
+                    .iter()
+                    .filter(|j| {
+                        !j.enabled
+                            && j.state
+                                .as_ref()
+                                .and_then(|s| s.next_run_at_ms)
+                                .map(|t| t <= now_ms)
+                                .unwrap_or(false)
+                    })
                     .map(|j| j.id.clone())
                     .collect();
                 if !disabled_due.is_empty() {
@@ -573,14 +647,43 @@ impl CronRunner {
                 let channels = Arc::clone(&self.channels);
                 let run_log_dir = self.run_log_dir.clone();
                 let default_delivery = self.default_delivery.clone();
+                // Clone dependencies for run_cron_job
+                let config = Arc::clone(&self.config);
+                let providers = Arc::clone(&self.providers);
+                let skills = Arc::clone(&self.skills);
+                let store = Arc::clone(&self.store);
+                let memory = self.memory.clone();
+                let event_tx = self.event_tx.clone();
+                let spawner = self.spawner.clone();
+                let plugins = self.plugins.clone();
+                let mcp = self.mcp.clone();
+                let notification_tx = self.notification_tx.clone();
 
                 let handle = tokio::spawn(async move {
                     let start_time = current_timestamp_ms();
                     let job_started_at = started_at;
-                    let prev_consecutive_errors = job.state.as_ref().map(|s| s.consecutive_errors).unwrap_or(0);
+                    let prev_consecutive_errors = job
+                        .state
+                        .as_ref()
+                        .map(|s| s.consecutive_errors)
+                        .unwrap_or(0);
                     info!(job_id = %job.id, "cron job triggered");
 
-                    let result = run_cron_job(&job, &agents).await;
+                    let result = run_cron_job(
+                        &job,
+                        &agents,
+                        &config,
+                        &providers,
+                        &skills,
+                        &store,
+                        &memory,
+                        &event_tx,
+                        &spawner,
+                        &plugins,
+                        &mcp,
+                        &notification_tx,
+                    )
+                    .await;
                     let duration_ms = current_timestamp_ms() - start_time;
                     drop(permit);
 
@@ -617,17 +720,12 @@ impl CronRunner {
                             if will_disable {
                                 format!(
                                     "❌ 定时任务执行失败\n\n**任务**: {}\n**连续失败**: {} 次\n**错误**: {}\n\n⚠️ 任务已被自动禁用，请检查配置后手动启用。",
-                                    job_name,
-                                    consecutive,
-                                    e
+                                    job_name, consecutive, e
                                 )
                             } else {
                                 format!(
                                     "❌ 定时任务执行失败\n\n**任务**: {}\n**连续失败**: {} 次\n**下次重试**: {}后\n**错误**: {}",
-                                    job_name,
-                                    consecutive,
-                                    backoff_text,
-                                    e
+                                    job_name, consecutive, backoff_text, e
                                 )
                             }
                         }
@@ -660,7 +758,13 @@ impl CronRunner {
                     let _ = write_run_log(&run_log_dir, &job.id, entry).await;
 
                     let error_msg = result.as_ref().err().map(|e| e.to_string());
-                    (job.id, result.is_ok(), duration_ms, job_started_at, error_msg)
+                    (
+                        job.id,
+                        result.is_ok(),
+                        duration_ms,
+                        job_started_at,
+                        error_msg,
+                    )
                 });
 
                 handles.push(handle);
@@ -683,7 +787,8 @@ impl CronRunner {
                                 state.last_status = Some("ok".to_string());
                                 state.last_error = None;
                                 // Compute next run normally
-                                state.next_run_at_ms = job.schedule.compute_next_run(completion_time);
+                                state.next_run_at_ms =
+                                    job.schedule.compute_next_run(completion_time);
                             } else {
                                 state.consecutive_errors += 1;
                                 state.last_run_status = Some("error".to_string());
@@ -695,7 +800,11 @@ impl CronRunner {
                                 let backoff_next = completion_time + backoff;
                                 let normal_next = job.schedule.compute_next_run(completion_time);
                                 // Use whichever is later: the natural next run or the backoff delay
-                                state.next_run_at_ms = Some(normal_next.map(|n| n.max(backoff_next)).unwrap_or(backoff_next));
+                                state.next_run_at_ms = Some(
+                                    normal_next
+                                        .map(|n| n.max(backoff_next))
+                                        .unwrap_or(backoff_next),
+                                );
 
                                 info!(
                                     job_id = %job.id,
@@ -737,8 +846,26 @@ impl CronRunner {
 
         info!(job_id = %job.id, "manually triggering cron job");
         let _permit = self.semaphore.acquire().await?;
-        let prev_consecutive_errors = job.state.as_ref().map(|s| s.consecutive_errors).unwrap_or(0);
-        let result = run_cron_job(job, &self.agents).await;
+        let prev_consecutive_errors = job
+            .state
+            .as_ref()
+            .map(|s| s.consecutive_errors)
+            .unwrap_or(0);
+        let result = run_cron_job(
+            job,
+            &self.agents,
+            &self.config,
+            &self.providers,
+            &self.skills,
+            &self.store,
+            &self.memory,
+            &self.event_tx,
+            &self.spawner,
+            &self.plugins,
+            &self.mcp,
+            &self.notification_tx,
+        )
+        .await;
         let success = result.is_ok();
 
         // Build delivery message with execution summary
@@ -780,7 +907,12 @@ impl CronRunner {
     /// Preserves running state and error counts for existing jobs.
     /// Jobs in old_jobs but NOT in new_jobs are dropped (deleted from file).
     /// Takes `now_ms` from the caller (timer_loop) to avoid redundant calls.
-    fn merge_jobs(&self, old_jobs: &[CronJob], new_jobs: Vec<CronJob>, now_ms: u64) -> Vec<CronJob> {
+    fn merge_jobs(
+        &self,
+        old_jobs: &[CronJob],
+        new_jobs: Vec<CronJob>,
+        now_ms: u64,
+    ) -> Vec<CronJob> {
         let mut result = Vec::with_capacity(new_jobs.len());
 
         for mut new_job in new_jobs {
@@ -855,6 +987,17 @@ impl Clone for CronRunner {
             semaphore: Arc::clone(&self.semaphore),
             default_delivery: self.default_delivery.clone(),
             reload_tx: self.reload_tx.clone(),
+            // Clone new dependencies
+            config: Arc::clone(&self.config),
+            providers: Arc::clone(&self.providers),
+            skills: Arc::clone(&self.skills),
+            store: Arc::clone(&self.store),
+            memory: self.memory.clone(),
+            event_tx: self.event_tx.clone(),
+            spawner: self.spawner.clone(),
+            plugins: self.plugins.clone(),
+            mcp: self.mcp.clone(),
+            notification_tx: self.notification_tx.clone(),
         }
     }
 }
@@ -877,7 +1020,9 @@ fn field_matches(field: &str, value: u32) -> bool {
     }
     // Handle comma-separated lists (each part may be a value, range, or step)
     if field.contains(',') {
-        return field.split(',').any(|part| field_matches(part.trim(), value));
+        return field
+            .split(',')
+            .any(|part| field_matches(part.trim(), value));
     }
     // Handle range: "9-15" means 9 through 15 exclusive (start <= value < end)
     // This matches openclaw's interpretation where "9-11" means 9,10 only (not 11:59)
@@ -961,7 +1106,11 @@ fn compute_next_run_from_expr(cron_expr: &str, from_ms: u64, tz: Option<&str>) -
 
     // Current minute in the target timezone
     let local_now = utc_dt.with_timezone(&tz_for_search);
-    let mut cand = local_now.with_second(0).unwrap().with_nanosecond(0).unwrap();
+    let mut cand = local_now
+        .with_second(0)
+        .unwrap()
+        .with_nanosecond(0)
+        .unwrap();
     cand += chrono::Duration::minutes(1);
 
     // Search up to 1 year ahead (in local time)
@@ -1005,7 +1154,24 @@ fn current_timestamp_ms() -> u64 {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-async fn run_cron_job(job: &CronJob, agents: &AgentRegistry) -> Result<String> {
+/// Run a cron job by creating a temporary AgentRuntime and calling run_turn directly.
+/// This bypasses the agent inbox queue, so cron jobs execute immediately without
+/// waiting for other messages in the queue.
+#[allow(clippy::too_many_arguments)]
+async fn run_cron_job(
+    job: &CronJob,
+    agents: &Arc<AgentRegistry>,
+    config: &Arc<RuntimeConfig>,
+    providers: &Arc<ProviderRegistry>,
+    skills: &Arc<SkillRegistry>,
+    store: &Arc<Store>,
+    memory: &Option<Arc<tokio::sync::Mutex<crate::agent::MemoryStore>>>,
+    event_tx: &broadcast::Sender<AgentEvent>,
+    spawner: &Option<Arc<crate::agent::AgentSpawner>>,
+    plugins: &Option<Arc<PluginRegistry>>,
+    mcp: &Option<Arc<crate::mcp::McpRegistry>>,
+    notification_tx: &Option<broadcast::Sender<OutboundMessage>>,
+) -> Result<String> {
     let session_key = job
         .session_key
         .clone()
@@ -1020,14 +1186,18 @@ async fn run_cron_job(job: &CronJob, agents: &AgentRegistry) -> Result<String> {
         .payload
         .as_ref()
         .and_then(|p| match p {
-CronPayload::Structured { timeout_seconds, .. } => timeout_seconds.clone(),
+            CronPayload::Structured {
+                timeout_seconds, ..
+            } => timeout_seconds.clone(),
             CronPayload::Text(_) => None,
         })
         .unwrap_or(300);
 
-    // Register abort flag for this session before dispatching
+    // Register abort flag for this session before running
     let abort_flag = {
-        let mut flags = handle.abort_flags.write()
+        let mut flags = handle
+            .abort_flags
+            .write()
             .expect("abort_flags lock poisoned");
         flags
             .entry(session_key.clone())
@@ -1035,61 +1205,69 @@ CronPayload::Structured { timeout_seconds, .. } => timeout_seconds.clone(),
             .clone()
     };
 
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let msg = AgentMessage {
-        session_key: session_key.clone(),
-        text: job.effective_message().to_owned(),
-        channel: "cron".to_string(),
-        peer_id: format!("cron:{}", job.id),
-        chat_id: String::new(),
-        reply_tx,
-        extra_tools: vec![],
-        images: vec![],
-        files: vec![],
-    };
+    // Get fallback models from agent config
+    let fallback_models = handle
+        .config
+        .model
+        .as_ref()
+        .and_then(|m| m.fallbacks.clone())
+        .unwrap_or_default();
 
-    handle.tx.send(msg).await.context("agent inbox closed")?;
+    // Create a temporary AgentRuntime for this cron job
+    let mut runtime = AgentRuntime::new(
+        Arc::clone(&handle),
+        Arc::clone(config),
+        Arc::clone(providers),
+        fallback_models,
+        Arc::clone(skills),
+        Arc::clone(store),
+        memory.clone(),
+        Some(Arc::clone(agents)),
+        Some(event_tx.clone()),
+        spawner.clone(),
+        plugins.clone(),
+        mcp.clone(),
+        notification_tx.clone(),
+    );
 
-    let reply = tokio::time::timeout(Duration::from_secs(timeout_secs), reply_rx)
-        .await
-        .map_err(|_| {
-            // Timeout fired: abort the agent execution and capture status for error reporting.
-            abort_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            warn!(job_id = %job.id, session = %session_key, "cron: timeout fired, aborting agent");
+    // Run turn directly (bypass inbox queue)
+    let result = tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        runtime.run_turn(
+            &session_key,
+            job.effective_message(),
+            "cron",
+            &format!("cron:{}", job.id),
+            vec![], // extra_tools
+            vec![], // images
+            vec![], // files
+        ),
+    )
+    .await;
 
-            let agent_status = handle
-                .live_status
-                .try_read()
-                .map(|s| {
-                    let task = if s.current_task.is_empty() {
-                        "none".to_string()
-                    } else {
-                        s.current_task.chars().take(100).collect::<String>()
-                    };
-                    let tools = if s.tool_history.is_empty() {
-                        "none".to_string()
-                    } else {
-                        s.tool_history.join(", ")
-                    };
-                    format!(
-                        " (state: {}, task: \"{}\", tools called: [{}])",
-                        s.state, task, tools
-                    )
-                })
-                .unwrap_or_default();
-            anyhow!("cron job timed out after {}s{}", timeout_secs, agent_status)
-        })?
-        .context("agent dropped reply channel")?;
-
-    // Clear abort flag after successful completion
+    // Clear abort flag after completion
     abort_flag.store(false, std::sync::atomic::Ordering::SeqCst);
 
-    if reply.is_empty {
-        debug!(job_id = %job.id, "cron job returned no output");
-        Ok(String::new())
-    } else {
-        info!(job_id = %job.id, len = reply.text.len(), "cron job completed");
-        Ok(reply.text)
+    match result {
+        Ok(Ok(reply)) => {
+            if reply.is_empty {
+                debug!(job_id = %job.id, "cron job returned no output");
+                Ok(String::new())
+            } else {
+                info!(job_id = %job.id, len = reply.text.len(), "cron job completed");
+                Ok(reply.text)
+            }
+        }
+        Ok(Err(e)) => {
+            warn!(job_id = %job.id, error = %e, "cron job failed");
+            Err(e)
+        }
+        Err(_) => {
+            // Timeout fired: abort the agent execution
+            abort_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            warn!(job_id = %job.id, session = %session_key, "cron: timeout fired, aborting agent");
+            anyhow::bail!("cron job timed out after {}s", timeout_secs)
+        }
     }
 }
 
@@ -1183,11 +1361,7 @@ async fn send_delivery(
     }
 }
 
-fn build_run_log_entry(
-    job: &CronJob,
-    success: bool,
-    error: Option<anyhow::Error>,
-) -> RunLogEntry {
+fn build_run_log_entry(job: &CronJob, success: bool, error: Option<anyhow::Error>) -> RunLogEntry {
     RunLogEntry {
         id: uuid::Uuid::new_v4().to_string(),
         job_id: job.id.clone(),
@@ -1284,7 +1458,9 @@ pub fn load_cron_jobs() -> Vec<CronJob> {
         Err(_) => return Vec::new(),
     };
 
-    let parsed: serde_json::Value = json5::from_str(&raw).or_else(|_| serde_json::from_str(&raw)).unwrap_or_default();
+    let parsed: serde_json::Value = json5::from_str(&raw)
+        .or_else(|_| serde_json::from_str(&raw))
+        .unwrap_or_default();
 
     let jobs_array = if let Some(arr) = parsed.get("jobs").and_then(|v| v.as_array()) {
         arr.clone()
@@ -1323,8 +1499,8 @@ pub fn save_cron_jobs(jobs: &[CronJob]) -> anyhow::Result<()> {
         "jobs": jobs,
     });
 
-    let json = serde_json::to_string_pretty(&store)
-        .context("failed to serialize cron jobs to JSON")?;
+    let json =
+        serde_json::to_string_pretty(&store).context("failed to serialize cron jobs to JSON")?;
 
     // Ensure directory exists
     if let Some(parent) = cron_file.parent() {
