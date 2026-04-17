@@ -1227,7 +1227,7 @@ async fn run_cron_job(
         spawner.clone(),
         plugins.clone(),
         mcp.clone(),
-        notification_tx.clone(),
+        None, // notification_tx - cron results go through send_delivery, not agent notification
     );
 
     // Run turn directly (bypass inbox queue)
