@@ -547,8 +547,10 @@ impl super::runtime::AgentRuntime {
 
         tracing::info!(cwd = %workspace.display(), command = %command, "exec: executing");
 
-        // Timeout priority: tool call arg > config > default 30s.
-        // The model can pass a timeout parameter for long-running commands.
+        // Timeout for exec commands.
+        // Default: 300s = 5 min. Longer than typical main agent loop timeout.
+        // This gives background tasks enough time to complete.
+        // Can be configured via tools.exec.timeoutSeconds.
         let config_timeout = self
             .config
             .ext
@@ -556,10 +558,10 @@ impl super::runtime::AgentRuntime {
             .as_ref()
             .and_then(|t| t.exec.as_ref())
             .and_then(|e| e.timeout_seconds)
-            .unwrap_or(30);
+            .unwrap_or(300);
         let timeout_secs = args["timeout"]
             .as_u64()
-            .map(|t| t.min(300)) // cap at 5 min from model, config can go higher
+            .map(|t| t.min(3600)) // cap at 1 hour from model, config can go higher
             .unwrap_or(config_timeout);
 
         let mut cmd = tokio::process::Command::new(shell);
@@ -627,11 +629,17 @@ impl super::runtime::AgentRuntime {
             }))
         } else {
             // Background execution — spawn and return task_id immediately.
-            // The result will be collected by exec_pool on the next turn.
+            // The result will be collected by exec_pool AND injected to agent inbox.
             let pool = std::sync::Arc::clone(&ctx.exec_pool);
             let session_key = ctx.session_key.clone();
             let tool_call_id_owned = tool_call_id.to_owned();
             let command_owned = command.to_owned();
+
+            // Clone agent inbox for proactive result injection
+            let agent_tx = self.handle.tx.clone();
+            let agent_channel = ctx.channel.clone();
+            let agent_peer_id = ctx.peer_id.clone();
+            let agent_chat_id = ctx.chat_id.clone();
 
             tracing::info!(task_id = %task_id, command = %command, "exec: spawning background task");
 
@@ -671,23 +679,67 @@ impl super::runtime::AgentRuntime {
                 );
 
                 let exec_result = super::exec_pool::ExecResult {
-                    task_id: tid,
+                    task_id: tid.clone(),
                     tool_call_id: tool_call_id_owned,
-                    command: command_owned,
+                    command: command_owned.clone(),
                     exit_code,
-                    stdout,
-                    stderr,
+                    stdout: stdout.clone(),
+                    stderr: stderr.clone(),
                     started_at,
                     completed_at,
                 };
 
-                pool.add_pending_for_session(session_key, exec_result).await;
+                // Store for next turn collection
+                pool.add_pending_for_session(session_key.clone(), exec_result).await;
+
+                // Proactive injection: send result directly to agent inbox
+                // This triggers immediate processing without waiting for next user message
+                let result_summary = if exit_code == Some(0) {
+                    let truncated = if stdout.chars().count() > 3000 {
+                        let cutoff = stdout.char_indices().nth(3000).map(|(i, _)| i).unwrap_or(stdout.len());
+                        &stdout[..cutoff]
+                    } else {
+                        &stdout
+                    };
+                    format!(
+                        "[Background exec completed] task_id={}\ncommand: {}\nexit_code: 0\nstdout:\n{}",
+                        tid, command_owned, truncated
+                    )
+                } else {
+                    format!(
+                        "[Background exec completed] task_id={}\ncommand: {}\nexit_code: {}\nstderr: {}\nstdout: {}",
+                        tid, command_owned, exit_code.unwrap_or(-1), stderr, stdout
+                    )
+                };
+
+                use super::registry::{AgentMessage, AgentReply};
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
+                let inject_msg = AgentMessage {
+                    session_key,
+                    text: result_summary,
+                    channel: agent_channel,
+                    peer_id: agent_peer_id,
+                    chat_id: agent_chat_id,
+                    reply_tx,
+                    extra_tools: vec![],
+                    images: vec![],
+                    files: vec![],
+                };
+
+                if agent_tx.send(inject_msg).await.is_ok() {
+                    tracing::info!(task_id = %tid, "exec: result injected to agent inbox for proactive processing");
+                    // Wait a bit for agent to process (optional)
+                    let _ = tokio::time::timeout(Duration::from_secs(60), reply_rx).await;
+                } else {
+                    tracing::warn!(task_id = %tid, "exec: failed to inject result to agent inbox");
+                }
             });
 
             Ok(json!({
                 "task_id": task_id,
-                "status": "running",
-                "message": "Command started in background. Results will be delivered on your next turn, or poll with task_id."
+                "status": "submitted",
+                "message": "Command started in background. Result will be delivered automatically on your next turn. DO NOT poll - just continue with other tasks.",
+                "note": "No polling needed. The result appears in your next turn automatically."
             }))
         }
     }
