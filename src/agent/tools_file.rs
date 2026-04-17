@@ -641,6 +641,9 @@ impl super::runtime::AgentRuntime {
             let agent_peer_id = ctx.peer_id.clone();
             let agent_chat_id = ctx.chat_id.clone();
 
+            // Register task as running BEFORE spawn so is_running() works
+            ctx.exec_pool.register_running(task_id.clone()).await;
+
             tracing::info!(task_id = %task_id, command = %command, "exec: spawning background task");
 
             let tid = task_id.clone();
@@ -668,6 +671,9 @@ impl super::runtime::AgentRuntime {
                         (None, String::new(), format!("timed out after {} seconds", timeout_secs))
                     }
                 };
+
+                // Unregister task (no longer running) AFTER completion
+                pool.unregister_running(&tid).await;
 
                 let completed_at = std::time::Instant::now();
                 tracing::info!(
