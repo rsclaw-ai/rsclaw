@@ -109,7 +109,15 @@ pub async fn search_concurrent(registries: &[Registry], query: &str) -> Vec<Sear
                 existing.installs = result.installs;
             }
             if existing.description.is_none() {
-                existing.description = result.description;
+                if let Some(desc) = result.description {
+                    // Annotate description with its source registry when it
+                    // differs from the registry that owns the slug.
+                    existing.description = Some(if result.registry != existing.registry {
+                        format!("[{}] {}", result.registry, desc)
+                    } else {
+                        desc
+                    });
+                }
             }
             if existing.version.is_none() {
                 existing.version = result.version;
