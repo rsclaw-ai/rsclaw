@@ -3561,6 +3561,22 @@ impl AgentRuntime {
                     session_text
                 };
 
+                // Result sufficiency hint: when a tool returns substantial content
+                // after 3+ iterations, nudge the LLM to stop if the result looks complete.
+                let session_text = if iteration >= 3
+                    && !session_text.contains("\"error\"")
+                    && !session_text.contains("_do_not_retry")
+                    && session_text.len() > 500
+                    && !session_text.contains("[LOOP WARNING]")
+                {
+                    format!(
+                        "{session_text}\n\n[HINT: This result contains substantial content. \
+                         If it answers the user's question, reply directly without further tool calls.]"
+                    )
+                } else {
+                    session_text
+                };
+
                 let tool_msg = Message {
                     role: Role::Tool,
                     content: MessageContent::Parts(vec![

@@ -336,6 +336,7 @@ pub fn tool_prompts_for_system(base_dir: &Path, _lang: Option<&str>) -> String {
          - evaluate: Run arbitrary JS for DOM operations, data extraction, complex interactions.\n\
          - search: Auto-detect search box on any site, fill query, submit.\n\
          - screenshot: Capture visible page or specific element as image.\n\
+         - network sniff: Discover all media resources (images/videos/audio) on the page. Filter by type: {\"action\":\"network\",\"value\":\"sniff\",\"text\":\"image\"}. Use 'all' for everything.\n\
          \n\
          ## Login Handling\n\
          - In headed mode, user's Chrome carries existing login sessions for most sites.\n\

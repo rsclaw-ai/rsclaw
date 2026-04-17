@@ -1858,7 +1858,55 @@ impl BrowserSession {
                 let _ = self.cdp.send("Fetch.disable", json!({})).await;
                 Ok(json!({"action": "network", "text": "All intercept rules cleared"}))
             }
-            _ => Err(anyhow!("network: unknown sub-action (use requests/block/unblock/intercept/clear_intercepts)"))
+            "sniff" | "resources" => {
+                // Discover all media resources on the page: images, videos, audio,
+                // fonts, and XHR/fetch URLs — combines DOM scanning with performance API.
+                let filter = args.get("text").and_then(|v| v.as_str()).unwrap_or("all");
+                let js = format!(r#"(function() {{
+  var r = {{}};
+  // DOM: images
+  document.querySelectorAll('img,picture source').forEach(function(el){{
+    var s = el.src || el.dataset.src || el.currentSrc || el.getAttribute('srcset') || '';
+    if(s && s.startsWith('http')) {{ r[s] = r[s] || {{type:'image',tag:el.tagName}}; }}
+  }});
+  // DOM: videos
+  document.querySelectorAll('video,video source').forEach(function(el){{
+    var s = el.src || el.dataset.src || el.getAttribute('src') || '';
+    if(s && s.startsWith('http')) {{ r[s] = r[s] || {{type:'video',tag:el.tagName}}; }}
+  }});
+  // DOM: audio
+  document.querySelectorAll('audio,audio source').forEach(function(el){{
+    var s = el.src || el.dataset.src || '';
+    if(s && s.startsWith('http')) {{ r[s] = r[s] || {{type:'audio',tag:el.tagName}}; }}
+  }});
+  // DOM: stylesheets and scripts
+  document.querySelectorAll('link[rel=stylesheet]').forEach(function(el){{
+    if(el.href) {{ r[el.href] = r[el.href] || {{type:'css'}}; }}
+  }});
+  // Performance API: XHR/fetch/other resources
+  performance.getEntriesByType('resource').forEach(function(e){{
+    if(!r[e.name]) {{
+      var t = e.initiatorType || 'other';
+      if(t==='xmlhttprequest'||t==='fetch') t='xhr';
+      r[e.name] = {{type:t,size:e.transferSize||0}};
+    }}
+  }});
+  // Filter
+  var filter = '{filter}';
+  var entries = Object.entries(r);
+  if(filter !== 'all') {{
+    entries = entries.filter(function(kv){{ return kv[1].type === filter; }});
+  }}
+  return JSON.stringify(entries.map(function(kv){{
+    return {{url:kv[0],type:kv[1].type,tag:kv[1].tag||'',size:kv[1].size||0}};
+  }}));
+}})()"#);
+                let result = self.eval_js(&js).await?;
+                let resources: Value = serde_json::from_str(&result).unwrap_or(json!([]));
+                let count = resources.as_array().map(|a| a.len()).unwrap_or(0);
+                Ok(json!({"action":"network","sub":"sniff","filter":filter,"count":count,"resources":resources}))
+            }
+            _ => Err(anyhow!("network: unknown sub-action (use requests/sniff/block/unblock/intercept/clear_intercepts)"))
         }
     }
 

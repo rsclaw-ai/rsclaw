@@ -249,6 +249,12 @@ pub(crate) fn build_system_prompt(
              - Read file: use `read_file`. Write/create file: use `write_file`.\n\
              - For documents (xlsx/docx/pdf/pptx): use the `doc` tool, not execute_command.\n\
              - Reserve `execute_command` for system commands and tasks that have no dedicated tool.\n\
+             ### Completion Discipline (CRITICAL)\n\
+             - When you have enough information to answer the user, STOP and reply immediately.\n\
+             - Do NOT search for additional confirmation after finding the answer.\n\
+             - Do NOT repeat a tool call that already returned useful results.\n\
+             - One successful search/fetch is usually enough. Two is the maximum for verification.\n\
+             - If a web_browser operation produced the content the user asked for, deliver it — do not navigate further.\n\
              ### Web Operations\n\
              - When user asks to go to a specific site (e.g. 'go to douyin', 'open taobao'), use `web_browser` directly. Do NOT search first.\n\
              - For general questions or info lookup, use `web_search` first.\n\
