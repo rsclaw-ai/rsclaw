@@ -120,8 +120,9 @@ pub async fn search_concurrent(registries: &[Registry], query: &str) -> Vec<Sear
         }
     }
 
-    // Sort by installs descending; unranked results go to the bottom.
-    merged.sort_by(|a, b| b.installs.unwrap_or(0).cmp(&a.installs.unwrap_or(0)));
+    // Sort by composite popularity score: installs (primary) + downloads + stars.
+    // Stars are weighted higher than raw downloads as a quality signal.
+    merged.sort_by(|a, b| popularity_score(b).cmp(&popularity_score(a)));
     merged
 }
 
@@ -260,6 +261,18 @@ fn to_result(item: &serde_json::Value, registry: &str) -> SearchResult {
             .or_else(|| item["star_count"].as_u64()),
         registry: registry.to_owned(),
     }
+}
+
+/// Composite popularity score for sorting search results.
+///
+/// installs + downloads×0.5 + stars×10
+/// Stars are weighted highest per unit as a quality signal.
+/// Results with no signals sort to the bottom.
+fn popularity_score(r: &SearchResult) -> u64 {
+    let installs = r.installs.unwrap_or(0);
+    let downloads = r.downloads.unwrap_or(0) / 2;
+    let stars = r.stars.unwrap_or(0).saturating_mul(10);
+    installs.saturating_add(downloads).saturating_add(stars)
 }
 
 /// Normalize slug to a short name for deduplication.

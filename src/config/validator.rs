@@ -21,10 +21,10 @@ pub fn validate(cfg: &RuntimeConfig) -> Result<()> {
 }
 
 fn validate_gateway(cfg: &RuntimeConfig) -> Result<()> {
-    if cfg.gateway.bind == BindMode::All && !cfg.gateway.auth_token_configured {
+    if !cfg.gateway.auth_token_configured {
         warn!(
-            "gateway.bind = \"all\" but no auth token is set. \
-             This exposes the gateway to the local network without authentication."
+            "gateway.auth.token is not set — the gateway accepts all connections without authentication. \
+             Set gateway.auth.token in your config to require a bearer token."
         );
     }
     if cfg.gateway.port < 1024 && cfg.gateway.port != 80 && cfg.gateway.port != 443 {
