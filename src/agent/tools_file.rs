@@ -654,14 +654,33 @@ impl super::runtime::AgentRuntime {
 
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::info!(cwd = %workspace.display(), command = %command, exit_code = ?output.status.code(), stdout_len = stdout.len(), stderr_len = stderr.len(), "exec: done");
+            let exit_code = output.status.code();
+            tracing::info!(cwd = %workspace.display(), command = %command, exit_code = ?exit_code, stdout_len = stdout.len(), stderr_len = stderr.len(), "exec: done");
 
-            Ok(json!({
-                "task_id": task_id,
-                "exit_code": output.status.code(),
-                "stdout": stdout,
-                "stderr": stderr,
-            }))
+            // Add _loop_key for stable loop detection (excludes task_id and varying output)
+            let loop_key = format!("exec_sync:{}", command);
+
+            // Add explicit failure indicator for non-zero exit codes
+            if exit_code.map(|c| c != 0).unwrap_or(true) {
+                Ok(json!({
+                    "task_id": task_id,
+                    "exit_code": exit_code,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "_loop_key": loop_key,
+                    "_failed": true,
+                    "_do_not_retry": true,
+                    "_hint": "This command failed. Do NOT retry the same command. Check the stderr for error details and inform the user about the failure."
+                }))
+            } else {
+                Ok(json!({
+                    "task_id": task_id,
+                    "exit_code": exit_code,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "_loop_key": loop_key,
+                }))
+            }
         } else {
             // Background execution — spawn and return task_id immediately.
             // The result will be collected by exec_pool AND injected to agent inbox.

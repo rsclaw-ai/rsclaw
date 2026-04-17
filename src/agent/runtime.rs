@@ -13,7 +13,11 @@
 //!   9. Auto-Recall (inject relevant memories) + Auto-Capture (store user
 //!      message)
 
-use std::{sync::Arc, sync::atomic::{AtomicBool, Ordering}, time::Duration};
+use std::{
+    sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use anyhow::{Result, anyhow};
 use futures::StreamExt;
@@ -47,27 +51,25 @@ pub struct LiveStatus {
     pub session_key: String,
 }
 
+pub use super::context_mgr::estimate_tokens;
+use super::context_mgr::{
+    apply_context_budget_trim, apply_context_pruning, build_clear_summary, compress_image_for_llm,
+    msg_tokens, strip_old_images,
+};
+use super::platform::match_skills;
+use super::prompt_builder::{
+    READONLY_COMMANDS, build_help_text_filtered, build_system_prompt, format_duration,
+    memory_age_label,
+};
+use super::security::check_read_safety;
+use super::tools_builder::{build_tool_list, toolset_allowed_names};
 use super::{
     loop_detection::LoopDetector,
     memory::{MemoryDoc, MemoryStore},
     registry::{AgentHandle, AgentMessage, AgentRegistry, AgentReply},
     tool_call_repair::repair_tool_result_pairing,
-    workspace::{
-        DEFAULT_MAX_CHARS_PER_FILE, DEFAULT_TOTAL_MAX_CHARS, SessionType,
-    },
+    workspace::{DEFAULT_MAX_CHARS_PER_FILE, DEFAULT_TOTAL_MAX_CHARS, SessionType},
 };
-pub use super::context_mgr::estimate_tokens;
-use super::context_mgr::{
-    apply_context_budget_trim, apply_context_pruning, build_clear_summary,
-    compress_image_for_llm, msg_tokens, strip_old_images,
-};
-use super::platform::match_skills;
-use super::prompt_builder::{
-    build_help_text_filtered, build_system_prompt, format_duration,
-    memory_age_label, READONLY_COMMANDS,
-};
-use super::security::check_read_safety;
-use super::tools_builder::{build_tool_list, toolset_allowed_names};
 use crate::{
     config::runtime::RuntimeConfig,
     events::AgentEvent,
@@ -118,7 +120,6 @@ impl Drop for AbortFlagGuard {
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // PendingFile — file awaiting user confirmation (two-layer)
@@ -259,7 +260,8 @@ pub struct AgentRuntime {
     workspace_cache: Option<crate::agent::workspace::WorkspaceCache>,
     /// Background context manager (/ctx command, formerly /btw).
     btw_manager: super::btw::BtwManager,
-    pub(crate) notification_tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
+    pub(crate) notification_tx:
+        Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
     pub(crate) opencode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
     pub(crate) claudecode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
     /// In-memory session alias cache: alias_key → canonical session_key.
@@ -307,11 +309,7 @@ impl AgentRuntime {
         let session_aliases = store.db.load_all_aliases().unwrap_or_default();
         let btw_manager = super::btw::BtwManager::new(Some(Arc::clone(&store.db)));
         let live_status = Arc::clone(&handle.live_status);
-        let max_concurrent = config
-            .agents
-            .defaults
-            .max_concurrent
-            .unwrap_or(4);
+        let max_concurrent = config.agents.defaults.max_concurrent.unwrap_or(4);
         let exec_pool = super::exec_pool::ExecPool::new(max_concurrent as usize);
         let rt = Self {
             handle,
@@ -1318,7 +1316,12 @@ impl AgentRuntime {
             {
                 // Group chat safety: block dangerous preparse commands (/run, /ls, /cat, etc.)
                 let is_group = session_key.contains(":group:");
-                if is_group && matches!(tool.as_str(), "execute_command" | "exec" | "read_file" | "read" | "write_file" | "write") {
+                if is_group
+                    && matches!(
+                        tool.as_str(),
+                        "execute_command" | "exec" | "read_file" | "read" | "write_file" | "write"
+                    )
+                {
                     return Ok(AgentReply {
                         text: "[Blocked] Shell/file commands are not allowed in group chats for security.".to_owned(),
                         is_empty: false,
@@ -1528,13 +1531,16 @@ impl AgentRuntime {
 
         if !media_files.is_empty() {
             // Auto-enable voice mode when user sends audio (not video).
-            let has_audio = media_files.iter().any(|f|
+            let has_audio = media_files.iter().any(|f| {
                 crate::channel::is_audio_attachment(&f.mime_type, &f.filename)
-                && !crate::channel::is_video_attachment(&f.mime_type, &f.filename)
-            );
+                    && !crate::channel::is_video_attachment(&f.mime_type, &f.filename)
+            });
             if has_audio {
                 self.voice_mode_sessions.insert(session_key.to_owned());
-                debug!(session = session_key, "voice mode enabled (audio attachment detected)");
+                debug!(
+                    session = session_key,
+                    "voice mode enabled (audio attachment detected)"
+                );
             }
             let mut transcriptions = Vec::new();
             for mf in &media_files {
@@ -1773,7 +1779,17 @@ impl AgentRuntime {
         // Detect parallelism keywords in user message and inject task-agent hint.
         {
             let lower = text.to_lowercase();
-            let parallel_keywords = ["并行", "并发", "最快", "同时", "parallel", "concurrent", "fastest", "simultaneously", "分别"];
+            let parallel_keywords = [
+                "并行",
+                "并发",
+                "最快",
+                "同时",
+                "parallel",
+                "concurrent",
+                "fastest",
+                "simultaneously",
+                "分别",
+            ];
             if parallel_keywords.iter().any(|kw| lower.contains(kw)) {
                 system_prompt.push_str(
                     "\n\n[PARALLEL HINT] The user wants parallel execution. \
@@ -1952,7 +1968,15 @@ impl AgentRuntime {
             // Group chat safety: strip dangerous tools to prevent exec via LLM
             let is_group = session_key.contains(":group:");
             if is_group {
-                const GROUP_BLOCKED_TOOLS: &[&str] = &["execute_command", "exec", "read_file", "read", "write_file", "write", "computer_use"];
+                const GROUP_BLOCKED_TOOLS: &[&str] = &[
+                    "execute_command",
+                    "exec",
+                    "read_file",
+                    "read",
+                    "write_file",
+                    "write",
+                    "computer_use",
+                ];
                 all.retain(|t| !GROUP_BLOCKED_TOOLS.contains(&t.name.as_str()));
             }
 
@@ -2067,11 +2091,16 @@ impl AgentRuntime {
 
         // Get or create abort flag for this session.
         let abort_flag: Arc<AtomicBool> = {
-            let mut flags = self.handle.abort_flags.write()
+            let mut flags = self
+                .handle
+                .abort_flags
+                .write()
                 .expect("abort_flags lock poisoned");
-            Arc::clone(flags.entry(session_key.to_string()).or_insert_with(|| {
-                Arc::new(AtomicBool::new(false))
-            }))
+            Arc::clone(
+                flags
+                    .entry(session_key.to_string())
+                    .or_insert_with(|| Arc::new(AtomicBool::new(false))),
+            )
         };
 
         // RAII guard: clears abort flag when turn exits (normal or error).
@@ -2148,12 +2177,14 @@ impl AgentRuntime {
             if !matched.is_empty() {
                 let skill_prompts: String = matched
                     .iter()
-                    .map(|s| format!(
-                        "<active_skill name=\"{}\" version=\"{}\">\n{}\n</active_skill>",
-                        s.name,
-                        s.version.as_deref().unwrap_or(""),
-                        s.prompt.trim(),
-                    ))
+                    .map(|s| {
+                        format!(
+                            "<active_skill name=\"{}\" version=\"{}\">\n{}\n</active_skill>",
+                            s.name,
+                            s.version.as_deref().unwrap_or(""),
+                            s.prompt.trim(),
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 system_prompt.push_str(&format!(
@@ -2169,7 +2200,14 @@ impl AgentRuntime {
 
         let reply = time::timeout(
             Duration::from_secs(timeout_secs),
-            self.agent_loop(&mut ctx, &model, &system_prompt, tools, extra_tools, abort_flag.clone()),
+            self.agent_loop(
+                &mut ctx,
+                &model,
+                &system_prompt,
+                tools,
+                extra_tools,
+                abort_flag.clone(),
+            ),
         )
         .await
         .map_err(|_| {
@@ -2185,7 +2223,9 @@ impl AgentRuntime {
             status.current_task.clear();
             status.text_preview.clear();
         }
-        self.handle.session_count.store(self.sessions.len(), std::sync::atomic::Ordering::Relaxed);
+        self.handle
+            .session_count
+            .store(self.sessions.len(), std::sync::atomic::Ordering::Relaxed);
 
         // Append to JSONL transcript (AGENTS.md §20 step 11).
         self.append_transcript(session_key, text, &reply.text).await;
@@ -2202,7 +2242,11 @@ impl AgentRuntime {
             && !ctx.recalled_memory_ids.is_empty()
         {
             let signal = Self::infer_outcome_signal(&reply, &ctx, channel);
-            tracing::debug!(signal, recalled = ctx.recalled_memory_ids.len(), "evolution: applying feedback");
+            tracing::debug!(
+                signal,
+                recalled = ctx.recalled_memory_ids.len(),
+                "evolution: applying feedback"
+            );
             if signal.abs() > f32::EPSILON {
                 let mut store = mem.lock().await;
                 for mem_id in &ctx.recalled_memory_ids {
@@ -2344,9 +2388,13 @@ impl AgentRuntime {
         {
             match self.generate_tts_audio(&reply.text).await {
                 Ok(audio_path) => {
-                    let mime = if audio_path.ends_with(".wav") { "audio/wav" }
-                        else if audio_path.ends_with(".mp3") { "audio/mpeg" }
-                        else { "audio/wav" };
+                    let mime = if audio_path.ends_with(".wav") {
+                        "audio/wav"
+                    } else if audio_path.ends_with(".mp3") {
+                        "audio/mpeg"
+                    } else {
+                        "audio/wav"
+                    };
                     reply.files.push((
                         std::path::Path::new(&audio_path)
                             .file_name()
@@ -2447,7 +2495,10 @@ impl AgentRuntime {
 
         // Inject completed async task results into the session.
         {
-            let mut pending = self.pending_task_results.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pending = self
+                .pending_task_results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let mut completed = Vec::new();
             pending.retain(|(tid, sk, result)| {
                 if sk == &ctx.session_key {
@@ -2478,31 +2529,54 @@ impl AgentRuntime {
         }
 
         // Check for pending exec results from background tasks.
-        let pending_results = self.exec_pool.collect_pending_for_session(&ctx.session_key).await;
+        let pending_results = self
+            .exec_pool
+            .collect_pending_for_session(&ctx.session_key)
+            .await;
         if !pending_results.is_empty() {
             info!(session = %ctx.session_key, count = pending_results.len(), "exec_pool: collected pending results");
             if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
                 // Collect existing ToolUse IDs in session
-                let session_tool_ids: std::collections::HashSet<String> = sess.iter()
+                let session_tool_ids: std::collections::HashSet<String> = sess
+                    .iter()
                     .filter_map(|m| {
                         if m.role == Role::Assistant {
                             if let MessageContent::Parts(parts) = &m.content {
-                                Some(parts.iter().filter_map(|p| {
-                                    if let ContentPart::ToolUse { id, .. } = p { Some(id.clone()) } else { None }
-                                }).collect::<Vec<_>>())
-                            } else { None }
-                        } else { None }
+                                Some(
+                                    parts
+                                        .iter()
+                                        .filter_map(|p| {
+                                            if let ContentPart::ToolUse { id, .. } = p {
+                                                Some(id.clone())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect::<Vec<_>>(),
+                                )
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
                     })
                     .flatten()
                     .collect();
 
                 // Find running ToolResults to replace
-                let running_ids: std::collections::HashSet<String> = sess.iter()
+                let running_ids: std::collections::HashSet<String> = sess
+                    .iter()
                     .filter_map(|m| {
                         if m.role == Role::Tool {
                             if let MessageContent::Parts(parts) = &m.content {
                                 for p in parts {
-                                    if let ContentPart::ToolResult { tool_use_id, content, .. } = p {
+                                    if let ContentPart::ToolResult {
+                                        tool_use_id,
+                                        content,
+                                        ..
+                                    } = p
+                                    {
                                         if content.contains("\"status\": \"running\"") {
                                             return Some(tool_use_id.clone());
                                         }
@@ -2515,7 +2589,8 @@ impl AgentRuntime {
                     .collect();
 
                 // Remove running status ToolResults that will be replaced
-                let ids_to_replace: std::collections::HashSet<String> = pending_results.iter()
+                let ids_to_replace: std::collections::HashSet<String> = pending_results
+                    .iter()
                     .map(|r| r.tool_call_id.clone())
                     .filter(|id| running_ids.contains(id))
                     .collect();
@@ -2524,8 +2599,15 @@ impl AgentRuntime {
                         if m.role == Role::Tool {
                             if let MessageContent::Parts(parts) = &m.content {
                                 for p in parts {
-                                    if let ContentPart::ToolResult { tool_use_id, content, .. } = p {
-                                        if ids_to_replace.contains(tool_use_id) && content.contains("\"status\": \"running\"") {
+                                    if let ContentPart::ToolResult {
+                                        tool_use_id,
+                                        content,
+                                        ..
+                                    } = p
+                                    {
+                                        if ids_to_replace.contains(tool_use_id)
+                                            && content.contains("\"status\": \"running\"")
+                                        {
                                             return false;
                                         }
                                     }
@@ -2554,7 +2636,8 @@ impl AgentRuntime {
                         "exit_code": result.exit_code,
                         "stdout": result.stdout,
                         "stderr": result.stderr,
-                    }).to_string();
+                    })
+                    .to_string();
                     sess.push(Message {
                         role: Role::Tool,
                         content: MessageContent::Parts(vec![ContentPart::ToolResult {
@@ -2570,7 +2653,11 @@ impl AgentRuntime {
         // Dynamic iteration limit based on task complexity.
         // Default: 15 iterations. Complex tools (browser/opencode/exec): up to configured max.
         const BASE_ITERATIONS: usize = 20;
-        let configured_complex: usize = self.config.agents.defaults.max_iterations
+        let configured_complex: usize = self
+            .config
+            .agents
+            .defaults
+            .max_iterations
             .map(|v| v as usize)
             .unwrap_or(50);
         let mut max_iterations = BASE_ITERATIONS;
@@ -2616,7 +2703,8 @@ impl AgentRuntime {
                     "agent_loop: hit max iteration limit, breaking out"
                 );
                 return Ok(AgentReply {
-                    text: crate::i18n::t("agent_max_iterations", crate::i18n::default_lang()).to_owned(),
+                    text: crate::i18n::t("agent_max_iterations", crate::i18n::default_lang())
+                        .to_owned(),
                     is_empty: false,
                     tool_calls: None,
                     images: vec![],
@@ -2709,7 +2797,9 @@ impl AgentRuntime {
 
             let msg_count = messages.len();
             let approx_tokens: usize = messages.iter().map(msg_tokens).sum();
-            self.handle.last_ctx_tokens.store(approx_tokens, std::sync::atomic::Ordering::Relaxed);
+            self.handle
+                .last_ctx_tokens
+                .store(approx_tokens, std::sync::atomic::Ordering::Relaxed);
             info!(session = %ctx.session_key, msg_count, approx_tokens, model = %model, "LLM call: context size");
 
             // Context usage awareness: inject hint when usage is high.
@@ -2718,13 +2808,17 @@ impl AgentRuntime {
             let effective_system = if approx_tokens > 0 && context_tokens > 0 {
                 let usage_pct = (approx_tokens * 100) / context_tokens;
                 if usage_pct >= 90 {
-                    format!("{system_prompt}\n\n[Context usage: {usage_pct}% — CRITICAL. \
+                    format!(
+                        "{system_prompt}\n\n[Context usage: {usage_pct}% — CRITICAL. \
                         Keep responses very concise. Do not re-read files already in context. \
-                        Suggest user start a new session if task is complete.]")
+                        Suggest user start a new session if task is complete.]"
+                    )
                 } else if usage_pct >= 70 {
-                    format!("{system_prompt}\n\n[Context usage: {usage_pct}%. \
+                    format!(
+                        "{system_prompt}\n\n[Context usage: {usage_pct}%. \
                         Optimize: keep tool outputs short (use offset/limit for reads, \
-                        pipe to head/tail for commands). Avoid re-reading files already in context.]")
+                        pipe to head/tail for commands). Avoid re-reading files already in context.]"
+                    )
                 } else {
                     system_prompt.to_owned()
                 }
@@ -2932,16 +3026,24 @@ impl AgentRuntime {
                                         other => serde_json::to_string(other).unwrap_or_default(),
                                     };
                                     let existing = last.2.as_str().unwrap_or("");
-                                    last.2 = serde_json::Value::String(format!("{existing}{fragment}"));
+                                    last.2 =
+                                        serde_json::Value::String(format!("{existing}{fragment}"));
                                 } else if let Some(new_str) = input.as_str() {
                                     // Last is Object but new chunk is String — convert.
-                                    let existing_str = serde_json::to_string(&last.2).unwrap_or_default();
-                                    last.2 = serde_json::Value::String(format!("{existing_str}{new_str}"));
+                                    let existing_str =
+                                        serde_json::to_string(&last.2).unwrap_or_default();
+                                    last.2 = serde_json::Value::String(format!(
+                                        "{existing_str}{new_str}"
+                                    ));
                                 } else {
                                     // Last resort: convert both to string.
-                                    let existing_str = serde_json::to_string(&last.2).unwrap_or_default();
-                                    let fragment = serde_json::to_string(&input).unwrap_or_default();
-                                    last.2 = serde_json::Value::String(format!("{existing_str}{fragment}"));
+                                    let existing_str =
+                                        serde_json::to_string(&last.2).unwrap_or_default();
+                                    let fragment =
+                                        serde_json::to_string(&input).unwrap_or_default();
+                                    last.2 = serde_json::Value::String(format!(
+                                        "{existing_str}{fragment}"
+                                    ));
                                     tracing::debug!(
                                         "streaming tool call: merged non-string types as strings"
                                     );
@@ -2953,7 +3055,9 @@ impl AgentRuntime {
                         // Update context token count with real usage from LLM if available.
                         if let Some(ref u) = usage {
                             let real_tokens = (u.input + u.output) as usize;
-                            self.handle.last_ctx_tokens.store(real_tokens, std::sync::atomic::Ordering::Relaxed);
+                            self.handle
+                                .last_ctx_tokens
+                                .store(real_tokens, std::sync::atomic::Ordering::Relaxed);
                             debug!(
                                 session = %ctx.session_key,
                                 input_tokens = u.input,
@@ -2995,7 +3099,12 @@ impl AgentRuntime {
             // Can be overridden via agents.defaults.stripThinkTags.
             let pre_strip_len = text_buf.trim().len();
             let thinking_active = thinking_budget.unwrap_or(0) > 0;
-            let strip_enabled = self.config.agents.defaults.strip_think_tags.unwrap_or(!thinking_active);
+            let strip_enabled = self
+                .config
+                .agents
+                .defaults
+                .strip_think_tags
+                .unwrap_or(!thinking_active);
             if strip_enabled {
                 let before = text_buf.clone();
                 text_buf = crate::provider::openai::strip_think_tags_pub(&text_buf);
@@ -3012,9 +3121,16 @@ impl AgentRuntime {
             // Reasoning models (e.g. kimi-for-coding) may return only reasoning_content
             // with empty content. Use reasoning as the reply text to avoid saving an
             // empty assistant message (which some APIs reject on the next turn).
-            tracing::info!(text_len = text_buf.len(), reasoning_len = reasoning_buf.len(), "agent_loop: post-stream buffers");
+            tracing::info!(
+                text_len = text_buf.len(),
+                reasoning_len = reasoning_buf.len(),
+                "agent_loop: post-stream buffers"
+            );
             if text_buf.trim().is_empty() && !reasoning_buf.trim().is_empty() {
-                tracing::info!(reasoning_len = reasoning_buf.len(), "agent_loop: using reasoning as reply text");
+                tracing::info!(
+                    reasoning_len = reasoning_buf.len(),
+                    "agent_loop: using reasoning as reply text"
+                );
                 text_buf = reasoning_buf.clone();
             }
 
@@ -3193,7 +3309,12 @@ impl AgentRuntime {
             // Send intermediate text to user immediately (progress feedback).
             // Model often says "好的，我来帮你搜索" before calling tools — send it now
             // instead of waiting for the entire turn to complete.
-            let intermediate_enabled = self.config.agents.defaults.intermediate_output.unwrap_or(true);
+            let intermediate_enabled = self
+                .config
+                .agents
+                .defaults
+                .intermediate_output
+                .unwrap_or(true);
             if intermediate_enabled && !text_buf.is_empty() && !tool_calls.is_empty() {
                 if let Some(ref ntx) = self.notification_tx {
                     let notif_target = if !ctx.chat_id.is_empty() {
@@ -3210,7 +3331,10 @@ impl AgentRuntime {
                         files: vec![],
                         channel: Some(ctx.channel.clone()),
                     });
-                    tracing::debug!(text_len = text_buf.len(), "agent_loop: sent intermediate text to user");
+                    tracing::debug!(
+                        text_len = text_buf.len(),
+                        "agent_loop: sent intermediate text to user"
+                    );
                 }
             }
 
@@ -3298,7 +3422,8 @@ impl AgentRuntime {
                             "Too many consecutive parse errors, aborting turn"
                         );
                         // Record for loop detection
-                        ctx.loop_detector.record_result(&serde_json::json!({"error": "too many parse errors"}));
+                        ctx.loop_detector
+                            .record_result(&serde_json::json!({"error": "too many parse errors"}));
                         // Return error to break the loop
                         return Err(anyhow!(
                             "Turn aborted: {} consecutive tool parse errors. Model output may be corrupted.",
@@ -3307,7 +3432,8 @@ impl AgentRuntime {
                     }
 
                     // Record for loop detection so error doesn't count as a "different result"
-                    ctx.loop_detector.record_result(&serde_json::json!({"error": err_msg}));
+                    ctx.loop_detector
+                        .record_result(&serde_json::json!({"error": err_msg}));
 
                     // Directly return error to session without executing the tool
                     let tool_msg = Message {
@@ -3333,9 +3459,16 @@ impl AgentRuntime {
                 debug!(tool = %tool_name, "dispatching tool call");
 
                 // Upgrade iteration limit when complex or multi-step tools are used.
-                if matches!(tool_name.as_str(),
-                    "web_browser" | "opencode" | "claudecode" | "agent"
-                    | "search_content" | "search_file" | "execute_command" | "exec"
+                if matches!(
+                    tool_name.as_str(),
+                    "web_browser"
+                        | "opencode"
+                        | "claudecode"
+                        | "agent"
+                        | "search_content"
+                        | "search_file"
+                        | "execute_command"
+                        | "exec"
                 ) {
                     max_iterations = max_iterations.max(configured_complex);
                 }
@@ -3418,10 +3551,13 @@ impl AgentRuntime {
                         // Record error result for loop detection (errors count as results too).
                         ctx.loop_detector
                             .record_result(&serde_json::json!({"error": e.to_string()}));
-                        (format!(
-                            "{{\"error\":\"{}\",\"_do_not_retry\":true,\"hint\":\"This tool call failed. Do NOT retry the same tool with the same arguments. Try a different approach or inform the user.\"}}",
-                            e
-                        ), vec![])
+                        (
+                            format!(
+                                "{{\"error\":\"{}\",\"_do_not_retry\":true,\"hint\":\"This tool call failed. Do NOT retry the same tool with the same arguments. Try a different approach or inform the user.\"}}",
+                                e
+                            ),
+                            vec![],
+                        )
                     }
                 };
 
@@ -3430,36 +3566,61 @@ impl AgentRuntime {
                 // send_file tool: images go to tool_images, other files to tool_files.
                 if tool_name == "send_file" {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result_text) {
-                        if v.get("__send_file").and_then(|b| b.as_bool()).unwrap_or(false) {
+                        if v.get("__send_file")
+                            .and_then(|b| b.as_bool())
+                            .unwrap_or(false)
+                        {
                             if let Some(path_str) = v.get("path").and_then(|p| p.as_str()) {
                                 let full = std::path::PathBuf::from(path_str);
-                                let filename = v.get("filename").and_then(|f| f.as_str()).unwrap_or("file").to_owned();
+                                let filename = v
+                                    .get("filename")
+                                    .and_then(|f| f.as_str())
+                                    .unwrap_or("file")
+                                    .to_owned();
                                 let lower = filename.to_lowercase();
-                                let is_image = lower.ends_with(".jpg") || lower.ends_with(".jpeg")
-                                    || lower.ends_with(".png") || lower.ends_with(".webp")
+                                let is_image = lower.ends_with(".jpg")
+                                    || lower.ends_with(".jpeg")
+                                    || lower.ends_with(".png")
+                                    || lower.ends_with(".webp")
                                     || lower.ends_with(".gif");
                                 if is_image {
                                     // Send as inline image, not file attachment.
                                     if let Ok(bytes) = std::fs::read(&full) {
                                         use base64::Engine as _;
-                                        let mime = if lower.ends_with(".png") { "image/png" }
-                                            else if lower.ends_with(".webp") { "image/webp" }
-                                            else if lower.ends_with(".gif") { "image/gif" }
-                                            else { "image/jpeg" };
-                                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                        let mime = if lower.ends_with(".png") {
+                                            "image/png"
+                                        } else if lower.ends_with(".webp") {
+                                            "image/webp"
+                                        } else if lower.ends_with(".gif") {
+                                            "image/gif"
+                                        } else {
+                                            "image/jpeg"
+                                        };
+                                        let b64 = base64::engine::general_purpose::STANDARD
+                                            .encode(&bytes);
                                         tool_images.push(format!("data:{mime};base64,{b64}"));
                                         tracing::info!(path = %full.display(), "agent: send_file queued as image");
                                     }
                                 } else {
-                                    let mime = if lower.ends_with(".xlsx") { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }
-                                        else if lower.ends_with(".docx") { "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
-                                        else if lower.ends_with(".pptx") { "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
-                                        else if lower.ends_with(".pdf") { "application/pdf" }
-                                        else if lower.ends_with(".csv") { "text/csv" }
-                                        else if lower.ends_with(".mp4") { "video/mp4" }
-                                        else if lower.ends_with(".mp3") { "audio/mpeg" }
-                                        else if lower.ends_with(".zip") { "application/zip" }
-                                        else { "application/octet-stream" };
+                                    let mime = if lower.ends_with(".xlsx") {
+                                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                    } else if lower.ends_with(".docx") {
+                                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                                    } else if lower.ends_with(".pptx") {
+                                        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                                    } else if lower.ends_with(".pdf") {
+                                        "application/pdf"
+                                    } else if lower.ends_with(".csv") {
+                                        "text/csv"
+                                    } else if lower.ends_with(".mp4") {
+                                        "video/mp4"
+                                    } else if lower.ends_with(".mp3") {
+                                        "audio/mpeg"
+                                    } else if lower.ends_with(".zip") {
+                                        "application/zip"
+                                    } else {
+                                        "application/octet-stream"
+                                    };
                                     let full_str = full.to_string_lossy().to_string();
                                     if !tool_files.iter().any(|(_, _, p)| p == &full_str) {
                                         tool_files.push((filename, mime.to_owned(), full_str));
@@ -3472,8 +3633,15 @@ impl AgentRuntime {
                 }
 
                 // Collect sendable file attachments from write/exec tool results.
-                if matches!(tool_name.as_str(), "write_file" | "write" | "execute_command" | "exec") {
-                    let workspace = self.handle.config.workspace.as_deref()
+                if matches!(
+                    tool_name.as_str(),
+                    "write_file" | "write" | "execute_command" | "exec"
+                ) {
+                    let workspace = self
+                        .handle
+                        .config
+                        .workspace
+                        .as_deref()
                         .or(self.config.agents.defaults.workspace.as_deref())
                         .map(expand_tilde)
                         .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
@@ -3481,30 +3649,65 @@ impl AgentRuntime {
                     // Helper: check if a path is a sendable file type and add to tool_files.
                     let mut try_add_file = |path_str: &str| {
                         let lower = path_str.to_lowercase();
-                        let sendable_exts = [".xlsx", ".xls", ".docx", ".doc", ".pptx", ".ppt",
-                            ".pdf", ".csv", ".mp4", ".mp3", ".zip", ".tar.gz", ".txt", ".json",
-                            ".html", ".py", ".md"];
-                        if !sendable_exts.iter().any(|ext| lower.ends_with(ext)) { return; }
+                        let sendable_exts = [
+                            ".xlsx", ".xls", ".docx", ".doc", ".pptx", ".ppt", ".pdf", ".csv",
+                            ".mp4", ".mp3", ".zip", ".tar.gz", ".txt", ".json", ".html", ".py",
+                            ".md",
+                        ];
+                        if !sendable_exts.iter().any(|ext| lower.ends_with(ext)) {
+                            return;
+                        }
                         let pb = std::path::PathBuf::from(path_str);
-                        let full = if pb.is_absolute() { pb } else { workspace.join(path_str) };
-                        if !full.exists() { return; }
+                        let full = if pb.is_absolute() {
+                            pb
+                        } else {
+                            workspace.join(path_str)
+                        };
+                        if !full.exists() {
+                            return;
+                        }
                         // Skip very large files (>50MB)
                         if let Ok(meta) = full.metadata() {
-                            if meta.len() > 50_000_000 { return; }
+                            if meta.len() > 50_000_000 {
+                                return;
+                            }
                         }
-                        let filename = full.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        let filename = full
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
                         // Avoid duplicates
-                        if tool_files.iter().any(|(_, _, p)| p == &full.to_string_lossy().to_string()) { return; }
-                        let mime = if lower.ends_with(".xlsx") { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }
-                            else if lower.ends_with(".docx") { "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
-                            else if lower.ends_with(".pptx") { "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
-                            else if lower.ends_with(".pdf") { "application/pdf" }
-                            else if lower.ends_with(".csv") { "text/csv" }
-                            else if lower.ends_with(".mp4") { "video/mp4" }
-                            else if lower.ends_with(".mp3") { "audio/mpeg" }
-                            else if lower.ends_with(".zip") { "application/zip" }
-                            else { "application/octet-stream" };
-                        tool_files.push((filename, mime.to_owned(), full.to_string_lossy().to_string()));
+                        if tool_files
+                            .iter()
+                            .any(|(_, _, p)| p == &full.to_string_lossy().to_string())
+                        {
+                            return;
+                        }
+                        let mime = if lower.ends_with(".xlsx") {
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        } else if lower.ends_with(".docx") {
+                            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        } else if lower.ends_with(".pptx") {
+                            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                        } else if lower.ends_with(".pdf") {
+                            "application/pdf"
+                        } else if lower.ends_with(".csv") {
+                            "text/csv"
+                        } else if lower.ends_with(".mp4") {
+                            "video/mp4"
+                        } else if lower.ends_with(".mp3") {
+                            "audio/mpeg"
+                        } else if lower.ends_with(".zip") {
+                            "application/zip"
+                        } else {
+                            "application/octet-stream"
+                        };
+                        tool_files.push((
+                            filename,
+                            mime.to_owned(),
+                            full.to_string_lossy().to_string(),
+                        ));
                         tracing::info!(path = %full.display(), "agent: sendable file detected");
                     };
 
@@ -3517,7 +3720,10 @@ impl AgentRuntime {
                         if let Some(stdout) = v.get("stdout").and_then(|s| s.as_str()) {
                             for line in stdout.lines() {
                                 let trimmed = line.trim();
-                                if trimmed.contains('.') && !trimmed.contains(' ') && trimmed.len() < 256 {
+                                if trimmed.contains('.')
+                                    && !trimmed.contains(' ')
+                                    && trimmed.len() < 256
+                                {
                                     try_add_file(trimmed);
                                 }
                             }
@@ -3715,12 +3921,20 @@ impl AgentRuntime {
             "send_file" => {
                 // Returns a marker that the agent loop picks up to add to tool_files.
                 let path = args["path"].as_str().unwrap_or("").to_owned();
-                let workspace = self.handle.config.workspace.as_deref()
+                let workspace = self
+                    .handle
+                    .config
+                    .workspace
+                    .as_deref()
                     .or(self.config.agents.defaults.workspace.as_deref())
                     .map(expand_tilde)
                     .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
                 let pb = std::path::PathBuf::from(&path);
-                let full = if pb.is_absolute() { pb } else { workspace.join(&path) };
+                let full = if pb.is_absolute() {
+                    pb
+                } else {
+                    workspace.join(&path)
+                };
 
                 // Reuse the same safety checks as the read tool.
                 if let Err(e) = check_read_safety(&path, &full) {
@@ -3736,7 +3950,11 @@ impl AgentRuntime {
                         return Ok(json!({"error": "file too large (>50MB)"}));
                     }
                 }
-                let filename = full.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let filename = full
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 return Ok(json!({
                     "__send_file": true,
                     "path": full.to_string_lossy(),
@@ -4096,7 +4314,6 @@ impl AgentRuntime {
     // Compaction (AGENTS.md §15)
     // -----------------------------------------------------------------------
 
-
     // Compaction methods (compact_if_needed, compact_force, compact_inner,
     // msgs_to_text_static, compact_single, extract_key_facts,
     // append_transcript) -> moved to compaction.rs
@@ -4224,7 +4441,6 @@ fn is_likely_text_file(lower: &str) -> bool {
     .any(|e| lower.ends_with(e))
 }
 
-
 /// Format a tool call result as human-readable markdown.
 fn format_tool_result(val: &serde_json::Value) -> String {
     // exec tool: { exit_code, stdout, stderr }
@@ -4248,7 +4464,15 @@ fn format_tool_result(val: &serde_json::Value) -> String {
                 if !out.is_empty() {
                     out.push('\n');
                 }
-                out.push_str(&format!("[exit code: {code}]"));
+                out.push_str(&format!("[exit code: {code} - FAILED]"));
+                // Add explicit hint if _failed flag is present
+                if val
+                    .get("_failed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    out.push_str("\n\nDo NOT retry the same command. Check stderr for error details and inform the user.");
+                }
             }
         }
         if out.is_empty() {
@@ -4363,8 +4587,6 @@ fn write_config_value(dot_path: &str, value: serde_json::Value) -> anyhow::Resul
     Ok(())
 }
 
-
-
 // ---------------------------------------------------------------------------
 // Hybrid memory retrieval — Reciprocal Rank Fusion
 // ---------------------------------------------------------------------------
@@ -4458,12 +4680,9 @@ fn inject_channel(mut args: Value, channel: &str) -> Value {
     args
 }
 
-
 /// Maximum characters to send from file content to LLM.
 #[allow(dead_code)]
 const MAX_FILE_CONTENT_CHARS: usize = 20_000;
-
-
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -4472,18 +4691,24 @@ const MAX_FILE_CONTENT_CHARS: usize = 20_000;
 
 /// Append an AgentEntry to the `agents.list` array in the config file.
 /// The hot-reload watcher will pick up the change automatically.
-pub(crate) async fn persist_agent_to_config(entry: &crate::config::schema::AgentEntry) -> anyhow::Result<()> {
+pub(crate) async fn persist_agent_to_config(
+    entry: &crate::config::schema::AgentEntry,
+) -> anyhow::Result<()> {
     let config_path = crate::config::loader::detect_config_path()
         .ok_or_else(|| anyhow!("no config file found"))?;
     let raw = tokio::fs::read_to_string(&config_path).await?;
-    let mut doc: serde_json::Value = json5::from_str(&raw)
-        .map_err(|e| anyhow!("parse config: {e}"))?;
+    let mut doc: serde_json::Value =
+        json5::from_str(&raw).map_err(|e| anyhow!("parse config: {e}"))?;
 
     // Don't duplicate if agent already exists.
     let id = entry.id.as_str();
-    let already_exists = doc.pointer("/agents/list")
+    let already_exists = doc
+        .pointer("/agents/list")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().any(|e| e.get("id").and_then(|v| v.as_str()) == Some(id)))
+        .map(|arr| {
+            arr.iter()
+                .any(|e| e.get("id").and_then(|v| v.as_str()) == Some(id))
+        })
         .unwrap_or(false);
     if already_exists {
         return Ok(());
@@ -4493,10 +4718,14 @@ pub(crate) async fn persist_agent_to_config(entry: &crate::config::schema::Agent
 
     // Strip model field if it matches agents.defaults.model.primary
     // (no need to persist what the defaults already provide).
-    let defaults_primary = doc.pointer("/agents/defaults/model/primary")
-        .and_then(|v| v.as_str()).map(|s| s.to_owned());
-    let entry_primary = entry_val.pointer("/model/primary")
-        .and_then(|v| v.as_str()).map(|s| s.to_owned());
+    let defaults_primary = doc
+        .pointer("/agents/defaults/model/primary")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned());
+    let entry_primary = entry_val
+        .pointer("/model/primary")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned());
     if defaults_primary.is_some() && defaults_primary == entry_primary {
         entry_val.as_object_mut().map(|o| o.remove("model"));
     }
@@ -4641,7 +4870,13 @@ mod tests {
         let tools = build_tool_list(&skills, None, "test-agent", &[]);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         for expected in &[
-            "memory", "session", "agent", "channel", "read_file", "write_file", "execute_command",
+            "memory",
+            "session",
+            "agent",
+            "channel",
+            "read_file",
+            "write_file",
+            "execute_command",
         ] {
             assert!(
                 names.contains(expected),
@@ -4650,4 +4885,3 @@ mod tests {
         }
     }
 }
-
