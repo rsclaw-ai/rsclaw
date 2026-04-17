@@ -682,6 +682,7 @@ impl CronRunner {
                         &plugins,
                         &mcp,
                         &notification_tx,
+                        &default_delivery,
                     )
                     .await;
                     let duration_ms = current_timestamp_ms() - start_time;
@@ -864,6 +865,7 @@ impl CronRunner {
             &self.plugins,
             &self.mcp,
             &self.notification_tx,
+            &self.default_delivery,
         )
         .await;
         let success = result.is_ok();
@@ -1171,6 +1173,7 @@ async fn run_cron_job(
     plugins: &Option<Arc<PluginRegistry>>,
     mcp: &Option<Arc<crate::mcp::McpRegistry>>,
     notification_tx: &Option<broadcast::Sender<OutboundMessage>>,
+    default_delivery: &Option<CronDelivery>,
 ) -> Result<String> {
     let session_key = job
         .session_key
@@ -1192,6 +1195,14 @@ async fn run_cron_job(
             CronPayload::Text(_) => None,
         })
         .unwrap_or(300);
+
+    // Get delivery channel for agent notification routing
+    // Priority: job.delivery.channel > default_delivery.channel > "cron" (no notification)
+    let delivery_channel = job
+        .delivery
+        .as_ref()
+        .and_then(|d| d.channel.clone())
+        .or_else(|| default_delivery.as_ref().and_then(|d| d.channel.clone()));
 
     // Register abort flag for this session before running
     let abort_flag = {
@@ -1227,8 +1238,18 @@ async fn run_cron_job(
         spawner.clone(),
         plugins.clone(),
         mcp.clone(),
-        None, // notification_tx - cron results go through send_delivery, not agent notification
+        notification_tx.clone(), // Enable notifications if delivery channel is configured
     );
+
+    // Use delivery channel for agent run_turn if configured
+    // This allows agent tools (OpenCode, send_file, etc.) to send notifications to the correct channel
+    let agent_channel = delivery_channel
+        .clone()
+        .unwrap_or_else(|| "cron".to_string());
+    let agent_peer_id = delivery_channel
+        .clone()
+        .map(|ch| format!("{}:{}", ch, job.id))
+        .unwrap_or_else(|| format!("cron:{}", job.id));
 
     // Run turn directly (bypass inbox queue)
     let result = tokio::time::timeout(
@@ -1236,8 +1257,8 @@ async fn run_cron_job(
         runtime.run_turn(
             &session_key,
             job.effective_message(),
-            "cron",
-            &format!("cron:{}", job.id),
+            &agent_channel,
+            &agent_peer_id,
             vec![], // extra_tools
             vec![], // images
             vec![], // files
