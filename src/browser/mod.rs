@@ -283,19 +283,7 @@ impl ChromeProcess {
 
     /// Extract the debugging port from the ws URL.
     pub(crate) fn port(&self) -> Result<u16> {
-        // ws://127.0.0.1:PORT/devtools/browser/...
-        let url = &self.ws_url;
-        let after_host = url
-            .find("127.0.0.1:")
-            .map(|i| i + "127.0.0.1:".len())
-            .ok_or_else(|| anyhow!("cannot parse port from ws URL: {url}"))?;
-        let end = url[after_host..]
-            .find('/')
-            .unwrap_or(url.len() - after_host);
-        let port_str = &url[after_host..after_host + end];
-        port_str
-            .parse::<u16>()
-            .map_err(|e| anyhow!("invalid port in ws URL: {e}"))
+        parse_port_from_ws_url(&self.ws_url)
     }
 }
 
@@ -380,8 +368,8 @@ pub(crate) async fn detect_existing_chrome(ports: &[u16]) -> Option<String> {
                     }
                 }
             }
-            Err(_) => {
-                debug!(port, "no Chrome remote debugging on this port");
+            Err(e) => {
+                debug!(port, error = %e, "no Chrome remote debugging on this port");
             }
         }
     }
@@ -669,7 +657,7 @@ impl BrowserSession {
             }
         }
         let page_target = page_target
-            .ok_or_else(|| anyhow!("no page target found in CDP target list after 10 attempts"))?;
+            .ok_or_else(|| anyhow!("no page target found in CDP target list after 20 attempts"))?;
 
         let page_ws_url = page_target["webSocketDebuggerUrl"]
             .as_str()
@@ -719,8 +707,47 @@ impl BrowserSession {
             self.chrome = Some(new_chrome);
             self.cdp = new_cdp;
         } else {
-            // External Chrome: reconnect CDP on existing port.
-            let new_cdp = Self::connect_cdp_by_port(self.debug_port).await?;
+            // External Chrome: create a fresh tab (don't hijack user's existing tabs).
+            let browser_ws = format!(
+                "ws://127.0.0.1:{}/devtools/browser",
+                self.debug_port
+            );
+            // Try to get the full browser ws URL from /json/version.
+            let version_url = format!("http://127.0.0.1:{}/json/version", self.debug_port);
+            let browser_ws_url = match reqwest::Client::new()
+                .get(&version_url)
+                .timeout(Duration::from_secs(3))
+                .send()
+                .await
+            {
+                Ok(resp) => resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| v["webSocketDebuggerUrl"].as_str().map(String::from))
+                    .unwrap_or(browser_ws),
+                Err(_) => browser_ws,
+            };
+            let browser_cdp = CdpClient::connect(&browser_ws_url).await?;
+            let create = browser_cdp.send("Target.createTarget", json!({"url": "about:blank"})).await?;
+            let target_id = create["targetId"]
+                .as_str()
+                .ok_or_else(|| anyhow!("restart: no targetId from Target.createTarget"))?;
+            // browser_cdp intentionally dropped here — we only needed it for Target.createTarget.
+            drop(browser_cdp);
+
+            let discovery = format!("http://127.0.0.1:{}/json", self.debug_port);
+            let targets: Vec<serde_json::Value> = reqwest::get(&discovery).await?.json().await?;
+            let tab_ws = targets
+                .iter()
+                .find(|t| t["id"].as_str() == Some(target_id))
+                .and_then(|t| t["webSocketDebuggerUrl"].as_str())
+                .ok_or_else(|| anyhow!("restart: new tab ws URL not found"))?;
+            let new_cdp = CdpClient::connect(tab_ws).await?;
+            new_cdp.send("Page.enable", json!({})).await?;
+            new_cdp.send("DOM.enable", json!({})).await?;
+            new_cdp.send("Runtime.enable", json!({})).await?;
+            new_cdp.send("Network.enable", json!({})).await?;
             self.cdp = new_cdp;
         }
         self.refs.clear();

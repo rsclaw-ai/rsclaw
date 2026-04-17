@@ -280,10 +280,10 @@ pub fn seed_workspace_with_lang(workspace: &Path, lang: Option<&str>) -> Result<
         ("xiaohongshu.md", SITE_XIAOHONGSHU),
         ("bilibili.md", SITE_BILIBILI),
     ];
+    std::fs::create_dir_all(&rules_dir)?;
     for (name, content) in site_rules {
         let path = rules_dir.join(name);
         if !path.exists() {
-            std::fs::create_dir_all(&rules_dir)?;
             std::fs::write(&path, content)?;
             info!(file = %path.display(), "seeded site rule");
             created += 1;
