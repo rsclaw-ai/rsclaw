@@ -4002,8 +4002,39 @@ impl AgentRuntime {
                 a["action"] = serde_json::json!("create_ppt");
                 return self.tool_doc(a).await;
             }
-            "opencode" => return self.tool_opencode(ctx, args).await,
-            "claudecode" => return self.tool_claudecode(ctx, args).await,
+            "opencode" | "claudecode" => {
+                // Intent detection: check if user explicitly requested Claude Code
+                let use_claudecode = self.sessions.get(&ctx.session_key)
+                    .and_then(|msgs| msgs.iter().rev().find(|m| m.role == Role::User))
+                    .and_then(|m| match &m.content {
+                        MessageContent::Text(s) => Some(s.clone()),
+                        MessageContent::Parts(parts) => parts.iter()
+                            .filter_map(|p| match p {
+                                ContentPart::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .first()
+                            .cloned(),
+                        _ => None,
+                    })
+                    .map(|text| {
+                        let lower = text.to_lowercase();
+                        lower.contains("claude code")
+                            || lower.contains("claudecode")
+                            || lower.contains("claude-code")
+                            || lower.contains("用 claude")
+                            || lower.contains("使用 claude")
+                    })
+                    .unwrap_or(false);
+
+                // If user explicitly requested Claude Code but agent called opencode,
+                // or if agent called claudecode, route to claudecode
+                if use_claudecode || name == "claudecode" {
+                    return self.tool_claudecode(ctx, args).await;
+                }
+                return self.tool_opencode(ctx, args).await;
+            }
             _ => {}
         }
 
