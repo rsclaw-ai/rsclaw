@@ -93,6 +93,10 @@ const NO_REPLY_TOKEN: &str = "NO_REPLY";
 const DEFAULT_MAX_FILE_SIZE: usize = 50_000_000;
 /// Default max text chars before token confirmation.
 const DEFAULT_MAX_TEXT_CHARS: usize = 50_000;
+/// Sessions older than this TTL (7 days) are eligible for eviction.
+const SESSION_IDLE_TTL_SECS: u64 = 7 * 24 * 3600;
+/// Eviction only triggers when the session count exceeds this threshold.
+const MAX_SESSIONS_PER_AGENT: usize = 10_000;
 
 /// RAII guard that clears the abort flag for a session when dropped.
 struct AbortFlagGuard {
@@ -958,6 +962,7 @@ impl AgentRuntime {
                                         abstract_text: None,
                                         overview_text: None,
                                         tags: vec![],
+                pinned: false,
                                     };
                                     match mem.lock().await.add(doc).await {
                                         Ok(_) => info!("compact: summary saved to memory ({} chars)", mem_text.len()),
@@ -1787,7 +1792,9 @@ impl AgentRuntime {
         // DEBUG: dump full system prompt to file for inspection
         if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
             let dump_path = crate::config::loader::base_dir().join("debug_system_prompt.txt");
-            let _ = std::fs::write(&dump_path, &system_prompt);
+            if let Err(e) = std::fs::write(&dump_path, &system_prompt) {
+                tracing::warn!("failed to dump system prompt: {e}");
+            }
             tracing::info!(path = %dump_path.display(), len = system_prompt.len(), "dumped system prompt");
         }
 
@@ -1891,7 +1898,8 @@ impl AgentRuntime {
         // Channel-aware formatting hints for IM channels (feishu, dingtalk, etc.)
         if channel == "feishu" || channel == "dingtalk" || channel == "wecom" {
             system_prompt.push_str(concat!(
-                "\n\n[Output format rules for IM chat]\n",
+                "\n\n",
+                "[Output format rules for IM chat]\n",
                 "- Never use Markdown headings (#, ##, ###).\n",
                 "- Use **bold text** or 【section title】 for sections.\n",
                 "- Use 1. or - for lists.\n",
@@ -2297,8 +2305,20 @@ impl AgentRuntime {
         }
 
         // Auto-Capture (AGENTS.md §31): persist user message as memory note.
+        // Threshold is 8 bytes (not 20) so short messages with key data like
+        // "手机号18674030927" (20 bytes) are not silently dropped.
+        // Messages containing long digit sequences (phone numbers, IDs, codes)
+        // get higher importance so they survive memory decay.
+        let has_key_digits = {
+            let mut run = 0usize;
+            let mut max_run = 0usize;
+            for b in text.bytes() {
+                if b.is_ascii_digit() { run += 1; max_run = max_run.max(run); } else { run = 0; }
+            }
+            max_run >= 8 // 8+ consecutive digits = phone number / ID / code
+        };
         if let Some(ref mem) = self.memory
-            && text.len() > 20
+            && text.len() > 8
             && !reply.text.starts_with(NO_REPLY_TOKEN)
         {
             let doc_id = Uuid::new_v4().to_string();
@@ -2311,14 +2331,19 @@ impl AgentRuntime {
                 created_at: 0, // backfilled in MemoryStore::add()
                 accessed_at: 0,
                 access_count: 0,
-                importance: 0.5,
+                // Bump importance for messages with phone numbers / long IDs so
+                // they survive memory decay and compaction fact extraction.
+                importance: if has_key_digits { 0.85 } else { 0.5 },
                 vector: vec![],
                 tier: Default::default(),
                 abstract_text: None,
                 overview_text: None,
                 tags: vec![],
+                pinned: false,
             };
-            let _ = mem.lock().await.add(doc).await;
+            if let Err(e) = mem.lock().await.add(doc).await {
+                tracing::warn!("auto-capture memory add failed: {e:#}");
+            }
             // Also index in tantivy BM25 for hybrid search.
             if let Err(e) = self
                 .store
@@ -2327,10 +2352,42 @@ impl AgentRuntime {
             {
                 tracing::warn!("BM25 index failed for auto-capture doc: {e:#}");
             }
+
+            // Deterministic entity extraction: phone numbers, ID cards, emails.
+            let user_entities = crate::agent::context_mgr::extract_key_entities(text);
+            if !user_entities.is_empty() {
+                crate::agent::context_mgr::write_entity_memories(
+                    mem, &doc_scope, user_entities,
+                ).await;
+            }
+
+            // LLM-based semantic entity extraction (name, birthday, zodiac, etc.)
+            let llm_entities = crate::agent::context_mgr::extract_entities_via_llm(
+                text, &model, &mut self.failover, &self.providers,
+            ).await;
+            if !llm_entities.is_empty() {
+                crate::agent::context_mgr::write_entity_memories(
+                    mem, &doc_scope, llm_entities,
+                ).await;
+            }
+        }
+
+        // Deterministic entity extraction from assistant reply.
+        if let Some(ref mem) = self.memory {
+            let reply_entities = crate::agent::context_mgr::extract_key_entities(&reply.text);
+            if !reply_entities.is_empty() {
+                let scope = format!("agent:{}", self.handle.id);
+                crate::agent::context_mgr::write_entity_memories(
+                    mem, &scope, reply_entities,
+                ).await;
+            }
         }
 
         // Compaction check (AGENTS.md §15).
         self.compact_if_needed(session_key, &model).await;
+
+        // Evict stale sessions if the cache has grown too large.
+        self.evict_stale_sessions();
 
         // Tick ctx TTL counters after each turn.
         self.btw_manager.tick_turn(session_key).await;
@@ -3112,19 +3169,31 @@ impl AgentRuntime {
             // emit tool calls as XML text instead of proper function_call format.
             // Detect <tool_call>/<function=...> patterns and parse them.
             if tool_calls.is_empty() && text_buf.contains("<function=") {
-                let re = regex::Regex::new(
-                    r#"<function=(\w+)>\s*<parameter=(\w+)>\s*([\s\S]*?)\s*</parameter>\s*</function>"#
-                ).unwrap();
-                for cap in re.captures_iter(&text_buf) {
-                    let name = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-                    let param = cap.get(2).map(|m| m.as_str()).unwrap_or("");
-                    let value = cap.get(3).map(|m| m.as_str().trim()).unwrap_or("");
-                    if !name.is_empty() {
-                        let input = json!({ param: value });
-                        let id = format!("rescued_{name}_{}", tool_calls.len());
-                        tracing::info!(name, param, "agent_loop: rescued tool call from text");
-                        tool_calls.push((id, name.to_owned(), input));
+                // Match <function=NAME> ... </function> blocks, then extract
+                // all <parameter=KEY>VALUE</parameter> pairs within each block.
+                let fn_re = regex::Regex::new(
+                    r#"<function=(\w+)>([\s\S]*?)</function>"#
+                ).expect("fn_re compile");
+                let param_re = regex::Regex::new(
+                    r#"<parameter=(\w+)>([\s\S]*?)</parameter>"#
+                ).expect("param_re compile");
+                for fn_cap in fn_re.captures_iter(&text_buf) {
+                    let name = fn_cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                    let body = fn_cap.get(2).map(|m| m.as_str()).unwrap_or("");
+                    if name.is_empty() {
+                        continue;
                     }
+                    let mut input = serde_json::Map::new();
+                    for p_cap in param_re.captures_iter(body) {
+                        let key = p_cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                        let val = p_cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+                        if !key.is_empty() {
+                            input.insert(key.to_owned(), json!(val));
+                        }
+                    }
+                    let id = format!("rescued_{name}_{}", tool_calls.len());
+                    tracing::info!(name, params = ?input.keys().collect::<Vec<_>>(), "agent_loop: rescued tool call from text");
+                    tool_calls.push((id, name.to_owned(), Value::Object(input)));
                 }
                 if !tool_calls.is_empty() {
                     // Clear the text since it was a tool call, not a real reply.
@@ -3756,6 +3825,7 @@ impl AgentRuntime {
             "web_browser" | "browser" => return self.tool_web_browser(ctx, args).await,
             "computer_use" => return self.tool_computer_use(args).await,
             "image_gen" | "image" => return self.tool_image(args).await,
+            "video_gen" | "video" => return self.tool_video(args).await,
             "pdf" => return self.tool_pdf(args).await,
             "text_to_voice" | "text_to_speech" | "tts" => return self.tool_tts(args).await,
             "send_message" | "message" => return self.tool_message(args).await,
@@ -4022,6 +4092,7 @@ impl AgentRuntime {
                 abstract_text: None,
                 overview_text: None,
                 tags: vec![],
+                pinned: false,
             })
             .await?;
         drop(store);
@@ -4099,6 +4170,61 @@ impl AgentRuntime {
     // Compaction methods (compact_if_needed, compact_force, compact_inner,
     // msgs_to_text_static, compact_single, extract_key_facts,
     // append_transcript) -> moved to compaction.rs
+
+    // -----------------------------------------------------------------------
+    // Session eviction
+    // -----------------------------------------------------------------------
+
+    /// Remove stale sessions that have been idle longer than
+    /// [`SESSION_IDLE_TTL_SECS`].
+    ///
+    /// Only runs when the number of cached sessions exceeds
+    /// [`MAX_SESSIONS_PER_AGENT`] to avoid unnecessary iteration on small
+    /// caches.  Corresponding entries in `compaction_state` and
+    /// `pending_files` are also removed.
+    fn evict_stale_sessions(&mut self) {
+        if self.sessions.len() <= MAX_SESSIONS_PER_AGENT {
+            return;
+        }
+
+        let ttl = Duration::from_secs(SESSION_IDLE_TTL_SECS);
+        let now = std::time::Instant::now();
+
+        // Collect keys to evict: sessions whose compaction_state timestamp
+        // is older than the TTL, or sessions that have no compaction_state
+        // entry at all (never compacted -- use runtime start as proxy).
+        let stale_keys: Vec<String> = self
+            .sessions
+            .keys()
+            .filter(|key| {
+                if let Some((last_active, _)) = self.compaction_state.get(*key) {
+                    now.duration_since(*last_active) > ttl
+                } else {
+                    // No compaction state -- compare against runtime start.
+                    now.duration_since(self.started_at) > ttl
+                }
+            })
+            .cloned()
+            .collect();
+
+        if stale_keys.is_empty() {
+            return;
+        }
+
+        let count = stale_keys.len();
+        for key in &stale_keys {
+            self.sessions.remove(key);
+            self.compaction_state.remove(key);
+            self.pending_files.remove(key);
+        }
+
+        info!(
+            agent = %self.handle.id,
+            evicted = count,
+            remaining = self.sessions.len(),
+            "evicted stale sessions from in-memory cache"
+        );
+    }
 
     // tool_exec -- moved to tools_file.rs
     // build_subagent_system_prompt, tool_agent_spawn, tool_agent_task,
@@ -4423,6 +4549,7 @@ fn rrf_fuse(
                         abstract_text: None,
                         overview_text: None,
                         tags: vec![],
+                pinned: false,
                     },
                 )
             });

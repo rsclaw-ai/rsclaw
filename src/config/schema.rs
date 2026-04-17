@@ -386,6 +386,9 @@ pub struct ModelConfig {
     pub image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_fallbacks: Option<Vec<String>>,
+    /// Text-to-video model, e.g. "doubao/seedance-1-0-lite-t2v-250428".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
     /// Whether to send tool definitions to the model. Default: true.

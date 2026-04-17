@@ -373,9 +373,7 @@ impl ClawhubClient {
         }
 
         // 2. skills.sh format: owner/repo@skill-id
-        if let Some(at_pos) = spec.find('@') {
-            let repo_part = &spec[..at_pos];   // "owner/repo"
-            let skill_id  = &spec[at_pos + 1..]; // "skill-id"
+        if let Some((repo_part, skill_id)) = spec.split_once('@') {
             if repo_part.contains('/') && !skill_id.is_empty() {
                 let parts: Vec<&str> = repo_part.splitn(2, '/').collect();
                 if parts.len() == 2 {

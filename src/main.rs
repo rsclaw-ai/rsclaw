@@ -95,7 +95,7 @@ async fn run() -> Result<()> {
     // Handle -v and -version before clap (clap handles --version and -V)
     let raw_args: Vec<String> = std::env::args().collect();
     if raw_args.len() == 2 && (raw_args[1] == "-v" || raw_args[1] == "-version") {
-        println!("rsclaw {}", env!("RSCLAW_BUILD_VERSION"));
+        println!("rsclaw v{}", env!("RSCLAW_BUILD_VERSION"));
         return Ok(());
     }
 

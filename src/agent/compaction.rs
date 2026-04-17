@@ -154,6 +154,31 @@ impl AgentRuntime {
             (msgs_to_text(&msgs), vec![])
         };
 
+        // Pre-compaction entity preservation: deterministic extraction (phone/ID/email)
+        // plus LLM-based semantic extraction (name, birthday, zodiac, etc.)
+        // Both run BEFORE the LLM summary to guarantee no data loss.
+        {
+            let entities = crate::agent::context_mgr::extract_key_entities(&old_text);
+            if !entities.is_empty() {
+                if let Some(ref mem) = self.memory {
+                    let scope = format!("agent:{}", self.handle.id);
+                    crate::agent::context_mgr::write_entity_memories(mem, &scope, entities).await;
+                    debug!(session = session_key, "pre-compaction deterministic entities pinned");
+                }
+            }
+            // LLM-based semantic entity extraction before compaction.
+            if let Some(ref mem) = self.memory {
+                let scope = format!("agent:{}", self.handle.id);
+                let llm_entities = crate::agent::context_mgr::extract_entities_via_llm(
+                    &old_text, compaction_model, &mut self.failover, &self.providers,
+                ).await;
+                if !llm_entities.is_empty() {
+                    crate::agent::context_mgr::write_entity_memories(mem, &scope, llm_entities).await;
+                    debug!(session = session_key, "pre-compaction LLM entities pinned");
+                }
+            }
+        }
+
         // Summarise the old portion.
         let summary = match mode {
             CompactionMode::Default | CompactionMode::Layered => {
@@ -219,6 +244,7 @@ impl AgentRuntime {
                                 abstract_text: None,
                                 overview_text: None,
                                 tags: vec![],
+                pinned: false,
                             };
                             let _ = guard.add(doc).await;
                         }
@@ -456,7 +482,8 @@ impl AgentRuntime {
                      1. **Task & Intent**: What the user wants to accomplish\n\
                      2. **Key Data**: Exact values that MUST be preserved verbatim \
                         (file paths, URLs, cron expressions, config values, IDs, \
-                        variable names, port numbers, credentials)\n\
+                        variable names, port numbers, credentials, phone numbers, \
+                        account numbers, any numeric sequence discovered during the conversation)\n\
                      3. **Actions Taken**: Tool calls and their outcomes — what was \
                         created, modified, or deleted\n\
                      4. **Current State**: Where things stand now\n\
@@ -527,9 +554,11 @@ impl AgentRuntime {
                 content: MessageContent::Text(format!(
                     "Extract the key facts from this conversation that should be remembered \
                      long-term. Output ONLY a bullet list (one fact per line, prefixed with \
-                     '- '). Include: names, user IDs, chat IDs, important decisions, file \
-                     paths, URLs, preferences, and action items. Be concise. Skip ephemeral \
-                     chit-chat.\n\n{input}"
+                     '- '). Include: names, user IDs, chat IDs, phone numbers, account numbers, \
+                     any numeric sequences that were looked up or confirmed, important decisions, \
+                     file paths, URLs, preferences, and action items. \
+                     IMPORTANT: copy numeric values (phone numbers, IDs) character-for-character — \
+                     never truncate or paraphrase them. Be concise. Skip ephemeral chit-chat.\n\n{input}"
                 )),
             }],
             tools: vec![],

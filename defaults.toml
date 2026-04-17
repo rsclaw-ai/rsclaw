@@ -286,6 +286,28 @@ url      = "https://api.bing.microsoft.com/v7.0/search"
 env_var  = "BING_API_KEY"
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Video Generation Providers (used by video_gen tool)
+# ──────────────────────────────────────────────────────────────────────────────
+
+[video_providers.seedance]
+label       = "Seedance 2.0 (ByteDance)"
+env_var     = "ARK_API_KEY"
+model       = "doubao-seedance-2-0-260128"
+base_url    = "https://ark.cn-beijing.volces.com/api/v3"
+
+[video_providers.minimax]
+label       = "MiniMax Video (Hailuo)"
+env_var     = "MINIMAX_API_KEY"
+model       = "video-01-director"
+base_url    = "https://api.minimaxi.com/v1"
+
+[video_providers.kling]
+label       = "Kling (Kuaishou)"
+env_var     = "KLING_ACCESS_KEY"
+model       = "kling-v2-master"
+base_url    = "https://api.klingai.com"
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Skill Registries (used by rsclaw skills install/search)
 # ──────────────────────────────────────────────────────────────────────────────
 

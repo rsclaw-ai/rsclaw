@@ -145,7 +145,7 @@ pub(crate) fn start_feishu_if_configured(
 
         // Register channel sender for notification routing (ACP tools like OpenCode, ClaudeCode)
         {
-            let mut senders = _channel_senders.write().unwrap();
+            let mut senders = _channel_senders.write().expect("channel_senders lock poisoned");
             // Register both "feishu" (for legacy/simple routing) and "feishu/{account}" (for multi-account)
             senders.insert("feishu".to_string(), out_tx.clone());
             senders.insert(format!("feishu/{}", acct_name), out_tx.clone());
@@ -220,7 +220,7 @@ pub(crate) fn start_feishu_if_configured(
                                 return;
                             }
                             PolicyResult::SendPairingCode(code) => {
-                                let _ = tx
+                                if let Err(e) = tx
                                     .send(OutboundMessage {
                                         target_id: chat_id.clone(),
                                         is_group: false,
@@ -234,11 +234,14 @@ pub(crate) fn start_feishu_if_configured(
                                         channel: None,
 
                     files: vec![],                                    })
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!("failed to send message: {e}");
+                                }
                                 return;
                             }
                             PolicyResult::PairingQueueFull => {
-                                let _ = tx
+                                if let Err(e) = tx
                                     .send(OutboundMessage {
                                         target_id: chat_id.clone(),
                                         is_group: false,
@@ -252,7 +255,10 @@ pub(crate) fn start_feishu_if_configured(
                                         channel: None,
 
                     files: vec![],                                    })
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!("failed to send message: {e}");
+                                }
                                 return;
                             }
                         }
@@ -277,7 +283,11 @@ pub(crate) fn start_feishu_if_configured(
                             reply.target_id = chat_id.clone();
                             reply.is_group = is_group;
                             if !reply.text.is_empty() || !reply.images.is_empty() {
-                                let _ = tx.send(reply).await;
+                                if let Err(e) = tx.send(reply).await {
+
+                                    tracing::warn!("failed to send message: {e}");
+
+                                }
                             }
                             return;
                         }
@@ -385,7 +395,7 @@ pub(crate) fn start_feishu_if_configured(
                                         Ok(r) => {
                                             let pending = r.pending_analysis;
                                             if !r.text.is_empty() || !r.images.is_empty() || !r.files.is_empty() {
-                                                let _ = w_tx
+                                                if let Err(e) = w_tx
                                                     .send(OutboundMessage {
                                                         target_id: fs_target.clone(),
                                                         is_group,
@@ -394,7 +404,10 @@ pub(crate) fn start_feishu_if_configured(
                                                         images: r.images,
                                                         files: r.files,
                                                         channel: None,                                                    })
-                                                    .await;
+                                                    .await
+                                                {
+                                                    tracing::warn!("failed to send message: {e}");
+                                                }
                                             }
                                             if let Some(analysis) = pending {
                                                 handle_pending_analysis(
@@ -415,7 +428,7 @@ pub(crate) fn start_feishu_if_configured(
                             });
                             utx
                         } else {
-                            map.get(&sender_id).unwrap().clone()
+                            map.get(&sender_id).expect("queue entry must exist").clone()
                         }
                     };
                     // /btw bypass: spawn directly, skip the per-user queue
@@ -438,7 +451,7 @@ pub(crate) fn start_feishu_if_configured(
                             )
                             .await
                             {
-                                let _ = tx
+                                if let Err(e) = tx
                                     .send(OutboundMessage {
                                         target_id: chat_id,
                                         is_group: false,
@@ -448,7 +461,10 @@ pub(crate) fn start_feishu_if_configured(
                                         channel: None,
 
                     files: vec![],                                    })
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!("failed to send message: {e}");
+                                }
                             }
                         });
                         return;
@@ -495,7 +511,11 @@ pub(crate) fn start_feishu_if_configured(
                                 reply.target_id = chat_id.clone();
                                 reply.is_group = is_group;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {
-                                    let _ = tx.send(reply).await;
+                                    if let Err(e) = tx.send(reply).await {
+
+                                        tracing::warn!("failed to send message: {e}");
+
+                                    }
                                 }
                                 return;
                             }
@@ -517,7 +537,7 @@ pub(crate) fn start_feishu_if_configured(
                             }
                             if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                                 if !r.is_empty {
-                                    let _ = tx.send(OutboundMessage {
+                                    if let Err(e) = tx.send(OutboundMessage {
                                         target_id: chat_id,
                                         is_group,
                                         text: r.text,
@@ -525,7 +545,10 @@ pub(crate) fn start_feishu_if_configured(
                                         images: r.images,
                                         files: r.files,
                                         channel: None,
-                                    }).await;
+                                    }).await
+                                    {
+                                        tracing::warn!("failed to send message: {e}");
+                                    }
                                 }
                             }
                         });
@@ -555,8 +578,12 @@ pub(crate) fn start_feishu_if_configured(
         let fs = Arc::new(fs_channel);
 
         // First account fills the webhook slot for backward compatibility.
-        let _ = feishu_slot.set(Arc::clone(&fs));
-        let _ = manager.register(Arc::clone(&fs) as Arc<dyn crate::channel::Channel>);
+        if feishu_slot.set(Arc::clone(&fs)).is_err() {
+            tracing::debug!("slot already set, skipping");
+        }
+        if let Err(e) = manager.register(Arc::clone(&fs) as Arc<dyn crate::channel::Channel>) {
+            tracing::warn!("failed to register channel: {e}");
+        }
 
         let fs_send = Arc::clone(&fs);
         tokio::spawn(async move {

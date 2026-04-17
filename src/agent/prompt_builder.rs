@@ -147,6 +147,33 @@ pub(crate) fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Dynamic context helper (used by KV cache modes 1 & 2)
+// ---------------------------------------------------------------------------
+
+/// Build the dynamic date/time context line.
+///
+/// When `prefix_kv_cache >= 1`, this is injected per-turn into the user
+/// message instead of the system prompt, to preserve KV cache prefix stability.
+pub(crate) fn build_date_context() -> String {
+    let now = chrono::Local::now();
+    use chrono::Datelike;
+    let weekday = now.date_naive().weekday().num_days_from_monday();
+    let last_friday = if weekday >= 4 {
+        now.date_naive() - chrono::Duration::days((weekday - 4) as i64)
+    } else {
+        now.date_naive() - chrono::Duration::days((weekday + 3) as i64)
+    };
+    let yesterday = now.date_naive() - chrono::Duration::days(1);
+    format!(
+        "Current date: {} ({}). Yesterday: {}. Last Friday: {}.",
+        now.format("%Y-%m-%d %H:%M"),
+        now.format("%A"),
+        yesterday.format("%Y-%m-%d"),
+        last_friday.format("%Y-%m-%d"),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // System prompt builder
 // ---------------------------------------------------------------------------
 
@@ -159,22 +186,7 @@ pub(crate) fn build_base_system_prompt(config: &crate::config::schema::Config) -
     let mut parts: Vec<String> = Vec::new();
 
     // Current date/time so the model knows "today", "last Friday", etc.
-    let now = chrono::Local::now();
-    use chrono::Datelike;
-    let weekday = now.date_naive().weekday().num_days_from_monday();
-    let last_friday = if weekday >= 4 {
-        now.date_naive() - chrono::Duration::days((weekday - 4) as i64)
-    } else {
-        now.date_naive() - chrono::Duration::days((weekday + 3) as i64)
-    };
-    let yesterday = now.date_naive() - chrono::Duration::days(1);
-    let mut date_line = format!(
-        "Current date: {} ({}). Yesterday: {}. Last Friday: {}.",
-        now.format("%Y-%m-%d %H:%M"),
-        now.format("%A"),
-        yesterday.format("%Y-%m-%d"),
-        last_friday.format("%Y-%m-%d"),
-    );
+    let mut date_line = build_date_context();
     if let Some(lang) = config.gateway.as_ref().and_then(|g| g.language.as_deref()) {
         date_line.push_str(&format!(
             "\nDefault response language: {lang}. Always reply in {lang} unless the user explicitly uses another language."
@@ -282,7 +294,8 @@ pub(crate) fn build_system_prompt(
              - For cron jobs: use the `cron` tool (action=list/add/remove).\n\
              - To install tools (python, node, ffmpeg, chrome, opencode, claude-code, sherpa-onnx): use `install_tool`. Do NOT download/install manually.\n\
              - When user asks about previous conversations, tasks, or anything you don't have context for, use `memory` to recall relevant information before answering.\n\
-             - At the start of a new session, if the user's first message references prior work, search memory first."
+             - At the start of a new session, if the user's first message references prior work, search memory first.\n\
+             - When you discover information that is more complete or accurate than what memory contains (e.g. you find a full phone number after memory only had partial digits, or you confirm a username/ID), immediately save the corrected value to memory so it survives context compaction. Do not rely on the information remaining in conversation context."
                 .to_owned(),
         );
 

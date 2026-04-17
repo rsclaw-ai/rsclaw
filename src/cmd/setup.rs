@@ -1651,8 +1651,10 @@ async fn configure_model(
             .map(|s| {
                 if s.starts_with("${") {
                     s
-                } else if s.len() > 8 {
-                    format!("{}...{}", &s[..4], &s[s.len() - 4..])
+                } else if s.chars().count() > 8 {
+                    let prefix: String = s.chars().take(4).collect();
+                    let suffix: String = s.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+                    format!("{prefix}...{suffix}")
                 } else {
                     "*".repeat(s.len().min(20))
                 }
@@ -1933,8 +1935,10 @@ async fn edit_channel_config(
             // Show masked value for secrets, ask to change
             let masked = if current.starts_with("${") {
                 current.clone()
-            } else if current.len() > 8 {
-                format!("{}...{}", &current[..4], &current[current.len() - 4..])
+            } else if current.chars().count() > 8 {
+                let prefix: String = current.chars().take(4).collect();
+                let suffix: String = current.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+                format!("{prefix}...{suffix}")
             } else {
                 "*".repeat(current.len().min(8))
             };

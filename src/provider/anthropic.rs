@@ -72,6 +72,7 @@ impl LlmProvider for AnthropicProvider {
                     self.user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT),
                 )
                 .json(&body)
+                .timeout(std::time::Duration::from_secs(120))
                 .send()
                 .await
                 .context("Anthropic request failed")?;
@@ -83,9 +84,14 @@ impl LlmProvider for AnthropicProvider {
             }
 
             let byte_stream = resp.bytes_stream();
+            let line_buffer = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
             let event_stream = byte_stream
                 .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
-                .flat_map(|chunk| futures::stream::iter(parse_sse_chunk(chunk)));
+                .then(move |chunk| {
+                    let line_buffer = line_buffer.clone();
+                    async move { parse_sse_chunk_buffered(chunk, &line_buffer).await }
+                })
+                .flat_map(|events| futures::stream::iter(events));
 
             let stream: LlmStream = Box::pin(event_stream);
             Ok(stream)
@@ -223,23 +229,39 @@ fn serialize_part(part: &ContentPart) -> Value {
 // SSE parser
 // ---------------------------------------------------------------------------
 
-fn parse_sse_chunk(chunk: Result<bytes::Bytes>) -> Vec<Result<StreamEvent>> {
+/// Buffered SSE parser — handles TCP chunk boundaries that split lines.
+async fn parse_sse_chunk_buffered(
+    chunk: Result<bytes::Bytes>,
+    line_buffer: &tokio::sync::Mutex<String>,
+) -> Vec<Result<StreamEvent>> {
     let bytes = match chunk {
         Ok(b) => b,
         Err(e) => return vec![Err(e)],
     };
 
-    let text: String = match std::str::from_utf8(&bytes) {
-        Ok(t) => t.to_owned(),
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(t) => std::borrow::Cow::Borrowed(t),
         Err(e) => {
-            tracing::warn!("anthropic: UTF-8 decode error at byte {}, replacing with �: {}", e.valid_up_to(), e);
-            String::from_utf8_lossy(&bytes).into_owned()
+            tracing::warn!("anthropic: UTF-8 decode error at byte {}, replacing: {}", e.valid_up_to(), e);
+            std::borrow::Cow::Owned(String::from_utf8_lossy(&bytes).into_owned())
         }
     };
 
-    let mut events = Vec::new();
+    let mut buffer = line_buffer.lock().await;
+    buffer.push_str(&text);
 
-    for line in text.lines() {
+    let last_newline_pos = match buffer.rfind('\n') {
+        Some(pos) => pos,
+        None => return vec![],
+    };
+
+    let complete_portion = buffer[..last_newline_pos].to_owned();
+    let incomplete_portion = buffer[last_newline_pos + 1..].to_owned();
+    buffer.clear();
+    buffer.push_str(&incomplete_portion);
+
+    let mut events = Vec::new();
+    for line in complete_portion.lines() {
         if let Some(data) = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:")) {
             if data == "[DONE]" {
                 continue;

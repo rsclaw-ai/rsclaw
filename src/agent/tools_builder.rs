@@ -33,6 +33,7 @@ pub(crate) fn toolset_allowed_names(
         "memory",
         "web_browser",
         "image_gen",
+        "video_gen",
         "channel",
         "cron",
         "computer_use",
@@ -429,6 +430,24 @@ pub(crate) fn build_tool_list(
             "properties": {
                 "prompt": {"type": "string", "description": "Image description. IMPORTANT: use the user's original language and wording, do not translate to English."},
                 "size":   {"type": "string", "description": "Image size, e.g. 2048x2048", "default": "2048x2048"}
+            },
+            "required": ["prompt"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "video_gen".to_owned(),
+        description: "Generate a video from a text description using an AI video model. \
+            Use this tool whenever the user asks to: create a video, animate an image, \
+            generate a clip, make a short film, produce footage, or anything involving \
+            video output. Pass the user's original description as-is (preserve their \
+            language, do not translate).".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "prompt":       {"type": "string", "description": "Video description. Use the user's original language and wording."},
+                "duration":     {"type": "integer", "description": "Duration in seconds (default: 5)", "default": 5},
+                "aspect_ratio": {"type": "string", "description": "Aspect ratio: 16:9, 9:16, 1:1 (default: 16:9)", "default": "16:9"},
+                "model":        {"type": "string", "description": "Video model to use, e.g. seedance, minimax, kling (optional, uses configured default)"}
             },
             "required": ["prompt"]
         }),

@@ -20,6 +20,7 @@ export function ModelConfigList(props: {
   );
   const value = `${props.modelConfig.model}@${props.modelConfig?.providerName}`;
   const compressModelValue = `${props.modelConfig.compressModel}@${props.modelConfig?.compressProviderName}`;
+  const videoModelValue = `${props.modelConfig.videoModel ?? ""}@${props.modelConfig?.videoProviderName ?? ""}`;
 
   return (
     <>
@@ -256,6 +257,33 @@ export function ModelConfigList(props: {
             props.updateConfig((config) => {
               config.compressModel = ModalConfigValidator.model(model);
               config.compressProviderName = providerName as ServiceProvider;
+            });
+          }}
+        >
+          {allModels
+            .filter((v) => v.available)
+            .map((v, i) => (
+              <option value={`${v.name}@${v.provider?.providerName}`} key={i}>
+                {v.displayName}({v.provider?.providerName})
+              </option>
+            ))}
+        </Select>
+      </ListItem>
+      <ListItem
+        title={Locale.Settings.VideoModel.Title}
+        subTitle={Locale.Settings.VideoModel.SubTitle}
+      >
+        <Select
+          className={styles["select-compress-model"]}
+          aria-label={Locale.Settings.VideoModel.Title}
+          value={videoModelValue}
+          onChange={(e) => {
+            const [model, providerName] = getModelProvider(
+              e.currentTarget.value,
+            );
+            props.updateConfig((config) => {
+              config.videoModel = ModalConfigValidator.model(model);
+              config.videoProviderName = providerName as ServiceProvider;
             });
           }}
         >

@@ -5624,6 +5624,7 @@ dependencies = [
  "genpdf",
  "glob",
  "hex",
+ "hmac",
  "hnsw_rs",
  "htmd",
  "image",

@@ -558,6 +558,10 @@ const en: LocaleType = {
       Title: "Summary Model",
       SubTitle: "Model used to compress history and generate title",
     },
+    VideoModel: {
+      Title: "Video Model",
+      SubTitle: "Model used for text-to-video generation (Seedance / MiniMax / Kling)",
+    },
     Temperature: {
       Title: "Temperature",
       SubTitle: "A larger value makes the more random output",

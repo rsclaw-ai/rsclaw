@@ -92,7 +92,7 @@ pub(crate) fn start_channels(
 
         // Register CLI channel sender for notification routing.
         {
-            let mut senders = channel_senders.write().unwrap();
+            let mut senders = channel_senders.write().expect("channel_senders lock poisoned");
             senders.insert("cli".to_string(), out_tx.clone());
         }
 
@@ -134,7 +134,7 @@ pub(crate) fn start_channels(
                 if let Ok(Ok(reply)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                     let pending = reply.pending_analysis;
                     if !reply.is_empty {
-                        let _ = tx
+                        if let Err(e) = tx
                             .send(OutboundMessage {
                                 target_id: "local".to_string(),
                                 is_group: false,
@@ -144,7 +144,10 @@ pub(crate) fn start_channels(
                                 channel: None,
                                 files: reply.files,
                             })
-                            .await;
+                            .await
+                        {
+                            tracing::warn!("failed to send message: {e}");
+                        }
                     }
                     if let Some(analysis) = pending {
                         handle_pending_analysis(
@@ -172,7 +175,9 @@ pub(crate) fn start_channels(
             }
         });
 
-        let _ = manager.register(Arc::clone(&cli_ch) as Arc<dyn Channel>);
+        if let Err(e) = manager.register(Arc::clone(&cli_ch) as Arc<dyn Channel>) {
+            tracing::warn!("failed to register channel: {e}");
+        }
         tokio::spawn(async move {
             if let Err(e) = cli_ch.run().await {
                 error!("CLI channel error: {e:#}");
@@ -256,7 +261,7 @@ pub(crate) fn start_channels(
 
             // Register Telegram channel sender for notification routing.
             {
-                let mut senders = channel_senders.write().unwrap();
+                let mut senders = channel_senders.write().expect("channel_senders lock poisoned");
                 senders.insert(format!("telegram/{}", acct_name), out_tx.clone());
             }
 
@@ -319,7 +324,7 @@ pub(crate) fn start_channels(
                                     return;
                                 }
                                 PolicyResult::SendPairingCode(code) => {
-                                    let _ = tx
+                                    if let Err(e) = tx
                                         .send(OutboundMessage {
                                             target_id: chat_id.to_string(),
                                             is_group: false,
@@ -329,11 +334,14 @@ pub(crate) fn start_channels(
             channel: None,
 
                     files: vec![],                                        })
-                                        .await;
+                                        .await
+                                    {
+                                        tracing::warn!("failed to send message: {e}");
+                                    }
                                     return;
                                 }
                                 PolicyResult::PairingQueueFull => {
-                                    let _ = tx
+                                    if let Err(e) = tx
                                         .send(OutboundMessage {
                                             target_id: chat_id.to_string(),
                                             is_group: false,
@@ -343,7 +351,10 @@ pub(crate) fn start_channels(
             channel: None,
 
                     files: vec![],                                        })
-                                        .await;
+                                        .await
+                                    {
+                                        tracing::warn!("failed to send message: {e}");
+                                    }
                                     return;
                                 }
                             }
@@ -434,7 +445,7 @@ pub(crate) fn start_channels(
                                         if let Ok(r) = reply {
                                             let pending = r.pending_analysis;
                                             if !r.is_empty {
-                                                let _ = w_tx
+                                                if let Err(e) = w_tx
                                                     .send(OutboundMessage {
                                                         target_id: chat_id.to_string(),
                                                         is_group,
@@ -443,7 +454,10 @@ pub(crate) fn start_channels(
                                                         images: r.images,
                                                         files: r.files,
                                                         channel: None,                                                    })
-                                                    .await;
+                                                    .await
+                                                {
+                                                    tracing::warn!("failed to send message: {e}");
+                                                }
                                             }
                                             if let Some(analysis) = pending {
                                                 handle_pending_analysis(
@@ -462,7 +476,7 @@ pub(crate) fn start_channels(
                                 });
                                 utx
                             } else {
-                                map.get(&queue_key).unwrap().clone()
+                                map.get(&queue_key).expect("queue entry must exist").clone()
                             }
                         };
                         // /btw bypass: spawn directly, skip the per-user queue
@@ -491,7 +505,7 @@ pub(crate) fn start_channels(
                                 if let Some(reply_text) = btw_direct_call(
                                     &question, &handle.live_status, &handle.providers, &cfg,
                                 ).await {
-                                    let _ = tx.send(OutboundMessage {
+                                    if let Err(e) = tx.send(OutboundMessage {
                                         target_id: chat_id_s,
                                         is_group: false,
                                         text: format!("[/btw] {}", reply_text),
@@ -499,7 +513,10 @@ pub(crate) fn start_channels(
                                         images: vec![],
             channel: None,
 
-                    files: vec![],                                    }).await;
+                    files: vec![],                                    }).await
+                                    {
+                                        tracing::warn!("failed to send message: {e}");
+                                    }
                                 }
                             });
                             return;
@@ -546,7 +563,11 @@ pub(crate) fn start_channels(
                                     reply.target_id = chat_id_s;
                                     reply.is_group = is_group;
                                     if !reply.text.is_empty() || !reply.images.is_empty() {
-                                        let _ = tx.send(reply).await;
+                                        if let Err(e) = tx.send(reply).await {
+
+                                            tracing::warn!("failed to send message: {e}");
+
+                                        }
                                     }
                                     return;
                                 }
@@ -567,7 +588,7 @@ pub(crate) fn start_channels(
                                 }
                                 if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                                     if !r.is_empty {
-                                        let _ = tx.send(OutboundMessage {
+                                        if let Err(e) = tx.send(OutboundMessage {
                                             target_id: chat_id_s,
                                             is_group,
                                             text: r.text,
@@ -575,7 +596,10 @@ pub(crate) fn start_channels(
                                             images: r.images,
                                             files: r.files,
                                             channel: None,
-                                        }).await;
+                                        }).await
+                                        {
+                                            tracing::warn!("failed to send message: {e}");
+                                        }
                                     }
                                 }
                             });
@@ -600,7 +624,9 @@ pub(crate) fn start_channels(
                 }
             });
 
-            let _ = manager.register(Arc::clone(&tg) as Arc<dyn Channel>);
+            if let Err(e) = manager.register(Arc::clone(&tg) as Arc<dyn Channel>) {
+                tracing::warn!("failed to register channel: {e}");
+            }
             tokio::spawn(async move {
                 if let Err(e) = tg.run().await {
                     error!("telegram channel error: {e:#}");

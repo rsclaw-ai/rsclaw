@@ -94,11 +94,20 @@ pub struct MemoryDoc {
     /// Freeform tags for lifecycle tracking (e.g. "crystallized", "merged").
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Pinned memories never decay and are immune to tier demotion.
+    /// Use for user-stated facts: phone numbers, IDs, credentials, names.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 impl MemoryDoc {
     /// P2: Weibull stretched-exponential decay replacing simple decay.
+    ///
+    /// Pinned documents always return 1.0 — they never decay.
     pub fn relevance_score(&self) -> f32 {
+        if self.pinned {
+            return 1.0;
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -143,7 +152,12 @@ impl MemoryDoc {
     ///
     /// Returns `true` if the doc was just promoted to [`MemDocTier::Core`]
     /// (used by the crystallization loop to detect skill candidates).
+    /// Pinned documents are immune to demotion.
     pub fn evaluate_tier_transition(&mut self) -> bool {
+        if self.pinned {
+            self.tier = MemDocTier::Core;
+            return false;
+        }
         let was_core = self.tier == MemDocTier::Core;
         let score = self.relevance_score();
 
