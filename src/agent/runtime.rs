@@ -3537,6 +3537,7 @@ impl AgentRuntime {
                     "web_search" => limits.and_then(|l| l.web_search).unwrap_or(2000),
                     "web_fetch" => limits.and_then(|l| l.web_fetch).unwrap_or(5000),
                     "execute_command" | "exec" => limits.and_then(|l| l.exec).unwrap_or(3000),
+                    "cron" => 100_000, // Don't truncate cron list - LLM needs full list to reference jobs
                     _ => limits.and_then(|l| l.default).unwrap_or(3000),
                 };
                 let session_text = if result_text.len() > max_chars {
