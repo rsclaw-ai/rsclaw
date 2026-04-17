@@ -784,21 +784,41 @@ impl CronRunner {
         let mut result = Vec::with_capacity(new_jobs.len());
 
         for mut new_job in new_jobs {
-            // Try to find existing job by ID and preserve its state
+            // Try to find existing job by ID
             if let Some(old_job) = old_jobs.iter().find(|j| j.id == new_job.id) {
-                // Preserve state from old job
-                new_job.state = old_job.state.clone();
+                // Check if schedule changed - must recompute next_run_at_ms
+                let schedule_changed = old_job.schedule.expr() != new_job.schedule.expr()
+                    || old_job.schedule.tz() != new_job.schedule.tz();
+
+                if schedule_changed {
+                    // Schedule changed - always recompute next_run time
+                    info!(
+                        job_id = %new_job.id,
+                        old_expr = %old_job.schedule.expr(),
+                        new_expr = %new_job.schedule.expr(),
+                        "cron: schedule changed, recomputing next_run_at_ms"
+                    );
+                    // Preserve old state but update next_run_at_ms
+                    let mut state = old_job.state.clone().unwrap_or_default();
+                    state.next_run_at_ms = new_job.schedule.compute_next_run(now_ms);
+                    state.running_at_ms = None; // Clear running marker
+                    new_job.state = Some(state);
+                } else {
+                    // Schedule unchanged - preserve state
+                    new_job.state = old_job.state.clone();
+                }
             } else {
                 // New job - initialize state
                 if new_job.state.is_none() {
                     new_job.state = Some(CronJobState {
                         consecutive_errors: 0,
+                        next_run_at_ms: new_job.schedule.compute_next_run(now_ms),
                         ..Default::default()
                     });
                 }
             }
 
-            // Ensure next_run_at_ms is set
+            // Ensure next_run_at_ms is set (fallback)
             if let Some(ref mut state) = new_job.state {
                 if state.next_run_at_ms.is_none() {
                     state.next_run_at_ms = new_job.schedule.compute_next_run(now_ms);
