@@ -294,11 +294,11 @@ label        = "ClawHub"
 api_base     = "https://clawhub.ai/api"
 
 [skill_registries.skillhub]
-label        = "SkillHub (Tencent COS)"
-index_url    = "https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/skills.json"
-download_url = "https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/skills/{slug}.zip"
-search_url   = "https://lightmake.site/api/v1/search"
-primary_download_url = "https://lightmake.site/api/v1/download"
+label        = "SkillHub"
+index_url    = "https://skillhub.cn/skills.json"
+download_url = "https://skillhub.cn/skills/{slug}.zip"
+search_url   = "https://skillhub.cn/search"
+primary_download_url = "https://skillhub.cn/download"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Exec Safety Rules
