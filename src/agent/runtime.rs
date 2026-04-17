@@ -1817,7 +1817,15 @@ impl AgentRuntime {
                 .search(text, Some(&scope), recall_top_k)
                 .unwrap_or_default();
             // 3. Fuse with Reciprocal Rank Fusion (k=60), return top final_k.
+            let vec_count = vec_hits.len();
+            let bm25_count = bm25_hits.len();
             let results = rrf_fuse(vec_hits, bm25_hits, recall_final_k);
+            tracing::debug!(
+                vec_count,
+                bm25_count,
+                fused = results.len(),
+                "auto-recall results"
+            );
             // Loop A (organic evolution): track recalled memory IDs for feedback.
             for doc in &results {
                 auto_recalled_ids.insert(doc.id.clone());
@@ -2184,10 +2192,17 @@ impl AgentRuntime {
 
         // Loop A (organic evolution): adjust importance of recalled memories
         // based on the outcome of this turn.
+        tracing::debug!(
+            recalled_count = ctx.recalled_memory_ids.len(),
+            loop_warning = ctx.loop_warning_triggered,
+            reply_empty = reply.is_empty,
+            "evolution: feedback check"
+        );
         if let Some(ref mem) = self.memory
             && !ctx.recalled_memory_ids.is_empty()
         {
             let signal = Self::infer_outcome_signal(&reply, &ctx, channel);
+            tracing::debug!(signal, recalled = ctx.recalled_memory_ids.len(), "evolution: applying feedback");
             if signal.abs() > f32::EPSILON {
                 let mut store = mem.lock().await;
                 for mem_id in &ctx.recalled_memory_ids {
