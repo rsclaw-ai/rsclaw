@@ -82,6 +82,7 @@ impl AgentSpawner {
             )),
             providers: Arc::clone(&self.providers),
             abort_flags: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            acp_running_tasks: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             started_at: std::time::Instant::now(),
             session_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_ctx_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),

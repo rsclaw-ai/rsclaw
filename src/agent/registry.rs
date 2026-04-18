@@ -44,6 +44,9 @@ pub struct AgentHandle {
     /// Per-session abort flags: session_key -> atomic abort flag.
     /// Uses std::sync::RwLock (not tokio) so it can be accessed in Drop impls.
     pub abort_flags: Arc<std::sync::RwLock<HashMap<String, Arc<AtomicBool>>>>,
+    /// ACP tasks currently running: session_key -> (tool_name, start_time).
+    /// Used to prevent duplicate ACP submissions from same session.
+    pub acp_running_tasks: Arc<std::sync::RwLock<HashMap<String, (String, Instant)>>>,
     /// When this agent handle was created (for /status uptime).
     pub started_at: Instant,
     /// Number of active sessions (updated after each turn for /status).
@@ -234,6 +237,7 @@ impl AgentRegistry {
                     ),
                     providers: Arc::clone(&providers),
                     abort_flags: Arc::new(std::sync::RwLock::new(HashMap::new())),
+                    acp_running_tasks: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     started_at: Instant::now(),
                     session_count: Arc::new(AtomicUsize::new(0)),
                     last_ctx_tokens: Arc::new(AtomicUsize::new(0)),

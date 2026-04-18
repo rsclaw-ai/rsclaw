@@ -1322,6 +1322,8 @@ pub struct SessionResultLimits {
     pub web_fetch: Option<usize>,
     /// exec result max chars in session (default: 3000)
     pub exec: Option<usize>,
+    /// ACP tools (opencode, claudecode) result max chars (default: 2000)
+    pub acp: Option<usize>,
     /// Default for all other tools (default: 3000)
     pub default: Option<usize>,
 }

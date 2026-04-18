@@ -381,7 +381,7 @@ pub struct RepairResult {
 /// 1. Scans all assistant messages for ToolUse parts
 /// 2. Collects all tool_use_ids from those messages
 /// 3. Ensures each tool_use_id has at least one ToolResult
-/// 4. Inserts synthetic error ToolResults for missing ids
+/// 4. Inserts synthetic error ToolResults for missing ids immediately after the Assistant
 /// 5. Removes orphaned ToolResult messages (no matching ToolUse)
 ///
 /// Returns a `RepairResult` with repaired messages and synthetic messages to persist.
@@ -429,10 +429,12 @@ pub fn repair_tool_result_pairing(messages: Vec<Message>) -> RepairResult {
         .cloned()
         .collect();
 
-    // Build repaired messages
+    // Build repaired messages - track position for each Assistant with tool_calls
     let mut repaired: Vec<Message> = Vec::new();
     let mut synthetic_messages: Vec<Message> = Vec::new();
 
+    // We need to insert synthetic ToolResults IMMEDIATELY after Assistant messages
+    // For each Assistant with tool_calls, we need to ensure Tool results follow directly
     for msg in messages {
         // Check if this is an orphaned ToolResult (tool_use_id not in all_tool_ids)
         if msg.role == Role::Tool {
@@ -477,9 +479,11 @@ pub fn repair_tool_result_pairing(messages: Vec<Message>) -> RepairResult {
             Vec::new()
         };
 
+        // Push the message first
         repaired.push(msg);
 
-        // After assistant message, add synthetic ToolResults for missing ids
+        // CRITICAL: Insert synthetic ToolResults IMMEDIATELY after Assistant (before any other message)
+        // This ensures the sequence is: Assistant(tool_calls) -> Tool(results) -> other messages
         for missing_id in tool_ids_in_this_msg.iter().filter(|id| missing_ids.contains(id)) {
             tracing::warn!(
                 tool_call_id = %missing_id,

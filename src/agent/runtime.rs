@@ -2769,7 +2769,7 @@ impl AgentRuntime {
                 if removed > 0 {
                     tracing::warn!(
                         removed = removed,
-                        "turn: removed {} orphaned Tool messages during final validation"
+                        "turn: removed {removed} orphaned Tool messages during final validation"
                     );
                 }
 

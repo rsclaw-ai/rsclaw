@@ -103,7 +103,7 @@ pub(crate) fn apply_context_pruning(messages: &mut Vec<Message>, cfg: Option<&Co
 
         if total > limit {
             let mut chars_over = total - limit;
-            let mut to_remove: Vec<usize> = Vec::new();
+            let mut tool_indices_to_remove: Vec<usize> = Vec::new();
             for (i, msg) in messages.iter().enumerate() {
                 if chars_over == 0 {
                     break;
@@ -111,35 +111,94 @@ pub(crate) fn apply_context_pruning(messages: &mut Vec<Message>, cfg: Option<&Co
                 if msg.role == Role::Tool {
                     let c = msg_chars(msg);
                     if c >= min_prunable {
-                        to_remove.push(i);
+                        tool_indices_to_remove.push(i);
                         chars_over = chars_over.saturating_sub(c);
                     }
                 }
             }
-            // Remove Tool messages, but also check for orphaned Assistants
-            // An Assistant with tool_calls whose Tool results were removed should also be removed
-            let mut assistant_to_remove: Vec<usize> = Vec::new();
-            for i in &to_remove {
-                // Check if preceding message is Assistant with tool_calls
-                if *i > 0 {
-                    let prev_idx = i - 1;
-                    if messages[prev_idx].role == Role::Assistant {
-                        if let MessageContent::Parts(parts) = &messages[prev_idx].content {
+
+            // For each Tool to remove, find its Assistant and ALL related Tool results.
+            // An Assistant may have multiple Tool results - we must remove them ALL together.
+            // Step 1: Find Assistants whose Tool results are being removed.
+            let mut assistant_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            for tool_idx in &tool_indices_to_remove {
+                // Find the Assistant that this Tool belongs to
+                // Scan backwards from tool_idx to find Assistant with tool_calls
+                for j in (0..*tool_idx).rev() {
+                    if messages[j].role == Role::User {
+                        break; // Stop at User - no Assistant found
+                    }
+                    if messages[j].role == Role::Assistant {
+                        if let MessageContent::Parts(parts) = &messages[j].content {
                             let has_tool_calls = parts.iter().any(|p| matches!(p, ContentPart::ToolUse { .. }));
                             if has_tool_calls {
-                                // This Assistant's Tool result is being removed, mark it too
-                                if !to_remove.contains(&prev_idx) && !assistant_to_remove.contains(&prev_idx) {
-                                    assistant_to_remove.push(prev_idx);
-                                }
+                                // Found the Assistant that owns this Tool result
+                                assistant_indices.insert(j);
+                                break;
                             }
                         }
                     }
                 }
             }
-            // Combine and sort removal indices
-            to_remove.extend(assistant_to_remove);
+
+            // Step 2: For each Assistant to remove, find ALL its Tool results
+            let mut all_tool_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            for assistant_idx in &assistant_indices {
+                // Collect tool_call_ids from this Assistant
+                let tool_call_ids: Vec<String> = match &messages[*assistant_idx].content {
+                    MessageContent::Parts(parts) => parts
+                        .iter()
+                        .filter_map(|p| {
+                            if let ContentPart::ToolUse { id, .. } = p {
+                                Some(id.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+
+                // Find all Tool results for these tool_call_ids
+                for j in (*assistant_idx + 1)..messages.len() {
+                    if messages[j].role == Role::User {
+                        break; // Stop at next User
+                    }
+                    if messages[j].role == Role::Tool {
+                        if let MessageContent::Parts(result_parts) = &messages[j].content {
+                            let matches = result_parts.iter().any(|p| {
+                                if let ContentPart::ToolResult { tool_use_id, .. } = p {
+                                    tool_call_ids.contains(tool_use_id)
+                                } else {
+                                    false
+                                }
+                            });
+                            if matches {
+                                all_tool_indices.insert(j);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Combine all indices to remove
+            let tools_count = all_tool_indices.len();
+            let assistants_count = assistant_indices.len();
+            let mut to_remove: Vec<usize> = Vec::new();
+            to_remove.extend(tool_indices_to_remove);
+            to_remove.extend(all_tool_indices);
+            to_remove.extend(assistant_indices);
             to_remove.sort();
             to_remove.dedup();
+
+            if !to_remove.is_empty() {
+                tracing::info!(
+                    tools = tools_count,
+                    assistants = assistants_count,
+                    total = to_remove.len(),
+                    "apply_context_pruning: removing Assistant-Tool pairs"
+                );
+            }
 
             for i in to_remove.into_iter().rev() {
                 messages.remove(i);
@@ -344,46 +403,57 @@ pub(crate) fn validate_message_sequence(messages: &mut Vec<Message>) -> usize {
     let mut removed = 0;
 
     // Check first message - cannot be Tool
-    while !messages.is_empty() && messages[0].role == Role::Tool {
-        tracing::warn!("validate_message_sequence: removing orphaned Tool at start");
-        messages.remove(0);
-        removed += 1;
+    let orphaned_at_start = messages.iter().take_while(|m| m.role == Role::Tool).count();
+    if orphaned_at_start > 0 {
+        tracing::warn!(
+            count = orphaned_at_start,
+            "validate_message_sequence: removing orphaned Tool messages at start"
+        );
+        messages.drain(..orphaned_at_start);
+        removed += orphaned_at_start;
     }
 
-    // Scan through and check each Tool message has preceding Assistant with tool_calls
-    let mut i = 1;
-    while i < messages.len() {
+    // Collect all orphaned Tool indices (Tool without preceding Assistant with tool_calls)
+    // Also track the range start for each orphaned segment for efficient removal.
+    let mut orphaned_tools: Vec<usize> = Vec::new();
+    for i in 1..messages.len() {
         if messages[i].role == Role::Tool {
-            // Check preceding message
             let prev = &messages[i - 1];
             let has_tool_calls = match &prev.content {
                 MessageContent::Parts(parts) => parts.iter().any(|p| matches!(p, ContentPart::ToolUse { .. })),
                 _ => false,
             };
-
             if prev.role != Role::Assistant || !has_tool_calls {
-                // Orphaned Tool - remove it and any following Tools
-                tracing::warn!(
-                    idx = i,
-                    "validate_message_sequence: removing orphaned Tool without preceding Assistant(tool_calls)"
-                );
-                messages.remove(i);
-                removed += 1;
-                continue; // Don't increment i, check same position again
+                orphaned_tools.push(i);
             }
         }
-        i += 1;
     }
 
-    // Final check: Assistant with tool_calls should have Tool results
-    // If an Assistant has tool_calls but no following Tool results, remove its tool_calls
-    // (This is less common, but let's handle it)
+    // Remove orphaned Tools in reverse order (batch removal, one log per segment)
+    if !orphaned_tools.is_empty() {
+        tracing::warn!(
+            count = orphaned_tools.len(),
+            first_idx = orphaned_tools.first().unwrap_or(&0),
+            last_idx = orphaned_tools.last().unwrap_or(&0),
+            "validate_message_sequence: removing orphaned Tool messages without preceding Assistant(tool_calls)"
+        );
+        for i in orphaned_tools.into_iter().rev() {
+            messages.remove(i);
+            removed += 1;
+        }
+    }
+
+    // Final check: Assistant with tool_calls must have Tool results
+    // If an Assistant has tool_calls but missing Tool results, remove it entirely.
+    // This prevents API errors like "An assistant message with tool_calls must be followed by tool messages".
+    // We need to collect indices first, then remove in reverse order.
+    let mut assistants_to_remove: Vec<usize> = Vec::new();
     for i in 0..messages.len() {
         if messages[i].role == Role::Assistant {
-            if let MessageContent::Parts(parts) = &mut messages[i].content {
+            if let MessageContent::Parts(parts) = &messages[i].content {
                 let has_tool_calls = parts.iter().any(|p| matches!(p, ContentPart::ToolUse { .. }));
                 if has_tool_calls {
-                    // Check if next message(s) are Tool results for these calls
+                    // Collect all tool_call_ids from this Assistant
                     let tool_call_ids: Vec<String> = parts
                         .iter()
                         .filter_map(|p| {
@@ -395,7 +465,7 @@ pub(crate) fn validate_message_sequence(messages: &mut Vec<Message>) -> usize {
                         })
                         .collect();
 
-                    // Find Tool results in following messages
+                    // Find Tool results in following messages (before next User)
                     let mut found_results: std::collections::HashSet<String> = std::collections::HashSet::new();
                     for j in (i + 1)..messages.len() {
                         if messages[j].role == Role::User {
@@ -412,19 +482,33 @@ pub(crate) fn validate_message_sequence(messages: &mut Vec<Message>) -> usize {
                         }
                     }
 
-                    // If some tool_calls have no results, we should probably remove them
-                    // But this is complex - for now just log a warning
-                    let missing = tool_call_ids.iter().filter(|id| !found_results.contains(id)).count();
-                    if missing > 0 {
+                    // Check if any tool_calls are missing results
+                    let missing_count = tool_call_ids.iter().filter(|id| !found_results.contains(id.as_str())).count();
+                    if missing_count > 0 {
                         tracing::warn!(
                             idx = i,
-                            missing = missing,
-                            "validate_message_sequence: Assistant has tool_calls without matching Tool results"
+                            missing = missing_count,
+                            total_tool_calls = tool_call_ids.len(),
+                            "validate_message_sequence: removing Assistant with incomplete tool_calls"
                         );
+                        assistants_to_remove.push(i);
                     }
                 }
             }
         }
+    }
+
+    // Remove incomplete Assistants in reverse order to preserve indices
+    for i in assistants_to_remove.into_iter().rev() {
+        messages.remove(i);
+        removed += 1;
+    }
+
+    // After removing Assistants, check again for orphaned Tools at start
+    while !messages.is_empty() && messages[0].role == Role::Tool {
+        tracing::warn!("validate_message_sequence: removing orphaned Tool at start (post-Assistant removal)");
+        messages.remove(0);
+        removed += 1;
     }
 
     removed

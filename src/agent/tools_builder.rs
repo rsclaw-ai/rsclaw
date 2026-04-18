@@ -192,13 +192,14 @@ pub(crate) fn build_tool_list(
             Tips:\n\
             - Use task for independent, parallelizable work. You can dispatch multiple tasks at once.\n\
             - Always specify toolset matching the task (web for search, code for file ops).\n\
-            - After dispatching, tell the user what you delegated and continue with other work.".to_owned(),
+            - After dispatching, tell the user what you delegated and continue with other work.\n\
+            - Do NOT specify a model parameter — the system automatically uses the current model.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "action":  {"type": "string", "enum": ["spawn", "task", "send", "list", "kill"], "description": "Action to perform"},
                 "id":      {"type": "string", "description": "Agent ID (for spawn/send/kill)"},
-                "model":   {"type": "string", "description": "Model string (for spawn/task)"},
+                "model":   {"type": "string", "description": "Optional model override. Leave empty to use current model. Do NOT guess or invent model names."},
                 "system":  {"type": "string", "description": "Role description (for spawn/task)"},
                 "message": {"type": "string", "description": "Message to send (for task/send)"},
                 "toolset": {"type": "string", "enum": ["minimal", "standard", "web", "code", "full"], "description": "Tool access level. Default: standard."}
