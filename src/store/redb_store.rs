@@ -154,6 +154,51 @@ impl RedbStore {
         Ok(keys)
     }
 
+    /// Increment the generation counter for a session and reset message_count.
+    /// Called by `/new` to start a fresh conversation on the same session key.
+    /// Active messages are deleted; archive is untouched.
+    pub fn new_generation(&self, session_key: &str) -> Result<u32> {
+        let meta_opt = self.get_session_meta(session_key)?;
+        let mut meta = meta_opt.unwrap_or_else(|| SessionMeta {
+            session_key: session_key.to_owned(),
+            message_count: 0,
+            last_active: chrono::Utc::now().timestamp(),
+            created_at: chrono::Utc::now().timestamp(),
+            generation: 1,
+        });
+
+        meta.generation += 1;
+        meta.message_count = 0;
+        meta.last_active = chrono::Utc::now().timestamp();
+
+        // Delete active messages (not archive).
+        let write = self.db.begin_write()?;
+        {
+            let mut msgs = write.open_table(MESSAGES)?;
+            let prefix = format!("{session_key}:");
+            let keys: Vec<String> = msgs
+                .range(prefix.as_str()..)?
+                .take_while(|r| {
+                    r.as_ref()
+                        .map(|(k, _)| k.value().starts_with(&prefix))
+                        .unwrap_or(false)
+                })
+                .filter_map(|r| r.ok())
+                .map(|(k, _)| k.value().to_owned())
+                .collect();
+            for key in &keys {
+                msgs.remove(key.as_str())?;
+            }
+
+            let meta_json = serde_json::to_string(&meta)?;
+            let mut metas = write.open_table(SESSION_META)?;
+            metas.insert(session_key, meta_json.as_str())?;
+        }
+        write.commit()?;
+
+        Ok(meta.generation)
+    }
+
     // -----------------------------------------------------------------------
     // Messages
     // -----------------------------------------------------------------------
@@ -170,6 +215,7 @@ impl RedbStore {
             message_count: 0,
             last_active: chrono::Utc::now().timestamp(),
             created_at: chrono::Utc::now().timestamp(),
+            generation: 1,
         });
 
         let seq = meta.message_count;
@@ -177,7 +223,8 @@ impl RedbStore {
         meta.last_active = chrono::Utc::now().timestamp();
 
         let msg_key = format!("{session_key}:{seq:016}");
-        let archive_key = format!("archive:{session_key}:{seq:016}");
+        let generation = meta.generation;
+        let archive_key = format!("archive:{session_key}:gen{generation}:{seq:016}");
         let msg_json = serde_json::to_string(message)?;
 
         let write = self.db.begin_write()?;
@@ -224,7 +271,7 @@ impl RedbStore {
         }
 
         // Backfill archive for pre-upgrade sessions: if no archive entries
-        // exist yet, copy all active messages to archive keys.
+        // exist yet, copy all active messages to archive:...:gen1:... keys.
         let archive_prefix = format!("archive:{session_key}:");
         let has_archive = table
             .range(archive_prefix.as_str()..)?
@@ -241,7 +288,9 @@ impl RedbStore {
             if let Ok(write) = self.db.begin_write() {
                 if let Ok(mut msgs_table) = write.open_table(MESSAGES) {
                     for (key, val) in &messages {
-                        let archive_key = format!("archive:{key}");
+                        // Pre-upgrade: no generation info, default to gen1.
+                        let suffix = key.strip_prefix(&format!("{session_key}:")).unwrap_or("0");
+                        let archive_key = format!("archive:{session_key}:gen1:{suffix}");
                         let json_str = serde_json::to_string(val).unwrap_or_default();
                         let _ = msgs_table.insert(archive_key.as_str(), json_str.as_str());
                     }
@@ -404,6 +453,15 @@ pub struct SessionMeta {
     pub message_count: u64,
     pub last_active: i64, // Unix timestamp
     pub created_at: i64,
+    /// Archive generation counter. Incremented on `/new` to separate
+    /// distinct conversations on the same session key.
+    /// Defaults to 1 for new sessions and pre-upgrade sessions (missing field).
+    #[serde(default = "default_generation")]
+    pub generation: u32,
+}
+
+fn default_generation() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -435,6 +493,7 @@ mod tests {
             message_count: 5,
             last_active: 1_700_000_000,
             created_at: 1_699_000_000,
+            generation: 1,
         };
         store
             .put_session_meta(&meta.session_key, &meta)

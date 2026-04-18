@@ -87,6 +87,22 @@ pub(crate) async fn try_preparse_locally(
         handle.clear_signal.store(true, Ordering::SeqCst);
         return Some(txt("✓ Session cleared.".to_owned()));
     }
+    // /new — start a fresh conversation (new generation, no summary)
+    if lower == "/new" {
+        let flags = handle.abort_flags.read().unwrap();
+        for f in flags.values() { f.store(true, Ordering::SeqCst); }
+        drop(flags);
+        handle.new_session_signal.store(true, Ordering::SeqCst);
+        return Some(txt("✓ New session started.".to_owned()));
+    }
+    // /reset — reset current session (no summary, same generation)
+    if lower == "/reset" {
+        let flags = handle.abort_flags.read().unwrap();
+        for f in flags.values() { f.store(true, Ordering::SeqCst); }
+        drop(flags);
+        handle.reset_signal.store(true, Ordering::SeqCst);
+        return Some(txt("✓ Session reset.".to_owned()));
+    }
     // /status
     if lower == "/status" {
         let model = handle.config.model.as_ref()

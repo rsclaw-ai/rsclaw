@@ -261,6 +261,16 @@ pub struct AgentRuntime {
     started_at: std::time::Instant,
     /// Cached workspace context (avoids re-reading unchanged files every turn).
     workspace_cache: Option<crate::agent::workspace::WorkspaceCache>,
+    /// Cached system prompt — built once per gateway lifetime, never
+    /// invalidated (only rebuilt on gateway restart).
+    cached_system_prompt: Option<String>,
+    /// Cached plugins system message — frozen at session start, rebuilt
+    /// on compact or `/new`. Sorted by name for byte-stable output.
+    cached_plugins_system: Option<String>,
+    /// Cached skills system message — same lifecycle as plugins.
+    cached_skills_system: Option<String>,
+    /// Snapshot of installed skill names (sorted) for change detection.
+    cached_skills_snapshot: Vec<String>,
     /// Background context manager (/ctx command, formerly /btw).
     btw_manager: super::btw::BtwManager,
     pub(crate) notification_tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
@@ -339,6 +349,10 @@ impl AgentRuntime {
             runtime_max_text_chars: None,
             started_at: std::time::Instant::now(),
             workspace_cache: None,
+            cached_system_prompt: None,
+            cached_plugins_system: None,
+            cached_skills_system: None,
+            cached_skills_snapshot: Vec::new(),
             btw_manager,
             pending_task_results: Arc::new(std::sync::Mutex::new(Vec::new())),
             voice_mode_sessions: std::collections::HashSet::new(),
@@ -544,10 +558,46 @@ impl AgentRuntime {
                 let _ = self.store.db.delete_session(&key);
             }
 
-            // Re-inject summaries so agent retains context.
+            // Re-inject summaries so agent retains context, and persist to redb.
             for (key, msg) in summary_msgs {
+                let val = serde_json::to_value(&msg).unwrap_or_default();
+                if let Err(e) = self.store.db.append_message(&key, &val) {
+                    tracing::warn!("failed to persist clear summary: {e:#}");
+                }
                 self.sessions.insert(key, vec![msg]);
             }
+            // /clear does NOT invalidate plugins/skills cache (same conversation continues).
+        }
+
+        // /new — start a fresh conversation with new archive generation.
+        if self.handle.new_session_signal.load(Ordering::SeqCst) {
+            self.handle.new_session_signal.store(false, Ordering::SeqCst);
+            info!("new_session_signal received, starting new generation");
+
+            self.sessions.clear();
+            self.compaction_state.clear();
+            // Increment generation in redb and clear active messages.
+            for key in self.store.db.list_sessions().unwrap_or_default() {
+                match self.store.db.new_generation(&key) {
+                    Ok(g) => info!(session = %key, generation = g, "new generation started"),
+                    Err(e) => tracing::warn!("failed to start new generation: {e:#}"),
+                }
+            }
+            // Rebuild plugins/skills on next turn (sorted, merged).
+            self.invalidate_plugins_skills_cache();
+        }
+
+        // /reset — clear current session without summary or generation change.
+        if self.handle.reset_signal.load(Ordering::SeqCst) {
+            self.handle.reset_signal.store(false, Ordering::SeqCst);
+            info!("reset_signal received, resetting sessions");
+
+            self.sessions.clear();
+            self.compaction_state.clear();
+            for key in self.store.db.list_sessions().unwrap_or_default() {
+                let _ = self.store.db.delete_session(&key);
+            }
+            // /reset does NOT invalidate plugins/skills cache (same generation).
         }
 
         // Reclaim idle browser session (kills Chrome process) to free memory.
@@ -1797,19 +1847,21 @@ impl AgentRuntime {
             )
         };
 
-        // Build system prompt — STABLE across turns for KV cache preservation.
-        // Dynamic content (date, memories, /ctx, hints) is injected into the
-        // API copy of the user message, NOT into the system prompt.
-        let system_prompt = build_system_prompt(&ws_ctx, &self.skills, &self.config.raw);
-
-        // DEBUG: dump full system prompt to file for inspection
-        if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
-            let dump_path = crate::config::loader::base_dir().join("debug_system_prompt.txt");
-            if let Err(e) = std::fs::write(&dump_path, &system_prompt) {
-                tracing::warn!("failed to dump system prompt: {e}");
+        // Build system prompt — cached for entire gateway lifetime.
+        // Only rebuilt on gateway restart.
+        if self.cached_system_prompt.is_none() {
+            let prompt = build_system_prompt(&ws_ctx, &self.skills, &self.config.raw);
+            // DEBUG: dump full system prompt to file for inspection
+            if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
+                let dump_path = crate::config::loader::base_dir().join("debug_system_prompt.txt");
+                if let Err(e) = std::fs::write(&dump_path, &prompt) {
+                    tracing::warn!("failed to dump system prompt: {e}");
+                }
+                tracing::info!(path = %dump_path.display(), len = prompt.len(), "dumped system prompt");
             }
-            tracing::info!(path = %dump_path.display(), len = system_prompt.len(), "dumped system prompt");
+            self.cached_system_prompt = Some(prompt);
         }
+        let system_prompt = self.cached_system_prompt.clone().expect("just set");
 
         // --- Dynamic context: injected into system prompt suffix ---
         // Only truly dynamic, per-turn content goes here. Static rules belong
@@ -2029,13 +2081,34 @@ impl AgentRuntime {
         } else {
             format!("{}\n\n{}", text, media_descriptions.join("\n"))
         };
+
+        // NOW load session (after media processing is done, no more self borrows).
+        let session_messages = self.load_session(session_key);
+
+        // First user message in session: prepend session metadata (date, timezone,
+        // channel). Stored in session so it becomes part of the stable prefix
+        // for KV cache — never changes across turns.
+        // Also triggers after /clear (session may contain a summary but no user messages).
+        let has_user_msg = session_messages.iter().any(|m| m.role == Role::User);
+        let persist_text = if !has_user_msg {
+            let now = chrono::Local::now();
+            let tz = now.format("%Z").to_string();
+            let session_meta = format!(
+                "[Session started: {} {}, {}, via {}]",
+                now.format("%Y-%m-%d %H:%M"),
+                now.format("%A"),
+                tz,
+                channel,
+            );
+            format!("{session_meta}\n{persist_text}")
+        } else {
+            persist_text
+        };
+
         let persist_msg = Message {
             role: Role::User,
             content: MessageContent::Text(persist_text),
         };
-
-        // NOW load session (after media processing is done, no more self borrows).
-        let session_messages = self.load_session(session_key);
         session_messages.push(persist_msg.clone());
         if let Err(e) = self.store.db.append_message(
             session_key,
@@ -2140,35 +2213,60 @@ impl AgentRuntime {
             loop_warning_triggered: false,
         };
 
-        // Build skills system message: a separate role=system message placed
-        // right after the main system prompt. Rebuilt only on skill changes or
-        // compaction, keeping the main system prompt perfectly stable for KV cache.
-        let skills_system: Option<String> = {
-            let all_skills: Vec<_> = self.skills.all().collect();
-            if all_skills.is_empty() {
-                None
-            } else {
-                let skill_prompts: String = all_skills
-                    .iter()
-                    .map(|s| format!(
-                        "<skill name=\"{}\" version=\"{}\">\n{}\n</skill>",
-                        s.name,
-                        s.version.as_deref().unwrap_or(""),
-                        s.prompt.trim(),
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                Some(format!(
-                    "## Installed Skills\n\
-                     When the user's request matches a skill, follow its instructions.\n\n\
-                     {skill_prompts}"
-                ))
+        // --- Plugins & Skills: cached, frozen at session start ---
+        // On first turn: build and cache. On subsequent turns: detect new
+        // additions and append as trailing system messages. On compact/`/new`:
+        // rebuild (handled by invalidate_plugins_skills_cache()).
+
+        // Build/cache plugins system message.
+        // TODO: populate from self.plugins when plugin system is merged.
+        if self.cached_plugins_system.is_none() {
+            // Placeholder — will be populated after jimeng-automation merge.
+            // self.cached_plugins_system = Some(build_plugins_system(&self.plugins));
+        }
+
+        // Build/cache skills system message.
+        if self.cached_skills_system.is_none() {
+            let (msg, snapshot) = Self::build_skills_system_msg(&self.skills);
+            self.cached_skills_system = msg;
+            self.cached_skills_snapshot = snapshot;
+        }
+
+        // Detect newly added skills since cache was frozen.
+        // New skills are appended as trailing system messages, not merged
+        // into the cached [2] — this preserves KV cache prefix.
+        let mut new_skills_tail: Vec<String> = Vec::new();
+        {
+            let mut current_names: Vec<String> = self.skills.all()
+                .map(|s| s.name.clone())
+                .collect();
+            current_names.sort();
+            for name in &current_names {
+                if !self.cached_skills_snapshot.contains(name) {
+                    if let Some(skill) = self.skills.all().find(|s| &s.name == name) {
+                        new_skills_tail.push(format!(
+                            "<skill name=\"{}\" version=\"{}\">\n{}\n</skill>",
+                            skill.name,
+                            skill.version.as_deref().unwrap_or(""),
+                            skill.prompt.trim(),
+                        ));
+                    }
+                }
             }
-        };
+        }
+
+        let plugins_system = self.cached_plugins_system.clone();
+        let skills_system = self.cached_skills_system.clone();
 
         let reply = time::timeout(
             Duration::from_secs(timeout_secs),
-            self.agent_loop(&mut ctx, &model, &system_prompt, skills_system.as_deref(), tools, extra_tools, abort_flag.clone(), dynamic_ctx),
+            self.agent_loop(
+                &mut ctx, &model, &system_prompt,
+                plugins_system.as_deref(),
+                skills_system.as_deref(),
+                tools, extra_tools, abort_flag.clone(),
+                dynamic_ctx, new_skills_tail,
+            ),
         )
         .await
         .map_err(|_| {
@@ -2435,6 +2533,46 @@ impl AgentRuntime {
         }
     }
 
+    /// Build the skills system message from the registry (sorted by name).
+    /// Returns (message, sorted_name_snapshot).
+    fn build_skills_system_msg(skills: &crate::skill::SkillRegistry) -> (Option<String>, Vec<String>) {
+        let mut all_skills: Vec<_> = skills.all().collect();
+        all_skills.sort_by(|a, b| a.name.cmp(&b.name));
+        let snapshot: Vec<String> = all_skills.iter().map(|s| s.name.clone()).collect();
+
+        if all_skills.is_empty() {
+            return (None, snapshot);
+        }
+
+        let skill_prompts: String = all_skills
+            .iter()
+            .map(|s| format!(
+                "<skill name=\"{}\" version=\"{}\">\n{}\n</skill>",
+                s.name,
+                s.version.as_deref().unwrap_or(""),
+                s.prompt.trim(),
+            ))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let msg = format!(
+            "## Installed Skills\n\
+             When the user's request matches a skill, follow its instructions \
+             unless a plugin already handles the task.\n\
+             Priority: plugins > skills > built-in tools.\n\n\
+             {skill_prompts}"
+        );
+        (Some(msg), snapshot)
+    }
+
+    /// Invalidate cached plugins and skills system messages.
+    /// Called after compaction or `/new` to force a rebuild on the next turn.
+    pub(crate) fn invalidate_plugins_skills_cache(&mut self) {
+        self.cached_plugins_system = None;
+        self.cached_skills_system = None;
+        self.cached_skills_snapshot.clear();
+    }
+
     /// Load session history from in-memory cache, falling back to redb.
     /// Session key should already be resolved through `resolve_session_key`
     /// (done in `run_turn`) so aliases are transparent.
@@ -2462,11 +2600,13 @@ impl AgentRuntime {
         ctx: &mut RunContext,
         model: &str,
         system_prompt: &str,
+        plugins_system: Option<&str>,
         skills_system: Option<&str>,
         tools: Vec<ToolDef>,
         extra_tools: Vec<ToolDef>,
         abort_flag: Arc<AtomicBool>,
         dynamic_ctx: Vec<String>,
+        new_skills_tail: Vec<String>,
     ) -> Result<AgentReply> {
         let pruning_cfg = self.config.agents.defaults.context_pruning.clone();
 
@@ -2704,14 +2844,36 @@ impl AgentRuntime {
                     }
                 }
 
-                // Skills system message: inserted at the front of history so
-                // it becomes [1] system right after the main [0] system prompt.
-                // Stable across turns — only changes on skill install/uninstall
-                // or compaction. Main system prompt prefix cache stays intact.
+                // Insert plugins and skills as system messages at the front
+                // of history. After provider prepends the main system prompt [0],
+                // the final order is:
+                //   [0] system — main prompt (stable, never changes)
+                //   [1] system — plugins (highest priority, overrides skills/built-in)
+                //   [2] system — skills (overrides built-in tools)
+                //   [3+] history — user/assistant/tool messages
+                // Insert in reverse order since each insert(0, ...) pushes previous ones down.
                 if let Some(skills) = skills_system {
                     raw.insert(0, Message {
                         role: Role::System,
                         content: MessageContent::Text(skills.to_owned()),
+                    });
+                }
+                if let Some(plugins) = plugins_system {
+                    raw.insert(0, Message {
+                        role: Role::System,
+                        content: MessageContent::Text(plugins.to_owned()),
+                    });
+                }
+
+                // Append newly installed skills as trailing system messages.
+                // These were added after the cached [2] was frozen — appending
+                // at the tail preserves the KV cache prefix.
+                for skill_block in &new_skills_tail {
+                    raw.push(Message {
+                        role: Role::System,
+                        content: MessageContent::Text(format!(
+                            "## New Skill Installed\n{skill_block}"
+                        )),
                     });
                 }
 
