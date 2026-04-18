@@ -2238,7 +2238,10 @@ impl AgentRuntime {
                     .join("\n\n");
                 dynamic_ctx.push(format!(
                     "## Active Skills (matched to current request)\n\
-                     Follow these skill instructions carefully:\n\n{skill_prompts}"
+                     IMPORTANT: The user's request matches an installed skill. \
+                     You MUST follow the skill instructions below instead of using \
+                     default tools (image_gen, video_gen, web_search, etc.) unless \
+                     the skill explicitly tells you to use them.\n\n{skill_prompts}"
                 ));
                 info!(
                     skills = ?matched.iter().map(|s| &s.name).collect::<Vec<_>>(),
