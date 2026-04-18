@@ -105,6 +105,7 @@ rusqlite = { version = "0.32", optional = true, features = ["bundled"] }
 async-trait = "0.1"
 htmd = "0.5"
 wasmtime = { version = "29", features = ["async"] }
+wasmtime-wasi = "29"
 moka = { version = "0.12", features = ["future"] }
 
 # System tray (optional)

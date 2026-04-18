@@ -79,6 +79,17 @@ struct WasmManifestRaw {
 /// State passed into the wasmtime `Store`, available to host functions.
 struct HostState {
     browser: Arc<Mutex<Option<BrowserSession>>>,
+    wasi: wasmtime_wasi::WasiCtx,
+    wasi_table: wasmtime::component::ResourceTable,
+}
+
+impl wasmtime_wasi::WasiView for HostState {
+    fn ctx(&mut self) -> &mut wasmtime_wasi::WasiCtx {
+        &mut self.wasi
+    }
+    fn table(&mut self) -> &mut wasmtime::component::ResourceTable {
+        &mut self.wasi_table
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -279,7 +290,7 @@ pub async fn load_wasm_plugins(
                 plugins.push(plugin);
             }
             Err(e) => {
-                warn!(path = %path.display(), error = %e, "failed to load WASM plugin");
+                warn!(path = %path.display(), error = format!("{e:#}"), "failed to load WASM plugin");
             }
         }
     }
@@ -291,6 +302,9 @@ pub async fn load_wasm_plugins(
 /// Build a `Linker<HostState>` with all host functions registered.
 fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
     let mut linker = Linker::new(engine);
+    // Add WASI interfaces (io, filesystem, etc.) required by wasm32-wasip2 components.
+    wasmtime_wasi::add_to_linker_async(&mut linker)?;
+    // Add our custom host interfaces.
     rsclaw::jimeng::host_browser::add_to_linker(&mut linker, |state: &mut HostState| state)?;
     rsclaw::jimeng::host_runtime::add_to_linker(&mut linker, |state: &mut HostState| state)?;
     Ok(linker)
@@ -311,10 +325,13 @@ async fn load_single_plugin(
     let linker = build_linker(engine)?;
 
     // Create a temporary store to call get-manifest and discover tools.
+    let wasi = wasmtime_wasi::WasiCtxBuilder::new().build();
     let mut store = Store::new(
         engine,
         HostState {
             browser: Arc::clone(&browser),
+            wasi,
+            wasi_table: wasmtime::component::ResourceTable::new(),
         },
     );
 
@@ -390,10 +407,13 @@ impl WasmPlugin {
         debug!(plugin = %self.name, tool = tool_name, "dispatching WASM tool call");
 
         // Fresh store per call for isolation.
+        let wasi = wasmtime_wasi::WasiCtxBuilder::new().build();
         let mut store = Store::new(
             &self.engine,
             HostState {
                 browser: Arc::clone(&self.browser),
+                wasi,
+                wasi_table: wasmtime::component::ResourceTable::new(),
             },
         );
 
