@@ -748,8 +748,10 @@ $synth.Speak('{}')
             "path": out_path_str,
             "filename": filename,
             "audio_file": out_path_str,
-            "voice": voice,
-            "chars": text.len()
+            "voice": effective_voice,
+            "chars": text.len(),
+            "auto_sent": true,
+            "note": "Audio file has been auto-sent to the user. Do NOT call send_file again."
         }))
     }
 
