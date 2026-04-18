@@ -3773,8 +3773,9 @@ impl AgentRuntime {
 
                 tool_images.extend(result_images);
 
-                // send_file tool: images go to tool_images, other files to tool_files.
-                if tool_name == "send_file" {
+                // Auto-send files: any tool returning __send_file=true queues the
+                // file for delivery. Images go to tool_images, others to tool_files.
+                {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result_text) {
                         if v.get("__send_file").and_then(|b| b.as_bool()).unwrap_or(false) {
                             if let Some(path_str) = v.get("path").and_then(|p| p.as_str()) {

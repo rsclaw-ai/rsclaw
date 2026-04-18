@@ -740,7 +740,16 @@ $synth.Speak('{}')
             }
         }
 
+        // Return with __send_file so the file is auto-sent to the user
+        // without requiring the LLM to call send_file separately.
+        let filename = std::path::Path::new(&out_path_str)
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| "tts.mp3".to_owned());
         Ok(json!({
+            "__send_file": true,
+            "path": out_path_str,
+            "filename": filename,
             "audio_file": out_path_str,
             "voice": voice,
             "chars": text.len()
