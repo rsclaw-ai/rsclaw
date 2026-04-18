@@ -566,6 +566,10 @@ const en: LocaleType = {
       Title: "Side Query Budget",
       SubTitle: "Max tokens for /ctx side queries",
     },
+    KvCacheMode: {
+      Title: "KV Cache Mode",
+      SubTitle: "0=off 1=full/append-only(default) 2=delta/incremental",
+    },
     Temperature: {
       Title: "Temperature",
       SubTitle: "A larger value makes the more random output",

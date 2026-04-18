@@ -2019,7 +2019,14 @@ impl AgentRuntime {
         };
 
         // Check vision support before loading session (avoids borrow conflict).
-        let vision = model_supports_vision(&model, &self.config);
+        // kvCacheMode >= 1: never send base64 images even if model supports vision,
+        // to keep message content stable for KV cache prefix matching.
+        let kv_mode = self.config.agents.defaults.kv_cache_mode.unwrap_or(1);
+        let vision = if kv_mode >= 1 {
+            false // always convert to text description for KV cache stability
+        } else {
+            model_supports_vision(&model, &self.config)
+        };
 
         // ---------------------------------------------------------------
         // Media processing: convert images/videos to text descriptions.

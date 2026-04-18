@@ -314,6 +314,25 @@ export function ModelConfigList(props: {
           }
         ></input>
       </ListItem>
+      <ListItem
+        title={Locale.Settings.KvCacheMode.Title}
+        subTitle={Locale.Settings.KvCacheMode.SubTitle}
+      >
+        <Select
+          className={styles["select-compress-model"]}
+          aria-label={Locale.Settings.KvCacheMode.Title}
+          value={(props.modelConfig.kvCacheMode ?? 1).toString()}
+          onChange={(e) =>
+            props.updateConfig(
+              (config) => (config.kvCacheMode = parseInt(e.currentTarget.value)),
+            )
+          }
+        >
+          <option value="0">0 - Off</option>
+          <option value="1">1 - Full (append-only)</option>
+          <option value="2">2 - Delta (incremental)</option>
+        </Select>
+      </ListItem>
     </>
   );
 }

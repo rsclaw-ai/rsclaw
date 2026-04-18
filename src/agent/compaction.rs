@@ -43,8 +43,8 @@ impl AgentRuntime {
         // unnecessarily discard context and break KV cache in the new
         // append-only architecture.
         let context_tokens = self.config.agents.defaults.context_tokens.unwrap_or(64_000) as usize;
-        let kv_cache_mode = self.config.agents.defaults.prefix_kv_cache.unwrap_or(1);
-        // prefix_kv_cache >= 1: append-only mode, delay compaction to 95%
+        let kv_cache_mode = self.config.agents.defaults.kv_cache_mode.unwrap_or(1);
+        // kvCacheMode >= 1: append-only mode, delay compaction to 95%
         // to maximize KV cache reuse. Mode 0: legacy 80% threshold.
         let default_threshold = if kv_cache_mode >= 1 {
             (context_tokens * 19 / 20).max(16_000) // 95%

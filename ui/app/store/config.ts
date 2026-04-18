@@ -69,6 +69,7 @@ export const DEFAULT_CONFIG = {
     videoModel: "",
     videoProviderName: "",
     btwTokens: 10000,
+    kvCacheMode: 1,
     enableInjectSystemPrompts: true,
     template: config?.template ?? DEFAULT_INPUT_TEMPLATE,
     size: "1024x1024" as ModelSize,
