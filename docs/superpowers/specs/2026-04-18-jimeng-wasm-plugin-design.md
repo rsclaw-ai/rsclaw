@@ -215,26 +215,36 @@ All actions are the user's responsibility.
 4. Register plugin tools in agent's tool list
 5. Route plugin tool calls through WASM runtime
 
-### Phase 2: Jimeng Plugin — Image & Video (Priority)
+### Phase 2: Jimeng Plugin — Image Generation (Priority 1)
 6. Create `rsclaw-plugin-jimeng` repo (Rust, wasm32-wasip2 target)
 7. Implement `jimeng.txt2img` (most complex: model select + prompt + generate + wait + download)
 8. Implement `jimeng.img2img`
-9. Implement `jimeng.txt2vid`
-10. Implement `jimeng.img2vid`
-11. Test end-to-end via rsclaw gateway
+9. Implement `jimeng.mix_images`, `jimeng.batch_images`, `jimeng.same_style`, `jimeng.face_swap`
+10. Test image generation end-to-end via rsclaw gateway
 
-### Phase 3: Remaining Functions
-12. Canvas tools (expand, inpaint, erase, cutout, merge)
-13. Digital human (create, talk, clone)
-14. Story creation (script, generate, edit)
-15. Advanced control (character_lock, pose_copy, camera_control)
-16. Utilities (photo_restore, photo_animate, export, history)
+### Phase 3: Jimeng Plugin — Video Generation (Priority 2)
+11. Implement `jimeng.txt2vid`
+12. Implement `jimeng.img2vid`
+13. Implement `jimeng.frame2vid`, `jimeng.vid_extend`, `jimeng.vid_upscale`, `jimeng.lip_sync`
+14. Test video generation end-to-end
 
-### Phase 4: Polish
-17. Error recovery (retry on timeout, re-login on session expire)
-18. Result caching (avoid re-generating same prompt)
-19. Progress reporting (stream status to user while generating)
-20. Multi-language prompt optimization
+### Phase 4: Jimeng Plugin — Digital Human (Priority 3)
+15. Implement `jimeng.digital_human_create`
+16. Implement `jimeng.digital_human_talk`
+17. Implement `jimeng.digital_human_clone`
+18. Test digital human end-to-end
+
+### Phase 5: Remaining Functions
+19. Canvas tools (expand, inpaint, erase, cutout, merge)
+20. Story creation (script, generate, edit)
+21. Advanced control (character_lock, pose_copy, camera_control)
+22. Utilities (photo_restore, photo_animate, export, history)
+
+### Phase 6: Polish
+23. Error recovery (retry on timeout, re-login on session expire)
+24. Result caching (avoid re-generating same prompt)
+25. Progress reporting (stream status to user while generating)
+26. Multi-language prompt optimization
 
 ## File Structure
 
