@@ -3935,8 +3935,22 @@ impl AgentRuntime {
             "web_download" => return self.tool_web_download(args).await,
             "web_browser" | "browser" => return self.tool_web_browser(ctx, args).await,
             "computer_use" => return self.tool_computer_use(args).await,
-            "image_gen" | "image" => return self.tool_image(args).await,
-            "video_gen" | "video" => return self.tool_video(args).await,
+            "image_gen" | "image" => {
+                // If jimeng WASM plugin is loaded, redirect to jimeng.txt2img.
+                if let Some(wp) = self.wasm_plugins.iter().find(|p| p.name == "jimeng") {
+                    info!("redirecting image_gen to jimeng.txt2img");
+                    return wp.call_tool("txt2img", args).await;
+                }
+                return self.tool_image(args).await;
+            }
+            "video_gen" | "video" => {
+                // If jimeng WASM plugin is loaded, redirect to jimeng.txt2vid.
+                if let Some(wp) = self.wasm_plugins.iter().find(|p| p.name == "jimeng") {
+                    info!("redirecting video_gen to jimeng.txt2vid");
+                    return wp.call_tool("txt2vid", args).await;
+                }
+                return self.tool_video(args).await;
+            }
             "pdf" => return self.tool_pdf(args).await,
             "text_to_voice" | "text_to_speech" | "tts" => return self.tool_tts(args).await,
             "send_message" | "message" => return self.tool_message(args).await,
