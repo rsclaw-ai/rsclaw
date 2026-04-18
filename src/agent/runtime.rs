@@ -1976,6 +1976,12 @@ impl AgentRuntime {
                 all.retain(|t| !GROUP_BLOCKED_TOOLS.contains(&t.name.as_str()));
             }
 
+            // Internal channels (heartbeat/cron/system): only memory tool
+            if session_key.starts_with("heartbeat:") || session_key.starts_with("cron:") || session_key.starts_with("system:") {
+                const INTERNAL_ALLOWED: &[&str] = &["memory"];
+                all.retain(|t| INTERNAL_ALLOWED.contains(&t.name.as_str()));
+            }
+
             // Channel-specific tool filtering: only keep the *_actions tool
             // that matches the current channel, strip all others (~500 tokens
             // saved per call).
