@@ -578,16 +578,23 @@ impl AgentRuntime {
             self.handle.new_session_signal.store(false, Ordering::SeqCst);
             info!("new_session_signal received, starting new generation");
 
+            // Save session summary to memory before clearing — no summary
+            // will be injected into the new session, so memory is the only
+            // way the LLM can find prior context.
+            let compaction_model = self.config.agents.defaults.compaction
+                .as_ref().and_then(|c| c.model.clone())
+                .or_else(|| self.handle.config.model.as_ref()?.primary.clone())
+                .unwrap_or_else(|| "default".to_owned());
+            self.save_session_summaries_to_memory(&compaction_model).await;
+
             self.sessions.clear();
             self.compaction_state.clear();
-            // Increment generation in redb and clear active messages.
             for key in self.store.db.list_sessions().unwrap_or_default() {
                 match self.store.db.new_generation(&key) {
                     Ok(g) => info!(session = %key, generation = g, "new generation started"),
                     Err(e) => tracing::warn!("failed to start new generation: {e:#}"),
                 }
             }
-            // Rebuild plugins/skills on next turn (sorted, merged).
             self.invalidate_plugins_skills_cache();
         }
 
@@ -596,12 +603,18 @@ impl AgentRuntime {
             self.handle.reset_signal.store(false, Ordering::SeqCst);
             info!("reset_signal received, resetting sessions");
 
+            // Save session summary to memory before clearing.
+            let compaction_model2 = self.config.agents.defaults.compaction
+                .as_ref().and_then(|c| c.model.clone())
+                .or_else(|| self.handle.config.model.as_ref()?.primary.clone())
+                .unwrap_or_else(|| "default".to_owned());
+            self.save_session_summaries_to_memory(&compaction_model2).await;
+
             self.sessions.clear();
             self.compaction_state.clear();
             for key in self.store.db.list_sessions().unwrap_or_default() {
                 let _ = self.store.db.delete_session(&key);
             }
-            // /reset does NOT invalidate plugins/skills cache (same generation).
         }
 
         // Reclaim idle browser session (kills Chrome process) to free memory.
@@ -2537,6 +2550,65 @@ impl AgentRuntime {
             canonical.as_str()
         } else {
             session_key
+        }
+    }
+
+    /// Save summaries of all active sessions to long-term memory.
+    ///
+    /// Called before `/new` and `/reset` — since no summary is injected into
+    /// the new session, memory is the only way the LLM can find prior context.
+    /// Uses KV cache mode when available (session is still in memory).
+    async fn save_session_summaries_to_memory(&mut self, model: &str) {
+        if self.memory.is_none() { return; }
+
+        let kv_cache_mode = self.config.agents.defaults.kv_cache_mode.unwrap_or(1);
+
+        // Collect session data upfront to avoid borrow conflicts.
+        let session_data: Vec<(String, String)> = self.sessions.iter()
+            .filter(|(_, msgs)| msgs.len() > 2)
+            .map(|(key, msgs)| {
+                let transcript = Self::msgs_to_text_static(msgs, 16_000);
+                (key.clone(), transcript)
+            })
+            .collect();
+
+        for (session_key, transcript) in &session_data {
+            // Generate summary — try KV cache mode first.
+            let summary = if kv_cache_mode >= 1 {
+                let result = self.compact_with_kv_cache(session_key, model, transcript, None).await;
+                if result.is_some() { result } else {
+                    self.compact_single(model, transcript, None).await
+                }
+            } else {
+                self.compact_single(model, transcript, None).await
+            };
+
+            let Some(summary) = summary else { continue };
+
+            // Store as a session_summary memory doc.
+            let scope = format!("agent:{}", self.handle.id);
+            let doc = crate::agent::memory::MemoryDoc {
+                id: format!("session-summary-{}", uuid::Uuid::new_v4()),
+                scope: scope.clone(),
+                kind: "session_summary".to_owned(),
+                text: summary,
+                vector: vec![],
+                created_at: 0,
+                accessed_at: 0,
+                access_count: 0,
+                importance: 0.8,
+                tier: Default::default(),
+                abstract_text: None,
+                overview_text: None,
+                tags: vec![],
+                pinned: false,
+            };
+            let mem = self.memory.as_ref().expect("checked above");
+            if let Err(e) = mem.lock().await.add(doc).await {
+                tracing::warn!("failed to save session summary to memory: {e:#}");
+            } else {
+                info!(session = %session_key, "session summary saved to memory before clear");
+            }
         }
     }
 

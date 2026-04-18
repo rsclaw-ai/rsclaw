@@ -545,7 +545,7 @@ impl AgentRuntime {
     /// to the current session's messages. The system prompt + tools + history
     /// are already cached in the LLM slot, so only the final summary prompt
     /// needs to be computed.
-    async fn compact_with_kv_cache(
+    pub(crate) async fn compact_with_kv_cache(
         &mut self,
         session_key: &str,
         model: &str,
