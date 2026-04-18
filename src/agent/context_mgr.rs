@@ -436,7 +436,7 @@ pub(crate) fn extract_key_entities(text: &str) -> Vec<KeyEntity> {
 
         for segment in text.split(|c: char| c == '\n' || c == '。') {
             let mut seg = segment.trim().to_owned();
-            if seg.chars().count() < 5 || seg.chars().count() > 120 {
+            if seg.chars().count() < 10 || seg.chars().count() > 60 {
                 continue;
             }
 
