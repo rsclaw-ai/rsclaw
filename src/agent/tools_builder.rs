@@ -755,7 +755,8 @@ pub(crate) fn build_tool_list(
         }
     }
 
-    // WASM plugin tools.
+    // WASM plugin tools — replace built-in equivalents.
+    let mut wasm_replaces: Vec<String> = Vec::new();
     for plugin in wasm_plugins {
         for tool in &plugin.tools {
             let full_name = format!("{}.{}", plugin.name, tool.name);
@@ -765,6 +766,17 @@ pub(crate) fn build_tool_list(
                 parameters: tool.parameters.clone(),
             });
         }
+        // If a WASM plugin provides image/video generation, remove the
+        // built-in tools so the LLM uses the plugin instead.
+        if plugin.tools.iter().any(|t| t.name == "txt2img") {
+            wasm_replaces.push("image_gen".to_string());
+        }
+        if plugin.tools.iter().any(|t| t.name == "txt2vid") {
+            wasm_replaces.push("video_gen".to_string());
+        }
+    }
+    if !wasm_replaces.is_empty() {
+        tools.retain(|t| !wasm_replaces.contains(&t.name));
     }
 
     // Inject `additionalProperties: false` and `$schema` into every tool's
