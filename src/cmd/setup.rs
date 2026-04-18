@@ -1,12 +1,43 @@
 ﻿use anyhow::Result;
 use dialoguer::{Input, Password, Select};
 use serde_json::json;
+use tracing::info;
 
 use super::config_json::{get_nested_value, load_config_json, set_nested_value};
 use crate::{
     agent,
     cli::{ConfigureArgs, OnboardArgs, SetupArgs},
 };
+
+/// Generate a 64-character hex auth token.
+pub(crate) fn generate_auth_token() -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut buf = [0u8; 32];
+    // Mix multiple entropy sources.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let pid = std::process::id();
+    let mut hasher = DefaultHasher::new();
+    now.as_nanos().hash(&mut hasher);
+    pid.hash(&mut hasher);
+    let h1 = hasher.finish();
+    hasher = DefaultHasher::new();
+    (h1 ^ 0xdeadbeef_cafebabe).hash(&mut hasher);
+    std::thread::current().id().hash(&mut hasher);
+    let h2 = hasher.finish();
+    buf[..8].copy_from_slice(&h1.to_le_bytes());
+    buf[8..16].copy_from_slice(&h2.to_le_bytes());
+    // Fill rest with more hashing rounds.
+    for i in (16..32).step_by(8) {
+        hasher = DefaultHasher::new();
+        buf[..i].hash(&mut hasher);
+        let h = hasher.finish();
+        buf[i..i + 8].copy_from_slice(&h.to_le_bytes());
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 // ---------------------------------------------------------------------------
 // Wizard step helpers (ESC-to-go-back support)
@@ -1207,6 +1238,17 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                 ch_obj.insert(name.clone(), serde_json::Value::Object(entry));
             }
         }
+    }
+
+    // Auto-generate gateway.auth.token if not set.
+    if val.pointer("/gateway/auth/token").is_none() {
+        let token = generate_auth_token();
+        if val.pointer("/gateway/auth").is_none() {
+            val["gateway"]["auth"] = json!({"token": token});
+        } else {
+            val["gateway"]["auth"]["token"] = json!(token);
+        }
+        info!("auto-generated gateway.auth.token");
     }
 
     let content = serde_json::to_string_pretty(&val)?;
