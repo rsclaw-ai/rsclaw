@@ -104,6 +104,7 @@ fs2 = "0.4.3"
 rusqlite = { version = "0.32", optional = true, features = ["bundled"] }
 async-trait = "0.1"
 htmd = "0.5"
+wasmtime = { version = "29", features = ["async"] }
 moka = { version = "0.12", features = ["future"] }
 
 # System tray (optional)
