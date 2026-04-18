@@ -419,7 +419,7 @@ impl WeChatPersonalChannel {
 
         let status = resp.status();
         let resp_body = resp.text().await.unwrap_or_default();
-        debug!(status = %status, "wechat: sendmessage ok");
+        info!(status = %status, resp = %resp_body, "wechat: sendmessage response");
         if !status.is_success() {
             bail!("sendmessage failed: {status} {resp_body}");
         }
@@ -1061,7 +1061,7 @@ impl WeChatPersonalChannel {
         if !status.is_success() {
             bail!("send image message failed: {status} {resp_body}");
         }
-        debug!(status = %status, "wechat: send_image_message ok");
+        info!(status = %status, resp = %resp_body, "wechat: send_image_message response");
         Ok(())
     }
 
@@ -1102,9 +1102,8 @@ impl WeChatPersonalChannel {
         let url = format!("{}/ilink/bot/sendmessage", self.base_url);
         let client_id = uuid::Uuid::new_v4().to_string();
 
-        let aes_key_bytes = hex::decode(&uploaded.aes_key_hex)
-            .context("invalid hex aes_key")?;
-        let aes_key_b64 = base64::engine::general_purpose::STANDARD.encode(&aes_key_bytes);
+        // base64 encode the hex string (as openclaw voice/file aes_key format)
+        let aes_key_b64 = base64::engine::general_purpose::STANDARD.encode(uploaded.aes_key_hex.as_bytes());
 
         let body = json!({
             "msg": {
@@ -1145,7 +1144,169 @@ impl WeChatPersonalChannel {
         if !status.is_success() {
             bail!("send file message failed: {status} {resp_body}");
         }
-        debug!(status = %status, "wechat: send_file_message ok");
+        info!(status = %status, resp = %resp_body, "wechat: send_file_message ok");
+        Ok(())
+    }
+
+    /// Convert audio bytes (mp3/wav/ogg) to SILK v3 format for WeChat voice messages.
+    /// Uses ffmpeg to decode to raw PCM (s16le, mono, 24kHz), then silk-rs to encode.
+    /// Returns (silk_bytes, duration_ms).
+    fn convert_to_silk(audio_bytes: &[u8], ext: &str) -> Result<(Vec<u8>, u64)> {
+        let tmp_src = std::env::temp_dir().join(format!(
+            "wechat_src_{}.{}",
+            chrono::Utc::now().timestamp_millis(),
+            ext
+        ));
+        let tmp_pcm = std::env::temp_dir().join(format!(
+            "wechat_pcm_{}.pcm",
+            chrono::Utc::now().timestamp_millis()
+        ));
+        std::fs::write(&tmp_src, audio_bytes)?;
+
+        // ffmpeg: decode to raw PCM s16le mono 24kHz
+        let output = std::process::Command::new("ffmpeg")
+            .args([
+                "-i", &tmp_src.to_string_lossy(),
+                "-y", "-f", "s16le", "-ar", "24000", "-ac", "1",
+                &tmp_pcm.to_string_lossy(),
+            ])
+            .output()
+            .context("ffmpeg not available for PCM conversion")?;
+        let _ = std::fs::remove_file(&tmp_src);
+
+        if !output.status.success() {
+            let _ = std::fs::remove_file(&tmp_pcm);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("ffmpeg PCM conversion failed: {stderr}");
+        }
+
+        let pcm_bytes = std::fs::read(&tmp_pcm)?;
+        let _ = std::fs::remove_file(&tmp_pcm);
+
+        if pcm_bytes.is_empty() {
+            bail!("ffmpeg produced empty PCM output");
+        }
+
+        // Encode PCM to SILK v3 (Tencent format)
+        let silk_bytes = silk_rs::encode_silk(&pcm_bytes, 24000, 25000, true)
+            .map_err(|e| anyhow::anyhow!("silk encode failed: {e:?}"))?;
+
+        // Duration from PCM: samples = pcm_bytes / 2 (s16le), rate = 24000
+        let duration_ms = (pcm_bytes.len() as u64 * 1000) / (24000 * 2);
+        let duration_ms = duration_ms.max(1000);
+
+        info!(pcm_len = pcm_bytes.len(), silk_len = silk_bytes.len(), duration_ms, "wechat: converted audio to silk");
+        Ok((silk_bytes, duration_ms))
+    }
+
+    /// Send a voice message referencing a previously uploaded voice file.
+    async fn send_voice_message(
+        &self,
+        to_user_id: &str,
+        uploaded: &UploadedFileInfo,
+        duration_ms: u64,
+    ) -> Result<()> {
+        let url = format!("{}/ilink/bot/sendmessage", self.base_url);
+        let client_id = uuid::Uuid::new_v4().to_string();
+
+        // base64 encode the hex string (as openclaw voice/file aes_key format)
+        let aes_key_b64 = base64::engine::general_purpose::STANDARD.encode(uploaded.aes_key_hex.as_bytes());
+
+        let body = json!({
+            "msg": {
+                "from_user_id": "",
+                "to_user_id": to_user_id,
+                "client_id": client_id,
+                "message_type": 2,
+                "message_state": 2,
+                "item_list": [{
+                    "type": 3,
+                    "voice_item": {
+                        "media": {
+                            "encrypt_query_param": uploaded.download_param,
+                            "aes_key": aes_key_b64,
+                            "encrypt_type": 1
+                        },
+                        "playtime": duration_ms
+                    }
+                }]
+            },
+            "base_info": base_info(),
+        });
+
+        let body_str = serde_json::to_string(&body).unwrap_or_default();
+        info!(body = %body_str, "wechat: sending voice message");
+        let headers = ilink_headers(&self.bot_token, body_str.len());
+        let resp = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .timeout(Duration::from_millis(SEND_TIMEOUT_MS))
+            .body(body_str)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let resp_body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("send voice message failed: {status} {resp_body}");
+        }
+        info!(status = %status, resp = %resp_body, "wechat: send_voice_message response");
+        Ok(())
+    }
+
+    /// Send a video message referencing a previously uploaded video file.
+    async fn send_video_message(
+        &self,
+        to_user_id: &str,
+        uploaded: &UploadedFileInfo,
+    ) -> Result<()> {
+        let url = format!("{}/ilink/bot/sendmessage", self.base_url);
+        let client_id = uuid::Uuid::new_v4().to_string();
+
+        // base64 encode the hex string (as openclaw media aes_key format)
+        let aes_key_b64 = base64::engine::general_purpose::STANDARD.encode(uploaded.aes_key_hex.as_bytes());
+
+        let body = json!({
+            "msg": {
+                "from_user_id": "",
+                "to_user_id": to_user_id,
+                "client_id": client_id,
+                "message_type": 2,
+                "message_state": 2,
+                "item_list": [{
+                    "type": 5,
+                    "video_item": {
+                        "media": {
+                            "encrypt_query_param": uploaded.download_param,
+                            "aes_key": aes_key_b64,
+                            "encrypt_type": 1
+                        },
+                        "video_size": uploaded.file_size_ciphertext
+                    }
+                }]
+            },
+            "base_info": base_info(),
+        });
+
+        let body_str = serde_json::to_string(&body).unwrap_or_default();
+        info!(body = %body_str, "wechat: sending video message");
+        let headers = ilink_headers(&self.bot_token, body_str.len());
+        let resp = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .timeout(Duration::from_millis(SEND_TIMEOUT_MS))
+            .body(body_str)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let resp_body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("send video message failed: {status} {resp_body}");
+        }
+        info!(status = %status, resp = %resp_body, "wechat: send_video_message response");
         Ok(())
     }
 }
@@ -1237,8 +1398,8 @@ impl Channel for WeChatPersonalChannel {
                 }
             }
 
-            // Send file attachments
-            for (idx, (filename, _mime, path_or_url)) in msg.files.iter().enumerate() {
+            // Send file attachments (audio files -> voice message, others -> file message)
+            for (idx, (filename, mime, path_or_url)) in msg.files.iter().enumerate() {
                 let bytes = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
                     match self.client.get(path_or_url.as_str()).send().await {
                         Ok(resp) if resp.status().is_success() => {
@@ -1256,6 +1417,70 @@ impl Channel for WeChatPersonalChannel {
                     }
                 };
 
+                // Audio files: convert to SILK and send as voice message
+                let is_audio = mime.starts_with("audio/")
+                    || filename.ends_with(".mp3")
+                    || filename.ends_with(".wav")
+                    || filename.ends_with(".ogg")
+                    || filename.ends_with(".aiff")
+                    || filename.ends_with(".silk");
+                if is_audio {
+                    let ext = filename.rsplit('.').next().unwrap_or("mp3");
+
+                    // Try silk encoding first, fallback to raw audio upload
+                    let (voice_bytes, duration_ms) = if ext == "silk" {
+                        let dur = (bytes.len() as u64 * 1000) / 3000;
+                        (bytes.clone(), dur.max(1000))
+                    } else {
+                        match Self::convert_to_silk(&bytes, ext) {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                warn!(index = idx, "wechat: silk conversion failed, uploading raw audio: {e:#}");
+                                // Estimate duration from mp3 size (~128kbps = 16KB/s)
+                                let dur = (bytes.len() as u64 * 1000) / 16_000;
+                                (bytes.clone(), dur.max(1000))
+                            }
+                        }
+                    };
+
+                    match self.upload_media(&voice_bytes, &msg.target_id, UploadMediaType::Voice).await {
+                        Ok(uploaded) => {
+                            if let Err(e) = self.send_voice_message(&msg.target_id, &uploaded, duration_ms).await {
+                                warn!(index = idx, "wechat: send voice message failed: {e:#}");
+                            } else {
+                                info!(index = idx, duration_ms, "wechat: voice message sent");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(index = idx, "wechat: voice upload failed: {e:#}");
+                        }
+                    }
+                    continue;
+                }
+
+                // Video files: upload as Video type and send as video message
+                let is_video = mime.starts_with("video/")
+                    || filename.ends_with(".mp4")
+                    || filename.ends_with(".mov")
+                    || filename.ends_with(".avi")
+                    || filename.ends_with(".mkv");
+                if is_video {
+                    match self.upload_media(&bytes, &msg.target_id, UploadMediaType::Video).await {
+                        Ok(uploaded) => {
+                            if let Err(e) = self.send_video_message(&msg.target_id, &uploaded).await {
+                                warn!(index = idx, "wechat: send video message failed: {e:#}");
+                            } else {
+                                info!(index = idx, filename = %filename, "wechat: video sent");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(index = idx, "wechat: video upload failed: {e:#}");
+                        }
+                    }
+                    continue;
+                }
+
+                // Other files: upload as File type and send as file message
                 match self.upload_media(&bytes, &msg.target_id, UploadMediaType::File).await {
                     Ok(uploaded) => {
                         if let Err(e) = self.send_file_message(&msg.target_id, filename, &uploaded).await {

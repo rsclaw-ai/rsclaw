@@ -652,28 +652,18 @@ impl Channel for TelegramChannel {
                     }
                 };
 
-                // Audio files: convert to ogg/opus and send as voice message.
+                // Audio files: convert to ogg/opus and send as voice message (pure Rust).
                 let is_audio = mime.starts_with("audio/");
                 let (send_bytes, send_filename, send_mime) = if is_audio && !filename.ends_with(".ogg") && !filename.ends_with(".opus") {
-                    // Convert to ogg/opus via ffmpeg for Telegram voice messages.
-                    let ts = chrono::Utc::now().timestamp_millis();
-                    let tmp_src = std::env::temp_dir().join(format!("tg_src_{ts}.{}", filename.rsplit('.').next().unwrap_or("mp3")));
-                    let tmp_opus = std::env::temp_dir().join(format!("tg_voice_{ts}.ogg"));
-                    let _ = std::fs::write(&tmp_src, &bytes);
-                    let result = std::process::Command::new("ffmpeg")
-                        .args(["-i", &tmp_src.to_string_lossy(), "-y", "-c:a", "libopus", "-b:a", "48k", &tmp_opus.to_string_lossy()])
-                        .output();
-                    let _ = std::fs::remove_file(&tmp_src);
-                    match result {
-                        Ok(o) if o.status.success() => {
-                            let opus_bytes = std::fs::read(&tmp_opus).unwrap_or_else(|_| bytes.clone());
-                            let _ = std::fs::remove_file(&tmp_opus);
+                    let ext = filename.rsplit('.').next().unwrap_or("mp3");
+                    match crate::channel::transcription::encode_audio_to_ogg_opus(&bytes, Some(ext)) {
+                        Ok(opus_bytes) => {
                             let ogg_name = filename.rsplit_once('.').map(|(n, _)| format!("{n}.ogg")).unwrap_or_else(|| format!("{filename}.ogg"));
-                            info!(idx, "telegram: converted audio to opus for voice message");
+                            info!(idx, src_len = bytes.len(), opus_len = opus_bytes.len(), "telegram: converted audio to ogg-opus");
                             (opus_bytes, ogg_name, "audio/ogg".to_owned())
                         }
-                        _ => {
-                            let _ = std::fs::remove_file(&tmp_opus);
+                        Err(e) => {
+                            warn!(idx, "telegram: ogg-opus conversion failed, sending as-is: {e:#}");
                             (bytes, filename.clone(), mime.clone())
                         }
                     }

@@ -737,7 +737,9 @@ impl WeComChannel {
 
     /// Upload raw image bytes via the 3-step WeCom media upload protocol and
     /// return the resulting `media_id`.
-    async fn upload_media(&self, bytes: &[u8]) -> Result<String> {
+    /// Upload media via the WS 3-step protocol.
+    /// `media_type`: "image", "voice", "video", "file"
+    async fn upload_media(&self, bytes: &[u8], media_type: &str, filename: &str) -> Result<String> {
         let total_size = bytes.len();
         let chunk_count = (total_size + UPLOAD_CHUNK_SIZE - 1).max(1) / UPLOAD_CHUNK_SIZE;
 
@@ -756,8 +758,8 @@ impl WeComChannel {
             "cmd": "aibot_upload_media_init",
             "headers": { "req_id": &init_req_id },
             "body": {
-                "type": "image",
-                "filename": "image.png",
+                "type": media_type,
+                "filename": filename,
                 "total_size": total_size,
                 "total_chunks": chunk_count,
                 "md5": md5_hex,
@@ -880,6 +882,31 @@ impl WeComChannel {
         }
         Ok(())
     }
+
+    /// Send a typed media message (voice/video) using a previously uploaded `media_id`.
+    async fn send_typed_message(&self, chat_id: &str, msg_type: &str, media_id: &str) -> Result<()> {
+        let req_id = uuid::Uuid::new_v4().to_string();
+        let media_obj = serde_json::json!({ "media_id": media_id });
+        let mut body = serde_json::json!({
+            "chatid": chat_id,
+            "msgtype": msg_type,
+        });
+        body.as_object_mut().expect("json object").insert(msg_type.to_owned(), media_obj);
+        let frame = json!({
+            "cmd": "aibot_send_msg",
+            "headers": { "req_id": &req_id },
+            "body": body,
+        });
+        debug!(req_id = %req_id, chat_id, media_id, msg_type, "WeCom: sending typed message");
+        let resp = self.send_rpc(&req_id, frame).await
+            .context("WeCom: send typed message RPC")?;
+        let errcode = resp.get("errcode").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if errcode != 0 {
+            let errmsg = resp.get("errmsg").and_then(|m| m.as_str()).unwrap_or("unknown");
+            bail!("WeCom: send {msg_type} message failed ({errcode}): {errmsg}");
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -919,7 +946,7 @@ impl Channel for WeComChannel {
                     continue;
                 };
 
-                match self.upload_media(&raw_bytes).await {
+                match self.upload_media(&raw_bytes, "image", "image.png").await {
                     Ok(media_id) => {
                         if let Err(e) = self.send_image_message(&msg.target_id, &media_id).await {
                             error!(idx, "WeCom: send image message failed: {e:#}");
@@ -930,8 +957,8 @@ impl Channel for WeComChannel {
                     }
                 }
             }
-            // Send file attachments
-            for (idx, (_filename, _mime, path_or_url)) in msg.files.iter().enumerate() {
+            // Send file attachments (auto-detect type: video/voice/file)
+            for (idx, (filename, mime, path_or_url)) in msg.files.iter().enumerate() {
                 let bytes = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
                     match reqwest::Client::new().get(path_or_url.as_str()).send().await {
                         Ok(resp) if resp.status().is_success() => {
@@ -949,14 +976,30 @@ impl Channel for WeComChannel {
                     }
                 };
 
-                match self.upload_media(&bytes).await {
+                // Determine upload type and send method by MIME
+                let (media_type, msg_type) = if mime.starts_with("video/") {
+                    ("video", "video")
+                } else if mime.starts_with("audio/") {
+                    ("voice", "voice")
+                } else {
+                    ("file", "file")
+                };
+
+                match self.upload_media(&bytes, media_type, filename).await {
                     Ok(media_id) => {
-                        if let Err(e) = self.send_file_message(&msg.target_id, &media_id).await {
-                            error!(idx, "WeCom: send file message failed: {e:#}");
+                        let send_result = match msg_type {
+                            "video" => self.send_typed_message(&msg.target_id, "video", &media_id).await,
+                            "voice" => self.send_typed_message(&msg.target_id, "voice", &media_id).await,
+                            _ => self.send_file_message(&msg.target_id, &media_id).await,
+                        };
+                        if let Err(e) = send_result {
+                            error!(idx, "WeCom: send {msg_type} message failed: {e:#}");
+                        } else {
+                            info!(idx, msg_type, "WeCom: {msg_type} sent");
                         }
                     }
                     Err(e) => {
-                        error!(idx, "WeCom: file upload failed: {e:#}");
+                        error!(idx, "WeCom: {media_type} upload failed: {e:#}");
                     }
                 }
             }

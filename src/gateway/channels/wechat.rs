@@ -94,6 +94,7 @@ fn spawn_wechat_user_worker(
                             user = %user_id,
                             text_len = r.text.len(),
                             images = r.images.len(),
+                            files = r.files.len(),
                             "wechat: got agent reply"
                         );
                         let pending = r.pending_analysis;
