@@ -866,6 +866,7 @@ impl BrowserSession {
             "find" => self.cmd_find(args).await,
             "get_article" => self.cmd_get_article().await,
             "upload" => self.cmd_upload(args).await,
+            "download" => self.cmd_download(args).await,
             "context" => self.cmd_context(args).await,
             "emulate" => self.cmd_emulate(args).await,
             "diff" => self.cmd_diff(args).await,
@@ -2025,6 +2026,117 @@ impl BrowserSession {
         })).await?;
 
         Ok(json!({"action": "upload", "ref": eref, "files": files.len()}))
+    }
+
+    /// Download a file by clicking a button/link that triggers a browser download.
+    ///
+    /// Sets up CDP download interception, clicks the element, waits for the
+    /// download to complete, and moves the file to the requested path.
+    async fn cmd_download(&self, args: &Value) -> Result<Value> {
+        let eref = args.get("ref").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("download: `ref` required"))?;
+        let save_path = args.get("path").and_then(|v| v.as_str())
+            .unwrap_or("download");
+
+        // Create a temp download directory
+        let dl_dir = std::env::temp_dir().join(format!("rsclaw-dl-{}", std::process::id()));
+        std::fs::create_dir_all(&dl_dir)?;
+        let dl_dir_str = dl_dir.to_string_lossy().to_string();
+
+        // Enable download interception via CDP
+        self.cdp.send("Browser.setDownloadBehavior", json!({
+            "behavior": "allowAndName",
+            "downloadPath": dl_dir_str,
+            "eventsEnabled": true,
+        })).await?;
+
+        // Click the download trigger element
+        self.cmd_click(args).await?;
+
+        // Wait for download to complete (poll the download directory)
+        let timeout = Duration::from_secs(30);
+        let start = std::time::Instant::now();
+        let mut final_path = None;
+
+        loop {
+            if start.elapsed() > timeout {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            // Check for completed files (not .crdownload / .tmp)
+            if let Ok(entries) = std::fs::read_dir(&dl_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    if !name.ends_with(".crdownload") && !name.ends_with(".tmp") && !name.starts_with('.') {
+                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        if size > 0 {
+                            final_path = Some(p);
+                            break;
+                        }
+                    }
+                }
+            }
+            if final_path.is_some() {
+                break;
+            }
+        }
+
+        // Reset download behavior
+        self.cdp.send("Browser.setDownloadBehavior", json!({
+            "behavior": "default",
+        })).await.ok();
+
+        let Some(downloaded) = final_path else {
+            // Clean up
+            std::fs::remove_dir_all(&dl_dir).ok();
+            bail!("download: timed out waiting for download to complete");
+        };
+
+        // Move to requested path
+        let expanded = if save_path.starts_with("~/") {
+            dirs_next::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(&save_path[2..])
+        } else if save_path.contains('/') || save_path.contains('\\') {
+            std::path::PathBuf::from(save_path)
+        } else {
+            std::env::current_dir()?.join(save_path)
+        };
+        let dest = expanded;
+
+        // Preserve original extension if dest has none
+        let dest = if dest.extension().is_none() {
+            if let Some(ext) = downloaded.extension() {
+                dest.with_extension(ext)
+            } else {
+                dest
+            }
+        } else {
+            dest
+        };
+
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(&downloaded, &dest).or_else(|_| {
+            // Cross-device: copy + remove
+            std::fs::copy(&downloaded, &dest)?;
+            std::fs::remove_file(&downloaded)?;
+            Ok::<(), std::io::Error>(())
+        })?;
+
+        // Clean up temp dir
+        std::fs::remove_dir_all(&dl_dir).ok();
+
+        let dest_str = dest.to_string_lossy().to_string();
+        let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+        Ok(json!({
+            "action": "download",
+            "path": dest_str,
+            "size": size,
+        }))
     }
 
     async fn cmd_get_article(&self) -> Result<Value> {
