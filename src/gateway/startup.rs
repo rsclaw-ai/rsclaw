@@ -185,6 +185,20 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     let plugins = Arc::new(plugin_registry);
 
+    // 7.5 Load WASM plugins from the same plugins directory.
+    let wasm_browser: Arc<tokio::sync::Mutex<Option<crate::browser::BrowserSession>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let wasm_plugins = crate::plugin::load_wasm_plugins(&plugins_dir, Arc::clone(&wasm_browser))
+        .await
+        .unwrap_or_else(|e| {
+            warn!("WASM plugin load error: {e:#}");
+            Vec::new()
+        });
+    if !wasm_plugins.is_empty() {
+        info!("{} WASM plugin(s) loaded: {}", wasm_plugins.len(),
+              wasm_plugins.iter().map(|p| format!("{}({}t)", p.name, p.tools.len())).collect::<Vec<_>>().join(", "));
+    }
+
     // Create the SSE broadcast channel once so agents and the HTTP server
     // share the same sender.
     let (event_tx, _) = broadcast::channel::<crate::events::AgentEvent>(1024);
@@ -612,6 +626,11 @@ fn spawn_agent_tasks(
             mcp.clone(),
             notification_tx.clone(),
         );
+
+        // Inject WASM plugins into the agent runtime.
+        // WasmPlugin is not Clone; share via reference counting.
+        // For now, WASM plugins are only loaded on startup, not per-agent.
+        // TODO: Use Arc<Vec<WasmPlugin>> to share across agents.
 
         let event_tx_task = event_tx.clone();
         tokio::spawn(async move {
