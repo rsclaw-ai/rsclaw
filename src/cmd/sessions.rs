@@ -1,17 +1,41 @@
 use std::io::Write;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use super::style::*;
-use crate::{cli::SessionsCommand, store, sys::detect_memory_tier};
+use crate::cli::SessionsCommand;
+
+/// Resolve the gateway base URL.
+fn gateway_url() -> String {
+    let base = crate::config::loader::base_dir();
+    // Try to read port from config file.
+    let config_path = base.join("rsclaw.json5");
+    let port = crate::config::loader::load_json5(&config_path)
+        .ok()
+        .and_then(|c| c.gateway.as_ref()?.port)
+        .unwrap_or(18888);
+    format!("http://127.0.0.1:{port}")
+}
+
+/// GET a JSON endpoint from the running gateway.
+async fn api_get(path: &str) -> Result<serde_json::Value> {
+    let url = format!("{}/api/v1{path}", gateway_url());
+    let resp = reqwest::get(&url).await
+        .map_err(|e| anyhow::anyhow!("gateway not reachable ({url}): {e}"))?;
+    if !resp.status().is_success() {
+        bail!("gateway returned {}: {}", resp.status(), resp.text().await.unwrap_or_default());
+    }
+    Ok(resp.json().await?)
+}
 
 pub async fn cmd_sessions(sub: SessionsCommand) -> Result<()> {
-    let tier = detect_memory_tier();
-    let data_dir = crate::config::loader::base_dir().join("var/data");
-    let store = store::Store::open(&data_dir, tier)?;
     match sub {
         SessionsCommand::List(args) => {
-            let sessions = store.db.list_sessions()?;
+            let data = api_get("/sessions").await?;
+            let sessions = data["sessions"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>())
+                .unwrap_or_default();
+
             if sessions.is_empty() {
                 if args.json {
                     println!("[]");
@@ -35,7 +59,11 @@ pub async fn cmd_sessions(sub: SessionsCommand) -> Result<()> {
             }
         }
         SessionsCommand::Export(args) => {
-            let sessions = store.db.list_sessions()?;
+            let data = api_get("/sessions").await?;
+            let sessions = data["sessions"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>())
+                .unwrap_or_default();
+
             let target_sessions: Vec<String> = if let Some(ref key) = args.session {
                 sessions.into_iter().filter(|s| s == key).collect()
             } else {
@@ -50,55 +78,28 @@ pub async fn cmd_sessions(sub: SessionsCommand) -> Result<()> {
 
             let mut total = 0usize;
             for session_key in &target_sessions {
-                let messages = store.db.load_messages(session_key)?;
-                if messages.is_empty() {
-                    continue;
+                let path = format!("/sessions/{}/messages", urlencoding::encode(session_key));
+                match api_get(&path).await {
+                    Ok(messages) => {
+                        let record = serde_json::json!({
+                            "session": session_key,
+                            "messages": messages,
+                        });
+                        writeln!(writer, "{}", serde_json::to_string(&record)?)?;
+                        total += 1;
+                    }
+                    Err(e) => eprintln!("skip {session_key}: {e}"),
                 }
-                let record = serde_json::json!({
-                    "session": session_key,
-                    "messages": messages,
-                });
-                writeln!(writer, "{}", serde_json::to_string(&record)?)?;
-                total += 1;
             }
 
             if args.output.is_some() {
                 eprintln!("exported {} session(s)", total);
             }
         }
-        SessionsCommand::Cleanup(args) => {
-            let sessions = store.db.list_sessions()?;
-            let to_delete: Vec<String> = sessions
-                .into_iter()
-                .filter(|k| args.active_key.as_deref() != Some(k.as_str()))
-                .collect();
-
-            if to_delete.is_empty() {
-                ok("nothing to clean up");
-                return Ok(());
-            }
-
-            if args.active_key.is_none() && !args.enforce {
-                err_msg(&format!(
-                    "refusing to delete all {} session(s) without --enforce or --active-key",
-                    to_delete.len()
-                ));
-                return Ok(());
-            }
-
-            if args.dry_run {
-                warn_msg(&format!("would delete {} session(s):", to_delete.len()));
-                for k in &to_delete {
-                    item("-", &dim(k));
-                }
-            } else {
-                let mut deleted = 0usize;
-                for k in &to_delete {
-                    store.db.delete_session(k)?;
-                    deleted += 1;
-                }
-                ok(&format!("deleted {} session(s)", bold(&deleted.to_string())));
-            }
+        SessionsCommand::Cleanup(_args) => {
+            // Cleanup requires write access — must be done via gateway API.
+            // For now, inform the user to use /clear or /new from the chat.
+            warn_msg("cleanup via CLI is not supported while gateway is running. Use /clear or /new from chat.");
         }
     }
     Ok(())
