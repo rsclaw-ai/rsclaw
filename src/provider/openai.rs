@@ -175,11 +175,10 @@ impl LlmProvider for OpenAiProvider {
                 body_len = body_str.len(),
                 "openai: request prepared"
             );
-            // Dump full body to temp file for debugging
-            #[cfg(debug_assertions)]
+            // Dump full body to temp file for debugging.
             let _ = std::fs::write(
-                std::env::temp_dir().join("rsclaw_last_request.json"),
-                &body_str,
+                "/tmp/debug_rsclaw_llm.json",
+                serde_json::to_string_pretty(&body).unwrap_or_default(),
             );
 
             let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -357,8 +356,13 @@ impl OpenAiProvider {
             body["tools"] = json!(tools);
         }
 
+        // Normalize messages for stable KV cache prefix.
+        if let Some(msgs) = body["messages"].as_array_mut() {
+            normalize_messages_for_cache(msgs);
+        }
+
         let _ = std::fs::write(
-            std::env::temp_dir().join("rsclaw_ollama_request.json"),
+            "/tmp/debug_rsclaw_llm.json",
             serde_json::to_string_pretty(&body).unwrap_or_default(),
         );
         tracing::debug!(
@@ -592,10 +596,9 @@ impl OpenAiProvider {
             body_len = body_str.len(),
             "openai-responses: request prepared"
         );
-        #[cfg(debug_assertions)]
         let _ = std::fs::write(
-            std::env::temp_dir().join("rsclaw_last_responses_request.json"),
-            &body_str,
+            "/tmp/debug_rsclaw_llm.json",
+            serde_json::to_string_pretty(&body).unwrap_or_default(),
         );
 
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
@@ -763,7 +766,43 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
         body["tools"] = json!(tools);
     }
 
+    // Normalize messages for stable KV cache prefix: trim content whitespace,
+    // sort tool_call arguments keys for bit-perfect prefix matching across turns.
+    if let Some(msgs) = body["messages"].as_array_mut() {
+        normalize_messages_for_cache(msgs);
+    }
+
     Ok(body)
+}
+
+/// Normalize messages in-place for KV cache prefix stability.
+///
+/// - Trims whitespace from string content.
+/// - Re-serializes tool_call arguments with sorted keys and compact separators
+///   so the same arguments always produce identical bytes.
+fn normalize_messages_for_cache(messages: &mut [Value]) {
+    for msg in messages.iter_mut() {
+        // Trim content whitespace.
+        if let Some(content) = msg.get_mut("content").and_then(|v| v.as_str()).map(|s| s.trim().to_owned()) {
+            msg["content"] = json!(content);
+        }
+        // Normalize tool_call arguments to sorted-key compact JSON.
+        if let Some(tcs) = msg.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
+            for tc in tcs.iter_mut() {
+                if let Some(args_str) = tc.pointer("/function/arguments").and_then(|v| v.as_str()) {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(args_str) {
+                        // serde_json with preserve_order still sorts within to_string;
+                        // force canonical form by round-tripping through BTreeMap.
+                        if let Ok(canonical) = serde_json::from_str::<std::collections::BTreeMap<String, Value>>(&parsed.to_string()) {
+                            if let Ok(sorted) = serde_json::to_string(&canonical) {
+                                tc["function"]["arguments"] = json!(sorted);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn serialize_message(msg: &Message) -> Value {

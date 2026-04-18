@@ -232,8 +232,22 @@ pub(crate) fn build_base_system_prompt(config: &crate::config::schema::Config) -
          5. Iterate: repeat until the task is complete, then reply to the user\n\
          If a tool call fails, do NOT retry with the same arguments. Try a different approach or inform the user.\n\
          Never fabricate URLs, file paths, or numeric values.\n\
-         When you need a Unix timestamp, use a shell command (e.g. `date +%s`) — never calculate it yourself.\n\
+         When you need a Unix timestamp or today's date, use a shell command (e.g. `date`) — never assume or calculate it yourself.\n\
          </agent_loop>"
+            .to_owned(),
+    );
+
+    // Output formatting and data integrity rules (always included).
+    parts.push(
+        "[Output format rules]\n\
+         - Avoid Markdown headings (#, ##, ###) in chat replies.\n\
+         - Use **bold text** or section markers for sections.\n\
+         - Use 1. or - for lists.\n\
+         - Do NOT use Markdown tables (|---|). Use \"label: value\" format instead.\n\
+         \n[Data integrity rules]\n\
+         - NEVER truncate or shorten ANY text, strings, numbers, or identifiers.\n\
+         - Copy ALL values EXACTLY: UUIDs, IDs, IP addresses, paths, URLs, code, data.\n\
+         - If you see truncated data in context, report it as incomplete."
             .to_owned(),
     );
 

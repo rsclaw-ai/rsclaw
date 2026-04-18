@@ -1811,99 +1811,18 @@ impl AgentRuntime {
             tracing::info!(path = %dump_path.display(), len = system_prompt.len(), "dumped system prompt");
         }
 
-        // --- Dynamic context: injected into API copy, not stored/system ---
+        // --- Dynamic context: injected into system prompt suffix ---
+        // Only truly dynamic, per-turn content goes here. Static rules belong
+        // in the base system prompt. Auto-recall memories are removed — LLM
+        // uses the memory tool to search when needed. Date is removed — LLM
+        // uses shell commands when it needs the current date/time.
         let mut dynamic_ctx = Vec::<String>::new();
 
-        // Date/time.
-        dynamic_ctx.push(super::prompt_builder::build_date_context());
-
-        // Parallelism hint.
-        {
-            let lower = text.to_lowercase();
-            let parallel_keywords = ["并行", "并发", "最快", "同时", "parallel", "concurrent", "fastest", "simultaneously", "分别"];
-            if parallel_keywords.iter().any(|kw| lower.contains(kw)) {
-                dynamic_ctx.push(
-                    "[PARALLEL HINT] The user wants parallel execution. \
-                     Use `agent` action=task to dispatch MULTIPLE task agents AT ONCE \
-                     (one task per independent sub-job). Do NOT execute them yourself sequentially. \
-                     Each task agent runs independently and results are delivered when done."
-                    .to_owned(),
-                );
-            }
-        }
-
-        // Channel-aware formatting hints for IM channels.
-        if channel == "feishu" || channel == "dingtalk" || channel == "wecom" {
-            dynamic_ctx.push(concat!(
-                "[Output format rules for IM chat]\n",
-                "- Never use Markdown headings (#, ##, ###).\n",
-                "- Use **bold text** or 【section title】 for sections.\n",
-                "- Use 1. or - for lists.\n",
-                "- Use > for important quotes.\n",
-                "- Do NOT use Markdown tables (|---|). Use \"label: value\" format instead.\n",
-                "\n[Data integrity rules - CRITICAL]\n",
-                "- NEVER truncate or shorten ANY text, strings, numbers, or identifiers.\n",
-                "- Copy ALL values EXACTLY: UUIDs, IDs, IP addresses, paths, URLs, code, data.\n",
-                "- UUIDs: 36 chars (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).\n",
-                "- IP addresses: complete (127.0.0.1 not 7.0.0.1).\n",
-                "- If you see truncated data in context, report it as incomplete.\n",
-                "\n[Tool usage rules]\n",
-                "- For ANY question about real-time data (prices, weather, news, dates, events), you MUST call web_search first. NEVER answer from memory.\n",
-                "- For shell commands, file operations, use exec/read/write tools.\n",
-            ).to_owned());
-        }
-
         // Loop A (organic evolution): collect recalled memory IDs for feedback.
-        let mut auto_recalled_ids = std::collections::HashSet::<String>::new();
-
-        // Auto-Recall (AGENTS.md §31): hybrid vector+BM25 recall.
-        if let Some(ref mem) = self.memory
-            && !text.trim().is_empty()
-        {
-            let scope = format!("agent:{}", self.handle.id);
-            let mem_cfg = &self.config.raw.memory;
-            let recall_top_k = mem_cfg.as_ref().and_then(|m| m.recall_top_k).unwrap_or(10);
-            let recall_final_k = mem_cfg.as_ref().and_then(|m| m.recall_final_k).unwrap_or(5);
-            let vec_hits = {
-                let mut guard = mem.lock().await;
-                guard
-                    .search(text, Some(&scope), recall_top_k)
-                    .await
-                    .unwrap_or_default()
-            };
-            let bm25_hits = self
-                .store
-                .search
-                .search(text, Some(&scope), recall_top_k)
-                .unwrap_or_default();
-            let vec_count = vec_hits.len();
-            let bm25_count = bm25_hits.len();
-            let results = rrf_fuse(vec_hits, bm25_hits, recall_final_k);
-            tracing::debug!(
-                vec_count,
-                bm25_count,
-                fused = results.len(),
-                "auto-recall results"
-            );
-            for doc in &results {
-                auto_recalled_ids.insert(doc.id.clone());
-            }
-            if !results.is_empty() {
-                let now_ts = chrono::Utc::now().timestamp();
-                let mem_block = format!(
-                    "<relevant-memories>\n{}\n</relevant-memories>",
-                    results
-                        .iter()
-                        .map(|d| {
-                            let age = memory_age_label(now_ts, d.created_at);
-                            format!("- [{}] {} ({})", d.kind, d.display_text(), age)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                );
-                dynamic_ctx.push(mem_block);
-            }
-        }
+        // Auto-recall is disabled — LLM uses the memory tool to search when needed.
+        // This avoids injecting dynamic content into user messages which would break
+        // prefix KV cache across turns.
+        let auto_recalled_ids = std::collections::HashSet::<String>::new();
 
         // Background context injection (/ctx).
         let btw_block = self
@@ -2221,38 +2140,35 @@ impl AgentRuntime {
             loop_warning_triggered: false,
         };
 
-        // On-demand skill injection: match user text against skill
-        // descriptions and inject full prompt for relevant skills.
-        {
-            let matched = match_skills(text, &self.skills);
-            if !matched.is_empty() {
-                let skill_prompts: String = matched
+        // Build skills system message: a separate role=system message placed
+        // right after the main system prompt. Rebuilt only on skill changes or
+        // compaction, keeping the main system prompt perfectly stable for KV cache.
+        let skills_system: Option<String> = {
+            let all_skills: Vec<_> = self.skills.all().collect();
+            if all_skills.is_empty() {
+                None
+            } else {
+                let skill_prompts: String = all_skills
                     .iter()
                     .map(|s| format!(
-                        "<active_skill name=\"{}\" version=\"{}\">\n{}\n</active_skill>",
+                        "<skill name=\"{}\" version=\"{}\">\n{}\n</skill>",
                         s.name,
                         s.version.as_deref().unwrap_or(""),
                         s.prompt.trim(),
                     ))
                     .collect::<Vec<_>>()
                     .join("\n\n");
-                dynamic_ctx.push(format!(
-                    "## Active Skills (matched to current request)\n\
-                     IMPORTANT: The user's request matches an installed skill. \
-                     You MUST follow the skill instructions below instead of using \
-                     default tools (image_gen, video_gen, web_search, etc.) unless \
-                     the skill explicitly tells you to use them.\n\n{skill_prompts}"
-                ));
-                info!(
-                    skills = ?matched.iter().map(|s| &s.name).collect::<Vec<_>>(),
-                    "skills matched for turn"
-                );
+                Some(format!(
+                    "## Installed Skills\n\
+                     When the user's request matches a skill, follow its instructions.\n\n\
+                     {skill_prompts}"
+                ))
             }
-        }
+        };
 
         let reply = time::timeout(
             Duration::from_secs(timeout_secs),
-            self.agent_loop(&mut ctx, &model, &system_prompt, tools, extra_tools, abort_flag.clone(), dynamic_ctx),
+            self.agent_loop(&mut ctx, &model, &system_prompt, skills_system.as_deref(), tools, extra_tools, abort_flag.clone(), dynamic_ctx),
         )
         .await
         .map_err(|_| {
@@ -2546,6 +2462,7 @@ impl AgentRuntime {
         ctx: &mut RunContext,
         model: &str,
         system_prompt: &str,
+        skills_system: Option<&str>,
         tools: Vec<ToolDef>,
         extra_tools: Vec<ToolDef>,
         abort_flag: Arc<AtomicBool>,
@@ -2787,22 +2704,25 @@ impl AgentRuntime {
                     }
                 }
 
-                // Inject dynamic context (date, memories, /ctx, hints) into the
-                // last user message of this API copy. Session storage is unchanged.
+                // Skills system message: inserted at the front of history so
+                // it becomes [1] system right after the main [0] system prompt.
+                // Stable across turns — only changes on skill install/uninstall
+                // or compaction. Main system prompt prefix cache stays intact.
+                if let Some(skills) = skills_system {
+                    raw.insert(0, Message {
+                        role: Role::System,
+                        content: MessageContent::Text(skills.to_owned()),
+                    });
+                }
+
+                // Inject remaining dynamic context (btw /ctx) as a trailing
+                // system message after all history. Session storage is unchanged.
                 if !dynamic_ctx.is_empty() {
-                    let ctx_block = format!("[Context]\n{}", dynamic_ctx.join("\n"));
-                    if let Some(last_user) = raw.iter_mut().rev().find(|m| m.role == Role::User) {
-                        match &mut last_user.content {
-                            MessageContent::Text(t) => {
-                                *t = format!("{ctx_block}\n\n{t}");
-                            }
-                            MessageContent::Parts(parts) => {
-                                parts.insert(0, ContentPart::Text {
-                                    text: format!("{ctx_block}\n\n"),
-                                });
-                            }
-                        }
-                    }
+                    let ctx_block = dynamic_ctx.join("\n\n");
+                    raw.push(Message {
+                        role: Role::System,
+                        content: MessageContent::Text(ctx_block),
+                    });
                 }
 
                 // Repair transcript: ensure all tool_calls have matching tool_results.
@@ -4169,7 +4089,14 @@ impl AgentRuntime {
 
     pub(crate) async fn tool_memory_put(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let text = args["text"].as_str().unwrap_or("").to_owned();
-        let scope = args["scope"].as_str().unwrap_or(&ctx.agent_id).to_owned();
+        // Internal channels (heartbeat/cron/system) get a separate scope so
+        // their memories don't pollute normal conversation auto-recall.
+        let default_scope = if matches!(ctx.channel.as_str(), "heartbeat" | "cron" | "system") {
+            format!("agent:{}:{}", ctx.agent_id, ctx.channel)
+        } else {
+            ctx.agent_id.clone()
+        };
+        let scope = args["scope"].as_str().unwrap_or(&default_scope).to_owned();
         let kind = args["kind"].as_str().unwrap_or("note").to_owned();
         let id = args["id"]
             .as_str()
