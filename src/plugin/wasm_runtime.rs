@@ -1,16 +1,12 @@
-//! WASM plugin runtime — loads `.wasm` plugins via wasmtime.
+//! WASM plugin runtime — loads `.wasm` component-model plugins via wasmtime.
 //!
-//! Each WASM plugin exports:
-//!   - `get_manifest() -> *const u8` — returns a JSON-encoded manifest
-//!   - `handle_tool(tool: *const u8, args: *const u8) -> *const u8` — executes a tool
+//! Each WASM plugin exports (via WIT `plugin-api` interface):
+//!   - `get-manifest() -> string` — returns a JSON-encoded manifest
+//!   - `handle-tool(tool-name, args-json) -> result<string, string>` — executes a tool
 //!
-//! Host functions provided to plugins:
-//!   - `browser_navigate(url)`, `browser_click(selector)`, etc.
-//!   - `log(level, message)`
-//!
-//! This module is a scaffold. The full wasmtime component model integration
-//! (host function linking, memory management, component model types) will be
-//! completed in Task 7.
+//! Host functions provided to plugins (via WIT `host-browser` and `host-runtime`):
+//!   - 13 browser automation functions (open, snapshot, click, fill, etc.)
+//!   - `log`, `sleep`, `read-file`
 
 use std::{
     path::{Path, PathBuf},
@@ -19,11 +15,25 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
-use wasmtime::{Config, Engine, Linker, Module, Store};
+use wasmtime::{
+    Config, Engine, Store,
+    component::{Component, Linker, bindgen},
+};
 
 use crate::browser::BrowserSession;
+
+// ---------------------------------------------------------------------------
+// WIT bindgen — generates host trait and typed export accessors
+// ---------------------------------------------------------------------------
+
+bindgen!({
+    path: "src/plugin/wit/world.wit",
+    async: true,
+    trappable_imports: true,
+});
 
 // ---------------------------------------------------------------------------
 // Types
@@ -38,13 +48,12 @@ pub struct WasmPlugin {
     /// Path to the `.wasm` file on disk.
     pub wasm_path: PathBuf,
     /// Wasmtime engine (shared across plugins).
-    #[allow(dead_code)]
     engine: Engine,
-    /// Compiled module.
-    #[allow(dead_code)]
-    module: Module,
+    /// Compiled component (component model, not core module).
+    component: Component,
+    /// Pre-linked instance for fast re-instantiation.
+    linker: Linker<HostState>,
     /// Reference to the browser session for host function callbacks.
-    #[allow(dead_code)]
     browser: Arc<Mutex<Option<BrowserSession>>>,
 }
 
@@ -61,7 +70,6 @@ pub struct WasmToolDef {
 
 /// Raw manifest returned by `get_manifest()` from the WASM module.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
 struct WasmManifestRaw {
     name: String,
     #[serde(default)]
@@ -69,10 +77,133 @@ struct WasmManifestRaw {
 }
 
 /// State passed into the wasmtime `Store`, available to host functions.
-#[allow(dead_code)]
 struct HostState {
     browser: Arc<Mutex<Option<BrowserSession>>>,
-    // TODO(task-7): Add memory allocator tracking, log buffers, etc.
+}
+
+// ---------------------------------------------------------------------------
+// Host trait implementations
+// ---------------------------------------------------------------------------
+
+impl rsclaw::jimeng::host_browser::Host for HostState {
+    async fn browser_open(&mut self, url: String) -> Result<Result<String, String>> {
+        Ok(self.browser_action("open", json!({"url": url})).await)
+    }
+
+    async fn browser_snapshot(&mut self) -> Result<Result<String, String>> {
+        Ok(self.browser_action("snapshot", json!({})).await)
+    }
+
+    async fn browser_click(&mut self, ref_str: String) -> Result<Result<String, String>> {
+        Ok(self.browser_action("click", json!({"ref": ref_str})).await)
+    }
+
+    async fn browser_click_at(&mut self, x: u32, y: u32) -> Result<Result<String, String>> {
+        Ok(self.browser_action("click_at", json!({"x": x, "y": y})).await)
+    }
+
+    async fn browser_fill(
+        &mut self,
+        ref_str: String,
+        text: String,
+    ) -> Result<Result<String, String>> {
+        Ok(self.browser_action("fill", json!({"ref": ref_str, "text": text})).await)
+    }
+
+    async fn browser_press(&mut self, key: String) -> Result<Result<String, String>> {
+        Ok(self.browser_action("press", json!({"key": key})).await)
+    }
+
+    async fn browser_scroll(
+        &mut self,
+        direction: String,
+        amount: u32,
+    ) -> Result<Result<String, String>> {
+        Ok(self
+            .browser_action("scroll", json!({"direction": direction, "amount": amount}))
+            .await)
+    }
+
+    async fn browser_eval(&mut self, code: String) -> Result<Result<String, String>> {
+        Ok(self.browser_action("evaluate", json!({"code": code})).await)
+    }
+
+    async fn browser_wait_text(
+        &mut self,
+        text: String,
+        timeout_ms: u32,
+    ) -> Result<Result<String, String>> {
+        Ok(self
+            .browser_action("wait", json!({"text": text, "timeout_ms": timeout_ms}))
+            .await)
+    }
+
+    async fn browser_screenshot(&mut self) -> Result<Result<String, String>> {
+        Ok(self.browser_action("screenshot", json!({})).await)
+    }
+
+    async fn browser_download(
+        &mut self,
+        ref_str: String,
+        filename: String,
+    ) -> Result<Result<String, String>> {
+        Ok(self
+            .browser_action("download", json!({"ref": ref_str, "filename": filename}))
+            .await)
+    }
+
+    async fn browser_upload(
+        &mut self,
+        ref_str: String,
+        filepath: String,
+    ) -> Result<Result<String, String>> {
+        Ok(self
+            .browser_action("upload", json!({"ref": ref_str, "filepath": filepath}))
+            .await)
+    }
+
+    async fn browser_get_url(&mut self) -> Result<Result<String, String>> {
+        Ok(self.browser_action("get_url", json!({})).await)
+    }
+}
+
+impl rsclaw::jimeng::host_runtime::Host for HostState {
+    async fn log(&mut self, level: String, msg: String) -> Result<()> {
+        match level.as_str() {
+            "error" => tracing::error!(target: "wasm_plugin", "{msg}"),
+            "warn" => tracing::warn!(target: "wasm_plugin", "{msg}"),
+            "info" => tracing::info!(target: "wasm_plugin", "{msg}"),
+            "debug" => tracing::debug!(target: "wasm_plugin", "{msg}"),
+            _ => tracing::trace!(target: "wasm_plugin", "{msg}"),
+        }
+        Ok(())
+    }
+
+    async fn sleep(&mut self, ms: u32) -> Result<()> {
+        tokio::time::sleep(std::time::Duration::from_millis(u64::from(ms))).await;
+        Ok(())
+    }
+
+    async fn read_file(&mut self, path: String) -> Result<Result<String, String>> {
+        match tokio::fs::read_to_string(&path).await {
+            Ok(contents) => Ok(Ok(contents)),
+            Err(e) => Ok(Err(format!("failed to read {path}: {e}"))),
+        }
+    }
+}
+
+impl HostState {
+    /// Execute a browser action by locking the shared browser session.
+    async fn browser_action(&mut self, action: &str, args: Value) -> Result<String, String> {
+        let mut guard = self.browser.lock().await;
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| "browser not initialized".to_string())?;
+        match session.execute(action, &args).await {
+            Ok(val) => Ok(val.to_string()),
+            Err(e) => Err(format!("{e:#}")),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -116,8 +247,8 @@ pub fn scan_wasm_plugins(dir: &Path) -> Vec<PathBuf> {
 
 /// Load all WASM plugins from a directory.
 ///
-/// Each `.wasm` file is compiled and its `get_manifest()` export is called
-/// to discover the plugin name and available tools.
+/// Each `.wasm` file is compiled as a component and its `get-manifest` export
+/// is called to discover the plugin name and available tools.
 ///
 /// Plugins that fail to load are logged at `warn` level and skipped.
 pub async fn load_wasm_plugins(
@@ -130,7 +261,7 @@ pub async fn load_wasm_plugins(
         return Ok(Vec::new());
     }
 
-    // Shared engine config — async fuel-based execution.
+    // Shared engine config — async support for async host functions.
     let mut config = Config::new();
     config.async_support(true);
     let engine = Engine::new(&config).context("failed to create wasmtime engine")?;
@@ -157,6 +288,14 @@ pub async fn load_wasm_plugins(
     Ok(plugins)
 }
 
+/// Build a `Linker<HostState>` with all host functions registered.
+fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
+    let mut linker = Linker::new(engine);
+    rsclaw::jimeng::host_browser::add_to_linker(&mut linker, |state: &mut HostState| state)?;
+    rsclaw::jimeng::host_runtime::add_to_linker(&mut linker, |state: &mut HostState| state)?;
+    Ok(linker)
+}
+
 /// Load a single `.wasm` file into a `WasmPlugin`.
 async fn load_single_plugin(
     path: &Path,
@@ -166,30 +305,57 @@ async fn load_single_plugin(
     let wasm_bytes = std::fs::read(path)
         .with_context(|| format!("failed to read WASM file: {}", path.display()))?;
 
-    let module = Module::new(engine, &wasm_bytes)
-        .with_context(|| format!("failed to compile WASM module: {}", path.display()))?;
+    let component = Component::new(engine, &wasm_bytes)
+        .with_context(|| format!("failed to compile WASM component: {}", path.display()))?;
 
-    // TODO(task-7): Link host functions (browser_navigate, browser_click,
-    //               browser_evaluate, log, etc.) via the Linker before
-    //               instantiating the module.
-    let _linker: Linker<HostState> = Linker::new(engine);
+    let linker = build_linker(engine)?;
 
-    // TODO(task-7): Instantiate the module, call `get_manifest()`, and parse
-    //               the returned JSON to populate `name` and `tools`.
-    //
-    // For now, derive the plugin name from the filename and leave tools empty.
-    let name = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    // Create a temporary store to call get-manifest and discover tools.
+    let mut store = Store::new(
+        engine,
+        HostState {
+            browser: Arc::clone(&browser),
+        },
+    );
+
+    let instance = linker
+        .instantiate_async(&mut store, &component)
+        .await
+        .with_context(|| format!("failed to instantiate component: {}", path.display()))?;
+
+    // Look up the plugin-api interface and call get-manifest.
+    let iface_idx = instance
+        .get_export(&mut store, None, "rsclaw:jimeng/plugin-api")
+        .with_context(|| "plugin-api interface not found in component exports")?;
+
+    let get_manifest_idx = instance
+        .get_export(&mut store, Some(&iface_idx), "get-manifest")
+        .with_context(|| "get-manifest export not found in plugin-api interface")?;
+
+    let get_manifest_fn = instance
+        .get_typed_func::<(), (String,)>(&mut store, &get_manifest_idx)
+        .with_context(|| "get-manifest has unexpected type")?;
+
+    let (manifest_json,) = get_manifest_fn
+        .call_async(&mut store, ())
+        .await
+        .with_context(|| "get-manifest call failed")?;
+
+    get_manifest_fn
+        .post_return_async(&mut store)
+        .await
+        .with_context(|| "get-manifest post-return failed")?;
+
+    let manifest: WasmManifestRaw = serde_json::from_str(&manifest_json)
+        .with_context(|| format!("invalid manifest JSON from {}: {manifest_json}", path.display()))?;
 
     Ok(WasmPlugin {
-        name,
-        tools: Vec::new(),
+        name: manifest.name,
+        tools: manifest.tools,
         wasm_path: path.to_path_buf(),
         engine: engine.clone(),
-        module,
+        component,
+        linker,
         browser,
     })
 }
@@ -221,39 +387,62 @@ impl WasmPlugin {
                 )
             })?;
 
-        // TODO(task-7): Create a fresh Store<HostState>, instantiate the module
-        //               with linked host functions, serialize `args` into WASM
-        //               linear memory, call `handle_tool(tool_name, args)`, and
-        //               deserialize the result.
-        debug!(
-            plugin = %self.name,
-            tool = tool_name,
-            "WASM tool call (stub — full impl in task-7)"
+        debug!(plugin = %self.name, tool = tool_name, "dispatching WASM tool call");
+
+        // Fresh store per call for isolation.
+        let mut store = Store::new(
+            &self.engine,
+            HostState {
+                browser: Arc::clone(&self.browser),
+            },
         );
 
-        bail!(
-            "WASM tool dispatch not yet implemented (task-7): plugin={}, tool={}, args={}",
-            self.name,
-            tool_name,
-            args
-        )
-    }
+        let instance = self
+            .linker
+            .instantiate_async(&mut store, &self.component)
+            .await
+            .context("failed to instantiate component for tool call")?;
 
-    /// Register host functions on the linker.
-    ///
-    /// These functions are callable by the WASM module and provide access to
-    /// browser automation, logging, and other host capabilities.
-    #[allow(dead_code)]
-    fn register_host_functions(
-        _linker: &mut Linker<HostState>,
-    ) -> Result<()> {
-        // TODO(task-7): Register host functions:
-        //   - "env" / "host_log"            — log(level, msg_ptr, msg_len)
-        //   - "env" / "browser_navigate"    — navigate(url_ptr, url_len) -> status
-        //   - "env" / "browser_click"       — click(selector_ptr, sel_len) -> status
-        //   - "env" / "browser_evaluate"    — evaluate(js_ptr, js_len) -> result_ptr
-        //   - "env" / "browser_screenshot"  — screenshot() -> bytes_ptr
-        //   - "env" / "alloc"               — allocate memory in host for returns
-        Ok(())
+        // Drill into the plugin-api interface to find handle-tool.
+        let iface_idx = instance
+            .get_export(&mut store, None, "rsclaw:jimeng/plugin-api")
+            .with_context(|| "plugin-api interface not found")?;
+
+        let handle_tool_idx = instance
+            .get_export(&mut store, Some(&iface_idx), "handle-tool")
+            .with_context(|| "handle-tool export not found")?;
+
+        let handle_tool_fn = instance
+            .get_typed_func::<(&str, &str), (Result<String, String>,)>(
+                &mut store,
+                &handle_tool_idx,
+            )
+            .with_context(|| "handle-tool has unexpected type")?;
+
+        let args_json = serde_json::to_string(&args)
+            .context("failed to serialize tool arguments")?;
+
+        let (result,) = handle_tool_fn
+            .call_async(&mut store, (tool_name, &args_json))
+            .await
+            .with_context(|| format!("handle-tool call failed for '{tool_name}'"))?;
+
+        handle_tool_fn
+            .post_return_async(&mut store)
+            .await
+            .with_context(|| "handle-tool post-return failed")?;
+
+        match result {
+            Ok(json_str) => {
+                let value: serde_json::Value = serde_json::from_str(&json_str)
+                    .with_context(|| {
+                        format!("invalid JSON result from tool '{tool_name}': {json_str}")
+                    })?;
+                Ok(value)
+            }
+            Err(err_str) => {
+                bail!("WASM plugin '{}' tool '{}' returned error: {}", self.name, tool_name, err_str)
+            }
+        }
     }
 }
