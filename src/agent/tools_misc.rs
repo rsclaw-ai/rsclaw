@@ -647,6 +647,16 @@ impl AgentRuntime {
             .ok_or_else(|| anyhow!("tts: `text` required"))?;
         let voice = args["voice"].as_str().unwrap_or("default");
 
+        // Auto-detect Chinese text and use Chinese voice on macOS.
+        let has_cjk = text.chars().any(|c| {
+            matches!(c, '\u{4e00}'..='\u{9fff}' | '\u{3400}'..='\u{4dbf}')
+        });
+        let effective_voice = if voice == "default" && has_cjk {
+            "Tingting" // macOS Chinese (Mandarin) voice
+        } else {
+            voice
+        };
+
         let ts = chrono::Utc::now().timestamp_millis();
         let tmp_dir = std::env::temp_dir();
         // Final output is ogg/opus for IM platform compatibility (feishu requires opus).
@@ -657,12 +667,11 @@ impl AgentRuntime {
         let is_windows = cfg!(target_os = "windows");
 
         if is_macos {
-            // macOS `say` outputs aiff, then convert to mp3 via ffmpeg.
             let aiff_path = tmp_dir.join(format!("rsclaw_tts_{ts}.aiff"));
             let aiff_str = aiff_path.to_string_lossy().to_string();
             let mut cmd = tokio::process::Command::new("say");
-            if voice != "default" {
-                cmd.args(["-v", voice]);
+            if effective_voice != "default" {
+                cmd.args(["-v", effective_voice]);
             }
             cmd.args(["-o", &aiff_str, text]);
             let output = cmd

@@ -1445,9 +1445,11 @@ impl Channel for FeishuChannel {
                 let send_url = format!("{}/im/v1/messages?receive_id_type={id_type}", self.api_base());
                 let (msg_type, content) = if is_media {
                     if mime.starts_with("audio/") {
-                        // Audio: send as "audio" msg_type with file_key only.
-                        let s = serde_json::json!({"file_key": file_key}).to_string();
-                        info!(content = %s, "feishu: sending audio message");
+                        // Audio: send as "audio" msg_type with file_key + duration.
+                        let dur_ms = audio_duration_ms(path_or_url).unwrap_or(1000);
+                        // Feishu audio duration is in milliseconds as string.
+                        let s = serde_json::json!({"file_key": file_key, "duration": dur_ms}).to_string();
+                        info!(content = %s, duration_ms = dur_ms, "feishu: sending audio message");
                         ("audio", s)
                     } else {
                         // Video: send as "media" msg_type with file_key + file_name.
