@@ -168,17 +168,12 @@ impl LlmProvider for OpenAiProvider {
 
             let body = build_request_body(&req)?;
             let body_str = serde_json::to_string(&body).unwrap_or_default();
-            tracing::info!(
+            tracing::debug!(
                 model = %req.model,
                 tools_count = req.tools.len(),
                 has_tools_in_body = body.get("tools").is_some(),
                 body_len = body_str.len(),
-                "openai: request body prepared"
-            );
-            // Print full request body to log for debugging
-            tracing::info!(
-                "\n========== LLM REQUEST BODY ==========\n{}\n========== END REQUEST BODY ==========",
-                serde_json::to_string_pretty(&body).unwrap_or_else(|_| body_str.clone())
+                "openai: request prepared"
             );
             // Dump full body to temp file for debugging
             #[cfg(debug_assertions)]
