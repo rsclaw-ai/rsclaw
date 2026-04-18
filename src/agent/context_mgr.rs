@@ -248,15 +248,16 @@ pub(crate) fn compress_image_for_llm(data_uri: &str) -> Option<String> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
 
-    // Skip if already small enough (<200KB)
-    if bytes.len() < 200_000 {
+    // Skip if already small enough (<20KB) — fits in proxy fast lane.
+    if bytes.len() < 20_000 {
         return Some(data_uri.to_owned());
     }
 
     let img = image::load_from_memory(&bytes).ok()?;
 
-    // Resize so neither dimension exceeds 1024px, preserving aspect ratio.
-    const MAX_DIM: u32 = 1024;
+    // Resize so neither dimension exceeds 512px, preserving aspect ratio.
+    // 512px is sufficient for vision models to describe image content.
+    const MAX_DIM: u32 = 512;
     let (w, h) = (img.width(), img.height());
     let img = if w > MAX_DIM || h > MAX_DIM {
         img.resize(MAX_DIM, MAX_DIM, image::imageops::FilterType::Lanczos3)
@@ -264,10 +265,23 @@ pub(crate) fn compress_image_for_llm(data_uri: &str) -> Option<String> {
         img
     };
 
-    // Encode to JPEG quality 85.
+    // Encode to JPEG quality 70 — aggressive compression for description only.
     let mut buf = std::io::Cursor::new(Vec::new());
-    img.write_to(&mut buf, image::ImageFormat::Jpeg).ok()?;
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 70);
+    img.write_with_encoder(encoder).ok()?;
     let compressed = buf.into_inner();
+
+    // If still over 20KB, try even smaller (256px + quality 50).
+    let compressed = if compressed.len() > 20_000 {
+        const SMALL_DIM: u32 = 256;
+        let img = img.resize(SMALL_DIM, SMALL_DIM, image::imageops::FilterType::Lanczos3);
+        let mut buf2 = std::io::Cursor::new(Vec::new());
+        let encoder2 = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf2, 50);
+        img.write_with_encoder(encoder2).ok()?;
+        buf2.into_inner()
+    } else {
+        compressed
+    };
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(&compressed);
     tracing::debug!(
