@@ -3407,16 +3407,23 @@ impl AgentRuntime {
                 "agent_loop: stream finished"
             );
             if tool_calls.is_empty() {
-                let assistant_msg = Message {
-                    role: Role::Assistant,
-                    content: MessageContent::Text(text_buf.clone()),
-                };
-                let _ = self.store.db.append_message(
-                    &ctx.session_key,
-                    &serde_json::to_value(&assistant_msg).unwrap_or_default(),
-                );
-                if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
-                    sess.push(assistant_msg);
+                // Only persist non-empty assistant replies to session.
+                // Empty responses pollute history and confuse the LLM on
+                // subsequent turns (it sees its own empty reply and mimics it).
+                if !text_buf.trim().is_empty() {
+                    let assistant_msg = Message {
+                        role: Role::Assistant,
+                        content: MessageContent::Text(text_buf.clone()),
+                    };
+                    let _ = self.store.db.append_message(
+                        &ctx.session_key,
+                        &serde_json::to_value(&assistant_msg).unwrap_or_default(),
+                    );
+                    if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
+                        sess.push(assistant_msg);
+                    }
+                } else {
+                    tracing::debug!(session = %ctx.session_key, "skipping empty assistant reply (not persisted)");
                 }
 
                 // Broadcast turn-done event to SSE subscribers.
