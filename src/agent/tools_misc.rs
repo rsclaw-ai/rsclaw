@@ -647,26 +647,24 @@ impl AgentRuntime {
             .ok_or_else(|| anyhow!("tts: `text` required"))?;
         let voice = args["voice"].as_str().unwrap_or("default");
 
-        let out_path = std::env::temp_dir().join(format!(
-            "rsclaw_tts_{}{}",
-            chrono::Utc::now().timestamp_millis(),
-            if cfg!(target_os = "windows") {
-                ".wav"
-            } else {
-                ".aiff"
-            }
-        ));
+        let ts = chrono::Utc::now().timestamp_millis();
+        let tmp_dir = std::env::temp_dir();
+        // Final output is always mp3 for IM platform compatibility.
+        let out_path = tmp_dir.join(format!("rsclaw_tts_{ts}.mp3"));
         let out_path_str = out_path.to_string_lossy().to_string();
 
         let is_macos = cfg!(target_os = "macos");
         let is_windows = cfg!(target_os = "windows");
 
         if is_macos {
+            // macOS `say` outputs aiff, then convert to mp3 via ffmpeg.
+            let aiff_path = tmp_dir.join(format!("rsclaw_tts_{ts}.aiff"));
+            let aiff_str = aiff_path.to_string_lossy().to_string();
             let mut cmd = tokio::process::Command::new("say");
             if voice != "default" {
                 cmd.args(["-v", voice]);
             }
-            cmd.args(["-o", &out_path_str, text]);
+            cmd.args(["-o", &aiff_str, text]);
             let output = cmd
                 .output()
                 .await
@@ -674,6 +672,33 @@ impl AgentRuntime {
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(anyhow!("tts: say failed: {stderr}"));
+            }
+            // Convert aiff to mp3 via ffmpeg (required for feishu/weixin/etc.)
+            let ffmpeg = tokio::process::Command::new("ffmpeg")
+                .args(["-i", &aiff_str, "-y", "-q:a", "4", &out_path_str])
+                .output()
+                .await;
+            match ffmpeg {
+                Ok(o) if o.status.success() => {
+                    let _ = std::fs::remove_file(&aiff_path);
+                }
+                _ => {
+                    // ffmpeg not available — try afconvert (macOS built-in)
+                    let afconvert = tokio::process::Command::new("afconvert")
+                        .args(["-f", "mp4f", "-d", "aac", &aiff_str, &out_path_str])
+                        .output()
+                        .await;
+                    match afconvert {
+                        Ok(o) if o.status.success() => {
+                            let _ = std::fs::remove_file(&aiff_path);
+                        }
+                        _ => {
+                            // Fallback: send aiff as-is (some platforms may not play it)
+                            tracing::warn!("tts: ffmpeg/afconvert not available, using aiff");
+                            let _ = std::fs::rename(&aiff_path, &out_path);
+                        }
+                    }
+                }
             }
         } else if is_windows {
             let script = format!(

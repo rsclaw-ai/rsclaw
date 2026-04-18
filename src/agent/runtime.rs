@@ -2947,9 +2947,15 @@ impl AgentRuntime {
             };
 
             let msg_count = messages.len();
-            let approx_tokens: usize = messages.iter().map(msg_tokens).sum();
+            let msg_tokens_sum: usize = messages.iter().map(msg_tokens).sum();
+            // Include system prompt + tools in total context estimate.
+            let sys_tokens = estimate_tokens(system_prompt);
+            let tools_tokens: usize = tools.iter()
+                .map(|t| estimate_tokens(&t.name) + estimate_tokens(&t.description) + estimate_tokens(&t.parameters.to_string()))
+                .sum();
+            let approx_tokens = msg_tokens_sum + sys_tokens + tools_tokens;
             self.handle.last_ctx_tokens.store(approx_tokens, std::sync::atomic::Ordering::Relaxed);
-            info!(session = %ctx.session_key, msg_count, approx_tokens, model = %model, "LLM call: context size");
+            info!(session = %ctx.session_key, msg_count, approx_tokens, sys_tokens, tools_tokens, msg_tokens = msg_tokens_sum, model = %model, "LLM call: context size");
 
             // Context usage awareness: inject hint into the LAST user message
             // (not system prompt) to preserve KV cache prefix stability.
