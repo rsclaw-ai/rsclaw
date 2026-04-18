@@ -141,35 +141,63 @@ impl AgentRuntime {
             Self::msgs_to_text_static(msgs, max_total_tokens)
         };
 
-        // Split messages into (old_portion, recent_portion) for layered mode.
-        let (old_text, recent_msgs) = if mode == CompactionMode::Layered {
+        // Split messages into (head, old_portion, recent_portion) for layered mode.
+        // Head: first user-assistant pair (contains [Session started:...], preserved verbatim)
+        // Middle: compressed into summary
+        // Tail: recent N pairs (preserved verbatim)
+        let (head_msgs, old_text, recent_msgs) = if mode == CompactionMode::Layered {
             let msgs = self.sessions.get(session_key).cloned().unwrap_or_default();
-            // Count user-assistant pairs from the end.
+
+            // Head: protect first user + first assistant (2 messages).
+            // If first message is a compaction summary from a previous round,
+            // don't protect it (it will be updated via iterative summary).
+            let head_end = {
+                let first_is_summary = msgs.first()
+                    .and_then(|m| if let MessageContent::Text(t) = &m.content { Some(t.starts_with("[CONTEXT COMPACTION")) } else { None })
+                    .unwrap_or(false);
+                if first_is_summary {
+                    0 // don't protect old summary as head
+                } else {
+                    // Protect first user + first assistant pair
+                    let mut count = 0usize;
+                    let mut end = 0;
+                    for (idx, m) in msgs.iter().enumerate() {
+                        if m.role == Role::Assistant {
+                            count += 1;
+                            end = idx + 1;
+                            if count >= 1 { break; }
+                        }
+                    }
+                    end.min(msgs.len())
+                }
+            };
+
+            // Tail: count user-assistant pairs from the end.
             let mut pair_count = 0usize;
             let mut split_idx = msgs.len();
             let mut i = msgs.len();
-            while i > 0 && pair_count < keep_pairs {
+            while i > head_end && pair_count < keep_pairs {
                 i -= 1;
                 if msgs[i].role == Role::User {
                     pair_count += 1;
                     split_idx = i;
                 }
             }
-            let mut old_portion = msgs[..split_idx].to_vec();
+            // Ensure split doesn't overlap with head.
+            split_idx = split_idx.max(head_end);
+
+            let head = msgs[..head_end].to_vec();
+            let mut old_portion = msgs[head_end..split_idx].to_vec();
             let recent = msgs[split_idx..].to_vec();
             if old_portion.is_empty() {
-                // Not enough history to compact -- skip.
-                return;
+                return; // not enough history to compact
             }
-            // Compress verbose tool results before LLM summarization to
-            // reduce input size. Preserves the last 6 messages in the old
-            // portion (3 user-assistant pairs) for continuity.
             compress_tool_results(&mut old_portion, 6);
-            (msgs_to_text(&old_portion), recent)
+            (head, msgs_to_text(&old_portion), recent)
         } else {
             let mut msgs = self.sessions.get(session_key).cloned().unwrap_or_default();
             compress_tool_results(&mut msgs, 6);
-            (msgs_to_text(&msgs), vec![])
+            (vec![], msgs_to_text(&msgs), vec![])
         };
 
         // Pre-compaction entity preservation: deterministic extraction (phone/ID/email)
@@ -316,9 +344,10 @@ impl AgentRuntime {
             }
         }
 
-        // Replace session history: summary + recent turns kept verbatim.
-        // Summary is wrapped with a prefix that tells the LLM to treat it
-        // as reference material, NOT as active instructions to follow.
+        // Replace session history: head + summary + tail.
+        // Head: first user-assistant pair (contains [Session started:...])
+        // Summary: wrapped with compaction prefix
+        // Tail: recent messages kept verbatim
         if let Some(sess) = self.sessions.get_mut(session_key) {
             let summary_msg = Message {
                 role: Role::User,
@@ -327,8 +356,11 @@ impl AgentRuntime {
                 )),
             };
             sess.clear();
+            // Head: preserved verbatim (first user + first assistant).
+            sess.extend(head_msgs);
+            // Summary: compacted middle portion.
             sess.push(summary_msg);
-            // Re-append the recent messages that we kept.
+            // Tail: recent messages kept verbatim.
             sess.extend(recent_msgs);
         }
 
