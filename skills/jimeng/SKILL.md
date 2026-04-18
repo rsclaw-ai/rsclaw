@@ -1,13 +1,18 @@
 ---
 name: jimeng
-description: Jimeng (即梦) AI creative platform automation — text-to-image, text-to-video, image-to-video, digital human, TTS, super resolution, inpainting, outpainting, object removal, lip sync
+description: 即梦 Jimeng AI 生成图片 生成视频 文生图 文生视频 图生视频 数字人 配音 超清 扩图 重绘 消除 对口型 动作模仿 text-to-image text-to-video image-to-video digital-human TTS super-resolution inpainting outpainting object-removal lip-sync
 version: 1.0.0
 author: "@rsclaw"
 ---
 
 # Jimeng AI Automation
 
-Automate all Jimeng AI creative platform features through browser automation.
+IMPORTANT:
+- You MUST use the `web_browser` tool to execute these actions. Do NOT use `image_gen` or `video_gen` tools -- those use a different API. Jimeng requires browser automation via `web_browser`.
+- Do NOT output JSON text -- instead, make actual tool calls.
+- Each step requires a separate web_browser tool call. Execute them sequentially, checking the result before proceeding.
+
+This skill automates all Jimeng AI creative platform features through browser automation.
 Requires Jimeng account login (handled via browser session persistence).
 
 Base URL: `https://jimeng.jianying.com`

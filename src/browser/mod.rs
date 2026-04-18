@@ -2033,7 +2033,7 @@ impl BrowserSession {
     /// Sets up CDP download interception, clicks the element, waits for the
     /// download to complete, and moves the file to the requested path.
     async fn cmd_download(&self, args: &Value) -> Result<Value> {
-        let eref = args.get("ref").and_then(|v| v.as_str())
+        let _eref = args.get("ref").and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("download: `ref` required"))?;
         let save_path = args.get("path").and_then(|v| v.as_str())
             .unwrap_or("download");
