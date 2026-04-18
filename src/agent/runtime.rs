@@ -1017,19 +1017,17 @@ impl AgentRuntime {
                         let model = self.resolve_model_name();
                         self.compact_force(session_key, &model).await;
                         // Extract summary from the compacted session for memory storage.
-                        // Look for the compaction-tagged System message specifically.
-                        const COMPACTION_TAG: &str = "[Conversation history compacted";
+                        // Look for the compaction-tagged message (role=User with COMPACTION prefix).
+                        const COMPACTION_TAG: &str = "[CONTEXT COMPACTION";
                         if let Some(msgs) = self.sessions.get(session_key) {
                             let summary_text = msgs.iter().find_map(|m| {
-                                if m.role == crate::provider::Role::System {
-                                    let text = match &m.content {
-                                        crate::provider::MessageContent::Text(s) => s.clone(),
-                                        crate::provider::MessageContent::Parts(parts) => parts.iter().filter_map(|p| {
-                                            if let crate::provider::ContentPart::Text { text } = p { Some(text.as_str()) } else { None }
-                                        }).collect::<Vec<_>>().join(" "),
-                                    };
-                                    if text.starts_with(COMPACTION_TAG) { Some(text) } else { None }
-                                } else { None }
+                                let text = match &m.content {
+                                    crate::provider::MessageContent::Text(s) => s.clone(),
+                                    crate::provider::MessageContent::Parts(parts) => parts.iter().filter_map(|p| {
+                                        if let crate::provider::ContentPart::Text { text } = p { Some(text.as_str()) } else { None }
+                                    }).collect::<Vec<_>>().join(" "),
+                                };
+                                if text.starts_with(COMPACTION_TAG) { Some(text) } else { None }
                             });
                             if let Some(summary) = summary_text {
                                 if let Some(ref mem) = self.memory {
