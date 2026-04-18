@@ -822,8 +822,8 @@ impl AcpClient {
                 }
             })?;
 
-        tracing::debug!("=== send_prompt raw response ===");
-        tracing::debug!(
+        tracing::info!("=== send_prompt raw response ===");
+        tracing::info!(
             "Full response: {}",
             serde_json::to_string(&resp).unwrap_or_default()
         );
@@ -833,8 +833,8 @@ impl AcpClient {
             .cloned()
             .unwrap_or(serde_json::Value::Null);
 
-        tracing::debug!("=== send_prompt result ===");
-        tracing::debug!(
+        tracing::info!("=== send_prompt result ===");
+        tracing::info!(
             "Result: {}",
             serde_json::to_string(&result).unwrap_or_default()
         );
@@ -842,31 +842,31 @@ impl AcpClient {
         let prompt_resp: PromptResponse =
             serde_json::from_value(result.clone()).context("Failed to parse prompt response")?;
 
-        tracing::debug!("=== send_prompt parsed ===");
-        tracing::debug!("stop_reason: {:?}", prompt_resp.stop_reason);
-        tracing::debug!("usage: {:?}", prompt_resp.usage);
+        tracing::info!("=== send_prompt parsed ===");
+        tracing::info!("stop_reason: {:?}", prompt_resp.stop_reason);
+        tracing::info!("usage: {:?}", prompt_resp.usage);
         if let Some(ref r) = prompt_resp.result {
             tracing::debug!("content blocks: {}", r.content.len());
             for (i, block) in r.content.iter().enumerate() {
                 match block {
                     crate::acp::types::ContentBlock::Text { text } => {
-                        tracing::debug!("  [{}] Text: {}", i, text);
+                        tracing::info!("  [{}] Text: {}", i, text);
                     }
                     crate::acp::types::ContentBlock::Image { .. } => {
-                        tracing::debug!("  [{}] Image", i);
+                        tracing::info!("  [{}] Image", i);
                     }
                     crate::acp::types::ContentBlock::Resource { .. } => {
-                        tracing::debug!("  [{}] Resource", i);
+                        tracing::info!("  [{}] Resource", i);
                     }
                     crate::acp::types::ContentBlock::ResourceLink { .. } => {
-                        tracing::debug!("  [{}] ResourceLink", i);
+                        tracing::info!("  [{}] ResourceLink", i);
                     }
                 }
             }
             if let Some(ref calls) = r.tool_calls {
-                tracing::debug!("tool_calls: {} calls", calls.len());
+                tracing::info!("tool_calls: {} calls", calls.len());
                 for (i, call) in calls.iter().enumerate() {
-                    tracing::debug!("  [{}] tool_call: id={}, name={}", i, call.id, call.name);
+                    tracing::info!("  [{}] tool_call: id={}, name={}", i, call.id, call.name);
                 }
             }
         }
@@ -1167,7 +1167,7 @@ async fn run_subprocess(
                             break;
                         }
 
-                        tracing::debug!("ACP request sent: {}", request);
+                        tracing::info!("ACP request sent: {}", request);
 
                         // Read response and notifications until we get the matching response
                         let mut line_buf = Vec::new(); // Use byte buffer to handle non-UTF8
@@ -1194,11 +1194,11 @@ async fn run_subprocess(
 
                                                 // Log all incoming messages with method field at INFO level
                                                 if let Some(method) = method_field {
-                                                    tracing::debug!("ACP incoming method: {} | msg: {}", method, line);
+                                                    tracing::info!("ACP incoming method: {} | msg: {}", method, line);
                                                 } else if msg.get("id").is_some() {
-                                                    tracing::debug!("ACP response: {}", line);
+                                                    tracing::info!("ACP response: {}", line);
                                                 } else {
-                                                    tracing::debug!("ACP message: {}", line);
+                                                    tracing::info!("ACP message: {}", line);
                                                 }
 
                                                 // Handle session/update notification
@@ -1209,7 +1209,7 @@ async fn run_subprocess(
 
                                                 // Handle Agent → Client requests
                                                 if let Some(method) = method_field {
-                                                    tracing::debug!("Handling agent request: {}", method);
+                                                    tracing::info!("Handling agent request: {}", method);
                                                     if handle_agent_request(&mut stdin, &msg, method, &handler).await {
                                                         continue;
                                                     }
@@ -1292,6 +1292,7 @@ async fn handle_session_update(
                 if let Some(content) = update.get("content") {
                     extract_text_content(content, collected_content).await;
                     if let Some(text) = content.get("text").and_then(|t| t.as_str()) {
+                        tracing::info!("ACP [agent_message_chunk]: {}", text);
                         let _ = event_tx.send(SessionEvent::AgentMessageChunk {
                             content: text.to_string(),
                         });
@@ -1301,7 +1302,7 @@ async fn handle_session_update(
             Some("agent_thought_chunk") => {
                 if let Some(content) = update.get("content") {
                     if let Some(text) = content.get("text").and_then(|t| t.as_str()) {
-                        tracing::debug!("ACP thought: {}", text);
+                        tracing::info!("ACP [agent_thought_chunk]: {}", text);
                         let _ = event_tx.send(SessionEvent::AgentThoughtChunk {
                             content: text.to_string(),
                         });
@@ -1321,8 +1322,8 @@ async fn handle_session_update(
                 let kind = parse_tool_kind(update.get("kind").and_then(|k| k.as_str()));
                 let status = update.get("status").and_then(|s| s.as_str());
 
-                tracing::debug!(
-                    "ACP tool_call: {} - {:?} ({:?})",
+                tracing::info!(
+                    "ACP [tool_call]: {} - {:?} (status={:?})",
                     tool_call_id,
                     title,
                     status

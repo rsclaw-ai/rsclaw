@@ -379,7 +379,7 @@ impl AgentRuntime {
                     result_files = notif_files.clone();
 
                     // Send notification to user
-                    tracing::debug!(
+                    tracing::info!(
                         "tool_opencode: sending completion notification, summary_len={}, files={}",
                         summary.len(), notif_files.len()
                     );
@@ -387,14 +387,14 @@ impl AgentRuntime {
                         match tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
-                            text: summary,
+                            text: summary.clone(),
                             reply_to: None,
                             images: vec![],
                             files: notif_files,
                             channel: Some(channel_bg.clone()),
                         }) {
                             Ok(_) => {
-                                tracing::debug!("tool_opencode: notification sent successfully")
+                                tracing::info!("tool_opencode: notification sent successfully: {}", summary)
                             }
                             Err(e) => {
                                 tracing::error!("tool_opencode: failed to send notification: {}", e)
@@ -908,7 +908,7 @@ impl AgentRuntime {
                     let result_files = notif_files.clone();
 
                     // Send notification to user
-                    tracing::debug!(
+                    tracing::info!(
                         "tool_claudecode: sending completion notification, summary_len={}, files={}",
                         summary.len(), notif_files.len()
                     );
@@ -916,14 +916,14 @@ impl AgentRuntime {
                         match tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
-                            text: summary,
+                            text: summary.clone(),
                             reply_to: None,
                             images: vec![],
                             files: notif_files,
                             channel: Some(channel_bg.clone()),
                         }) {
                             Ok(_) => {
-                                tracing::debug!("tool_claudecode: notification sent successfully")
+                                tracing::info!("tool_claudecode: notification sent successfully: {}", summary)
                             }
                             Err(e) => {
                                 tracing::error!("tool_claudecode: failed to send notification: {}", e)
