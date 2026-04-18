@@ -726,16 +726,12 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
     }
 
     if let Some(sys) = &req.system {
-        // Prepend a system message if not already present.
-        if messages
-            .first()
-            .and_then(|m| m["role"].as_str())
-            .is_none_or(|r| r != "system")
-        {
-            let mut msgs = vec![json!({"role": "system", "content": sys})];
-            msgs.extend(body["messages"].as_array().cloned().unwrap_or_default());
-            body["messages"] = json!(msgs);
-        }
+        // Always prepend the main system prompt as the first message.
+        // Other system messages (plugins, skills) may already be present
+        // but the main prompt must come first for KV cache prefix stability.
+        let mut msgs = vec![json!({"role": "system", "content": sys})];
+        msgs.extend(body["messages"].as_array().cloned().unwrap_or_default());
+        body["messages"] = json!(msgs);
     }
 
     if let Some(t) = req.temperature {
