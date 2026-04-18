@@ -2389,9 +2389,13 @@ impl AgentRuntime {
             }
             max_run >= 8 // 8+ consecutive digits = phone number / ID / code
         };
+        // Skip auto-capture for internal channels — heartbeat/cron/system
+        // don't need long-term memory and would pollute user recall results.
+        let internal_channel = matches!(channel, "heartbeat" | "cron" | "system");
         if let Some(ref mem) = self.memory
             && text.len() > 8
             && !reply.text.starts_with(NO_REPLY_TOKEN)
+            && !internal_channel
         {
             let doc_id = Uuid::new_v4().to_string();
             let doc_scope = format!("agent:{}", self.handle.id);
