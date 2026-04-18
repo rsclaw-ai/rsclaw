@@ -454,8 +454,16 @@ pub(crate) fn extract_key_entities(text: &str) -> Vec<KeyEntity> {
 
             let marker_count = ADDR_MARKERS.iter().filter(|m| joined.contains(*m)).count();
             let has_prefix = ADDR_PREFIXES.iter().any(|p| joined.contains(p));
+            // Require a digit in the segment — real addresses almost always have
+            // numbers (门牌号, 楼层, 房间号). This filters out narrative text
+            // like "车停在了一栋豪华公寓楼下" which has markers but no numbers.
+            let has_digit = joined.chars().any(|c| c.is_ascii_digit());
 
             if marker_count < 2 && !(marker_count >= 1 && has_prefix) {
+                continue;
+            }
+            if !has_digit && !has_prefix {
+                // No digits and no province prefix — likely not a real address.
                 continue;
             }
 

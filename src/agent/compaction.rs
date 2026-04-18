@@ -58,14 +58,18 @@ impl AgentRuntime {
         // kvCacheMode >= 1: append-only mode, delay compaction to 95%
         // to maximize KV cache reuse. Mode 0: legacy 80% threshold.
         let default_threshold = if kv_cache_mode >= 1 {
-            (context_tokens * 19 / 20).max(16_000) // 95%
+            (context_tokens * 19 / 20).max(16_000) // 95% — delay compaction for KV cache reuse
         } else {
-            (context_tokens * 4 / 5).max(16_000)   // 80%
+            (context_tokens / 2).max(16_000)        // 50% — same as hermes, save tokens/cost
         };
-        let token_threshold = cfg
-            .reserve_tokens_floor
-            .map(|t| t as usize)
-            .unwrap_or(default_threshold);
+        // reserveTokensFloor is the MINIMUM tokens to keep free for replies.
+        // Trigger compaction when used tokens exceed (contextTokens - reserveFloor).
+        // NOT a direct threshold — it's how much headroom to leave.
+        let token_threshold = if let Some(floor) = cfg.reserve_tokens_floor {
+            context_tokens.saturating_sub(floor as usize).max(16_000)
+        } else {
+            default_threshold
+        };
 
         let total_tokens: usize = self
             .sessions
