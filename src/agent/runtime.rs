@@ -240,6 +240,8 @@ pub struct AgentRuntime {
     /// Plugin registry — None when running outside the gateway or with no
     /// plugins.
     pub plugins: Option<Arc<PluginRegistry>>,
+    /// WASM plugin instances for tool dispatch.
+    pub wasm_plugins: Vec<crate::plugin::WasmPlugin>,
     /// MCP server registry — None when no MCP servers are configured.
     pub mcp: Option<Arc<crate::mcp::McpRegistry>>,
     /// CDP browser session -- lazy-initialized on first web_browser tool call.
@@ -329,6 +331,7 @@ impl AgentRuntime {
             event_bus,
             spawner,
             plugins,
+            wasm_plugins: Vec::new(),
             mcp,
             live_status,
             browser: Arc::new(tokio::sync::Mutex::new(None)),
@@ -856,6 +859,7 @@ impl AgentRuntime {
                             self.agents.as_deref(),
                             &self.handle.id,
                             &self.config.agents.external,
+                            &self.wasm_plugins,
                         );
                         let tools_json = serde_json::to_string(&tools).unwrap_or_default();
                         let tools_tokens = tools_json.len() / 4; // JSON is mostly ASCII, ~4 chars/token
@@ -1960,6 +1964,7 @@ impl AgentRuntime {
                 self.agents.as_deref(),
                 &self.handle.id,
                 &self.config.agents.external,
+                &self.wasm_plugins,
             );
             all.extend(extra_tools.iter().cloned());
             if let Some(ref mcp) = self.mcp {
@@ -2238,7 +2243,11 @@ impl AgentRuntime {
                     .join("\n\n");
                 dynamic_ctx.push(format!(
                     "## Active Skills (matched to current request)\n\
-                     Follow these skill instructions carefully:\n\n{skill_prompts}"
+                     IMPORTANT: When a skill is active, you MUST follow the skill instructions \
+                     and use the tools specified by the skill. Skill instructions take priority \
+                     over default tool selection. For example, if a skill says to use `web_browser`, \
+                     do NOT use `image_gen` or `video_gen` even if they seem relevant.\n\n\
+                     {skill_prompts}"
                 ));
                 info!(
                     skills = ?matched.iter().map(|s| &s.name).collect::<Vec<_>>(),
@@ -3990,6 +3999,16 @@ impl AgentRuntime {
             return Err(anyhow!("MCP tool `{name}` not found"));
         }
 
+        // 3.5 WASM plugin tool: prefixed with `<plugin_name>.`
+        if let Some((plugin_name, tool_name_inner)) = name.split_once('.') {
+            for wp in &self.wasm_plugins {
+                if wp.name == plugin_name {
+                    let result = wp.call_tool(tool_name_inner, args).await?;
+                    return Ok(result);
+                }
+            }
+        }
+
         // 4. Skill tool.
         let (skill_name, tool_name) = name.split_once('.').unwrap_or((name, name));
         let Some(skill) = self.skills.get(skill_name) else {
@@ -4866,7 +4885,7 @@ mod tests {
     #[test]
     fn build_tool_list_contains_builtins() {
         let skills = SkillRegistry::new();
-        let tools = build_tool_list(&skills, None, "test-agent", &[]);
+        let tools = build_tool_list(&skills, None, "test-agent", &[], &[]);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         for expected in &[
             "memory", "session", "agent", "channel", "read_file", "write_file", "execute_command",
