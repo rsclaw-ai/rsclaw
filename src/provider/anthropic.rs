@@ -60,6 +60,21 @@ impl LlmProvider for AnthropicProvider {
     fn stream(&self, req: LlmRequest) -> BoxFuture<'_, Result<LlmStream>> {
         Box::pin(async move {
             let body = build_request_body(&req)?;
+            let body_str = serde_json::to_string(&body).unwrap_or_default();
+            tracing::info!(
+                model = %req.model,
+                max_tokens = ?req.max_tokens,
+                thinking_budget = ?req.thinking_budget,
+                tools_count = req.tools.len(),
+                messages_count = req.messages.len(),
+                body_len = body_str.len(),
+                "anthropic: request prepared"
+            );
+            // Print full request body to log for debugging
+            tracing::info!(
+                "\n========== ANTHROPIC REQUEST BODY ==========\n{}\n========== END REQUEST BODY ==========",
+                serde_json::to_string_pretty(&body).unwrap_or_else(|_| body_str.clone())
+            );
 
             let resp = self
                 .client
