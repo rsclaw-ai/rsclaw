@@ -205,11 +205,22 @@ impl rsclaw::jimeng::host_runtime::Host for HostState {
 
 impl HostState {
     /// Execute a browser action by locking the shared browser session.
+    /// Auto-starts Chrome if no session exists.
     async fn browser_action(&mut self, action: &str, args: Value) -> Result<String, String> {
         let mut guard = self.browser.lock().await;
-        let session = guard
-            .as_mut()
-            .ok_or_else(|| "browser not initialized".to_string())?;
+
+        // Auto-start browser if not initialized.
+        if guard.is_none() {
+            tracing::info!("WASM plugin: auto-starting browser session");
+            let chrome_path = crate::agent::platform::detect_chrome()
+                .ok_or_else(|| "Chrome not found on this system".to_string())?;
+            let session = BrowserSession::start(&chrome_path, true, Some("jimeng"))
+                .await
+                .map_err(|e| format!("failed to start Chrome: {e:#}"))?;
+            *guard = Some(session);
+        }
+
+        let session = guard.as_mut().expect("browser session just initialized");
         match session.execute(action, &args).await {
             Ok(val) => Ok(val.to_string()),
             Err(e) => Err(format!("{e:#}")),
