@@ -1997,14 +1997,12 @@ impl AgentRuntime {
         self.cached_tools = tools.clone();
 
         // Check vision support before loading session (avoids borrow conflict).
-        // kvCacheMode >= 1: never send base64 images even if model supports vision,
-        // to keep message content stable for KV cache prefix matching.
         let kv_mode = self.config.agents.defaults.kv_cache_mode.unwrap_or(1);
-        let vision = if kv_mode >= 1 {
-            false // always convert to text description for KV cache stability
-        } else {
-            model_supports_vision(&model, &self.config)
-        };
+        // Always detect vision capability — used to decide which model describes images.
+        // kvCacheMode >= 1: images are described then stored as text (never base64 in session).
+        // kvCacheMode = 0: images kept as base64 in session for vision models.
+        let model_has_vision = model_supports_vision(&model, &self.config);
+        let vision = if kv_mode >= 1 { false } else { model_has_vision };
 
         // ---------------------------------------------------------------
         // Media processing: convert images/videos to text descriptions.
@@ -2034,8 +2032,10 @@ impl AgentRuntime {
                 }
 
                 // Generate text description for session storage.
-                // Use current model if vision-capable, otherwise find a vision model.
-                let vision_model = if vision {
+                // Use current model if vision-capable (even in kv_cache_mode >= 1,
+                // the image description is a separate LLM call that doesn't pollute
+                // the main session's KV cache). Otherwise find a vision model.
+                let vision_model = if model_has_vision {
                     model.clone()
                 } else {
                     // Try image model config, then fallback to known vision providers.
