@@ -1444,17 +1444,22 @@ impl Channel for FeishuChannel {
                     else { "chat_id" };
                 let send_url = format!("{}/im/v1/messages?receive_id_type={id_type}", self.api_base());
                 let (msg_type, content) = if is_media {
-                    let mut media_json = serde_json::json!({"file_key": file_key, "file_name": filename});
-                    // Try to extract cover image via ffmpeg and upload as image_key.
-                    if mime.starts_with("video/") {
+                    if mime.starts_with("audio/") {
+                        // Audio: send as "audio" msg_type with file_key only.
+                        let s = serde_json::json!({"file_key": file_key}).to_string();
+                        info!(content = %s, "feishu: sending audio message");
+                        ("audio", s)
+                    } else {
+                        // Video: send as "media" msg_type with file_key + file_name.
+                        let mut media_json = serde_json::json!({"file_key": file_key, "file_name": filename});
                         let api = self.api_base().to_owned();
                         if let Some(cover_key) = extract_and_upload_cover(path_or_url, &self.client, &api, &token).await {
                             media_json["image_key"] = serde_json::json!(cover_key);
                         }
+                        let s = media_json.to_string();
+                        info!(content = %s, "feishu: sending media message");
+                        ("media", s)
                     }
-                    let s = media_json.to_string();
-                    info!(content = %s, "feishu: sending media message");
-                    ("media", s)
                 } else {
                     ("file", serde_json::json!({"file_key": file_key}).to_string())
                 };
