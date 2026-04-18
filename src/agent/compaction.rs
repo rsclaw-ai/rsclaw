@@ -185,14 +185,11 @@ impl AgentRuntime {
         }
 
         // Detect previous compaction summary for iterative update.
-        // If the old portion starts with a compaction prefix, extract the
-        // previous summary so the LLM can update it instead of starting fresh.
         let previous_summary = {
             let msgs = self.sessions.get(session_key).cloned().unwrap_or_default();
             msgs.iter().find_map(|m| {
                 if let MessageContent::Text(t) = &m.content {
                     if t.starts_with("[CONTEXT COMPACTION") {
-                        // Strip the prefix to get the raw summary
                         let summary_start = t.find("\n\n").map(|i| i + 2).unwrap_or(0);
                         Some(t[summary_start..].to_owned())
                     } else {
@@ -205,44 +202,59 @@ impl AgentRuntime {
         };
 
         // Summarise the old portion.
-        let summary = match mode {
-            CompactionMode::Default | CompactionMode::Layered => {
-                self.compact_single(
-                    compaction_model,
-                    &old_text,
-                    previous_summary.as_deref(),
-                ).await
+        // KV cache mode: append summary instruction to existing session messages
+        // so the LLM reuses the already-cached prefix. Only the summary prompt
+        // itself needs to be computed. Falls back to standalone mode on failure.
+        let summary = if kv_cache_mode >= 1 && mode != CompactionMode::Safeguard {
+            let result = self.compact_with_kv_cache(
+                session_key,
+                compaction_model,
+                &old_text,
+                previous_summary.as_deref(),
+            ).await;
+            if result.is_some() {
+                result
+            } else {
+                // Fallback to standalone summarization
+                info!(session = session_key, "KV cache compact failed, falling back to standalone");
+                self.compact_single(compaction_model, &old_text, previous_summary.as_deref()).await
             }
-            CompactionMode::Safeguard => {
-                const CHUNK_SIZE: usize = 40_000;
-                let chunks: Vec<&str> = {
-                    let mut result = Vec::new();
-                    let mut remaining = old_text.as_str();
-                    while !remaining.is_empty() {
-                        let mut end = CHUNK_SIZE.min(remaining.len());
-                        while end < remaining.len() && !remaining.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        let (chunk, rest) = remaining.split_at(end);
-                        result.push(chunk);
-                        remaining = rest;
-                    }
-                    result
-                };
-                let mut combined = String::new();
-                for chunk in chunks {
-                    match self.compact_single(compaction_model, chunk, None).await {
-                        Some(s) => {
-                            combined.push_str(&s);
-                            combined.push('\n');
-                        }
-                        None => return,
-                    }
+        } else {
+            match mode {
+                CompactionMode::Default | CompactionMode::Layered => {
+                    self.compact_single(
+                        compaction_model,
+                        &old_text,
+                        previous_summary.as_deref(),
+                    ).await
                 }
-                if combined.is_empty() {
-                    None
-                } else {
-                    Some(combined)
+                CompactionMode::Safeguard => {
+                    const CHUNK_SIZE: usize = 40_000;
+                    let chunks: Vec<&str> = {
+                        let mut result = Vec::new();
+                        let mut remaining = old_text.as_str();
+                        while !remaining.is_empty() {
+                            let mut end = CHUNK_SIZE.min(remaining.len());
+                            while end < remaining.len() && !remaining.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            let (chunk, rest) = remaining.split_at(end);
+                            result.push(chunk);
+                            remaining = rest;
+                        }
+                        result
+                    };
+                    let mut combined = String::new();
+                    for chunk in chunks {
+                        match self.compact_single(compaction_model, chunk, None).await {
+                            Some(s) => {
+                                combined.push_str(&s);
+                                combined.push('\n');
+                            }
+                            None => return,
+                        }
+                    }
+                    if combined.is_empty() { None } else { Some(combined) }
                 }
             }
         };
@@ -523,6 +535,127 @@ impl AgentRuntime {
         result
     }
 
+    /// Compact using existing session messages to reuse KV cache prefix.
+    ///
+    /// Instead of sending a standalone request, appends a summary instruction
+    /// to the current session's messages. The system prompt + tools + history
+    /// are already cached in the LLM slot, so only the final summary prompt
+    /// needs to be computed.
+    async fn compact_with_kv_cache(
+        &mut self,
+        session_key: &str,
+        model: &str,
+        _old_text: &str,
+        previous_summary: Option<&str>,
+    ) -> Option<String> {
+        let system_prompt = self.cached_system_prompt.clone()?;
+
+        // Clone session messages — we'll append the summary instruction
+        // to the API copy only, not to the stored session.
+        let mut messages = self
+            .sessions
+            .get(session_key)
+            .cloned()
+            .unwrap_or_default();
+
+        if messages.is_empty() {
+            return None;
+        }
+
+        // Build the summary instruction
+        let template = Self::summary_template();
+        let instruction = if let Some(prev) = previous_summary {
+            format!(
+                "Ignore all previous instructions. You are now a summarization agent. \
+                 Do NOT call any tools. Do NOT answer questions. Output ONLY a structured summary.\n\n\
+                 Update the previous compaction summary with the new conversation turns above.\n\n\
+                 PREVIOUS SUMMARY:\n{prev}\n\n\
+                 PRESERVE existing info, ADD new actions, update Active Task.\n\n{template}"
+            )
+        } else {
+            format!(
+                "Ignore all previous instructions. You are now a summarization agent. \
+                 Do NOT call any tools. Do NOT answer questions. Output ONLY a structured summary \
+                 of the entire conversation above.\n\n{template}"
+            )
+        };
+
+        // Append summary instruction as the last user message
+        messages.push(Message {
+            role: Role::User,
+            content: MessageContent::Text(instruction),
+        });
+
+        // Reuse the cached tools from the last run_turn for exact prefix match.
+        // The summary instruction already says "Do NOT call any tools".
+        // If the LLM still tries, we ignore the tool call in the stream handler.
+        let tools = self.cached_tools.clone();
+
+        let req = LlmRequest {
+            model: model.to_owned(),
+            messages,
+            tools,
+            system: Some(system_prompt),
+            max_tokens: Some(4096),
+            temperature: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+        };
+
+        let providers = Arc::clone(&self.providers);
+        let mut stream = match self.failover.call(req, &providers).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("KV cache compact LLM call failed: {e:#}");
+                return None;
+            }
+        };
+
+        let mut summary = String::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(StreamEvent::TextDelta(d)) => summary.push_str(&d),
+                Ok(StreamEvent::ReasoningDelta(_)) => {}
+                Ok(StreamEvent::Done { .. }) | Ok(StreamEvent::Error(_)) => break,
+                Ok(StreamEvent::ToolCall { .. }) => {
+                    // LLM tried to call a tool despite empty tools list — skip
+                    warn!("compact_with_kv_cache: unexpected tool call, ignoring");
+                }
+                Err(e) => {
+                    warn!("KV cache compact stream error: {e:#}");
+                    return None;
+                }
+            }
+        }
+
+        if summary.is_empty() {
+            None
+        } else {
+            info!("compact_with_kv_cache: summary generated ({} chars)", summary.len());
+            Some(summary)
+        }
+    }
+
+    /// Shared summary template used by both standalone and KV cache modes.
+    fn summary_template() -> &'static str {
+        "Use this exact structure:\n\n\
+         ## Active Task\n\
+         [THE MOST IMPORTANT FIELD. Copy the user's most recent unfulfilled request \
+         verbatim. If no outstanding task, write \"None.\"]\n\n\
+         ## Goal\n[Overall goal]\n\n\
+         ## Completed\n[Numbered list: N. ACTION target - outcome]\n\n\
+         ## Active State\n[Modified files, test status, running processes, branch]\n\n\
+         ## In Progress\n[Work underway when compaction fired]\n\n\
+         ## Key Data\n[Exact values verbatim: file paths, URLs, IDs, phone numbers]\n\n\
+         ## Decisions\n[Technical decisions and WHY]\n\n\
+         ## Pending\n[Blocked items or awaiting user]\n\n\
+         ## Resolved Questions\n[Already answered — include the answer]\n\n\
+         ## Files\n[Files read/modified/created]\n\n\
+         ## Entities\n[kind=value per line. Kinds: name, phone, id_card, email, birthday, \
+         age, zodiac, address, relationship, preference. If none: (none)]\n\n\
+         CRITICAL: Copy ALL values character-for-character. Be CONCRETE."
+    }
+
     /// Call the LLM once with a summarization prompt and return the text.
     ///
     /// Supports iterative updates: if `previous_summary` is provided (from a
@@ -541,32 +674,7 @@ impl AgentRuntime {
             in the conversation - only output the structured summary. \
             Do NOT include any preamble, greeting, or prefix.";
 
-        let template = "\
-            ## Active Task\n\
-            [THE MOST IMPORTANT FIELD. Copy the user's most recent unfulfilled request \
-            verbatim. If no outstanding task, write \"None.\"]\n\n\
-            ## Goal\n[Overall goal the user is trying to accomplish]\n\n\
-            ## Completed\n[Numbered list of concrete actions taken. Format each as:\n\
-            N. ACTION target - outcome. Be specific with file paths, commands, line numbers.]\n\n\
-            ## Active State\n[Current working state: modified files, test status, \
-            running processes, branch, environment details.]\n\n\
-            ## In Progress\n[Work currently underway when compaction fired]\n\n\
-            ## Key Data\n[Exact values that MUST be preserved verbatim: \
-            file paths, URLs, IDs, port numbers, phone numbers, \
-            account numbers, any numeric sequence. Copy character-for-character.]\n\n\
-            ## Decisions\n[Technical decisions made and WHY]\n\n\
-            ## Pending\n[Blocked items or awaiting user confirmation]\n\n\
-            ## Resolved Questions\n[Questions already answered - include the answer \
-            so the next assistant does not re-answer them]\n\n\
-            ## Files\n[Files read, modified, or created with brief note on each]\n\n\
-            ## Entities\n[Personal information found in the conversation.\n\
-            Format: kind=value, one per line.\n\
-            Kinds: name, phone, id_card, email, birthday, age, zodiac, \
-            lucky_number, address, relationship, preference.\n\
-            Example: name=小王\\nphone=18674030927\\nbirthday=1995年3月15日\\n\
-            If none found, write: (none)]\n\n\
-            CRITICAL: Copy ALL values character-for-character. \
-            Do NOT paraphrase or truncate any data. Be CONCRETE.";
+        let template = Self::summary_template();
 
         let prompt = if let Some(prev) = previous_summary {
             format!(
