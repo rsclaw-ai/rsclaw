@@ -263,14 +263,17 @@ pub struct AgentRuntime {
     workspace_cache: Option<crate::agent::workspace::WorkspaceCache>,
     /// Cached system prompt — built once per gateway lifetime, never
     /// invalidated (only rebuilt on gateway restart).
-    cached_system_prompt: Option<String>,
+    pub(crate) cached_system_prompt: Option<String>,
     /// Cached plugins system message — frozen at session start, rebuilt
     /// on compact or `/new`. Sorted by name for byte-stable output.
-    cached_plugins_system: Option<String>,
+    pub(crate) cached_plugins_system: Option<String>,
     /// Cached skills system message — same lifecycle as plugins.
-    cached_skills_system: Option<String>,
+    pub(crate) cached_skills_system: Option<String>,
     /// Snapshot of installed skill names (sorted) for change detection.
-    cached_skills_snapshot: Vec<String>,
+    pub(crate) cached_skills_snapshot: Vec<String>,
+    /// Cached tool definitions from the last run_turn — reused by compaction
+    /// to match the KV cache prefix exactly.
+    pub(crate) cached_tools: Vec<crate::provider::ToolDef>,
     /// Background context manager (/ctx command, formerly /btw).
     btw_manager: super::btw::BtwManager,
     pub(crate) notification_tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
@@ -353,6 +356,7 @@ impl AgentRuntime {
             cached_plugins_system: None,
             cached_skills_system: None,
             cached_skills_snapshot: Vec::new(),
+            cached_tools: Vec::new(),
             btw_manager,
             pending_task_results: Arc::new(std::sync::Mutex::new(Vec::new())),
             voice_mode_sessions: std::collections::HashSet::new(),
@@ -1988,6 +1992,9 @@ impl AgentRuntime {
 
             all
         };
+
+        // Cache tools for compaction KV cache reuse.
+        self.cached_tools = tools.clone();
 
         // Check vision support before loading session (avoids borrow conflict).
         // kvCacheMode >= 1: never send base64 images even if model supports vision,
