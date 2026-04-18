@@ -1400,14 +1400,18 @@ impl Channel for FeishuChannel {
                     .text("file_name", filename.clone())
                     .part("file", part);
                 // Add duration (ms) for video/audio uploads.
+                // Feishu requires duration for media uploads (234001 error without it).
                 if is_media {
                     let dur = if mime.starts_with("video/") {
                         mp4_duration_ms(path_or_url).unwrap_or(0)
-                    } else { 0 };
-                    if dur > 0 {
-                        form = form.text("duration", dur.to_string());
-                        info!(duration_ms = dur, "feishu: uploading media with duration");
-                    }
+                    } else {
+                        // Audio: try ffprobe, fallback to estimate from file size.
+                        audio_duration_ms(path_or_url).unwrap_or(0)
+                    };
+                    // Always send duration for media, default 1000ms if unknown.
+                    let dur = if dur > 0 { dur } else { 1000 };
+                    form = form.text("duration", dur.to_string());
+                    info!(duration_ms = dur, "feishu: uploading media with duration");
                 }
 
                 let upload_resp = self.client
@@ -1864,4 +1868,24 @@ fn mp4_duration_ms(path: &str) -> Option<u64> {
         scan += atom_size;
     }
     None
+}
+
+/// Get audio file duration in milliseconds using ffprobe.
+/// Falls back to estimate from file size if ffprobe is not available.
+fn audio_duration_ms(path: &str) -> Option<u64> {
+    // Try ffprobe first.
+    let output = std::process::Command::new("ffprobe")
+        .args(["-v", "quiet", "-show_entries", "format=duration",
+               "-of", "default=noprint_wrappers=1:nokey=1", path])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let s = String::from_utf8_lossy(&output.stdout);
+        if let Ok(secs) = s.trim().parse::<f64>() {
+            return Some((secs * 1000.0) as u64);
+        }
+    }
+    // Fallback: estimate from file size (mp3 ~128kbps = 16KB/s).
+    let size = std::fs::metadata(path).ok()?.len();
+    Some(size * 1000 / 16_000)
 }
