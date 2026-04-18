@@ -974,7 +974,7 @@ impl AgentRuntime {
                                 // Render transcript (reuse the same logic as compaction).
                                 let transcript = Self::msgs_to_text_static(msgs, max_transcript);
                                 let compaction_model = cfg.model.as_deref().unwrap_or(&model);
-                                self.compact_single(compaction_model, &transcript).await
+                                self.compact_single(compaction_model, &transcript, None).await
                             }
                         } else {
                             None
