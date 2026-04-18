@@ -198,6 +198,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         info!("{} WASM plugin(s) loaded: {}", wasm_plugins.len(),
               wasm_plugins.iter().map(|p| format!("{}({}t)", p.name, p.tools.len())).collect::<Vec<_>>().join(", "));
     }
+    let wasm_plugins = Arc::new(wasm_plugins);
 
     // Create the SSE broadcast channel once so agents and the HTTP server
     // share the same sender.
@@ -236,6 +237,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Some(Arc::clone(&plugins)),
         Some(Arc::clone(&mcp_registry)),
         Some(notification_tx.clone()),
+        Arc::clone(&wasm_plugins),
     );
 
     // Set i18n default language from gateway config.
@@ -585,6 +587,7 @@ fn spawn_agent_tasks(
     plugins: Option<Arc<crate::plugin::PluginRegistry>>,
     mcp: Option<Arc<crate::mcp::McpRegistry>>,
     notification_tx: Option<broadcast::Sender<crate::channel::OutboundMessage>>,
+    wasm_plugins: Arc<Vec<crate::plugin::WasmPlugin>>,
 ) {
     for (agent_id, mut rx) in receivers {
         let handle = match registry.get(&agent_id) {
@@ -628,9 +631,7 @@ fn spawn_agent_tasks(
         );
 
         // Inject WASM plugins into the agent runtime.
-        // WasmPlugin is not Clone; share via reference counting.
-        // For now, WASM plugins are only loaded on startup, not per-agent.
-        // TODO: Use Arc<Vec<WasmPlugin>> to share across agents.
+        runtime.wasm_plugins = Arc::clone(&wasm_plugins);
 
         let event_tx_task = event_tx.clone();
         tokio::spawn(async move {

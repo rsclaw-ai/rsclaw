@@ -240,8 +240,8 @@ pub struct AgentRuntime {
     /// Plugin registry — None when running outside the gateway or with no
     /// plugins.
     pub plugins: Option<Arc<PluginRegistry>>,
-    /// WASM plugin instances for tool dispatch.
-    pub wasm_plugins: Vec<crate::plugin::WasmPlugin>,
+    /// WASM plugin instances for tool dispatch (shared across agents).
+    pub wasm_plugins: Arc<Vec<crate::plugin::WasmPlugin>>,
     /// MCP server registry — None when no MCP servers are configured.
     pub mcp: Option<Arc<crate::mcp::McpRegistry>>,
     /// CDP browser session -- lazy-initialized on first web_browser tool call.
@@ -331,7 +331,7 @@ impl AgentRuntime {
             event_bus,
             spawner,
             plugins,
-            wasm_plugins: Vec::new(),
+            wasm_plugins: Arc::new(Vec::new()),
             mcp,
             live_status,
             browser: Arc::new(tokio::sync::Mutex::new(None)),
@@ -4001,7 +4001,7 @@ impl AgentRuntime {
 
         // 3.5 WASM plugin tool: prefixed with `<plugin_name>.`
         if let Some((plugin_name, tool_name_inner)) = name.split_once('.') {
-            for wp in &self.wasm_plugins {
+            for wp in self.wasm_plugins.iter() {
                 if wp.name == plugin_name {
                     let result = wp.call_tool(tool_name_inner, args).await?;
                     return Ok(result);
