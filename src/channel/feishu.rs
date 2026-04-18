@@ -1376,7 +1376,8 @@ impl Channel for FeishuChannel {
                 let is_media = mime.starts_with("video/") || mime.starts_with("audio/");
 
                 let file_type = if is_media {
-                    if mime.starts_with("video/") { "mp4" } else { "mp3" }
+                    // Feishu requires file_type "opus" for audio (not "mp3").
+                    if mime.starts_with("video/") { "mp4" } else { "opus" }
                 } else if mime.contains("pdf") { "pdf" }
                     else if mime.contains("doc") { "doc" }
                     else if mime.contains("sheet") || mime.contains("xls") { "xls" }
