@@ -2433,15 +2433,9 @@ impl AgentRuntime {
                 ).await;
             }
 
-            // LLM-based semantic entity extraction (name, birthday, zodiac, etc.)
-            let llm_entities = crate::agent::context_mgr::extract_entities_via_llm(
-                text, &model, &mut self.failover, &self.providers,
-            ).await;
-            if !llm_entities.is_empty() {
-                crate::agent::context_mgr::write_entity_memories(
-                    mem, &doc_scope, llm_entities,
-                ).await;
-            }
+            // LLM-based entity extraction moved to compaction — the summary
+            // prompt includes an Entities section, so extraction happens at
+            // compaction time with zero extra LLM calls.
         }
 
         // Deterministic entity extraction from assistant reply.

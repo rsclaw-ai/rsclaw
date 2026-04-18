@@ -169,17 +169,8 @@ impl AgentRuntime {
                     debug!(session = session_key, "pre-compaction deterministic entities pinned");
                 }
             }
-            // LLM-based semantic entity extraction before compaction.
-            if let Some(ref mem) = self.memory {
-                let scope = format!("agent:{}", self.handle.id);
-                let llm_entities = crate::agent::context_mgr::extract_entities_via_llm(
-                    &old_text, compaction_model, &mut self.failover, &self.providers,
-                ).await;
-                if !llm_entities.is_empty() {
-                    crate::agent::context_mgr::write_entity_memories(mem, &scope, llm_entities).await;
-                    debug!(session = session_key, "pre-compaction LLM entities pinned");
-                }
-            }
+            // LLM-based entity extraction is now handled by the summary prompt
+            // (Entities section), parsed after summary generation below.
         }
 
         // Summarise the old portion.
@@ -223,6 +214,18 @@ impl AgentRuntime {
         };
 
         let Some(summary) = summary else { return };
+
+        // -- Entity extraction from summary's Entities section --
+        // The summary prompt includes an Entities section (kind=value format).
+        // Parse it and write as pinned memories — no extra LLM call needed.
+        if let Some(ref mem) = self.memory {
+            let entities = parse_entities_from_summary(&summary);
+            if !entities.is_empty() {
+                let scope = format!("agent:{}", self.handle.id);
+                crate::agent::context_mgr::write_entity_memories(mem, &scope, entities).await;
+                debug!(session = session_key, "entities extracted from compaction summary");
+            }
+        }
 
         // -- Key fact extraction: store important facts in long-term memory --
         if extract_facts {
@@ -488,17 +491,24 @@ impl AgentRuntime {
                 role: Role::User,
                 content: MessageContent::Text(format!(
                     "Summarize the following conversation into these sections:\n\n\
-                     1. **Task & Intent**: What the user wants to accomplish\n\
-                     2. **Key Data**: Exact values that MUST be preserved verbatim \
-                        (file paths, URLs, cron expressions, config values, IDs, \
-                        variable names, port numbers, credentials, phone numbers, \
-                        account numbers, any numeric sequence discovered during the conversation)\n\
-                     3. **Actions Taken**: Tool calls and their outcomes — what was \
-                        created, modified, or deleted\n\
-                     4. **Current State**: Where things stand now\n\
-                     5. **Pending Work**: Unfinished tasks or planned next steps\n\n\
-                     CRITICAL: In section 2 (Key Data), copy values character-for-character. \
-                     Do NOT paraphrase cron expressions, file paths, or IDs.\n\n\
+                     ## Active Task\n[Current unfinished task]\n\n\
+                     ## Goal\n[Overall goal]\n\n\
+                     ## Completed\n[Numbered list of completed actions with outcomes]\n\n\
+                     ## In Progress\n[Work currently underway]\n\n\
+                     ## Key Data\n[Exact values that MUST be preserved verbatim: \
+                        file paths, URLs, IDs, port numbers, credentials, phone numbers, \
+                        account numbers, any numeric sequence. Copy character-for-character.]\n\n\
+                     ## Decisions\n[Technical decisions made and why]\n\n\
+                     ## Pending\n[Blocked items or awaiting user confirmation]\n\n\
+                     ## Files\n[Files read, modified, or created]\n\n\
+                     ## Entities\n[Personal information found in the conversation.\n\
+                        Format: kind=value, one per line.\n\
+                        Kinds: name, phone, id_card, email, birthday, age, zodiac, \
+                        lucky_number, address, relationship, preference.\n\
+                        Example: name=小王\\nphone=18674030927\\nbirthday=1995年3月15日\\n\
+                        If none found, write: (none)]\n\n\
+                     CRITICAL: Copy ALL values character-for-character. \
+                     Do NOT paraphrase or truncate any data.\n\n\
                      ---\n\n{history}"
                 )),
             }],
@@ -663,4 +673,65 @@ impl AgentRuntime {
             Err(e) => warn!("transcript open: {e:#}"),
         }
     }
+}
+
+/// Parse `## Entities` section from a compaction summary.
+///
+/// Expected format (one per line):
+/// ```text
+/// ## Entities
+/// name=小王
+/// phone=18674030927
+/// birthday=1995年3月15日
+/// ```
+fn parse_entities_from_summary(summary: &str) -> Vec<crate::agent::context_mgr::KeyEntity> {
+    let mut entities = Vec::new();
+
+    // Find the Entities section
+    let section_start = summary.find("## Entities");
+    let Some(start) = section_start else {
+        return entities;
+    };
+    let content = &summary[start..];
+    // Take lines until next ## section or end of string
+    let section_end = content[3..].find("\n## ").map(|i| i + 3).unwrap_or(content.len());
+    let section = &content[..section_end];
+
+    let kind_to_label: &[(&str, &str, &'static str)] = &[
+        ("name", "用户姓名", "name"),
+        ("phone", "用户手机号", "phone_number"),
+        ("id_card", "用户身份证", "id_card"),
+        ("email", "用户邮箱", "email"),
+        ("birthday", "用户生日", "birthday"),
+        ("age", "用户年龄", "age"),
+        ("zodiac", "用户星座", "zodiac"),
+        ("lucky_number", "用户幸运数字", "lucky_number"),
+        ("address", "用户地址", "address"),
+        ("relationship", "用户关系", "relationship"),
+        ("preference", "用户偏好", "preference"),
+    ];
+
+    for line in section.lines().skip(1) {
+        let line = line.trim();
+        if line.is_empty() || line == "(none)" || line.starts_with("##") {
+            continue;
+        }
+        // Parse kind=value
+        if let Some((kind, value)) = line.split_once('=') {
+            let kind = kind.trim().to_lowercase();
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            if let Some((_, label, static_kind)) = kind_to_label.iter().find(|(k, _, _)| *k == kind) {
+                entities.push(crate::agent::context_mgr::KeyEntity {
+                    kind: static_kind,
+                    value: value.to_owned(),
+                    memory_text: format!("{label}: {value}"),
+                });
+            }
+        }
+    }
+
+    entities
 }
