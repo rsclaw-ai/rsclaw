@@ -558,6 +558,10 @@ const cn = {
       Title: "视频生成模型",
       SubTitle: "用于文生视频的模型 (Seedance / MiniMax / Kling)",
     },
+    BtwTokens: {
+      Title: "旁路上下文预算",
+      SubTitle: "/ctx 旁路查询的最大 token 数",
+    },
     Temperature: {
       Title: "随机性 (temperature)",
       SubTitle: "值越大，回复越随机",

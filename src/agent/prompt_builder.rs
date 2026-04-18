@@ -179,20 +179,18 @@ pub(crate) fn build_date_context() -> String {
 
 /// Build the base system prompt shared by main agent and sub agents.
 ///
-/// Contains: date/time, language, platform, command safety rules.
-/// Sub agents call this directly; the main agent calls `build_system_prompt`
-/// which adds workspace context, skills, and tool guidance on top.
+/// Contains: language directive, platform info, command safety rules.
+/// Date/time and other dynamic content is injected per-turn into the user
+/// message by the runtime, NOT here, to preserve KV cache prefix stability.
 pub(crate) fn build_base_system_prompt(config: &crate::config::schema::Config) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
 
-    // Current date/time so the model knows "today", "last Friday", etc.
-    let mut date_line = build_date_context();
+    // Language directive is stable (doesn't change per-turn).
     if let Some(lang) = config.gateway.as_ref().and_then(|g| g.language.as_deref()) {
-        date_line.push_str(&format!(
-            "\nDefault response language: {lang}. Always reply in {lang} unless the user explicitly uses another language."
+        parts.push(format!(
+            "Default response language: {lang}. Always reply in {lang} unless the user explicitly uses another language."
         ));
     }
-    parts.push(date_line);
 
     // Platform information so LLM generates correct shell commands.
     let platform_info = if cfg!(target_os = "windows") {

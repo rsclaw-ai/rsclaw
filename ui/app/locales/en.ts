@@ -562,6 +562,10 @@ const en: LocaleType = {
       Title: "Video Model",
       SubTitle: "Model used for text-to-video generation (Seedance / MiniMax / Kling)",
     },
+    BtwTokens: {
+      Title: "Side Query Budget",
+      SubTitle: "Max tokens for /ctx side queries",
+    },
     Temperature: {
       Title: "Temperature",
       SubTitle: "A larger value makes the more random output",

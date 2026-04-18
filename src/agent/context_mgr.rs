@@ -37,39 +37,6 @@ pub fn estimate_tokens(text: &str) -> usize {
     ascii_chars / 4 + (cjk_chars * 2 + 1) / 3 + other_chars / 2 + 1
 }
 
-/// Strip image data URIs from all but the last user message to prevent
-/// context bloat.
-pub(crate) fn strip_old_images(mut messages: Vec<Message>) -> Vec<Message> {
-    // Find the index of the last user message (the one that may have fresh images).
-    let last_user_idx = messages.iter().rposition(|m| m.role == Role::User);
-
-    for (i, msg) in messages.iter_mut().enumerate() {
-        if Some(i) == last_user_idx {
-            continue; // keep images on the latest user message
-        }
-        if let MessageContent::Parts(parts) = &msg.content {
-            let has_image = parts.iter().any(|p| matches!(p, ContentPart::Image { .. }));
-            if has_image {
-                // Replace with text-only version
-                let text: String = parts
-                    .iter()
-                    .filter_map(|p| match p {
-                        ContentPart::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                msg.content = MessageContent::Text(if text.is_empty() {
-                    "[image]".to_owned()
-                } else {
-                    format!("{text} [image]")
-                });
-            }
-        }
-    }
-    messages
-}
-
 /// Prune the session message history in-place according to config.
 ///
 /// Strategy (applied in order):
@@ -633,4 +600,190 @@ fn parse_llm_entities(raw: &str) -> Vec<KeyEntity> {
         });
     }
     entities
+}
+
+// ---------------------------------------------------------------------------
+// Media description — convert images/videos to text for session storage
+// ---------------------------------------------------------------------------
+
+/// Describe an image using a vision-capable LLM.
+///
+/// Sends the image (base64 data URI) to the specified model and returns a
+/// short text description. Used to convert images to text before storing in
+/// the session, so that:
+/// - Non-vision models can still "see" what was in the image
+/// - Session history stays text-only (no base64 bloat)
+/// - KV cache prefix is not disrupted
+pub(crate) async fn describe_image_via_llm(
+    image_data_uri: &str,
+    model: &str,
+    failover: &mut FailoverManager,
+    providers: &Arc<ProviderRegistry>,
+) -> Option<String> {
+    let req = LlmRequest {
+        model: model.to_owned(),
+        messages: vec![Message {
+            role: Role::User,
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "Describe this image concisely in 2-3 sentences. \
+                           Focus on the main subject, key details, and any text visible. \
+                           If it's a screenshot, describe the UI/content shown. \
+                           Reply in the same language as any text in the image, \
+                           or Chinese if no text is visible."
+                        .to_owned(),
+                },
+                ContentPart::Image {
+                    url: image_data_uri.to_owned(),
+                },
+            ]),
+        }],
+        tools: vec![],
+        system: None,
+        max_tokens: Some(300),
+        temperature: Some(0.0),
+        frequency_penalty: None,
+        thinking_budget: None,
+    };
+
+    let mut stream = match failover.call(req, providers).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!("image description LLM call failed: {e:#}");
+            return None;
+        }
+    };
+
+    let mut output = String::new();
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(StreamEvent::TextDelta(d)) => output.push_str(&d),
+            Ok(StreamEvent::Done { .. }) => break,
+            Ok(StreamEvent::Error(e)) => {
+                tracing::debug!("image description stream error: {e}");
+                break;
+            }
+            Err(e) => {
+                tracing::debug!("image description stream error: {e:#}");
+                return None;
+            }
+            _ => {}
+        }
+    }
+
+    let trimmed = output.trim().to_owned();
+    if trimmed.is_empty() { None } else { Some(trimmed) }
+}
+
+/// Build a text description for a video attachment.
+///
+/// Returns a formatted string like:
+/// - `[视频 12s] 转录: "大家好，今天..."` (if audio transcript available)
+/// - `[视频 12s] (无音频内容)` (if no audio)
+/// - `[视频] (无法获取时长)` (if duration unknown)
+pub(crate) fn describe_video(duration_secs: Option<u64>, transcript: Option<&str>) -> String {
+    let dur = match duration_secs {
+        Some(s) => format!(" {s}s"),
+        None => String::new(),
+    };
+    match transcript {
+        Some(t) if !t.trim().is_empty() => {
+            let preview: String = t.chars().take(500).collect();
+            let ellipsis = if t.chars().count() > 500 { "..." } else { "" };
+            format!("[视频{dur}] 转录: \"{preview}{ellipsis}\"")
+        }
+        _ => format!("[视频{dur}] (无音频内容)"),
+    }
+}
+
+/// Compress tool results and tool-call arguments in-place to reduce token
+/// count before LLM summarization during compaction.
+///
+/// For `Role::Tool` messages whose text content exceeds 200 chars, the content
+/// is replaced with a one-line summary:
+///   `[tool result] {first_line_or_truncated}... ({original_len} chars)`
+///
+/// For `Role::Assistant` messages containing `ContentPart::ToolUse` with
+/// serialized arguments longer than 500 chars, the arguments are truncated
+/// to 100 chars.
+///
+/// The last `preserve_tail` messages are left untouched so that recent
+/// context is not degraded.
+pub(crate) fn compress_tool_results(messages: &mut Vec<Message>, preserve_tail: usize) {
+    if messages.len() <= preserve_tail {
+        return;
+    }
+    let compress_end = messages.len() - preserve_tail;
+
+    for msg in messages[..compress_end].iter_mut() {
+        match msg.role {
+            Role::Tool => {
+                // Compress long tool-result text messages.
+                if let MessageContent::Text(ref text) = msg.content {
+                    if text.len() > 200 {
+                        let original_len = text.len();
+                        let first_line = text.lines().next().unwrap_or(text);
+                        let summary: String = first_line.chars().take(100).collect();
+                        let ellipsis = if first_line.chars().count() > 100 { "..." } else { "" };
+                        msg.content = MessageContent::Text(format!(
+                            "[tool result] {summary}{ellipsis} ({original_len} chars)"
+                        ));
+                    }
+                }
+                // Also handle Parts-based tool results.
+                if let MessageContent::Parts(ref mut parts) = msg.content {
+                    for part in parts.iter_mut() {
+                        if let ContentPart::ToolResult { content, .. } = part {
+                            if content.len() > 200 {
+                                let original_len = content.len();
+                                let first_line = content.lines().next().unwrap_or(content);
+                                let summary: String = first_line.chars().take(100).collect();
+                                let ellipsis = if first_line.chars().count() > 100 { "..." } else { "" };
+                                *content = format!(
+                                    "[tool result] {summary}{ellipsis} ({original_len} chars)"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Role::Assistant => {
+                // Truncate long tool-call arguments.
+                if let MessageContent::Parts(ref mut parts) = msg.content {
+                    for part in parts.iter_mut() {
+                        if let ContentPart::ToolUse { input, .. } = part {
+                            let serialized = serde_json::to_string(&input).unwrap_or_default();
+                            if serialized.len() > 500 {
+                                let truncated: String = serialized.chars().take(100).collect();
+                                // Replace with a JSON string value containing the truncated form.
+                                *input = serde_json::Value::String(format!("{truncated}..."));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Build a text description for a generic file attachment.
+pub(crate) fn describe_file(filename: &str, mime_type: &str) -> String {
+    if mime_type.starts_with("audio/") {
+        format!("[音频: {filename}]")
+    } else if mime_type.starts_with("text/")
+        || mime_type.contains("json")
+        || mime_type.contains("xml")
+        || mime_type.contains("javascript")
+    {
+        format!("[文件: {filename}] (文本文件，可用 read_file 读取)")
+    } else if mime_type.contains("pdf")
+        || mime_type.contains("word")
+        || mime_type.contains("spreadsheet")
+        || mime_type.contains("presentation")
+    {
+        format!("[文件: {filename}] (文档，可用 doc 工具读取)")
+    } else {
+        format!("[文件: {filename}] ({mime_type})")
+    }
 }

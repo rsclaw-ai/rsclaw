@@ -296,6 +296,24 @@ export function ModelConfigList(props: {
             ))}
         </Select>
       </ListItem>
+      <ListItem
+        title={Locale.Settings.BtwTokens.Title}
+        subTitle={Locale.Settings.BtwTokens.SubTitle}
+      >
+        <input
+          aria-label={Locale.Settings.BtwTokens.Title}
+          type="number"
+          min={1000}
+          max={50000}
+          step={1000}
+          value={props.modelConfig.btwTokens ?? 10000}
+          onChange={(e) =>
+            props.updateConfig(
+              (config) => (config.btwTokens = e.currentTarget.valueAsNumber),
+            )
+          }
+        ></input>
+      </ListItem>
     </>
   );
 }

@@ -267,6 +267,11 @@ pub struct AgentDefaults {
     pub image_gen: Option<Value>,
     pub repo_root: Option<String>,
     pub context_tokens: Option<u32>,
+    /// KV cache prefix optimization level:
+    /// 0 = off, 1 = append-only (stable system prompt, default), 2 = incremental (delta only).
+    pub prefix_kv_cache: Option<u8>,
+    /// Maximum token budget for /ctx (btw) side queries. Default: 10000.
+    pub btw_tokens: Option<u32>,
     pub timezone: Option<String>,
     pub timestamp: Option<Value>,
     pub thinking: Option<ThinkingConfig>,

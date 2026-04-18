@@ -59,7 +59,7 @@ use super::{
 pub use super::context_mgr::estimate_tokens;
 use super::context_mgr::{
     apply_context_budget_trim, apply_context_pruning, build_clear_summary,
-    compress_image_for_llm, msg_tokens, strip_old_images,
+    compress_image_for_llm, msg_tokens,
 };
 use super::platform::match_skills;
 use super::prompt_builder::{
@@ -420,11 +420,36 @@ impl AgentRuntime {
     /// context but NO tools. The result is ephemeral -- it is NOT added to
     /// session history and does not affect the main conversation.
     async fn handle_side_query(&mut self, session_key: &str, question: &str) -> Result<AgentReply> {
-        // Read current session history (read-only snapshot for context).
+        // Read current session history — only User/Assistant text messages,
+        // skip Tool/ToolCall messages (btw has no tools, they'd confuse the model).
+        let btw_budget = self.config.agents.defaults.btw_tokens.unwrap_or(10_000) as usize;
         let history: Vec<Message> = self.sessions.get(session_key).cloned().unwrap_or_default();
-
-        // Take last 10 messages for context, then append the question.
-        let mut messages: Vec<Message> = history.into_iter().rev().take(10).rev().collect();
+        let mut messages = Vec::new();
+        let mut token_count = 0usize;
+        // Walk backwards, collect up to btw_budget tokens of User/Assistant text.
+        for m in history.iter().rev() {
+            if !matches!(m.role, Role::User | Role::Assistant) {
+                continue;
+            }
+            let text = match &m.content {
+                MessageContent::Text(t) => t.clone(),
+                _ => continue,
+            };
+            let msg_tokens = super::context_mgr::estimate_tokens(&text);
+            if token_count + msg_tokens > btw_budget && !messages.is_empty() {
+                break;
+            }
+            // Truncate individual messages that are too long.
+            let content = if text.chars().count() > 2000 {
+                let truncated: String = text.chars().take(2000).collect();
+                MessageContent::Text(format!("{truncated}..."))
+            } else {
+                MessageContent::Text(text)
+            };
+            messages.push(Message { role: m.role.clone(), content });
+            token_count += msg_tokens;
+        }
+        messages.reverse();
         messages.push(Message {
             role: Role::User,
             content: MessageContent::Text(question.to_owned()),
@@ -1772,22 +1797,10 @@ impl AgentRuntime {
             )
         };
 
-        // Build system prompt.
-        let mut system_prompt = build_system_prompt(&ws_ctx, &self.skills, &self.config.raw);
-
-        // Detect parallelism keywords in user message and inject task-agent hint.
-        {
-            let lower = text.to_lowercase();
-            let parallel_keywords = ["并行", "并发", "最快", "同时", "parallel", "concurrent", "fastest", "simultaneously", "分别"];
-            if parallel_keywords.iter().any(|kw| lower.contains(kw)) {
-                system_prompt.push_str(
-                    "\n\n[PARALLEL HINT] The user wants parallel execution. \
-                     Use `agent` action=task to dispatch MULTIPLE task agents AT ONCE \
-                     (one task per independent sub-job). Do NOT execute them yourself sequentially. \
-                     Each task agent runs independently and results are delivered when done."
-                );
-            }
-        }
+        // Build system prompt — STABLE across turns for KV cache preservation.
+        // Dynamic content (date, memories, /ctx, hints) is injected into the
+        // API copy of the user message, NOT into the system prompt.
+        let system_prompt = build_system_prompt(&ws_ctx, &self.skills, &self.config.raw);
 
         // DEBUG: dump full system prompt to file for inspection
         if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
@@ -1798,10 +1811,52 @@ impl AgentRuntime {
             tracing::info!(path = %dump_path.display(), len = system_prompt.len(), "dumped system prompt");
         }
 
+        // --- Dynamic context: injected into API copy, not stored/system ---
+        let mut dynamic_ctx = Vec::<String>::new();
+
+        // Date/time.
+        dynamic_ctx.push(super::prompt_builder::build_date_context());
+
+        // Parallelism hint.
+        {
+            let lower = text.to_lowercase();
+            let parallel_keywords = ["并行", "并发", "最快", "同时", "parallel", "concurrent", "fastest", "simultaneously", "分别"];
+            if parallel_keywords.iter().any(|kw| lower.contains(kw)) {
+                dynamic_ctx.push(
+                    "[PARALLEL HINT] The user wants parallel execution. \
+                     Use `agent` action=task to dispatch MULTIPLE task agents AT ONCE \
+                     (one task per independent sub-job). Do NOT execute them yourself sequentially. \
+                     Each task agent runs independently and results are delivered when done."
+                    .to_owned(),
+                );
+            }
+        }
+
+        // Channel-aware formatting hints for IM channels.
+        if channel == "feishu" || channel == "dingtalk" || channel == "wecom" {
+            dynamic_ctx.push(concat!(
+                "[Output format rules for IM chat]\n",
+                "- Never use Markdown headings (#, ##, ###).\n",
+                "- Use **bold text** or 【section title】 for sections.\n",
+                "- Use 1. or - for lists.\n",
+                "- Use > for important quotes.\n",
+                "- Do NOT use Markdown tables (|---|). Use \"label: value\" format instead.\n",
+                "\n[Data integrity rules - CRITICAL]\n",
+                "- NEVER truncate or shorten ANY text, strings, numbers, or identifiers.\n",
+                "- Copy ALL values EXACTLY: UUIDs, IDs, IP addresses, paths, URLs, code, data.\n",
+                "- UUIDs: 36 chars (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).\n",
+                "- IP addresses: complete (127.0.0.1 not 7.0.0.1).\n",
+                "- If you see truncated data in context, report it as incomplete.\n",
+                "\n[Tool usage rules]\n",
+                "- For ANY question about real-time data (prices, weather, news, dates, events), you MUST call web_search first. NEVER answer from memory.\n",
+                "- For shell commands, file operations, use exec/read/write tools.\n",
+            ).to_owned());
+        }
+
         // Loop A (organic evolution): collect recalled memory IDs for feedback.
         let mut auto_recalled_ids = std::collections::HashSet::<String>::new();
 
-        // Auto-Recall (AGENTS.md §31): hybrid vector+BM25 recall before prompt.
+        // Auto-Recall (AGENTS.md §31): hybrid vector+BM25 recall.
         if let Some(ref mem) = self.memory
             && !text.trim().is_empty()
         {
@@ -1809,7 +1864,6 @@ impl AgentRuntime {
             let mem_cfg = &self.config.raw.memory;
             let recall_top_k = mem_cfg.as_ref().and_then(|m| m.recall_top_k).unwrap_or(10);
             let recall_final_k = mem_cfg.as_ref().and_then(|m| m.recall_final_k).unwrap_or(5);
-            // 1. Vector recall.
             let vec_hits = {
                 let mut guard = mem.lock().await;
                 guard
@@ -1817,13 +1871,11 @@ impl AgentRuntime {
                     .await
                     .unwrap_or_default()
             };
-            // 2. BM25 recall (tantivy).
             let bm25_hits = self
                 .store
                 .search
                 .search(text, Some(&scope), recall_top_k)
                 .unwrap_or_default();
-            // 3. Fuse with Reciprocal Rank Fusion (k=60), return top final_k.
             let vec_count = vec_hits.len();
             let bm25_count = bm25_hits.len();
             let results = rrf_fuse(vec_hits, bm25_hits, recall_final_k);
@@ -1833,7 +1885,6 @@ impl AgentRuntime {
                 fused = results.len(),
                 "auto-recall results"
             );
-            // Loop A (organic evolution): track recalled memory IDs for feedback.
             for doc in &results {
                 auto_recalled_ids.insert(doc.id.clone());
             }
@@ -1850,11 +1901,7 @@ impl AgentRuntime {
                         .collect::<Vec<_>>()
                         .join("\n")
                 );
-                if system_prompt.is_empty() {
-                    system_prompt = mem_block;
-                } else {
-                    system_prompt = format!("{system_prompt}\n\n{mem_block}");
-                }
+                dynamic_ctx.push(mem_block);
             }
         }
 
@@ -1864,8 +1911,7 @@ impl AgentRuntime {
             .to_prompt_block_relevant(session_key, channel, text)
             .await;
         if !btw_block.is_empty() {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(&btw_block);
+            dynamic_ctx.push(btw_block);
         }
 
         // Plugin hook: before_prompt_build (AGENTS.md §20).
@@ -1894,28 +1940,6 @@ impl AgentRuntime {
             })
             .unwrap_or("anthropic/claude-sonnet-4-6")
             .to_owned();
-
-        // Channel-aware formatting hints for IM channels (feishu, dingtalk, etc.)
-        if channel == "feishu" || channel == "dingtalk" || channel == "wecom" {
-            system_prompt.push_str(concat!(
-                "\n\n",
-                "[Output format rules for IM chat]\n",
-                "- Never use Markdown headings (#, ##, ###).\n",
-                "- Use **bold text** or 【section title】 for sections.\n",
-                "- Use 1. or - for lists.\n",
-                "- Use > for important quotes.\n",
-                "- Do NOT use Markdown tables (|---|). Use \"label: value\" format instead.\n",
-                "\n[Data integrity rules - CRITICAL]\n",
-                "- NEVER truncate or shorten ANY text, strings, numbers, or identifiers.\n",
-                "- Copy ALL values EXACTLY: UUIDs, IDs, IP addresses, paths, URLs, code, data.\n",
-                "- UUIDs: 36 chars (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).\n",
-                "- IP addresses: complete (127.0.0.1 not 7.0.0.1).\n",
-                "- If you see truncated data in context, report it as incomplete.\n",
-                "\n[Tool usage rules]\n",
-                "- For ANY question about real-time data (prices, weather, news, dates, events), you MUST call web_search first. NEVER answer from memory.\n",
-                "- For shell commands, file operations, use exec/read/write tools.\n",
-            ));
-        }
 
         // Build tool list from skills and registered agents (local + remote).
         // Tool selection: toolsEnabled -> toolset level -> tools whitelist
@@ -1997,73 +2021,102 @@ impl AgentRuntime {
         // Check vision support before loading session (avoids borrow conflict).
         let vision = model_supports_vision(&model, &self.config);
 
-        // Load or initialise session history.
-        let session_messages = self.load_session(session_key);
+        // ---------------------------------------------------------------
+        // Media processing: convert images/videos to text descriptions.
+        // Done BEFORE load_session() to avoid borrow conflicts with self.
+        // Session stores ONLY text — no base64, no binary blobs.
+        // This preserves KV cache and prevents context bloat.
+        // ---------------------------------------------------------------
+        let mut media_descriptions = Vec::<String>::new();
+        let mut vision_images_for_current_turn = Vec::<String>::new(); // base64 URIs for vision model
 
-        // Append user message to session.
-        let images = if vision {
-            images
-        } else {
-            if !images.is_empty() {
-                info!(
-                    "model {model} does not support vision, stripping {} image(s)",
-                    images.len()
-                );
-            }
-            vec![]
-        };
-        // Compress images before sending to LLM to save tokens.
-        // Skip compression for video attachments — they go to Files API directly.
-        let compressed_images: Vec<_> = images
-            .iter()
-            .filter_map(|img| {
-                if img.mime_type.starts_with("video/") {
-                    // Pass video through without compression
-                    return Some(img.clone());
-                }
-                compress_image_for_llm(&img.data).map(|data| super::registry::ImageAttachment {
-                    data,
-                    mime_type: "image/jpeg".to_owned(),
-                })
-            })
-            .collect();
-        let content = if compressed_images.is_empty() && images.is_empty() {
-            MessageContent::Text(text.to_owned())
-        } else {
-            let imgs = if compressed_images.is_empty() {
-                &images
+        for img in &images {
+            if img.mime_type.starts_with("video/") {
+                // Video: generate text placeholder (transcript support is TODO).
+                let desc = crate::agent::context_mgr::describe_video(None, None);
+                media_descriptions.push(desc);
             } else {
-                &compressed_images
-            };
-            let mut parts = vec![ContentPart::Text {
-                text: text.to_owned(),
-            }];
-            for img in imgs {
-                parts.push(ContentPart::Image {
-                    url: img.data.clone(),
-                });
+                // Image: get text description via vision model.
+                // If current model supports vision, also keep the image for the
+                // current LLM turn (so it sees the original).
+                if vision {
+                    // Current model can see images — keep for this turn's API call.
+                    if let Some(compressed) = compress_image_for_llm(&img.data) {
+                        vision_images_for_current_turn.push(compressed);
+                    } else {
+                        vision_images_for_current_turn.push(img.data.clone());
+                    }
+                }
+
+                // Generate text description for session storage.
+                // Use current model if vision-capable, otherwise find a vision model.
+                let vision_model = if vision {
+                    model.clone()
+                } else {
+                    // Try image model config, then fallback to known vision providers.
+                    self.handle.config.model.as_ref()
+                        .and_then(|m| m.image.as_deref())
+                        .or_else(|| self.config.agents.defaults.model.as_ref()
+                            .and_then(|m| m.image.as_deref()))
+                        .map(|s| s.to_owned())
+                        .unwrap_or_else(|| {
+                            // Auto-detect a vision-capable provider from config.
+                            let vision_providers = ["doubao", "gemini", "openai", "qwen"];
+                            for vp in vision_providers {
+                                let has_key = self.config.model.models.as_ref()
+                                    .and_then(|m| m.providers.get(vp))
+                                    .and_then(|p| p.api_key.as_ref())
+                                    .is_some()
+                                    || std::env::var(format!("{}_API_KEY", vp.to_uppercase())).is_ok();
+                                if has_key {
+                                    return match vp {
+                                        "doubao" => "doubao/doubao-seed-2-0-pro-260215".to_owned(),
+                                        "gemini" => "gemini/gemini-2.0-flash".to_owned(),
+                                        "openai" => "openai/gpt-4o-mini".to_owned(),
+                                        "qwen" => "qwen/qwen-vl-max".to_owned(),
+                                        _ => format!("{vp}/default"),
+                                    };
+                                }
+                            }
+                            tracing::warn!("no vision-capable provider found for image description");
+                            String::new() // no vision model available
+                        })
+                };
+
+                if vision_model.is_empty() {
+                    media_descriptions.push("[图片] (无视觉模型可用)".to_owned());
+                } else {
+                    let desc = crate::agent::context_mgr::describe_image_via_llm(
+                        &img.data, &vision_model, &mut self.failover, &self.providers,
+                    ).await;
+                    match desc {
+                        Some(d) => media_descriptions.push(format!("[图片] {d}")),
+                        None => media_descriptions.push("[图片] (无法生成描述)".to_owned()),
+                    }
+                }
             }
-            MessageContent::Parts(parts)
-        };
-        let user_msg = Message {
-            role: Role::User,
-            content,
-        };
-        // Store stripped version in session (no image base64 to avoid bloating).
-        // The full user_msg with images is only used for the current LLM call.
-        let persist_msg = if images.is_empty() {
-            user_msg.clone()
+        }
+
+        // Build the persisted message: user text + media descriptions (text only).
+        let persist_text = if media_descriptions.is_empty() {
+            text.to_owned()
         } else {
-            Message {
-                role: Role::User,
-                content: MessageContent::Text(format!("{text} [image attached]")),
-            }
+            format!("{}\n\n{}", text, media_descriptions.join("\n"))
         };
+        let persist_msg = Message {
+            role: Role::User,
+            content: MessageContent::Text(persist_text),
+        };
+
+        // NOW load session (after media processing is done, no more self borrows).
+        let session_messages = self.load_session(session_key);
         session_messages.push(persist_msg.clone());
-        let _ = self.store.db.append_message(
+        if let Err(e) = self.store.db.append_message(
             session_key,
             &serde_json::to_value(&persist_msg).unwrap_or_default(),
-        );
+        ) {
+            tracing::warn!("failed to persist user message: {e:#}");
+        }
 
         // Timeout wrapper.
         let timeout_secs = self
@@ -2138,9 +2191,21 @@ impl AgentRuntime {
                     LoopDetector::new(usize::MAX, usize::MAX)
                 }
             },
-            has_images: !images.is_empty(),
-            user_msg_with_images: if !images.is_empty() {
-                Some(user_msg.clone())
+            has_images: !vision_images_for_current_turn.is_empty(),
+            user_msg_with_images: if !vision_images_for_current_turn.is_empty() {
+                // Build a multimodal message for the current LLM turn only.
+                // The persisted message is text-only; this adds images back for vision.
+                let base_text = match &persist_msg.content {
+                    MessageContent::Text(t) => t.clone(),
+                    MessageContent::Parts(p) => p.iter().filter_map(|part| {
+                        if let ContentPart::Text { text } = part { Some(text.as_str()) } else { None }
+                    }).collect::<Vec<_>>().join(""),
+                };
+                let mut parts = vec![ContentPart::Text { text: base_text }];
+                for img_uri in &vision_images_for_current_turn {
+                    parts.push(ContentPart::Image { url: img_uri.clone() });
+                }
+                Some(Message { role: Role::User, content: MessageContent::Parts(parts) })
             } else {
                 None
             },
@@ -2164,8 +2229,8 @@ impl AgentRuntime {
                     ))
                     .collect::<Vec<_>>()
                     .join("\n\n");
-                system_prompt.push_str(&format!(
-                    "\n\n## Active Skills (matched to current request)\n\
+                dynamic_ctx.push(format!(
+                    "## Active Skills (matched to current request)\n\
                      Follow these skill instructions carefully:\n\n{skill_prompts}"
                 ));
                 info!(
@@ -2177,7 +2242,7 @@ impl AgentRuntime {
 
         let reply = time::timeout(
             Duration::from_secs(timeout_secs),
-            self.agent_loop(&mut ctx, &model, &system_prompt, tools, extra_tools, abort_flag.clone()),
+            self.agent_loop(&mut ctx, &model, &system_prompt, tools, extra_tools, abort_flag.clone(), dynamic_ctx),
         )
         .await
         .map_err(|_| {
@@ -2476,6 +2541,7 @@ impl AgentRuntime {
         tools: Vec<ToolDef>,
         extra_tools: Vec<ToolDef>,
         abort_flag: Arc<AtomicBool>,
+        dynamic_ctx: Vec<String>,
     ) -> Result<AgentReply> {
         let pruning_cfg = self.config.agents.defaults.context_pruning.clone();
 
@@ -2691,18 +2757,20 @@ impl AgentRuntime {
             // total history fits within the model's context window minus reserves
             // for the system prompt, tools, and reply generation.
             if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
-                apply_context_budget_trim(sess, context_tokens, system_prompt, &tools);
+                apply_context_budget_trim(sess, context_tokens, &system_prompt, &tools);
             }
 
-            let messages = {
+            // Build API copy of messages — clone from session, then inject
+            // dynamic context and vision images. Session storage is NOT modified.
+            let mut messages = {
                 let mut raw = self
                     .sessions
                     .get(&ctx.session_key)
                     .cloned()
                     .unwrap_or_default();
-                // Replace the last user message with the full version that
-                // includes image data (session stores a stripped [image attached]
-                // placeholder to avoid bloating persistent storage).
+
+                // For vision models: replace last user message with multimodal
+                // version containing original images (only for this API call).
                 if ctx.has_images {
                     if let Some(last) = raw.last_mut() {
                         if last.role == Role::User {
@@ -2710,22 +2778,39 @@ impl AgentRuntime {
                         }
                     }
                 }
-                // Strip image data URIs from older messages.
-                let stripped = strip_old_images(raw);
+
+                // Inject dynamic context (date, memories, /ctx, hints) into the
+                // last user message of this API copy. Session storage is unchanged.
+                if !dynamic_ctx.is_empty() {
+                    let ctx_block = format!("[Context]\n{}", dynamic_ctx.join("\n"));
+                    if let Some(last_user) = raw.iter_mut().rev().find(|m| m.role == Role::User) {
+                        match &mut last_user.content {
+                            MessageContent::Text(t) => {
+                                *t = format!("{ctx_block}\n\n{t}");
+                            }
+                            MessageContent::Parts(parts) => {
+                                parts.insert(0, ContentPart::Text {
+                                    text: format!("{ctx_block}\n\n"),
+                                });
+                            }
+                        }
+                    }
+                }
+
                 // Repair transcript: ensure all tool_calls have matching tool_results.
-                // This fixes orphaned tool_calls from interrupted sessions.
-                let repair_result = repair_tool_result_pairing(stripped);
+                let repair_result = repair_tool_result_pairing(raw);
 
                 // Persist any synthetic tool results to session storage
                 // so they don't need to be added again on the next turn.
                 if !repair_result.synthetic_messages.is_empty() {
                     for synthetic in &repair_result.synthetic_messages {
-                        let _ = self.store.db.append_message(
+                        if let Err(e) = self.store.db.append_message(
                             &ctx.session_key,
                             &serde_json::to_value(synthetic).unwrap_or_default(),
-                        );
+                        ) {
+                            tracing::warn!("failed to persist synthetic message: {e:#}");
+                        }
                     }
-                    // Also update in-memory session cache
                     if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
                         sess.extend(repair_result.synthetic_messages.clone());
                     }
@@ -2769,25 +2854,35 @@ impl AgentRuntime {
             self.handle.last_ctx_tokens.store(approx_tokens, std::sync::atomic::Ordering::Relaxed);
             info!(session = %ctx.session_key, msg_count, approx_tokens, model = %model, "LLM call: context size");
 
-            // Context usage awareness: inject hint when usage is high.
-            // This goes into the system prompt so the LLM can self-adjust
-            // (shorter outputs, avoid re-reading files, etc.).
-            let effective_system = if approx_tokens > 0 && context_tokens > 0 {
+            // Context usage awareness: inject hint into the LAST user message
+            // (not system prompt) to preserve KV cache prefix stability.
+            if approx_tokens > 0 && context_tokens > 0 {
                 let usage_pct = (approx_tokens * 100) / context_tokens;
-                if usage_pct >= 90 {
-                    format!("{system_prompt}\n\n[Context usage: {usage_pct}% — CRITICAL. \
+                let usage_hint = if usage_pct >= 90 {
+                    Some(format!("[Context usage: {usage_pct}% — CRITICAL. \
                         Keep responses very concise. Do not re-read files already in context. \
-                        Suggest user start a new session if task is complete.]")
+                        Suggest user start a new session if task is complete.]"))
                 } else if usage_pct >= 70 {
-                    format!("{system_prompt}\n\n[Context usage: {usage_pct}%. \
+                    Some(format!("[Context usage: {usage_pct}%. \
                         Optimize: keep tool outputs short (use offset/limit for reads, \
-                        pipe to head/tail for commands). Avoid re-reading files already in context.]")
+                        pipe to head/tail for commands). Avoid re-reading files already in context.]"))
                 } else {
-                    system_prompt.to_owned()
+                    None
+                };
+                if let Some(hint) = usage_hint {
+                    if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == Role::User) {
+                        match &mut last_user.content {
+                            MessageContent::Text(t) => {
+                                t.push_str(&format!("\n\n{hint}"));
+                            }
+                            MessageContent::Parts(parts) => {
+                                parts.push(ContentPart::Text { text: format!("\n\n{hint}") });
+                            }
+                        }
+                    }
                 }
-            } else {
-                system_prompt.to_owned()
-            };
+            }
+            let effective_system = system_prompt.to_owned();
 
             // Resolve max_tokens with priority: config > built-in defaults > 8192
             let (provider_name, model_id) =

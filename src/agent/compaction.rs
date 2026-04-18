@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt as _;
 use tracing::{debug, info, warn};
 
-use super::context_mgr::{estimate_tokens, msg_tokens};
+use super::context_mgr::{compress_tool_results, estimate_tokens, msg_tokens};
 use super::runtime::AgentRuntime;
 use crate::provider::{
     ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent,
@@ -38,17 +38,23 @@ impl AgentRuntime {
         let cfg = self.config.agents.defaults.compaction.clone()
             .unwrap_or_default();
 
-        // Multi-condition compaction trigger: token threshold OR turn count OR time
-        // elapsed. Whichever fires first.
-        // Default threshold: 80% of configured context window, minimum 16000.
+        // Compaction trigger: token threshold ONLY.
+        // Turn count and time-based triggers were removed because they
+        // unnecessarily discard context and break KV cache in the new
+        // append-only architecture.
         let context_tokens = self.config.agents.defaults.context_tokens.unwrap_or(64_000) as usize;
-        let default_threshold = (context_tokens * 4 / 5).max(16_000);
+        let kv_cache_mode = self.config.agents.defaults.prefix_kv_cache.unwrap_or(1);
+        // prefix_kv_cache >= 1: append-only mode, delay compaction to 95%
+        // to maximize KV cache reuse. Mode 0: legacy 80% threshold.
+        let default_threshold = if kv_cache_mode >= 1 {
+            (context_tokens * 19 / 20).max(16_000) // 95%
+        } else {
+            (context_tokens * 4 / 5).max(16_000)   // 80%
+        };
         let token_threshold = cfg
             .reserve_tokens_floor
             .map(|t| t as usize)
             .unwrap_or(default_threshold);
-        let max_turns: u32 = 60;
-        let max_elapsed_secs: u64 = 30 * 60; // 30 minutes
 
         let total_tokens: usize = self
             .sessions
@@ -56,16 +62,13 @@ impl AgentRuntime {
             .map(|msgs| msgs.iter().map(msg_tokens).sum())
             .unwrap_or(0);
 
-        let (last_compaction, turns) = self
+        let turns = self
             .compaction_state
             .get(session_key)
-            .copied()
-            .unwrap_or((std::time::Instant::now(), 0));
+            .map(|(_, t)| *t)
+            .unwrap_or(0);
 
         let token_trigger = total_tokens > token_threshold;
-        let turn_trigger = turns >= max_turns;
-        let time_trigger = last_compaction.elapsed().as_secs() >= max_elapsed_secs
-            && total_tokens > token_threshold / 2;
 
         debug!(
             session = session_key,
@@ -73,14 +76,11 @@ impl AgentRuntime {
             token_threshold,
             turns,
             token_trigger,
-            turn_trigger,
-            time_trigger,
             force,
             "compaction check"
         );
 
-        if !force && !token_trigger && !turn_trigger && !time_trigger {
-            // Increment turn counter only.
+        if !force && !token_trigger {
             self.compaction_state
                 .entry(session_key.to_owned())
                 .and_modify(|(_, t)| *t += 1)
@@ -90,8 +90,6 @@ impl AgentRuntime {
 
         let trigger_reason = if token_trigger {
             "tokens"
-        } else if turn_trigger {
-            "turns"
         } else {
             "time"
         };
@@ -142,15 +140,20 @@ impl AgentRuntime {
                     split_idx = i;
                 }
             }
-            let old_portion = &msgs[..split_idx];
+            let mut old_portion = msgs[..split_idx].to_vec();
             let recent = msgs[split_idx..].to_vec();
             if old_portion.is_empty() {
                 // Not enough history to compact -- skip.
                 return;
             }
-            (msgs_to_text(old_portion), recent)
+            // Compress verbose tool results before LLM summarization to
+            // reduce input size. Preserves the last 6 messages in the old
+            // portion (3 user-assistant pairs) for continuity.
+            compress_tool_results(&mut old_portion, 6);
+            (msgs_to_text(&old_portion), recent)
         } else {
-            let msgs = self.sessions.get(session_key).cloned().unwrap_or_default();
+            let mut msgs = self.sessions.get(session_key).cloned().unwrap_or_default();
+            compress_tool_results(&mut msgs, 6);
             (msgs_to_text(&msgs), vec![])
         };
 
@@ -246,7 +249,9 @@ impl AgentRuntime {
                                 tags: vec![],
                 pinned: false,
                             };
-                            let _ = guard.add(doc).await;
+                            if let Err(e) = guard.add(doc).await {
+                                tracing::warn!("compaction fact memory add failed: {e:#}");
+                            }
                         }
                     }
                     drop(guard);
@@ -278,10 +283,14 @@ impl AgentRuntime {
 
         // Persist compacted session to redb (survives restarts).
         if let Some(sess) = self.sessions.get(session_key) {
-            let _ = self.store.db.delete_session(session_key);
+            if let Err(e) = self.store.db.delete_session(session_key) {
+                tracing::warn!("compaction: failed to delete old session: {e:#}");
+            }
             for msg in sess.iter() {
                 let val = serde_json::to_value(msg).unwrap_or_default();
-                let _ = self.store.db.append_message(session_key, &val);
+                if let Err(e) = self.store.db.append_message(session_key, &val) {
+                    tracing::warn!("compaction: failed to persist message: {e:#}");
+                }
             }
         }
 
