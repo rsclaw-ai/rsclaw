@@ -659,8 +659,8 @@ impl AgentRuntime {
 
         let ts = chrono::Utc::now().timestamp_millis();
         let tmp_dir = std::env::temp_dir();
-        // Final output is ogg/opus for IM platform compatibility (feishu requires opus).
-        let out_path = tmp_dir.join(format!("rsclaw_tts_{ts}.ogg"));
+        // Output mp3 (most compatible). Feishu converts to opus at send time.
+        let out_path = tmp_dir.join(format!("rsclaw_tts_{ts}.mp3"));
         let out_path_str = out_path.to_string_lossy().to_string();
 
         let is_macos = cfg!(target_os = "macos");
@@ -682,9 +682,10 @@ impl AgentRuntime {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(anyhow!("tts: say failed: {stderr}"));
             }
-            // Convert aiff to ogg/opus via ffmpeg (feishu requires opus format).
+            // Convert aiff to mp3 via ffmpeg (most compatible format).
+            // Feishu converts to opus at send time.
             let ffmpeg = tokio::process::Command::new("ffmpeg")
-                .args(["-i", &aiff_str, "-y", "-c:a", "libopus", "-b:a", "48k", &out_path_str])
+                .args(["-i", &aiff_str, "-y", "-q:a", "4", &out_path_str])
                 .output()
                 .await;
             match ffmpeg {
@@ -692,24 +693,8 @@ impl AgentRuntime {
                     let _ = std::fs::remove_file(&aiff_path);
                 }
                 _ => {
-                    // Fallback: try mp3 then rename (better than nothing)
-                    let mp3_path = tmp_dir.join(format!("rsclaw_tts_{ts}.mp3"));
-                    let mp3_str = mp3_path.to_string_lossy().to_string();
-                    let ffmpeg_mp3 = tokio::process::Command::new("ffmpeg")
-                        .args(["-i", &aiff_str, "-y", &mp3_str])
-                        .output()
-                        .await;
-                    match ffmpeg_mp3 {
-                        Ok(o) if o.status.success() => {
-                            let _ = std::fs::remove_file(&aiff_path);
-                            let _ = std::fs::rename(&mp3_path, &out_path);
-                            tracing::warn!("tts: opus not available, using mp3 fallback");
-                        }
-                        _ => {
-                            tracing::warn!("tts: ffmpeg not available, using aiff");
-                            let _ = std::fs::rename(&aiff_path, &out_path);
-                        }
-                    }
+                    tracing::warn!("tts: ffmpeg not available, using aiff");
+                    let _ = std::fs::rename(&aiff_path, &out_path);
                 }
             }
         } else if is_windows {

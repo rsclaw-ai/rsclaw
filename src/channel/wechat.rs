@@ -1222,9 +1222,11 @@ impl Channel for WeChatPersonalChannel {
                 max_chars: 4096,
                 ..Default::default()
             };
-            let chunks = chunk_text(&msg.text, &chunk_cfg);
-            for chunk in &chunks {
-                self.send_text(&msg.target_id, chunk).await?;
+            if !msg.text.trim().is_empty() {
+                let chunks = chunk_text(&msg.text, &chunk_cfg);
+                for chunk in &chunks {
+                    self.send_text(&msg.target_id, chunk).await?;
+                }
             }
 
             // Upload and send each image

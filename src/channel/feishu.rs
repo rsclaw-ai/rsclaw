@@ -1375,8 +1375,39 @@ impl Channel for FeishuChannel {
                 // Feishu separates media (video/audio) from files (pdf/doc/xls).
                 let is_media = mime.starts_with("video/") || mime.starts_with("audio/");
 
+                // Feishu requires opus for audio. Convert mp3/wav/aiff to opus via ffmpeg.
+                let (bytes, filename) = if mime.starts_with("audio/") && !filename.ends_with(".ogg") && !filename.ends_with(".opus") {
+                    let tmp_opus = std::env::temp_dir().join(format!("feishu_opus_{}.ogg", chrono::Utc::now().timestamp_millis()));
+                    let tmp_opus_str = tmp_opus.to_string_lossy().to_string();
+                    // Write source audio to temp file for ffmpeg input.
+                    let tmp_src = std::env::temp_dir().join(format!("feishu_src_{}.{}", chrono::Utc::now().timestamp_millis(),
+                        if filename.contains('.') { filename.rsplit('.').next().unwrap_or("mp3") } else { "mp3" }));
+                    let _ = std::fs::write(&tmp_src, &bytes);
+                    let tmp_src_str = tmp_src.to_string_lossy().to_string();
+                    let result = std::process::Command::new("ffmpeg")
+                        .args(["-i", &tmp_src_str, "-y", "-c:a", "libopus", "-b:a", "48k", &tmp_opus_str])
+                        .output();
+                    let _ = std::fs::remove_file(&tmp_src);
+                    match result {
+                        Ok(o) if o.status.success() => {
+                            let opus_bytes = std::fs::read(&tmp_opus).unwrap_or(bytes);
+                            let _ = std::fs::remove_file(&tmp_opus);
+                            let opus_name = filename.rsplit_once('.').map(|(n, _)| format!("{n}.ogg")).unwrap_or_else(|| format!("{filename}.ogg"));
+                            info!("feishu: converted audio to opus for upload");
+                            (opus_bytes, opus_name)
+                        }
+                        _ => {
+                            warn!("feishu: ffmpeg opus conversion failed, uploading as-is");
+                            let _ = std::fs::remove_file(&tmp_opus);
+                            (bytes, filename.clone())
+                        }
+                    }
+                } else {
+                    (bytes, filename.clone())
+                };
+
                 let file_type = if is_media {
-                    // Feishu requires file_type "opus" for audio (not "mp3").
+                    // Feishu requires file_type "opus" for audio.
                     if mime.starts_with("video/") { "mp4" } else { "opus" }
                 } else if mime.contains("pdf") { "pdf" }
                     else if mime.contains("doc") { "doc" }
