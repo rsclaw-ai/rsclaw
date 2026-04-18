@@ -370,7 +370,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
     matches!(
         lower.as_str(),
         "/ls" | "/status" | "/version" | "/help" | "/?" | "/health" | "/uptime"
-            | "/model" | "/models" | "/cron" | "/clear" | "/abort" | "/sessions"
+            | "/model" | "/models" | "/cron" | "/clear" | "/new" | "/reset" | "/abort" | "/sessions"
     )
     // Commands with optional/required args
     || lower.starts_with("/ls ")
