@@ -3805,6 +3805,8 @@ impl AgentRuntime {
                                         else if lower.ends_with(".csv") { "text/csv" }
                                         else if lower.ends_with(".mp4") { "video/mp4" }
                                         else if lower.ends_with(".mp3") { "audio/mpeg" }
+                                        else if lower.ends_with(".ogg") { "audio/ogg" }
+                                        else if lower.ends_with(".opus") { "audio/opus" }
                                         else if lower.ends_with(".zip") { "application/zip" }
                                         else { "application/octet-stream" };
                                     let full_str = full.to_string_lossy().to_string();
