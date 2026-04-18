@@ -294,13 +294,14 @@ pub struct KeyEntity {
 
 /// Extract key entities from text using deterministic char-level scanning.
 ///
-/// Only handles high-precision structured patterns:
+/// Handles high-precision structured patterns:
 /// - Chinese mobile phone numbers (11-digit, starts with 1[3-9])
 /// - Chinese national ID cards (18-digit, last char may be X)
 /// - Email addresses
+/// - Chinese addresses (province/city/district/road/number patterns)
 ///
-/// Semantic entities (name, birthday, age, zodiac, lucky number, address,
-/// relationship) are handled by [`extract_entities_via_llm`] instead.
+/// Semantic entities (name, birthday, age, zodiac, lucky number,
+/// relationship) are extracted during compaction via the summary prompt.
 ///
 /// Returns one `KeyEntity` per detected value (deduped).
 pub(crate) fn extract_key_entities(text: &str) -> Vec<KeyEntity> {
@@ -395,6 +396,119 @@ pub(crate) fn extract_key_entities(text: &str) -> Vec<KeyEntity> {
             }
         }
         j += 1;
+    }
+
+    // Chinese address detection (inspired by github.com/pupuk/addr).
+    // Parses shipping-address style text: "收件人 电话 地址" in one pass.
+    // Also detects standalone addresses with province/city/district markers.
+    {
+        const ADDR_MARKERS: &[&str] = &[
+            "省", "市", "区", "县", "镇", "乡", "村",
+            "路", "街", "道", "巷", "弄",
+            "号", "栋", "楼", "层", "室", "单元",
+        ];
+        const ADDR_PREFIXES: &[&str] = &[
+            "北京", "上海", "天津", "重庆", "广东", "浙江", "江苏", "山东",
+            "河南", "河北", "湖北", "湖南", "四川", "福建", "安徽", "江西",
+            "辽宁", "吉林", "黑龙江", "陕西", "山西", "云南", "贵州", "广西",
+            "海南", "甘肃", "青海", "宁夏", "新疆", "西藏", "内蒙古",
+        ];
+        // Filter words commonly used as labels in address forms
+        const FILTER_WORDS: &[&str] = &[
+            "收货人", "收件人", "收货", "所在地区", "详细地址",
+            "地址", "邮编", "电话", "手机", "手机号", "手机号码",
+            "号码", "身份证号码", "身份证号", "身份证",
+        ];
+
+        for segment in text.split(|c: char| c == '\n' || c == '。') {
+            let mut seg = segment.trim().to_owned();
+            if seg.chars().count() < 5 || seg.chars().count() > 120 {
+                continue;
+            }
+
+            // Strip filter words (address form labels)
+            for fw in FILTER_WORDS {
+                seg = seg.replace(fw, " ");
+            }
+            // Normalize separators
+            for sep in &["：", ":", "；", ";", "，", ","] {
+                seg = seg.replace(sep, " ");
+            }
+            // Collapse whitespace
+            let parts: Vec<&str> = seg.split_whitespace().filter(|s| !s.is_empty()).collect();
+            let joined = parts.join(" ");
+
+            let marker_count = ADDR_MARKERS.iter().filter(|m| joined.contains(*m)).count();
+            let has_prefix = ADDR_PREFIXES.iter().any(|p| joined.contains(p));
+
+            if marker_count < 2 && !(marker_count >= 1 && has_prefix) {
+                continue;
+            }
+
+            // Found an address segment. Try to separate name/phone/address.
+            // Strategy (from pupuk/addr): shortest token is likely the name,
+            // 11-digit number is phone, rest is address.
+            let mut addr_phone = String::new();
+            let mut addr_name = String::new();
+            let mut addr_parts = Vec::new();
+
+            for part in &parts {
+                let is_digits = part.chars().all(|c| c.is_ascii_digit() || c == '-');
+                let digit_count = part.chars().filter(|c| c.is_ascii_digit()).count();
+                if is_digits && digit_count >= 7 {
+                    addr_phone = part.replace('-', "");
+                } else {
+                    addr_parts.push(*part);
+                }
+            }
+
+            // Shortest remaining part is likely the name (2-4 chars Chinese)
+            if addr_parts.len() >= 2 {
+                let min_idx = addr_parts.iter().enumerate()
+                    .min_by_key(|(_, p)| p.chars().count())
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                let candidate = addr_parts[min_idx];
+                // Name heuristic: 2-4 CJK chars, no address markers
+                let char_count = candidate.chars().count();
+                let has_marker = ADDR_MARKERS.iter().any(|m| candidate.contains(m));
+                if char_count >= 2 && char_count <= 4 && !has_marker {
+                    addr_name = candidate.to_owned();
+                    addr_parts.remove(min_idx);
+                }
+            }
+
+            let addr_text = addr_parts.join("");
+            if addr_text.is_empty() {
+                continue;
+            }
+
+            // Store as composite shipping address if we have name or phone
+            if (!addr_name.is_empty() || !addr_phone.is_empty()) && seen.insert(format!("addr:{addr_text}")) {
+                let mut full = String::new();
+                if !addr_name.is_empty() {
+                    full.push_str(&addr_name);
+                    full.push(' ');
+                }
+                if !addr_phone.is_empty() {
+                    full.push_str(&addr_phone);
+                    full.push(' ');
+                }
+                full.push_str(&addr_text);
+                entities.push(KeyEntity {
+                    kind: "address",
+                    memory_text: format!("用户收货地址: {full}"),
+                    value: full,
+                });
+            } else if seen.insert(format!("addr:{addr_text}")) {
+                // Standalone address without name/phone
+                entities.push(KeyEntity {
+                    kind: "address",
+                    memory_text: format!("用户地址: {addr_text}"),
+                    value: addr_text,
+                });
+            }
+        }
     }
 
     entities
