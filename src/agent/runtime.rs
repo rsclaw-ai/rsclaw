@@ -186,6 +186,8 @@ fn model_supports_vision(model: &str, config: &RuntimeConfig) -> bool {
         || lower.contains("qwen3")
         || lower.contains("doubao")
         || lower.contains("seed") // doubao-seed models
+        || lower.contains("gemma4") // Google Gemma 4 (vision-capable)
+        || lower.contains("gemma-4") // Google Gemma 4 variant
     // Known NON-vision models (deepseek-chat, deepseek-r1, qwen-turbo,
     // moonshot, minimax, etc.) return false by default.
 }
