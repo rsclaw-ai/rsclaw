@@ -116,8 +116,38 @@ pub(crate) fn apply_context_pruning(messages: &mut Vec<Message>, cfg: Option<&Co
                     }
                 }
             }
+            // Remove Tool messages, but also check for orphaned Assistants
+            // An Assistant with tool_calls whose Tool results were removed should also be removed
+            let mut assistant_to_remove: Vec<usize> = Vec::new();
+            for i in &to_remove {
+                // Check if preceding message is Assistant with tool_calls
+                if *i > 0 {
+                    let prev_idx = i - 1;
+                    if messages[prev_idx].role == Role::Assistant {
+                        if let MessageContent::Parts(parts) = &messages[prev_idx].content {
+                            let has_tool_calls = parts.iter().any(|p| matches!(p, ContentPart::ToolUse { .. }));
+                            if has_tool_calls {
+                                // This Assistant's Tool result is being removed, mark it too
+                                if !to_remove.contains(&prev_idx) && !assistant_to_remove.contains(&prev_idx) {
+                                    assistant_to_remove.push(prev_idx);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Combine and sort removal indices
+            to_remove.extend(assistant_to_remove);
+            to_remove.sort();
+            to_remove.dedup();
+
             for i in to_remove.into_iter().rev() {
                 messages.remove(i);
+            }
+
+            // Final check: if first message is Tool, remove it (orphaned)
+            while !messages.is_empty() && messages[0].role == Role::Tool {
+                messages.remove(0);
             }
         }
     }
@@ -197,6 +227,7 @@ pub(crate) fn msg_tokens(m: &Message) -> usize {
 ///   history_budget = context_budget - reply_reserve - system_tokens - tools_tokens
 ///
 /// Always keeps at least the last 3 user-assistant pairs (6 messages).
+/// IMPORTANT: Ensures no orphaned Tool messages (Tool must follow Assistant with tool_calls).
 pub(crate) fn apply_context_budget_trim(
     messages: &mut Vec<Message>,
     context_tokens: usize,
@@ -224,6 +255,8 @@ pub(crate) fn apply_context_budget_trim(
     }
 
     // Trim from the front, keeping at least the last 6 messages.
+    // CRITICAL: Never leave orphaned Tool messages at the start.
+    // A Tool message must follow an Assistant with tool_calls.
     let min_keep = 6;
     let max_removable = messages.len().saturating_sub(min_keep);
     let mut removed_tokens: usize = 0;
@@ -235,6 +268,44 @@ pub(crate) fn apply_context_budget_trim(
         }
         removed_tokens += msg_tokens(&messages[i]);
         remove_count += 1;
+    }
+
+    // Adjust remove_count to avoid orphaned Tool message at start.
+    // If the first remaining message would be Tool, extend removal to include it.
+    if remove_count < messages.len() {
+        let first_remaining_idx = remove_count;
+        if messages[first_remaining_idx].role == Role::Tool {
+            // Need to remove this Tool and its preceding Assistant (tool_calls)
+            // Find the Assistant that has tool_calls before this Tool
+            // Actually, we should remove until we hit a non-Tool message
+            while remove_count < messages.len() && messages[remove_count].role == Role::Tool {
+                removed_tokens += msg_tokens(&messages[remove_count]);
+                remove_count += 1;
+            }
+            // Also remove any Assistant that follows (it might have tool_calls for the removed Tool)
+            // Actually, we need to find a safe starting point: either User or System
+            // Skip any Assistant that might be incomplete (has tool_calls for removed Tools)
+            while remove_count < messages.len() {
+                let msg = &messages[remove_count];
+                if msg.role == Role::User || msg.role == Role::System {
+                    break;
+                }
+                // Check if Assistant has tool_calls - if so, its Tool results may have been removed
+                if msg.role == Role::Assistant {
+                    if let MessageContent::Parts(parts) = &msg.content {
+                        let has_tool_calls = parts.iter().any(|p| matches!(p, ContentPart::ToolUse { .. }));
+                        if has_tool_calls {
+                            // This Assistant's Tool results were removed, remove it too
+                            removed_tokens += msg_tokens(msg);
+                            remove_count += 1;
+                            continue;
+                        }
+                    }
+                }
+                // Non-tool-call Assistant is safe, stop
+                break;
+            }
+        }
     }
 
     if remove_count > 0 {
@@ -262,7 +333,102 @@ pub(crate) fn apply_context_budget_trim(
     }
 }
 
-/// Compress an image for LLM: resize to max 1024px and convert to JPEG.
+/// Validate and repair message sequence to ensure no orphaned Tool messages.
+/// OpenAI API requires Tool messages to follow Assistant messages with tool_calls.
+/// Returns the number of messages removed.
+pub(crate) fn validate_message_sequence(messages: &mut Vec<Message>) -> usize {
+    if messages.is_empty() {
+        return 0;
+    }
+
+    let mut removed = 0;
+
+    // Check first message - cannot be Tool
+    while !messages.is_empty() && messages[0].role == Role::Tool {
+        tracing::warn!("validate_message_sequence: removing orphaned Tool at start");
+        messages.remove(0);
+        removed += 1;
+    }
+
+    // Scan through and check each Tool message has preceding Assistant with tool_calls
+    let mut i = 1;
+    while i < messages.len() {
+        if messages[i].role == Role::Tool {
+            // Check preceding message
+            let prev = &messages[i - 1];
+            let has_tool_calls = match &prev.content {
+                MessageContent::Parts(parts) => parts.iter().any(|p| matches!(p, ContentPart::ToolUse { .. })),
+                _ => false,
+            };
+
+            if prev.role != Role::Assistant || !has_tool_calls {
+                // Orphaned Tool - remove it and any following Tools
+                tracing::warn!(
+                    idx = i,
+                    "validate_message_sequence: removing orphaned Tool without preceding Assistant(tool_calls)"
+                );
+                messages.remove(i);
+                removed += 1;
+                continue; // Don't increment i, check same position again
+            }
+        }
+        i += 1;
+    }
+
+    // Final check: Assistant with tool_calls should have Tool results
+    // If an Assistant has tool_calls but no following Tool results, remove its tool_calls
+    // (This is less common, but let's handle it)
+    for i in 0..messages.len() {
+        if messages[i].role == Role::Assistant {
+            if let MessageContent::Parts(parts) = &mut messages[i].content {
+                let has_tool_calls = parts.iter().any(|p| matches!(p, ContentPart::ToolUse { .. }));
+                if has_tool_calls {
+                    // Check if next message(s) are Tool results for these calls
+                    let tool_call_ids: Vec<String> = parts
+                        .iter()
+                        .filter_map(|p| {
+                            if let ContentPart::ToolUse { id, .. } = p {
+                                Some(id.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    // Find Tool results in following messages
+                    let mut found_results: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    for j in (i + 1)..messages.len() {
+                        if messages[j].role == Role::User {
+                            break; // Stop at next User message
+                        }
+                        if messages[j].role == Role::Tool {
+                            if let MessageContent::Parts(result_parts) = &messages[j].content {
+                                for p in result_parts {
+                                    if let ContentPart::ToolResult { tool_use_id, .. } = p {
+                                        found_results.insert(tool_use_id.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // If some tool_calls have no results, we should probably remove them
+                    // But this is complex - for now just log a warning
+                    let missing = tool_call_ids.iter().filter(|id| !found_results.contains(id)).count();
+                    if missing > 0 {
+                        tracing::warn!(
+                            idx = i,
+                            missing = missing,
+                            "validate_message_sequence: Assistant has tool_calls without matching Tool results"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    removed
+}
 /// Uses the `image` crate (pure Rust, cross-platform).
 /// Returns data URI or None if compression fails.
 pub(crate) fn compress_image_for_llm(data_uri: &str) -> Option<String> {

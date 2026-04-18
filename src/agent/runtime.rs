@@ -2762,7 +2762,18 @@ impl AgentRuntime {
                     }
                 }
 
-                repair_result.messages
+                // Final validation: ensure no orphaned Tool messages at start
+                // This catches cases missed by repair_tool_result_pairing.
+                let mut messages = repair_result.messages;
+                let removed = crate::agent::context_mgr::validate_message_sequence(&mut messages);
+                if removed > 0 {
+                    tracing::warn!(
+                        removed = removed,
+                        "turn: removed {} orphaned Tool messages during final validation"
+                    );
+                }
+
+                messages
             };
 
             // Resolve thinking budget from agent config or defaults.
