@@ -54,7 +54,7 @@
       "providerShortName": null,
       "signingIdentity": null
     },
-    "resources": ["icons/icon.png"],
+    "resources": ["icons/icon.png", "icons/icon-tray.png", "icons/icon-tray@2x.png"],
     "shortDescription": "RsClaw AI Automation Manager",
     "targets": "all",
     "windows": {
