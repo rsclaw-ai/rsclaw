@@ -354,12 +354,13 @@ pub(crate) fn build_tool_list(
         name: "web_browser".to_owned(),
         description: "Control a web browser. Core workflow:\n\
             1. `open` — navigate to a URL\n\
-            2. `snapshot` — get page content with interactive element refs (@e1, @e2...)\n\
-            3. `click` ref=@e1 / `fill` ref=@e2 text='...' — interact using refs from snapshot\n\
+            2. `snapshot` — get page structure with interactive element refs (@e1, @e2...). Use `interactive: true` to only get actionable elements (saves tokens).\n\
+            3. `click` ref=@e1 / `fill` ref=@e2 text='...' — interact using refs\n\
             4. Re-snapshot after any page change to get updated refs\n\
-            Quick search: `search` — auto-find search box on ANY site, fill text, submit, return results. Use this for site-specific searches (Douyin, Taobao, JD, etc.).\n\
+            Interaction: hover (triggers menus/tooltips), dblclick, drag (from=@e1 to=@e2, for sliders), focus, scrollintoview.\n\
+            Quick search: `search` — auto-find search box on ANY site, fill text, submit, return results.\n\
             `clickAt` ref=@e1 or x=100 y=200 — real mouse click via CDP (for file dialogs, anti-bot sites).\n\
-            Other actions: type, select, check, scroll, screenshot, pdf, press, back, forward, reload, wait, evaluate, cookies, get_text, get_url, get_title, find, get_article, upload, new_tab, switch_tab, close_tab.\n\
+            Other: type, select, check, scroll, screenshot, pdf, press, back, forward, reload, wait, evaluate, cookies, get_text, get_url, get_title, find, get_article, upload, new_tab, switch_tab, close_tab.\n\
             IMPORTANT: Always snapshot BEFORE clicking/filling. Element refs change after page updates.".to_owned(),
         parameters: json!({
             "type": "object",
@@ -367,6 +368,7 @@ pub(crate) fn build_tool_list(
                 "action":     {"type": "string", "enum": [
                     "open", "navigate", "snapshot", "click", "clickAt", "fill", "type",
                     "select", "check", "uncheck", "scroll", "screenshot", "pdf",
+                    "hover", "dblclick", "drag", "focus", "scrollintoview",
                     "back", "forward", "reload", "get_text", "get_url", "get_title",
                     "wait", "evaluate", "cookies", "press", "set_viewport",
                     "dialog", "state", "network", "new_tab", "list_tabs",
@@ -375,7 +377,10 @@ pub(crate) fn build_tool_list(
                     "search"
                 ]},
                 "url":        {"type": "string", "description": "URL for open/navigate"},
+                "interactive":{"type": "boolean", "description": "For snapshot: only return actionable elements (saves ~80% tokens). Default: false"},
                 "ref":        {"type": "string", "description": "Element ref like @e3 from snapshot"},
+                "from":       {"type": "string", "description": "Source element ref for drag"},
+                "to":         {"type": "string", "description": "Target element ref for drag"},
                 "x":          {"type": "number", "description": "X pixel coordinate for clickAt"},
                 "y":          {"type": "number", "description": "Y pixel coordinate for clickAt"},
                 "text":       {"type": "string", "description": "Text for fill/type/click-by-text/clipboard/dialog"},
