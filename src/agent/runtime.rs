@@ -3566,8 +3566,11 @@ impl AgentRuntime {
             }
 
             // Push assistant message with tool_calls as Parts.
+            // Intermediate text (e.g. "好的，我来帮你搜索") is NOT saved to session —
+            // it's already sent to the user above but pollutes context quality.
             let mut parts: Vec<crate::provider::ContentPart> = Vec::new();
-            if !text_buf.is_empty() {
+            if !text_buf.is_empty() && tool_calls.is_empty() {
+                // Only save text if there are no tool calls (final reply).
                 parts.push(crate::provider::ContentPart::Text { text: text_buf });
             }
             for (id, name, input) in &tool_calls {

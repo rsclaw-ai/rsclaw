@@ -706,23 +706,22 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
     let model_lower = req.model.to_lowercase();
     let is_minimax = model_lower.contains("minimax");
 
-    match req.thinking_budget {
-        Some(budget) if budget > 0 => {
-            body["enable_thinking"] = json!(true);
-            body["thinking_budget"] = json!(budget);
-            body["chat_template_kwargs"] = json!({"enable_thinking": true});
-        }
-        _ => {
-            // Disable thinking for models that support it (DashScope, llama.cpp).
-            body["enable_thinking"] = json!(false);
-            body["chat_template_kwargs"] = json!({"enable_thinking": false});
-        }
-    }
-
-    // MiniMax: always split reasoning into reasoning_content field so <think>
-    // tags don't leak into content. Works regardless of thinking_budget.
+    // MiniMax does not support thinking/reasoning params — skip entirely.
     if is_minimax {
         body["reasoning_split"] = json!(true);
+    } else {
+        match req.thinking_budget {
+            Some(budget) if budget > 0 => {
+                body["enable_thinking"] = json!(true);
+                body["thinking_budget"] = json!(budget);
+                body["chat_template_kwargs"] = json!({"enable_thinking": true});
+            }
+            _ => {
+                // Disable thinking for models that support it (DashScope, llama.cpp).
+                body["enable_thinking"] = json!(false);
+                body["chat_template_kwargs"] = json!({"enable_thinking": false});
+            }
+        }
     }
 
     if let Some(sys) = &req.system {
@@ -766,6 +765,9 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
     // sort tool_call arguments keys for bit-perfect prefix matching across turns.
     if let Some(msgs) = body["messages"].as_array_mut() {
         normalize_messages_for_cache(msgs);
+        // Fix orphaned tool_calls/tool_results: some providers (MiniMax) require
+        // strict assistant(tool_calls) → tool(result) pairing with no gaps.
+        fix_tool_call_pairing(msgs);
     }
 
     Ok(body)
@@ -795,6 +797,67 @@ fn normalize_messages_for_cache(messages: &mut [Value]) {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Fix tool_call / tool_result pairing issues.
+///
+/// Some providers (MiniMax error 2013) require that every `role: tool` message
+/// immediately follows an `assistant` message containing the matching `tool_calls`,
+/// and vice versa. After compaction or session manipulation, orphaned entries
+/// can appear. This function removes them.
+fn fix_tool_call_pairing(messages: &mut Vec<Value>) {
+    // Collect all tool_call_ids from assistant messages
+    let mut valid_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for msg in messages.iter() {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                for tc in tcs {
+                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                        valid_call_ids.insert(id.to_owned());
+                    }
+                }
+            }
+        }
+    }
+
+    // Collect all tool_call_ids that have a matching tool result
+    let mut result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for msg in messages.iter() {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("tool") {
+            if let Some(id) = msg.get("tool_call_id").and_then(|v| v.as_str()) {
+                result_ids.insert(id.to_owned());
+            }
+        }
+    }
+
+    // Remove orphaned tool results (no matching tool_call)
+    messages.retain(|msg| {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("tool") {
+            if let Some(id) = msg.get("tool_call_id").and_then(|v| v.as_str()) {
+                return valid_call_ids.contains(id);
+            }
+        }
+        true
+    });
+
+    // Remove tool_calls from assistant messages where results are missing
+    for msg in messages.iter_mut() {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()).cloned() {
+                let filtered: Vec<Value> = tcs.into_iter().filter(|tc| {
+                    tc.get("id").and_then(|v| v.as_str())
+                        .map(|id| result_ids.contains(id))
+                        .unwrap_or(true)
+                }).collect();
+                if filtered.is_empty() {
+                    // No tool_calls left — remove the field entirely
+                    msg.as_object_mut().map(|m| m.remove("tool_calls"));
+                } else if filtered.len() != msg["tool_calls"].as_array().map(|a| a.len()).unwrap_or(0) {
+                    msg["tool_calls"] = json!(filtered);
                 }
             }
         }
