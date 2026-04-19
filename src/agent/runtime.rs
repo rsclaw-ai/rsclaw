@@ -3019,6 +3019,15 @@ impl AgentRuntime {
             // Apply legacy context pruning (hard clear / soft trim) as fallback.
             if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
                 apply_context_pruning(sess, pruning_cfg.as_ref());
+                // Validate after pruning to clean any orphaned Tool messages
+                let removed = crate::agent::context_mgr::validate_message_sequence(sess);
+                if removed > 0 {
+                    tracing::info!(
+                        session = %ctx.session_key,
+                        removed,
+                        "context pruning: cleaned orphaned messages"
+                    );
+                }
             }
 
             // Apply context-budget-aware trimming: trim oldest messages so the
@@ -3026,6 +3035,16 @@ impl AgentRuntime {
             // for the system prompt, tools, and reply generation.
             if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
                 apply_context_budget_trim(sess, context_tokens, &system_prompt, &tools);
+                // Immediately validate after trim to clean orphaned Tool messages
+                // (trimming may produce incomplete Assistant-Tool pairs)
+                let removed = crate::agent::context_mgr::validate_message_sequence(sess);
+                if removed > 0 {
+                    tracing::info!(
+                        session = %ctx.session_key,
+                        removed,
+                        "context trim: cleaned orphaned messages"
+                    );
+                }
             }
 
             // Build API copy of messages — clone from session, then inject
@@ -3114,9 +3133,9 @@ impl AgentRuntime {
                 let mut messages = repair_result.messages;
                 let removed = crate::agent::context_mgr::validate_message_sequence(&mut messages);
                 if removed > 0 {
-                    tracing::warn!(
+                    tracing::debug!(
                         removed = removed,
-                        "turn: removed {removed} orphaned Tool messages during final validation"
+                        "turn: removed orphaned Tool messages during final validation"
                     );
                 }
 

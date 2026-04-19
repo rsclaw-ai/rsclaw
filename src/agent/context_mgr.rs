@@ -377,7 +377,7 @@ pub(crate) fn validate_message_sequence(messages: &mut Vec<Message>) -> usize {
     // Check first message - cannot be Tool
     let orphaned_at_start = messages.iter().take_while(|m| m.role == Role::Tool).count();
     if orphaned_at_start > 0 {
-        tracing::warn!(
+        tracing::debug!(
             count = orphaned_at_start,
             "validate_message_sequence: removing orphaned Tool messages at start"
         );
@@ -403,7 +403,7 @@ pub(crate) fn validate_message_sequence(messages: &mut Vec<Message>) -> usize {
 
     // Remove orphaned Tools in reverse order (batch removal, one log per segment)
     if !orphaned_tools.is_empty() {
-        tracing::warn!(
+        tracing::debug!(
             count = orphaned_tools.len(),
             first_idx = orphaned_tools.first().unwrap_or(&0),
             last_idx = orphaned_tools.last().unwrap_or(&0),
@@ -457,7 +457,7 @@ pub(crate) fn validate_message_sequence(messages: &mut Vec<Message>) -> usize {
                     // Check if any tool_calls are missing results
                     let missing_count = tool_call_ids.iter().filter(|id| !found_results.contains(id.as_str())).count();
                     if missing_count > 0 {
-                        tracing::warn!(
+                        tracing::debug!(
                             idx = i,
                             missing = missing_count,
                             total_tool_calls = tool_call_ids.len(),
@@ -478,7 +478,7 @@ pub(crate) fn validate_message_sequence(messages: &mut Vec<Message>) -> usize {
 
     // After removing Assistants, check again for orphaned Tools at start
     while !messages.is_empty() && messages[0].role == Role::Tool {
-        tracing::warn!("validate_message_sequence: removing orphaned Tool at start (post-Assistant removal)");
+        tracing::debug!("validate_message_sequence: removing orphaned Tool at start (post-Assistant removal)");
         messages.remove(0);
         removed += 1;
     }
