@@ -239,8 +239,11 @@ impl LoopDetector {
                 tool_name: tool_name.to_owned(),
                 count: 1,
                 message: format!(
-                    "CRITICAL: command `{tool_name}` previously returned `_failed: true`. \
-                    Retrying the same command is blocked. Use a different approach or inform the user."
+                    "Command blocked: `{tool_name}` previously returned `_failed: true`. \
+                    This indicates a permanent failure (e.g., exit_code != 0). \
+                    Retrying the same command is NOT allowed.\n\n\
+                    **Action required**: Use a different approach or inform the user about the failure. \
+                    If this is a script/CLI error, check the error message and fix the underlying issue."
                 ),
             };
         }

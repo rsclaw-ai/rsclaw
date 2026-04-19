@@ -64,7 +64,7 @@ use super::prompt_builder::{
 use super::security::check_read_safety;
 use super::tools_builder::{build_tool_list, toolset_allowed_names};
 use super::{
-    loop_detection::LoopDetector,
+    loop_detection::{LoopCheckResult, LoopDetector},
     memory::{MemoryDoc, MemoryStore},
     registry::{AgentHandle, AgentMessage, AgentRegistry, AgentReply},
     tool_call_repair::repair_tool_result_pairing,
@@ -3289,6 +3289,8 @@ impl AgentRuntime {
             // Track loop detection warnings per tool call id (to inject into result)
             let mut loop_warnings: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
+            // Track blocked tool calls (failed_commands) that should return error to LLM
+            let mut blocked_tool_results: Vec<(String, String)> = Vec::new();
             // Streaming throttle: batch small deltas to reduce channel update rate.
             let mut delta_buf = String::new();
             let mut last_delta_flush = std::time::Instant::now();
@@ -3359,17 +3361,26 @@ impl AgentRuntime {
                             // New tool call with both id and name — start fresh entry.
                             // Use check_with_params which hashes the full input (OpenClaw-compatible).
                             // This ensures different arguments count as different calls.
-                            if let Some(warning_msg) = ctx
-                                .loop_detector
-                                .check_with_params(&name, &input)
-                                .to_result()?
-                            {
-                                tracing::warn!(tool = %name, params = ?input, "{}", warning_msg);
-                                // Store warning to inject into tool result (so LLM sees it)
-                                loop_warnings.insert(id.clone(), warning_msg);
-                                ctx.loop_warning_triggered = true;
+                            let loop_result = ctx.loop_detector.check_with_params(&name, &input);
+                            match loop_result {
+                                LoopCheckResult::Ok => {
+                                    tool_calls.push((id, name, input));
+                                }
+                                LoopCheckResult::Warning { message, .. } => {
+                                    tracing::warn!(tool = %name, params = ?input, "{}", message);
+                                    // Store warning to inject into tool result (so LLM sees it)
+                                    loop_warnings.insert(id.clone(), message);
+                                    ctx.loop_warning_triggered = true;
+                                    tool_calls.push((id, name, input));
+                                }
+                                LoopCheckResult::Critical { message, .. } => {
+                                    // For failed_commands: return error result to LLM instead of aborting turn
+                                    // This gives LLM a chance to try a different approach
+                                    tracing::warn!(tool = %name, params = ?input, "Critical loop detected, returning error to LLM: {}", message);
+                                    // Add a synthetic tool result telling LLM the command was blocked
+                                    blocked_tool_results.push((id.clone(), message));
+                                }
                             }
-                            tool_calls.push((id, name, input));
                         } else if !id.is_empty() && name.is_empty() {
                             // Streaming tool call: first chunk has id but no name yet
                             tool_calls.push((
@@ -3805,6 +3816,38 @@ impl AgentRuntime {
                     pending_analysis: None,
                     was_preparse: false,
                 });
+            }
+
+            // First, handle blocked tool calls (failed_commands) that were detected during streaming.
+            // These are commands that previously failed (_failed: true) and should not be retried.
+            // We return an error result to the LLM so it can try a different approach.
+            for (tool_id, message) in blocked_tool_results {
+                let tool_msg = Message {
+                    role: Role::Tool,
+                    content: MessageContent::Parts(vec![
+                        crate::provider::ContentPart::ToolResult {
+                            tool_use_id: tool_id.clone(),
+                            content: serde_json::to_string(&serde_json::json!({
+                                "error": "Command blocked - previously failed",
+                                "_blocked": true,
+                                "_hint": message,
+                                "_suggestion": "This command was blocked because it previously returned _failed: true. \
+                                                Try a different approach: modify the command parameters, \
+                                                check for syntax errors, or inform the user about the underlying issue."
+                            })).unwrap_or_default(),
+                            is_error: Some(true),
+                        },
+                    ]),
+                };
+                let _ = self.store.db.append_message(
+                    &ctx.session_key,
+                    &serde_json::to_value(&tool_msg).unwrap_or_default(),
+                );
+                if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
+                    sess.push(tool_msg);
+                }
+                // Also record as result for loop detection
+                ctx.loop_detector.record_result(&serde_json::json!({"_blocked": true, "tool_id": tool_id}));
             }
 
             // Execute each tool and push results.
