@@ -185,6 +185,21 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     let plugins = Arc::new(plugin_registry);
 
+    // 7.5 Load WASM plugins from the same plugins directory.
+    let wasm_browser: Arc<tokio::sync::Mutex<Option<crate::browser::BrowserSession>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let wasm_plugins = crate::plugin::load_wasm_plugins(&plugins_dir, Arc::clone(&wasm_browser))
+        .await
+        .unwrap_or_else(|e| {
+            warn!("WASM plugin load error: {e:#}");
+            Vec::new()
+        });
+    if !wasm_plugins.is_empty() {
+        info!("{} WASM plugin(s) loaded: {}", wasm_plugins.len(),
+              wasm_plugins.iter().map(|p| format!("{}({}t)", p.name, p.tools.len())).collect::<Vec<_>>().join(", "));
+    }
+    let wasm_plugins = Arc::new(wasm_plugins);
+
     // Create the SSE broadcast channel once so agents and the HTTP server
     // share the same sender.
     let (event_tx, _) = broadcast::channel::<crate::events::AgentEvent>(1024);
@@ -222,6 +237,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Some(Arc::clone(&plugins)),
         Some(Arc::clone(&mcp_registry)),
         Some(notification_tx.clone()),
+        Arc::clone(&wasm_plugins),
     );
 
     // Set i18n default language from gateway config.
@@ -469,6 +485,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         custom_webhooks: Arc::clone(&custom_webhooks),
         cron_reload: cron_reload_tx,
         notification_tx: notification_tx.clone(),
+        wasm_plugins: Arc::clone(&wasm_plugins),
     };
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
 
@@ -571,6 +588,7 @@ fn spawn_agent_tasks(
     plugins: Option<Arc<crate::plugin::PluginRegistry>>,
     mcp: Option<Arc<crate::mcp::McpRegistry>>,
     notification_tx: Option<broadcast::Sender<crate::channel::OutboundMessage>>,
+    wasm_plugins: Arc<Vec<crate::plugin::WasmPlugin>>,
 ) {
     for (agent_id, mut rx) in receivers {
         let handle = match registry.get(&agent_id) {
@@ -612,6 +630,9 @@ fn spawn_agent_tasks(
             mcp.clone(),
             notification_tx.clone(),
         );
+
+        // Inject WASM plugins into the agent runtime.
+        runtime.wasm_plugins = Arc::clone(&wasm_plugins);
 
         let event_tx_task = event_tx.clone();
         tokio::spawn(async move {

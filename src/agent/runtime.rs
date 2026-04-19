@@ -243,6 +243,8 @@ pub struct AgentRuntime {
     pub plugins: Option<Arc<PluginRegistry>>,
     /// MCP server registry — None when no MCP servers are configured.
     pub mcp: Option<Arc<crate::mcp::McpRegistry>>,
+    /// WASM plugin instances for tool dispatch (shared across agents).
+    pub wasm_plugins: Arc<Vec<crate::plugin::WasmPlugin>>,
     /// CDP browser session -- lazy-initialized on first web_browser tool call.
     /// Stored as Option so it can be dropped (killing Chrome) when idle expires.
     pub(crate) browser: Arc<tokio::sync::Mutex<Option<crate::browser::BrowserSession>>>,
@@ -344,6 +346,7 @@ impl AgentRuntime {
             spawner,
             plugins,
             mcp,
+            wasm_plugins: Arc::new(Vec::new()),
             live_status,
             browser: Arc::new(tokio::sync::Mutex::new(None)),
             sessions: std::collections::HashMap::new(),

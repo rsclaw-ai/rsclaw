@@ -1,0 +1,34 @@
+package rsclaw:jimeng;
+
+interface host-browser {
+    browser-open: func(url: string) -> result<string, string>;
+    browser-snapshot: func() -> result<string, string>;
+    browser-click: func(ref-str: string) -> result<string, string>;
+    browser-click-at: func(x: u32, y: u32) -> result<string, string>;
+    browser-fill: func(ref-str: string, text: string) -> result<string, string>;
+    browser-press: func(key: string) -> result<string, string>;
+    browser-scroll: func(direction: string, amount: u32) -> result<string, string>;
+    browser-eval: func(code: string) -> result<string, string>;
+    browser-wait-text: func(text: string, timeout-ms: u32) -> result<string, string>;
+    browser-screenshot: func() -> result<string, string>;
+    browser-download: func(ref-str: string, filename: string) -> result<string, string>;
+    browser-upload: func(ref-str: string, filepath: string) -> result<string, string>;
+    browser-get-url: func() -> result<string, string>;
+}
+
+interface host-runtime {
+    log: func(level: string, msg: string);
+    sleep: func(ms: u32);
+    read-file: func(path: string) -> result<string, string>;
+}
+
+interface plugin-api {
+    get-manifest: func() -> string;
+    handle-tool: func(tool-name: string, args-json: string) -> result<string, string>;
+}
+
+world jimeng-plugin {
+    import host-browser;
+    import host-runtime;
+    export plugin-api;
+}

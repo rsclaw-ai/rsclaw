@@ -13,6 +13,7 @@
 pub mod manifest;
 pub mod shell_bridge;
 pub mod slots;
+pub mod wasm_runtime;
 
 use std::collections::HashMap;
 
@@ -20,6 +21,7 @@ use anyhow::Result;
 pub use manifest::{MANIFEST_FILE, PluginManifest, PluginToolDef, load_manifest, scan_plugins};
 pub use shell_bridge::Plugin;
 pub use slots::{ContextEngineSlot, MemoryItem, MemorySlot, MemoryStoreSlot, SlotRegistry};
+pub use wasm_runtime::{WasmPlugin, WasmToolDef, load_wasm_plugins, scan_wasm_plugins};
 use tracing::{info, warn};
 
 use crate::config::schema::PluginsConfig;
