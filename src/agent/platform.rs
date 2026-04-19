@@ -328,6 +328,7 @@ pub(crate) fn win_map_single_key(key: &str) -> String {
 }
 
 /// Match user text against installed skills by keyword overlap.
+#[allow(dead_code)]
 pub(crate) fn match_skills<'a>(
     text: &str,
     skills: &'a crate::skill::SkillRegistry,

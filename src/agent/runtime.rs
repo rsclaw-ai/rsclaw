@@ -61,7 +61,6 @@ use super::context_mgr::{
     apply_context_budget_trim, apply_context_pruning, build_clear_summary,
     compress_image_for_llm, msg_tokens,
 };
-use super::platform::match_skills;
 use super::prompt_builder::{
     build_help_text_filtered, build_system_prompt, format_duration,
     memory_age_label, READONLY_COMMANDS,
@@ -4792,6 +4791,7 @@ fn write_config_value(dot_path: &str, value: serde_json::Value) -> anyhow::Resul
 /// Documents appearing in both lists get a higher combined score.
 /// Documents only in one list still contribute their single-list score.
 /// Returns the top `top_k` results as `MemoryDoc`s.
+#[allow(dead_code)]
 fn rrf_fuse(
     vec_hits: Vec<crate::agent::memory::MemoryDoc>,
     bm25_hits: Vec<crate::store::search::IndexDoc>,

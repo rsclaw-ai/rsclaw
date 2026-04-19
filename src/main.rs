@@ -1,3 +1,4 @@
+#![allow(clippy::all, unused)]
 //! rsclaw — AI Automation Manager Compatible with OpenClaw
 //!
 //! Architecture reference: AGENTS.md

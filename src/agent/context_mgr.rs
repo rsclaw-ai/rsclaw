@@ -594,6 +594,7 @@ pub(crate) async fn write_entity_memories(
 ///
 /// Uses a single user message, no system prompt, no tools, temperature=0.
 /// Returns `Vec<KeyEntity>` parsed from the LLM's JSON array response.
+#[allow(dead_code)]
 pub(crate) async fn extract_entities_via_llm(
     text: &str,
     model: &str,
@@ -661,6 +662,7 @@ pub(crate) async fn extract_entities_via_llm(
 }
 
 /// Parse the JSON array returned by the entity extraction LLM.
+#[allow(dead_code)]
 fn parse_llm_entities(raw: &str) -> Vec<KeyEntity> {
     // Find the JSON array boundaries — LLM may wrap in markdown fences.
     let start = match raw.find('[') {
@@ -904,6 +906,7 @@ pub(crate) fn compress_tool_results(messages: &mut Vec<Message>, preserve_tail: 
 }
 
 /// Build a text description for a generic file attachment.
+#[allow(dead_code)]
 pub(crate) fn describe_file(filename: &str, mime_type: &str) -> String {
     if mime_type.starts_with("audio/") {
         format!("[音频: {filename}]")

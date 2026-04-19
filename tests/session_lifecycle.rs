@@ -37,6 +37,7 @@ fn put_and_get_session_meta_roundtrip() {
         message_count: 7,
         last_active: 1_700_000_100,
         created_at: 1_700_000_000,
+        generation: 0,
     };
 
     store
@@ -64,6 +65,7 @@ fn put_session_appears_in_list() {
             message_count: 0,
             last_active: 0,
             created_at: 0,
+            generation: 0,
         };
         store.put_session_meta(k, &meta).expect("put");
     }

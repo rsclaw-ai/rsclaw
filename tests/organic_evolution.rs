@@ -112,7 +112,7 @@ fn slugify_empty() {
 // Crystallizer: find_cluster requires MIN_CLUSTER_SIZE (3)
 // ---------------------------------------------------------------------------
 
-use rsclaw::skill::crystallizer::{find_cluster, build_distill_prompt, write_skill};
+use rsclaw::skill::crystallizer::{build_distill_prompt, write_skill};
 
 #[test]
 fn build_distill_prompt_contains_cluster_texts() {

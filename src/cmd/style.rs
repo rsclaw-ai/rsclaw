@@ -1,6 +1,5 @@
 /// ANSI styling helpers for CLI output.
 /// Respects `NO_COLOR` env var and `--no-color` flag.
-
 pub fn use_color() -> bool {
     std::env::var("NO_COLOR").is_err()
 }

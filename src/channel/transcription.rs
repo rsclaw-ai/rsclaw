@@ -1219,6 +1219,7 @@ pub fn encode_audio_to_ogg_opus(audio_bytes: &[u8], file_ext: Option<&str>) -> R
 }
 
 /// Decode audio to mono f32 PCM at a specific target sample rate.
+#[allow(dead_code)]
 fn decode_audio_to_pcm_at_rate(
     audio_bytes: &[u8],
     file_ext: Option<&str>,
@@ -1251,6 +1252,7 @@ fn decode_audio_to_pcm_at_rate(
 }
 
 /// Linear interpolation resampling.
+#[allow(dead_code)]
 fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if from_rate == to_rate || from_rate == 0 || samples.is_empty() {
         return samples.to_vec();
@@ -1275,6 +1277,7 @@ fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 }
 
 /// Symphonia decode returning (mono f32 samples, original sample rate).
+#[allow(dead_code)]
 fn decode_audio_symphonia_raw(audio_bytes: &[u8], ext_hint: Option<&str>) -> Result<(Vec<f32>, u32)> {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::codecs::DecoderOptions;
@@ -1329,6 +1332,7 @@ fn decode_audio_symphonia_raw(audio_bytes: &[u8], ext_hint: Option<&str>) -> Res
 }
 
 /// ffmpeg decode to f32 PCM at a specific sample rate.
+#[allow(dead_code)]
 fn decode_audio_ffmpeg_at_rate(audio_bytes: &[u8], ext: &str, target_rate: u32) -> Result<Vec<f32>> {
     let tmp_in = std::env::temp_dir().join(format!("rsclaw_in_{}.{ext}", chrono::Utc::now().timestamp_millis()));
     let tmp_out = std::env::temp_dir().join(format!("rsclaw_out_{}.pcm", chrono::Utc::now().timestamp_millis()));

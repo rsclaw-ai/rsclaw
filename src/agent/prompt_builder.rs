@@ -154,6 +154,7 @@ pub(crate) fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
 ///
 /// When `kv_cache_mode >= 1`, this is injected per-turn into the user
 /// message instead of the system prompt, to preserve KV cache prefix stability.
+#[allow(dead_code)]
 pub(crate) fn build_date_context() -> String {
     let now = chrono::Local::now();
     use chrono::Datelike;
