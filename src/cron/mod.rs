@@ -670,9 +670,26 @@ impl CronRunner {
                 handles.push(handle);
             }
 
-            // Wait for all jobs to complete and update state
-            for handle in handles {
-                if let Ok((job_id, success, duration_ms, started_at, error_msg)) = handle.await {
+            // Wait for all jobs to complete and update state.
+            // Use select to also listen for reload signals, so deletions
+            // are not delayed until all running jobs finish.
+            let all_handles = futures::future::join_all(handles);
+            let results = tokio::select! {
+                r = all_handles => r,
+                _ = reload_rx.recv() => {
+                    // Reload triggered while jobs are running — apply immediately
+                    info!("cron: reload signal during job execution, reloading now");
+                    let new_jobs = crate::cron::load_cron_jobs();
+                    let now_ms = current_timestamp_ms();
+                    jobs = self.merge_jobs(&jobs, new_jobs, now_ms);
+                    if let Err(e) = self.save_store(&jobs).await {
+                        warn!(err = %e, "cron: failed to save store after mid-execution reload");
+                    }
+                    continue; // back to top of loop, running tasks finish on their own
+                }
+            };
+            for result in results {
+                if let Ok((job_id, success, duration_ms, started_at, error_msg)) = result {
                     if let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) {
                         if let Some(state) = job.state.as_mut() {
                             state.running_at_ms = None;
