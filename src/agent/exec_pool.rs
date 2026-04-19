@@ -30,6 +30,7 @@ pub struct ExecPool {
     /// Completed results pending collection, keyed by session_key.
     pending_results: RwLock<HashMap<String, Vec<ExecResult>>>,
     /// Max concurrent exec tasks.
+    #[allow(dead_code)]
     max_concurrent: usize,
 }
 

@@ -6,7 +6,7 @@ use tracing::{debug, warn};
 
 use super::{
     runtime::RuntimeConfig,
-    schema::{BindMode, DmScope},
+    schema::DmScope,
 };
 
 /// Validate the fully-loaded RuntimeConfig.

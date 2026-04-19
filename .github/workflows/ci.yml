@@ -69,4 +69,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get install -y protobuf-compiler
-      - run: cargo clippy --all-targets -- -W warnings
+      - run: cargo clippy --all-targets

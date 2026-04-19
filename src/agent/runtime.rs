@@ -5102,6 +5102,7 @@ fn write_config_value(dot_path: &str, value: serde_json::Value) -> anyhow::Resul
 /// Documents appearing in both lists get a higher combined score.
 /// Documents only in one list still contribute their single-list score.
 /// Returns the top `top_k` results as `MemoryDoc`s.
+#[allow(dead_code)]
 fn rrf_fuse(
     vec_hits: Vec<crate::agent::memory::MemoryDoc>,
     bm25_hits: Vec<crate::store::search::IndexDoc>,
