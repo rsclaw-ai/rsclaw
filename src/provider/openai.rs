@@ -725,12 +725,34 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
     }
 
     if let Some(sys) = &req.system {
-        // Always prepend the main system prompt as the first message.
-        // Other system messages (plugins, skills) may already be present
-        // but the main prompt must come first for KV cache prefix stability.
+        // Prepend the main system prompt, then merge all system messages
+        // into a single message. Some models (e.g. older Llama) don't
+        // support multiple system messages scattered through the array.
+        // Merge order: main prompt + plugins + skills + trailing system,
+        // joined by "\n". The main prompt is always the prefix, so the
+        // KV cache prefix stays stable when only trailing parts change.
         let mut msgs = vec![json!({"role": "system", "content": sys})];
         msgs.extend(body["messages"].as_array().cloned().unwrap_or_default());
-        body["messages"] = json!(msgs);
+
+        // Collect all system message contents in order, then keep only
+        // non-system messages.
+        let mut system_parts: Vec<String> = Vec::new();
+        let mut non_system: Vec<Value> = Vec::new();
+        for msg in &msgs {
+            if msg["role"].as_str() == Some("system") {
+                if let Some(c) = msg["content"].as_str() {
+                    if !c.is_empty() {
+                        system_parts.push(c.to_owned());
+                    }
+                }
+            } else {
+                non_system.push(msg.clone());
+            }
+        }
+
+        let mut merged = vec![json!({"role": "system", "content": system_parts.join("\n")})];
+        merged.extend(non_system);
+        body["messages"] = json!(merged);
     }
 
     if let Some(t) = req.temperature {

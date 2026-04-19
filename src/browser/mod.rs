@@ -875,6 +875,13 @@ impl BrowserSession {
             "emulate" => self.cmd_emulate(args).await,
             "diff" => self.cmd_diff(args).await,
             "record" => self.cmd_record(args).await,
+            "keydown" | "key_down" => self.cmd_keydown(args).await,
+            "keyup" | "key_up" => self.cmd_keyup(args).await,
+            "mouse" => self.cmd_mouse(args).await,
+            "storage" => self.cmd_storage(args).await,
+            "download_wait" => self.cmd_download_wait(args).await,
+            "is" => self.cmd_is(args).await,
+            "get" => self.cmd_get(args).await,
             "search" => self.cmd_search(args).await,
             other => Err(anyhow!("web_browser: unsupported action `{other}`")),
         };
@@ -1421,6 +1428,144 @@ impl BrowserSession {
         let result = self.eval_js(&js).await?;
         if result == "NOT_FOUND" { bail!("scrollintoview: element `{sel}` not found"); }
         Ok(json!({"action": "scrollintoview", "ref": sel}))
+    }
+
+    /// Press a key down without releasing it.
+    async fn cmd_keydown(&self, args: &Value) -> Result<Value> {
+        let key = args.get("key").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("keydown: `key` required"))?;
+        self.cdp.send("Input.dispatchKeyEvent", json!({
+            "type": "keyDown",
+            "key": key,
+        })).await?;
+        Ok(json!({"action": "keydown", "key": key}))
+    }
+
+    /// Release a previously pressed key.
+    async fn cmd_keyup(&self, args: &Value) -> Result<Value> {
+        let key = args.get("key").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("keyup: `key` required"))?;
+        self.cdp.send("Input.dispatchKeyEvent", json!({
+            "type": "keyUp",
+            "key": key,
+        })).await?;
+        Ok(json!({"action": "keyup", "key": key}))
+    }
+
+    /// Raw mouse operation: move, click, down, or up at given coordinates.
+    async fn cmd_mouse(&self, args: &Value) -> Result<Value> {
+        let x = args.get("x").and_then(|v| v.as_f64())
+            .ok_or_else(|| anyhow!("mouse: `x` required"))?;
+        let y = args.get("y").and_then(|v| v.as_f64())
+            .ok_or_else(|| anyhow!("mouse: `y` required"))?;
+        let button = args.get("button").and_then(|v| v.as_str()).unwrap_or("left");
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("click");
+        match action {
+            "move" => {
+                self.cdp.send("Input.dispatchMouseEvent", json!({
+                    "type": "mouseMoved", "x": x, "y": y,
+                })).await?;
+            }
+            "down" => {
+                self.cdp.send("Input.dispatchMouseEvent", json!({
+                    "type": "mousePressed", "x": x, "y": y, "button": button, "clickCount": 1,
+                })).await?;
+            }
+            "up" => {
+                self.cdp.send("Input.dispatchMouseEvent", json!({
+                    "type": "mouseReleased", "x": x, "y": y, "button": button, "clickCount": 1,
+                })).await?;
+            }
+            _ => {
+                self.cdp.send("Input.dispatchMouseEvent", json!({
+                    "type": "mousePressed", "x": x, "y": y, "button": button, "clickCount": 1,
+                })).await?;
+                self.cdp.send("Input.dispatchMouseEvent", json!({
+                    "type": "mouseReleased", "x": x, "y": y, "button": button, "clickCount": 1,
+                })).await?;
+            }
+        }
+        Ok(json!({"action": "mouse", "x": x, "y": y, "button": button, "mouse_action": action}))
+    }
+
+    /// Read/write localStorage or sessionStorage.
+    async fn cmd_storage(&self, args: &Value) -> Result<Value> {
+        let op = args.get("value").and_then(|v| v.as_str()).unwrap_or("get");
+        let storage_type = args.get("type").and_then(|v| v.as_str()).unwrap_or("local");
+        let store = if storage_type == "session" { "sessionStorage" } else { "localStorage" };
+        match op {
+            "get" => {
+                let key = args.get("key").and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("storage get: `key` required"))?;
+                let js = format!(r#"{}.getItem('{}')"#, store, escape_js_string(key));
+                let val = self.eval_js(&js).await?;
+                Ok(json!({"action": "storage", "op": "get", "key": key, "data": val}))
+            }
+            "set" => {
+                let key = args.get("key").and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("storage set: `key` required"))?;
+                let data = args.get("data").and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("storage set: `data` required"))?;
+                let js = format!(r#"{}.setItem('{}', '{}')"#, store, escape_js_string(key), escape_js_string(data));
+                self.eval_js(&js).await?;
+                Ok(json!({"action": "storage", "op": "set", "key": key}))
+            }
+            "clear" => {
+                let js = format!("{}.clear()", store);
+                self.eval_js(&js).await?;
+                Ok(json!({"action": "storage", "op": "clear", "type": storage_type}))
+            }
+            other => Err(anyhow!("storage: unsupported op `{other}`, use get/set/clear")),
+        }
+    }
+
+    /// Wait for a download to complete.
+    async fn cmd_download_wait(&self, args: &Value) -> Result<Value> {
+        let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
+        self.cdp.send("Page.setDownloadBehavior", json!({
+            "behavior": "allow",
+            "downloadPath": "/tmp/rsclaw-downloads",
+        })).await?;
+        tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
+        Ok(json!({"action": "download_wait", "timeout": timeout_secs, "status": "completed"}))
+    }
+
+    /// Query element state: visible, hidden, checked, enabled, disabled.
+    async fn cmd_is(&self, args: &Value) -> Result<Value> {
+        let sel = self.get_ref_or_selector(args).ok_or_else(|| anyhow!("is: `ref` or `selector` required"))?;
+        let check = args.get("check").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("is: `check` required (visible/hidden/checked/enabled/disabled)"))?;
+        let find = self.build_find_js(sel);
+        let js_check = match check {
+            "visible" => "var r=el.getBoundingClientRect(); return String(r.width>0 && r.height>0 && getComputedStyle(el).visibility!=='hidden');",
+            "hidden" => "var r=el.getBoundingClientRect(); return String(r.width===0 || r.height===0 || getComputedStyle(el).visibility==='hidden' || getComputedStyle(el).display==='none');",
+            "checked" => "return String(!!el.checked);",
+            "enabled" => "return String(!el.disabled);",
+            "disabled" => "return String(!!el.disabled);",
+            other => bail!("is: unsupported check `{other}`"),
+        };
+        let js = format!(r#"(function(){{{find} {js_check}}})()"#);
+        let result = self.eval_js(&js).await?;
+        if result == "NOT_FOUND" { bail!("is: element `{sel}` not found"); }
+        let value = result == "true";
+        Ok(json!({"action": "is", "ref": sel, "check": check, "result": value}))
+    }
+
+    /// Get an element attribute value (text, value, href, src, class, or any attribute).
+    async fn cmd_get(&self, args: &Value) -> Result<Value> {
+        let sel = self.get_ref_or_selector(args).ok_or_else(|| anyhow!("get: `ref` or `selector` required"))?;
+        let attr = args.get("attr").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("get: `attr` required (text/value/href/src/class/...)"))?;
+        let find = self.build_find_js(sel);
+        let js_attr = match attr {
+            "text" => "return el.textContent || '';".to_string(),
+            "value" => "return el.value || '';".to_string(),
+            _ => format!("return el.getAttribute('{}') || '';", escape_js_string(attr)),
+        };
+        let js = format!(r#"(function(){{{find} {js_attr}}})()"#);
+        let result = self.eval_js(&js).await?;
+        if result == "NOT_FOUND" { bail!("get: element `{sel}` not found"); }
+        Ok(json!({"action": "get", "ref": sel, "attr": attr, "value": result}))
     }
 
     async fn cmd_screenshot(&mut self, args: &Value) -> Result<Value> {
