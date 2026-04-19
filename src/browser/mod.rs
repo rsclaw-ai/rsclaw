@@ -833,13 +833,18 @@ impl BrowserSession {
 
         let result = match action {
             "open" | "navigate" => self.cmd_open(args).await,
-            "snapshot" => self.cmd_snapshot().await,
+            "snapshot" => self.cmd_snapshot(args).await,
             "click" => self.cmd_click(args).await,
             "clickAt" | "click_at" => self.cmd_click_at(args).await,
             "fill" | "type" => self.cmd_fill(args).await,
             "select" => self.cmd_select(args).await,
             "check" => self.cmd_check(args, true).await,
             "uncheck" => self.cmd_check(args, false).await,
+            "hover" => self.cmd_hover(args).await,
+            "dblclick" | "double_click" => self.cmd_dblclick(args).await,
+            "drag" => self.cmd_drag(args).await,
+            "focus" => self.cmd_focus(args).await,
+            "scrollintoview" | "scroll_into_view" => self.cmd_scroll_into_view(args).await,
             "scroll" => self.cmd_scroll(args).await,
             "screenshot" => self.cmd_screenshot(args).await,
             "pdf" => self.cmd_pdf().await,
@@ -942,12 +947,16 @@ impl BrowserSession {
         Ok(json!({ "action": "open", "url": url, "text": format!("Navigated to {url}") }))
     }
 
-    async fn cmd_snapshot(&mut self) -> Result<Value> {
+    async fn cmd_snapshot(&mut self, args: &Value) -> Result<Value> {
         // Clear old refs.
         self.refs.clear();
         self.ref_counter = 0;
 
-        let js = SNAPSHOT_JS;
+        // interactive mode: only return elements with @ref (saves 80% tokens)
+        let interactive = args.get("interactive").and_then(|v| v.as_bool()).unwrap_or(false)
+            || args.get("i").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let js = if interactive { SNAPSHOT_INTERACTIVE_JS } else { SNAPSHOT_JS };
         let result = self
             .cdp
             .send(
@@ -1330,6 +1339,90 @@ impl BrowserSession {
         Ok(json!({ "action": "scroll", "direction": direction, "amount": amount }))
     }
 
+    /// Resolve a ref (@eN) or selector from args.
+    fn get_ref_or_selector<'a>(&self, args: &'a Value) -> Option<&'a str> {
+        args.get("ref").and_then(|v| v.as_str())
+            .or_else(|| args.get("selector").and_then(|v| v.as_str()))
+    }
+
+    /// Build JS to find element by @ref or CSS selector.
+    fn build_find_js(&self, ref_or_sel: &str) -> String {
+        format!(
+            r#"{FIND_REF_JS} var el=findRef('{}'); if(!el) el=document.querySelector('{}'); if(!el) return 'NOT_FOUND';"#,
+            escape_js_string(ref_or_sel),
+            escape_js_string(ref_or_sel),
+            FIND_REF_JS = FIND_REF_JS,
+        )
+    }
+
+    /// Get element center coordinates by ref/selector.
+    async fn get_element_center(&self, ref_or_sel: &str) -> Result<(f64, f64)> {
+        let find = self.build_find_js(ref_or_sel);
+        let js = format!(
+            r#"(function(){{{find} var r=el.getBoundingClientRect(); return JSON.stringify({{x:r.x+r.width/2,y:r.y+r.height/2}});}})() "#,
+        );
+        let result = self.eval_js(&js).await?;
+        if result == "NOT_FOUND" {
+            bail!("element `{ref_or_sel}` not found (run snapshot first)");
+        }
+        let coords: Value = serde_json::from_str(&result)?;
+        Ok((coords["x"].as_f64().unwrap_or(0.0), coords["y"].as_f64().unwrap_or(0.0)))
+    }
+
+    /// Hover over an element (triggers tooltips, dropdown menus).
+    async fn cmd_hover(&self, args: &Value) -> Result<Value> {
+        let sel = self.get_ref_or_selector(args).ok_or_else(|| anyhow!("hover: `ref` or `selector` required"))?;
+        let (x, y) = self.get_element_center(sel).await?;
+        self.cdp.send("Input.dispatchMouseEvent", json!({"type": "mouseMoved", "x": x, "y": y})).await?;
+        Ok(json!({"action": "hover", "ref": sel}))
+    }
+
+    /// Double-click an element.
+    async fn cmd_dblclick(&self, args: &Value) -> Result<Value> {
+        let sel = self.get_ref_or_selector(args).ok_or_else(|| anyhow!("dblclick: `ref` or `selector` required"))?;
+        let (x, y) = self.get_element_center(sel).await?;
+        self.cdp.send("Input.dispatchMouseEvent", json!({"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 2})).await?;
+        self.cdp.send("Input.dispatchMouseEvent", json!({"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 2})).await?;
+        Ok(json!({"action": "dblclick", "ref": sel}))
+    }
+
+    /// Drag from one element to another (for slider captchas, sorting, etc.).
+    async fn cmd_drag(&self, args: &Value) -> Result<Value> {
+        let from = args.get("from").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("drag: `from` ref required"))?;
+        let to = args.get("to").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("drag: `to` ref required"))?;
+        let (fx, fy) = self.get_element_center(from).await?;
+        let (tx, ty) = self.get_element_center(to).await?;
+        self.cdp.send("Input.dispatchMouseEvent", json!({"type": "mousePressed", "x": fx, "y": fy, "button": "left"})).await?;
+        let steps = 10;
+        for i in 1..=steps {
+            let t = i as f64 / steps as f64;
+            self.cdp.send("Input.dispatchMouseEvent", json!({"type": "mouseMoved", "x": fx + (tx-fx)*t, "y": fy + (ty-fy)*t})).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        self.cdp.send("Input.dispatchMouseEvent", json!({"type": "mouseReleased", "x": tx, "y": ty, "button": "left"})).await?;
+        Ok(json!({"action": "drag", "from": from, "to": to}))
+    }
+
+    /// Focus an element.
+    async fn cmd_focus(&self, args: &Value) -> Result<Value> {
+        let sel = self.get_ref_or_selector(args).ok_or_else(|| anyhow!("focus: `ref` or `selector` required"))?;
+        let find = self.build_find_js(sel);
+        let js = format!(r#"(function(){{{find} el.focus(); return 'OK';}})()"#);
+        let result = self.eval_js(&js).await?;
+        if result == "NOT_FOUND" { bail!("focus: element `{sel}` not found"); }
+        Ok(json!({"action": "focus", "ref": sel}))
+    }
+
+    /// Scroll an element into view.
+    async fn cmd_scroll_into_view(&self, args: &Value) -> Result<Value> {
+        let sel = self.get_ref_or_selector(args).ok_or_else(|| anyhow!("scrollintoview: `ref` or `selector` required"))?;
+        let find = self.build_find_js(sel);
+        let js = format!(r#"(function(){{{find} el.scrollIntoView({{behavior:'smooth',block:'center'}}); return 'OK';}})()"#);
+        let result = self.eval_js(&js).await?;
+        if result == "NOT_FOUND" { bail!("scrollintoview: element `{sel}` not found"); }
+        Ok(json!({"action": "scrollintoview", "ref": sel}))
+    }
+
     async fn cmd_screenshot(&mut self, args: &Value) -> Result<Value> {
         let format = args.get("format").and_then(|v| v.as_str()).unwrap_or("png");
         let quality = args.get("quality").and_then(|v| v.as_i64());
@@ -1356,7 +1449,7 @@ impl BrowserSession {
 
         // Annotated screenshot: overlay numbered labels on interactive elements
         if annotate {
-            self.cmd_snapshot().await?;
+            self.cmd_snapshot(&json!({})).await?;
 
             let annotate_js = r#"(function(){
                 var refs=document.querySelectorAll('[data-ref]');var labels=[];
@@ -2560,6 +2653,72 @@ const SNAPSHOT_JS: &str = r#"(function(){
     }
     for (var child = node.firstChild; child; child = child.nextSibling) {
       walk(child, label ? depth + 1 : depth);
+    }
+  }
+  if (document.body) walk(document.body, 0);
+  return JSON.stringify({lines: lines, refCount: counter});
+})()"#;
+
+/// Interactive-only snapshot: only outputs elements that have @ref (interactive).
+/// Saves ~80% tokens compared to full snapshot.
+const SNAPSHOT_INTERACTIVE_JS: &str = r#"(function(){
+  var lines = [];
+  var counter = 0;
+  var INTERACTIVE_ROLES = ['button','link','textbox','checkbox','radio','tab',
+    'menuitem','menuitemcheckbox','menuitemradio','switch','slider','combobox',
+    'searchbox','spinbutton','option','treeitem'];
+  function walk(node, depth) {
+    if (node.nodeType !== 1) return;
+    var el = node;
+    var tag = el.tagName.toLowerCase();
+    if (tag === 'script' || tag === 'style' || tag === 'noscript') return;
+    var style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return;
+    if (el.offsetWidth === 0 && el.offsetHeight === 0 && tag !== 'input') return;
+    var role = el.getAttribute('role') || '';
+    var ariaLabel = el.getAttribute('aria-label') || '';
+    var isEditable = el.isContentEditable && !el.parentElement.isContentEditable;
+    var hasCursorPointer = style.cursor === 'pointer';
+    var cls = (el.className || '').toString().toLowerCase();
+    var isUploadZone = (tag === 'input' && el.type === 'file')
+      || role === 'dropzone' || cls.indexOf('upload') >= 0;
+    var isInteractive = ['a','button','input','select','textarea','details','summary'].indexOf(tag) >= 0
+      || INTERACTIVE_ROLES.indexOf(role) >= 0
+      || isEditable || isUploadZone
+      || el.getAttribute('onclick') || el.getAttribute('tabindex')
+      || (hasCursorPointer && (el.innerText||'').trim().length > 0);
+    var isDisabled = el.disabled || el.getAttribute('aria-disabled') === 'true';
+    if (isInteractive && !isDisabled) {
+      counter++;
+      var ref = '@e' + counter;
+      el.setAttribute('data-ref', ref);
+      var label = '';
+      if (isUploadZone && tag === 'input') label = 'upload[file]';
+      else if (tag === 'a') label = 'link';
+      else if (tag === 'button' || role === 'button') label = 'button';
+      else if (tag === 'input') label = 'input[' + (el.type||'text') + ']';
+      else if (tag === 'select') label = 'select';
+      else if (tag === 'textarea') label = 'textarea';
+      else if (isEditable) label = 'editable';
+      else label = 'clickable';
+      var text = ariaLabel || el.getAttribute('alt') || el.getAttribute('placeholder') || el.getAttribute('title') || '';
+      if (!text) {
+        var inner = el.innerText;
+        if (inner) text = inner.split('\n')[0].substring(0, 100);
+      }
+      var extraStr = '';
+      if ((tag === 'input' || tag === 'textarea' || isEditable) && (el.value || el.innerText)) {
+        extraStr = ' value="' + (el.value || el.innerText).substring(0, 50) + '"';
+      }
+      if (tag === 'a' && el.href) {
+        var href = el.href.length > 80 ? el.href.substring(0, 80) + '...' : el.href;
+        extraStr += ' href="' + href + '"';
+      }
+      var textStr = text ? ' "' + text.substring(0, 100) + '"' : '';
+      lines.push('[' + label + '] ' + ref + textStr + extraStr);
+    }
+    for (var child = node.firstChild; child; child = child.nextSibling) {
+      walk(child, depth + 1);
     }
   }
   if (document.body) walk(document.body, 0);

@@ -427,8 +427,8 @@ impl AgentRuntime {
             }
         }
 
-        // --- Auto-fetch top 3 results for deeper content ---
-        let fetch_count = results.len().min(3);
+        // --- Auto-fetch top 5 results for deeper content ---
+        let fetch_count = results.len().min(5);
         let fetch_urls: Vec<String> = results.iter()
             .take(fetch_count)
             .filter_map(|r| r["url"].as_str().map(String::from))
