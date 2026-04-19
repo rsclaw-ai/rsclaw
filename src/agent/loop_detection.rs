@@ -151,6 +151,8 @@ pub struct LoopDetector {
     overrides: HashMap<String, (usize, usize)>, // (warning, critical) per-tool
     /// History of tool call records with args_hash and result_hash.
     history: VecDeque<ToolCallRecord>,
+    /// Cache of args_hash that returned `_failed: true`. Immediate block on retry.
+    failed_commands: std::collections::HashSet<String>,
 }
 
 impl LoopDetector {
@@ -176,6 +178,7 @@ impl LoopDetector {
             critical_threshold,
             overrides: builtin_overrides(),
             history: VecDeque::new(),
+            failed_commands: std::collections::HashSet::new(),
         }
     }
 
@@ -193,6 +196,7 @@ impl LoopDetector {
             critical_threshold,
             overrides,
             history: VecDeque::new(),
+            failed_commands: std::collections::HashSet::new(),
         }
     }
 
@@ -227,6 +231,19 @@ impl LoopDetector {
         params: &serde_json::Value,
     ) -> LoopCheckResult {
         let args_hash = hash_tool_call(tool_name, params);
+
+        // Immediate block for previously failed commands with `_failed: true`.
+        // This prevents retrying commands that already returned a failure.
+        if self.failed_commands.contains(&args_hash) {
+            return LoopCheckResult::Critical {
+                tool_name: tool_name.to_owned(),
+                count: 1,
+                message: format!(
+                    "CRITICAL: command `{tool_name}` previously returned `_failed: true`. \
+                    Retrying the same command is blocked. Use a different approach or inform the user."
+                ),
+            };
+        }
 
         // Add to history (result_hash will be set later via record_result)
         self.history.push_back(ToolCallRecord {
@@ -323,8 +340,16 @@ impl LoopDetector {
     /// If result contains `_loop_key` field, uses that for hashing instead of
     /// the full result. This allows tools to provide a stable key that excludes
     /// dynamic fields (like task_id) for proper loop detection.
+    ///
+    /// If result contains `_failed: true`, adds the args_hash to failed_commands
+    /// cache so subsequent calls with same args are immediately blocked.
     pub fn record_result(&mut self, result: &serde_json::Value) {
         if let Some(last) = self.history.back_mut() {
+            // Check for _failed flag - add to failed_commands cache for immediate block
+            if result.get("_failed").and_then(|v| v.as_bool()).unwrap_or(false) {
+                self.failed_commands.insert(last.args_hash.clone());
+            }
+
             // Use _loop_key if present, otherwise use full result
             let result_str =
                 if let Some(loop_key) = result.get("_loop_key").and_then(|v| v.as_str()) {
@@ -339,6 +364,8 @@ impl LoopDetector {
     /// Reset the history (e.g. after a tool successfully produces new output).
     pub fn reset(&mut self) {
         self.history.clear();
+        // Also clear failed_commands on reset (new context)
+        self.failed_commands.clear();
     }
 }
 
