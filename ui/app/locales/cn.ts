@@ -554,6 +554,18 @@ const cn = {
       Title: "对话摘要模型",
       SubTitle: "用于压缩历史记录、生成对话标题的模型",
     },
+    VideoModel: {
+      Title: "视频生成模型",
+      SubTitle: "用于文生视频的模型 (Seedance / MiniMax / Kling)",
+    },
+    BtwTokens: {
+      Title: "旁路上下文预算",
+      SubTitle: "/ctx 旁路查询的最大 token 数",
+    },
+    KvCacheMode: {
+      Title: "KV Cache 模式",
+      SubTitle: "0=关闭 1=完整追加(默认) 2=增量",
+    },
     Temperature: {
       Title: "随机性 (temperature)",
       SubTitle: "值越大，回复越随机",

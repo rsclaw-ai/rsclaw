@@ -1,9 +1,15 @@
 fn main() {
     // Set RSCLAW_BUILD_VERSION and RSCLAW_BUILD_DATE at compile time.
     // CI overrides these via env vars; local dev gets sensible defaults.
+    //
+    // VERSION CONVENTION:
+    //   RSCLAW_BUILD_VERSION stores the bare version WITHOUT "v" prefix.
+    //   Display code (preparse.rs, main.rs) adds "v" when showing to users.
+    //   CI/scripts should pass bare versions: RSCLAW_BUILD_VERSION=2026.4.15
+    //   NOT: RSCLAW_BUILD_VERSION=v2026.4.15
     if std::env::var("RSCLAW_BUILD_VERSION").is_err() {
         let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "dev".to_owned());
-        println!("cargo:rustc-env=RSCLAW_BUILD_VERSION=v{version}");
+        println!("cargo:rustc-env=RSCLAW_BUILD_VERSION={version}");
     }
     if std::env::var("RSCLAW_BUILD_DATE").is_err() {
         // Simple date without external crates

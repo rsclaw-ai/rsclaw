@@ -26,7 +26,7 @@ pub fn cmd_tray() -> Result<()> {
     let config_item = MenuItem::new("Open Config", true, None);
     let separator3 = PredefinedMenuItem::separator();
     let version_item = MenuItem::new(
-        format!("rsclaw {}", env!("RSCLAW_BUILD_VERSION")),
+        format!("rsclaw v{}", env!("RSCLAW_BUILD_VERSION")),
         false,
         None,
     );

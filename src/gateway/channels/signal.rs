@@ -137,7 +137,7 @@ pub(crate) fn start_signal_if_configured(
                             return;
                         }
                         PolicyResult::SendPairingCode(code) => {
-                            let _ = tx
+                            if let Err(e) = tx
                                 .send(OutboundMessage {
                                     target_id: sender.clone(),
                                     is_group: false,
@@ -151,11 +151,14 @@ pub(crate) fn start_signal_if_configured(
                                     channel: None,
 
                     files: vec![],                                })
-                                .await;
+                                .await
+                            {
+                                tracing::warn!("failed to send message: {e}");
+                            }
                             return;
                         }
                         PolicyResult::PairingQueueFull => {
-                            let _ = tx
+                            if let Err(e) = tx
                                 .send(OutboundMessage {
                                     target_id: sender.clone(),
                                     is_group: false,
@@ -169,7 +172,10 @@ pub(crate) fn start_signal_if_configured(
                                     channel: None,
 
                     files: vec![],                                })
-                                .await;
+                                .await
+                            {
+                                tracing::warn!("failed to send message: {e}");
+                            }
                             return;
                         }
                     }
@@ -249,7 +255,7 @@ pub(crate) fn start_signal_if_configured(
                             if let Ok(r) = reply {
                                 let pending = r.pending_analysis;
                                 if !r.is_empty {
-                                    let _ = w_tx
+                                    if let Err(e) = w_tx
                                         .send(OutboundMessage {
                                             target_id: sender.clone(),
                                             is_group,
@@ -258,7 +264,10 @@ pub(crate) fn start_signal_if_configured(
                                             images: r.images,
                                             files: r.files,
                                             channel: None,                                        })
-                                        .await;
+                                        .await
+                                    {
+                                        tracing::warn!("failed to send message: {e}");
+                                    }
                                 }
                                 if let Some(analysis) = pending {
                                     handle_pending_analysis(
@@ -277,7 +286,7 @@ pub(crate) fn start_signal_if_configured(
                         });
                         utx
                     } else {
-                        map.get(&sender).unwrap().clone()
+                        map.get(&sender).expect("queue entry must exist").clone()
                     }
                 };
                 // /btw bypass: spawn directly, skip the per-user queue
@@ -296,7 +305,7 @@ pub(crate) fn start_signal_if_configured(
                             btw_direct_call(&question, &handle.live_status, &handle.providers, &cfg)
                                 .await
                         {
-                            let _ = tx
+                            if let Err(e) = tx
                                 .send(OutboundMessage {
                                     target_id: sender,
                                     is_group: false,
@@ -306,7 +315,10 @@ pub(crate) fn start_signal_if_configured(
                                     channel: None,
 
                     files: vec![],                                })
-                                .await;
+                                .await
+                            {
+                                tracing::warn!("failed to send message: {e}");
+                            }
                         }
                     });
                     return;
@@ -341,7 +353,11 @@ pub(crate) fn start_signal_if_configured(
                             reply.target_id = sender.clone();
                             reply.is_group = is_group;
                             if !reply.text.is_empty() || !reply.images.is_empty() {
-                                let _ = tx.send(reply).await;
+                                if let Err(e) = tx.send(reply).await {
+
+                                    tracing::warn!("failed to send message: {e}");
+
+                                }
                             }
                             return;
                         }
@@ -362,7 +378,7 @@ pub(crate) fn start_signal_if_configured(
                         }
                         if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                             if !r.is_empty {
-                                let _ = tx.send(OutboundMessage {
+                                if let Err(e) = tx.send(OutboundMessage {
                                     target_id: sender,
                                     is_group,
                                     text: r.text,
@@ -370,7 +386,10 @@ pub(crate) fn start_signal_if_configured(
                                     images: r.images,
                                     files: r.files,
                                     channel: None,
-                                }).await;
+                                }).await
+                                {
+                                    tracing::warn!("failed to send message: {e}");
+                                }
                             }
                         }
                     });

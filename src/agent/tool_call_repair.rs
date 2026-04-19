@@ -224,9 +224,16 @@ pub fn try_extract_usable_args(raw: &str) -> Option<ToolCallRepair> {
 
     // Try to extract balanced JSON prefix
     let extracted = extract_balanced_json_prefix(raw)?;
-    let leading_prefix = raw[..extracted.1].trim().to_string();
+    let leading_prefix = raw.get(..extracted.1)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let json_part = &extracted.0;
-    let trailing_suffix = raw[extracted.1 + json_part.len()..].trim().to_string();
+    let suffix_start = extracted.1 + json_part.len();
+    let trailing_suffix = raw.get(suffix_start..)
+        .unwrap_or("")
+        .trim()
+        .to_string();
 
     // Validate leading prefix - be more lenient for incomplete JSON
     if !leading_prefix.is_empty() && !is_allowed_leading_prefix(&leading_prefix) {

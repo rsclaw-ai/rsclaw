@@ -528,6 +528,7 @@ fn import_memories_to_redb(
             abstract_text: None,
             overview_text: None,
             tags: vec![],
+                pinned: false,
         };
 
         let json_bytes = serde_json::to_vec(&doc)?;

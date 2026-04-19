@@ -126,6 +126,53 @@ Memory maintenance: deduplicate near-identical memories, clean up crystallized s
 ";
 
 // ---------------------------------------------------------------------------
+// Skill creation template (SKILL.md standard)
+// ---------------------------------------------------------------------------
+
+/// Canonical SKILL.md template following the Anthropic skill-creator standard.
+///
+/// The agent uses this when crystallizing memories or when explicitly asked to
+/// create a new skill.  All fields marked REQUIRED must be present; optional
+/// sections are included only when relevant.
+pub const SKILL_TEMPLATE: &str = "\
+---
+name: skill-name-in-kebab-case
+description: >
+  What this skill does AND when to invoke it. Phrase this somewhat \"pushily\"
+  so the agent does not undertrigger. Example: \"How to do X. Use this skill
+  whenever the user asks about X, Y, or similar tasks, even if not explicit.\"
+# compatibility: python>=3.10  (optional — list required tools/runtimes)
+---
+
+# Skill Name
+
+One-sentence summary of what this skill accomplishes.
+
+## When to use
+
+Describe the exact situations that should trigger this skill. Include
+alternative phrasings and edge cases.
+
+## Workflow
+
+1. **Step one** — What to do and *why* it matters.
+2. **Step two** — Continue with specifics.
+3. **Step three** — Include validation or verification.
+
+## Example
+
+**Input:** describe what the user provides
+**Output:** describe what the agent produces
+
+## Notes
+
+- Any important caveats or edge cases.
+- References to bundled resources if applicable:
+  - `See scripts/helper.py — run with: python scripts/helper.py <args>`
+  - `See references/guide.md for detailed field descriptions`
+";
+
+// ---------------------------------------------------------------------------
 // Platform rule seed files (site-rules/)
 // ---------------------------------------------------------------------------
 

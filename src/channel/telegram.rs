@@ -652,26 +652,52 @@ impl Channel for TelegramChannel {
                     }
                 };
 
-                let part = match reqwest::multipart::Part::bytes(bytes)
-                    .file_name(filename.clone())
-                    .mime_str(mime)
+                // Audio files: convert to ogg/opus and send as voice message (pure Rust).
+                let is_audio = mime.starts_with("audio/");
+                let (send_bytes, send_filename, send_mime) = if is_audio && !filename.ends_with(".ogg") && !filename.ends_with(".opus") {
+                    let ext = filename.rsplit('.').next().unwrap_or("mp3");
+                    match crate::channel::transcription::encode_audio_to_ogg_opus(&bytes, Some(ext)) {
+                        Ok(opus_bytes) => {
+                            let ogg_name = filename.rsplit_once('.').map(|(n, _)| format!("{n}.ogg")).unwrap_or_else(|| format!("{filename}.ogg"));
+                            info!(idx, src_len = bytes.len(), opus_len = opus_bytes.len(), "telegram: converted audio to ogg-opus");
+                            (opus_bytes, ogg_name, "audio/ogg".to_owned())
+                        }
+                        Err(e) => {
+                            warn!(idx, "telegram: ogg-opus conversion failed, sending as-is: {e:#}");
+                            (bytes, filename.clone(), mime.clone())
+                        }
+                    }
+                } else {
+                    (bytes, filename.clone(), mime.clone())
+                };
+
+                let part = match reqwest::multipart::Part::bytes(send_bytes)
+                    .file_name(send_filename.clone())
+                    .mime_str(&send_mime)
                 {
                     Ok(p) => p,
                     Err(e) => { warn!(idx, "telegram: build multipart failed: {e}"); continue; }
                 };
+
+                // Audio: sendVoice (voice bubble), others: sendDocument (file).
+                let (api_method, field_name) = if is_audio {
+                    ("sendVoice", "voice")
+                } else {
+                    ("sendDocument", "document")
+                };
                 let form = reqwest::multipart::Form::new()
                     .text("chat_id", msg.target_id.clone())
-                    .part("document", part);
+                    .part(field_name, part);
 
-                let url = self.api_url("sendDocument");
+                let url = self.api_url(api_method);
                 match self.client.post(&url).multipart(form).send().await {
                     Ok(resp) if !resp.status().is_success() => {
                         let status = resp.status();
                         let body = resp.text().await.unwrap_or_default();
-                        warn!(idx, %status, "telegram: sendDocument failed: {body}");
+                        warn!(idx, %status, "telegram: {api_method} failed: {body}");
                     }
-                    Err(e) => warn!(idx, "telegram: sendDocument request failed: {e}"),
-                    Ok(_) => debug!(idx, "telegram: file sent: {filename}"),
+                    Err(e) => warn!(idx, "telegram: {api_method} request failed: {e}"),
+                    Ok(_) => debug!(idx, "telegram: file sent via {api_method}: {send_filename}"),
                 }
             }
 

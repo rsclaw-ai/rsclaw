@@ -123,7 +123,7 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                                 let acct = next_account_slot(accounts, "wechat");
                                 acct.insert("botToken".to_owned(), serde_json::json!(token));
                                 acct.insert("botId".to_owned(), serde_json::json!(bot_id));
-                                acct.insert("label".to_owned(), serde_json::json!(format!("WeChat {}", &bot_id[..bot_id.len().min(8)])));
+                                acct.insert("label".to_owned(), serde_json::json!(format!("WeChat {}", bot_id.chars().take(8).collect::<String>())));
                             }
                         }
                     }
@@ -165,7 +165,7 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                                 let acct = next_account_slot(accounts, "feishu");
                                 acct.insert("appId".to_owned(), serde_json::json!(app_id));
                                 acct.insert("appSecret".to_owned(), serde_json::json!(app_secret));
-                                acct.insert("label".to_owned(), serde_json::json!(format!("Feishu {}", &app_id[..app_id.len().min(8)])));
+                                acct.insert("label".to_owned(), serde_json::json!(format!("Feishu {}", app_id.chars().take(8).collect::<String>())));
                             }
                         }
                     }

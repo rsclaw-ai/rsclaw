@@ -1185,6 +1185,177 @@ fn decode_audio_symphonia_with_hint(audio_bytes: &[u8], ext_hint: Option<&str>) 
     Ok(samples)
 }
 
+/// Convert audio bytes (mp3/wav/ogg/aiff) to ogg-opus format.
+///
+/// Returns ogg-opus encoded bytes suitable for Feishu/Telegram voice messages.
+/// Uses ffmpeg for encoding (opus-rs pure Rust produces incompatible output).
+pub fn encode_audio_to_ogg_opus(audio_bytes: &[u8], file_ext: Option<&str>) -> Result<Vec<u8>> {
+    let ext = file_ext.unwrap_or("mp3");
+    let ts = chrono::Utc::now().timestamp_millis();
+    let tmp_src = std::env::temp_dir().join(format!("rsclaw_opus_src_{ts}.{ext}"));
+    let tmp_ogg = std::env::temp_dir().join(format!("rsclaw_opus_out_{ts}.ogg"));
+
+    std::fs::write(&tmp_src, audio_bytes)?;
+    let output = std::process::Command::new(which_ffmpeg())
+        .args([
+            "-i", &tmp_src.to_string_lossy(),
+            "-y", "-c:a", "libopus", "-b:a", "48k",
+            &tmp_ogg.to_string_lossy().to_string(),
+        ])
+        .output()
+        .context("ffmpeg not available for opus encoding")?;
+    let _ = std::fs::remove_file(&tmp_src);
+
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&tmp_ogg);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ffmpeg opus encoding failed: {stderr}");
+    }
+
+    let ogg_bytes = std::fs::read(&tmp_ogg)?;
+    let _ = std::fs::remove_file(&tmp_ogg);
+    info!(src_len = audio_bytes.len(), ogg_len = ogg_bytes.len(), "audio encoded to ogg-opus via ffmpeg");
+    Ok(ogg_bytes)
+}
+
+/// Decode audio to mono f32 PCM at a specific target sample rate.
+fn decode_audio_to_pcm_at_rate(
+    audio_bytes: &[u8],
+    file_ext: Option<&str>,
+    target_rate: u32,
+) -> Result<Vec<f32>> {
+    // Try OGG Opus first
+    if audio_bytes.starts_with(b"OggS") {
+        if let Ok(samples) = decode_ogg_opus(audio_bytes) {
+            // ogg-opus decodes at 48000 Hz
+            return Ok(resample_linear(&samples, 48000, target_rate));
+        }
+    }
+    // Detect format hint for symphonia
+    let hint = file_ext.or_else(|| {
+        if audio_bytes.len() >= 12 && audio_bytes[4..].windows(4).any(|w| w == b"ftyp") {
+            Some("mp4")
+        } else if audio_bytes.starts_with(b"\x1aE\xdf\xa3") {
+            Some("webm")
+        } else {
+            None
+        }
+    });
+    if let Ok((samples, rate)) = decode_audio_symphonia_raw(audio_bytes, hint) {
+        return Ok(resample_linear(&samples, rate, target_rate));
+    }
+    // Fallback: ffmpeg
+    let ext = hint.or(file_ext).unwrap_or("bin");
+    let samples = decode_audio_ffmpeg_at_rate(audio_bytes, ext, target_rate)?;
+    Ok(samples)
+}
+
+/// Linear interpolation resampling.
+fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if from_rate == to_rate || from_rate == 0 || samples.is_empty() {
+        return samples.to_vec();
+    }
+    let ratio = to_rate as f64 / from_rate as f64;
+    let new_len = (samples.len() as f64 * ratio) as usize;
+    let mut out = Vec::with_capacity(new_len);
+    for i in 0..new_len {
+        let src_pos = i as f64 / ratio;
+        let idx = src_pos as usize;
+        let frac = src_pos - idx as f64;
+        let s = if idx + 1 < samples.len() {
+            samples[idx] * (1.0 - frac as f32) + samples[idx + 1] * frac as f32
+        } else if idx < samples.len() {
+            samples[idx]
+        } else {
+            0.0
+        };
+        out.push(s);
+    }
+    out
+}
+
+/// Symphonia decode returning (mono f32 samples, original sample rate).
+fn decode_audio_symphonia_raw(audio_bytes: &[u8], ext_hint: Option<&str>) -> Result<(Vec<f32>, u32)> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    let cursor = std::io::Cursor::new(audio_bytes.to_vec());
+    let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = ext_hint {
+        hint.with_extension(ext);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .context("failed to probe audio format")?;
+    let mut format = probed.format;
+    let track = format.default_track().context("no audio track found")?;
+    let track_id = track.id;
+    let sample_rate = track.codec_params.sample_rate.unwrap_or(16000);
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .context("failed to create audio decoder")?;
+    let mut samples: Vec<f32> = Vec::new();
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) if p.track_id() == track_id => p,
+            Ok(_) => continue,
+            Err(_) => break,
+        };
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let spec = *decoded.spec();
+        let num_samples = decoded.capacity();
+        let mut sample_buf = SampleBuffer::<f32>::new(num_samples as u64, spec);
+        sample_buf.copy_interleaved_ref(decoded);
+        let channel_samples = sample_buf.samples();
+        let channels = spec.channels.count();
+        if channels > 1 {
+            for chunk in channel_samples.chunks(channels) {
+                let avg = chunk.iter().sum::<f32>() / channels as f32;
+                samples.push(avg);
+            }
+        } else {
+            samples.extend_from_slice(channel_samples);
+        }
+    }
+    Ok((samples, sample_rate))
+}
+
+/// ffmpeg decode to f32 PCM at a specific sample rate.
+fn decode_audio_ffmpeg_at_rate(audio_bytes: &[u8], ext: &str, target_rate: u32) -> Result<Vec<f32>> {
+    let tmp_in = std::env::temp_dir().join(format!("rsclaw_in_{}.{ext}", chrono::Utc::now().timestamp_millis()));
+    let tmp_out = std::env::temp_dir().join(format!("rsclaw_out_{}.pcm", chrono::Utc::now().timestamp_millis()));
+    std::fs::write(&tmp_in, audio_bytes)?;
+    let output = std::process::Command::new(which_ffmpeg())
+        .args([
+            "-i", &tmp_in.to_string_lossy(),
+            "-y", "-f", "s16le", "-ar", &target_rate.to_string(), "-ac", "1",
+            &tmp_out.to_string_lossy().to_string(),
+        ])
+        .output()
+        .context("ffmpeg not available")?;
+    let _ = std::fs::remove_file(&tmp_in);
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&tmp_out);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ffmpeg decode failed: {stderr}");
+    }
+    let pcm_bytes = std::fs::read(&tmp_out)?;
+    let _ = std::fs::remove_file(&tmp_out);
+    let samples: Vec<f32> = pcm_bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+        .collect();
+    Ok(samples)
+}
+
 /// Write f32 PCM samples as a 16-bit mono WAV file.
 fn write_wav_from_pcm(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     let channels: u16 = 1;

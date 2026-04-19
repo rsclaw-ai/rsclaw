@@ -54,7 +54,7 @@ pub struct LiveStatus {
 pub use super::context_mgr::estimate_tokens;
 use super::context_mgr::{
     apply_context_budget_trim, apply_context_pruning, build_clear_summary, compress_image_for_llm,
-    msg_tokens, strip_old_images,
+    msg_tokens,
 };
 use super::platform::match_skills;
 use super::prompt_builder::{
@@ -95,6 +95,10 @@ const NO_REPLY_TOKEN: &str = "NO_REPLY";
 const DEFAULT_MAX_FILE_SIZE: usize = 50_000_000;
 /// Default max text chars before token confirmation.
 const DEFAULT_MAX_TEXT_CHARS: usize = 50_000;
+/// Sessions older than this TTL (7 days) are eligible for eviction.
+const SESSION_IDLE_TTL_SECS: u64 = 7 * 24 * 3600;
+/// Eviction only triggers when the session count exceeds this threshold.
+const MAX_SESSIONS_PER_AGENT: usize = 10_000;
 
 /// RAII guard that clears the abort flag for a session when dropped.
 struct AbortFlagGuard {
@@ -183,6 +187,8 @@ fn model_supports_vision(model: &str, config: &RuntimeConfig) -> bool {
         || lower.contains("qwen3")
         || lower.contains("doubao")
         || lower.contains("seed") // doubao-seed models
+        || lower.contains("gemma4") // Google Gemma 4 (vision-capable)
+        || lower.contains("gemma-4") // Google Gemma 4 variant
     // Known NON-vision models (deepseek-chat, deepseek-r1, qwen-turbo,
     // moonshot, minimax, etc.) return false by default.
 }
@@ -258,6 +264,19 @@ pub struct AgentRuntime {
     started_at: std::time::Instant,
     /// Cached workspace context (avoids re-reading unchanged files every turn).
     workspace_cache: Option<crate::agent::workspace::WorkspaceCache>,
+    /// Cached system prompt — built once per gateway lifetime, never
+    /// invalidated (only rebuilt on gateway restart).
+    pub(crate) cached_system_prompt: Option<String>,
+    /// Cached plugins system message — frozen at session start, rebuilt
+    /// on compact or `/new`. Sorted by name for byte-stable output.
+    pub(crate) cached_plugins_system: Option<String>,
+    /// Cached skills system message — same lifecycle as plugins.
+    pub(crate) cached_skills_system: Option<String>,
+    /// Snapshot of installed skill names (sorted) for change detection.
+    pub(crate) cached_skills_snapshot: Vec<String>,
+    /// Cached tool definitions from the last run_turn — reused by compaction
+    /// to match the KV cache prefix exactly.
+    pub(crate) cached_tools: Vec<crate::provider::ToolDef>,
     /// Background context manager (/ctx command, formerly /btw).
     btw_manager: super::btw::BtwManager,
     pub(crate) notification_tx:
@@ -333,6 +352,11 @@ impl AgentRuntime {
             runtime_max_text_chars: None,
             started_at: std::time::Instant::now(),
             workspace_cache: None,
+            cached_system_prompt: None,
+            cached_plugins_system: None,
+            cached_skills_system: None,
+            cached_skills_snapshot: Vec::new(),
+            cached_tools: Vec::new(),
             btw_manager,
             pending_task_results: Arc::new(std::sync::Mutex::new(Vec::new())),
             voice_mode_sessions: std::collections::HashSet::new(),
@@ -414,11 +438,36 @@ impl AgentRuntime {
     /// context but NO tools. The result is ephemeral -- it is NOT added to
     /// session history and does not affect the main conversation.
     async fn handle_side_query(&mut self, session_key: &str, question: &str) -> Result<AgentReply> {
-        // Read current session history (read-only snapshot for context).
+        // Read current session history — only User/Assistant text messages,
+        // skip Tool/ToolCall messages (btw has no tools, they'd confuse the model).
+        let btw_budget = self.config.agents.defaults.btw_tokens.unwrap_or(10_000) as usize;
         let history: Vec<Message> = self.sessions.get(session_key).cloned().unwrap_or_default();
-
-        // Take last 10 messages for context, then append the question.
-        let mut messages: Vec<Message> = history.into_iter().rev().take(10).rev().collect();
+        let mut messages = Vec::new();
+        let mut token_count = 0usize;
+        // Walk backwards, collect up to btw_budget tokens of User/Assistant text.
+        for m in history.iter().rev() {
+            if !matches!(m.role, Role::User | Role::Assistant) {
+                continue;
+            }
+            let text = match &m.content {
+                MessageContent::Text(t) => t.clone(),
+                _ => continue,
+            };
+            let msg_tokens = super::context_mgr::estimate_tokens(&text);
+            if token_count + msg_tokens > btw_budget && !messages.is_empty() {
+                break;
+            }
+            // Truncate individual messages that are too long.
+            let content = if text.chars().count() > 2000 {
+                let truncated: String = text.chars().take(2000).collect();
+                MessageContent::Text(format!("{truncated}..."))
+            } else {
+                MessageContent::Text(text)
+            };
+            messages.push(Message { role: m.role.clone(), content });
+            token_count += msg_tokens;
+        }
+        messages.reverse();
         messages.push(Message {
             role: Role::User,
             content: MessageContent::Text(question.to_owned()),
@@ -513,9 +562,58 @@ impl AgentRuntime {
                 let _ = self.store.db.delete_session(&key);
             }
 
-            // Re-inject summaries so agent retains context.
+            // Re-inject summaries so agent retains context, and persist to redb.
             for (key, msg) in summary_msgs {
+                let val = serde_json::to_value(&msg).unwrap_or_default();
+                if let Err(e) = self.store.db.append_message(&key, &val) {
+                    tracing::warn!("failed to persist clear summary: {e:#}");
+                }
                 self.sessions.insert(key, vec![msg]);
+            }
+            // /clear does NOT invalidate plugins/skills cache (same conversation continues).
+        }
+
+        // /new — start a fresh conversation with new archive generation.
+        if self.handle.new_session_signal.load(Ordering::SeqCst) {
+            self.handle.new_session_signal.store(false, Ordering::SeqCst);
+            info!("new_session_signal received, starting new generation");
+
+            // Save session summary to memory before clearing — no summary
+            // will be injected into the new session, so memory is the only
+            // way the LLM can find prior context.
+            let compaction_model = self.config.agents.defaults.compaction
+                .as_ref().and_then(|c| c.model.clone())
+                .or_else(|| self.handle.config.model.as_ref()?.primary.clone())
+                .unwrap_or_else(|| "default".to_owned());
+            self.save_session_summaries_to_memory(&compaction_model).await;
+
+            self.sessions.clear();
+            self.compaction_state.clear();
+            for key in self.store.db.list_sessions().unwrap_or_default() {
+                match self.store.db.new_generation(&key) {
+                    Ok(g) => info!(session = %key, generation = g, "new generation started"),
+                    Err(e) => tracing::warn!("failed to start new generation: {e:#}"),
+                }
+            }
+            self.invalidate_plugins_skills_cache();
+        }
+
+        // /reset — clear current session without summary or generation change.
+        if self.handle.reset_signal.load(Ordering::SeqCst) {
+            self.handle.reset_signal.store(false, Ordering::SeqCst);
+            info!("reset_signal received, resetting sessions");
+
+            // Save session summary to memory before clearing.
+            let compaction_model2 = self.config.agents.defaults.compaction
+                .as_ref().and_then(|c| c.model.clone())
+                .or_else(|| self.handle.config.model.as_ref()?.primary.clone())
+                .unwrap_or_else(|| "default".to_owned());
+            self.save_session_summaries_to_memory(&compaction_model2).await;
+
+            self.sessions.clear();
+            self.compaction_state.clear();
+            for key in self.store.db.list_sessions().unwrap_or_default() {
+                let _ = self.store.db.delete_session(&key);
             }
         }
 
@@ -893,7 +991,7 @@ impl AgentRuntime {
                                 // Render transcript (reuse the same logic as compaction).
                                 let transcript = Self::msgs_to_text_static(msgs, max_transcript);
                                 let compaction_model = cfg.model.as_deref().unwrap_or(&model);
-                                self.compact_single(compaction_model, &transcript).await
+                                self.compact_single(compaction_model, &transcript, None).await
                             }
                         } else {
                             None
@@ -919,19 +1017,17 @@ impl AgentRuntime {
                         let model = self.resolve_model_name();
                         self.compact_force(session_key, &model).await;
                         // Extract summary from the compacted session for memory storage.
-                        // Look for the compaction-tagged System message specifically.
-                        const COMPACTION_TAG: &str = "[Conversation history compacted";
+                        // Look for the compaction-tagged message (role=User with COMPACTION prefix).
+                        const COMPACTION_TAG: &str = "[CONTEXT COMPACTION";
                         if let Some(msgs) = self.sessions.get(session_key) {
                             let summary_text = msgs.iter().find_map(|m| {
-                                if m.role == crate::provider::Role::System {
-                                    let text = match &m.content {
-                                        crate::provider::MessageContent::Text(s) => s.clone(),
-                                        crate::provider::MessageContent::Parts(parts) => parts.iter().filter_map(|p| {
-                                            if let crate::provider::ContentPart::Text { text } = p { Some(text.as_str()) } else { None }
-                                        }).collect::<Vec<_>>().join(" "),
-                                    };
-                                    if text.starts_with(COMPACTION_TAG) { Some(text) } else { None }
-                                } else { None }
+                                let text = match &m.content {
+                                    crate::provider::MessageContent::Text(s) => s.clone(),
+                                    crate::provider::MessageContent::Parts(parts) => parts.iter().filter_map(|p| {
+                                        if let crate::provider::ContentPart::Text { text } = p { Some(text.as_str()) } else { None }
+                                    }).collect::<Vec<_>>().join(" "),
+                                };
+                                if text.starts_with(COMPACTION_TAG) { Some(text) } else { None }
                             });
                             if let Some(summary) = summary_text {
                                 if let Some(ref mem) = self.memory {
@@ -956,6 +1052,7 @@ impl AgentRuntime {
                                         abstract_text: None,
                                         overview_text: None,
                                         tags: vec![],
+                pinned: false,
                                     };
                                     match mem.lock().await.add(doc).await {
                                         Ok(_) => info!("compact: summary saved to memory ({} chars)", mem_text.len()),
@@ -1773,8 +1870,21 @@ impl AgentRuntime {
             )
         };
 
-        // Build system prompt.
-        let mut system_prompt = build_system_prompt(&ws_ctx, &self.skills, &self.config.raw);
+// Build system prompt — cached for entire gateway lifetime.
+        // Only rebuilt on gateway restart.
+        if self.cached_system_prompt.is_none() {
+            let prompt = build_system_prompt(&ws_ctx, &self.skills, &self.config.raw);
+            // DEBUG: dump full system prompt to file for inspection
+            if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
+                let dump_path = crate::config::loader::base_dir().join("debug_system_prompt.txt");
+                if let Err(e) = std::fs::write(&dump_path, &prompt) {
+                    tracing::warn!("failed to dump system prompt: {e}");
+                }
+                tracing::info!(path = %dump_path.display(), len = prompt.len(), "dumped system prompt");
+            }
+            self.cached_system_prompt = Some(prompt);
+        }
+        let mut system_prompt = self.cached_system_prompt.clone().expect("just set");
 
         // Detect parallelism keywords in user message and inject task-agent hint.
         {
@@ -1800,72 +1910,18 @@ impl AgentRuntime {
             }
         }
 
-        // DEBUG: dump full system prompt to file for inspection
-        if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
-            let dump_path = crate::config::loader::base_dir().join("debug_system_prompt.txt");
-            let _ = std::fs::write(&dump_path, &system_prompt);
-            tracing::info!(path = %dump_path.display(), len = system_prompt.len(), "dumped system prompt");
-        }
+        // --- Dynamic context: injected into system prompt suffix ---
+        // Only truly dynamic, per-turn content goes here. Static rules belong
+        // in the base system prompt. Auto-recall memories are removed — LLM
+        // uses the memory tool to search when needed. Date is removed — LLM
+        // uses shell commands when it needs the current date/time.
+        let mut dynamic_ctx = Vec::<String>::new();
 
         // Loop A (organic evolution): collect recalled memory IDs for feedback.
-        let mut auto_recalled_ids = std::collections::HashSet::<String>::new();
-
-        // Auto-Recall (AGENTS.md §31): hybrid vector+BM25 recall before prompt.
-        if let Some(ref mem) = self.memory
-            && !text.trim().is_empty()
-        {
-            let scope = format!("agent:{}", self.handle.id);
-            let mem_cfg = &self.config.raw.memory;
-            let recall_top_k = mem_cfg.as_ref().and_then(|m| m.recall_top_k).unwrap_or(10);
-            let recall_final_k = mem_cfg.as_ref().and_then(|m| m.recall_final_k).unwrap_or(5);
-            // 1. Vector recall.
-            let vec_hits = {
-                let mut guard = mem.lock().await;
-                guard
-                    .search(text, Some(&scope), recall_top_k)
-                    .await
-                    .unwrap_or_default()
-            };
-            // 2. BM25 recall (tantivy).
-            let bm25_hits = self
-                .store
-                .search
-                .search(text, Some(&scope), recall_top_k)
-                .unwrap_or_default();
-            // 3. Fuse with Reciprocal Rank Fusion (k=60), return top final_k.
-            let vec_count = vec_hits.len();
-            let bm25_count = bm25_hits.len();
-            let results = rrf_fuse(vec_hits, bm25_hits, recall_final_k);
-            tracing::debug!(
-                vec_count,
-                bm25_count,
-                fused = results.len(),
-                "auto-recall results"
-            );
-            // Loop A (organic evolution): track recalled memory IDs for feedback.
-            for doc in &results {
-                auto_recalled_ids.insert(doc.id.clone());
-            }
-            if !results.is_empty() {
-                let now_ts = chrono::Utc::now().timestamp();
-                let mem_block = format!(
-                    "<relevant-memories>\n{}\n</relevant-memories>",
-                    results
-                        .iter()
-                        .map(|d| {
-                            let age = memory_age_label(now_ts, d.created_at);
-                            format!("- [{}] {} ({})", d.kind, d.display_text(), age)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                );
-                if system_prompt.is_empty() {
-                    system_prompt = mem_block;
-                } else {
-                    system_prompt = format!("{system_prompt}\n\n{mem_block}");
-                }
-            }
-        }
+        // Auto-recall is disabled — LLM uses the memory tool to search when needed.
+        // This avoids injecting dynamic content into user messages which would break
+        // prefix KV cache across turns.
+        let auto_recalled_ids = std::collections::HashSet::<String>::new();
 
         // Background context injection (/ctx).
         let btw_block = self
@@ -1873,8 +1929,7 @@ impl AgentRuntime {
             .to_prompt_block_relevant(session_key, channel, text)
             .await;
         if !btw_block.is_empty() {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(&btw_block);
+            dynamic_ctx.push(btw_block);
         }
 
         // Plugin hook: before_prompt_build (AGENTS.md §20).
@@ -1903,27 +1958,6 @@ impl AgentRuntime {
             })
             .unwrap_or("anthropic/claude-sonnet-4-6")
             .to_owned();
-
-        // Channel-aware formatting hints for IM channels (feishu, dingtalk, etc.)
-        if channel == "feishu" || channel == "dingtalk" || channel == "wecom" {
-            system_prompt.push_str(concat!(
-                "\n\n[Output format rules for IM chat]\n",
-                "- Never use Markdown headings (#, ##, ###).\n",
-                "- Use **bold text** or 【section title】 for sections.\n",
-                "- Use 1. or - for lists.\n",
-                "- Use > for important quotes.\n",
-                "- Do NOT use Markdown tables (|---|). Use \"label: value\" format instead.\n",
-                "\n[Data integrity rules - CRITICAL]\n",
-                "- NEVER truncate or shorten ANY text, strings, numbers, or identifiers.\n",
-                "- Copy ALL values EXACTLY: UUIDs, IDs, IP addresses, paths, URLs, code, data.\n",
-                "- UUIDs: 36 chars (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).\n",
-                "- IP addresses: complete (127.0.0.1 not 7.0.0.1).\n",
-                "- If you see truncated data in context, report it as incomplete.\n",
-                "\n[Tool usage rules]\n",
-                "- For ANY question about real-time data (prices, weather, news, dates, events), you MUST call web_search first. NEVER answer from memory.\n",
-                "- For shell commands, file operations, use exec/read/write tools.\n",
-            ));
-        }
 
         // Build tool list from skills and registered agents (local + remote).
         // Tool selection: toolsEnabled -> toolset level -> tools whitelist
@@ -1980,6 +2014,12 @@ impl AgentRuntime {
                 all.retain(|t| !GROUP_BLOCKED_TOOLS.contains(&t.name.as_str()));
             }
 
+            // Internal channels (heartbeat/cron/system): only memory tool
+            if session_key.starts_with("heartbeat:") || session_key.starts_with("cron:") || session_key.starts_with("system:") {
+                const INTERNAL_ALLOWED: &[&str] = &["memory"];
+                all.retain(|t| INTERNAL_ALLOWED.contains(&t.name.as_str()));
+            }
+
             // Channel-specific tool filtering: only keep the *_actions tool
             // that matches the current channel, strip all others (~500 tokens
             // saved per call).
@@ -2010,76 +2050,136 @@ impl AgentRuntime {
             all
         };
 
-        // Check vision support before loading session (avoids borrow conflict).
-        let vision = model_supports_vision(&model, &self.config);
+        // Cache tools for compaction KV cache reuse.
+        self.cached_tools = tools.clone();
 
-        // Load or initialise session history.
+        // Check vision support before loading session (avoids borrow conflict).
+        let kv_mode = self.config.agents.defaults.kv_cache_mode.unwrap_or(1);
+        // Always detect vision capability — used to decide which model describes images.
+        // kvCacheMode >= 1: images are described then stored as text (never base64 in session).
+        // kvCacheMode = 0: images kept as base64 in session for vision models.
+        let model_has_vision = model_supports_vision(&model, &self.config);
+        let vision = if kv_mode >= 1 { false } else { model_has_vision };
+
+        // ---------------------------------------------------------------
+        // Media processing: convert images/videos to text descriptions.
+        // Done BEFORE load_session() to avoid borrow conflicts with self.
+        // Session stores ONLY text — no base64, no binary blobs.
+        // This preserves KV cache and prevents context bloat.
+        // ---------------------------------------------------------------
+        let mut media_descriptions = Vec::<String>::new();
+        let mut vision_images_for_current_turn = Vec::<String>::new(); // base64 URIs for vision model
+
+        for img in &images {
+            if img.mime_type.starts_with("video/") {
+                // Video: generate text placeholder (transcript support is TODO).
+                let desc = crate::agent::context_mgr::describe_video(None, None);
+                media_descriptions.push(desc);
+            } else {
+                // Image: get text description via vision model.
+                // If current model supports vision, also keep the image for the
+                // current LLM turn (so it sees the original).
+                if vision {
+                    // Current model can see images — keep for this turn's API call.
+                    if let Some(compressed) = compress_image_for_llm(&img.data) {
+                        vision_images_for_current_turn.push(compressed);
+                    } else {
+                        vision_images_for_current_turn.push(img.data.clone());
+                    }
+                }
+
+                // Generate text description for session storage.
+                // Use current model if vision-capable (even in kv_cache_mode >= 1,
+                // the image description is a separate LLM call that doesn't pollute
+                // the main session's KV cache). Otherwise find a vision model.
+                let vision_model = if model_has_vision {
+                    model.clone()
+                } else {
+                    // Try image model config, then fallback to known vision providers.
+                    self.handle.config.model.as_ref()
+                        .and_then(|m| m.image.as_deref())
+                        .or_else(|| self.config.agents.defaults.model.as_ref()
+                            .and_then(|m| m.image.as_deref()))
+                        .map(|s| s.to_owned())
+                        .unwrap_or_else(|| {
+                            // Auto-detect a vision-capable provider from config.
+                            let vision_providers = ["doubao", "gemini", "openai", "qwen"];
+                            for vp in vision_providers {
+                                let has_key = self.config.model.models.as_ref()
+                                    .and_then(|m| m.providers.get(vp))
+                                    .and_then(|p| p.api_key.as_ref())
+                                    .is_some()
+                                    || std::env::var(format!("{}_API_KEY", vp.to_uppercase())).is_ok();
+                                if has_key {
+                                    return match vp {
+                                        "doubao" => "doubao/doubao-seed-2-0-pro-260215".to_owned(),
+                                        "gemini" => "gemini/gemini-2.0-flash".to_owned(),
+                                        "openai" => "openai/gpt-4o-mini".to_owned(),
+                                        "qwen" => "qwen/qwen-vl-max".to_owned(),
+                                        _ => format!("{vp}/default"),
+                                    };
+                                }
+                            }
+                            tracing::warn!("no vision-capable provider found for image description");
+                            String::new() // no vision model available
+                        })
+                };
+
+                if vision_model.is_empty() {
+                    media_descriptions.push("[图片] (无视觉模型可用)".to_owned());
+                } else {
+                    let desc = crate::agent::context_mgr::describe_image_via_llm(
+                        &img.data, &vision_model, &mut self.failover, &self.providers,
+                    ).await;
+                    match desc {
+                        Some(d) => media_descriptions.push(format!("[图片] {d}")),
+                        None => media_descriptions.push("[图片] (无法生成描述)".to_owned()),
+                    }
+                }
+            }
+        }
+
+        // Build the persisted message: user text + media descriptions (text only).
+        let persist_text = if media_descriptions.is_empty() {
+            text.to_owned()
+        } else {
+            format!("{}\n\n{}", text, media_descriptions.join("\n"))
+        };
+
+        // NOW load session (after media processing is done, no more self borrows).
         let session_messages = self.load_session(session_key);
 
-        // Append user message to session.
-        let images = if vision {
-            images
+        // First user message in session: prepend session metadata (date, timezone,
+        // channel). Stored in session so it becomes part of the stable prefix
+        // for KV cache — never changes across turns.
+        // Also triggers after /clear (session may contain a summary but no user messages).
+        let has_user_msg = session_messages.iter().any(|m| m.role == Role::User);
+        let persist_text = if !has_user_msg {
+            let now = chrono::Local::now();
+            let tz = now.format("%Z").to_string();
+            let session_meta = format!(
+                "[Session started: {} {}, {}, via {}]",
+                now.format("%Y-%m-%d %H:%M"),
+                now.format("%A"),
+                tz,
+                channel,
+            );
+            format!("{session_meta}\n{persist_text}")
         } else {
-            if !images.is_empty() {
-                info!(
-                    "model {model} does not support vision, stripping {} image(s)",
-                    images.len()
-                );
-            }
-            vec![]
+            persist_text
         };
-        // Compress images before sending to LLM to save tokens.
-        // Skip compression for video attachments — they go to Files API directly.
-        let compressed_images: Vec<_> = images
-            .iter()
-            .filter_map(|img| {
-                if img.mime_type.starts_with("video/") {
-                    // Pass video through without compression
-                    return Some(img.clone());
-                }
-                compress_image_for_llm(&img.data).map(|data| super::registry::ImageAttachment {
-                    data,
-                    mime_type: "image/jpeg".to_owned(),
-                })
-            })
-            .collect();
-        let content = if compressed_images.is_empty() && images.is_empty() {
-            MessageContent::Text(text.to_owned())
-        } else {
-            let imgs = if compressed_images.is_empty() {
-                &images
-            } else {
-                &compressed_images
-            };
-            let mut parts = vec![ContentPart::Text {
-                text: text.to_owned(),
-            }];
-            for img in imgs {
-                parts.push(ContentPart::Image {
-                    url: img.data.clone(),
-                });
-            }
-            MessageContent::Parts(parts)
-        };
-        let user_msg = Message {
+
+        let persist_msg = Message {
             role: Role::User,
-            content,
-        };
-        // Store stripped version in session (no image base64 to avoid bloating).
-        // The full user_msg with images is only used for the current LLM call.
-        let persist_msg = if images.is_empty() {
-            user_msg.clone()
-        } else {
-            Message {
-                role: Role::User,
-                content: MessageContent::Text(format!("{text} [image attached]")),
-            }
+            content: MessageContent::Text(persist_text),
         };
         session_messages.push(persist_msg.clone());
-        let _ = self.store.db.append_message(
+        if let Err(e) = self.store.db.append_message(
             session_key,
             &serde_json::to_value(&persist_msg).unwrap_or_default(),
-        );
+        ) {
+            tracing::warn!("failed to persist user message: {e:#}");
+        }
 
         // Timeout wrapper.
         let timeout_secs = self
@@ -2159,9 +2259,21 @@ impl AgentRuntime {
                     LoopDetector::new(usize::MAX, usize::MAX)
                 }
             },
-            has_images: !images.is_empty(),
-            user_msg_with_images: if !images.is_empty() {
-                Some(user_msg.clone())
+            has_images: !vision_images_for_current_turn.is_empty(),
+            user_msg_with_images: if !vision_images_for_current_turn.is_empty() {
+                // Build a multimodal message for the current LLM turn only.
+                // The persisted message is text-only; this adds images back for vision.
+                let base_text = match &persist_msg.content {
+                    MessageContent::Text(t) => t.clone(),
+                    MessageContent::Parts(p) => p.iter().filter_map(|part| {
+                        if let ContentPart::Text { text } = part { Some(text.as_str()) } else { None }
+                    }).collect::<Vec<_>>().join(""),
+                };
+                let mut parts = vec![ContentPart::Text { text: base_text }];
+                for img_uri in &vision_images_for_current_turn {
+                    parts.push(ContentPart::Image { url: img_uri.clone() });
+                }
+                Some(Message { role: Role::User, content: MessageContent::Parts(parts) })
             } else {
                 None
             },
@@ -2170,9 +2282,48 @@ impl AgentRuntime {
             loop_warning_triggered: false,
         };
 
-        // On-demand skill injection: match user text against skill
-        // descriptions and inject full prompt for relevant skills.
+        // --- Plugins & Skills: cached, frozen at session start ---
+        // On first turn: build and cache. On subsequent turns: detect new
+        // additions and append as trailing system messages. On compact/`/new`:
+        // rebuild (handled by invalidate_plugins_skills_cache()).
+
+        // Build/cache plugins system message.
+        // TODO: populate from self.plugins when plugin system is merged.
+        if self.cached_plugins_system.is_none() {
+            // Placeholder — will be populated after jimeng-automation merge.
+            // self.cached_plugins_system = Some(build_plugins_system(&self.plugins));
+        }
+
+        // Build/cache skills system message.
+        if self.cached_skills_system.is_none() {
+            let (msg, snapshot) = Self::build_skills_system_msg(&self.skills);
+            self.cached_skills_system = msg;
+            self.cached_skills_snapshot = snapshot;
+        }
+
+        // Detect newly added skills since cache was frozen.
+        // New skills are appended as trailing system messages, not merged
+        // into the cached [2] — this preserves KV cache prefix.
+        let mut new_skills_tail: Vec<String> = Vec::new();
         {
+            // Detect newly added skills
+            let mut current_names: Vec<String> = self.skills.all()
+                .map(|s| s.name.clone())
+                .collect();
+            current_names.sort();
+            for name in &current_names {
+                if !self.cached_skills_snapshot.contains(name) {
+                    if let Some(skill) = self.skills.all().find(|s| &s.name == name) {
+                        new_skills_tail.push(format!(
+                            "<skill name=\"{}\" version=\"{}\">\n{}\n</skill>",
+                            skill.name,
+                            skill.version.as_deref().unwrap_or(""),
+                            skill.prompt.trim(),
+                        ));
+                    }
+                }
+            }
+            // Also match skills based on current request text
             let matched = match_skills(text, &self.skills);
             if !matched.is_empty() {
                 let skill_prompts: String = matched
@@ -2198,15 +2349,17 @@ impl AgentRuntime {
             }
         }
 
+        let plugins_system = self.cached_plugins_system.clone();
+        let skills_system = self.cached_skills_system.clone();
+
         let reply = time::timeout(
             Duration::from_secs(timeout_secs),
             self.agent_loop(
-                &mut ctx,
-                &model,
-                &system_prompt,
-                tools,
-                extra_tools,
-                abort_flag.clone(),
+                &mut ctx, &model, &system_prompt,
+                plugins_system.as_deref(),
+                skills_system.as_deref(),
+                tools, extra_tools, abort_flag.clone(),
+                dynamic_ctx, new_skills_tail,
             ),
         )
         .await
@@ -2341,9 +2494,25 @@ impl AgentRuntime {
         }
 
         // Auto-Capture (AGENTS.md §31): persist user message as memory note.
+        // Threshold is 8 bytes (not 20) so short messages with key data like
+        // "手机号18674030927" (20 bytes) are not silently dropped.
+        // Messages containing long digit sequences (phone numbers, IDs, codes)
+        // get higher importance so they survive memory decay.
+        let has_key_digits = {
+            let mut run = 0usize;
+            let mut max_run = 0usize;
+            for b in text.bytes() {
+                if b.is_ascii_digit() { run += 1; max_run = max_run.max(run); } else { run = 0; }
+            }
+            max_run >= 8 // 8+ consecutive digits = phone number / ID / code
+        };
+        // Skip auto-capture for internal channels — heartbeat/cron/system
+        // don't need long-term memory and would pollute user recall results.
+        let internal_channel = matches!(channel, "heartbeat" | "cron" | "system");
         if let Some(ref mem) = self.memory
-            && text.len() > 20
+            && text.len() > 8
             && !reply.text.starts_with(NO_REPLY_TOKEN)
+            && !internal_channel
         {
             let doc_id = Uuid::new_v4().to_string();
             let doc_scope = format!("agent:{}", self.handle.id);
@@ -2355,14 +2524,19 @@ impl AgentRuntime {
                 created_at: 0, // backfilled in MemoryStore::add()
                 accessed_at: 0,
                 access_count: 0,
-                importance: 0.5,
+                // Bump importance for messages with phone numbers / long IDs so
+                // they survive memory decay and compaction fact extraction.
+                importance: if has_key_digits { 0.85 } else { 0.5 },
                 vector: vec![],
                 tier: Default::default(),
                 abstract_text: None,
                 overview_text: None,
                 tags: vec![],
+                pinned: false,
             };
-            let _ = mem.lock().await.add(doc).await;
+            if let Err(e) = mem.lock().await.add(doc).await {
+                tracing::warn!("auto-capture memory add failed: {e:#}");
+            }
             // Also index in tantivy BM25 for hybrid search.
             if let Err(e) = self
                 .store
@@ -2371,10 +2545,36 @@ impl AgentRuntime {
             {
                 tracing::warn!("BM25 index failed for auto-capture doc: {e:#}");
             }
+
+            // Deterministic entity extraction: phone numbers, ID cards, emails.
+            let user_entities = crate::agent::context_mgr::extract_key_entities(text);
+            if !user_entities.is_empty() {
+                crate::agent::context_mgr::write_entity_memories(
+                    mem, &doc_scope, user_entities,
+                ).await;
+            }
+
+            // LLM-based entity extraction moved to compaction — the summary
+            // prompt includes an Entities section, so extraction happens at
+            // compaction time with zero extra LLM calls.
+        }
+
+        // Deterministic entity extraction from assistant reply.
+        if let Some(ref mem) = self.memory {
+            let reply_entities = crate::agent::context_mgr::extract_key_entities(&reply.text);
+            if !reply_entities.is_empty() {
+                let scope = format!("agent:{}", self.handle.id);
+                crate::agent::context_mgr::write_entity_memories(
+                    mem, &scope, reply_entities,
+                ).await;
+            }
         }
 
         // Compaction check (AGENTS.md §15).
         self.compact_if_needed(session_key, &model).await;
+
+        // Evict stale sessions if the cache has grown too large.
+        self.evict_stale_sessions();
 
         // Tick ctx TTL counters after each turn.
         self.btw_manager.tick_turn(session_key).await;
@@ -2437,6 +2637,105 @@ impl AgentRuntime {
         }
     }
 
+    /// Save summaries of all active sessions to long-term memory.
+    ///
+    /// Called before `/new` and `/reset` — since no summary is injected into
+    /// the new session, memory is the only way the LLM can find prior context.
+    /// Uses KV cache mode when available (session is still in memory).
+    async fn save_session_summaries_to_memory(&mut self, model: &str) {
+        if self.memory.is_none() { return; }
+
+        let kv_cache_mode = self.config.agents.defaults.kv_cache_mode.unwrap_or(1);
+
+        // Collect session data upfront to avoid borrow conflicts.
+        let session_data: Vec<(String, String)> = self.sessions.iter()
+            .filter(|(_, msgs)| msgs.len() > 2)
+            .map(|(key, msgs)| {
+                let transcript = Self::msgs_to_text_static(msgs, 16_000);
+                (key.clone(), transcript)
+            })
+            .collect();
+
+        for (session_key, transcript) in &session_data {
+            // Generate summary — try KV cache mode first.
+            let summary = if kv_cache_mode >= 1 {
+                let result = self.compact_with_kv_cache(session_key, model, transcript, None).await;
+                if result.is_some() { result } else {
+                    self.compact_single(model, transcript, None).await
+                }
+            } else {
+                self.compact_single(model, transcript, None).await
+            };
+
+            let Some(summary) = summary else { continue };
+
+            // Store as a session_summary memory doc.
+            let scope = format!("agent:{}", self.handle.id);
+            let doc = crate::agent::memory::MemoryDoc {
+                id: format!("session-summary-{}", uuid::Uuid::new_v4()),
+                scope: scope.clone(),
+                kind: "session_summary".to_owned(),
+                text: summary,
+                vector: vec![],
+                created_at: 0,
+                accessed_at: 0,
+                access_count: 0,
+                importance: 0.8,
+                tier: Default::default(),
+                abstract_text: None,
+                overview_text: None,
+                tags: vec![],
+                pinned: false,
+            };
+            let mem = self.memory.as_ref().expect("checked above");
+            if let Err(e) = mem.lock().await.add(doc).await {
+                tracing::warn!("failed to save session summary to memory: {e:#}");
+            } else {
+                info!(session = %session_key, "session summary saved to memory before clear");
+            }
+        }
+    }
+
+    /// Build the skills system message from the registry (sorted by name).
+    /// Returns (message, sorted_name_snapshot).
+    fn build_skills_system_msg(skills: &crate::skill::SkillRegistry) -> (Option<String>, Vec<String>) {
+        let mut all_skills: Vec<_> = skills.all().collect();
+        all_skills.sort_by(|a, b| a.name.cmp(&b.name));
+        let snapshot: Vec<String> = all_skills.iter().map(|s| s.name.clone()).collect();
+
+        if all_skills.is_empty() {
+            return (None, snapshot);
+        }
+
+        let skill_prompts: String = all_skills
+            .iter()
+            .map(|s| format!(
+                "<skill name=\"{}\" version=\"{}\">\n{}\n</skill>",
+                s.name,
+                s.version.as_deref().unwrap_or(""),
+                s.prompt.trim(),
+            ))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let msg = format!(
+            "## Installed Skills\n\
+             When the user's request matches a skill, follow its instructions \
+             unless a plugin already handles the task.\n\
+             Priority: plugins > skills > built-in tools.\n\n\
+             {skill_prompts}"
+        );
+        (Some(msg), snapshot)
+    }
+
+    /// Invalidate cached plugins and skills system messages.
+    /// Called after compaction or `/new` to force a rebuild on the next turn.
+    pub(crate) fn invalidate_plugins_skills_cache(&mut self) {
+        self.cached_plugins_system = None;
+        self.cached_skills_system = None;
+        self.cached_skills_snapshot.clear();
+    }
+
     /// Load session history from in-memory cache, falling back to redb.
     /// Session key should already be resolved through `resolve_session_key`
     /// (done in `run_turn`) so aliases are transparent.
@@ -2464,9 +2763,13 @@ impl AgentRuntime {
         ctx: &mut RunContext,
         model: &str,
         system_prompt: &str,
+        plugins_system: Option<&str>,
+        skills_system: Option<&str>,
         tools: Vec<ToolDef>,
         extra_tools: Vec<ToolDef>,
         abort_flag: Arc<AtomicBool>,
+        dynamic_ctx: Vec<String>,
+        new_skills_tail: Vec<String>,
     ) -> Result<AgentReply> {
         let pruning_cfg = self.config.agents.defaults.context_pruning.clone();
 
@@ -2722,18 +3025,20 @@ impl AgentRuntime {
             // total history fits within the model's context window minus reserves
             // for the system prompt, tools, and reply generation.
             if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
-                apply_context_budget_trim(sess, context_tokens, system_prompt, &tools);
+                apply_context_budget_trim(sess, context_tokens, &system_prompt, &tools);
             }
 
-            let messages = {
+            // Build API copy of messages — clone from session, then inject
+            // dynamic context and vision images. Session storage is NOT modified.
+            let mut messages = {
                 let mut raw = self
                     .sessions
                     .get(&ctx.session_key)
                     .cloned()
                     .unwrap_or_default();
-                // Replace the last user message with the full version that
-                // includes image data (session stores a stripped [image attached]
-                // placeholder to avoid bloating persistent storage).
+
+                // For vision models: replace last user message with multimodal
+                // version containing original images (only for this API call).
                 if ctx.has_images {
                     if let Some(last) = raw.last_mut() {
                         if last.role == Role::User {
@@ -2741,22 +3046,64 @@ impl AgentRuntime {
                         }
                     }
                 }
-                // Strip image data URIs from older messages.
-                let stripped = strip_old_images(raw);
+
+                // Insert plugins and skills as system messages at the front
+                // of history. After provider prepends the main system prompt [0],
+                // the final order is:
+                //   [0] system — main prompt (stable, never changes)
+                //   [1] system — plugins (highest priority, overrides skills/built-in)
+                //   [2] system — skills (overrides built-in tools)
+                //   [3+] history — user/assistant/tool messages
+                // Insert in reverse order since each insert(0, ...) pushes previous ones down.
+                if let Some(skills) = skills_system {
+                    raw.insert(0, Message {
+                        role: Role::System,
+                        content: MessageContent::Text(skills.to_owned()),
+                    });
+                }
+                if let Some(plugins) = plugins_system {
+                    raw.insert(0, Message {
+                        role: Role::System,
+                        content: MessageContent::Text(plugins.to_owned()),
+                    });
+                }
+
+                // Append newly installed skills as trailing system messages.
+                // These were added after the cached [2] was frozen — appending
+                // at the tail preserves the KV cache prefix.
+                for skill_block in &new_skills_tail {
+                    raw.push(Message {
+                        role: Role::System,
+                        content: MessageContent::Text(format!(
+                            "## New Skill Installed\n{skill_block}"
+                        )),
+                    });
+                }
+
+                // Inject remaining dynamic context (btw /ctx) as a trailing
+                // system message after all history. Session storage is unchanged.
+                if !dynamic_ctx.is_empty() {
+                    let ctx_block = dynamic_ctx.join("\n\n");
+                    raw.push(Message {
+                        role: Role::System,
+                        content: MessageContent::Text(ctx_block),
+                    });
+                }
+
                 // Repair transcript: ensure all tool_calls have matching tool_results.
-                // This fixes orphaned tool_calls from interrupted sessions.
-                let repair_result = repair_tool_result_pairing(stripped);
+                let repair_result = repair_tool_result_pairing(raw);
 
                 // Persist any synthetic tool results to session storage
                 // so they don't need to be added again on the next turn.
                 if !repair_result.synthetic_messages.is_empty() {
                     for synthetic in &repair_result.synthetic_messages {
-                        let _ = self.store.db.append_message(
+                        if let Err(e) = self.store.db.append_message(
                             &ctx.session_key,
                             &serde_json::to_value(synthetic).unwrap_or_default(),
-                        );
+                        ) {
+                            tracing::warn!("failed to persist synthetic message: {e:#}");
+                        }
                     }
-                    // Also update in-memory session cache
                     if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
                         sess.extend(repair_result.synthetic_messages.clone());
                     }
@@ -2807,35 +3154,45 @@ impl AgentRuntime {
             };
 
             let msg_count = messages.len();
-            let approx_tokens: usize = messages.iter().map(msg_tokens).sum();
-            self.handle
-                .last_ctx_tokens
-                .store(approx_tokens, std::sync::atomic::Ordering::Relaxed);
-            info!(session = %ctx.session_key, msg_count, approx_tokens, model = %model, "LLM call: context size");
+            let msg_tokens_sum: usize = messages.iter().map(msg_tokens).sum();
+            // Include system prompt + tools in total context estimate.
+            let sys_tokens = estimate_tokens(system_prompt);
+            let tools_tokens: usize = tools.iter()
+                .map(|t| estimate_tokens(&t.name) + estimate_tokens(&t.description) + estimate_tokens(&t.parameters.to_string()))
+                .sum();
+            let approx_tokens = msg_tokens_sum + sys_tokens + tools_tokens;
+            self.handle.last_ctx_tokens.store(approx_tokens, std::sync::atomic::Ordering::Relaxed);
+            info!(session = %ctx.session_key, msg_count, approx_tokens, sys_tokens, tools_tokens, msg_tokens = msg_tokens_sum, model = %model, "LLM call: context size");
 
-            // Context usage awareness: inject hint when usage is high.
-            // This goes into the system prompt so the LLM can self-adjust
-            // (shorter outputs, avoid re-reading files, etc.).
-            let effective_system = if approx_tokens > 0 && context_tokens > 0 {
+            // Context usage awareness: inject hint into the LAST user message
+            // (not system prompt) to preserve KV cache prefix stability.
+            if approx_tokens > 0 && context_tokens > 0 {
                 let usage_pct = (approx_tokens * 100) / context_tokens;
-                if usage_pct >= 90 {
-                    format!(
-                        "{system_prompt}\n\n[Context usage: {usage_pct}% — CRITICAL. \
+                let usage_hint = if usage_pct >= 90 {
+                    Some(format!("[Context usage: {usage_pct}% — CRITICAL. \
                         Keep responses very concise. Do not re-read files already in context. \
-                        Suggest user start a new session if task is complete.]"
-                    )
+                        Suggest user start a new session if task is complete.]"))
                 } else if usage_pct >= 70 {
-                    format!(
-                        "{system_prompt}\n\n[Context usage: {usage_pct}%. \
+                    Some(format!("[Context usage: {usage_pct}%. \
                         Optimize: keep tool outputs short (use offset/limit for reads, \
-                        pipe to head/tail for commands). Avoid re-reading files already in context.]"
-                    )
+                        pipe to head/tail for commands). Avoid re-reading files already in context.]"))
                 } else {
-                    system_prompt.to_owned()
+                    None
+                };
+                if let Some(hint) = usage_hint {
+                    if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == Role::User) {
+                        match &mut last_user.content {
+                            MessageContent::Text(t) => {
+                                t.push_str(&format!("\n\n{hint}"));
+                            }
+                            MessageContent::Parts(parts) => {
+                                parts.push(ContentPart::Text { text: format!("\n\n{hint}") });
+                            }
+                        }
+                    }
                 }
-            } else {
-                system_prompt.to_owned()
-            };
+            }
+            let effective_system = system_prompt.to_owned();
 
             // Resolve max_tokens with priority: config > built-in defaults > 8192
             let (provider_name, model_id) =
@@ -3239,19 +3596,31 @@ impl AgentRuntime {
             // emit tool calls as XML text instead of proper function_call format.
             // Detect <tool_call>/<function=...> patterns and parse them.
             if tool_calls.is_empty() && text_buf.contains("<function=") {
-                let re = regex::Regex::new(
-                    r#"<function=(\w+)>\s*<parameter=(\w+)>\s*([\s\S]*?)\s*</parameter>\s*</function>"#
-                ).unwrap();
-                for cap in re.captures_iter(&text_buf) {
-                    let name = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-                    let param = cap.get(2).map(|m| m.as_str()).unwrap_or("");
-                    let value = cap.get(3).map(|m| m.as_str().trim()).unwrap_or("");
-                    if !name.is_empty() {
-                        let input = json!({ param: value });
-                        let id = format!("rescued_{name}_{}", tool_calls.len());
-                        tracing::info!(name, param, "agent_loop: rescued tool call from text");
-                        tool_calls.push((id, name.to_owned(), input));
+                // Match <function=NAME> ... </function> blocks, then extract
+                // all <parameter=KEY>VALUE</parameter> pairs within each block.
+                let fn_re = regex::Regex::new(
+                    r#"<function=(\w+)>([\s\S]*?)</function>"#
+                ).expect("fn_re compile");
+                let param_re = regex::Regex::new(
+                    r#"<parameter=(\w+)>([\s\S]*?)</parameter>"#
+                ).expect("param_re compile");
+                for fn_cap in fn_re.captures_iter(&text_buf) {
+                    let name = fn_cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                    let body = fn_cap.get(2).map(|m| m.as_str()).unwrap_or("");
+                    if name.is_empty() {
+                        continue;
                     }
+                    let mut input = serde_json::Map::new();
+                    for p_cap in param_re.captures_iter(body) {
+                        let key = p_cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                        let val = p_cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+                        if !key.is_empty() {
+                            input.insert(key.to_owned(), json!(val));
+                        }
+                    }
+                    let id = format!("rescued_{name}_{}", tool_calls.len());
+                    tracing::info!(name, params = ?input.keys().collect::<Vec<_>>(), "agent_loop: rescued tool call from text");
+                    tool_calls.push((id, name.to_owned(), Value::Object(input)));
                 }
                 if !tool_calls.is_empty() {
                     // Clear the text since it was a tool call, not a real reply.
@@ -3267,16 +3636,23 @@ impl AgentRuntime {
                 "agent_loop: stream finished"
             );
             if tool_calls.is_empty() {
-                let assistant_msg = Message {
-                    role: Role::Assistant,
-                    content: MessageContent::Text(text_buf.clone()),
-                };
-                let _ = self.store.db.append_message(
-                    &ctx.session_key,
-                    &serde_json::to_value(&assistant_msg).unwrap_or_default(),
-                );
-                if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
-                    sess.push(assistant_msg);
+                // Only persist non-empty assistant replies to session.
+                // Empty responses pollute history and confuse the LLM on
+                // subsequent turns (it sees its own empty reply and mimics it).
+                if !text_buf.trim().is_empty() {
+                    let assistant_msg = Message {
+                        role: Role::Assistant,
+                        content: MessageContent::Text(text_buf.clone()),
+                    };
+                    let _ = self.store.db.append_message(
+                        &ctx.session_key,
+                        &serde_json::to_value(&assistant_msg).unwrap_or_default(),
+                    );
+                    if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
+                        sess.push(assistant_msg);
+                    }
+                } else {
+                    tracing::debug!(session = %ctx.session_key, "skipping empty assistant reply (not persisted)");
                 }
 
                 // Broadcast turn-done event to SSE subscribers.
@@ -3574,8 +3950,9 @@ impl AgentRuntime {
 
                 tool_images.extend(result_images);
 
-                // send_file tool: images go to tool_images, other files to tool_files.
-                if tool_name == "send_file" {
+                // Auto-send files: any tool returning __send_file=true queues the
+                // file for delivery. Images go to tool_images, others to tool_files.
+                {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result_text) {
                         if v.get("__send_file")
                             .and_then(|b| b.as_bool())
@@ -3627,6 +4004,10 @@ impl AgentRuntime {
                                         "video/mp4"
                                     } else if lower.ends_with(".mp3") {
                                         "audio/mpeg"
+                                    } else if lower.ends_with(".ogg") {
+                                        "audio/ogg"
+                                    } else if lower.ends_with(".opus") {
+                                        "audio/opus"
                                     } else if lower.ends_with(".zip") {
                                         "application/zip"
                                     } else {
@@ -3986,6 +4367,7 @@ impl AgentRuntime {
             "web_browser" | "browser" => return self.tool_web_browser(ctx, args).await,
             "computer_use" => return self.tool_computer_use(args).await,
             "image_gen" | "image" => return self.tool_image(args).await,
+            "video_gen" | "video" => return self.tool_video(args).await,
             "pdf" => return self.tool_pdf(args).await,
             "text_to_voice" | "text_to_speech" | "tts" => return self.tool_tts(args).await,
             "send_message" | "message" => return self.tool_message(args).await,
@@ -4257,7 +4639,14 @@ impl AgentRuntime {
 
     pub(crate) async fn tool_memory_put(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let text = args["text"].as_str().unwrap_or("").to_owned();
-        let scope = args["scope"].as_str().unwrap_or(&ctx.agent_id).to_owned();
+        // Internal channels (heartbeat/cron/system) get a separate scope so
+        // their memories don't pollute normal conversation auto-recall.
+        let default_scope = if matches!(ctx.channel.as_str(), "heartbeat" | "cron" | "system") {
+            format!("agent:{}:{}", ctx.agent_id, ctx.channel)
+        } else {
+            ctx.agent_id.clone()
+        };
+        let scope = args["scope"].as_str().unwrap_or(&default_scope).to_owned();
         let kind = args["kind"].as_str().unwrap_or("note").to_owned();
         let id = args["id"]
             .as_str()
@@ -4283,6 +4672,7 @@ impl AgentRuntime {
                 abstract_text: None,
                 overview_text: None,
                 tags: vec![],
+                pinned: false,
             })
             .await?;
         drop(store);
@@ -4359,6 +4749,61 @@ impl AgentRuntime {
     // Compaction methods (compact_if_needed, compact_force, compact_inner,
     // msgs_to_text_static, compact_single, extract_key_facts,
     // append_transcript) -> moved to compaction.rs
+
+    // -----------------------------------------------------------------------
+    // Session eviction
+    // -----------------------------------------------------------------------
+
+    /// Remove stale sessions that have been idle longer than
+    /// [`SESSION_IDLE_TTL_SECS`].
+    ///
+    /// Only runs when the number of cached sessions exceeds
+    /// [`MAX_SESSIONS_PER_AGENT`] to avoid unnecessary iteration on small
+    /// caches.  Corresponding entries in `compaction_state` and
+    /// `pending_files` are also removed.
+    fn evict_stale_sessions(&mut self) {
+        if self.sessions.len() <= MAX_SESSIONS_PER_AGENT {
+            return;
+        }
+
+        let ttl = Duration::from_secs(SESSION_IDLE_TTL_SECS);
+        let now = std::time::Instant::now();
+
+        // Collect keys to evict: sessions whose compaction_state timestamp
+        // is older than the TTL, or sessions that have no compaction_state
+        // entry at all (never compacted -- use runtime start as proxy).
+        let stale_keys: Vec<String> = self
+            .sessions
+            .keys()
+            .filter(|key| {
+                if let Some((last_active, _)) = self.compaction_state.get(*key) {
+                    now.duration_since(*last_active) > ttl
+                } else {
+                    // No compaction state -- compare against runtime start.
+                    now.duration_since(self.started_at) > ttl
+                }
+            })
+            .cloned()
+            .collect();
+
+        if stale_keys.is_empty() {
+            return;
+        }
+
+        let count = stale_keys.len();
+        for key in &stale_keys {
+            self.sessions.remove(key);
+            self.compaction_state.remove(key);
+            self.pending_files.remove(key);
+        }
+
+        info!(
+            agent = %self.handle.id,
+            evicted = count,
+            remaining = self.sessions.len(),
+            "evicted stale sessions from in-memory cache"
+        );
+    }
 
     // tool_exec -- moved to tools_file.rs
     // build_subagent_system_prompt, tool_agent_spawn, tool_agent_task,
@@ -4688,6 +5133,7 @@ fn rrf_fuse(
                         abstract_text: None,
                         overview_text: None,
                         tags: vec![],
+                pinned: false,
                     },
                 )
             });

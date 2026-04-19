@@ -14,6 +14,7 @@ pub mod clawhub;
 pub mod crystallizer;
 pub mod loader;
 pub mod manifest;
+pub mod registry;
 pub mod runner;
 
 pub use clawhub::{ClawhubClient, LockFile, LockedSkill, SearchResult, SkillSource};

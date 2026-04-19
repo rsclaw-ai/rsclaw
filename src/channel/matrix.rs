@@ -95,7 +95,8 @@ impl MatrixChannel {
 
             let device_id = self.device_id.clone()
                 .unwrap_or_else(|| {
-                    let local = &self.user_id[1..self.user_id.find(':').unwrap_or(self.user_id.len())];
+                    let local = self.user_id.trim_start_matches('@')
+                        .split(':').next().unwrap_or(&self.user_id);
                     format!("RSCLAW_{}", local.to_uppercase())
                 });
 

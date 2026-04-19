@@ -323,6 +323,212 @@ impl AgentRuntime {
     }
 
     // -----------------------------------------------------------------------
+    // Video generation
+    // -----------------------------------------------------------------------
+
+    /// Generate a video from a text prompt.
+    ///
+    /// Supports Seedance (ByteDance ARK), MiniMax (Hailuo), and Kling (Kuaishou).
+    /// All three use async task-based APIs: submit → poll → download.
+    pub(crate) async fn tool_video(&self, args: Value) -> Result<Value> {
+        let prompt = args["prompt"]
+            .as_str()
+            .ok_or_else(|| anyhow!("video_gen: `prompt` required"))?;
+        let duration = args["duration"].as_u64().unwrap_or(5);
+        let aspect_ratio = args["aspect_ratio"].as_str().unwrap_or("16:9");
+
+        // Resolve configured video model (agents.defaults.model.video or handle override).
+        let user_video_model = self
+            .handle
+            .config
+            .model
+            .as_ref()
+            .and_then(|m| m.video.as_deref())
+            .or_else(|| {
+                self.config
+                    .agents
+                    .defaults
+                    .model
+                    .as_ref()
+                    .and_then(|m| m.video.as_deref())
+            })
+            .map(|s| s.to_owned());
+
+        // Allow caller to override model hint.
+        let model_hint = args["model"].as_str().map(|s| s.to_lowercase());
+
+        // Helper: resolve API key from provider config, then fallback to env var.
+        let resolve_key = |prov: &str, env_name: &str| -> Option<String> {
+            self.config
+                .model
+                .models
+                .as_ref()
+                .and_then(|m| m.providers.get(prov))
+                .and_then(|p| p.api_key.as_ref())
+                .and_then(|k| k.as_plain().map(str::to_owned))
+                .or_else(|| std::env::var(env_name).ok())
+        };
+
+        // Determine provider from configured model or model_hint.
+        let provider = if let Some(hint) = &model_hint {
+            if hint.contains("llama") || hint.contains("local") {
+                "llamacpp"
+            } else if hint.contains("kling") || hint.contains("kuaishou") {
+                "kling"
+            } else if hint.contains("minimax") || hint.contains("hailuo") {
+                "minimax"
+            } else {
+                "doubao"
+            }
+        } else if let Some(ref vm) = user_video_model {
+            let vm = vm.to_lowercase();
+            if vm.contains("llama") || vm.contains("local") || vm.starts_with("http://127.")
+                || vm.starts_with("http://localhost")
+            {
+                "llamacpp"
+            } else if vm.contains("kling") {
+                "kling"
+            } else if vm.contains("minimax") || vm.contains("hailuo") {
+                "minimax"
+            } else {
+                "doubao"
+            }
+        } else {
+            // Auto-detect: check provider config first, then env vars.
+            let has_local = std::env::var("LLAMA_VIDEO_URL").is_ok();
+            let has_ark = resolve_key("doubao", "ARK_API_KEY").is_some();
+            let has_minimax = resolve_key("minimax", "MINIMAX_API_KEY").is_some();
+            let has_kling = resolve_key("kling", "KLING_ACCESS_KEY").is_some()
+                || std::env::var("KLING_ACCESS_KEY").is_ok();
+            if has_local {
+                "llamacpp"
+            } else if has_ark {
+                "doubao"
+            } else if has_minimax {
+                "minimax"
+            } else if has_kling {
+                "kling"
+            } else {
+                return Ok(json!({
+                    "error": "No video provider configured. Configure a provider with API key in rsclaw.json5, or set env vars: LLAMA_VIDEO_URL, ARK_API_KEY, MINIMAX_API_KEY, KLING_ACCESS_KEY+KLING_SECRET_KEY."
+                }));
+            }
+        };
+
+        // Resolve API key for the selected provider from config -> env var.
+        let api_key = match provider {
+            "doubao" => resolve_key("doubao", "ARK_API_KEY"),
+            "minimax" => resolve_key("minimax", "MINIMAX_API_KEY"),
+            "kling" => None, // Kling uses access_key + secret_key pair, resolved inside video_gen_kling
+            "llamacpp" => None, // local, no key needed
+            _ => None,
+        };
+
+        // For Kling, resolve the key pair from config -> env var.
+        let kling_keys = if provider == "kling" {
+            let ak = resolve_key("kling", "KLING_ACCESS_KEY");
+            let sk = self.config.model.models.as_ref()
+                .and_then(|m| m.providers.get("kling"))
+                .and_then(|p| {
+                    // Secret key stored in a second field or as part of api_key "ak:sk" format
+                    p.api_key.as_ref().and_then(|k| k.as_plain().map(str::to_owned))
+                })
+                .or_else(|| std::env::var("KLING_SECRET_KEY").ok());
+            Some((ak, sk))
+        } else {
+            None
+        };
+
+        let ua = self
+            .config
+            .gateway
+            .user_agent
+            .as_deref()
+            .unwrap_or(crate::provider::DEFAULT_USER_AGENT);
+        let client = reqwest::Client::builder()
+            .user_agent(ua)
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
+
+        let prompt_preview: String = prompt.chars().take(80).collect();
+        tracing::info!(provider, prompt = prompt_preview, duration, aspect_ratio, "tool_video: starting");
+
+        let video_url = match provider {
+            "llamacpp" => {
+                video_gen_llamacpp(&client, prompt, duration, aspect_ratio, user_video_model.as_deref()).await?
+            }
+            "doubao" => {
+                let key = api_key.ok_or_else(|| anyhow!("video_gen: no API key for doubao/Seedance"))?;
+                video_gen_seedance(&client, &key, prompt, duration, aspect_ratio, user_video_model.as_deref()).await?
+            }
+            "minimax" => {
+                let key = api_key.ok_or_else(|| anyhow!("video_gen: no API key for MiniMax"))?;
+                video_gen_minimax(&client, &key, prompt, duration, aspect_ratio, user_video_model.as_deref()).await?
+            }
+            "kling" => {
+                let (ak, sk) = kling_keys.unwrap_or((None, None));
+                let access = ak.ok_or_else(|| anyhow!("video_gen: KLING_ACCESS_KEY not configured"))?;
+                let secret = sk.ok_or_else(|| anyhow!("video_gen: KLING_SECRET_KEY not configured"))?;
+                video_gen_kling(&client, &access, &secret, prompt, duration, aspect_ratio, user_video_model.as_deref()).await?
+            }
+            _ => bail!("video_gen: unknown provider {provider}"),
+        };
+
+        // Resolve video to a local temp file (download URL, copy local path, or decode base64).
+        let ext = if video_url.ends_with(".gif") { "gif" } else { "mp4" };
+        let tmp_path = std::env::temp_dir().join(format!(
+            "rsclaw_video_{}.{ext}",
+            chrono::Utc::now().timestamp_millis()
+        ));
+
+        if video_url.starts_with("data:") {
+            // base64 data URI: data:video/mp4;base64,<data>
+            use base64::Engine;
+            let b64 = video_url
+                .splitn(2, ',')
+                .nth(1)
+                .ok_or_else(|| anyhow!("video_gen: malformed data URI"))?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| anyhow!("video_gen: base64 decode failed: {e}"))?;
+            std::fs::write(&tmp_path, &bytes)
+                .map_err(|e| anyhow!("video_gen: write temp file failed: {e}"))?;
+        } else if video_url.starts_with('/') || video_url.starts_with("./") {
+            // Local file path returned by llama.cpp server — copy to our temp path.
+            std::fs::copy(&video_url, &tmp_path)
+                .map_err(|e| anyhow!("video_gen: copy local file failed: {e}"))?;
+        } else {
+            // HTTP URL — download.
+            let dl_client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .unwrap_or_default();
+            let video_bytes = dl_client
+                .get(&video_url)
+                .send()
+                .await
+                .map_err(|e| anyhow!("video_gen: download failed: {e}"))?
+                .bytes()
+                .await
+                .map_err(|e| anyhow!("video_gen: read bytes failed: {e}"))?;
+            std::fs::write(&tmp_path, &video_bytes)
+                .map_err(|e| anyhow!("video_gen: write temp file failed: {e}"))?;
+        }
+
+        let filename = format!("video_{}.{ext}", chrono::Utc::now().format("%Y%m%d_%H%M%S"));
+        let file_size = std::fs::metadata(&tmp_path).map(|m| m.len()).unwrap_or(0);
+        tracing::info!(path = %tmp_path.display(), bytes = file_size, "tool_video: done");
+
+        Ok(json!({
+            "__send_file": true,
+            "path": tmp_path.to_string_lossy(),
+            "filename": filename,
+            "mime_type": if ext == "gif" { "image/gif" } else { "video/mp4" }
+        }))
+    }
+
+    // -----------------------------------------------------------------------
     // TTS (text-to-speech)
     // -----------------------------------------------------------------------
 
@@ -441,26 +647,33 @@ impl AgentRuntime {
             .ok_or_else(|| anyhow!("tts: `text` required"))?;
         let voice = args["voice"].as_str().unwrap_or("default");
 
-        let out_path = std::env::temp_dir().join(format!(
-            "rsclaw_tts_{}{}",
-            chrono::Utc::now().timestamp_millis(),
-            if cfg!(target_os = "windows") {
-                ".wav"
-            } else {
-                ".aiff"
-            }
-        ));
+        // Auto-detect Chinese text and use Chinese voice on macOS.
+        let has_cjk = text.chars().any(|c| {
+            matches!(c, '\u{4e00}'..='\u{9fff}' | '\u{3400}'..='\u{4dbf}')
+        });
+        let effective_voice = if voice == "default" && has_cjk {
+            "Tingting" // macOS Chinese (Mandarin) voice
+        } else {
+            voice
+        };
+
+        let ts = chrono::Utc::now().timestamp_millis();
+        let tmp_dir = std::env::temp_dir();
+        // Output mp3 (most compatible). Feishu converts to opus at send time.
+        let out_path = tmp_dir.join(format!("rsclaw_tts_{ts}.mp3"));
         let out_path_str = out_path.to_string_lossy().to_string();
 
         let is_macos = cfg!(target_os = "macos");
         let is_windows = cfg!(target_os = "windows");
 
         if is_macos {
+            let aiff_path = tmp_dir.join(format!("rsclaw_tts_{ts}.aiff"));
+            let aiff_str = aiff_path.to_string_lossy().to_string();
             let mut cmd = tokio::process::Command::new("say");
-            if voice != "default" {
-                cmd.args(["-v", voice]);
+            if effective_voice != "default" {
+                cmd.args(["-v", effective_voice]);
             }
-            cmd.args(["-o", &out_path_str, text]);
+            cmd.args(["-o", &aiff_str, text]);
             let output = cmd
                 .output()
                 .await
@@ -468,6 +681,21 @@ impl AgentRuntime {
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(anyhow!("tts: say failed: {stderr}"));
+            }
+            // Convert aiff to mp3 via ffmpeg (most compatible format).
+            // Feishu converts to opus at send time.
+            let ffmpeg = tokio::process::Command::new("ffmpeg")
+                .args(["-i", &aiff_str, "-y", "-q:a", "4", &out_path_str])
+                .output()
+                .await;
+            match ffmpeg {
+                Ok(o) if o.status.success() => {
+                    let _ = std::fs::remove_file(&aiff_path);
+                }
+                _ => {
+                    tracing::warn!("tts: ffmpeg not available, using aiff");
+                    let _ = std::fs::rename(&aiff_path, &out_path);
+                }
             }
         } else if is_windows {
             let script = format!(
@@ -509,10 +737,21 @@ $synth.Speak('{}')
             }
         }
 
+        // Return with __send_file so the file is auto-sent to the user
+        // without requiring the LLM to call send_file separately.
+        let filename = std::path::Path::new(&out_path_str)
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| "tts.mp3".to_owned());
         Ok(json!({
+            "__send_file": true,
+            "path": out_path_str,
+            "filename": filename,
             "audio_file": out_path_str,
-            "voice": voice,
-            "chars": text.len()
+            "voice": effective_voice,
+            "chars": text.len(),
+            "auto_sent": true,
+            "note": "Audio file has been auto-sent to the user. Do NOT call send_file again."
         }))
     }
 
@@ -850,4 +1089,400 @@ $synth.Speak('{}')
             )
         }))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Video generation — per-provider free functions
+// ---------------------------------------------------------------------------
+
+/// Generate video via a local llama.cpp-compatible video model server.
+///
+/// Uses the same OpenAI-compatible streaming protocol as regular llama.cpp.
+/// Configure with `LLAMA_VIDEO_URL` (default: `http://127.0.0.1:8080`) and
+/// optionally `LLAMA_VIDEO_MODEL`.
+///
+/// The server is expected to stream the video data and return either:
+/// - A local file path in the response text (e.g. `/tmp/output.mp4`)
+/// - A `data:video/mp4;base64,...` URI
+/// - A `http://127.x.x.x/...` URL pointing to the generated file
+async fn video_gen_llamacpp(
+    client: &reqwest::Client,
+    prompt: &str,
+    duration: u64,
+    aspect_ratio: &str,
+    model_override: Option<&str>,
+) -> anyhow::Result<String> {
+    let base = std::env::var("LLAMA_VIDEO_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_owned());
+    let base = base.trim_end_matches('/');
+    let model = model_override
+        .or_else(|| std::env::var("LLAMA_VIDEO_MODEL").ok().as_deref().map(|_| ""))
+        .unwrap_or("default");
+    let model = if model.is_empty() {
+        std::env::var("LLAMA_VIDEO_MODEL").unwrap_or_else(|_| "default".to_owned())
+    } else {
+        model.to_owned()
+    };
+
+    let system = format!(
+        "You are a video generation model. Generate a {duration}-second video with aspect ratio {aspect_ratio}. \
+         Output the generated video as a file path or base64 data URI."
+    );
+
+    // Use OpenAI-compatible chat completions with streaming.
+    use futures::StreamExt;
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt}
+            ],
+            "stream": true,
+            "max_tokens": 4096
+        }))
+        .timeout(std::time::Duration::from_secs(600))
+        .send()
+        .await
+        .map_err(|e| anyhow!("llamacpp video: request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        bail!("llamacpp video: server returned {status}: {body}");
+    }
+
+    // Collect the full streamed text response.
+    let mut full_text = String::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| anyhow!("llamacpp video: stream error: {e}"))?;
+        let text = String::from_utf8_lossy(&chunk);
+        // SSE lines: "data: {...}\n\n" or "data: [DONE]\n\n"
+        for line in text.lines() {
+            let line = line.trim();
+            if !line.starts_with("data: ") {
+                continue;
+            }
+            let payload = line.strip_prefix("data: ").unwrap_or(line);
+            if payload == "[DONE]" {
+                break;
+            }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(payload) {
+                if let Some(delta) = val.pointer("/choices/0/delta/content").and_then(|v| v.as_str()) {
+                    full_text.push_str(delta);
+                }
+            }
+        }
+    }
+
+    let result = full_text.trim().to_owned();
+    if result.is_empty() {
+        bail!("llamacpp video: empty response from server");
+    }
+
+    tracing::info!(len = result.len(), "llamacpp video: got response");
+
+    // The result is either a file path, a URL, or a base64 data URI —
+    // return it directly; tool_video will handle download/copy.
+    Ok(result)
+}
+
+/// Generate video via ByteDance ARK Seedance 2.0.
+///
+/// API: POST /api/v3/contents/generations/tasks → task_id
+/// Poll: GET /api/v3/contents/generations/tasks/{id} until status == "succeeded"
+async fn video_gen_seedance(
+    client: &reqwest::Client,
+    api_key: &str,
+    prompt: &str,
+    duration: u64,
+    aspect_ratio: &str,
+    model_override: Option<&str>,
+) -> anyhow::Result<String> {
+    let model = model_override.unwrap_or("doubao-seedance-2-0-260128");
+    let base = "https://ark.cn-beijing.volces.com/api/v3";
+
+    // Submit task.
+    let body = json!({
+        "model": model,
+        "content": [{"type": "text", "text": prompt}],
+        "ratio": aspect_ratio,
+        "duration": duration,
+        "watermark": false
+    });
+    let resp: serde_json::Value = client
+        .post(format!("{base}/contents/generations/tasks"))
+        .bearer_auth(&api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow!("seedance: submit failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| anyhow!("seedance: submit parse failed: {e}"))?;
+
+    let task_id = resp["id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("seedance: no task id in response: {resp}"))?
+        .to_owned();
+
+    tracing::info!(task_id, "seedance: task submitted, polling");
+
+    // Poll until done (max 10 min, every 5s).
+    for _ in 0..120 {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let poll: serde_json::Value = client
+            .get(format!("{base}/contents/generations/tasks/{task_id}"))
+            .bearer_auth(&api_key)
+            .send()
+            .await
+            .map_err(|e| anyhow!("seedance: poll failed: {e}"))?
+            .json()
+            .await
+            .map_err(|e| anyhow!("seedance: poll parse failed: {e}"))?;
+
+        let status = poll["status"].as_str().unwrap_or("unknown");
+        tracing::debug!(task_id, status, "seedance: poll");
+
+        match status {
+            "succeeded" => {
+                // ARK content generation response:
+                // {content: [{type:"video_url", video_url:{url:"..."}}]}
+                // Actual API returns {content: {video_url: "https://..."}}
+                // (not array format from docs).
+                let url = poll
+                    .pointer("/content/video_url")
+                    .or_else(|| poll.pointer("/content/0/video_url/url"))
+                    .or_else(|| poll.pointer("/content/0/url"))
+                    .or_else(|| poll.pointer("/result/video_url/url"))
+                    .or_else(|| poll.pointer("/output/url"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("seedance: no video URL in result: {poll}"))?
+                    .to_owned();
+                return Ok(url);
+            }
+            "failed" | "cancelled" => {
+                let msg = poll["error"]["message"]
+                    .as_str()
+                    .or_else(|| poll["message"].as_str())
+                    .unwrap_or("task failed");
+                bail!("seedance: task {task_id} {status}: {msg}");
+            }
+            _ => continue,
+        }
+    }
+    bail!("seedance: task {task_id} timed out after 10 minutes")
+}
+
+/// Generate video via MiniMax (Hailuo) video generation API.
+///
+/// API: POST /v1/video_generation → task_id
+/// Poll: GET /v1/query/video_generation?task_id={id}
+/// File: GET /v1/files/retrieve?file_id={id} → download_url
+async fn video_gen_minimax(
+    client: &reqwest::Client,
+    api_key: &str,
+    prompt: &str,
+    duration: u64,
+    aspect_ratio: &str,
+    model_override: Option<&str>,
+) -> anyhow::Result<String> {
+    let model = model_override.unwrap_or("video-01-director");
+    let base = "https://api.minimaxi.com/v1";
+
+    let resolution = match aspect_ratio {
+        "9:16" => "720x1280",
+        "1:1" => "720x720",
+        _ => "1280x720",
+    };
+
+    // Submit.
+    let resp: serde_json::Value = client
+        .post(format!("{base}/video_generation"))
+        .bearer_auth(&api_key)
+        .json(&json!({
+            "prompt": prompt,
+            "model": model,
+            "duration": duration,
+            "resolution": resolution
+        }))
+        .send()
+        .await
+        .map_err(|e| anyhow!("minimax: submit failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| anyhow!("minimax: submit parse failed: {e}"))?;
+
+    let task_id = resp["task_id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("minimax: no task_id in response: {resp}"))?
+        .to_owned();
+
+    tracing::info!(task_id, "minimax: task submitted, polling");
+
+    // Poll until done.
+    for _ in 0..120 {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let poll: serde_json::Value = client
+            .get(format!("{base}/query/video_generation"))
+            .bearer_auth(&api_key)
+            .query(&[("task_id", task_id.as_str())])
+            .send()
+            .await
+            .map_err(|e| anyhow!("minimax: poll failed: {e}"))?
+            .json()
+            .await
+            .map_err(|e| anyhow!("minimax: poll parse failed: {e}"))?;
+
+        let status = poll
+            .pointer("/task/status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        tracing::debug!(task_id, status, "minimax: poll");
+
+        match status {
+            "Success" => {
+                // file_id → retrieve download URL
+                let file_id = poll
+                    .pointer("/task/file_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("minimax: no file_id in result: {poll}"))?
+                    .to_owned();
+                let file_resp: serde_json::Value = client
+                    .get(format!("{base}/files/retrieve"))
+                    .bearer_auth(&api_key)
+                    .query(&[("file_id", file_id.as_str())])
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("minimax: file retrieve failed: {e}"))?
+                    .json()
+                    .await
+                    .map_err(|e| anyhow!("minimax: file retrieve parse failed: {e}"))?;
+                let url = file_resp
+                    .pointer("/file/download_url")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("minimax: no download_url: {file_resp}"))?
+                    .to_owned();
+                return Ok(url);
+            }
+            "Fail" => {
+                bail!("minimax: task {task_id} failed: {poll}");
+            }
+            _ => continue,
+        }
+    }
+    bail!("minimax: task {task_id} timed out after 10 minutes")
+}
+
+/// Generate video via Kling (Kuaishou) API.
+///
+/// Auth uses JWT (HS256) signed with KLING_ACCESS_KEY + KLING_SECRET_KEY.
+/// API: POST /v1/videos/text2video → task_id
+/// Poll: GET /v1/videos/text2video/{task_id}
+async fn video_gen_kling(
+    client: &reqwest::Client,
+    access_key: &str,
+    secret_key: &str,
+    prompt: &str,
+    duration: u64,
+    aspect_ratio: &str,
+    model_override: Option<&str>,
+) -> anyhow::Result<String> {
+    let model = model_override.unwrap_or("kling-v2-master");
+    let base = "https://api.klingai.com";
+
+    let jwt = kling_jwt(&access_key, &secret_key)?;
+
+    let duration_str = duration.to_string();
+    let resp: serde_json::Value = client
+        .post(format!("{base}/v1/videos/text2video"))
+        .bearer_auth(&jwt)
+        .json(&json!({
+            "model_name": model,
+            "prompt": prompt,
+            "duration": duration_str,
+            "aspect_ratio": aspect_ratio
+        }))
+        .send()
+        .await
+        .map_err(|e| anyhow!("kling: submit failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| anyhow!("kling: submit parse failed: {e}"))?;
+
+    let task_id = resp
+        .pointer("/data/task_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("kling: no task_id in response: {resp}"))?
+        .to_owned();
+
+    tracing::info!(task_id, "kling: task submitted, polling");
+
+    for _ in 0..120 {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        // Refresh JWT (expires in 30 min, but refresh each poll to be safe for long videos).
+        let jwt = kling_jwt(&access_key, &secret_key)?;
+        let poll: serde_json::Value = client
+            .get(format!("{base}/v1/videos/text2video/{task_id}"))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .map_err(|e| anyhow!("kling: poll failed: {e}"))?
+            .json()
+            .await
+            .map_err(|e| anyhow!("kling: poll parse failed: {e}"))?;
+
+        let status = poll
+            .pointer("/data/task_status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        tracing::debug!(task_id, status, "kling: poll");
+
+        match status {
+            "succeed" => {
+                let url = poll
+                    .pointer("/data/task_result/videos/0/url")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("kling: no video URL in result: {poll}"))?
+                    .to_owned();
+                return Ok(url);
+            }
+            "failed" => {
+                let msg = poll
+                    .pointer("/data/task_status_msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("task failed");
+                bail!("kling: task {task_id} failed: {msg}");
+            }
+            _ => continue,
+        }
+    }
+    bail!("kling: task {task_id} timed out after 10 minutes")
+}
+
+/// Build a short-lived JWT for Kling API authentication (HS256).
+fn kling_jwt(access_key: &str, secret_key: &str) -> anyhow::Result<String> {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let now = chrono::Utc::now().timestamp();
+    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(r#"{"alg":"HS256","typ":"JWT"}"#);
+    let payload_json = format!(
+        r#"{{"iss":"{access_key}","exp":{},"nbf":{}}}"#,
+        now + 1800,
+        now - 5
+    );
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload_json);
+    let signing_input = format!("{header}.{payload}");
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret_key.as_bytes())
+        .map_err(|e| anyhow!("kling_jwt: invalid key: {e}"))?;
+    mac.update(signing_input.as_bytes());
+    let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+
+    Ok(format!("{signing_input}.{sig}"))
 }

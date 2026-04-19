@@ -207,9 +207,23 @@ pub async fn cmd_doctor(args: DoctorArgs) -> Result<()> {
         }
 
         if c.gateway.auth_token.is_none() {
-            issues.push(Issue::warn(
-                "gateway.auth.token not set \u{2014} consider setting one for security".to_owned(),
-            ));
+            let config_path = config::loader::base_dir().join("rsclaw.json5");
+            issues.push(Issue {
+                message: "gateway.auth.token not set \u{2014} gateway accepts all connections without auth".to_owned(),
+                fix_hint: Some("auto-generate a 64-char auth token"),
+                fix_fn: Some(Box::new(move || {
+                    let token = super::setup::generate_auth_token();
+                    let content = std::fs::read_to_string(&config_path)?;
+                    let mut val: serde_json::Value = json5::from_str(&content)?;
+                    if val.pointer("/gateway/auth").is_none() {
+                        val["gateway"]["auth"] = serde_json::json!({"token": &token});
+                    } else {
+                        val["gateway"]["auth"]["token"] = serde_json::json!(&token);
+                    }
+                    std::fs::write(&config_path, serde_json::to_string_pretty(&val)?)?;
+                    Ok(format!("generated auth token: {}", &token[..8]))
+                })),
+            });
         }
     }
 

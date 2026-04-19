@@ -366,7 +366,9 @@ impl CronRunner {
     ) -> Self {
         let run_log_dir = data_dir.join("cron");
         let store_path = data_dir.join("cron_store.json");
-        let _ = std::fs::create_dir_all(&run_log_dir);
+        if let Err(e) = std::fs::create_dir_all(&run_log_dir) {
+            tracing::warn!("failed to create cron run log dir: {e}");
+        }
         Self {
             jobs,
             agents,
@@ -641,7 +643,7 @@ impl CronRunner {
                     // using the completion time, so interval-based jobs don't fire early
                 }
 
-                let permit = permit.unwrap();
+                let permit = permit.expect("permit checked above");
                 let job = job.clone();
                 let agents = Arc::clone(&self.agents);
                 let channels = Arc::clone(&self.channels);
@@ -756,7 +758,9 @@ impl CronRunner {
                         result.is_ok(),
                         result.as_ref().err().map(|e| anyhow::anyhow!("{e}")),
                     );
-                    let _ = write_run_log(&run_log_dir, &job.id, entry).await;
+                    if let Err(e) = write_run_log(&run_log_dir, &job.id, entry).await {
+                        tracing::warn!(job_id = %job.id, "failed to write cron run log: {e}");
+                    }
 
                     let error_msg = result.as_ref().err().map(|e| e.to_string());
                     (
@@ -1109,10 +1113,8 @@ fn compute_next_run_from_expr(cron_expr: &str, from_ms: u64, tz: Option<&str>) -
     // Current minute in the target timezone
     let local_now = utc_dt.with_timezone(&tz_for_search);
     let mut cand = local_now
-        .with_second(0)
-        .unwrap()
-        .with_nanosecond(0)
-        .unwrap();
+        .with_second(0).expect("second 0 always valid")
+        .with_nanosecond(0).expect("nanosecond 0 always valid");
     cand += chrono::Duration::minutes(1);
 
     // Search up to 1 year ahead (in local time)
@@ -1148,7 +1150,7 @@ fn compute_next_run_from_expr(cron_expr: &str, from_ms: u64, tz: Option<&str>) -
 fn current_timestamp_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .expect("system clock before UNIX epoch")
         .as_millis() as u64
 }
 
@@ -1464,8 +1466,12 @@ pub fn load_cron_jobs() -> Vec<CronJob> {
                 warn!(err = %e, "failed to migrate legacy cron/jobs.json");
             } else {
                 // Remove legacy file and empty directory
-                let _ = std::fs::remove_file(&legacy);
-                let _ = std::fs::remove_dir(base.join("cron"));
+                if let Err(e) = std::fs::remove_file(&legacy) {
+                    tracing::debug!("failed to remove legacy cron file: {e}");
+                }
+                if let Err(e) = std::fs::remove_dir(base.join("cron")) {
+                    tracing::debug!("failed to remove legacy cron dir: {e}");
+                }
             }
         }
     }

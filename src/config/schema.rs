@@ -267,6 +267,10 @@ pub struct AgentDefaults {
     pub image_gen: Option<Value>,
     pub repo_root: Option<String>,
     pub context_tokens: Option<u32>,
+    /// KV cache mode: 0 = off, 1 = full/append-only (default), 2 = delta/incremental.
+    pub kv_cache_mode: Option<u8>,
+    /// Maximum token budget for /ctx (btw) side queries. Default: 10000.
+    pub btw_tokens: Option<u32>,
     pub timezone: Option<String>,
     pub timestamp: Option<Value>,
     pub thinking: Option<ThinkingConfig>,
@@ -386,6 +390,9 @@ pub struct ModelConfig {
     pub image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_fallbacks: Option<Vec<String>>,
+    /// Text-to-video model, e.g. "doubao/seedance-1-0-lite-t2v-250428".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
     /// Whether to send tool definitions to the model. Default: true.

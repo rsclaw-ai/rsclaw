@@ -50,6 +50,7 @@ fn config_with_echo_agent(port: u16) -> RuntimeConfig {
             channel_stale_event_threshold_minutes: 30,
             channel_max_restarts_per_hour: 10,
             user_agent: None,
+            language: None,
         },
         agents: AgentsRuntime {
             defaults: Default::default(),
