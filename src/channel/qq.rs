@@ -815,6 +815,106 @@ impl Channel for QQBotChannel {
                 }
             }
 
+            // Send file attachments (file_type: 1=image, 2=video, 3=audio, 4=file)
+            for (idx, (filename, mime, path_or_url)) in msg.files.iter().enumerate() {
+                let bytes = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
+                    match self.client.get(path_or_url.as_str()).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            match resp.bytes().await {
+                                Ok(b) if !b.is_empty() => b.to_vec(),
+                                _ => { warn!(idx, "qq: empty file download"); continue; }
+                            }
+                        }
+                        _ => { warn!(idx, "qq: file download failed: {path_or_url}"); continue; }
+                    }
+                } else {
+                    match std::fs::read(path_or_url) {
+                        Ok(b) => b,
+                        Err(e) => { warn!(idx, "qq: failed to read file {path_or_url}: {e}"); continue; }
+                    }
+                };
+
+                let file_type = if mime.starts_with("image/") { 1 }
+                    else if mime.starts_with("video/") { 2 }
+                    else if mime.starts_with("audio/") { 3 }
+                    else { 4 };
+
+                let token = match self.get_token().await {
+                    Ok(t) => t,
+                    Err(e) => { warn!(idx, "qq: failed to get token for file send: {e}"); continue; }
+                };
+
+                // Step 1: upload file
+                let upload_url = if msg.is_group {
+                    format!("{}/v2/groups/{}/files", self.api_base, msg.target_id)
+                } else {
+                    format!("{}/v2/users/{}/files", self.api_base, msg.target_id)
+                };
+                let file_b64 = {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD.encode(&bytes)
+                };
+                let upload_body = json!({
+                    "file_type": file_type,
+                    "file_data": file_b64,
+                    "srv_send_msg": false,
+                });
+                let upload_resp = match self
+                    .client
+                    .post(&upload_url)
+                    .header("Authorization", format!("QQBot {token}"))
+                    .json(&upload_body)
+                    .send()
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => { warn!(idx, "qq: file upload request failed: {e}"); continue; }
+                };
+                if !upload_resp.status().is_success() {
+                    let err = upload_resp.text().await.unwrap_or_default();
+                    warn!(idx, "qq: file upload failed: {err}");
+                    continue;
+                }
+                let resp_body: serde_json::Value = match upload_resp.json().await {
+                    Ok(v) => v,
+                    Err(e) => { warn!(idx, "qq: file upload parse error: {e}"); continue; }
+                };
+                let file_info_str = match resp_body.get("file_info").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_owned(),
+                    None => { warn!(idx, "qq: file upload missing file_info: {resp_body}"); continue; }
+                };
+
+                // Step 2: send message with file reference
+                let msg_id = uuid::Uuid::new_v4().to_string();
+                let send_body = json!({
+                    "msg_type": 7,
+                    "media": { "file_info": file_info_str },
+                    "msg_id": msg_id,
+                });
+                let send_url = if msg.is_group {
+                    format!("{}/v2/groups/{}/messages", self.api_base, msg.target_id)
+                } else {
+                    format!("{}/v2/users/{}/messages", self.api_base, msg.target_id)
+                };
+                match self.client.post(&send_url)
+                    .header("Authorization", format!("QQBot {token}"))
+                    .json(&send_body)
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => {
+                        info!(idx, filename = %filename, file_type, "qq: file sent");
+                    }
+                    Ok(r) => {
+                        let err = r.text().await.unwrap_or_default();
+                        warn!(idx, "qq: file send failed: {err}");
+                    }
+                    Err(e) => {
+                        warn!(idx, "qq: file send request failed: {e}");
+                    }
+                }
+            }
+
             Ok(())
         })
     }

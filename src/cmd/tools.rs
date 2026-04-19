@@ -146,7 +146,7 @@ pub async fn cmd_tools(sub: ToolsCommand) -> Result<()> {
 
 fn cmd_list() {
     banner(&format!(
-        "rsclaw tools {}",
+        "rsclaw tools v{}",
         env!("RSCLAW_BUILD_VERSION")
     ));
     println!();
@@ -173,7 +173,7 @@ fn cmd_list() {
 
 fn cmd_status() {
     banner(&format!(
-        "rsclaw tools {}",
+        "rsclaw tools v{}",
         env!("RSCLAW_BUILD_VERSION")
     ));
     println!();

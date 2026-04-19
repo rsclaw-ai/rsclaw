@@ -94,6 +94,7 @@ fn spawn_wechat_user_worker(
                             user = %user_id,
                             text_len = r.text.len(),
                             images = r.images.len(),
+                            files = r.files.len(),
                             "wechat: got agent reply"
                         );
                         let pending = r.pending_analysis;
@@ -289,7 +290,7 @@ pub(crate) fn start_wechat_personal_if_configured(
                                 return;
                             }
                             PolicyResult::SendPairingCode(code) => {
-                                let _ = tx
+                                if let Err(e) = tx
                                     .send(OutboundMessage {
                                         target_id: from_user.clone(),
                                         is_group: false,
@@ -303,11 +304,14 @@ pub(crate) fn start_wechat_personal_if_configured(
                                         channel: None,
 
                     files: vec![],                                    })
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!("failed to send message: {e}");
+                                }
                                 return;
                             }
                             PolicyResult::PairingQueueFull => {
-                                let _ = tx
+                                if let Err(e) = tx
                                     .send(OutboundMessage {
                                         target_id: from_user.clone(),
                                         is_group: false,
@@ -321,7 +325,10 @@ pub(crate) fn start_wechat_personal_if_configured(
                                         channel: None,
 
                     files: vec![],                                    })
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!("failed to send message: {e}");
+                                }
                                 return;
                             }
                         }
@@ -380,7 +387,7 @@ pub(crate) fn start_wechat_personal_if_configured(
                             )
                             .await
                             {
-                                let _ = tx
+                                if let Err(e) = tx
                                     .send(OutboundMessage {
                                         target_id: from_user,
                                         is_group: false,
@@ -390,7 +397,10 @@ pub(crate) fn start_wechat_personal_if_configured(
                                         channel: None,
 
                     files: vec![],                                    })
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!("failed to send message: {e}");
+                                }
                             }
                         });
                         return;
@@ -418,7 +428,11 @@ pub(crate) fn start_wechat_personal_if_configured(
                                 reply.target_id = from_user.clone();
                                 reply.is_group = false;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {
-                                    let _ = tx.send(reply).await;
+                                    if let Err(e) = tx.send(reply).await {
+
+                                        tracing::warn!("failed to send message: {e}");
+
+                                    }
                                 }
                                 return;
                             }
@@ -439,7 +453,7 @@ pub(crate) fn start_wechat_personal_if_configured(
                             }
                             if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                                 if !r.is_empty {
-                                    let _ = tx.send(OutboundMessage {
+                                    if let Err(e) = tx.send(OutboundMessage {
                                         target_id: from_user,
                                         is_group: false,
                                         text: r.text,
@@ -447,7 +461,10 @@ pub(crate) fn start_wechat_personal_if_configured(
                                         images: r.images,
                                         files: r.files,
                                         channel: None,
-                                    }).await;
+                                    }).await
+                                    {
+                                        tracing::warn!("failed to send message: {e}");
+                                    }
                                 }
                             }
                         });
@@ -469,7 +486,9 @@ pub(crate) fn start_wechat_personal_if_configured(
                 ch
             }
         });
-        let _ = manager.register(Arc::clone(&wc) as Arc<dyn crate::channel::Channel>);
+        if let Err(e) = manager.register(Arc::clone(&wc) as Arc<dyn crate::channel::Channel>) {
+            tracing::warn!("failed to register channel: {e}");
+        }
         let wc_send = Arc::clone(&wc);
 
         tokio::spawn(async move {

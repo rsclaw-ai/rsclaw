@@ -67,37 +67,71 @@ pub fn find_cluster(
 }
 
 /// Build an LLM prompt that asks the model to distill the given cluster of
-/// memory documents into a valid `SKILL.md` file with YAML frontmatter and
-/// concise execution steps.
+/// memory documents into a standard-compliant `SKILL.md` file.
+///
+/// The output follows the Anthropic skill-creator standard:
+/// - YAML frontmatter with `name` and a "pushy" `description` that states
+///   both what the skill does and when it should trigger.
+/// - Imperative Markdown body (under 500 lines) covering the workflow in
+///   enough detail that an agent can execute it without further context.
+/// - Optionally references `scripts/` or `references/` bundled resources when
+///   the cluster content implies reusable scripts or large reference material.
 pub fn build_distill_prompt(cluster: &[MemoryDoc]) -> String {
-    let mut prompt = String::with_capacity(4096);
+    let mut prompt = String::with_capacity(8192);
 
     prompt.push_str(
-        "You are an expert knowledge engineer. Below are several related memory \
-         documents from an AI agent's long-term memory store. Your task is to \
-         distill them into a single SKILL.md file.\n\n\
-         Requirements:\n\
-         - Start with YAML frontmatter delimited by '---' containing: name, \
-           description, version (use \"1.0.0\").\n\
-         - After frontmatter, write a concise Markdown body with numbered \
-           execution steps the agent should follow when this skill is invoked.\n\
-         - Do not exceed 80 lines total.\n\
-         - Do not invent information beyond what the memories contain.\n\
-         - Merge overlapping facts; prefer the most-accessed version.\n\n\
+        "You are a skill-engineering expert. Below are related memory documents \
+         from an AI agent's long-term memory store. Distill them into a single \
+         SKILL.md file following the Anthropic skill-creator standard.\n\n\
+         \
+         ## SKILL.md Standard\n\
+         \
+         **Frontmatter** (required fields):\n\
+         ```yaml\n\
+         ---\n\
+         name: skill-name-in-kebab-case\n\
+         description: >\n\
+           What the skill does AND when to invoke it. Be slightly pushy so the\n\
+           agent does not undertrigger. Example: \"How to do X. Use this skill\n\
+           whenever the user asks about X, Y, or Z, even if not phrased explicitly.\"\n\
+         ---\n\
+         ```\n\n\
+         \
+         **Body** (Markdown, imperative language, under 500 lines):\n\
+         - Use numbered steps or headers to structure the workflow.\n\
+         - Explain *why* each step matters, not just *what* to do.\n\
+         - Include a short example (Input / Output) where it helps.\n\
+         - If the skill needs a reusable helper script, note it as:\n\
+           `See scripts/helper.py — run with: python scripts/helper.py <args>`\n\
+           (do NOT write the script here; the caller will create it separately)\n\
+         - If the skill references large external docs, note them as:\n\
+           `See references/guide.md for detailed field descriptions`\n\n\
+         \
+         **Rules**:\n\
+         - Do not invent information beyond what the memory documents contain.\n\
+         - Merge overlapping facts; prefer the most-accessed version.\n\
+         - Use imperative voice: \"Check the config\", not \"You should check\".\n\
+         - Avoid ALL-CAPS MUST/NEVER; explain reasoning instead.\n\
+         - Keep total length under 300 lines unless complexity demands more.\n\n\
+         \
          === MEMORY DOCUMENTS ===\n\n",
     );
 
     for (i, doc) in cluster.iter().enumerate() {
         prompt.push_str(&format!(
-            "--- Memory {} ---\nKind: {}\nAccess count: {}\nText:\n{}\n\n",
+            "--- Memory {} (access_count={}) ---\nKind: {}\nText:\n{}\n\n",
             i + 1,
-            doc.kind,
             doc.access_count,
+            doc.kind,
             doc.text,
         ));
     }
 
-    prompt.push_str("=== END OF MEMORIES ===\n\nProduce only the SKILL.md content.");
+    prompt.push_str(
+        "=== END OF MEMORIES ===\n\n\
+         Produce ONLY the SKILL.md content — frontmatter + body. \
+         No explanation, no commentary outside the file.",
+    );
 
     prompt
 }

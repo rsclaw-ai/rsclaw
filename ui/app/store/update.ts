@@ -32,9 +32,8 @@ type VersionType = "date" | "tag";
 const RSCLAW_VERSION_URL = "https://app.rsclaw.ai/api/version";
 
 async function getVersion(type: VersionType) {
-  // Desktop uses app-v* tags, CLI uses v* tags
-  const tagPrefix = isApp ? "app-v" : "v";
-  const matchTag = (t: string) => t.startsWith(tagPrefix) && (isApp || !t.startsWith("app-"));
+  // Both desktop and CLI use v* tags
+  const matchTag = (t: string) => t.startsWith("v") && !t.startsWith("vscode");
 
   // Primary: app.rsclaw.ai/api/version (array of release objects)
   try {

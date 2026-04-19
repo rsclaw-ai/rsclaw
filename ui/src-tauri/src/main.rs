@@ -979,9 +979,15 @@ fn main() {
                 .build()?;
 
             let tray_icon = {
+                // On macOS, prefer @2x template image for retina menu bar
+                let icon_name = if cfg!(target_os = "macos") {
+                    "icons/icon-tray@2x.png"
+                } else {
+                    "icons/icon.png"
+                };
                 let icon_path = app.path().resource_dir()
                     .ok()
-                    .map(|d| d.join("icons/icon.png"));
+                    .map(|d| d.join(icon_name));
                 let icon = icon_path
                     .and_then(|p| {
                         eprintln!("[tray] loading icon from: {}", p.display());
@@ -996,6 +1002,7 @@ fn main() {
             let mut tray_builder = TrayIconBuilder::new()
                 .menu(&menu)
                 .tooltip("RsClaw")
+                .icon_as_template(true)
                 .show_menu_on_left_click(false);
             if let Some(icon) = tray_icon {
                 tray_builder = tray_builder.icon(icon);

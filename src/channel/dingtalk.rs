@@ -1015,8 +1015,13 @@ impl Channel for DingTalkChannel {
                     Ok(p) => p,
                     Err(e) => { warn!("DingTalk: multipart error: {e}"); continue; }
                 };
+                // Detect media type for upload
+                let upload_type = if mime.starts_with("video/") { "video" }
+                    else if mime.starts_with("audio/") { "voice" }
+                    else if mime.starts_with("image/") { "image" }
+                    else { "file" };
                 let form = reqwest::multipart::Form::new()
-                    .text("type", "file")
+                    .text("type", upload_type.to_owned())
                     .part("media", part);
                 let upload_url = format!("{}/media/upload", self.oapi_base);
                 let upload_resp = self.client
@@ -1041,14 +1046,25 @@ impl Channel for DingTalkChannel {
                     Err(e) => { warn!("DingTalk: file upload failed: {e}"); continue; }
                 };
 
-                // Extract file extension for fileType field.
-                let file_ext = filename.rsplit('.').next().unwrap_or("").to_owned();
                 let token2 = self.get_access_token().await?;
-                let msg_param = json!({
-                    "mediaId": media_id,
-                    "fileName": filename,
-                    "fileType": file_ext,
-                }).to_string();
+                // Build msgKey and msgParam based on media type
+                let (msg_key, msg_param) = if mime.starts_with("video/") {
+                    ("sampleVideo", json!({
+                        "videoMediaId": media_id,
+                        "videoType": filename.rsplit('.').next().unwrap_or("mp4"),
+                    }).to_string())
+                } else if mime.starts_with("audio/") {
+                    ("sampleAudio", json!({
+                        "mediaId": media_id,
+                    }).to_string())
+                } else {
+                    let file_ext = filename.rsplit('.').next().unwrap_or("").to_owned();
+                    ("sampleFile", json!({
+                        "mediaId": media_id,
+                        "fileName": filename,
+                        "fileType": file_ext,
+                    }).to_string())
+                };
 
                 let send_result = if msg.is_group {
                     self.client
@@ -1057,7 +1073,7 @@ impl Channel for DingTalkChannel {
                         .json(&json!({
                             "robotCode": self.robot_code,
                             "openConversationId": msg.target_id,
-                            "msgKey": "sampleFile",
+                            "msgKey": msg_key,
                             "msgParam": msg_param,
                         }))
                         .send()
@@ -1069,7 +1085,7 @@ impl Channel for DingTalkChannel {
                         .json(&json!({
                             "robotCode": self.robot_code,
                             "userIds": [msg.target_id],
-                            "msgKey": "sampleFile",
+                            "msgKey": msg_key,
                             "msgParam": msg_param,
                         }))
                         .send()

@@ -23,6 +23,7 @@ fn tier_promotion_returns_true_on_first_core() {
         abstract_text: None,
         overview_text: None,
         tags: vec![],
+        pinned: false,
     };
     // First transition to Core should return true.
     assert!(doc.evaluate_tier_transition());
@@ -47,6 +48,7 @@ fn tier_demotion_does_not_return_true() {
         abstract_text: None,
         overview_text: None,
         tags: vec![],
+        pinned: false,
     };
     assert!(!doc.evaluate_tier_transition());
     assert_eq!(doc.tier, MemDocTier::Peripheral);
@@ -129,6 +131,7 @@ fn build_distill_prompt_contains_cluster_texts() {
             abstract_text: None,
             overview_text: None,
             tags: vec![],
+            pinned: false,
         })
         .collect();
 

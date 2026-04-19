@@ -1375,8 +1375,27 @@ impl Channel for FeishuChannel {
                 // Feishu separates media (video/audio) from files (pdf/doc/xls).
                 let is_media = mime.starts_with("video/") || mime.starts_with("audio/");
 
+                // Feishu requires opus for audio. Convert mp3/wav/aiff to ogg-opus (pure Rust).
+                let (bytes, filename, mime_override) = if mime.starts_with("audio/") && !filename.ends_with(".ogg") && !filename.ends_with(".opus") {
+                    let ext = filename.rsplit('.').next().unwrap_or("mp3");
+                    match crate::channel::transcription::encode_audio_to_ogg_opus(&bytes, Some(ext)) {
+                        Ok(opus_bytes) => {
+                            let opus_name = filename.rsplit_once('.').map(|(n, _)| format!("{n}.ogg")).unwrap_or_else(|| format!("{filename}.ogg"));
+                            info!(src_len = bytes.len(), opus_len = opus_bytes.len(), "feishu: converted audio to ogg-opus");
+                            (opus_bytes, opus_name, "audio/ogg")
+                        }
+                        Err(e) => {
+                            warn!("feishu: ogg-opus conversion failed, uploading as-is: {e:#}");
+                            (bytes, filename.clone(), mime.as_str())
+                        }
+                    }
+                } else {
+                    (bytes, filename.clone(), mime.as_str())
+                };
+
                 let file_type = if is_media {
-                    if mime.starts_with("video/") { "mp4" } else { "mp3" }
+                    // Feishu requires file_type "opus" for audio.
+                    if mime.starts_with("video/") { "mp4" } else { "opus" }
                 } else if mime.contains("pdf") { "pdf" }
                     else if mime.contains("doc") { "doc" }
                     else if mime.contains("sheet") || mime.contains("xls") { "xls" }
@@ -1390,7 +1409,7 @@ impl Channel for FeishuChannel {
 
                 let part = match reqwest::multipart::Part::bytes(bytes)
                     .file_name(filename.clone())
-                    .mime_str(mime)
+                    .mime_str(mime_override)
                 {
                     Ok(p) => p,
                     Err(e) => { warn!("feishu: multipart error: {e}"); continue; }
@@ -1400,14 +1419,18 @@ impl Channel for FeishuChannel {
                     .text("file_name", filename.clone())
                     .part("file", part);
                 // Add duration (ms) for video/audio uploads.
+                // Feishu requires duration for media uploads (234001 error without it).
                 if is_media {
                     let dur = if mime.starts_with("video/") {
                         mp4_duration_ms(path_or_url).unwrap_or(0)
-                    } else { 0 };
-                    if dur > 0 {
-                        form = form.text("duration", dur.to_string());
-                        info!(duration_ms = dur, "feishu: uploading media with duration");
-                    }
+                    } else {
+                        // Audio: try ffprobe, fallback to estimate from file size.
+                        audio_duration_ms(path_or_url).unwrap_or(0)
+                    };
+                    // Always send duration for media, default 1000ms if unknown.
+                    let dur = if dur > 0 { dur } else { 1000 };
+                    form = form.text("duration", dur.to_string());
+                    info!(duration_ms = dur, "feishu: uploading media with duration");
                 }
 
                 let upload_resp = self.client
@@ -1439,17 +1462,24 @@ impl Channel for FeishuChannel {
                     else { "chat_id" };
                 let send_url = format!("{}/im/v1/messages?receive_id_type={id_type}", self.api_base());
                 let (msg_type, content) = if is_media {
-                    let mut media_json = serde_json::json!({"file_key": file_key, "file_name": filename});
-                    // Try to extract cover image via ffmpeg and upload as image_key.
-                    if mime.starts_with("video/") {
+                    if mime.starts_with("audio/") {
+                        // Audio: send as "audio" msg_type with file_key + duration.
+                        let dur_ms = audio_duration_ms(path_or_url).unwrap_or(1000);
+                        // Feishu audio duration is in milliseconds as string.
+                        let s = serde_json::json!({"file_key": file_key, "duration": dur_ms}).to_string();
+                        info!(content = %s, duration_ms = dur_ms, "feishu: sending audio message");
+                        ("audio", s)
+                    } else {
+                        // Video: send as "media" msg_type with file_key + file_name.
+                        let mut media_json = serde_json::json!({"file_key": file_key, "file_name": filename});
                         let api = self.api_base().to_owned();
                         if let Some(cover_key) = extract_and_upload_cover(path_or_url, &self.client, &api, &token).await {
                             media_json["image_key"] = serde_json::json!(cover_key);
                         }
+                        let s = media_json.to_string();
+                        info!(content = %s, "feishu: sending media message");
+                        ("media", s)
                     }
-                    let s = media_json.to_string();
-                    info!(content = %s, "feishu: sending media message");
-                    ("media", s)
                 } else {
                     ("file", serde_json::json!({"file_key": file_key}).to_string())
                 };
@@ -1864,4 +1894,24 @@ fn mp4_duration_ms(path: &str) -> Option<u64> {
         scan += atom_size;
     }
     None
+}
+
+/// Get audio file duration in milliseconds using ffprobe.
+/// Falls back to estimate from file size if ffprobe is not available.
+fn audio_duration_ms(path: &str) -> Option<u64> {
+    // Try ffprobe first.
+    let output = std::process::Command::new("ffprobe")
+        .args(["-v", "quiet", "-show_entries", "format=duration",
+               "-of", "default=noprint_wrappers=1:nokey=1", path])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let s = String::from_utf8_lossy(&output.stdout);
+        if let Ok(secs) = s.trim().parse::<f64>() {
+            return Some((secs * 1000.0) as u64);
+        }
+    }
+    // Fallback: estimate from file size (mp3 ~128kbps = 16KB/s).
+    let size = std::fs::metadata(path).ok()?.len();
+    Some(size * 1000 / 16_000)
 }

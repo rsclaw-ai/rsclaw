@@ -199,6 +199,7 @@ mod tests {
                 auth_token_configured: false,
                 auth_token_is_plaintext: false,
                 user_agent: None,
+                language: None,
             },
             agents: AgentsRuntime {
                 defaults: Default::default(),

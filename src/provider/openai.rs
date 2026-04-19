@@ -175,11 +175,10 @@ impl LlmProvider for OpenAiProvider {
                 body_len = body_str.len(),
                 "openai: request prepared"
             );
-            // Dump full body to temp file for debugging
-            #[cfg(debug_assertions)]
+            // Dump full body to temp file for debugging.
             let _ = std::fs::write(
-                std::env::temp_dir().join("rsclaw_last_request.json"),
-                &body_str,
+                "/tmp/debug_rsclaw_llm.json",
+                serde_json::to_string_pretty(&body).unwrap_or_default(),
             );
 
             let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -357,8 +356,13 @@ impl OpenAiProvider {
             body["tools"] = json!(tools);
         }
 
+        // Normalize messages for stable KV cache prefix.
+        if let Some(msgs) = body["messages"].as_array_mut() {
+            normalize_messages_for_cache(msgs);
+        }
+
         let _ = std::fs::write(
-            std::env::temp_dir().join("rsclaw_ollama_request.json"),
+            "/tmp/debug_rsclaw_llm.json",
             serde_json::to_string_pretty(&body).unwrap_or_default(),
         );
         tracing::debug!(
@@ -592,10 +596,9 @@ impl OpenAiProvider {
             body_len = body_str.len(),
             "openai-responses: request prepared"
         );
-        #[cfg(debug_assertions)]
         let _ = std::fs::write(
-            std::env::temp_dir().join("rsclaw_last_responses_request.json"),
-            &body_str,
+            "/tmp/debug_rsclaw_llm.json",
+            serde_json::to_string_pretty(&body).unwrap_or_default(),
         );
 
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
@@ -660,9 +663,20 @@ impl OpenAiProvider {
         }
 
         let byte_stream = resp.bytes_stream();
+
+        // SSE parser with line buffer — same pattern as Chat Completions.
+        // Without buffering, TCP chunk boundaries can split SSE lines,
+        // causing JSON parse failures and lost content.
+        let line_buffer = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
         let event_stream = byte_stream
             .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
-            .flat_map(|chunk| futures::stream::iter(parse_responses_sse_chunk(chunk)));
+            .then(move |chunk| {
+                let line_buffer = line_buffer.clone();
+                async move {
+                    parse_responses_sse_chunk_buffered(chunk, &line_buffer).await
+                }
+            })
+            .flat_map(|events| futures::stream::iter(events));
 
         let stream: LlmStream = Box::pin(event_stream);
         Ok(stream)
@@ -712,16 +726,12 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
     }
 
     if let Some(sys) = &req.system {
-        // Prepend a system message if not already present.
-        if messages
-            .first()
-            .and_then(|m| m["role"].as_str())
-            .is_none_or(|r| r != "system")
-        {
-            let mut msgs = vec![json!({"role": "system", "content": sys})];
-            msgs.extend(body["messages"].as_array().cloned().unwrap_or_default());
-            body["messages"] = json!(msgs);
-        }
+        // Always prepend the main system prompt as the first message.
+        // Other system messages (plugins, skills) may already be present
+        // but the main prompt must come first for KV cache prefix stability.
+        let mut msgs = vec![json!({"role": "system", "content": sys})];
+        msgs.extend(body["messages"].as_array().cloned().unwrap_or_default());
+        body["messages"] = json!(msgs);
     }
 
     if let Some(t) = req.temperature {
@@ -752,7 +762,43 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
         body["tools"] = json!(tools);
     }
 
+    // Normalize messages for stable KV cache prefix: trim content whitespace,
+    // sort tool_call arguments keys for bit-perfect prefix matching across turns.
+    if let Some(msgs) = body["messages"].as_array_mut() {
+        normalize_messages_for_cache(msgs);
+    }
+
     Ok(body)
+}
+
+/// Normalize messages in-place for KV cache prefix stability.
+///
+/// - Trims whitespace from string content.
+/// - Re-serializes tool_call arguments with sorted keys and compact separators
+///   so the same arguments always produce identical bytes.
+fn normalize_messages_for_cache(messages: &mut [Value]) {
+    for msg in messages.iter_mut() {
+        // Trim content whitespace.
+        if let Some(content) = msg.get_mut("content").and_then(|v| v.as_str()).map(|s| s.trim().to_owned()) {
+            msg["content"] = json!(content);
+        }
+        // Normalize tool_call arguments to sorted-key compact JSON.
+        if let Some(tcs) = msg.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
+            for tc in tcs.iter_mut() {
+                if let Some(args_str) = tc.pointer("/function/arguments").and_then(|v| v.as_str()) {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(args_str) {
+                        // serde_json with preserve_order still sorts within to_string;
+                        // force canonical form by round-tripping through BTreeMap.
+                        if let Ok(canonical) = serde_json::from_str::<std::collections::BTreeMap<String, Value>>(&parsed.to_string()) {
+                            if let Ok(sorted) = serde_json::to_string(&canonical) {
+                                tc["function"]["arguments"] = json!(sorted);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn serialize_message(msg: &Message) -> Value {
@@ -1274,25 +1320,50 @@ fn serialize_media_for_responses(url: &str, file_id_map: &HashMap<String, String
 }
 
 // ---------------------------------------------------------------------------
-// SSE parser (OpenAI Responses API format)
+// SSE parser (OpenAI Responses API format) — with line buffering
 // ---------------------------------------------------------------------------
 
-fn parse_responses_sse_chunk(chunk: Result<bytes::Bytes>) -> Vec<Result<StreamEvent>> {
+/// Buffered SSE parser for the Responses API.
+/// Handles TCP chunk boundaries that split SSE lines mid-JSON.
+async fn parse_responses_sse_chunk_buffered(
+    chunk: Result<bytes::Bytes>,
+    line_buffer: &tokio::sync::Mutex<String>,
+) -> Vec<Result<StreamEvent>> {
     let bytes = match chunk {
         Ok(b) => b,
         Err(e) => return vec![Err(e)],
     };
 
-    let text = String::from_utf8_lossy(&bytes);
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(t) => std::borrow::Cow::Borrowed(t),
+        Err(e) => {
+            tracing::warn!(
+                "openai-responses: UTF-8 decode error at byte {}, replacing: {}",
+                e.valid_up_to(), e,
+            );
+            std::borrow::Cow::Owned(String::from_utf8_lossy(&bytes).into_owned())
+        }
+    };
+
+    let mut buffer = line_buffer.lock().await;
+    buffer.push_str(&text);
 
     let mut events = Vec::new();
-    // Track the current event type from `event:` lines
-    let mut current_event_type: Option<String> = None;
 
-    for line in text.lines() {
+    let last_newline_pos = match buffer.rfind('\n') {
+        Some(pos) => pos,
+        None => return events, // no complete line yet
+    };
+
+    let complete_portion = buffer[..last_newline_pos].to_owned();
+    let incomplete_portion = buffer[last_newline_pos + 1..].to_owned();
+    buffer.clear();
+    buffer.push_str(&incomplete_portion);
+
+    let mut current_event_type: Option<String> = None;
+    for line in complete_portion.lines() {
         let line = line.trim();
         if line.is_empty() {
-            // Blank line resets event type for next event
             current_event_type = None;
             continue;
         }
@@ -1338,7 +1409,14 @@ fn parse_responses_event(data: &str, event_type: Option<&str>) -> Option<StreamE
     match evt_type {
         // Text delta
         "response.output_text.delta" => {
-            let delta = v["delta"].as_str().unwrap_or("").to_owned();
+            // Handle delta as String, Number, or Bool — some providers send
+            // numeric content as JSON numbers instead of strings.
+            let delta = match &v["delta"] {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                _ => String::new(),
+            };
             if delta.is_empty() {
                 None
             } else {
@@ -1646,13 +1724,28 @@ mod tests {
             assert_eq!(strip_think_tags(text), "answer rest");
         }
 
-        #[test]
-        fn parse_sse_chunk_with_event_lines() {
+        #[tokio::test]
+        async fn parse_responses_sse_chunk_with_event_lines() {
             let raw = b"event: response.output_text.delta\ndata: {\"delta\":\"hi\"}\n\nevent: response.completed\ndata: {\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n";
-            let events = parse_responses_sse_chunk(Ok(bytes::Bytes::from_static(raw)));
+            let buffer = tokio::sync::Mutex::new(String::new());
+            let events = parse_responses_sse_chunk_buffered(
+                Ok(bytes::Bytes::from_static(raw)), &buffer,
+            ).await;
             assert_eq!(events.len(), 2);
             assert!(matches!(&events[0], Ok(StreamEvent::TextDelta(t)) if t == "hi"));
             assert!(matches!(&events[1], Ok(StreamEvent::Done { .. })));
+        }
+
+        #[tokio::test]
+        async fn parse_responses_numeric_delta_not_lost() {
+            // Regression: numeric delta was silently dropped by as_str().unwrap_or("")
+            let raw = b"event: response.output_text.delta\ndata: {\"delta\":42}\n\n";
+            let buffer = tokio::sync::Mutex::new(String::new());
+            let events = parse_responses_sse_chunk_buffered(
+                Ok(bytes::Bytes::from_static(raw)), &buffer,
+            ).await;
+            assert_eq!(events.len(), 1);
+            assert!(matches!(&events[0], Ok(StreamEvent::TextDelta(t)) if t == "42"));
         }
     }
 

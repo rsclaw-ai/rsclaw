@@ -52,7 +52,7 @@ pub(crate) async fn try_preparse_locally(
 
     // /version
     if lower == "/version" {
-        return Some(txt(format!("rsclaw {}", env!("RSCLAW_BUILD_VERSION"))));
+        return Some(txt(format!("rsclaw v{}", env!("RSCLAW_BUILD_VERSION"))));
     }
     // /health
     if lower == "/health" {
@@ -87,6 +87,22 @@ pub(crate) async fn try_preparse_locally(
         handle.clear_signal.store(true, Ordering::SeqCst);
         return Some(txt("✓ Session cleared.".to_owned()));
     }
+    // /new — start a fresh conversation (new generation, no summary)
+    if lower == "/new" {
+        let flags = handle.abort_flags.read().unwrap();
+        for f in flags.values() { f.store(true, Ordering::SeqCst); }
+        drop(flags);
+        handle.new_session_signal.store(true, Ordering::SeqCst);
+        return Some(txt("✓ New session started.".to_owned()));
+    }
+    // /reset — reset current session (no summary, same generation)
+    if lower == "/reset" {
+        let flags = handle.abort_flags.read().unwrap();
+        for f in flags.values() { f.store(true, Ordering::SeqCst); }
+        drop(flags);
+        handle.reset_signal.store(true, Ordering::SeqCst);
+        return Some(txt("✓ Session reset.".to_owned()));
+    }
     // /status
     if lower == "/status" {
         let model = handle.config.model.as_ref()
@@ -108,7 +124,7 @@ pub(crate) async fn try_preparse_locally(
             .and_then(|m| m.context_tokens)
             .unwrap_or(64000) as usize;
         return Some(txt(format!(
-            "Gateway: running\nOS: {os}\nModel: {model}\nSessions: {sessions}\nContext: ~{:.1}k/{:.0}k tokens\nUptime: {uptime}\nVersion: rsclaw {}",
+            "Gateway: running\nOS: {os}\nModel: {model}\nSessions: {sessions}\nContext: ~{:.1}k/{:.0}k tokens\nUptime: {uptime}\nVersion: rsclaw v{}",
             ctx_tokens as f64 / 1000.0,
             ctx_limit as f64 / 1000.0,
             env!("RSCLAW_BUILD_VERSION")
@@ -354,7 +370,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
     matches!(
         lower.as_str(),
         "/ls" | "/status" | "/version" | "/help" | "/?" | "/health" | "/uptime"
-            | "/model" | "/models" | "/cron" | "/clear" | "/abort" | "/sessions"
+            | "/model" | "/models" | "/cron" | "/clear" | "/new" | "/reset" | "/abort" | "/sessions"
     )
     // Commands with optional/required args
     || lower.starts_with("/ls ")

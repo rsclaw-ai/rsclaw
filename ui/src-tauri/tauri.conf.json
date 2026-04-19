@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicegoodthings/tauri-v2-schema/refs/heads/main/tauri.conf.json",
   "productName": "RsClaw",
-  "version": "26.4.16",
+  "version": "26.4.18",
   "identifier": "ai.rsclaw.app",
   "build": {
     "beforeBuildCommand": "yarn export",
@@ -54,7 +54,7 @@
       "providerShortName": null,
       "signingIdentity": null
     },
-    "resources": ["icons/icon.png"],
+    "resources": ["icons/icon.png", "icons/icon-tray.png", "icons/icon-tray@2x.png"],
     "shortDescription": "RsClaw AI Automation Manager",
     "targets": "all",
     "windows": {

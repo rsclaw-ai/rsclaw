@@ -515,7 +515,7 @@ fn build_args(template: &ArgTemplate, caps: &regex::Captures<'_>, _full_input: &
             let input = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
             let known = ["google", "bing", "baidu", "ddg", "duckduckgo", "sogou", "serper", "brave"];
             if let Some(last_space) = input.rfind(' ') {
-                let last_word = input[last_space + 1..].trim().to_lowercase();
+                let last_word = input.get(last_space + 1..).unwrap_or("").trim().to_lowercase();
                 if known.contains(&last_word.as_str()) {
                     let provider = match last_word.as_str() {
                         "ddg" | "duckduckgo" => "duckduckgo-free",

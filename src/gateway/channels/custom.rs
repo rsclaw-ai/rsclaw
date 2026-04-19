@@ -128,7 +128,7 @@ fn start_custom_webhook(
             if let Ok(Ok(r)) = tokio::time::timeout(Duration::from_secs(120), reply_rx).await {
                 let pending = r.pending_analysis;
                 if !r.is_empty {
-                    let _ = tx
+                    if let Err(e) = tx
                         .send(OutboundMessage {
                             target_id: sender.clone(),
                             is_group,
@@ -137,7 +137,10 @@ fn start_custom_webhook(
                             images: r.images,
                             files: r.files,
                             channel: None,                        })
-                        .await;
+                        .await
+                    {
+                        tracing::warn!("failed to send message: {e}");
+                    }
                 }
                 if let Some(analysis) = pending {
                     handle_pending_analysis(
@@ -170,7 +173,9 @@ fn start_custom_webhook(
         }
     });
 
-    let _ = manager.register(Arc::clone(&ch) as Arc<dyn Channel>);
+    if let Err(e) = manager.register(Arc::clone(&ch) as Arc<dyn Channel>) {
+        tracing::warn!("failed to register channel: {e}");
+    }
     tokio::spawn(async move {
         if let Err(e) = ch.run().await {
             error!("custom webhook channel error: {e:#}");
@@ -239,7 +244,7 @@ fn start_custom_websocket(
             if let Ok(Ok(r)) = tokio::time::timeout(Duration::from_secs(120), reply_rx).await {
                 let pending = r.pending_analysis;
                 if !r.is_empty {
-                    let _ = tx
+                    if let Err(e) = tx
                         .send(OutboundMessage {
                             target_id: sender.clone(),
                             is_group,
@@ -248,7 +253,10 @@ fn start_custom_websocket(
                             images: r.images,
                             files: r.files,
                             channel: None,                        })
-                        .await;
+                        .await
+                    {
+                        tracing::warn!("failed to send message: {e}");
+                    }
                 }
                 if let Some(analysis) = pending {
                     handle_pending_analysis(
@@ -276,7 +284,9 @@ fn start_custom_websocket(
         }
     });
 
-    let _ = manager.register(Arc::clone(&ch) as Arc<dyn Channel>);
+    if let Err(e) = manager.register(Arc::clone(&ch) as Arc<dyn Channel>) {
+        tracing::warn!("failed to register channel: {e}");
+    }
     tokio::spawn(async move {
         if let Err(e) = ch.run().await {
             error!("custom WS channel error: {e:#}");

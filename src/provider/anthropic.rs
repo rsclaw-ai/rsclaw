@@ -72,6 +72,7 @@ impl LlmProvider for AnthropicProvider {
                     self.user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT),
                 )
                 .json(&body)
+                .timeout(std::time::Duration::from_secs(120))
                 .send()
                 .await
                 .context("Anthropic request failed")?;
@@ -83,9 +84,14 @@ impl LlmProvider for AnthropicProvider {
             }
 
             let byte_stream = resp.bytes_stream();
+            let line_buffer = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
             let event_stream = byte_stream
                 .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
-                .flat_map(|chunk| futures::stream::iter(parse_sse_chunk(chunk)));
+                .then(move |chunk| {
+                    let line_buffer = line_buffer.clone();
+                    async move { parse_sse_chunk_buffered(chunk, &line_buffer).await }
+                })
+                .flat_map(|events| futures::stream::iter(events));
 
             let stream: LlmStream = Box::pin(event_stream);
             Ok(stream)
@@ -111,6 +117,9 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
     if let Some(sys) = system {
         body["system"] = json!(sys);
     }
+
+    // Inject prompt caching markers (system_and_3 strategy).
+    inject_cache_control(&mut body);
 
     if let Some(t) = req.temperature {
         body["temperature"] = json!(t);
@@ -220,26 +229,119 @@ fn serialize_part(part: &ContentPart) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// Prompt caching — "system_and_3" strategy
+// ---------------------------------------------------------------------------
+
+/// Inject `cache_control: {"type": "ephemeral"}` markers into the request body.
+///
+/// Strategy (matches hermes-agent "system_and_3"):
+/// - 1 breakpoint on the system prompt (stable prefix, high cache-hit rate)
+/// - Up to 3 rolling breakpoints on the most recent non-system messages
+///
+/// The system prompt is converted from a plain string to a content-block array
+/// so that the `cache_control` field can be attached to the last block.
+fn inject_cache_control(body: &mut Value) {
+    let cache_marker = json!({"type": "ephemeral"});
+
+    // -- System prompt breakpoint --
+    if let Some(system_val) = body.get_mut("system") {
+        match system_val {
+            // Plain string -> convert to content-block array with cache_control.
+            Value::String(text) => {
+                let block = json!([{
+                    "type": "text",
+                    "text": text.clone(),
+                    "cache_control": cache_marker.clone(),
+                }]);
+                *system_val = block;
+            }
+            // Already an array of content blocks -> tag the last one.
+            Value::Array(blocks) => {
+                if let Some(last) = blocks.last_mut() {
+                    last["cache_control"] = cache_marker.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // -- Message breakpoints (last 3 messages) --
+    if let Some(Value::Array(messages)) = body.get_mut("messages") {
+        let len = messages.len();
+        let start = len.saturating_sub(3);
+        for msg in &mut messages[start..] {
+            tag_last_content_block(msg, &cache_marker);
+        }
+    }
+}
+
+/// Add `cache_control` to the last content block of a message.
+///
+/// If the message content is a plain string, convert it to a content-block array
+/// so the marker can be attached.
+fn tag_last_content_block(msg: &mut Value, marker: &Value) {
+    let content = match msg.get_mut("content") {
+        Some(c) => c,
+        None => return,
+    };
+
+    match content {
+        // Plain string -> convert to [{type: "text", text: "...", cache_control: ...}]
+        Value::String(text) => {
+            let block = json!([{
+                "type": "text",
+                "text": text.clone(),
+                "cache_control": marker.clone(),
+            }]);
+            *content = block;
+        }
+        // Array of content blocks -> tag the last one.
+        Value::Array(blocks) => {
+            if let Some(last) = blocks.last_mut() {
+                last["cache_control"] = marker.clone();
+            }
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SSE parser
 // ---------------------------------------------------------------------------
 
-fn parse_sse_chunk(chunk: Result<bytes::Bytes>) -> Vec<Result<StreamEvent>> {
+/// Buffered SSE parser — handles TCP chunk boundaries that split lines.
+async fn parse_sse_chunk_buffered(
+    chunk: Result<bytes::Bytes>,
+    line_buffer: &tokio::sync::Mutex<String>,
+) -> Vec<Result<StreamEvent>> {
     let bytes = match chunk {
         Ok(b) => b,
         Err(e) => return vec![Err(e)],
     };
 
-    let text: String = match std::str::from_utf8(&bytes) {
-        Ok(t) => t.to_owned(),
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(t) => std::borrow::Cow::Borrowed(t),
         Err(e) => {
-            tracing::warn!("anthropic: UTF-8 decode error at byte {}, replacing with �: {}", e.valid_up_to(), e);
-            String::from_utf8_lossy(&bytes).into_owned()
+            tracing::warn!("anthropic: UTF-8 decode error at byte {}, replacing: {}", e.valid_up_to(), e);
+            std::borrow::Cow::Owned(String::from_utf8_lossy(&bytes).into_owned())
         }
     };
 
-    let mut events = Vec::new();
+    let mut buffer = line_buffer.lock().await;
+    buffer.push_str(&text);
 
-    for line in text.lines() {
+    let last_newline_pos = match buffer.rfind('\n') {
+        Some(pos) => pos,
+        None => return vec![],
+    };
+
+    let complete_portion = buffer[..last_newline_pos].to_owned();
+    let incomplete_portion = buffer[last_newline_pos + 1..].to_owned();
+    buffer.clear();
+    buffer.push_str(&incomplete_portion);
+
+    let mut events = Vec::new();
+    for line in complete_portion.lines() {
         if let Some(data) = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:")) {
             if data == "[DONE]" {
                 continue;
@@ -369,7 +471,97 @@ mod tests {
             ..make_request()
         };
         let body = build_request_body(&req).unwrap();
-        assert_eq!(body["system"].as_str().unwrap(), "hello");
+        // After cache_control injection, system is an array of content blocks.
+        let blocks = body["system"].as_array().expect("system should be content-block array");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["text"].as_str().unwrap(), "hello");
+        assert_eq!(
+            blocks[0]["cache_control"]["type"].as_str().unwrap(),
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn cache_control_system_and_3() {
+        let req = LlmRequest {
+            system: Some("system prompt".to_owned()),
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    content: MessageContent::Text("m1".to_owned()),
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: MessageContent::Text("m2".to_owned()),
+                },
+                Message {
+                    role: Role::User,
+                    content: MessageContent::Text("m3".to_owned()),
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: MessageContent::Text("m4".to_owned()),
+                },
+                Message {
+                    role: Role::User,
+                    content: MessageContent::Text("m5".to_owned()),
+                },
+            ],
+            ..make_request()
+        };
+        let body = build_request_body(&req).unwrap();
+
+        // System should have cache_control.
+        let sys_blocks = body["system"].as_array().expect("system content blocks");
+        assert_eq!(
+            sys_blocks[0]["cache_control"]["type"].as_str().unwrap(),
+            "ephemeral"
+        );
+
+        // Last 3 messages (m3, m4, m5) should have cache_control.
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 5);
+
+        // m1, m2: no cache_control
+        assert!(msgs[0]["content"].as_str().is_some() || msgs[0]["content"][0].get("cache_control").is_none());
+        assert!(msgs[1]["content"].as_str().is_some() || msgs[1]["content"][0].get("cache_control").is_none());
+
+        // m3, m4, m5: have cache_control on last content block
+        for i in 2..5 {
+            let content = &msgs[i]["content"];
+            let block = if content.is_array() {
+                content.as_array().unwrap().last().unwrap()
+            } else {
+                panic!("expected content to be converted to array for cached message");
+            };
+            assert_eq!(
+                block["cache_control"]["type"].as_str().unwrap(),
+                "ephemeral",
+                "message index {i} should have cache_control"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_control_fewer_than_3_messages() {
+        let req = LlmRequest {
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    content: MessageContent::Text("only one".to_owned()),
+                },
+            ],
+            ..make_request()
+        };
+        let body = build_request_body(&req).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        // Single message should still get cache_control.
+        let content = &msgs[0]["content"];
+        assert!(content.is_array());
+        assert_eq!(
+            content[0]["cache_control"]["type"].as_str().unwrap(),
+            "ephemeral"
+        );
     }
 
     #[test]

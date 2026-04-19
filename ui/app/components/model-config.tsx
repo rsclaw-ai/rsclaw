@@ -20,6 +20,7 @@ export function ModelConfigList(props: {
   );
   const value = `${props.modelConfig.model}@${props.modelConfig?.providerName}`;
   const compressModelValue = `${props.modelConfig.compressModel}@${props.modelConfig?.compressProviderName}`;
+  const videoModelValue = `${props.modelConfig.videoModel ?? ""}@${props.modelConfig?.videoProviderName ?? ""}`;
 
   return (
     <>
@@ -266,6 +267,70 @@ export function ModelConfigList(props: {
                 {v.displayName}({v.provider?.providerName})
               </option>
             ))}
+        </Select>
+      </ListItem>
+      <ListItem
+        title={Locale.Settings.VideoModel.Title}
+        subTitle={Locale.Settings.VideoModel.SubTitle}
+      >
+        <Select
+          className={styles["select-compress-model"]}
+          aria-label={Locale.Settings.VideoModel.Title}
+          value={videoModelValue}
+          onChange={(e) => {
+            const [model, providerName] = getModelProvider(
+              e.currentTarget.value,
+            );
+            props.updateConfig((config) => {
+              config.videoModel = ModalConfigValidator.model(model);
+              config.videoProviderName = providerName as ServiceProvider;
+            });
+          }}
+        >
+          {allModels
+            .filter((v) => v.available)
+            .map((v, i) => (
+              <option value={`${v.name}@${v.provider?.providerName}`} key={i}>
+                {v.displayName}({v.provider?.providerName})
+              </option>
+            ))}
+        </Select>
+      </ListItem>
+      <ListItem
+        title={Locale.Settings.BtwTokens.Title}
+        subTitle={Locale.Settings.BtwTokens.SubTitle}
+      >
+        <input
+          aria-label={Locale.Settings.BtwTokens.Title}
+          type="number"
+          min={1000}
+          max={50000}
+          step={1000}
+          value={props.modelConfig.btwTokens ?? 10000}
+          onChange={(e) =>
+            props.updateConfig(
+              (config) => (config.btwTokens = e.currentTarget.valueAsNumber),
+            )
+          }
+        ></input>
+      </ListItem>
+      <ListItem
+        title={Locale.Settings.KvCacheMode.Title}
+        subTitle={Locale.Settings.KvCacheMode.SubTitle}
+      >
+        <Select
+          className={styles["select-compress-model"]}
+          aria-label={Locale.Settings.KvCacheMode.Title}
+          value={(props.modelConfig.kvCacheMode ?? 1).toString()}
+          onChange={(e) =>
+            props.updateConfig(
+              (config) => (config.kvCacheMode = parseInt(e.currentTarget.value)),
+            )
+          }
+        >
+          <option value="0">0 - Off</option>
+          <option value="1">1 - Full (append-only)</option>
+          <option value="2">2 - Delta (incremental)</option>
         </Select>
       </ListItem>
     </>

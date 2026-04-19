@@ -109,6 +109,7 @@ pub async fn memory_store(ctx: MethodCtx) -> MethodResult {
         abstract_text: None,
         overview_text: None,
         tags: vec![],
+                pinned: false,
     };
     mem.add(doc)
         .await

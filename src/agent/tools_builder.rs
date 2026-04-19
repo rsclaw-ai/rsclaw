@@ -33,6 +33,7 @@ pub(crate) fn toolset_allowed_names(
         "memory",
         "web_browser",
         "image_gen",
+        "video_gen",
         "channel",
         "cron",
         "computer_use",
@@ -79,16 +80,22 @@ pub(crate) fn build_tool_list(
     // Built-in tools — consolidated (32+ tools -> ~13 unified tools).
     tools.push(ToolDef {
         name: "memory".to_owned(),
-        description: "Manage long-term memory. Actions: search (semantic search), get (by ID), put (store new).".to_owned(),
+        description: "Manage long-term memory across sessions.\n\
+            Actions:\n\
+            - search: Semantic search over stored memories. Example: {\"action\":\"search\",\"query\":\"user preferences\"}\n\
+            - get: Retrieve a specific memory by ID. Example: {\"action\":\"get\",\"id\":\"abc-123\"}\n\
+            - put: Store a new memory. Example: {\"action\":\"put\",\"text\":\"User prefers dark mode\",\"kind\":\"fact\"}\n\
+            Use this tool to recall prior context, user preferences, or previously learned information.\n\
+            Search BEFORE answering questions about past conversations or user details.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["search", "get", "put"], "description": "Action to perform"},
-                "query":  {"type": "string", "description": "Search query (for search action)"},
+                "action": {"type": "string", "enum": ["search", "get", "put"], "description": "Action to perform: search, get, or put"},
+                "query":  {"type": "string", "description": "Search query (for search). Examples: 'user name', 'project deadlines', 'API keys'"},
                 "id":     {"type": "string", "description": "Memory document ID (for get)"},
-                "text":   {"type": "string", "description": "Content to store (for put action)"},
+                "text":   {"type": "string", "description": "Content to store (for put). Be specific and include context."},
                 "scope":  {"type": "string", "description": "Scope filter (optional)"},
-                "kind":   {"type": "string", "description": "Document kind: note, fact, summary, or remember. Use 'remember' ONLY when the user explicitly asks to remember/memorize something."},
+                "kind":   {"type": "string", "description": "Document kind: note (general), fact (verified info), summary (session summary), remember (user explicitly asked to remember)"},
                 "top_k":  {"type": "integer", "description": "Max results (for search, default 5)"}
             },
             "required": ["action"]
@@ -96,12 +103,15 @@ pub(crate) fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "read_file".to_owned(),
-        description: "Read a file from the agent workspace. Path is relative to workspace root."
-            .to_owned(),
+        description: "Read a file from the agent workspace.\n\
+            Path is relative to workspace root.\n\
+            Supports text files, code, config, markdown, etc.\n\
+            Example: {\"path\":\"config.json\"} or {\"path\":\"src/main.py\"}\n\
+            For binary files (images, PDFs), use the dedicated tools instead.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Relative file path within the workspace"}
+                "path": {"type": "string", "description": "Relative file path. Examples: 'README.md', 'src/app.py', 'data/output.csv'"}
             },
             "required": ["path"]
         }),
@@ -224,24 +234,34 @@ pub(crate) fn build_tool_list(
     // These help small models avoid digit-loss and dead-loop issues.
     tools.push(ToolDef {
         name: "list_dir".to_owned(),
-        description: "List files and directories in a given path. Use this instead of exec ls.".to_owned(),
+        description: "List files and directories in a given path.\n\
+            Use this instead of execute_command with ls/dir.\n\
+            - Returns file names, sizes, and types.\n\
+            - Does not display hidden/dot files by default.\n\
+            - Use 'pattern' to filter by glob (e.g. '*.json').\n\
+            - Use 'recursive' to list subdirectories.\n\
+            CRITICAL: 'path' must be returned before other parameters.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "path":      {"type": "string", "description": "Directory path to list. Defaults to workspace root."},
+                "path":      {"type": "string", "description": "Directory path to list. Relative to workspace root or absolute. Examples: '.', 'src/', '/tmp'"},
                 "recursive": {"type": "boolean", "description": "If true, list all files in subdirectories recursively. Default: false."},
-                "pattern":   {"type": "string", "description": "Glob pattern filter (e.g. '*.json', '*.rs')"}
+                "pattern":   {"type": "string", "description": "Glob pattern filter. Examples: '*.json', '*.py', 'test_*'"}
             }
         }),
     });
     tools.push(ToolDef {
         name: "search_file".to_owned(),
-        description: "Search for files by name pattern. Use this instead of exec find.".to_owned(),
+        description: "Search for files by name pattern. Use this instead of execute_command with find.\n\
+            - Supports wildcard patterns for flexible matching.\n\
+            - Returns relative file paths.\n\
+            - Prefer this over list_dir when you have a specific file pattern.\n\
+            CRITICAL: 'pattern' must be returned before other parameters.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "description": "File name pattern with wildcards (e.g. '*.log', 'config*')"},
-                "path":    {"type": "string", "description": "Root directory to search in. Defaults to workspace."},
+                "pattern": {"type": "string", "description": "REQUIRED: File name pattern with wildcards. Examples: '*.log', 'config*', 'test_*.py', '**/*.rs'"},
+                "path":    {"type": "string", "description": "Root directory to search in. Defaults to workspace root. Can be relative or absolute."},
                 "max_results": {"type": "integer", "description": "Maximum results to return (default: 20)"}
             },
             "required": ["pattern"]
@@ -249,13 +269,18 @@ pub(crate) fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "search_content".to_owned(),
-        description: "Search file contents by regex or text pattern. Use this instead of exec grep.".to_owned(),
+        description: "Search file contents by regex or text pattern. Built on ripgrep.\n\
+            Use this instead of execute_command with grep/rg. This tool is faster and respects .gitignore.\n\
+            - Supports full regex syntax: 'log.*Error', 'function\\s+\\w+', 'TODO|FIXME'\n\
+            - Escape special chars for literal matches: 'functionCall\\('\n\
+            - Use 'include' to filter by file type: '*.py', '*.rs'\n\
+            CRITICAL: 'pattern' must be returned before other parameters.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "pattern":  {"type": "string", "description": "Text or regex pattern to search for"},
-                "path":     {"type": "string", "description": "File or directory to search in. Defaults to workspace."},
-                "include":  {"type": "string", "description": "File glob filter (e.g. '*.py', '*.rs')"},
+                "pattern":  {"type": "string", "description": "REQUIRED: Regex pattern to search for. Examples: 'TODO', 'import.*from', 'class\\s+\\w+', 'def main'"},
+                "path":     {"type": "string", "description": "File or directory to search in. Defaults to workspace root."},
+                "include":  {"type": "string", "description": "File glob filter. Examples: '*.py', '*.{ts,tsx}', '*.rs'"},
                 "ignore_case": {"type": "boolean", "description": "If true, match case-insensitively. Default: false."},
                 "max_results": {"type": "integer", "description": "Maximum results (default: 20)"}
             },
@@ -434,37 +459,66 @@ pub(crate) fn build_tool_list(
         }),
     });
     tools.push(ToolDef {
-        name: "pdf".to_owned(),
-        description: "Extract text content from a PDF file or URL.".to_owned(),
+        name: "video_gen".to_owned(),
+        description: "Generate a video from a text description using an AI video model. \
+            Use this tool whenever the user asks to: create a video, animate an image, \
+            generate a clip, make a short film, produce footage, or anything involving \
+            video output. Pass the user's original description as-is (preserve their \
+            language, do not translate).".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "File path or URL to a PDF document"}
+                "prompt":       {"type": "string", "description": "Video description. Use the user's original language and wording."},
+                "duration":     {"type": "integer", "description": "Duration in seconds (default: 5)", "default": 5},
+                "aspect_ratio": {"type": "string", "description": "Aspect ratio: 16:9, 9:16, 1:1 (default: 16:9)", "default": "16:9"},
+                "model":        {"type": "string", "description": "Video model to use, e.g. seedance, minimax, kling (optional, uses configured default)"}
+            },
+            "required": ["prompt"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "pdf".to_owned(),
+        description: "Extract text content from a PDF file or URL.\n\
+            - Supports local files and remote URLs.\n\
+            - Returns extracted text suitable for analysis.\n\
+            - For large PDFs, content may be truncated.\n\
+            Example: {\"path\":\"report.pdf\"} or {\"path\":\"https://example.com/doc.pdf\"}".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "REQUIRED: File path (relative to workspace) or full URL. Examples: 'docs/report.pdf', 'https://example.com/whitepaper.pdf'"}
             },
             "required": ["path"]
         }),
     });
     tools.push(ToolDef {
         name: "text_to_voice".to_owned(),
-        description: "Convert text to speech audio.".to_owned(),
+        description: "Convert text to speech audio and send as voice message.\n\
+            - Generates audio from text input.\n\
+            - On macOS uses 'say', on Linux uses espeak/sherpa-onnx.\n\
+            - Result is sent as a voice attachment to the user.\n\
+            Example: {\"text\":\"Hello world\",\"voice\":\"Tingting\"}".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "text":  {"type": "string", "description": "Text to convert to speech"},
-                "voice": {"type": "string", "description": "Voice name (macOS: say -v '?', Linux: espeak --voices)"}
+                "text":  {"type": "string", "description": "REQUIRED: Text to convert to speech. Can be any language."},
+                "voice": {"type": "string", "description": "Voice name. macOS: run 'say -v ?' for list. Linux: run 'espeak --voices'. Examples: 'Tingting' (Chinese), 'Samantha' (English)"}
             },
             "required": ["text"]
         }),
     });
     tools.push(ToolDef {
         name: "send_message".to_owned(),
-        description: "Send a message to a chat channel target (user or group).".to_owned(),
+        description: "Send a message to a chat channel target (user or group).\n\
+            Use this to proactively reach out to users on messaging platforms.\n\
+            Channel is auto-detected from current session if not specified.\n\
+            Example: {\"target\":\"user123\",\"text\":\"Task completed!\",\"channel\":\"telegram\"}".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "channel": {"type": "string", "description": "Channel type (e.g. telegram, discord)"},
-                "target":  {"type": "string", "description": "Target user or group ID"},
-                "text":    {"type": "string", "description": "Message text to send"}
+                "channel": {"type": "string", "description": "Channel type. Examples: 'telegram', 'discord', 'feishu', 'weixin', 'slack'"},
+                "target":  {"type": "string", "description": "REQUIRED: Target user ID or group/chat ID"},
+                "text":    {"type": "string", "description": "REQUIRED: Message text to send"}
             },
             "required": ["target", "text"]
         }),
@@ -504,11 +558,14 @@ pub(crate) fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "gateway".to_owned(),
-        description: "Query gateway status and information.".to_owned(),
+        description: "Query gateway status and information.\n\
+            - status: Current gateway state, uptime, connected channels, active agents\n\
+            - health: Health check (OK/degraded)\n\
+            - version: Gateway version and build info".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["status", "health", "version"], "description": "Info to retrieve"}
+                "action": {"type": "string", "enum": ["status", "health", "version"], "description": "REQUIRED: Info to retrieve. Examples: 'status', 'version'"}
             },
             "required": ["action"]
         }),

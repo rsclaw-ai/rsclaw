@@ -148,6 +148,7 @@ impl MemorySlot for MemoryStoreSlot {
                 abstract_text: None,
                 overview_text: None,
                 tags: vec![],
+                pinned: false,
             };
             self.inner.lock().await.add(doc).await?;
             Ok(id)

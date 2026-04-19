@@ -147,18 +147,14 @@ pub(crate) fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// System prompt builder
+// Dynamic context helper (used by KV cache modes 1 & 2)
 // ---------------------------------------------------------------------------
 
-/// Build the base system prompt shared by main agent and sub agents.
+/// Build the dynamic date/time context line.
 ///
-/// Contains: date/time, language, platform, command safety rules.
-/// Sub agents call this directly; the main agent calls `build_system_prompt`
-/// which adds workspace context, skills, and tool guidance on top.
-pub(crate) fn build_base_system_prompt(config: &crate::config::schema::Config) -> Vec<String> {
-    let mut parts: Vec<String> = Vec::new();
-
-    // Current date/time so the model knows "today", "last Friday", etc.
+/// When `kv_cache_mode >= 1`, this is injected per-turn into the user
+/// message instead of the system prompt, to preserve KV cache prefix stability.
+pub(crate) fn build_date_context() -> String {
     let now = chrono::Local::now();
     use chrono::Datelike;
     let weekday = now.date_naive().weekday().num_days_from_monday();
@@ -168,19 +164,33 @@ pub(crate) fn build_base_system_prompt(config: &crate::config::schema::Config) -
         now.date_naive() - chrono::Duration::days((weekday + 3) as i64)
     };
     let yesterday = now.date_naive() - chrono::Duration::days(1);
-    let mut date_line = format!(
+    format!(
         "Current date: {} ({}). Yesterday: {}. Last Friday: {}.",
         now.format("%Y-%m-%d %H:%M"),
         now.format("%A"),
         yesterday.format("%Y-%m-%d"),
         last_friday.format("%Y-%m-%d"),
-    );
+    )
+}
+
+// ---------------------------------------------------------------------------
+// System prompt builder
+// ---------------------------------------------------------------------------
+
+/// Build the base system prompt shared by main agent and sub agents.
+///
+/// Contains: language directive, platform info, command safety rules.
+/// Date/time and other dynamic content is injected per-turn into the user
+/// message by the runtime, NOT here, to preserve KV cache prefix stability.
+pub(crate) fn build_base_system_prompt(config: &crate::config::schema::Config) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+
+    // Language directive is stable (doesn't change per-turn).
     if let Some(lang) = config.gateway.as_ref().and_then(|g| g.language.as_deref()) {
-        date_line.push_str(&format!(
-            "\nDefault response language: {lang}. Always reply in {lang} unless the user explicitly uses another language."
+        parts.push(format!(
+            "Default response language: {lang}. Always reply in {lang} unless the user explicitly uses another language."
         ));
     }
-    parts.push(date_line);
 
     // Platform information so LLM generates correct shell commands.
     let platform_info = if cfg!(target_os = "windows") {
@@ -222,8 +232,22 @@ pub(crate) fn build_base_system_prompt(config: &crate::config::schema::Config) -
          5. Iterate: repeat until the task is complete, then reply to the user\n\
          If a tool call fails, do NOT retry with the same arguments. Try a different approach or inform the user.\n\
          Never fabricate URLs, file paths, or numeric values.\n\
-         When you need a Unix timestamp, use a shell command (e.g. `date +%s`) — never calculate it yourself.\n\
+         When you need a Unix timestamp or today's date, use a shell command (e.g. `date`) — never assume or calculate it yourself.\n\
          </agent_loop>"
+            .to_owned(),
+    );
+
+    // Output formatting and data integrity rules (always included).
+    parts.push(
+        "[Output format rules]\n\
+         - Avoid Markdown headings (#, ##, ###) in chat replies.\n\
+         - Use **bold text** or section markers for sections.\n\
+         - Use 1. or - for lists.\n\
+         - Do NOT use Markdown tables (|---|). Use \"label: value\" format instead.\n\
+         \n[Data integrity rules]\n\
+         - NEVER truncate or shorten ANY text, strings, numbers, or identifiers.\n\
+         - Copy ALL values EXACTLY: UUIDs, IDs, IP addresses, paths, URLs, code, data.\n\
+         - If you see truncated data in context, report it as incomplete."
             .to_owned(),
     );
 
@@ -282,7 +306,8 @@ pub(crate) fn build_system_prompt(
              - For cron jobs: use the `cron` tool (action=list/add/remove).\n\
              - To install tools (python, node, ffmpeg, chrome, opencode, claude-code, sherpa-onnx): use `install_tool`. Do NOT download/install manually.\n\
              - When user asks about previous conversations, tasks, or anything you don't have context for, use `memory` to recall relevant information before answering.\n\
-             - At the start of a new session, if the user's first message references prior work, search memory first."
+             - At the start of a new session, if the user's first message references prior work, search memory first.\n\
+             - When you discover information that is more complete or accurate than what memory contains (e.g. you find a full phone number after memory only had partial digits, or you confirm a username/ID), immediately save the corrected value to memory so it survives context compaction. Do not rely on the information remaining in conversation context."
                 .to_owned(),
         );
 
@@ -307,10 +332,31 @@ pub(crate) fn build_system_prompt(
              3. The skill auto-matches and injects on future relevant requests.\n\
              Proactively find and install skills you need — do NOT ask permission.\n\
              ### Creating Skills\n\
-             When you discover a reusable pattern through trial and error:\n\
-             1. Create workspace/skills/<slug>/SKILL.md with frontmatter (name, description, version).\n\
-             2. Body: trigger conditions + key execution steps (keep under 100 lines).\n\
-             3. Record in memory to avoid duplicates. Inform the user.\n\
+             When you discover a genuinely reusable pattern, create a skill following the\n\
+             Anthropic skill-creator standard (same format used by skills.sh):\n\
+             \n\
+             Directory layout:\n\
+               workspace/skills/<slug>/\n\
+                 SKILL.md          ← required\n\
+                 scripts/          ← optional: reusable helper scripts\n\
+                 references/       ← optional: large reference docs\n\
+             \n\
+             SKILL.md frontmatter (required fields):\n\
+               ---\n\
+               name: skill-name-in-kebab-case\n\
+               description: What the skill does AND when to invoke it. Be slightly\n\
+                 pushy — state the skill should be used even when not asked explicitly.\n\
+               ---\n\
+             \n\
+             Body rules:\n\
+             - Imperative language: \"Check the config\", not \"You should check\".\n\
+             - Explain WHY each step matters, not just what to do.\n\
+             - Include an Input/Output example where it helps.\n\
+             - Under 500 lines; reference scripts/ or references/ for heavy content.\n\
+             - Do NOT use ALL-CAPS MUST/NEVER; explain reasoning instead.\n\
+             \n\
+             After creating the skill: run `rsclaw skills list` to confirm it loaded.\n\
+             Record in memory to avoid duplicates. Inform the user.\n\
              Only create skills for genuinely reusable patterns, not one-off tasks.\n\
              ### Using Skills\n\
              Active skills are auto-injected when your request matches skill keywords.\n\

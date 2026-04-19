@@ -1,6 +1,6 @@
 [package]
 name = "rsclaw"
-version = "2026.4.15"
+version = "2026.4.18"
 edition = "2024"
 rust-version = "1.91"
 description = "AI Automation Manager Compatible with OpenClaw"
@@ -38,7 +38,7 @@ candle-transformers = "0.9"
 
 # Serialization
 serde        = { version = "1", features = ["derive"] }
-serde_json   = "1"
+serde_json   = { version = "1", features = ["preserve_order"] }
 json5        = "0.4"
 toml         = "1"
 
@@ -68,6 +68,7 @@ tar           = "0.4"
 md-5          = "0.10"
 sha1          = "0.10"
 sha2          = "0.10"
+hmac          = "0.12"
 hex           = "0.4"
 dirs-next = "2"
 console = "0.16"
