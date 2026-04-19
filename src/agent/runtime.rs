@@ -4120,6 +4120,8 @@ impl AgentRuntime {
             "pdf" => return self.tool_pdf(args).await,
             "text_to_voice" | "text_to_speech" | "tts" => return self.tool_tts(args).await,
             "send_message" | "message" => return self.tool_message(args).await,
+            "clarify" => return self.tool_clarify(args).await,
+            "anycli" | "opencli" => return self.tool_anycli(args).await,
             "cron" => return self.tool_cron(args, ctx).await,
             "gateway" => return self.tool_gateway(args).await,
             "pairing" => return self.tool_pairing(args).await,

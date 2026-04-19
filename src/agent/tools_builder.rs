@@ -18,7 +18,7 @@ pub(crate) fn toolset_allowed_names(
     toolset: &str,
     custom_tools: Option<&Vec<String>>,
 ) -> Option<std::collections::HashSet<String>> {
-    const MINIMAL: &[&str] = &["execute_command", "read_file", "write_file", "send_file", "list_dir", "search_file", "search_content", "web_search", "web_fetch", "memory"];
+    const MINIMAL: &[&str] = &["execute_command", "read_file", "write_file", "send_file", "list_dir", "search_file", "search_content", "web_search", "web_fetch", "memory", "clarify", "anycli"];
     const WEB: &[&str] = &["web_search", "web_fetch", "web_download", "read_file", "write_file", "list_dir", "search_file", "memory"];
     const CODE: &[&str] = &["execute_command", "read_file", "write_file", "list_dir", "search_file", "search_content", "memory"];
     const STANDARD: &[&str] = &[
@@ -37,6 +37,8 @@ pub(crate) fn toolset_allowed_names(
         "channel",
         "cron",
         "computer_use",
+        "clarify",
+        "anycli",
     ];
 
     let base: Option<&[&str]> = match toolset {
@@ -613,6 +615,47 @@ pub(crate) fn build_tool_list(
         }),
     });
 
+    tools.push(ToolDef {
+        name: "anycli".to_owned(),
+        description: "Extract structured data from websites using declarative adapters.\n\
+            Actions:\n\
+            - run: Execute an adapter command (e.g., hackernews top, bilibili hot)\n\
+            - list: List all available adapters\n\
+            - info: Show adapter details and available commands\n\
+            - search: Search community hub for adapters\n\
+            - install: Install an adapter from the hub\n\
+            Built-in adapters: hackernews, bilibili, arxiv, wikipedia, github-trending.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "action":  {"type": "string", "enum": ["run", "list", "info", "search", "install"], "description": "Action to perform"},
+                "adapter": {"type": "string", "description": "Adapter name (for run/info)"},
+                "command": {"type": "string", "description": "Command name within adapter (for run)"},
+                "params":  {"type": "object", "description": "Key-value parameters (for run), e.g. {\"limit\": \"10\", \"query\": \"rust\"}"},
+                "query":   {"type": "string", "description": "Search query (for search)"},
+                "name":    {"type": "string", "description": "Adapter name (for install)"},
+                "format":  {"type": "string", "enum": ["json", "table", "csv", "markdown"], "description": "Output format (for run, default: json)"}
+            },
+            "required": ["action"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "clarify".to_owned(),
+        description: "Ask the user a clarifying question before proceeding. Use when:\n\
+            - The request is ambiguous and multiple valid interpretations exist\n\
+            - A choice is needed (e.g., which file, which format, which approach)\n\
+            - Destructive or irreversible action needs confirmation\n\
+            Provide options for quick selection or leave open-ended for free-form answers.\n\
+            IMPORTANT: Do NOT use this for simple confirmations. Only when genuine ambiguity exists.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "The question to ask the user"},
+                "options":  {"type": "array", "items": {"type": "string"}, "description": "Optional list of choices. Omit for open-ended questions."}
+            },
+            "required": ["question"]
+        }),
+    });
     tools.push(ToolDef {
         name: "pairing".to_owned(),
         description: "Manage channel pairing (dmPolicy=pairing). Actions: list (show pending codes and approved peers), approve (approve a pairing code), revoke (revoke an approved peer).".to_owned(),

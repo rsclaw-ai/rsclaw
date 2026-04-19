@@ -698,15 +698,16 @@ impl AgentRuntime {
             var el = document.querySelector('article') || document.querySelector('main')
                 || document.querySelector('.content') || document.body;
             var title = document.title || '';
-            var text = el ? el.innerText || '' : '';
-            return JSON.stringify({title: title, text: text});
+            var html = el ? el.innerHTML || '' : '';
+            return JSON.stringify({title: title, html: html});
         })()"#;
         let result = tab.evaluate(js).await?;
         let result_str = result.as_str().unwrap_or("{}");
         let parsed: Value = serde_json::from_str(result_str).unwrap_or_default();
         let title = parsed["title"].as_str().unwrap_or("").to_owned();
-        let text = parsed["text"].as_str().unwrap_or("").to_owned();
-        Ok((title, text))
+        let html = parsed["html"].as_str().unwrap_or("");
+        let md = htmd::convert(html).unwrap_or_else(|_| strip_html(html));
+        Ok((title, md))
     }
 
     /// Browser-based search fallback: open a search engine in the shared browser pool,

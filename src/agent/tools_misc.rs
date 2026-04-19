@@ -802,6 +802,174 @@ $synth.Speak('{}')
     }
 
     // -------------------------------------------------------------------
+    // AnyCLI — structured web data extraction
+    // -------------------------------------------------------------------
+
+    /// Extract structured data from websites using anycli adapters.
+    pub(crate) async fn tool_anycli(&self, args: Value) -> Result<Value> {
+        let action = args["action"]
+            .as_str()
+            .ok_or_else(|| anyhow!("anycli: `action` required"))?;
+
+        match action {
+            "list" => {
+                let registry = anycli::Registry::load()?;
+                let adapters: Vec<serde_json::Value> = registry
+                    .list()
+                    .iter()
+                    .map(|a| {
+                        json!({
+                            "name": a.name,
+                            "description": a.description,
+                            "commands": a.commands.keys().collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                Ok(json!({"adapters": adapters}))
+            }
+
+            "info" => {
+                let adapter_name = args["adapter"]
+                    .as_str()
+                    .or_else(|| args["name"].as_str())
+                    .ok_or_else(|| anyhow!("anycli info: `adapter` required"))?;
+                let registry = anycli::Registry::load()?;
+                let adapter = registry.find(adapter_name)?;
+
+                let commands: serde_json::Map<String, serde_json::Value> = adapter
+                    .commands
+                    .iter()
+                    .map(|(name, cmd)| {
+                        let params: serde_json::Map<String, serde_json::Value> = cmd
+                            .params
+                            .iter()
+                            .map(|(k, v)| {
+                                (k.clone(), json!({
+                                    "type": v.param_type,
+                                    "required": v.required,
+                                    "default": v.default,
+                                    "description": v.description,
+                                }))
+                            })
+                            .collect();
+                        (name.clone(), json!({
+                            "description": cmd.description,
+                            "params": params,
+                        }))
+                    })
+                    .collect();
+
+                Ok(json!({
+                    "name": adapter.name,
+                    "description": adapter.description,
+                    "base_url": adapter.base_url,
+                    "commands": commands,
+                }))
+            }
+
+            "run" => {
+                let adapter_name = args["adapter"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("anycli run: `adapter` required"))?;
+                let command = args["command"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("anycli run: `command` required"))?;
+
+                let registry = anycli::Registry::load()?;
+                let adapter = registry.find(adapter_name)?;
+
+                // Build params from the JSON object.
+                let mut params_vec: Vec<(String, String)> = Vec::new();
+                if let Some(obj) = args["params"].as_object() {
+                    for (k, v) in obj {
+                        let val = match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        params_vec.push((k.clone(), val));
+                    }
+                }
+
+                let param_refs: Vec<(&str, &str)> = params_vec
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+
+                let result = anycli::Pipeline::execute(adapter, command, &param_refs).await?;
+
+                let fmt_str = args["format"].as_str().unwrap_or("json");
+                let fmt: anycli::OutputFormat = fmt_str.parse()
+                    .unwrap_or(anycli::OutputFormat::Json);
+
+                Ok(json!({
+                    "adapter": result.adapter,
+                    "command": result.command,
+                    "count": result.count,
+                    "data": result.format(fmt)?,
+                }))
+            }
+
+            "search" => {
+                let query = args["query"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("anycli search: `query` required"))?;
+                let hub = anycli::Hub::new()?;
+                let results = hub.search(query).await?;
+                let entries: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|e| json!({"name": e.name, "description": e.description}))
+                    .collect();
+                Ok(json!({"results": entries, "count": entries.len()}))
+            }
+
+            "install" => {
+                let name = args["name"]
+                    .as_str()
+                    .or_else(|| args["adapter"].as_str())
+                    .ok_or_else(|| anyhow!("anycli install: `name` required"))?;
+                let hub = anycli::Hub::new()?;
+                let dir = anycli::hub::default_adapters_dir()
+                    .ok_or_else(|| anyhow!("cannot determine home directory"))?;
+                let path = hub.install(name, &dir).await?;
+                Ok(json!({"installed": name, "path": path.display().to_string()}))
+            }
+
+            other => Err(anyhow!("anycli: unknown action `{other}`")),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Clarify — ask the user a question before proceeding
+    // -------------------------------------------------------------------
+
+    /// Present a clarifying question to the user.  The formatted question is
+    /// returned as the tool result so the LLM includes it in its response text,
+    /// which then gets delivered to the user through the normal channel.  The
+    /// user's next message becomes the answer.
+    pub(crate) async fn tool_clarify(&self, args: Value) -> Result<Value> {
+        let question = args["question"]
+            .as_str()
+            .ok_or_else(|| anyhow!("clarify: `question` required"))?;
+
+        let mut formatted = String::from(question);
+
+        if let Some(options) = args["options"].as_array() {
+            formatted.push('\n');
+            for (i, opt) in options.iter().enumerate() {
+                if let Some(s) = opt.as_str() {
+                    formatted.push_str(&format!("\n{}. {}", i + 1, s));
+                }
+            }
+        }
+
+        Ok(json!({
+            "action": "clarify",
+            "question": formatted,
+            "waiting_for_user": true
+        }))
+    }
+
+    // -------------------------------------------------------------------
     // Gateway / pairing tools
     // -------------------------------------------------------------------
 

@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 pub mod acp;
 pub mod agent_turn;
 pub mod agents;
+pub mod anycli;
 pub mod approvals;
 pub mod channels;
 pub mod completion;
@@ -38,6 +39,7 @@ pub mod webhooks;
 pub use acp::{AcpCommand, AgentCommand};
 pub use agent_turn::AgentTurnArgs;
 pub use agents::{AgentsCommand, BindArgs};
+pub use anycli::AnycliCommand;
 pub use approvals::ApprovalsCommand;
 pub use channels::ChannelsCommand;
 pub use completion::CompletionArgs;
@@ -273,6 +275,10 @@ pub enum Command {
     /// Contact/group ID lookup via gateway directory API.
     #[command(subcommand)]
     Directory(DirectoryCommand),
+
+    /// Extract structured data from websites using declarative adapters.
+    #[command(subcommand)]
+    Anycli(AnycliCommand),
 
     /// DNS helpers for Tailscale wide-area discovery.
     #[command(subcommand)]

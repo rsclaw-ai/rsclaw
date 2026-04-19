@@ -1,5 +1,6 @@
 pub mod agent_turn;
 pub mod agents;
+pub mod anycli;
 pub mod approvals;
 pub mod backup;
 pub mod channels;
@@ -39,6 +40,7 @@ pub mod webhooks;
 
 pub use agent_turn::cmd_agent_turn;
 pub use agents::cmd_agents;
+pub use anycli::cmd_anycli;
 pub use approvals::cmd_approvals;
 pub use backup::cmd_backup;
 pub use channels::cmd_channels;
