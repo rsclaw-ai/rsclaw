@@ -3290,7 +3290,8 @@ impl AgentRuntime {
             let mut loop_warnings: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
             // Track blocked tool calls (failed_commands) that should return error to LLM
-            let mut blocked_tool_results: Vec<(String, String)> = Vec::new();
+            // Format: (tool_id, tool_name, error_message)
+            let mut blocked_tool_results: Vec<(String, String, String)> = Vec::new();
             // Streaming throttle: batch small deltas to reduce channel update rate.
             let mut delta_buf = String::new();
             let mut last_delta_flush = std::time::Instant::now();
@@ -3374,11 +3375,12 @@ impl AgentRuntime {
                                     tool_calls.push((id, name, input));
                                 }
                                 LoopCheckResult::Critical { message, .. } => {
-                                    // For failed_commands: return error result to LLM instead of aborting turn
-                                    // This gives LLM a chance to try a different approach
-                                    tracing::warn!(tool = %name, params = ?input, "Critical loop detected, returning error to LLM: {}", message);
-                                    // Add a synthetic tool result telling LLM the command was blocked
-                                    blocked_tool_results.push((id.clone(), message));
+                                    // For failed_commands: still add to tool_calls so Assistant
+                                    // message has ToolUse, but also track in blocked_tool_results
+                                    // so execution returns error instead of actually running.
+                                    tracing::warn!(tool = %name, params = ?input, "Critical loop detected, marking as blocked: {}", message);
+                                    tool_calls.push((id.clone(), name.clone(), input.clone()));
+                                    blocked_tool_results.push((id, name, message));
                                 }
                             }
                         } else if !id.is_empty() && name.is_empty() {
@@ -3821,7 +3823,13 @@ impl AgentRuntime {
             // First, handle blocked tool calls (failed_commands) that were detected during streaming.
             // These are commands that previously failed (_failed: true) and should not be retried.
             // We return an error result to the LLM so it can try a different approach.
-            for (tool_id, message) in blocked_tool_results {
+            // Note: blocked tools were also added to tool_calls so Assistant message has ToolUse.
+            let blocked_ids: std::collections::HashSet<String> = blocked_tool_results
+                .iter()
+                .map(|(id, _, _)| id.clone())
+                .collect();
+
+            for (tool_id, tool_name, message) in blocked_tool_results {
                 let tool_msg = Message {
                     role: Role::Tool,
                     content: MessageContent::Parts(vec![
@@ -3831,6 +3839,7 @@ impl AgentRuntime {
                                 "error": "Command blocked - previously failed",
                                 "_blocked": true,
                                 "_hint": message,
+                                "_tool": tool_name,
                                 "_suggestion": "This command was blocked because it previously returned _failed: true. \
                                                 Try a different approach: modify the command parameters, \
                                                 check for syntax errors, or inform the user about the underlying issue."
@@ -3848,10 +3857,17 @@ impl AgentRuntime {
                 }
                 // Also record as result for loop detection
                 ctx.loop_detector.record_result(&serde_json::json!({"_blocked": true, "tool_id": tool_id}));
+                info!(tool = %tool_name, tool_id = %tool_id, "blocked tool result sent to LLM");
             }
 
             // Execute each tool and push results.
+            // Skip blocked tools (their results were already handled above).
             for (tool_id, tool_name, tool_input) in tool_calls {
+                // Skip blocked tools - result already sent above
+                if blocked_ids.contains(&tool_id) {
+                    continue;
+                }
+
                 // Skip tools with parse errors — do not execute, return error directly.
                 // This prevents infinite retry loops when model output gets truncated.
                 if let Some(parse_error) = tool_input.get("_parse_error").and_then(|v| v.as_str()) {
