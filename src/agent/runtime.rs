@@ -3359,6 +3359,9 @@ impl AgentRuntime {
                     text_buf
                 };
 
+                if !tool_images.is_empty() {
+                    info!("AgentReply returning with {} image(s), first {} bytes", tool_images.len(), tool_images.first().map(|s| s.len()).unwrap_or(0));
+                }
                 return Ok(AgentReply {
                     text: final_text,
                     is_empty: no_reply && tool_images.is_empty(),
@@ -3550,7 +3553,7 @@ impl AgentRuntime {
                 )
                 .await;
 
-                let (result_text, result_images) = match result {
+                let (mut result_text, result_images) = match result {
                     Ok(v) => {
                         // Reset parse error counter on successful tool execution
                         ctx.parse_error_count = 0;
@@ -3594,14 +3597,38 @@ impl AgentRuntime {
                         }
                     }
                     Err(e) => {
-                        warn!(tool = %tool_name, "tool error: {e:#}");
-                        // Record error result for loop detection (errors count as results too).
+                        let err_str = e.to_string();
+                        warn!(tool = %tool_name, "tool error: {err_str}");
+
+                        // Special: WASM plugins can return QR/image data via error message.
+                        // Look for JIMENG_LOGIN_QR: anywhere in the error string
+                        // (it may be wrapped by the WASM runtime: "WASM plugin ... error: JIMENG_LOGIN_QR:...")
+                        let mut extra_images: Vec<String> = vec![];
+                        let clean_err;
+                        if err_str.contains("JIMENG_PHONE_LOGIN:") {
+                            // Phone login flow — ask user for phone number.
+                            clean_err = "即梦需要登录。请告诉我您的手机号码，我会发送验证码帮您登录。使用 jimeng.login_phone 工具提交手机号。".to_string();
+                        } else if let Some(qr_pos) = err_str.find("JIMENG_LOGIN_QR:") {
+                            let rest = &err_str[qr_pos + "JIMENG_LOGIN_QR:".len()..];
+                            let b64_line = rest.lines().next().unwrap_or("").trim();
+                            if b64_line.starts_with("data:image/") {
+                                info!("attaching QR login image for user");
+                                extra_images.push(b64_line.to_string());
+                            } else if !b64_line.is_empty() {
+                                info!("attaching QR login image (raw base64) for user");
+                                extra_images.push(format!("data:image/png;base64,{}", b64_line));
+                            }
+                            clean_err = "请使用抖音APP扫描二维码登录即梦。登录成功后请重新发送您的请求。".to_string();
+                        } else {
+                            clean_err = err_str.clone();
+                        }
+
                         ctx.loop_detector
-                            .record_result(&serde_json::json!({"error": e.to_string()}));
+                            .record_result(&serde_json::json!({"error": clean_err}));
                         (format!(
                             "{{\"error\":\"{}\",\"_do_not_retry\":true,\"hint\":\"This tool call failed. Do NOT retry the same tool with the same arguments. Try a different approach or inform the user.\"}}",
-                            e
-                        ), vec![])
+                            clean_err
+                        ), extra_images)
                     }
                 };
 
@@ -3701,6 +3728,84 @@ impl AgentRuntime {
                                     try_add_file(trimmed);
                                 }
                             }
+                        }
+                    }
+                }
+
+                // Extract inline images and file attachments from WASM plugin results.
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result_text) {
+                    // data:image/ URIs → tool_images
+                    if let Some(imgs) = v.get("images").and_then(|i| i.as_array()) {
+                        for img in imgs {
+                            if let Some(s) = img.as_str() {
+                                if s.starts_with("data:image/") {
+                                    tool_images.push(s.to_string());
+                                    tracing::info!("extracted inline image from tool result ({} bytes)", s.len());
+                                }
+                            }
+                        }
+                        if !tool_images.is_empty() {
+                            let mut cleaned = v.clone();
+                            cleaned["images"] = serde_json::json!(format!("[{} images extracted as attachments]", tool_images.len()));
+                            result_text = cleaned.to_string();
+                        }
+                    }
+
+                    // File paths from "files" array → tool_images/tool_files (auto-send)
+                    // Jimeng plugin returns: {"files": ["{\"path\":\"/path/to/1.png\",\"size\":123}", ...]}
+                    if let Some(files) = v.get("files").and_then(|f| f.as_array()) {
+                        for file_entry in files {
+                            let path_str = if let Some(s) = file_entry.as_str() {
+                                // May be a JSON string with path field
+                                if let Ok(fv) = serde_json::from_str::<serde_json::Value>(s) {
+                                    fv.get("path").and_then(|p| p.as_str()).unwrap_or(s).to_string()
+                                } else {
+                                    s.to_string()
+                                }
+                            } else if let Some(p) = file_entry.get("path").and_then(|p| p.as_str()) {
+                                p.to_string()
+                            } else {
+                                continue;
+                            };
+
+                            let pb = std::path::PathBuf::from(&path_str);
+                            if pb.exists() {
+                                let lower = path_str.to_lowercase();
+                                let is_image = lower.ends_with(".png") || lower.ends_with(".jpg")
+                                    || lower.ends_with(".jpeg") || lower.ends_with(".webp");
+                                if is_image {
+                                    // Convert to data URI for inline sending
+                                    if let Ok(bytes) = std::fs::read(&pb) {
+                                        use base64::Engine as _;
+                                        let mime = if lower.ends_with(".png") { "image/png" }
+                                            else if lower.ends_with(".webp") { "image/webp" }
+                                            else { "image/jpeg" };
+                                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                        tool_images.push(format!("data:{mime};base64,{b64}"));
+                                        tracing::info!(path = %path_str, size = bytes.len(), "auto-sending image file as attachment");
+                                    }
+                                } else {
+                                    // Non-image file (video, etc.) → tool_files
+                                    let filename = pb.file_name()
+                                        .map(|f| f.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "file".to_string());
+                                    let mime = if lower.ends_with(".mp4") { "video/mp4" }
+                                        else if lower.ends_with(".mp3") { "audio/mpeg" }
+                                        else { "application/octet-stream" };
+                                    tool_files.push((filename, mime.to_string(), path_str.clone()));
+                                    tracing::info!(path = %path_str, "auto-sending file as attachment");
+                                }
+                            }
+                        }
+                        // Clean up result_text
+                        if !tool_images.is_empty() || !tool_files.is_empty() {
+                            let mut cleaned = v.clone();
+                            cleaned["files"] = serde_json::json!(format!(
+                                "[{} files auto-sent as attachments]",
+                                tool_images.len() + tool_files.len()
+                            ));
+                            cleaned.as_object_mut().map(|o| o.remove("_action"));
+                            result_text = cleaned.to_string();
                         }
                     }
                 }

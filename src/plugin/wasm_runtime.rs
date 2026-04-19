@@ -136,7 +136,35 @@ impl rsclaw::jimeng::host_browser::Host for HostState {
     }
 
     async fn browser_eval(&mut self, code: String) -> Result<Result<String, String>> {
-        Ok(self.browser_action("evaluate", json!({"code": code})).await)
+        // Special command: switch to the newest/last tab
+        if code == "__switch_latest_tab" {
+            let mut guard = self.browser.lock().await;
+            if guard.is_none() {
+                return Ok(Err("browser not initialized".to_string()));
+            }
+            let session = guard.as_mut().unwrap();
+            // list_tabs returns {"action":"list_tabs","tabs":[{"id":"...","url":"..."},...]}
+            match session.execute("list_tabs", &json!({})).await {
+                Ok(val) => {
+                    if let Some(tabs) = val.get("tabs").and_then(|t| t.as_array()) {
+                        tracing::info!("list_tabs: {} tab(s)", tabs.len());
+                        if let Some(last_tab) = tabs.last() {
+                            if let Some(tid) = last_tab.get("id").and_then(|t| t.as_str()) {
+                                let url = last_tab.get("url").and_then(|u| u.as_str()).unwrap_or("?");
+                                tracing::info!("switching to tab: {} url={}", tid, &url[..url.len().min(80)]);
+                                match session.execute("switch_tab", &json!({"target_id": tid})).await {
+                                    Ok(_) => return Ok(Ok(format!("switched to tab: {}", url))),
+                                    Err(e) => return Ok(Err(format!("switch_tab failed: {e:#}"))),
+                                }
+                            }
+                        }
+                    }
+                    return Ok(Err("no tabs found in list".to_string()));
+                }
+                Err(e) => return Ok(Err(format!("list_tabs failed: {e:#}"))),
+            }
+        }
+        Ok(self.browser_action("evaluate", json!({"js": code})).await)
     }
 
     async fn browser_wait_text(
@@ -159,7 +187,7 @@ impl rsclaw::jimeng::host_browser::Host for HostState {
         filename: String,
     ) -> Result<Result<String, String>> {
         Ok(self
-            .browser_action("download", json!({"ref": ref_str, "filename": filename}))
+            .browser_action("download", json!({"ref": ref_str, "path": filename}))
             .await)
     }
 
@@ -222,7 +250,17 @@ impl HostState {
 
         let session = guard.as_mut().expect("browser session just initialized");
         match session.execute(action, &args).await {
-            Ok(val) => Ok(val.to_string()),
+            Ok(val) => {
+                // Extract the payload field from action results so WASM plugins
+                // get clean data, not the JSON wrapper.
+                // snapshot → "text", screenshot → "image", others → full JSON
+                for field in &["text", "image", "data", "url", "result"] {
+                    if let Some(s) = val.get(field).and_then(|v| v.as_str()) {
+                        return Ok(s.to_string());
+                    }
+                }
+                Ok(val.to_string())
+            }
             Err(e) => Err(format!("{e:#}")),
         }
     }
