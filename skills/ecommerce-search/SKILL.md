@@ -51,7 +51,7 @@ author: "@rsclaw"
 ### 淘宝（taobao.com）— 需要登录
 
 **登录检查：**
-1. `state load` key=`taobao.com`
+1. `{"tool": "web_browser", "action": "state", "value": "load", "path": "taobao.com-auth.json"}`
 2. `open` 导航到 `https://s.taobao.com/search?q=test`
 3. 如果 URL 被重定向到 `login.taobao.com` → 触发 `web-scan-login` skill 登录
 4. 如果页面正常显示搜索结果 → 登录态有效
@@ -121,10 +121,10 @@ author: "@rsclaw"
 ### 抖音商城（douyin.com/mall）— 需要登录
 
 **登录检查：**
-1. `state load` key=`douyin.com`
+1. `{"tool": "web_browser", "action": "state", "value": "load", "path": "douyin.com-auth.json"}`
 2. `open` 导航到 `https://www.douyin.com`
 3. 如果页面出现登录弹窗或未登录状态 → 触发 `web-scan-login` skill
-4. 登录后 `state save` key=`douyin.com`
+4. 登录后 `{"tool": "web_browser", "action": "state", "value": "save", "path": "douyin.com-auth.json"}`
 
 **搜索步骤：**
 1. `open` 导航到 `https://www.douyin.com/search/{query}?type=general`

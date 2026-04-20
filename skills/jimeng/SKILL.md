@@ -29,7 +29,15 @@ If not logged in, screenshot the QR code and send to user:
 ```json
 {"tool": "web_browser", "action": "screenshot"}
 ```
-Wait for user to scan and confirm login, then proceed.
+Wait for user to scan and confirm login, then save state:
+```json
+{"tool": "web_browser", "action": "state", "value": "save", "path": "jimeng-auth.json"}
+```
+
+On subsequent sessions, restore login state first:
+```json
+{"tool": "web_browser", "action": "state", "value": "load", "path": "jimeng-auth.json"}
+```
 
 ## Available Functions
 
@@ -48,7 +56,7 @@ Navigate to image generation page, select model, input prompt, generate and down
 
 **Step 2**: Select model (open dropdown, click model option)
 ```json
-{"tool": "web_browser", "action": "eval", "code": "var els=document.querySelectorAll('[class*=select]');for(var e of els){if(e.innerText&&e.innerText.match(/图片\\s*\\d/)&&e.offsetHeight>0&&e.offsetHeight<50){e.click();break}}"}
+{"tool": "web_browser", "action": "evaluate", "code": "var els=document.querySelectorAll('[class*=select]');for(var e of els){if(e.innerText&&e.innerText.match(/图片\\s*\\d/)&&e.offsetHeight>0&&e.offsetHeight<50){e.click();break}}"}
 ```
 Wait 2s, then snapshot to find model options:
 ```json
@@ -74,7 +82,7 @@ Wait 10-30s for generation to complete. Poll with snapshot looking for "生成�
 **Step 5**: View and download results
 Click first generated image (use eval with dispatchEvent for reliable click):
 ```json
-{"tool": "web_browser", "action": "eval", "code": "var imgs=document.querySelectorAll('img');for(var img of imgs){var src=img.src||'';if(src.indexOf('dreamina-sign')>-1&&img.offsetHeight>80){var rect=img.getBoundingClientRect();if(rect.y>0&&rect.y<600){['mousedown','mouseup','click'].forEach(function(t){img.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window,clientX:rect.x+rect.width/2,clientY:rect.y+rect.height/2,button:0}))});break}}}"}
+{"tool": "web_browser", "action": "evaluate", "code": "var imgs=document.querySelectorAll('img');for(var img of imgs){var src=img.src||'';if(src.indexOf('dreamina-sign')>-1&&img.offsetHeight>80){var rect=img.getBoundingClientRect();if(rect.y>0&&rect.y<600){['mousedown','mouseup','click'].forEach(function(t){img.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window,clientX:rect.x+rect.width/2,clientY:rect.y+rect.height/2,button:0}))});break}}}"}
 ```
 Wait 3s, then find and click download button:
 ```json
@@ -82,7 +90,7 @@ Wait 3s, then find and click download button:
 ```
 Find download button ref, then:
 ```json
-{"tool": "web_browser", "action": "download", "ref": "<download_ref>", "path": "<filename>"}
+{"tool": "web_browser", "action": "click", "ref": "<download_ref>"}
 ```
 Use ArrowRight/ArrowLeft to navigate between images in the set.
 

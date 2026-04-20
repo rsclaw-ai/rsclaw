@@ -13,7 +13,7 @@ author: "@rsclaw"
 ## 核心流程
 
 1. **检查已保存的登录态**
-   - `state load` 对应站点的 state（key 为域名，如 `jd.com`）
+   - 尝试加载 state：`{"tool": "web_browser", "action": "state", "value": "load", "path": "{domain}-auth.json"}`
    - 导航到目标页，检测是否仍然登录
    - 如果登录态有效 → 直接继续任务
    - 如果失效（跳回登录页、出现登录按钮）→ 进入扫码流程
@@ -28,7 +28,7 @@ author: "@rsclaw"
    - 超时则提示用户二维码可能过期，重新获取二维码
 
 3. **登录成功后收尾**
-   - `state save` 持久化（key 为域名）
+   - 保存 state：`{"tool": "web_browser", "action": "state", "value": "save", "path": "{domain}-auth.json"}`
    - 向用户报告"XXX 登录成功"（一句话）
    - 立即结束登录流程，回到原任务
 
