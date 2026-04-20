@@ -127,6 +127,17 @@ pub enum BrowserCommand {
         #[arg(long, default_value = "8000")]
         wait: u64,
     },
+    /// Download video from a page (capture URL + download with cookies).
+    DownloadVideo {
+        /// Video page URL.
+        url: String,
+        /// Output file path.
+        #[arg(short, long, default_value = "video.mp4")]
+        output: String,
+        /// Wait time in milliseconds for video to load (default: 8000).
+        #[arg(long, default_value = "8000")]
+        wait: u64,
+    },
     /// Find elements by ARIA role.
     GetByRole {
         /// Role name (e.g., button, link, textbox).

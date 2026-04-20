@@ -147,6 +147,89 @@ async fn dispatch_and_print(
             eprintln!("State saved to {path}");
             return Ok(());
         }
+        BrowserCommand::DownloadVideo { url, output, wait } => {
+            // 1. Capture video URLs.
+            eprintln!("Capturing video URLs from {url}...");
+            let result = session.execute("capture_video", &json!({"url": url, "wait_ms": wait})).await?;
+            let urls = result.get("video_urls")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            if urls.is_empty() {
+                eprintln!("No video URLs found. Try logging in first (rsclaw browser state-load).");
+                return Ok(());
+            }
+
+            // 2. Pick the best URL (prefer mp4/playaddr, largest, video over audio).
+            let best = urls.iter()
+                .filter_map(|u| u.as_str())
+                .filter(|u| !u.contains("audio"))
+                .max_by_key(|u| {
+                    let mut score = 0i32;
+                    if u.contains(".mp4") { score += 10; }
+                    if u.contains("playaddr") || u.contains("play_addr") { score += 5; }
+                    if u.contains("1080") { score += 3; }
+                    if u.contains("720") { score += 2; }
+                    score
+                })
+                .or_else(|| urls.first().and_then(|u| u.as_str()));
+
+            let Some(video_url) = best else {
+                eprintln!("No suitable video URL found.");
+                return Ok(());
+            };
+
+            eprintln!("Downloading: {}", &video_url[..video_url.len().min(100)]);
+
+            // 3. Extract cookies from browser for this domain.
+            let cookies_result = session.execute("cookies", &json!({"value": "get"})).await.ok();
+            let cookie_header = cookies_result
+                .as_ref()
+                .and_then(|r| r.get("cookies"))
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|c| {
+                            let name = c.get("name").and_then(|v| v.as_str())?;
+                            let value = c.get("value").and_then(|v| v.as_str())?;
+                            Some(format!("{name}={value}"))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .unwrap_or_default();
+
+            // 4. Download with cookies and referer.
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(300))
+                .build()?;
+
+            let referer = if video_url.contains("bilibili") || video_url.contains("bilivideo") {
+                "https://www.bilibili.com/"
+            } else if video_url.contains("douyin") || video_url.contains("douyinvod") {
+                "https://www.douyin.com/"
+            } else {
+                &url
+            };
+
+            let resp = client.get(video_url)
+                .header("Cookie", &cookie_header)
+                .header("Referer", referer)
+                .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                eprintln!("Download failed: HTTP {}", resp.status());
+                return Ok(());
+            }
+
+            let bytes = resp.bytes().await?;
+            std::fs::write(&output, &bytes)?;
+            eprintln!("Saved to {output} ({} bytes)", bytes.len());
+            return Ok(());
+        }
         BrowserCommand::Requests { clear, filter } => {
             let js = "JSON.stringify(performance.getEntriesByType('resource').map(e => ({name: e.name, type: e.initiatorType, duration: Math.round(e.duration), size: e.transferSize || 0})))";
             let result = session.execute("evaluate", &json!({"js": js})).await?;
@@ -431,7 +514,8 @@ fn to_action_args(sub: BrowserCommand) -> (&'static str, serde_json::Value) {
         | BrowserCommand::Profiles
         | BrowserCommand::Connect { .. }
         | BrowserCommand::Requests { .. }
-        | BrowserCommand::Session { .. } => unreachable!(),
+        | BrowserCommand::Session { .. }
+        | BrowserCommand::DownloadVideo { .. } => unreachable!(),
     }
 }
 
