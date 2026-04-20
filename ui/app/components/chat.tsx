@@ -568,7 +568,7 @@ export function ChatActions(props: {
         )}
         <ChatAction
           onClick={props.attachFile}
-          text="Attach File"
+          text={Locale.Chat.InputActions.AttachFile}
           icon={<UploadIcon />}
         />
         <ChatAction

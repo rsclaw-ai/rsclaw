@@ -74,6 +74,7 @@ const en: LocaleType = {
       Clear: "Clear Context",
       Settings: "Settings",
       UploadImage: "Upload Images",
+      AttachFile: "Attach File",
     },
     Rename: "Rename Chat",
     Typing: "Typing…",
