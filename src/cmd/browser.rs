@@ -31,8 +31,9 @@ async fn connect_or_launch(port: Option<u16>) -> Result<crate::browser::BrowserS
     } else {
         let chrome_path = crate::agent::platform::detect_chrome()
             .ok_or_else(|| anyhow!("Chrome not found. Install with: rsclaw tools install chrome"))?;
+        let profile = std::env::var("RSCLAW_BROWSER_PROFILE").ok();
         eprintln!("Launching headless Chrome");
-        crate::browser::BrowserSession::start(&chrome_path, false, None).await
+        crate::browser::BrowserSession::start(&chrome_path, false, profile.as_deref()).await
     }
 }
 
@@ -143,6 +144,69 @@ async fn dispatch_and_print(
             });
             std::fs::write(path, serde_json::to_string_pretty(&state)?)?;
             eprintln!("State saved to {path}");
+            return Ok(());
+        }
+        BrowserCommand::Requests { clear, filter } => {
+            let js = "JSON.stringify(performance.getEntriesByType('resource').map(e => ({name: e.name, type: e.initiatorType, duration: Math.round(e.duration), size: e.transferSize || 0})))";
+            let result = session.execute("evaluate", &json!({"js": js})).await?;
+            if let Some(val) = result.get("result") {
+                let text = match val {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => serde_json::to_string(other).unwrap_or_default(),
+                };
+                if let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
+                    let filtered: Vec<&serde_json::Value> = if let Some(pat) = filter {
+                        entries.iter().filter(|e| {
+                            e.get("name").and_then(|v| v.as_str())
+                                .map(|n| n.contains(pat.as_str()))
+                                .unwrap_or(false)
+                        }).collect()
+                    } else {
+                        entries.iter().collect()
+                    };
+                    println!("{}", serde_json::to_string_pretty(&filtered)?);
+                } else {
+                    println!("{text}");
+                }
+            }
+            if *clear {
+                let _ = session.execute("evaluate", &json!({"js": "performance.clearResourceTimings()"})).await;
+                eprintln!("Resource timings cleared");
+            }
+            return Ok(());
+        }
+        BrowserCommand::Session { action } => {
+            match action.as_str() {
+                "list" => {
+                    // List all Chrome debugging targets via /json endpoint.
+                    let port = session.debug_port();
+                    let url = format!("http://127.0.0.1:{port}/json");
+                    let client = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(5))
+                        .build()?;
+                    let resp = client.get(&url).send().await?;
+                    let targets: serde_json::Value = resp.json().await?;
+                    println!("{}", serde_json::to_string_pretty(&targets)?);
+                }
+                _ => {
+                    // "show" -- print current session info.
+                    let url_result = session.execute("get_url", &json!({})).await.ok();
+                    let title_result = session.execute("get_title", &json!({})).await.ok();
+                    let tabs_result = session.execute("list_tabs", &json!({})).await.ok();
+                    let url = url_result.as_ref()
+                        .and_then(|r| r.get("url")).and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let title = title_result.as_ref()
+                        .and_then(|r| r.get("title")).and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let tab_count = tabs_result.as_ref()
+                        .and_then(|r| r.get("tabs")).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                    let info = json!({
+                        "url": url,
+                        "title": title,
+                        "tabs": tab_count,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&info)?);
+                }
+            }
             return Ok(());
         }
         BrowserCommand::StateLoad { path } => {
@@ -272,7 +336,12 @@ async fn dispatch_and_print(
 fn to_action_args(sub: BrowserCommand) -> (&'static str, serde_json::Value) {
     match sub {
         BrowserCommand::Open { url } => ("open", json!({"url": url})),
-        BrowserCommand::Snapshot { interactive } => ("snapshot", json!({"interactive": interactive})),
+        BrowserCommand::Snapshot { interactive, compact, depth, selector } => ("snapshot", json!({
+            "interactive": interactive,
+            "compact": compact,
+            "depth": depth,
+            "selector": selector,
+        })),
         BrowserCommand::Click { eref } => ("click", json!({"ref": eref})),
         BrowserCommand::ClickAt { eref, x, y } => {
             let mut a = json!({});
@@ -338,7 +407,9 @@ fn to_action_args(sub: BrowserCommand) -> (&'static str, serde_json::Value) {
         | BrowserCommand::StateLoad { .. }
         | BrowserCommand::Auth(_)
         | BrowserCommand::Profiles
-        | BrowserCommand::Connect { .. } => unreachable!(),
+        | BrowserCommand::Connect { .. }
+        | BrowserCommand::Requests { .. }
+        | BrowserCommand::Session { .. } => unreachable!(),
     }
 }
 

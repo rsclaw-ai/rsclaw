@@ -548,6 +548,11 @@ pub struct BrowserSession {
 }
 
 impl BrowserSession {
+    /// Return the Chrome remote debugging port.
+    pub fn debug_port(&self) -> u16 {
+        self.debug_port
+    }
+
     /// Launch Chrome, discover the default page target, and connect CDP.
     pub async fn start(chrome_path: &str, headed: bool, profile: Option<&str>) -> Result<Self> {
         let chrome = ChromeProcess::launch(chrome_path, headed, profile).await?;
@@ -996,8 +1001,27 @@ impl BrowserSession {
         // interactive mode: only return elements with @ref (saves 80% tokens)
         let interactive = args.get("interactive").and_then(|v| v.as_bool()).unwrap_or(false)
             || args.get("i").and_then(|v| v.as_bool()).unwrap_or(false);
+        let compact = args.get("compact").and_then(|v| v.as_bool()).unwrap_or(false);
+        let max_depth = args.get("depth").and_then(|v| v.as_u64()).map(|d| d as usize);
+        let selector = args.get("selector").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
 
-        let js = if interactive { SNAPSHOT_INTERACTIVE_JS } else { SNAPSHOT_JS };
+        let base_js = if interactive { SNAPSHOT_INTERACTIVE_JS } else { SNAPSHOT_JS };
+
+        // If a CSS selector is specified, patch the JS to scope to that element.
+        let js = if let Some(sel) = selector {
+            let escaped = sel.replace('\\', "\\\\").replace('\'', "\\'");
+            // Replace `walk(document.body, 0)` with scoped element lookup.
+            base_js.replace(
+                "if (document.body) walk(document.body, 0);",
+                &format!(
+                    "var __root = document.querySelector('{}'); if (__root) walk(__root, 0);",
+                    escaped
+                ),
+            )
+        } else {
+            base_js.to_owned()
+        };
+
         let result = self
             .cdp
             .send(
@@ -1018,16 +1042,37 @@ impl BrowserSession {
         let parsed: Value =
             serde_json::from_str(raw).unwrap_or_else(|_| json!({"lines": [], "refCount": 0}));
 
-        let lines = parsed
+        let line_strs: Vec<&str> = parsed
             .get("lines")
             .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
+
+        // Post-processing: depth and compact filters.
+        let lines: Vec<&str> = line_strs
+            .into_iter()
+            .filter(|line| {
+                // Depth filter: count leading spaces, each level = 2 spaces.
+                if let Some(max_d) = max_depth {
+                    let indent = line.len() - line.trim_start().len();
+                    if indent > max_d * 2 {
+                        return false;
+                    }
+                }
+                // Compact filter: remove lines that are only structural tags with no text.
+                if compact {
+                    let trimmed = line.trim();
+                    // Structural-only lines look like [section], [div], [nav], etc.
+                    // Keep lines that have text content, @ref markers, or meaningful info.
+                    if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.contains('@') {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+
+        let text = lines.join("\n");
 
         let ref_count = parsed
             .get("refCount")
@@ -1043,7 +1088,7 @@ impl BrowserSession {
 
         Ok(json!({
             "action": "snapshot",
-            "text": lines,
+            "text": text,
         }))
     }
 

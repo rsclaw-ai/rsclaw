@@ -12,6 +12,15 @@ pub enum BrowserCommand {
         /// Only show interactive/actionable elements.
         #[arg(long, short)]
         interactive: bool,
+        /// Remove empty structural elements (no text content).
+        #[arg(long, short)]
+        compact: bool,
+        /// Limit tree depth.
+        #[arg(long, short)]
+        depth: Option<u32>,
+        /// Scope snapshot to a CSS selector.
+        #[arg(long, short = 'S')]
+        selector: Option<String>,
     },
     /// Click an element by @ref.
     Click {
@@ -167,6 +176,21 @@ pub enum BrowserCommand {
     StateLoad {
         /// Input file path.
         path: String,
+    },
+    /// List network requests from the page.
+    Requests {
+        /// Clear request history after listing.
+        #[arg(long)]
+        clear: bool,
+        /// Filter requests by URL pattern.
+        #[arg(long)]
+        filter: Option<String>,
+    },
+    /// Show or list browser sessions/targets.
+    Session {
+        /// Action: show (current session info) or list (all debugging targets).
+        #[arg(default_value = "show")]
+        action: String,
     },
     /// Run any browser action with JSON args (advanced).
     Raw {
