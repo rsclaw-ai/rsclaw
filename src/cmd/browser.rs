@@ -26,13 +26,13 @@ async fn connect_or_launch(port: Option<u16>) -> Result<crate::browser::BrowserS
         vec![9222, 9223]
     };
     if let Some(ws_url) = crate::browser::detect_existing_chrome(&ports).await {
-        eprintln!("Connected to existing Chrome");
+        tracing::debug!("Connected to existing Chrome");
         crate::browser::BrowserSession::connect_existing_reuse(&ws_url).await
     } else {
         let chrome_path = crate::agent::platform::detect_chrome()
             .ok_or_else(|| anyhow!("Chrome not found. Install with: rsclaw tools install chrome"))?;
         let profile = std::env::var("RSCLAW_BROWSER_PROFILE").ok();
-        eprintln!("Launching headless Chrome");
+        tracing::debug!("Launching headless Chrome");
         crate::browser::BrowserSession::start(&chrome_path, false, profile.as_deref()).await
     }
 }

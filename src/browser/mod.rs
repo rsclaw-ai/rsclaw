@@ -675,7 +675,7 @@ impl BrowserSession {
                         let types: Vec<&str> = targets.iter()
                             .filter_map(|t| t["type"].as_str())
                             .collect();
-                        warn!(attempt, ?types, "CDP target types discovered");
+                        debug!(attempt, ?types, "CDP target types discovered");
                     }
                     if let Some(target) = targets.into_iter().find(|t| t["type"].as_str() == Some("page")) {
                         page_target = Some(target);
