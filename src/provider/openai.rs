@@ -866,27 +866,10 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
         // strict assistant(tool_calls) → tool(result) pairing with no gaps.
         fix_tool_call_pairing(msgs);
 
-        // Extra safety: ensure no tool message appears without an immediately
-        // preceding assistant message with tool_calls. Compaction can break this.
-        let mut i = 0;
-        while i < msgs.len() {
-            if msgs[i].get("role").and_then(|r| r.as_str()) == Some("tool") {
-                // Check if previous message is assistant with tool_calls
-                let prev_ok = i > 0
-                    && msgs[i - 1].get("role").and_then(|r| r.as_str()) == Some("assistant")
-                    && msgs[i - 1].get("tool_calls").and_then(|v| v.as_array()).is_some();
-                if !prev_ok {
-                    // Also allow consecutive tool messages (multiple results for one call)
-                    let prev_tool = i > 0
-                        && msgs[i - 1].get("role").and_then(|r| r.as_str()) == Some("tool");
-                    if !prev_tool {
-                        msgs.remove(i);
-                        continue;
-                    }
-                }
-            }
-            i += 1;
-        }
+        // Reorder messages: ensure every tool result immediately follows its
+        // corresponding assistant(tool_calls). Parallel tool execution and
+        // compaction can scatter them.
+        reorder_tool_messages(msgs);
     }
 
     Ok(body)
@@ -980,6 +963,56 @@ fn fix_tool_call_pairing(messages: &mut Vec<Value>) {
                 }
             }
         }
+    }
+}
+
+/// Reorder tool result messages so each immediately follows its assistant(tool_calls).
+///
+/// Parallel tool execution can scatter results throughout the message list.
+/// This rebuilds the list with correct ordering:
+///   assistant(tool_calls=[A,B]) → tool(A) → tool(B) → next message
+fn reorder_tool_messages(messages: &mut Vec<Value>) {
+    // Extract all tool results by call_id.
+    let mut tool_results: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
+    let mut non_tool: Vec<Value> = Vec::new();
+
+    for msg in messages.drain(..) {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("tool") {
+            if let Some(id) = msg.get("tool_call_id").and_then(|v| v.as_str()) {
+                tool_results.entry(id.to_owned()).or_default().push(msg);
+            }
+            // orphaned tool (no id) is dropped
+        } else {
+            non_tool.push(msg);
+        }
+    }
+
+    // Rebuild: insert tool results right after their assistant(tool_calls).
+    for msg in non_tool {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                let call_ids: Vec<String> = tcs.iter()
+                    .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()).map(String::from))
+                    .collect();
+                messages.push(msg);
+                // Insert results in the same order as tool_calls.
+                for cid in &call_ids {
+                    if let Some(results) = tool_results.remove(cid) {
+                        messages.extend(results);
+                    }
+                }
+                continue;
+            }
+        }
+        messages.push(msg);
+    }
+
+    // Any remaining orphaned tool results (no matching assistant) are dropped.
+    if !tool_results.is_empty() {
+        tracing::debug!(
+            orphaned = tool_results.len(),
+            "reorder_tool_messages: dropped orphaned tool results"
+        );
     }
 }
 
