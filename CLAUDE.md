@@ -173,4 +173,4 @@ cd ui && yarn lint
 
 ## License
 
-AGPL-3.0. All contributions must be license-compatible.
+MIT OR Apache-2.0 dual license. Contributions are dual-licensed under the same terms (see README).

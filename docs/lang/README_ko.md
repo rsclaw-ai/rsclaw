@@ -1,9 +1,9 @@
 # RsClaw
 
-**Your AI Automation Butler — one binary, 13 channels, 15 LLM providers, native long-term memory, self-evolution, A2A cross-machine orchestration, distributed agent scheduling, browser automation, all in pure Rust.**
+**AI Agent Engine with long-term memory and self-learning — one 15MB binary, 13 channels, 15 LLM providers, A2A cross-machine orchestration, browser automation, all in pure Rust. Your AI never forgets and gets better the more you use it.**
 
 [![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
+[![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue)](../../README.md#license)
 [![Binary Size](https://img.shields.io/badge/binary-~15MB-green)]()
 
 [English](../../README.md) | [中文](README_cn.md) | [日本語](README_ja.md) | **한국어** | [ไทย](README_th.md) | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | [Русский](README_ru.md)
@@ -91,6 +91,5 @@ macOS (x86_64, ARM64), Linux (x86_64, ARM64), Windows (x86_64, ARM64)
 
 ## 라이선스
 
-이 프로젝트는 [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE)으로 라이선스됩니다.
+이 프로젝트는 MIT OR Apache-2.0 듀얼 라이선스로 제공됩니다. 자세한 내용은 [영문 README](../../README.md#license)를 참조하십시오.
 
-이 소프트웨어를 자유롭게 사용, 수정, 배포할 수 있지만, 수정된 버전(네트워크 서비스 포함)은 동일한 라이선스로 오픈소스해야 합니다.

@@ -97,23 +97,27 @@ impl AgentRuntime {
             claudecode: None,
         };
 
-        spawner.spawn_agent(entry.clone())?;
-
-        // Write full system prompt (base + role) as SOUL.md in the new agent's workspace.
-        let ws_path = crate::config::loader::base_dir().join(format!("workspace-{id}"));
-        if let Err(e) = tokio::fs::create_dir_all(&ws_path).await {
-            warn!("agent_spawn: failed to create workspace for {id}: {e:#}");
-        }
-        let soul_path = ws_path.join("SOUL.md");
-        let full_prompt = self.build_subagent_system_prompt(&system);
-        if let Err(e) = tokio::fs::write(&soul_path, format!("# Agent: {id}\n\n{full_prompt}\n")).await {
-            warn!("agent_spawn: failed to write SOUL.md for {id}: {e:#}");
-        }
-
         // Persist to config file by default (user-created agents survive restart).
-        // Pass persistent=false for task agents (one-shot, destroyed after completion).
+        // Pass persistent=false for sub agents (temporary, destroyed on restart).
         let persistent = args["persistent"].as_bool().unwrap_or(true);
+        let kind = if persistent {
+            crate::agent::registry::AgentKind::Named
+        } else {
+            crate::agent::registry::AgentKind::Sub
+        };
+        spawner.spawn_agent_with_kind(entry.clone(), kind)?;
+
         if persistent {
+            // Named agent: write SOUL.md and workspace, persist to config.
+            let ws_path = crate::config::loader::base_dir().join(format!("workspace-{id}"));
+            if let Err(e) = tokio::fs::create_dir_all(&ws_path).await {
+                warn!("agent_spawn: failed to create workspace for {id}: {e:#}");
+            }
+            let soul_path = ws_path.join("SOUL.md");
+            let full_prompt = self.build_subagent_system_prompt(&system);
+            if let Err(e) = tokio::fs::write(&soul_path, format!("# Agent: {id}\n\n{full_prompt}\n")).await {
+                warn!("agent_spawn: failed to write SOUL.md for {id}: {e:#}");
+            }
             if let Err(e) = persist_agent_to_config(&entry).await {
                 warn!("agent_spawn: failed to persist to config: {e:#}");
             }
@@ -202,7 +206,7 @@ impl AgentRuntime {
             claudecode: None,
         };
 
-        spawner.spawn_agent(entry)?;
+        spawner.spawn_agent_with_kind(entry, crate::agent::registry::AgentKind::Task)?;
 
         // Write full system prompt (base + role) as SOUL.md.
         if let Err(e) = tokio::fs::create_dir_all(&ws_path).await {
@@ -252,7 +256,7 @@ impl AgentRuntime {
             .defaults
             .timeout_seconds
             .unwrap_or(DEFAULT_TIMEOUT_SECONDS as u32) as u64;
-        let task_timeout = timeout_secs.min(300); // up to 5 min for background tasks
+        let task_timeout = timeout_secs; // use configured timeout, no hard cap
 
         tokio::spawn(async move {
             let result_text = match tokio::time::timeout(
@@ -261,7 +265,14 @@ impl AgentRuntime {
             ).await {
                 Ok(Ok(reply)) => reply.text,
                 Ok(Err(_)) => "[task agent channel closed unexpectedly]".to_owned(),
-                Err(_) => format!("[task {task_id} timed out after {task_timeout}s]"),
+                Err(_) => {
+                    // Timeout: kill the task agent to free resources.
+                    if let Some(ref reg) = agents {
+                        reg.remove_handle(&task_id);
+                    }
+                    info!(task = %task_id, timeout = task_timeout, "task agent timed out and killed");
+                    format!("[task {task_id} timed out after {task_timeout}s and was terminated]")
+                }
             };
 
             // Store result for main agent to pick up when run_turn fires.
@@ -338,6 +349,18 @@ impl AgentRuntime {
             .ok_or_else(|| anyhow!("agent_send: `message` required"))?
             .to_owned();
 
+        // Anti-loop: count send depth from session_key chain.
+        // Each send appends ":send:<id>" to session_key. Max depth = 5.
+        let send_depth = ctx.session_key.matches(":send:").count();
+        if send_depth >= 5 {
+            return Ok(json!({
+                "error": "agent_send: max communication depth reached (5). Possible loop detected.",
+                "depth": send_depth,
+                "from": ctx.agent_id,
+                "to": target_id,
+            }));
+        }
+
         let registry = self
             .agents
             .as_ref()
@@ -375,7 +398,7 @@ impl AgentRuntime {
             .defaults
             .timeout_seconds
             .unwrap_or(DEFAULT_TIMEOUT_SECONDS as u32) as u64;
-        let send_timeout = timeout_secs.min(300);
+        let send_timeout = timeout_secs;
         let send_id = format!("send-{target_id}-{short_id}");
         let send_id_bg = send_id.clone();
         let target_id_bg = target_id.clone();
@@ -446,6 +469,7 @@ impl AgentRuntime {
                 .map(|h| {
                     json!({
                         "id": h.id,
+                        "kind": h.kind,
                         "model": h.config.model.as_ref()
                             .and_then(|m| m.primary.as_deref())
                             .unwrap_or("unknown"),
@@ -459,6 +483,23 @@ impl AgentRuntime {
 
     pub(crate) async fn tool_agent_consolidated(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let action = args["action"].as_str().unwrap_or("list");
+
+        // Permission check based on AgentKind:
+        //   Main:  spawn ✅  task ✅  send ✅  list ✅  kill ✅ (except self)
+        //   Named: spawn ✅  task ✅  send ✅  list ✅  kill ✅ (except Main)
+        //   Sub:   spawn ❌  task ✅  send ❌  list ✅  kill ❌
+        //   Task:  spawn ❌  task ❌  send ❌  list ✅  kill ❌
+        let kind = self.handle.kind;
+        match (kind, action) {
+            (crate::agent::registry::AgentKind::Task, a) if a != "list" => {
+                return Ok(json!({"error": "task agents cannot manage other agents"}));
+            }
+            (crate::agent::registry::AgentKind::Sub, "spawn" | "send" | "kill") => {
+                return Ok(json!({"error": format!("sub agents can only use task and list, not {action}")}));
+            }
+            _ => {} // allowed
+        }
+
         match action {
             "spawn" => self.tool_agent_spawn(args).await,
             "task" => self.tool_agent_task(ctx, args).await,
@@ -468,6 +509,14 @@ impl AgentRuntime {
                 let id = args["id"]
                     .as_str()
                     .ok_or_else(|| anyhow!("agent kill: `id` required"))?;
+                // Prevent killing the main agent.
+                if let Some(reg) = &self.agents {
+                    if let Ok(handle) = reg.get(id) {
+                        if handle.kind == crate::agent::registry::AgentKind::Main {
+                            return Ok(json!({"error": "cannot kill the main agent"}));
+                        }
+                    }
+                }
                 Ok(json!({
                     "action": "kill",
                     "id": id,

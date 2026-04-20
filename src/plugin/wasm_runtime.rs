@@ -55,6 +55,10 @@ pub struct WasmPlugin {
     linker: Linker<HostState>,
     /// Reference to the browser session for host function callbacks.
     browser: Arc<Mutex<Option<BrowserSession>>>,
+    /// Channel for sending progress notifications to the user.
+    notification_tx: Arc<Mutex<Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>>>,
+    /// Target and channel for notifications (set per-call).
+    notification_target: Arc<Mutex<(String, String)>>,
 }
 
 /// A tool definition extracted from a WASM plugin's manifest.
@@ -81,6 +85,12 @@ struct HostState {
     browser: Arc<Mutex<Option<BrowserSession>>>,
     wasi: wasmtime_wasi::WasiCtx,
     wasi_table: wasmtime::component::ResourceTable,
+    /// Optional channel for sending progress/notification messages to the user.
+    notification_tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
+    /// Target ID for notifications (chat_id or peer_id).
+    notification_target: String,
+    /// Channel name for notifications.
+    notification_channel: String,
 }
 
 impl wasmtime_wasi::WasiView for HostState {
@@ -228,6 +238,26 @@ impl rsclaw::jimeng::host_runtime::Host for HostState {
             Ok(contents) => Ok(Ok(contents)),
             Err(e) => Ok(Err(format!("failed to read {path}: {e}"))),
         }
+    }
+
+    async fn notify(&mut self, message: String) -> Result<Result<String, String>> {
+        if let Some(ref tx) = self.notification_tx {
+            if !self.notification_target.is_empty() {
+                let _ = tx.send(crate::channel::OutboundMessage {
+                    target_id: self.notification_target.clone(),
+                    is_group: false,
+                    text: message.clone(),
+                    reply_to: None,
+                    images: vec![],
+                    files: vec![],
+                    channel: Some(self.notification_channel.clone()),
+                });
+                tracing::debug!(target: "wasm_plugin", "notify sent: {}", &message[..message.len().min(80)]);
+                return Ok(Ok("sent".to_string()));
+            }
+        }
+        tracing::debug!(target: "wasm_plugin", "notify: no channel, message: {}", &message[..message.len().min(80)]);
+        Ok(Ok("no_channel".to_string()))
     }
 }
 
@@ -381,6 +411,9 @@ async fn load_single_plugin(
             browser: Arc::clone(&browser),
             wasi,
             wasi_table: wasmtime::component::ResourceTable::new(),
+            notification_tx: None,
+            notification_target: String::new(),
+            notification_channel: String::new(),
         },
     );
 
@@ -423,6 +456,8 @@ async fn load_single_plugin(
         component,
         linker,
         browser,
+        notification_tx: Arc::new(Mutex::new(None)),
+        notification_target: Arc::new(Mutex::new((String::new(), String::new()))),
     })
 }
 
@@ -431,6 +466,17 @@ async fn load_single_plugin(
 // ---------------------------------------------------------------------------
 
 impl WasmPlugin {
+    /// Set the notification channel for progress messages.
+    pub async fn set_notification_async(
+        &self,
+        tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
+        target: String,
+        channel: String,
+    ) {
+        *self.notification_tx.lock().await = tx;
+        *self.notification_target.lock().await = (target, channel);
+    }
+
     /// Dispatch a tool call to this WASM plugin.
     ///
     /// The tool name must match one of the plugin's declared tools.
@@ -457,12 +503,20 @@ impl WasmPlugin {
 
         // Fresh store per call for isolation.
         let wasi = wasmtime_wasi::WasiCtxBuilder::new().build();
+        let (notif_target, notif_channel) = {
+            let guard = self.notification_target.lock().await;
+            (guard.0.clone(), guard.1.clone())
+        };
+        let notif_tx = self.notification_tx.lock().await.clone();
         let mut store = Store::new(
             &self.engine,
             HostState {
                 browser: Arc::clone(&self.browser),
                 wasi,
                 wasi_table: wasmtime::component::ResourceTable::new(),
+                notification_tx: notif_tx,
+                notification_target: notif_target,
+                notification_channel: notif_channel,
             },
         );
 

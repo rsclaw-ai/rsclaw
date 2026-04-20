@@ -1,18 +1,26 @@
 # RsClaw
 
-**Your AI Automation Butler — one binary, 13 channels, 15 LLM providers, native long-term memory, self-evolution, A2A cross-machine orchestration, distributed agent scheduling, browser automation, all in pure Rust.**
+> **An AI agent engine that remembers — and gets better the more you use it.**  
+> One 15MB binary · 13 channels · 15 LLM providers · Multi-backend agents · OpenCLI-ready · Built in pure Rust.
 
-[![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Binary Size](https://img.shields.io/badge/binary-~15MB-green)]()
+[![GitHub Stars](https://img.shields.io/github/stars/rsclaw-ai/rsclaw?style=flat&logo=github)](https://github.com/rsclaw-ai/rsclaw/stargazers)
+[![Crates.io](https://img.shields.io/crates/v/rsclaw?style=flat&logo=rust)](https://crates.io/crates/rsclaw)
+[![Release](https://img.shields.io/github/v/release/rsclaw-ai/rsclaw)](https://github.com/rsclaw-ai/rsclaw/releases)
+[![Downloads](https://img.shields.io/crates/d/rsclaw?style=flat)](https://crates.io/crates/rsclaw)
+[![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue)](#license)
+[![Rust](https://img.shields.io/badge/Rust-1.91%2B-orange?logo=rust)](https://www.rust-lang.org/)
 
-**English** | [中文](docs/lang/README_cn.md) | [日本語](docs/lang/README_ja.md) | [한국어](docs/lang/README_ko.md) | [ไทย](docs/lang/README_th.md) | [Tiếng Việt](docs/lang/README_vi.md) | [Français](docs/lang/README_fr.md) | [Deutsch](docs/lang/README_de.md) | [Español](docs/lang/README_es.md) | [Русский](docs/lang/README_ru.md)
-
-RsClaw (Crab AI / 螃蟹 AI 自动化管家) is your personal AI automation butler. A single 15MB native executable that connects 13 messaging channels to AI agents — handling tasks, browsing the web, and managing conversations around the clock. It never forgets context, gets smarter over time, and coordinates agents across multiple machines. One-click migration from OpenClaw, zero Node.js dependency.
+**🇺🇸 English** · [🇨🇳 中文](docs/lang/README_cn.md) · [🇯🇵 日本語](docs/lang/README_ja.md) · [🇰🇷 한국어](docs/lang/README_ko.md) · [More languages ▾](docs/lang/)
 
 <p align="center">
   <img src="docs/images/en.gif" alt="RsClaw Preview" width="800" />
 </p>
+
+Most AI agents forget everything between sessions. Every new conversation starts from zero — your preferences, your context, your workflow, all gone.
+
+**RsClaw doesn't forget.**
+
+Built from scratch in Rust, RsClaw (Crab AI / 螃蟹 AI) persists every interaction through a three-layer memory store (redb + tantivy + hnsw_rs), learns from your usage patterns, and ships as a single 15MB binary running on ~20MB RAM. Four agent lifetime modes (Main/Named/Sub/Task), four execution backends (Native Rust/Claude Code/OpenCode/ACP), 13 messaging channels, 15 LLM providers, A2A cross-machine orchestration — all without a line of Node.js. Drop-in OpenClaw replacement.
 
 💬 [Join Community](https://rsclaw.ai/en/community) — WeChat / Feishu / QQ / Telegram
 
@@ -20,30 +28,39 @@ RsClaw (Crab AI / 螃蟹 AI 自动化管家) is your personal AI automation butl
 
 ## Install
 
+### 👉 New users
+
 ```bash
 # macOS / Linux
 curl -fsSL https://app.rsclaw.ai/scripts/install.sh | bash
 
 # Windows (PowerShell)
 irm https://app.rsclaw.ai/scripts/install.ps1 | iex
-
-# From source
-git clone https://github.com/rsclaw-ai/rsclaw.git && cd rsclaw
-cargo build --release
 ```
 
-Desktop app (.dmg / .msi / .deb): [Releases](https://github.com/rsclaw-ai/rsclaw/releases)
+Then initialize:
 
 ```bash
-# Migrate from OpenClaw
-rsclaw setup      # detects OpenClaw data, offers import
-rsclaw start      # config already imported, ready to go
-
-# New install
-rsclaw setup      # initialize ~/.rsclaw/
-rsclaw onboard    # interactive wizard: provider, channels, etc.
+rsclaw setup      # Initialize ~/.rsclaw/
+rsclaw onboard    # Interactive wizard: provider, channels, etc.
 rsclaw start
 ```
+
+### 👉 Migrating from OpenClaw
+
+```bash
+openclaw gateway stop
+rsclaw setup      # Detects OpenClaw data, offers one-click import
+rsclaw start      # Everything just works — channels, agents, sessions
+```
+
+Your `~/.openclaw/` is never modified. See [Migrate from OpenClaw](#migrate-from-openclaw) below for details.
+
+### Other install options
+
+- **Desktop app** — `.dmg` / `.msi` / `.deb` from [Releases](https://github.com/rsclaw-ai/rsclaw/releases)
+- **Via Cargo** — `cargo install rsclaw`
+- **From source** — `git clone https://github.com/rsclaw-ai/rsclaw.git && cd rsclaw && cargo build --release`
 
 ---
 
@@ -80,9 +97,9 @@ Features: failover with exponential backoff, model fallback chains, thinking bud
 
 ## Key Features
 
-### Built-in Tools (32)
+### Built-in Tools (36)
 
-File read/write, shell exec (with safety rules), web search/fetch, CDP browser automation (20 actions), memory CRUD, document extraction (PDF/DOCX/XLSX/PPTX), image compression, voice STT (Whisper/SenseVoice), TTS, computer_use, cron jobs, multi-agent spawn.
+File read/write/search, shell exec (with safety rules), web search/fetch/download, CDP browser automation (50+ actions), memory CRUD, document extraction/creation (PDF/DOCX/XLSX/PPTX), image/video generation, voice STT (Whisper/SenseVoice), TTS, computer_use, cron jobs (recurring + one-shot timer), multi-agent spawn/task, clarify (interactive Q&A), anycli (structured web data extraction).
 
 ### Pre-parsed Commands (40+)
 
@@ -100,31 +117,81 @@ Local commands that bypass the LLM — zero token cost, sub-millisecond:
 ### Browser Automation (CDP)
 
 Built-in headless Chrome — no ChromeDriver, no Playwright, no Node.js:
-- 20 actions: open, snapshot, click, fill, scroll, screenshot, evaluate, etc.
+- 50+ actions: open, snapshot, click, fill, scroll, screenshot, evaluate, annotate, capture_video, etc.
 - Accessibility tree snapshots with `@e1` refs for LLM interaction
+- Semantic locators: getbytext, getbyrole, getbylabel
+- One-click video download: `rsclaw browser download-video <url>`
+- Auth persistence: state save/load for login session reuse
 - Memory-adaptive instance limits, 5-min idle timeout, crash auto-restart
+- CLI: `rsclaw browser open/snapshot/click/screenshot/...` (full agent-browser parity)
+
+### AnyCLI — Structured Web Data
+
+Built-in [anycli](https://crates.io/crates/anycli) integration. Turn any website into structured CLI output with declarative YAML adapters:
+
+```bash
+rsclaw anycli run hackernews top --format table limit=10
+rsclaw anycli run bilibili hot --format markdown
+rsclaw anycli run github-trending repos language=rust
+rsclaw anycli search zhihu        # search community hub
+rsclaw anycli install zhihu       # install adapter
+```
+
+Built-in adapters: hackernews, bilibili, github-trending, arxiv, wikipedia. Community hub at [anycli.org](https://anycli.org). Agent uses `anycli` tool automatically when structured data is available — cleaner than web_fetch.
 
 ### Long-term Memory
 
 Three-layer storage: redb (hot KV), tantivy (full-text search), hnsw_rs (vector similarity). Session compaction at 80% context window, `/compact` manual compression with memory save, `/clear` preserves conversation summary.
 
-### Multi-Agent
+### Multi-Agent Architecture
+
+Four agent types with up to 4-layer delegation:
+
+| Type | Created by | Lifetime | Persisted |
+|------|-----------|----------|-----------|
+| **Main** | System | Forever | Config (`default: true`) |
+| **Named** | User | Permanent | Config file (survives restart) |
+| **Sub** | LLM | Session | Memory only (gone on restart) |
+| **Task** | LLM | One-shot | Auto-destroyed after completion |
+
+```
+Main ──spawn──→ Named "pm" (persistent, in config)
+                 └─spawn──→ Sub "analyst" (temporary)
+                              ├─task──→ Task "search-jd" (parallel)
+                              └─task──→ Task "search-tb" (parallel)
+```
+
+Each agent can use a different execution backend:
+
+| Backend | Description |
+|---------|-------------|
+| **Native Rust** | Built-in LLM runtime (default, fastest) |
+| **Claude Code** | Claude Agent SDK via ACP protocol |
+| **OpenCode** | Open-source coding agent |
+| **ACP** | Any Agent Client Protocol compliant agent |
 
 ```json5
 {
   agents: {
     list: [
-      { id: "main", model: { primary: "anthropic/claude-sonnet-4-5" }, allowed_commands: "*" },
-      { id: "coder", model: { primary: "deepseek/deepseek-chat" }, allowed_commands: "read|write|exec" },
+      { id: "main", default: true, model: { primary: "qwen-plus" } },
+      { id: "coder", model: { primary: "deepseek-chat", toolset: "code" },
+        claudecode: { command: "claude-agent-acp" } },  // uses Claude Code backend
     ],
     external: [
-      { id: "remote", url: "https://remote-gateway.example.com", auth_token: "${TOKEN}" },
+      { id: "gpu-worker", url: "http://gpu-server:18888", token: "${TOKEN}" },
     ],
   },
 }
 ```
 
-Collaboration modes: sequential (chain), parallel (fan-out), orchestrated (LLM-driven tool calls).
+Collaboration modes: sequential (chain), parallel (fan-out), orchestrated (LLM-driven `agent_<id>` tool calls).
+
+Permission model:
+- **Toolset** per agent: `minimal` (12 tools) / `web` / `code` / `standard` (16) / `full` (all)
+- **Exec safety**: 50+ global deny patterns apply to ALL agents (cannot be bypassed)
+- **Main cannot be killed**; Named/Sub/Task can be killed by their creator
+- Agents cannot communicate upward or sideways — delegation is strictly top-down
 
 ### A2A Protocol
 
@@ -206,6 +273,23 @@ Import copies config, workspace, and sessions into `~/.rsclaw/`. OpenClaw data i
 | Browser | built-in CDP | -- |
 | Exec safety | deny/confirm/allow | -- |
 
+### FAQ
+
+**Can I run RsClaw and OpenClaw simultaneously?**  
+Yes. RsClaw uses port 18888 by default, OpenClaw uses 18789. They have separate data directories (`~/.rsclaw/` vs `~/.openclaw/`) and can run side by side without conflict.
+
+**Will RsClaw modify my OpenClaw data?**  
+Never. Import mode is strictly read-only on `~/.openclaw/`. All RsClaw data goes to `~/.rsclaw/`.
+
+**How do I switch back to OpenClaw?**  
+`rsclaw stop && openclaw gateway start`. Your `~/.openclaw/` is untouched.
+
+**Does it work offline?**  
+Yes — with Ollama for local models, or any OpenAI-compatible local endpoint. Voice STT can also run fully local via Candle Whisper.
+
+**Can I use RsClaw in my commercial product?**  
+Yes, freely. RsClaw is dual-licensed under MIT OR Apache-2.0 — you can build proprietary products, run SaaS services, or redistribute modified versions without open-source obligations.
+
 ---
 
 ## Development
@@ -242,6 +326,38 @@ Requirements: Rust 1.91+, macOS / Linux / Windows. Optional: ffmpeg, Chrome.
 
 ---
 
+## Support the project
+
+If RsClaw saves you hours, consider:
+
+- ⭐ **Star this repo** — helps other developers discover RsClaw
+- 🐛 **Report bugs** via [GitHub Issues](https://github.com/rsclaw-ai/rsclaw/issues)
+- 💬 **Join the community** — [WeChat / Feishu / QQ / Telegram](https://rsclaw.ai/en/community)
+- 🤝 **Contribute** — see [CONTRIBUTING.md](CONTRIBUTING.md)
+
 ## License
 
-[AGPL-3.0](LICENSE) — Free to use, modify, and distribute. Network services must open-source modifications under the same license.
+Licensed under either of
+
+- **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- **MIT license** ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+### What this means
+
+- ✅ **Use freely** in personal, commercial, and enterprise projects
+- ✅ **Modify and redistribute** without any obligation to open-source your changes
+- ✅ **Build proprietary products** on top of RsClaw
+- ✅ **Run as a SaaS service** without any licensing requirements
+- ✅ **No copyleft** — your derivative work stays yours
+
+This is the same dual-license used by the Rust language itself, Tokio, Serde, Axum, and most of the Rust ecosystem.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+
+---
+
+Built with 🦀 in Rust. Inspired by the OpenClaw community.

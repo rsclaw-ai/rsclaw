@@ -245,10 +245,10 @@ pub struct AgentRuntime {
     /// Plugin registry — None when running outside the gateway or with no
     /// plugins.
     pub plugins: Option<Arc<PluginRegistry>>,
-    /// MCP server registry — None when no MCP servers are configured.
-    pub mcp: Option<Arc<crate::mcp::McpRegistry>>,
     /// WASM plugin instances for tool dispatch (shared across agents).
     pub wasm_plugins: Arc<Vec<crate::plugin::WasmPlugin>>,
+    /// MCP server registry — None when no MCP servers are configured.
+    pub mcp: Option<Arc<crate::mcp::McpRegistry>>,
     /// CDP browser session -- lazy-initialized on first web_browser tool call.
     /// Stored as Option so it can be dropped (killing Chrome) when idle expires.
     pub(crate) browser: Arc<tokio::sync::Mutex<Option<crate::browser::BrowserSession>>>,
@@ -346,8 +346,8 @@ impl AgentRuntime {
             event_bus,
             spawner,
             plugins,
-            mcp,
             wasm_plugins: Arc::new(Vec::new()),
+            mcp,
             live_status,
             browser: Arc::new(tokio::sync::Mutex::new(None)),
             sessions: std::collections::HashMap::new(),
@@ -931,6 +931,7 @@ impl AgentRuntime {
                             self.agents.as_deref(),
                             &self.handle.id,
                             &self.config.agents.external,
+                            &self.wasm_plugins,
                         );
                         let tools_json = serde_json::to_string(&tools).unwrap_or_default();
                         let tools_tokens = tools_json.len() / 4; // JSON is mostly ASCII, ~4 chars/token
@@ -1989,6 +1990,7 @@ impl AgentRuntime {
                 self.agents.as_deref(),
                 &self.handle.id,
                 &self.config.agents.external,
+                &self.wasm_plugins,
             );
             all.extend(extra_tools.iter().cloned());
             if let Some(ref mcp) = self.mcp {
@@ -2006,7 +2008,9 @@ impl AgentRuntime {
 
             let allowed = toolset_allowed_names(toolset, custom_tools);
             if let Some(ref names) = allowed {
-                all.retain(|t| names.contains(&t.name.as_str().to_owned()));
+                // Always keep agent/session tools (permission checked at dispatch by AgentKind).
+                all.retain(|t| names.contains(&t.name.as_str().to_owned())
+                    || t.name == "agent" || t.name == "session");
             }
             // else: "full" or unknown -> keep all
 
@@ -2316,43 +2320,28 @@ impl AgentRuntime {
         // Detect newly added skills since cache was frozen.
         // New skills are appended as trailing system messages, not merged
         // into the cached [2] — this preserves KV cache prefix.
-        let mut new_skills_tail: Vec<String> = Vec::new();
+        let new_skills_tail: Vec<String> = Vec::new();
         {
-            // Detect newly added skills
-            let mut current_names: Vec<String> = self.skills.all()
-                .map(|s| s.name.clone())
-                .collect();
-            current_names.sort();
-            for name in &current_names {
-                if !self.cached_skills_snapshot.contains(name) {
-                    if let Some(skill) = self.skills.all().find(|s| &s.name == name) {
-                        new_skills_tail.push(format!(
-                            "<skill name=\"{}\" version=\"{}\">\n{}\n</skill>",
-                            skill.name,
-                            skill.version.as_deref().unwrap_or(""),
-                            skill.prompt.trim(),
-                        ));
-                    }
-                }
-            }
-            // Also match skills based on current request text
-            let matched = match_skills(text, &self.skills);
+// Active skill matching — inject matched skills into dynamic context.
+            let matched = super::platform::match_skills(text, &self.skills);
             if !matched.is_empty() {
                 let skill_prompts: String = matched
                     .iter()
-                    .map(|s| {
-                        format!(
-                            "<active_skill name=\"{}\" version=\"{}\">\n{}\n</active_skill>",
-                            s.name,
-                            s.version.as_deref().unwrap_or(""),
-                            s.prompt.trim(),
-                        )
-                    })
+                    .map(|s| format!(
+                        "<active_skill name=\"{}\" version=\"{}\">\n{}\n</active_skill>",
+                        s.name,
+                        s.version.as_deref().unwrap_or(""),
+                        s.prompt.trim(),
+                    ))
                     .collect::<Vec<_>>()
                     .join("\n\n");
-                system_prompt.push_str(&format!(
-                    "\n\n## Active Skills (matched to current request)\n\
-                     Follow these skill instructions carefully:\n\n{skill_prompts}"
+                dynamic_ctx.push(format!(
+                    "## Active Skills (matched to current request)\n\
+                     IMPORTANT: When a skill is active, you MUST follow the skill instructions \
+                     and use the tools specified by the skill. Skill instructions take priority \
+                     over default tool selection. For example, if a skill says to use `web_browser`, \
+                     do NOT use `image_gen` or `video_gen` even if they seem relevant.\n\n\
+                     {skill_prompts}"
                 ));
                 info!(
                     skills = ?matched.iter().map(|s| &s.name).collect::<Vec<_>>(),
@@ -3277,6 +3266,31 @@ impl AgentRuntime {
                 Some(0.6)
             };
 
+            // Pre-flight check: emergency compact if we'd exceed context.
+            let context_limit = self.config.agents.defaults.context_tokens.unwrap_or(64_000) as usize;
+            let overhead = self.estimate_fixed_overhead();
+            let session_tokens: usize = self.sessions
+                .get(&ctx.session_key)
+                .map(|msgs| msgs.iter().map(super::context_mgr::msg_tokens).sum())
+                .unwrap_or(0);
+            let total_est = overhead + session_tokens;
+            if total_est > context_limit.saturating_sub(2000) {
+                warn!(
+                    session = %ctx.session_key,
+                    total_est,
+                    context_limit,
+                    overhead,
+                    session_tokens,
+                    "pre-flight: approaching context limit, forcing compaction"
+                );
+                self.compact_inner(&ctx.session_key, model, true).await;
+                // Re-read messages after compaction.
+                messages = self.sessions
+                    .get(&ctx.session_key)
+                    .cloned()
+                    .unwrap_or_default();
+            }
+
             let kv_cache_mode = self.config.agents.defaults.kv_cache_mode.unwrap_or(1);
             let req = LlmRequest {
                 model: model.to_owned(),
@@ -3729,6 +3743,9 @@ impl AgentRuntime {
                     text_buf
                 };
 
+                if !tool_images.is_empty() {
+                    info!("AgentReply returning with {} image(s), first {} bytes", tool_images.len(), tool_images.first().map(|s| s.len()).unwrap_or(0));
+                }
                 return Ok(AgentReply {
                     text: final_text,
                     is_empty: no_reply && tool_images.is_empty(),
@@ -3987,7 +4004,7 @@ impl AgentRuntime {
                 )
                 .await;
 
-                let (result_text, result_images) = match result {
+                let (mut result_text, result_images) = match result {
                     Ok(v) => {
                         // Reset parse error counter on successful tool execution
                         ctx.parse_error_count = 0;
@@ -4031,17 +4048,38 @@ impl AgentRuntime {
                         }
                     }
                     Err(e) => {
-                        warn!(tool = %tool_name, "tool error: {e:#}");
-                        // Record error result for loop detection (errors count as results too).
+                        let err_str = e.to_string();
+                        warn!(tool = %tool_name, "tool error: {err_str}");
+
+                        // Special: WASM plugins can return QR/image data via error message.
+                        // Look for JIMENG_LOGIN_QR: anywhere in the error string
+                        // (it may be wrapped by the WASM runtime: "WASM plugin ... error: JIMENG_LOGIN_QR:...")
+                        let mut extra_images: Vec<String> = vec![];
+                        let clean_err;
+                        if err_str.contains("JIMENG_PHONE_LOGIN:") {
+                            // Phone login flow — ask user for phone number.
+                            clean_err = "即梦需要登录。请告诉我您的手机号码，我会发送验证码帮您登录。使用 jimeng.login_phone 工具提交手机号。".to_string();
+                        } else if let Some(qr_pos) = err_str.find("JIMENG_LOGIN_QR:") {
+                            let rest = &err_str[qr_pos + "JIMENG_LOGIN_QR:".len()..];
+                            let b64_line = rest.lines().next().unwrap_or("").trim();
+                            if b64_line.starts_with("data:image/") {
+                                info!("attaching QR login image for user");
+                                extra_images.push(b64_line.to_string());
+                            } else if !b64_line.is_empty() {
+                                info!("attaching QR login image (raw base64) for user");
+                                extra_images.push(format!("data:image/png;base64,{}", b64_line));
+                            }
+                            clean_err = "请使用抖音APP扫描二维码登录即梦。登录成功后请重新发送您的请求。".to_string();
+                        } else {
+                            clean_err = err_str.clone();
+                        }
+
                         ctx.loop_detector
-                            .record_result(&serde_json::json!({"error": e.to_string()}));
-                        (
-                            format!(
-                                "{{\"error\":\"{}\",\"_do_not_retry\":true,\"hint\":\"This tool call failed. Do NOT retry the same tool with the same arguments. Try a different approach or inform the user.\"}}",
-                                e
-                            ),
-                            vec![],
-                        )
+                            .record_result(&serde_json::json!({"error": clean_err}));
+                        (format!(
+                            "{{\"error\":\"{}\",\"_do_not_retry\":true,\"hint\":\"This tool call failed. Do NOT retry the same tool with the same arguments. Try a different approach or inform the user.\"}}",
+                            clean_err
+                        ), extra_images)
                     }
                 };
 
@@ -4216,6 +4254,84 @@ impl AgentRuntime {
                                     try_add_file(trimmed);
                                 }
                             }
+                        }
+                    }
+                }
+
+                // Extract inline images and file attachments from WASM plugin results.
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result_text) {
+                    // data:image/ URIs → tool_images
+                    if let Some(imgs) = v.get("images").and_then(|i| i.as_array()) {
+                        for img in imgs {
+                            if let Some(s) = img.as_str() {
+                                if s.starts_with("data:image/") {
+                                    tool_images.push(s.to_string());
+                                    tracing::info!("extracted inline image from tool result ({} bytes)", s.len());
+                                }
+                            }
+                        }
+                        if !tool_images.is_empty() {
+                            let mut cleaned = v.clone();
+                            cleaned["images"] = serde_json::json!(format!("[{} images extracted as attachments]", tool_images.len()));
+                            result_text = cleaned.to_string();
+                        }
+                    }
+
+                    // File paths from "files" array → tool_images/tool_files (auto-send)
+                    // Jimeng plugin returns: {"files": ["{\"path\":\"/path/to/1.png\",\"size\":123}", ...]}
+                    if let Some(files) = v.get("files").and_then(|f| f.as_array()) {
+                        for file_entry in files {
+                            let path_str = if let Some(s) = file_entry.as_str() {
+                                // May be a JSON string with path field
+                                if let Ok(fv) = serde_json::from_str::<serde_json::Value>(s) {
+                                    fv.get("path").and_then(|p| p.as_str()).unwrap_or(s).to_string()
+                                } else {
+                                    s.to_string()
+                                }
+                            } else if let Some(p) = file_entry.get("path").and_then(|p| p.as_str()) {
+                                p.to_string()
+                            } else {
+                                continue;
+                            };
+
+                            let pb = std::path::PathBuf::from(&path_str);
+                            if pb.exists() {
+                                let lower = path_str.to_lowercase();
+                                let is_image = lower.ends_with(".png") || lower.ends_with(".jpg")
+                                    || lower.ends_with(".jpeg") || lower.ends_with(".webp");
+                                if is_image {
+                                    // Convert to data URI for inline sending
+                                    if let Ok(bytes) = std::fs::read(&pb) {
+                                        use base64::Engine as _;
+                                        let mime = if lower.ends_with(".png") { "image/png" }
+                                            else if lower.ends_with(".webp") { "image/webp" }
+                                            else { "image/jpeg" };
+                                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                        tool_images.push(format!("data:{mime};base64,{b64}"));
+                                        tracing::info!(path = %path_str, size = bytes.len(), "auto-sending image file as attachment");
+                                    }
+                                } else {
+                                    // Non-image file (video, etc.) → tool_files
+                                    let filename = pb.file_name()
+                                        .map(|f| f.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "file".to_string());
+                                    let mime = if lower.ends_with(".mp4") { "video/mp4" }
+                                        else if lower.ends_with(".mp3") { "audio/mpeg" }
+                                        else { "application/octet-stream" };
+                                    tool_files.push((filename, mime.to_string(), path_str.clone()));
+                                    tracing::info!(path = %path_str, "auto-sending file as attachment");
+                                }
+                            }
+                        }
+                        // Clean up result_text
+                        if !tool_images.is_empty() || !tool_files.is_empty() {
+                            let mut cleaned = v.clone();
+                            cleaned["files"] = serde_json::json!(format!(
+                                "[{} files auto-sent as attachments]",
+                                tool_images.len() + tool_files.len()
+                            ));
+                            cleaned.as_object_mut().map(|o| o.remove("_action"));
+                            result_text = cleaned.to_string();
                         }
                     }
                 }
@@ -4463,8 +4579,22 @@ impl AgentRuntime {
             "web_download" => return self.tool_web_download(args).await,
             "web_browser" | "browser" => return self.tool_web_browser(ctx, args).await,
             "computer_use" => return self.tool_computer_use(args).await,
-            "image_gen" | "image" => return self.tool_image(args).await,
-            "video_gen" | "video" => return self.tool_video(args).await,
+            "image_gen" | "image" => {
+                // If jimeng WASM plugin is loaded, redirect to jimeng.txt2img.
+                if let Some(wp) = self.wasm_plugins.iter().find(|p| p.name == "jimeng") {
+                    info!("redirecting image_gen to jimeng.txt2img");
+                    return wp.call_tool("txt2img", args).await;
+                }
+                return self.tool_image(args).await;
+            }
+            "video_gen" | "video" => {
+                // If jimeng WASM plugin is loaded, redirect to jimeng.txt2vid.
+                if let Some(wp) = self.wasm_plugins.iter().find(|p| p.name == "jimeng") {
+                    info!("redirecting video_gen to jimeng.txt2vid");
+                    return wp.call_tool("txt2vid", args).await;
+                }
+                return self.tool_video(args).await;
+            }
             "pdf" => return self.tool_pdf(args).await,
             "text_to_voice" | "text_to_speech" | "tts" => return self.tool_tts(args).await,
             "send_message" | "message" => return self.tool_message(args).await,
@@ -4558,6 +4688,27 @@ impl AgentRuntime {
                 return Ok(serde_json::json!(text));
             }
             return Err(anyhow!("MCP tool `{name}` not found"));
+        }
+
+        // 3.5 WASM plugin tool: prefixed with `<plugin_name>.`
+        if let Some((plugin_name, tool_name_inner)) = name.split_once('.') {
+            for wp in self.wasm_plugins.iter() {
+                if wp.name == plugin_name {
+                    // Set notification context so WASM plugin can send progress messages
+                    let notif_target = if !ctx.chat_id.is_empty() {
+                        ctx.chat_id.clone()
+                    } else {
+                        ctx.peer_id.clone()
+                    };
+                    wp.set_notification_async(
+                        self.notification_tx.clone(),
+                        notif_target,
+                        ctx.channel.clone(),
+                    ).await;
+                    let result = wp.call_tool(tool_name_inner, args).await?;
+                    return Ok(result);
+                }
+            }
         }
 
         // 4. Skill tool.
@@ -5456,7 +5607,7 @@ mod tests {
     #[test]
     fn build_tool_list_contains_builtins() {
         let skills = SkillRegistry::new();
-        let tools = build_tool_list(&skills, None, "test-agent", &[]);
+        let tools = build_tool_list(&skills, None, "test-agent", &[], &[]);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         for expected in &[
             "memory",

@@ -41,6 +41,9 @@ pub(crate) fn toolset_allowed_names(
         "anycli",
     ];
 
+    // `agent` and `session` are always available regardless of toolset.
+    // Permission control is handled at dispatch time based on AgentKind.
+
     let base: Option<&[&str]> = match toolset {
         "minimal" => Some(MINIMAL),
         "web" => Some(WEB),
@@ -76,6 +79,7 @@ pub(crate) fn build_tool_list(
     agents: Option<&AgentRegistry>,
     caller_id: &str,
     external_agents: &[ExternalAgentConfig],
+    wasm_plugins: &[crate::plugin::WasmPlugin],
 ) -> Vec<ToolDef> {
     let mut tools = Vec::new();
 
@@ -848,6 +852,19 @@ pub(crate) fn build_tool_list(
                     .input_schema
                     .clone()
                     .unwrap_or_else(|| Value::Object(Default::default())),
+            });
+        }
+    }
+
+    // WASM plugin tools — replace built-in equivalents.
+    let _wasm_replaces: Vec<String> = Vec::new();
+    for plugin in wasm_plugins {
+        for tool in &plugin.tools {
+            let full_name = format!("{}.{}", plugin.name, tool.name);
+            tools.push(ToolDef {
+                name: full_name,
+                description: tool.description.clone(),
+                parameters: tool.parameters.clone(),
             });
         }
     }

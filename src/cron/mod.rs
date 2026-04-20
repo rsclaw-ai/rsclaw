@@ -10,6 +10,7 @@
 //! session (`session:<key>`). Concurrent runs are capped by
 //! `max_concurrent_runs`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -510,6 +511,12 @@ impl CronRunner {
         semaphore: Arc<Semaphore>,
         mut reload_rx: broadcast::Receiver<()>,
     ) {
+        // Channel for collecting job results asynchronously.
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<(String, bool, u64, u64, Option<String>)>(64);
+
+        // Cancel flags for running jobs — set to true to signal abort on deletion.
+        let mut cancel_flags: HashMap<String, Arc<std::sync::atomic::AtomicBool>> = HashMap::new();
+
         loop {
             if !running.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
@@ -601,6 +608,22 @@ impl CronRunner {
                     .collect();
                 info!(after_merge_count = jobs.len(), disabled=?disabled_after_merge, "cron: merge complete");
 
+                // Cancel running tasks that were removed or disabled.
+                let active_ids: std::collections::HashSet<&str> = jobs.iter()
+                    .filter(|j| j.enabled)
+                    .map(|j| j.id.as_str())
+                    .collect();
+                let to_cancel: Vec<String> = cancel_flags.keys()
+                    .filter(|id| !active_ids.contains(id.as_str()))
+                    .cloned()
+                    .collect();
+                for id in &to_cancel {
+                    if let Some(flag) = cancel_flags.remove(id) {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        info!(job_id = id, "cron: cancelled running job (deleted/disabled)");
+                    }
+                }
+
                 if let Err(e) = self.save_store(&jobs).await {
                     warn!(err = %e, "cron: failed to save store after reload");
                 }
@@ -653,13 +676,12 @@ impl CronRunner {
 
             info!(count = due.len(), "cron: {} jobs due", due.len());
 
-            // Execute due jobs with concurrency limit
-            let mut handles = Vec::new();
-
+            // Execute due jobs concurrently — spawn and continue immediately.
+            // Results are collected via a channel, not by join_all.
             for job_id in due {
                 let permit = semaphore.clone().acquire_owned().await.ok();
                 if permit.is_none() {
-                    // Max concurrency reached
+                    // Max concurrency reached — remaining jobs will fire next tick.
                     break;
                 }
 
@@ -676,6 +698,8 @@ impl CronRunner {
                 }
 
                 let permit = permit.expect("permit checked above");
+                let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                cancel_flags.insert(job.id.clone(), Arc::clone(&cancelled));
                 let job = job.clone();
                 let agents = Arc::clone(&self.agents);
                 let channels = Arc::clone(&self.channels);
@@ -703,22 +727,35 @@ impl CronRunner {
                         .unwrap_or(0);
                     info!(job_id = %job.id, "cron job triggered");
 
-                    let result = run_cron_job(
-                        &job,
-                        &agents,
-                        &config,
-                        &providers,
-                        &skills,
-                        &store,
-                        &memory,
-                        &event_tx,
-                        &spawner,
-                        &plugins,
-                        &mcp,
-                        &notification_tx,
-                        &default_delivery,
-                    )
-                    .await;
+// Run with cancellation check — polls cancel flag every second.
+                    let result = tokio::select! {
+                        r = run_cron_job(
+                            &job,
+                            &agents,
+                            &config,
+                            &providers,
+                            &skills,
+                            &store,
+                            &memory,
+                            &event_tx,
+                            &spawner,
+                            &plugins,
+                            &mcp,
+                            &notification_tx,
+                            &default_delivery,
+                        ) => r,
+                        _ = async {
+                            loop {
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                                    info!(job_id = %job.id, "cron job cancelled");
+                                    break;
+                                }
+                            }
+                        } => {
+                            Err(anyhow::anyhow!("job cancelled"))
+                        }
+                    };
                     let duration_ms = current_timestamp_ms() - start_time;
                     drop(permit);
 
@@ -804,29 +841,21 @@ impl CronRunner {
                     )
                 });
 
-                handles.push(handle);
+                // Send result back via channel for async collection.
+                let result_tx = result_tx.clone();
+                tokio::spawn(async move {
+                    let result = handle.await;
+                    if let Ok(r) = result {
+                        let _ = result_tx.send(r).await;
+                    }
+                });
             }
 
-            // Wait for all jobs to complete and update state.
-            // Use select to also listen for reload signals, so deletions
-            // are not delayed until all running jobs finish.
-            let all_handles = futures::future::join_all(handles);
-            let results = tokio::select! {
-                r = all_handles => r,
-                _ = reload_rx.recv() => {
-                    // Reload triggered while jobs are running — apply immediately
-                    info!("cron: reload signal during job execution, reloading now");
-                    let new_jobs = crate::cron::load_cron_jobs();
-                    let now_ms = current_timestamp_ms();
-                    jobs = self.merge_jobs(&jobs, new_jobs, now_ms);
-                    if let Err(e) = self.save_store(&jobs).await {
-                        warn!(err = %e, "cron: failed to save store after mid-execution reload");
-                    }
-                    continue; // back to top of loop, running tasks finish on their own
-                }
-            };
-            for result in results {
-                if let Ok((job_id, success, duration_ms, started_at, error_msg)) = result {
+            // Collect any completed job results (non-blocking).
+            // This processes results from ALL previously spawned jobs,
+            // not just the ones spawned this tick.
+            while let Ok((job_id, success, duration_ms, started_at, error_msg)) = result_rx.try_recv() {
+                    cancel_flags.remove(&job_id);
                     if let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) {
                         if let Some(state) = job.state.as_mut() {
                             state.running_at_ms = None;
@@ -888,7 +917,6 @@ impl CronRunner {
                         }
                     }
                 }
-            }
 
             // Remove completed one-shot jobs
             let before = jobs.len();

@@ -548,6 +548,11 @@ pub struct BrowserSession {
 }
 
 impl BrowserSession {
+    /// Return the Chrome remote debugging port.
+    pub fn debug_port(&self) -> u16 {
+        self.debug_port
+    }
+
     /// Launch Chrome, discover the default page target, and connect CDP.
     pub async fn start(chrome_path: &str, headed: bool, profile: Option<&str>) -> Result<Self> {
         let chrome = ChromeProcess::launch(chrome_path, headed, profile).await?;
@@ -670,7 +675,7 @@ impl BrowserSession {
                         let types: Vec<&str> = targets.iter()
                             .filter_map(|t| t["type"].as_str())
                             .collect();
-                        warn!(attempt, ?types, "CDP target types discovered");
+                        debug!(attempt, ?types, "CDP target types discovered");
                     }
                     if let Some(target) = targets.into_iter().find(|t| t["type"].as_str() == Some("page")) {
                         page_target = Some(target);
@@ -873,6 +878,9 @@ impl BrowserSession {
             "scrollintoview" | "scroll_into_view" => self.cmd_scroll_into_view(args).await,
             "scroll" => self.cmd_scroll(args).await,
             "screenshot" => self.cmd_screenshot(args).await,
+            "annotate" => self.cmd_annotate().await,
+            "inspect" => self.cmd_inspect().await,
+            "capture_video" => self.cmd_capture_video(args).await,
             "pdf" => self.cmd_pdf().await,
             "back" => self.cmd_back().await,
             "forward" => self.cmd_forward().await,
@@ -883,7 +891,7 @@ impl BrowserSession {
             "wait" => self.cmd_wait(args).await,
             "evaluate" => self.cmd_evaluate(args).await,
             "cookies" => self.cmd_cookies(args).await,
-            "press" => self.cmd_press(args).await,
+            "press" | "key" => self.cmd_press(args).await,
             "set_viewport" => self.cmd_set_viewport(args).await,
             "dialog" => self.cmd_dialog(args).await,
             "new_tab" => self.cmd_new_tab(args).await,
@@ -897,6 +905,7 @@ impl BrowserSession {
             "find" => self.cmd_find(args).await,
             "get_article" => self.cmd_get_article().await,
             "upload" => self.cmd_upload(args).await,
+            "download" => self.cmd_download(args).await,
             "context" => self.cmd_context(args).await,
             "emulate" => self.cmd_emulate(args).await,
             "diff" => self.cmd_diff(args).await,
@@ -996,8 +1005,27 @@ impl BrowserSession {
         // interactive mode: only return elements with @ref (saves 80% tokens)
         let interactive = args.get("interactive").and_then(|v| v.as_bool()).unwrap_or(false)
             || args.get("i").and_then(|v| v.as_bool()).unwrap_or(false);
+        let compact = args.get("compact").and_then(|v| v.as_bool()).unwrap_or(false);
+        let max_depth = args.get("depth").and_then(|v| v.as_u64()).map(|d| d as usize);
+        let selector = args.get("selector").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
 
-        let js = if interactive { SNAPSHOT_INTERACTIVE_JS } else { SNAPSHOT_JS };
+        let base_js = if interactive { SNAPSHOT_INTERACTIVE_JS } else { SNAPSHOT_JS };
+
+        // If a CSS selector is specified, patch the JS to scope to that element.
+        let js = if let Some(sel) = selector {
+            let escaped = sel.replace('\\', "\\\\").replace('\'', "\\'");
+            // Replace `walk(document.body, 0)` with scoped element lookup.
+            base_js.replace(
+                "if (document.body) walk(document.body, 0);",
+                &format!(
+                    "var __root = document.querySelector('{}'); if (__root) walk(__root, 0);",
+                    escaped
+                ),
+            )
+        } else {
+            base_js.to_owned()
+        };
+
         let result = self
             .cdp
             .send(
@@ -1018,16 +1046,37 @@ impl BrowserSession {
         let parsed: Value =
             serde_json::from_str(raw).unwrap_or_else(|_| json!({"lines": [], "refCount": 0}));
 
-        let lines = parsed
+        let line_strs: Vec<&str> = parsed
             .get("lines")
             .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
+
+        // Post-processing: depth and compact filters.
+        let lines: Vec<&str> = line_strs
+            .into_iter()
+            .filter(|line| {
+                // Depth filter: count leading spaces, each level = 2 spaces.
+                if let Some(max_d) = max_depth {
+                    let indent = line.len() - line.trim_start().len();
+                    if indent > max_d * 2 {
+                        return false;
+                    }
+                }
+                // Compact filter: remove lines that are only structural tags with no text.
+                if compact {
+                    let trimmed = line.trim();
+                    // Structural-only lines look like [section], [div], [nav], etc.
+                    // Keep lines that have text content, @ref markers, or meaningful info.
+                    if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.contains('@') {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+
+        let text = lines.join("\n");
 
         let ref_count = parsed
             .get("refCount")
@@ -1043,7 +1092,7 @@ impl BrowserSession {
 
         Ok(json!({
             "action": "snapshot",
-            "text": lines,
+            "text": text,
         }))
     }
 
@@ -2299,6 +2348,117 @@ impl BrowserSession {
         Ok(json!({"action": "upload", "ref": eref, "files": files.len()}))
     }
 
+    /// Download a file by clicking a button/link that triggers a browser download.
+    ///
+    /// Sets up CDP download interception, clicks the element, waits for the
+    /// download to complete, and moves the file to the requested path.
+    async fn cmd_download(&self, args: &Value) -> Result<Value> {
+        let _eref = args.get("ref").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("download: `ref` required"))?;
+        let save_path = args.get("path").and_then(|v| v.as_str())
+            .unwrap_or("download");
+
+        // Create a temp download directory
+        let dl_dir = std::env::temp_dir().join(format!("rsclaw-dl-{}", std::process::id()));
+        std::fs::create_dir_all(&dl_dir)?;
+        let dl_dir_str = dl_dir.to_string_lossy().to_string();
+
+        // Enable download interception via CDP
+        self.cdp.send("Browser.setDownloadBehavior", json!({
+            "behavior": "allowAndName",
+            "downloadPath": dl_dir_str,
+            "eventsEnabled": true,
+        })).await?;
+
+        // Click the download trigger element
+        self.cmd_click(args).await?;
+
+        // Wait for download to complete (poll the download directory)
+        let timeout = Duration::from_secs(30);
+        let start = std::time::Instant::now();
+        let mut final_path = None;
+
+        loop {
+            if start.elapsed() > timeout {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            // Check for completed files (not .crdownload / .tmp)
+            if let Ok(entries) = std::fs::read_dir(&dl_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    if !name.ends_with(".crdownload") && !name.ends_with(".tmp") && !name.starts_with('.') {
+                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        if size > 0 {
+                            final_path = Some(p);
+                            break;
+                        }
+                    }
+                }
+            }
+            if final_path.is_some() {
+                break;
+            }
+        }
+
+        // Reset download behavior
+        self.cdp.send("Browser.setDownloadBehavior", json!({
+            "behavior": "default",
+        })).await.ok();
+
+        let Some(downloaded) = final_path else {
+            // Clean up
+            std::fs::remove_dir_all(&dl_dir).ok();
+            bail!("download: timed out waiting for download to complete");
+        };
+
+        // Move to requested path
+        let expanded = if save_path.starts_with("~/") {
+            dirs_next::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(&save_path[2..])
+        } else if save_path.contains('/') || save_path.contains('\\') {
+            std::path::PathBuf::from(save_path)
+        } else {
+            std::env::current_dir()?.join(save_path)
+        };
+        let dest = expanded;
+
+        // Preserve original extension if dest has none
+        let dest = if dest.extension().is_none() {
+            if let Some(ext) = downloaded.extension() {
+                dest.with_extension(ext)
+            } else {
+                dest
+            }
+        } else {
+            dest
+        };
+
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(&downloaded, &dest).or_else(|_| {
+            // Cross-device: copy + remove
+            std::fs::copy(&downloaded, &dest)?;
+            std::fs::remove_file(&downloaded)?;
+            Ok::<(), std::io::Error>(())
+        })?;
+
+        // Clean up temp dir
+        std::fs::remove_dir_all(&dl_dir).ok();
+
+        let dest_str = dest.to_string_lossy().to_string();
+        let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+        Ok(json!({
+            "action": "download",
+            "path": dest_str,
+            "size": size,
+        }))
+    }
+
     async fn cmd_get_article(&self) -> Result<Value> {
         let js = r#"(function(){
             var doc=document.cloneNode(true);var body=doc.querySelector('body');
@@ -2676,6 +2836,173 @@ impl BrowserSession {
     // -----------------------------------------------------------------------
     // Console — get browser console messages
     // -----------------------------------------------------------------------
+
+    /// Take an annotated screenshot — interactive elements are labeled with numbers.
+    async fn cmd_annotate(&mut self) -> Result<Value> {
+        // Inject numbered overlays on all interactive elements.
+        let inject_js = r#"(function(){
+            var labels = document.querySelectorAll('.__rsclaw_label');
+            labels.forEach(function(l){ l.remove(); });
+            var sels = 'a,button,input,select,textarea,[role=button],[role=link],[contenteditable=true],[onclick]';
+            var els = document.querySelectorAll(sels);
+            var n = 0;
+            els.forEach(function(el){
+                var r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return;
+                if (r.bottom < 0 || r.top > window.innerHeight) return;
+                n++;
+                var label = document.createElement('div');
+                label.className = '__rsclaw_label';
+                label.textContent = n;
+                label.style.cssText = 'position:fixed;z-index:999999;background:#ff3333;color:#fff;font:bold 11px/14px Arial;padding:1px 4px;border-radius:7px;pointer-events:none;min-width:14px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.5);left:'+(r.left-2)+'px;top:'+(r.top-16)+'px;';
+                document.body.appendChild(label);
+            });
+            return n;
+        })()"#;
+
+        let count_result = self.cdp.send("Runtime.evaluate", json!({"expression": inject_js})).await?;
+        let count = count_result["result"]["value"].as_u64().unwrap_or(0);
+
+        // Take screenshot with labels.
+        let screenshot = self.cmd_screenshot(&json!({})).await?;
+
+        // Remove labels.
+        let cleanup_js = "document.querySelectorAll('.__rsclaw_label').forEach(function(l){ l.remove(); })";
+        let _ = self.cdp.send("Runtime.evaluate", json!({"expression": cleanup_js})).await;
+
+        let mut result = screenshot;
+        result["action"] = json!("annotate");
+        result["labels"] = json!(count);
+        Ok(result)
+    }
+
+    /// Open Chrome DevTools for the active page.
+    async fn cmd_inspect(&self) -> Result<Value> {
+        // Get the target ID to open DevTools.
+        let port = self.debug_port;
+        let url = format!("http://127.0.0.1:{port}/json");
+        let targets: Vec<Value> = reqwest::get(&url).await?.json().await?;
+        let target_id = targets.iter()
+            .find(|t| t["type"].as_str() == Some("page"))
+            .and_then(|t| t["id"].as_str())
+            .unwrap_or("unknown");
+
+        let devtools_url = format!(
+            "devtools://devtools/bundled/inspector.html?ws=127.0.0.1:{port}/devtools/page/{target_id}"
+        );
+
+        Ok(json!({
+            "action": "inspect",
+            "devtools_url": devtools_url,
+            "hint": "Open this URL in Chrome to inspect the page"
+        }))
+    }
+
+    /// Capture video/audio URLs from a page.
+    ///
+    /// Strategy: navigate, trigger playback, then collect from:
+    /// 1. `<video>`/`<source>` element src/currentSrc
+    /// 2. Performance API entries with initiatorType=video/audio
+    /// 3. Intercepted XHR/fetch with media Content-Type
+    async fn cmd_capture_video(&mut self, args: &Value) -> Result<Value> {
+        let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        if url.is_empty() {
+            return Err(anyhow!("capture_video: `url` required"));
+        }
+        let wait_ms = args.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(8000);
+
+        // Inject fetch/XHR interceptor that checks Content-Type for media.
+        let inject_js = r#"(function(){
+            window.__mediaUrls=[];
+            var bad=/static|douyinstatic|poster|cover|thumbnail|preview|placeholder|loading|advert/;
+            var ff=window.fetch;
+            window.fetch=function(){
+                var p=ff.apply(this,arguments);
+                p.then(function(r){
+                    var ct=(r.headers.get('content-type')||'').toLowerCase();
+                    if(/video\/|audio\/|octet-stream|mpegurl|mp2t/.test(ct)&&r.url&&!bad.test(r.url))
+                        window.__mediaUrls.push(r.url);
+                }).catch(function(){});
+                return p;
+            };
+            var xo=XMLHttpRequest.prototype.open,xs=XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open=function(m,u){this.__u=u;return xo.apply(this,arguments)};
+            XMLHttpRequest.prototype.send=function(){
+                var s=this;
+                s.addEventListener('load',function(){
+                    var ct=(s.getResponseHeader('content-type')||'').toLowerCase();
+                    var u=s.__u?s.__u.toString():'';
+                    if(/video\/|audio\/|octet-stream|mpegurl|mp2t/.test(ct)&&u&&!bad.test(u))
+                        window.__mediaUrls.push(u);
+                });
+                return xs.apply(this,arguments);
+            };
+        })()"#;
+
+        // Navigate and inject.
+        self.cmd_open(&json!({"url": url})).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = self.cmd_evaluate(&json!({"js": inject_js})).await;
+
+        // Try to trigger playback.
+        let _ = self.cmd_evaluate(&json!({"js":
+            "var v=document.querySelector('video');if(v)v.play().catch(function(){});\
+             var b=document.querySelector('[class*=play],[class*=Play],.bpx-player-ctrl-play,\
+             button[aria-label*=play],[data-player-hook=play]');\
+             if(b)b.click();'ok'"
+        })).await;
+
+        // Wait for video to load.
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+
+        // Collect from all sources.
+        let collect_js = r#"(function(){
+            var urls=(window.__mediaUrls||[]).slice();
+            // <video>/<source> elements
+            document.querySelectorAll('video,source').forEach(function(el){
+                var s=el.src||el.currentSrc||'';
+                if(s&&s.startsWith('http'))urls.push(s);
+            });
+            // Performance API (initiatorType=video/audio)
+            try{
+                performance.getEntriesByType('resource').forEach(function(e){
+                    if((e.initiatorType==='video'||e.initiatorType==='audio')
+                       &&e.name&&e.name.startsWith('http'))
+                        urls.push(e.name);
+                });
+            }catch(x){}
+            return JSON.stringify([...new Set(urls)]);
+        })()"#;
+
+        let result = self.cmd_evaluate(&json!({"js": collect_js})).await?;
+        let urls_str = result.get("result").and_then(|v| v.as_str()).unwrap_or("[]");
+        let mut urls: Vec<String> = serde_json::from_str(urls_str).unwrap_or_default();
+
+        // Retry if empty.
+        if urls.is_empty() {
+            let _ = self.cmd_evaluate(&json!({"js": "location.reload()"})).await;
+            tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+            let _ = self.cmd_evaluate(&json!({"js": inject_js})).await;
+            let _ = self.cmd_evaluate(&json!({"js":
+                "var v=document.querySelector('video');if(v)v.play().catch(function(){});'ok'"
+            })).await;
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+            let result2 = self.cmd_evaluate(&json!({"js": collect_js})).await?;
+            let urls_str2 = result2.get("result").and_then(|v| v.as_str()).unwrap_or("[]");
+            urls = serde_json::from_str(urls_str2).unwrap_or_default();
+        }
+
+        Ok(json!({
+            "action": "capture_video",
+            "video_urls": urls,
+            "count": urls.len(),
+            "hint": if urls.is_empty() {
+                "No media URLs found. Try with headed mode or login first."
+            } else {
+                "Pick the best URL for download. Use web_download with use_browser_cookies=true."
+            }
+        }))
+    }
 
     /// Get recent console messages (log, warn, error, info).
     async fn cmd_console(&self, args: &Value) -> Result<Value> {

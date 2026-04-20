@@ -42,6 +42,31 @@ impl AgentRuntime {
         self.compact_inner(session_key, model, true).await;
     }
 
+    /// Estimate the fixed token overhead from system prompt, tools, and skills.
+    /// This overhead is always present regardless of conversation length.
+    pub(crate) fn estimate_fixed_overhead(&self) -> usize {
+        let mut overhead = 0usize;
+
+        // System prompt.
+        if let Some(ref sys) = self.cached_system_prompt {
+            overhead += estimate_tokens(sys);
+        }
+
+        // Tool definitions.
+        for tool in &self.cached_tools {
+            overhead += estimate_tokens(&tool.name);
+            overhead += estimate_tokens(&tool.description);
+            overhead += estimate_tokens(&tool.parameters.to_string());
+        }
+
+        // Skills loaded in system prompt (rough estimate from skill count).
+        let skill_count = self.skills.len();
+        // Average skill prompt is ~500 tokens.
+        overhead += skill_count * 500;
+
+        overhead
+    }
+
     pub(crate) async fn compact_inner(&mut self, session_key: &str, model: &str, force: bool) {
         use crate::config::schema::CompactionMode;
 
@@ -71,11 +96,16 @@ impl AgentRuntime {
             default_threshold
         };
 
-        let total_tokens: usize = self
+        // Estimate fixed overhead: system prompt + tools + skills.
+        // This is NOT in the session messages but still counts towards context.
+        let overhead_tokens = self.estimate_fixed_overhead();
+
+        let session_tokens: usize = self
             .sessions
             .get(session_key)
             .map(|msgs| msgs.iter().map(msg_tokens).sum())
             .unwrap_or(0);
+        let total_tokens = session_tokens + overhead_tokens;
 
         let turns = self
             .compaction_state

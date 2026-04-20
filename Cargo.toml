@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.91"
 description = "AI Automation Manager Compatible with OpenClaw"
 repository = "https://github.com/rsclaw-ai/rsclaw"
-license = "AGPL-3.0"
+license = "MIT OR Apache-2.0"
 
 [[bin]]
 name = "rsclaw"
@@ -106,6 +106,8 @@ fs2 = "0.4.3"
 rusqlite = { version = "0.32", optional = true, features = ["bundled"] }
 async-trait = "0.1"
 htmd = "0.5"
+wasmtime = { version = "29", features = ["async"] }
+wasmtime-wasi = "29"
 moka = { version = "0.12", features = ["future"] }
 
 # System tray (optional)
@@ -114,8 +116,6 @@ muda = { version = "0.16", optional = true }
 bzip2 = "0.6.1"
 lopdf = "0.34"
 glob = "0.3.3"
-wasmtime = { version = "29", features = ["async"] }
-wasmtime-wasi = "29"
 
 [features]
 default = ["openclaw-migrate"]
