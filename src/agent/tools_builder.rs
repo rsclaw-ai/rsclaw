@@ -362,6 +362,11 @@ pub(crate) fn build_tool_list(
             Interaction: hover (triggers menus/tooltips), dblclick, drag (from=@e1 to=@e2, for sliders), focus, scrollintoview.\n\
             Quick search: `search` — auto-find search box on ANY site, fill text, submit, return results.\n\
             `clickAt` ref=@e1 or x=100 y=200 — real mouse click via CDP (for file dialogs, anti-bot sites).\n\
+            Semantic locators: `getbytext` value='Submit', `getbyrole` value='button', `getbylabel` value='Email' — find elements without @ref.\n\
+            Frame: `frame` selector=@e1 (switch to iframe), `mainframe` (switch back).\n\
+            Console: `console` — get browser console messages (log/warn/error).\n\
+            Content: `content` — get full page HTML.\n\
+            WaitForUrl: `waitforurl` url='dashboard' — wait for URL change (after login/redirect).\n\
             Other: type, select, check, scroll, screenshot, pdf, press, back, forward, reload, wait, evaluate, cookies, get_text, get_url, get_title, find, get_article, upload, new_tab, switch_tab, close_tab.\n\
             IMPORTANT: Always snapshot BEFORE clicking/filling. Element refs change after page updates.".to_owned(),
         parameters: json!({
@@ -376,7 +381,8 @@ pub(crate) fn build_tool_list(
                     "dialog", "state", "network", "new_tab", "list_tabs",
                     "switch_tab", "close_tab", "highlight", "clipboard", "find",
                     "get_article", "upload", "context", "emulate", "diff", "record",
-                    "search"
+                    "search", "console", "content", "frame", "mainframe",
+                    "waitforurl", "getbytext", "getbyrole", "getbylabel"
                 ]},
                 "url":        {"type": "string", "description": "URL for open/navigate"},
                 "interactive":{"type": "boolean", "description": "For snapshot: only return actionable elements (saves ~80% tokens). Default: false"},

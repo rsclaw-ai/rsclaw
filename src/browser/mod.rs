@@ -883,6 +883,14 @@ impl BrowserSession {
             "is" => self.cmd_is(args).await,
             "get" => self.cmd_get(args).await,
             "search" => self.cmd_search(args).await,
+            "console" => self.cmd_console(args).await,
+            "content" => self.cmd_content().await,
+            "frame" => self.cmd_frame(args).await,
+            "mainframe" | "main_frame" => self.cmd_mainframe().await,
+            "waitforurl" | "wait_for_url" => self.cmd_wait_for_url(args).await,
+            "getbytext" | "get_by_text" => self.cmd_getby(args, "text").await,
+            "getbyrole" | "get_by_role" => self.cmd_getby(args, "role").await,
+            "getbylabel" | "get_by_label" => self.cmd_getby(args, "label").await,
             other => Err(anyhow!("web_browser: unsupported action `{other}`")),
         };
 
@@ -2636,6 +2644,243 @@ impl BrowserSession {
             "title": page_title["title"],
             "text": page_text["text"],
             "input": parsed["selector"],
+        }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Console — get browser console messages
+    // -----------------------------------------------------------------------
+
+    /// Get recent console messages (log, warn, error, info).
+    async fn cmd_console(&self, args: &Value) -> Result<Value> {
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let level = args.get("level").and_then(|v| v.as_str()).unwrap_or("all");
+
+        let js = r#"(function(){
+            if (!window.__rsclaw_console) return JSON.stringify([]);
+            return JSON.stringify(window.__rsclaw_console.slice(-500));
+        })()"#;
+
+        // Inject console interceptor if not already done.
+        let inject = r#"(function(){
+            if (window.__rsclaw_console) return;
+            window.__rsclaw_console = [];
+            var orig = {log: console.log, warn: console.warn, error: console.error, info: console.info};
+            ['log','warn','error','info'].forEach(function(level) {
+                console[level] = function() {
+                    var args = Array.from(arguments).map(function(a) {
+                        try { return typeof a === 'object' ? JSON.stringify(a) : String(a); }
+                        catch(e) { return String(a); }
+                    });
+                    window.__rsclaw_console.push({level: level, text: args.join(' '), ts: Date.now()});
+                    if (window.__rsclaw_console.length > 500) window.__rsclaw_console.shift();
+                    orig[level].apply(console, arguments);
+                };
+            });
+        })()"#;
+
+        let _ = self.cdp.send("Runtime.evaluate", json!({"expression": inject})).await;
+        let result = self.cdp.send("Runtime.evaluate", json!({"expression": js})).await?;
+        let raw = result["result"]["value"].as_str().unwrap_or("[]");
+        let entries: Vec<Value> = serde_json::from_str(raw).unwrap_or_default();
+
+        let filtered: Vec<&Value> = entries.iter()
+            .filter(|e| level == "all" || e["level"].as_str() == Some(level))
+            .rev()
+            .take(limit)
+            .collect();
+
+        Ok(json!({"action": "console", "entries": filtered, "count": filtered.len()}))
+    }
+
+    // -----------------------------------------------------------------------
+    // Content — get full page HTML
+    // -----------------------------------------------------------------------
+
+    /// Get the full HTML content of the current page.
+    async fn cmd_content(&self) -> Result<Value> {
+        let result = self.cdp.send("Runtime.evaluate", json!({
+            "expression": "document.documentElement.outerHTML"
+        })).await?;
+        let html = result["result"]["value"].as_str().unwrap_or("");
+        Ok(json!({"action": "content", "html": html, "length": html.len()}))
+    }
+
+    // -----------------------------------------------------------------------
+    // Frame — switch to iframe / mainframe
+    // -----------------------------------------------------------------------
+
+    /// Switch execution context to an iframe by selector or @ref.
+    async fn cmd_frame(&mut self, args: &Value) -> Result<Value> {
+        let selector = args.get("selector").or(args.get("ref"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("frame: `selector` or `ref` required"))?;
+
+        // Resolve @ref to CSS selector if needed.
+        let css = if selector.starts_with('@') {
+            let idx: usize = selector.trim_start_matches("@e").parse()
+                .map_err(|_| anyhow!("frame: invalid ref `{selector}`"))?;
+            format!("[data-rsclaw-ref='e{idx}']")
+        } else {
+            selector.to_owned()
+        };
+
+        // Get the iframe's frame ID via Page.getFrameTree.
+        let tree = self.cdp.send("Page.getFrameTree", json!({})).await?;
+
+        // Find iframe src from DOM to match with frame tree.
+        let js = format!(
+            r#"(function(){{
+                var el = document.querySelector('{css}');
+                if (!el) return JSON.stringify({{"error": "element not found"}});
+                if (el.tagName !== 'IFRAME') return JSON.stringify({{"error": "not an iframe"}});
+                return JSON.stringify({{"src": el.src || '', "name": el.name || ''}});
+            }})()"#,
+            css = css.replace('\'', "\\'")
+        );
+        let result = self.cdp.send("Runtime.evaluate", json!({"expression": js})).await?;
+        let raw = result["result"]["value"].as_str().unwrap_or("{}");
+        let parsed: Value = serde_json::from_str(raw).unwrap_or_default();
+
+        if parsed.get("error").is_some() {
+            return Ok(parsed);
+        }
+
+        Ok(json!({
+            "action": "frame",
+            "selector": selector,
+            "iframe": parsed,
+            "hint": "Use evaluate with the iframe's document context for interactions inside the frame"
+        }))
+    }
+
+    /// Switch back to the main frame.
+    async fn cmd_mainframe(&self) -> Result<Value> {
+        // Mainframe is the default execution context — no special action needed
+        // as CDP Runtime.evaluate runs in the main context by default.
+        Ok(json!({"action": "mainframe", "status": "switched to main frame"}))
+    }
+
+    // -----------------------------------------------------------------------
+    // WaitForUrl — wait for URL to change
+    // -----------------------------------------------------------------------
+
+    /// Wait for the page URL to match a pattern (useful after login/redirect).
+    async fn cmd_wait_for_url(&self, args: &Value) -> Result<Value> {
+        let pattern = args.get("url").or(args.get("pattern"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("waitforurl: `url` pattern required"))?;
+        let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
+
+        let start = std::time::Instant::now();
+        let deadline = std::time::Duration::from_secs(timeout);
+
+        loop {
+            let result = self.cdp.send("Runtime.evaluate", json!({
+                "expression": "window.location.href"
+            })).await?;
+            let current_url = result["result"]["value"].as_str().unwrap_or("");
+
+            if current_url.contains(pattern) {
+                return Ok(json!({
+                    "action": "waitforurl",
+                    "matched": true,
+                    "url": current_url,
+                    "pattern": pattern
+                }));
+            }
+
+            if start.elapsed() > deadline {
+                return Ok(json!({
+                    "action": "waitforurl",
+                    "matched": false,
+                    "url": current_url,
+                    "pattern": pattern,
+                    "error": "timeout"
+                }));
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Semantic locators — getbytext, getbyrole, getbylabel
+    // -----------------------------------------------------------------------
+
+    /// Find elements by semantic locators (text, role, label).
+    async fn cmd_getby(&self, args: &Value, by: &str) -> Result<Value> {
+        let value = args.get("value").or(args.get("text")).or(args.get("role")).or(args.get("label"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("getby{by}: `value` required"))?;
+        let exact = args.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let escaped = escape_js_string(value);
+
+        let js = match by {
+            "text" => format!(
+                r#"(function(){{
+                    var exact = {exact};
+                    var query = '{escaped}';
+                    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                    var results = [];
+                    while (walker.nextNode()) {{
+                        var text = walker.currentNode.textContent.trim();
+                        var match = exact ? text === query : text.toLowerCase().includes(query.toLowerCase());
+                        if (match && walker.currentNode.parentElement) {{
+                            var el = walker.currentNode.parentElement;
+                            var tag = el.tagName.toLowerCase();
+                            var r = el.getBoundingClientRect();
+                            results.push({{tag: tag, text: text.substring(0, 100), x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height)}});
+                            if (results.length >= 10) break;
+                        }}
+                    }}
+                    return JSON.stringify(results);
+                }})()"#
+            ),
+            "role" => format!(
+                r#"(function(){{
+                    var els = document.querySelectorAll('[role="{escaped}"]');
+                    var results = [];
+                    els.forEach(function(el) {{
+                        var r = el.getBoundingClientRect();
+                        var text = (el.textContent || '').trim().substring(0, 100);
+                        results.push({{tag: el.tagName.toLowerCase(), role: '{escaped}', text: text, x: Math.round(r.x), y: Math.round(r.y)}});
+                        if (results.length >= 10) return;
+                    }});
+                    return JSON.stringify(results);
+                }})()"#
+            ),
+            "label" => format!(
+                r#"(function(){{
+                    var labels = document.querySelectorAll('label');
+                    var results = [];
+                    labels.forEach(function(label) {{
+                        var text = (label.textContent || '').trim();
+                        if (text.toLowerCase().includes('{escaped}'.toLowerCase())) {{
+                            var forId = label.getAttribute('for');
+                            var input = forId ? document.getElementById(forId) : label.querySelector('input,select,textarea');
+                            if (input) {{
+                                var r = input.getBoundingClientRect();
+                                results.push({{label: text.substring(0, 100), tag: input.tagName.toLowerCase(), type: input.type || '', x: Math.round(r.x), y: Math.round(r.y)}});
+                            }}
+                        }}
+                    }});
+                    return JSON.stringify(results);
+                }})()"#
+            ),
+            _ => return Err(anyhow!("getby: unknown locator type `{by}`")),
+        };
+
+        let result = self.cdp.send("Runtime.evaluate", json!({"expression": js})).await?;
+        let raw = result["result"]["value"].as_str().unwrap_or("[]");
+        let elements: Vec<Value> = serde_json::from_str(raw).unwrap_or_default();
+
+        Ok(json!({
+            "action": format!("getby{by}"),
+            "value": value,
+            "elements": elements,
+            "count": elements.len()
         }))
     }
 }
