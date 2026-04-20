@@ -10,6 +10,7 @@
 //! session (`session:<key>`). Concurrent runs are capped by
 //! `max_concurrent_runs`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -455,9 +456,10 @@ impl CronRunner {
         mut reload_rx: broadcast::Receiver<()>,
     ) {
         // Channel for collecting job results asynchronously.
-        // Jobs are spawned and results come back via this channel,
-        // so the timer loop never blocks waiting for jobs to finish.
         let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<(String, bool, u64, u64, Option<String>)>(64);
+
+        // Cancel flags for running jobs — set to true to signal abort on deletion.
+        let mut cancel_flags: HashMap<String, Arc<std::sync::atomic::AtomicBool>> = HashMap::new();
 
         loop {
             if !running.load(std::sync::atomic::Ordering::SeqCst) {
@@ -541,6 +543,22 @@ impl CronRunner {
                     .collect();
                 info!(after_merge_count = jobs.len(), disabled=?disabled_after_merge, "cron: merge complete");
 
+                // Cancel running tasks that were removed or disabled.
+                let active_ids: std::collections::HashSet<&str> = jobs.iter()
+                    .filter(|j| j.enabled)
+                    .map(|j| j.id.as_str())
+                    .collect();
+                let to_cancel: Vec<String> = cancel_flags.keys()
+                    .filter(|id| !active_ids.contains(id.as_str()))
+                    .cloned()
+                    .collect();
+                for id in &to_cancel {
+                    if let Some(flag) = cancel_flags.remove(id) {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        info!(job_id = id, "cron: cancelled running job (deleted/disabled)");
+                    }
+                }
+
                 if let Err(e) = self.save_store(&jobs).await {
                     warn!(err = %e, "cron: failed to save store after reload");
                 }
@@ -605,6 +623,8 @@ impl CronRunner {
                 }
 
                 let permit = permit.expect("permit checked above");
+                let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                cancel_flags.insert(job.id.clone(), Arc::clone(&cancelled));
                 let job = job.clone();
                 let agents = Arc::clone(&self.agents);
                 let channels = Arc::clone(&self.channels);
@@ -617,7 +637,21 @@ impl CronRunner {
                     let prev_consecutive_errors = job.state.as_ref().map(|s| s.consecutive_errors).unwrap_or(0);
                     info!(job_id = %job.id, "cron job triggered");
 
-                    let result = run_cron_job(&job, &agents).await;
+                    // Run with cancellation check — polls cancel flag every second.
+                    let result = tokio::select! {
+                        r = run_cron_job(&job, &agents) => r,
+                        _ = async {
+                            loop {
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                                    info!(job_id = %job.id, "cron job cancelled");
+                                    break;
+                                }
+                            }
+                        } => {
+                            Err(anyhow::anyhow!("job cancelled"))
+                        }
+                    };
                     let duration_ms = current_timestamp_ms() - start_time;
                     drop(permit);
 
@@ -716,6 +750,7 @@ impl CronRunner {
             // This processes results from ALL previously spawned jobs,
             // not just the ones spawned this tick.
             while let Ok((job_id, success, duration_ms, started_at, error_msg)) = result_rx.try_recv() {
+                    cancel_flags.remove(&job_id);
                     if let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) {
                         if let Some(state) = job.state.as_mut() {
                             state.running_at_ms = None;
