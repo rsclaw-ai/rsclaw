@@ -532,12 +532,17 @@ pub(crate) fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "cron".to_owned(),
-        description: "List, add, edit, remove, enable or disable cron jobs. For edit/remove/enable/disable, prefer using `index` from the list output instead of `id` to avoid ID truncation issues.".to_owned(),
+        description: "List, add, edit, remove, enable or disable cron jobs.\n\
+            Supports both recurring (cron expression) and one-shot (delay_ms) schedules.\n\
+            For one-shot: set delay_ms instead of schedule. Example: delay_ms=1200000 for 20 minutes.\n\
+            One-shot jobs auto-remove after execution.\n\
+            For edit/remove/enable/disable, prefer using `index` from the list output instead of `id`.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "action":   {"type": "string", "enum": ["list", "add", "edit", "remove", "enable", "disable"], "description": "Action to perform"},
-                "schedule": {"type": "string", "description": "Cron schedule expression (for add, edit)"},
+                "schedule": {"type": "string", "description": "Cron schedule expression (for add/edit recurring jobs)"},
+                "delay_ms": {"type": "number", "description": "Delay in milliseconds for one-shot timer (e.g., 1200000 = 20 min). Use instead of schedule for reminders/timers."},
                 "message":  {"type": "string", "description": "Message or task to run (for add, edit)"},
                 "index":    {"type": "number", "description": "Job index from list (1-based, for edit/remove/enable/disable - preferred)"},
                 "id":       {"type": "string", "description": "Job ID (for edit/remove/enable/disable - use index instead if possible)"},

@@ -38,9 +38,6 @@ impl super::runtime::AgentRuntime {
                 )
             }
             "add" => {
-                let schedule = args["schedule"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("cron add: `schedule` required"))?;
                 let message = args["message"]
                     .as_str()
                     .ok_or_else(|| anyhow!("cron add: `message` required"))?;
@@ -59,11 +56,24 @@ impl super::runtime::AgentRuntime {
                     "createdAtMs": now_ms,
                     "updatedAtMs": now_ms,
                 });
-                // Schedule: use nested format if tz provided, flat otherwise.
-                if let Some(tz_val) = tz {
-                    job["schedule"] = json!({"kind": "cron", "expr": schedule, "tz": tz_val});
+
+                // Schedule: support cron expr, delay (once), or interval.
+                let delay_ms = args["delay_ms"].as_u64().or(args["delayMs"].as_u64());
+                let schedule = args["schedule"].as_str();
+
+                if let Some(delay) = delay_ms {
+                    // One-shot: fire once after delay_ms, then auto-remove.
+                    let at_ms = now_ms + delay;
+                    job["schedule"] = json!({"kind": "once", "atMs": at_ms});
+                } else if let Some(sched) = schedule {
+                    // Standard cron expression or interval.
+                    if let Some(tz_val) = tz {
+                        job["schedule"] = json!({"kind": "cron", "expr": sched, "tz": tz_val});
+                    } else {
+                        job["schedule"] = json!({"kind": "cron", "expr": sched});
+                    }
                 } else {
-                    job["schedule"] = json!({"kind": "cron", "expr": schedule});
+                    return Err(anyhow!("cron add: `schedule` or `delay_ms` required"));
                 }
                 // Payload in OpenClaw format.
                 job["payload"] = json!({"kind": "systemEvent", "text": message});
