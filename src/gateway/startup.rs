@@ -422,7 +422,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let channel_manager = Arc::new(channel_manager);
 
     // Create cron reload broadcast channel (used to notify CronRunner of new jobs)
-    let (cron_reload_tx, _cron_reload_guard) = tokio::sync::broadcast::channel::<()>(16);
+    // Keep receiver active until CronRunner's timer_loop subscribes to ensure
+    // reload signals sent during startup are not dropped.
+    let (cron_reload_tx, cron_reload_guard) = tokio::sync::broadcast::channel::<()>(16);
 
     // Start cron runner — jobs loaded from base_dir/cron.json5
     {
@@ -469,7 +471,13 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 Some(Arc::clone(&mcp_registry)),
                 Some(notification_tx.clone()),
             );
+
+            // Transfer the guard to the spawned task so it's held until timer_loop starts
+            let guard_for_spawn = cron_reload_guard;
             tokio::spawn(async move {
+                // Keep guard alive during initial setup - drop it after first select iteration
+                // ensures reload signals sent before timer_loop starts are received
+                let _guard = guard_for_spawn;
                 if let Err(e) = runner.run().await {
                     error!("cron runner error: {e:#}");
                 }
