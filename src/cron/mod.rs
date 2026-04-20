@@ -1029,8 +1029,24 @@ fn compute_next_run_from_expr(cron_expr: &str, from_ms: u64, tz: Option<&str>) -
                 return tz;
             }
         }
-        // Fall back to UTC
-        chrono_tz::UTC
+        // Try gateway config timezone
+        // Fall back to detecting system offset and mapping to a timezone
+        let local_offset = chrono::Local::now().offset().local_minus_utc();
+        match local_offset {
+            25200 => chrono_tz::Asia::Bangkok,     // +07:00
+            28800 => chrono_tz::Asia::Shanghai,    // +08:00
+            32400 => chrono_tz::Asia::Tokyo,       // +09:00
+            36000 => chrono_tz::Australia::Sydney,  // +10:00
+            -18000 => chrono_tz::US::Eastern,      // -05:00
+            -21600 => chrono_tz::US::Central,      // -06:00
+            -25200 => chrono_tz::US::Mountain,     // -07:00
+            -28800 => chrono_tz::US::Pacific,      // -08:00
+            0 => chrono_tz::UTC,
+            _ => {
+                warn!(offset_secs = local_offset, "cron: unknown system timezone offset, using UTC. Set TZ env var for accuracy.");
+                chrono_tz::UTC
+            }
+        }
     }
 
     let tz_for_search: chrono_tz::Tz = tz_opt.unwrap_or_else(system_tz);
