@@ -66,20 +66,32 @@ fn error_backoff_ms(consecutive_errors: u32) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Schedule descriptor — supports both rsclaw flat format and OpenClaw nested format.
+///
+/// Uses `#[serde(untagged)]` at the top level to distinguish a plain string (Flat)
+/// from an object. Object variants use `#[serde(tag = "kind")]` (internally tagged)
+/// so that `{"kind": "once", "atMs": ...}` is not accidentally matched by `Every`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CronSchedule {
     /// Flat string: "*/30 9-11 * * 1-5" (rsclaw native).
     Flat(String),
-    /// Nested object: { kind: "cron", expr: "...", tz: "Asia/Shanghai" } (OpenClaw compat).
+    /// Object-based schedule with a "kind" discriminator.
+    Tagged(CronScheduleTagged),
+}
+
+/// Internally tagged schedule object. Discriminated by the `kind` field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum CronScheduleTagged {
+    /// Cron expression: { kind: "cron", expr: "...", tz: "Asia/Shanghai" } (OpenClaw compat).
+    #[serde(rename = "cron")]
     Nested {
-        #[serde(default)]
-        kind: Option<String>,
         expr: String,
         #[serde(default)]
         tz: Option<String>,
     },
     /// Interval-based schedule: { kind: "every", everyMs: 259200000, anchorMs: ... } (OpenClaw compat).
+    #[serde(rename = "every")]
     Every {
         #[serde(default, alias = "everyMs")]
         every_ms: Option<u64>,
@@ -89,6 +101,7 @@ pub enum CronSchedule {
     /// One-shot schedule: fires once then auto-removes.
     /// { kind: "once", atMs: 1713600000000 } — absolute timestamp
     /// { kind: "once", delayMs: 1200000 }   — relative delay from creation
+    #[serde(rename = "once")]
     Once {
         #[serde(default, alias = "atMs")]
         at_ms: Option<u64>,
@@ -101,24 +114,24 @@ impl CronSchedule {
     pub fn expr(&self) -> &str {
         match self {
             CronSchedule::Flat(s) => s,
-            CronSchedule::Nested { expr, .. } => expr,
-            CronSchedule::Every { .. } => "every",
-            CronSchedule::Once { .. } => "once",
+            CronSchedule::Tagged(CronScheduleTagged::Nested { expr, .. }) => expr,
+            CronSchedule::Tagged(CronScheduleTagged::Every { .. }) => "every",
+            CronSchedule::Tagged(CronScheduleTagged::Once { .. }) => "once",
         }
     }
 
     pub fn tz(&self) -> Option<&str> {
         match self {
             CronSchedule::Flat(_) => None,
-            CronSchedule::Nested { tz, .. } => tz.as_deref(),
-            CronSchedule::Every { .. } => None,
-            CronSchedule::Once { .. } => None,
+            CronSchedule::Tagged(CronScheduleTagged::Nested { tz, .. }) => tz.as_deref(),
+            CronSchedule::Tagged(CronScheduleTagged::Every { .. }) => None,
+            CronSchedule::Tagged(CronScheduleTagged::Once { .. }) => None,
         }
     }
 
     /// Whether this is a one-shot schedule (auto-remove after execution).
     pub fn is_once(&self) -> bool {
-        matches!(self, CronSchedule::Once { .. })
+        matches!(self, CronSchedule::Tagged(CronScheduleTagged::Once { .. }))
     }
 
     /// Compute the next run timestamp (ms) from the given `from_ms`.
@@ -129,10 +142,10 @@ impl CronSchedule {
             CronSchedule::Flat(expr) => {
                 crate::cron::compute_next_run_from_expr(expr, from_ms, None)
             }
-            CronSchedule::Nested { expr, tz, .. } => {
+            CronSchedule::Tagged(CronScheduleTagged::Nested { expr, tz, .. }) => {
                 crate::cron::compute_next_run_from_expr(expr, from_ms, tz.as_deref())
             }
-            CronSchedule::Every { every_ms, anchor_ms } => {
+            CronSchedule::Tagged(CronScheduleTagged::Every { every_ms, anchor_ms }) => {
                 let every_ms = every_ms.unwrap_or(0);
                 if every_ms == 0 {
                     return None;
@@ -147,7 +160,7 @@ impl CronSchedule {
                     Some(anchor + n * every_ms)
                 }
             }
-            CronSchedule::Once { at_ms, delay_ms } => {
+            CronSchedule::Tagged(CronScheduleTagged::Once { at_ms, delay_ms }) => {
                 // Absolute timestamp takes priority over delay.
                 if let Some(at) = at_ms {
                     if *at > from_ms { Some(*at) } else { None }
@@ -273,11 +286,10 @@ impl From<&CronJobConfig> for CronJob {
             }
         });
         let schedule = if let Some(ref tz) = cfg.tz {
-            CronSchedule::Nested {
-                kind: Some("cron".to_string()),
+            CronSchedule::Tagged(CronScheduleTagged::Nested {
                 expr: cfg.schedule.clone(),
                 tz: Some(tz.clone()),
-            }
+            })
         } else {
             CronSchedule::Flat(cfg.schedule.clone())
         };

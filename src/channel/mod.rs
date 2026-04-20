@@ -24,6 +24,7 @@ pub mod auth;
 pub mod chunker;
 pub mod cli;
 pub mod custom;
+pub mod desktop;
 pub mod dingtalk;
 pub mod discord;
 pub mod feishu;

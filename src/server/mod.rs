@@ -1251,13 +1251,44 @@ async fn get_session_messages(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match state.store.db.load_messages(&id) {
-        Ok(messages) => Json(serde_json::json!({"messages": messages})).into_response(),
+        Ok(messages) => {
+            // Filter out compaction summary messages — internal only.
+            let visible: Vec<_> = messages
+                .into_iter()
+                .filter(|v| !is_compaction_message(v))
+                .collect();
+            Json(serde_json::json!({"messages": visible})).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response(),
     }
+}
+
+/// Returns true if the JSON message value is a compaction summary (internal only).
+fn is_compaction_message(v: &serde_json::Value) -> bool {
+    let obj = match v.as_object() {
+        Some(o) => o,
+        None => return false,
+    };
+    let role = obj.get("role").and_then(|r| r.as_str()).unwrap_or("");
+    if role != "user" {
+        return false;
+    }
+    if let Some(text) = obj.get("content").and_then(|c| c.as_str()) {
+        return text.starts_with("[CONTEXT COMPACTION");
+    }
+    if let Some(parts) = obj.get("content").and_then(|c| c.as_array()) {
+        if let Some(first_text) = parts.first()
+            .and_then(|p| p.get("text"))
+            .and_then(|t| t.as_str())
+        {
+            return first_text.starts_with("[CONTEXT COMPACTION");
+        }
+    }
+    false
 }
 
 async fn clear_session(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {

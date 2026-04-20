@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn parse_basic_frontmatter() {
-        let input = "---\nevery: 30m\n---\nHello world\n";
+        let input = "---\nevery: 30m\ntimezone: Asia/Shanghai\n---\nHello world\n";
         let spec = parse_heartbeat_md(input).unwrap();
         assert_eq!(spec.every, Duration::from_secs(30 * 60));
         assert!(spec.active_hours.is_none());
