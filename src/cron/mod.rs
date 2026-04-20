@@ -330,6 +330,9 @@ pub struct CronRunner {
     semaphore: Arc<Semaphore>,
     default_delivery: Option<CronDelivery>,
     reload_tx: broadcast::Sender<()>,
+    /// Guard receiver to ensure reload signals are not dropped when no active receiver exists.
+    /// Broadcast channel drops messages when there are zero receivers.
+    reload_guard: broadcast::Receiver<()>,
     /// Dependencies for creating temporary AgentRuntime instances.
     config: Arc<RuntimeConfig>,
     providers: Arc<ProviderRegistry>,
@@ -377,7 +380,8 @@ impl CronRunner {
             store_path,
             semaphore: Arc::new(Semaphore::new(4)),
             default_delivery: config.default_delivery.clone(),
-            reload_tx,
+            reload_tx: reload_tx.clone(),
+            reload_guard: reload_tx.subscribe(),  // Guard receiver ensures messages not dropped
             config: runtime_config,
             providers,
             skills,
@@ -993,6 +997,7 @@ impl Clone for CronRunner {
             semaphore: Arc::clone(&self.semaphore),
             default_delivery: self.default_delivery.clone(),
             reload_tx: self.reload_tx.clone(),
+            reload_guard: self.reload_tx.subscribe(),  // New subscription for cloned instance
             // Clone new dependencies
             config: Arc::clone(&self.config),
             providers: Arc::clone(&self.providers),
