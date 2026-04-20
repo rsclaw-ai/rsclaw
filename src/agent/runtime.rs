@@ -1971,7 +1971,9 @@ impl AgentRuntime {
 
             let allowed = toolset_allowed_names(toolset, custom_tools);
             if let Some(ref names) = allowed {
-                all.retain(|t| names.contains(&t.name.as_str().to_owned()));
+                // Always keep agent/session tools (permission checked at dispatch by AgentKind).
+                all.retain(|t| names.contains(&t.name.as_str().to_owned())
+                    || t.name == "agent" || t.name == "session");
             }
             // else: "full" or unknown -> keep all
 

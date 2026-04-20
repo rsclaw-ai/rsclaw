@@ -473,9 +473,21 @@ impl AgentRuntime {
     pub(crate) async fn tool_agent_consolidated(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let action = args["action"].as_str().unwrap_or("list");
 
-        // Permission check: only Main can kill other agents.
-        // Named agents can spawn/task/send/list but not kill Main.
-        // Sub/Task agents don't have the agent tool at all (filtered by toolset).
+        // Permission check based on AgentKind:
+        //   Main:  spawn ✅  task ✅  send ✅  list ✅  kill ✅ (except self)
+        //   Named: spawn ✅  task ✅  send ✅  list ✅  kill ✅ (except Main)
+        //   Sub:   spawn ❌  task ✅  send ❌  list ✅  kill ❌
+        //   Task:  spawn ❌  task ❌  send ❌  list ✅  kill ❌
+        let kind = self.handle.kind;
+        match (kind, action) {
+            (crate::agent::registry::AgentKind::Task, a) if a != "list" => {
+                return Ok(json!({"error": "task agents cannot manage other agents"}));
+            }
+            (crate::agent::registry::AgentKind::Sub, "spawn" | "send" | "kill") => {
+                return Ok(json!({"error": format!("sub agents can only use task and list, not {action}")}));
+            }
+            _ => {} // allowed
+        }
 
         match action {
             "spawn" => self.tool_agent_spawn(args).await,

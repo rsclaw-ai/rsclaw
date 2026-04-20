@@ -39,9 +39,10 @@ pub(crate) fn toolset_allowed_names(
         "computer_use",
         "clarify",
         "anycli",
-        "agent",    // enables Main ↔ Named bidirectional communication
-        "session",
     ];
+
+    // `agent` and `session` are always available regardless of toolset.
+    // Permission control is handled at dispatch time based on AgentKind.
 
     let base: Option<&[&str]> = match toolset {
         "minimal" => Some(MINIMAL),
