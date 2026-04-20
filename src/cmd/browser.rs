@@ -32,8 +32,9 @@ async fn connect_or_launch(port: Option<u16>) -> Result<crate::browser::BrowserS
         let chrome_path = crate::agent::platform::detect_chrome()
             .ok_or_else(|| anyhow!("Chrome not found. Install with: rsclaw tools install chrome"))?;
         let profile = std::env::var("RSCLAW_BROWSER_PROFILE").ok();
-        tracing::debug!("Launching headless Chrome");
-        crate::browser::BrowserSession::start(&chrome_path, false, profile.as_deref()).await
+        let headed = crate::agent::platform::has_display();
+        tracing::debug!(headed, "Launching Chrome");
+        crate::browser::BrowserSession::start(&chrome_path, headed, profile.as_deref()).await
     }
 }
 

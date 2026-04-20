@@ -2898,7 +2898,12 @@ impl BrowserSession {
         }))
     }
 
-    /// Capture video URLs from a page by injecting request interceptors.
+    /// Capture video/audio URLs from a page.
+    ///
+    /// Strategy: navigate, trigger playback, then collect from:
+    /// 1. `<video>`/`<source>` element src/currentSrc
+    /// 2. Performance API entries with initiatorType=video/audio
+    /// 3. Intercepted XHR/fetch with media Content-Type
     async fn cmd_capture_video(&mut self, args: &Value) -> Result<Value> {
         let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
         if url.is_empty() {
@@ -2906,72 +2911,94 @@ impl BrowserSession {
         }
         let wait_ms = args.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(8000);
 
+        // Inject fetch/XHR interceptor that checks Content-Type for media.
         let inject_js = r#"(function(){
-            window.__vUrls=[];
-            var xo=XMLHttpRequest.prototype.open;
-            XMLHttpRequest.prototype.open=function(m,u){
-                if(u&&typeof u==='string'&&/video|mp4|m3u8|m4s|flv|playaddr|play_addr|pcdn|bilivideo/.test(u))
-                    window.__vUrls.push(u);
-                return xo.apply(this,arguments);
-            };
+            window.__mediaUrls=[];
             var ff=window.fetch;
-            window.fetch=function(u){
-                var s=typeof u==='string'?u:(u&&u.url||'');
-                if(/video|mp4|m3u8|m4s|flv|playaddr|play_addr|pcdn|bilivideo/.test(s))
-                    window.__vUrls.push(s);
-                return ff.apply(this,arguments);
+            window.fetch=function(){
+                var p=ff.apply(this,arguments);
+                p.then(function(r){
+                    var ct=(r.headers.get('content-type')||'').toLowerCase();
+                    if(/video\/|audio\/|octet-stream|mpegurl|mp2t/.test(ct)&&r.url)
+                        window.__mediaUrls.push(r.url);
+                }).catch(function(){});
+                return p;
             };
-            return 'interceptor_ready';
+            var xo=XMLHttpRequest.prototype.open,xs=XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open=function(m,u){this.__u=u;return xo.apply(this,arguments)};
+            XMLHttpRequest.prototype.send=function(){
+                var s=this;
+                s.addEventListener('load',function(){
+                    var ct=(s.getResponseHeader('content-type')||'').toLowerCase();
+                    if(/video\/|audio\/|octet-stream|mpegurl|mp2t/.test(ct)&&s.__u)
+                        window.__mediaUrls.push(s.__u.toString());
+                });
+                return xs.apply(this,arguments);
+            };
         })()"#;
 
+        // Navigate and inject.
+        self.cmd_open(&json!({"url": url})).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = self.cmd_evaluate(&json!({"js": inject_js})).await;
+
+        // Try to trigger playback.
+        let _ = self.cmd_evaluate(&json!({"js":
+            "var v=document.querySelector('video');if(v)v.play().catch(function(){});\
+             var b=document.querySelector('[class*=play],[class*=Play],.bpx-player-ctrl-play,\
+             button[aria-label*=play],[data-player-hook=play]');\
+             if(b)b.click();'ok'"
+        })).await;
+
+        // Wait for video to load.
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+
+        // Collect from all sources.
         let collect_js = r#"(function(){
-            var urls = (window.__vUrls||[]).slice();
-            try {
+            var urls=(window.__mediaUrls||[]).slice();
+            // <video>/<source> elements
+            document.querySelectorAll('video,source').forEach(function(el){
+                var s=el.src||el.currentSrc||'';
+                if(s&&s.startsWith('http'))urls.push(s);
+            });
+            // Performance API (initiatorType=video/audio)
+            try{
                 performance.getEntriesByType('resource').forEach(function(e){
-                    if(e.name && /video|mp4|m3u8|m4s|flv|playaddr|play_addr|pcdn|bilivideo/.test(e.name)
-                       && e.name.startsWith('http')
-                       && !/poster|cover|thumbnail|preview/.test(e.name))
+                    if((e.initiatorType==='video'||e.initiatorType==='audio')
+                       &&e.name&&e.name.startsWith('http'))
                         urls.push(e.name);
                 });
-            } catch(e){}
-            document.querySelectorAll('video,source').forEach(function(el){
-                var s = el.src || el.currentSrc || '';
-                if(s && s.startsWith('http')) urls.push(s);
-            });
+            }catch(x){}
             return JSON.stringify([...new Set(urls)]);
         })()"#;
 
-        // Navigate and inject interceptor (use cmd_* directly to avoid recursion).
-        self.cmd_open(&json!({"url": url})).await?;
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-        let _ = self.cmd_evaluate(&json!({"js": inject_js})).await;
-        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-
-        // Collect URLs.
         let result = self.cmd_evaluate(&json!({"js": collect_js})).await?;
         let urls_str = result.get("result").and_then(|v| v.as_str()).unwrap_or("[]");
-        let urls: Vec<String> = serde_json::from_str(urls_str).unwrap_or_default();
+        let mut urls: Vec<String> = serde_json::from_str(urls_str).unwrap_or_default();
 
-        // If empty, retry with reload.
+        // Retry if empty.
         if urls.is_empty() {
-            let _ = self.cmd_evaluate(&json!({"js": "window.__vUrls=[];location.reload()"})).await;
-            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+            let _ = self.cmd_evaluate(&json!({"js": "location.reload()"})).await;
+            tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
             let _ = self.cmd_evaluate(&json!({"js": inject_js})).await;
+            let _ = self.cmd_evaluate(&json!({"js":
+                "var v=document.querySelector('video');if(v)v.play().catch(function(){});'ok'"
+            })).await;
             tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
             let result2 = self.cmd_evaluate(&json!({"js": collect_js})).await?;
             let urls_str2 = result2.get("result").and_then(|v| v.as_str()).unwrap_or("[]");
-            let urls2: Vec<String> = serde_json::from_str(urls_str2).unwrap_or_default();
-            return Ok(json!({
-                "action": "capture_video",
-                "video_urls": urls2,
-                "hint": if urls2.is_empty() { "No video URLs found." } else { "Pick the URL containing mp4/playaddr for download." }
-            }));
+            urls = serde_json::from_str(urls_str2).unwrap_or_default();
         }
 
         Ok(json!({
             "action": "capture_video",
             "video_urls": urls,
-            "hint": "Pick the URL containing mp4/playaddr for download. Use web_download with use_browser_cookies=true."
+            "count": urls.len(),
+            "hint": if urls.is_empty() {
+                "No media URLs found. Try with headed mode or login first."
+            } else {
+                "Pick the best URL for download. Use web_download with use_browser_cookies=true."
+            }
         }))
     }
 
