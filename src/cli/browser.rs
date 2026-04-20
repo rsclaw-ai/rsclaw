@@ -112,6 +112,11 @@ pub enum BrowserCommand {
         /// Label text.
         label: String,
     },
+    /// Find element by text content or label.
+    Find {
+        /// Text or label to search for.
+        text: String,
+    },
     /// Navigate back.
     Back,
     /// Navigate forward.

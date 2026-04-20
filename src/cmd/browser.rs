@@ -47,6 +47,7 @@ pub async fn cmd_browser(sub: BrowserCommand) -> Result<()> {
         BrowserCommand::GetByText { text, exact } => ("getbytext", json!({"value": text, "exact": exact})),
         BrowserCommand::GetByRole { role } => ("getbyrole", json!({"value": role})),
         BrowserCommand::GetByLabel { label } => ("getbylabel", json!({"value": label})),
+        BrowserCommand::Find { text } => ("find", json!({"text": text})),
         BrowserCommand::Back => ("back", json!({})),
         BrowserCommand::Forward => ("forward", json!({})),
         BrowserCommand::Reload => ("reload", json!({})),
