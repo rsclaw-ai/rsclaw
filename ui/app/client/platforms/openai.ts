@@ -188,38 +188,85 @@ export class ChatGPTApi implements LLMApi {
   }
 
   async chat(options: ChatOptions) {
-    // RsClaw: route through agent runtime via /api/v1/message (non-streaming)
+    // RsClaw: route through agent runtime via /api/v1/message with SSE streaming.
     // This gives full agent features: context compression, memory, tools, etc.
-    const isTauriApp = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-    if (isTauriApp || true) {
-      try {
-        const { getGatewayUrl, getAuthToken } = require("../../lib/rsclaw-api");
-        const gwUrl = getGatewayUrl() || "http://localhost:18888";
-        const token = getAuthToken() || "";
-        const lastMsg = options.messages[options.messages.length - 1];
-        const text = typeof lastMsg.content === "string" ? lastMsg.content : getMessageTextContent(lastMsg);
-        const session = useChatStore.getState().currentSession();
-        const agentId = session.agentId || "main";
-        const sessionKey = `desktop:${agentId}:${session.id}`;
-        const headers: Record<string, string> = { "Content-Type": "application/json" };
-        if (token) headers["Authorization"] = `Bearer ${token}`;
+    try {
+      const { getGatewayUrl, getAuthToken } = require("../../lib/rsclaw-api");
+      const gwUrl = getGatewayUrl() || "http://localhost:18888";
+      const token = getAuthToken() || "";
+      const lastMsg = options.messages[options.messages.length - 1];
+      let text = typeof lastMsg.content === "string" ? lastMsg.content : getMessageTextContent(lastMsg);
 
-        const controller = new AbortController();
-        options.onController?.(controller);
+      // File references: convert [file:path] markers to readable format for agent
+      text = text.replace(/\[file:([^\]]+)\]/g, "[Attached file: $1]");
 
-        const resp = await fetch(`${gwUrl}/api/v1/message`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({
-            text,
-            agent_id: agentId,
-            session_key: sessionKey,
-            channel: "desktop",
-            peer_id: "desktop-user",
-          }),
-          signal: controller.signal,
-        });
+      const session = useChatStore.getState().currentSession();
+      const agentId = session.agentId || "main";
+      const sessionKey = `desktop:${agentId}:${session.id}`;
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (token) headers["Authorization"] = `Bearer ${token}`;
 
+      const controller = new AbortController();
+      options.onController?.(controller);
+
+      const resp = await fetch(`${gwUrl}/api/v1/message`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          text,
+          agent_id: agentId,
+          session_key: sessionKey,
+          channel: "desktop",
+          peer_id: "desktop-user",
+          stream: true,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
+        options.onError?.(new Error(data.error || `HTTP ${resp.status}`));
+        return;
+      }
+
+      const contentType = resp.headers.get("content-type") || "";
+
+      if (contentType.includes("text/event-stream")) {
+        // SSE streaming mode
+        const reader = resp.body?.getReader();
+        const decoder = new TextDecoder();
+        let fullText = "";
+
+        if (reader) {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            const chunk = decoder.decode(value, { stream: true });
+            const lines = chunk.split("\n");
+
+            for (const line of lines) {
+              if (!line.startsWith("data: ")) continue;
+              const data = line.slice(6).trim();
+              if (data === "[DONE]") break;
+
+              try {
+                const parsed = JSON.parse(data);
+                const delta = parsed.choices?.[0]?.delta?.content;
+                if (delta) {
+                  fullText += delta;
+                  options.onUpdate?.(fullText, delta);
+                }
+              } catch {
+                // skip malformed chunks
+              }
+            }
+          }
+        }
+
+        options.onFinish(fullText, new Response(fullText));
+      } else {
+        // Non-streaming fallback (JSON response)
         const data = await resp.json();
         if (data.error) {
           options.onError?.(new Error(data.error));
@@ -228,11 +275,11 @@ export class ChatGPTApi implements LLMApi {
         const reply = data.reply || data.text || data.content || "";
         options.onUpdate?.(reply, reply);
         options.onFinish(reply, data);
-        return;
-      } catch (e) {
-        // Fall through to legacy path on error
-        console.warn("[RsClaw] /api/v1/message failed, falling back to /v1/chat/completions", e);
       }
+      return;
+    } catch (e) {
+      // Fall through to legacy path on error
+      console.warn("[RsClaw] /api/v1/message failed, falling back to /v1/chat/completions", e);
     }
 
     const modelConfig = {
