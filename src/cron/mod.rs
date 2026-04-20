@@ -524,10 +524,12 @@ impl CronRunner {
 
             let now_ms = current_timestamp_ms();
 
-            // Find next wake time among enabled jobs
+            // Find next wake time among enabled jobs that are NOT currently running.
+            // Running jobs have their next_run_at_ms in the past but should not be
+            // counted as "due" again until they complete and update their next run time.
             let next_wake = jobs
                 .iter()
-                .filter(|j| j.enabled)
+                .filter(|j| j.enabled && j.state.as_ref().and_then(|s| s.running_at_ms).is_none())
                 .filter_map(|j| j.state.as_ref().and_then(|s| s.next_run_at_ms))
                 .min();
 
