@@ -123,6 +123,41 @@ pub enum BrowserCommand {
     Forward,
     /// Reload page.
     Reload,
+    /// Close the browser.
+    Close,
+    /// Tab management subcommands.
+    #[command(subcommand)]
+    Tab(TabCommand),
+    /// Get element property (text, html, value, attribute, count, bounding box).
+    #[command(subcommand)]
+    Get(GetCommand),
+    /// Get page errors.
+    Errors,
+    /// Execute multiple browser commands in a single session.
+    Batch {
+        /// Commands to execute, each as a quoted string (e.g., "open https://example.com" "snapshot -i").
+        commands: Vec<String>,
+    },
+    /// Keyboard input subcommands.
+    #[command(subcommand)]
+    Keyboard(KeyboardCommand),
+    /// Download a file by clicking an element.
+    Download {
+        /// Element selector or @ref to click.
+        selector: String,
+        /// Output file path.
+        path: String,
+    },
+    /// Auth vault management for saved credentials.
+    #[command(subcommand)]
+    Auth(AuthCommand),
+    /// List available Chrome profiles.
+    Profiles,
+    /// Connect to a specific Chrome DevTools Protocol port.
+    Connect {
+        /// CDP port number.
+        port: u16,
+    },
     /// Run any browser action with JSON args (advanced).
     Raw {
         /// Action name.
@@ -130,5 +165,112 @@ pub enum BrowserCommand {
         /// JSON arguments.
         #[arg(default_value = "{}")]
         args: String,
+    },
+}
+
+/// Tab management subcommands.
+#[derive(Subcommand, Debug)]
+pub enum TabCommand {
+    /// Open a new tab.
+    New {
+        /// Optional URL to open in the new tab.
+        url: Option<String>,
+    },
+    /// List all open tabs.
+    List,
+    /// Close a tab by index.
+    Close {
+        /// Tab index (0-based).
+        index: u32,
+    },
+    /// Switch to a tab by index.
+    Switch {
+        /// Tab index (0-based).
+        index: u32,
+    },
+}
+
+/// Get element property subcommands.
+#[derive(Subcommand, Debug)]
+pub enum GetCommand {
+    /// Get element text content.
+    Text {
+        /// CSS selector or @ref.
+        selector: Option<String>,
+    },
+    /// Get element inner HTML.
+    Html {
+        /// CSS selector or @ref.
+        selector: Option<String>,
+    },
+    /// Get input element value.
+    Value {
+        /// CSS selector or @ref.
+        selector: Option<String>,
+    },
+    /// Get element attribute value.
+    Attr {
+        /// Attribute name.
+        name: String,
+        /// CSS selector or @ref.
+        selector: Option<String>,
+    },
+    /// Count elements matching a selector.
+    Count {
+        /// CSS selector.
+        selector: String,
+    },
+    /// Get element bounding box.
+    Box {
+        /// CSS selector or @ref.
+        selector: Option<String>,
+    },
+}
+
+/// Keyboard input subcommands.
+#[derive(Subcommand, Debug)]
+pub enum KeyboardCommand {
+    /// Type text with key events (keyDown/keyUp per character).
+    Type {
+        /// Text to type.
+        text: String,
+    },
+    /// Insert text directly (bypasses key events).
+    Inserttext {
+        /// Text to insert.
+        text: String,
+    },
+}
+
+/// Auth vault subcommands.
+#[derive(Subcommand, Debug)]
+pub enum AuthCommand {
+    /// Save credentials to the vault.
+    Save {
+        /// Site domain or identifier.
+        site: String,
+        /// Username.
+        #[arg(long)]
+        username: String,
+        /// Password.
+        #[arg(long)]
+        password: String,
+    },
+    /// Auto-login using saved credentials.
+    Login {
+        /// Site domain or identifier.
+        site: String,
+    },
+    /// List saved credential entries.
+    List,
+    /// Show details for a saved credential.
+    Show {
+        /// Site domain or identifier.
+        site: String,
+    },
+    /// Delete a saved credential.
+    Delete {
+        /// Site domain or identifier.
+        site: String,
     },
 }
