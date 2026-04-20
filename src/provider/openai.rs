@@ -179,58 +179,37 @@ impl LlmProvider for OpenAiProvider {
 
             let mut body = build_request_body(&req)?;
 
-            // kv_cache_mode=2: incremental messages via cache_id.
-            if req.kv_cache_mode >= 2 {
-                if let Some(ref session_key) = req.session_key {
-                    let current_messages = body["messages"].as_array().cloned().unwrap_or_default();
+            // kv_cache_mode=2: incremental messages via cache_id (server-generated).
+            let kv2_session_key = if req.kv_cache_mode >= 2 { req.session_key.clone() } else { None };
+            if let Some(ref session_key) = kv2_session_key {
+                let current_messages = body["messages"].as_array().cloned().unwrap_or_default();
 
-                    if let Some(cached) = SESSION_CACHES.get(session_key) {
-                        // Compute delta: messages beyond what was cached.
-                        let cached_len = cached.messages.len();
-                        if current_messages.len() > cached_len
-                            && current_messages[..cached_len] == cached.messages[..]
-                        {
-                            // Prefix matches — send only the new messages.
-                            let append = current_messages[cached_len..].to_vec();
-                            body.as_object_mut().map(|m| m.remove("messages"));
-                            body["cache_id"] = json!(cached.cache_id);
-                            body["messages_append"] = json!(append);
-                            tracing::debug!(
-                                session_key,
-                                cache_id = cached.cache_id.as_str(),
-                                cached = cached_len,
-                                append = append.len(),
-                                "kv_cache=2: sending incremental"
-                            );
-                        } else {
-                            // Prefix changed (compaction or edit) — send full, update cache.
-                            let cache_id = cached.cache_id.clone();
-                            drop(cached);
-                            SESSION_CACHES.insert(session_key.clone(), SessionMessageCache {
-                                cache_id: cache_id.clone(),
-                                messages: current_messages,
-                            });
-                            body["cache_id"] = json!(cache_id);
-                            tracing::debug!(session_key, "kv_cache=2: prefix changed, sending full");
-                        }
+                if let Some(cached) = SESSION_CACHES.get(session_key) {
+                    // We have a server-assigned cache_id from a previous response.
+                    let cached_len = cached.messages.len();
+                    if current_messages.len() > cached_len
+                        && current_messages[..cached_len] == cached.messages[..]
+                    {
+                        // Prefix matches — send only the new messages.
+                        let append = current_messages[cached_len..].to_vec();
+                        body.as_object_mut().map(|m| m.remove("messages"));
+                        body["cache_id"] = json!(cached.cache_id);
+                        body["messages_append"] = json!(append);
+                        tracing::debug!(
+                            session_key,
+                            cache_id = cached.cache_id.as_str(),
+                            cached = cached_len,
+                            append = append.len(),
+                            "kv_cache=2: sending incremental"
+                        );
                     } else {
-                        // First request for this session — send full, create cache.
-                        let cache_id = format!("c-{:016x}", {
-                            use std::hash::{Hash, Hasher};
-                            let mut h = std::collections::hash_map::DefaultHasher::new();
-                            session_key.hash(&mut h);
-                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default().as_nanos().hash(&mut h);
-                            h.finish()
-                        });
-                        SESSION_CACHES.insert(session_key.clone(), SessionMessageCache {
-                            cache_id: cache_id.clone(),
-                            messages: current_messages,
-                        });
-                        body["cache_id"] = json!(cache_id);
-                        tracing::debug!(session_key, cache_id = cache_id.as_str(), "kv_cache=2: new session cache");
+                        // Prefix changed (compaction) — send full with same cache_id.
+                        body["cache_id"] = json!(cached.cache_id);
+                        tracing::debug!(session_key, "kv_cache=2: prefix changed, sending full");
                     }
                 }
+                // else: first request — no cache_id, send full messages.
+                // Server will generate cache_id and return it in X-Cache-Id header.
             }
 
             let body_str = serde_json::to_string(&body).unwrap_or_default();
@@ -270,6 +249,36 @@ impl LlmProvider for OpenAiProvider {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_owned();
+
+            // kv_cache_mode=2: extract server-generated cache_id and update local cache.
+            if let Some(ref session_key) = kv2_session_key {
+                let server_cache_id = resp.headers()
+                    .get("x-cache-id")
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from);
+                if let Some(cache_id) = server_cache_id {
+                    let current_messages = body.get("messages")
+                        .and_then(|m| m.as_array())
+                        .cloned()
+                        .or_else(|| {
+                            // Incremental mode: reconstruct from cached + append.
+                            SESSION_CACHES.get(session_key).map(|c| {
+                                let mut msgs = c.messages.clone();
+                                if let Some(append) = body.get("messages_append").and_then(|a| a.as_array()) {
+                                    msgs.extend(append.iter().cloned());
+                                }
+                                msgs
+                            })
+                        })
+                        .unwrap_or_default();
+
+                    SESSION_CACHES.insert(session_key.clone(), SessionMessageCache {
+                        cache_id,
+                        messages: current_messages,
+                    });
+                }
+            }
+
             tracing::info!(
                 %status,
                 content_type = %content_type,
