@@ -3133,6 +3133,31 @@ impl AgentRuntime {
                 Some(0.6)
             };
 
+            // Pre-flight check: emergency compact if we'd exceed context.
+            let context_limit = self.config.agents.defaults.context_tokens.unwrap_or(64_000) as usize;
+            let overhead = self.estimate_fixed_overhead();
+            let session_tokens: usize = self.sessions
+                .get(&ctx.session_key)
+                .map(|msgs| msgs.iter().map(super::context_mgr::msg_tokens).sum())
+                .unwrap_or(0);
+            let total_est = overhead + session_tokens;
+            if total_est > context_limit.saturating_sub(2000) {
+                warn!(
+                    session = %ctx.session_key,
+                    total_est,
+                    context_limit,
+                    overhead,
+                    session_tokens,
+                    "pre-flight: approaching context limit, forcing compaction"
+                );
+                self.compact_inner(&ctx.session_key, model, true).await;
+                // Re-read messages after compaction.
+                messages = self.sessions
+                    .get(&ctx.session_key)
+                    .cloned()
+                    .unwrap_or_default();
+            }
+
             let kv_cache_mode = self.config.agents.defaults.kv_cache_mode.unwrap_or(1);
             let req = LlmRequest {
                 model: model.to_owned(),
