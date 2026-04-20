@@ -454,6 +454,11 @@ impl CronRunner {
         semaphore: Arc<Semaphore>,
         mut reload_rx: broadcast::Receiver<()>,
     ) {
+        // Channel for collecting job results asynchronously.
+        // Jobs are spawned and results come back via this channel,
+        // so the timer loop never blocks waiting for jobs to finish.
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<(String, bool, u64, u64, Option<String>)>(64);
+
         loop {
             if !running.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
@@ -578,13 +583,12 @@ impl CronRunner {
 
             info!(count = due.len(), "cron: {} jobs due", due.len());
 
-            // Execute due jobs with concurrency limit
-            let mut handles = Vec::new();
-
+            // Execute due jobs concurrently — spawn and continue immediately.
+            // Results are collected via a channel, not by join_all.
             for job_id in due {
                 let permit = semaphore.clone().acquire_owned().await.ok();
                 if permit.is_none() {
-                    // Max concurrency reached
+                    // Max concurrency reached — remaining jobs will fire next tick.
                     break;
                 }
 
@@ -698,29 +702,20 @@ impl CronRunner {
                     (job.id, result.is_ok(), duration_ms, job_started_at, error_msg)
                 });
 
-                handles.push(handle);
+                // Send result back via channel for async collection.
+                let result_tx = result_tx.clone();
+                tokio::spawn(async move {
+                    let result = handle.await;
+                    if let Ok(r) = result {
+                        let _ = result_tx.send(r).await;
+                    }
+                });
             }
 
-            // Wait for all jobs to complete and update state.
-            // Use select to also listen for reload signals, so deletions
-            // are not delayed until all running jobs finish.
-            let all_handles = futures::future::join_all(handles);
-            let results = tokio::select! {
-                r = all_handles => r,
-                _ = reload_rx.recv() => {
-                    // Reload triggered while jobs are running — apply immediately
-                    info!("cron: reload signal during job execution, reloading now");
-                    let new_jobs = crate::cron::load_cron_jobs();
-                    let now_ms = current_timestamp_ms();
-                    jobs = self.merge_jobs(&jobs, new_jobs, now_ms);
-                    if let Err(e) = self.save_store(&jobs).await {
-                        warn!(err = %e, "cron: failed to save store after mid-execution reload");
-                    }
-                    continue; // back to top of loop, running tasks finish on their own
-                }
-            };
-            for result in results {
-                if let Ok((job_id, success, duration_ms, started_at, error_msg)) = result {
+            // Collect any completed job results (non-blocking).
+            // This processes results from ALL previously spawned jobs,
+            // not just the ones spawned this tick.
+            while let Ok((job_id, success, duration_ms, started_at, error_msg)) = result_rx.try_recv() {
                     if let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) {
                         if let Some(state) = job.state.as_mut() {
                             state.running_at_ms = None;
@@ -778,7 +773,6 @@ impl CronRunner {
                         }
                     }
                 }
-            }
 
             // Remove completed one-shot jobs
             let before = jobs.len();
