@@ -108,6 +108,20 @@ Built-in headless Chrome — no ChromeDriver, no Playwright, no Node.js:
 - Memory-adaptive instance limits, 5-min idle timeout, crash auto-restart
 - CLI: `rsclaw browser open/snapshot/click/screenshot/...` (full agent-browser parity)
 
+### AnyCLI — Structured Web Data
+
+Built-in [anycli](https://crates.io/crates/anycli) integration. Turn any website into structured CLI output with declarative YAML adapters:
+
+```bash
+rsclaw anycli run hackernews top --format table limit=10
+rsclaw anycli run bilibili hot --format markdown
+rsclaw anycli run github-trending repos language=rust
+rsclaw anycli search zhihu        # search community hub
+rsclaw anycli install zhihu       # install adapter
+```
+
+Built-in adapters: hackernews, bilibili, github-trending, arxiv, wikipedia. Community hub at [anycli.org](https://anycli.org). Agent uses `anycli` tool automatically when structured data is available — cleaner than web_fetch.
+
 ### Long-term Memory
 
 Three-layer storage: redb (hot KV), tantivy (full-text search), hnsw_rs (vector similarity). Session compaction at 80% context window, `/compact` manual compression with memory save, `/clear` preserves conversation summary.
