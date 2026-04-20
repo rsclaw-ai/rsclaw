@@ -25,6 +25,19 @@ const DEFAULT_MAX_CONCURRENT: u32 = 4;
 // AgentHandle
 // ---------------------------------------------------------------------------
 
+/// The four kinds of agent in the system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum AgentKind {
+    /// The default entry point. Cannot be deleted. `default: true` in config.
+    Main,
+    /// User-created persistent agent. Saved to config file, survives restarts.
+    Named,
+    /// LLM-spawned temporary agent (`persistent: false`). Lives in memory, gone on restart.
+    Sub,
+    /// One-shot task agent. Automatically destroyed after completion.
+    Task,
+}
+
 /// A lightweight handle to a running agent.
 ///
 /// The actual agent loop lives in a tokio task; communication happens
@@ -32,6 +45,7 @@ const DEFAULT_MAX_CONCURRENT: u32 = 4;
 #[derive(Clone)]
 pub struct AgentHandle {
     pub id: String,
+    pub kind: AgentKind,
     pub config: AgentEntry,
     /// Sender to the agent's message queue.
     pub tx: mpsc::Sender<AgentMessage>,
@@ -230,8 +244,14 @@ impl AgentRegistry {
                     .lane_concurrency
                     .map(|n| n as usize)
                     .unwrap_or(max_concurrent);
+                let kind = if entry.default.unwrap_or(false) {
+                    AgentKind::Main
+                } else {
+                    AgentKind::Named
+                };
                 let handle = Arc::new(AgentHandle {
                     id: entry.id.clone(),
+                    kind,
                     config: entry.clone(),
                     tx,
                     concurrency: Arc::new(tokio::sync::Semaphore::new(permits)),

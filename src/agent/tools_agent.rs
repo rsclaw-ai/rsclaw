@@ -97,7 +97,15 @@ impl AgentRuntime {
             claudecode: None,
         };
 
-        spawner.spawn_agent(entry.clone())?;
+        // Persist to config file by default (user-created agents survive restart).
+        // Pass persistent=false for sub agents (temporary, destroyed on restart).
+        let persistent = args["persistent"].as_bool().unwrap_or(true);
+        let kind = if persistent {
+            crate::agent::registry::AgentKind::Named
+        } else {
+            crate::agent::registry::AgentKind::Sub
+        };
+        spawner.spawn_agent_with_kind(entry.clone(), kind)?;
 
         // Write full system prompt (base + role) as SOUL.md in the new agent's workspace.
         let ws_path = crate::config::loader::base_dir().join(format!("workspace-{id}"));
@@ -109,10 +117,6 @@ impl AgentRuntime {
         if let Err(e) = tokio::fs::write(&soul_path, format!("# Agent: {id}\n\n{full_prompt}\n")).await {
             warn!("agent_spawn: failed to write SOUL.md for {id}: {e:#}");
         }
-
-        // Persist to config file by default (user-created agents survive restart).
-        // Pass persistent=false for task agents (one-shot, destroyed after completion).
-        let persistent = args["persistent"].as_bool().unwrap_or(true);
         if persistent {
             if let Err(e) = persist_agent_to_config(&entry).await {
                 warn!("agent_spawn: failed to persist to config: {e:#}");
@@ -202,7 +206,7 @@ impl AgentRuntime {
             claudecode: None,
         };
 
-        spawner.spawn_agent(entry)?;
+        spawner.spawn_agent_with_kind(entry, crate::agent::registry::AgentKind::Task)?;
 
         // Write full system prompt (base + role) as SOUL.md.
         if let Err(e) = tokio::fs::create_dir_all(&ws_path).await {
@@ -442,6 +446,7 @@ impl AgentRuntime {
                 .map(|h| {
                     json!({
                         "id": h.id,
+                        "kind": h.kind,
                         "model": h.config.model.as_ref()
                             .and_then(|m| m.primary.as_deref())
                             .unwrap_or("unknown"),
@@ -464,6 +469,14 @@ impl AgentRuntime {
                 let id = args["id"]
                     .as_str()
                     .ok_or_else(|| anyhow!("agent kill: `id` required"))?;
+                // Prevent killing the main agent.
+                if let Some(reg) = &self.agents {
+                    if let Ok(handle) = reg.get(id) {
+                        if handle.kind == crate::agent::registry::AgentKind::Main {
+                            return Ok(json!({"error": "cannot kill the main agent"}));
+                        }
+                    }
+                }
                 Ok(json!({
                     "action": "kill",
                     "id": id,

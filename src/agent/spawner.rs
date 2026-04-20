@@ -61,6 +61,11 @@ impl AgentSpawner {
     /// Dynamically spawn a new agent at runtime.
     /// Returns the new agent's ID on success.
     pub fn spawn_agent(&self, entry: AgentEntry) -> Result<String> {
+        self.spawn_agent_with_kind(entry, crate::agent::registry::AgentKind::Named)
+    }
+
+    /// Spawn an agent with an explicit kind.
+    pub fn spawn_agent_with_kind(&self, entry: AgentEntry, kind: crate::agent::registry::AgentKind) -> Result<String> {
         let id = entry.id.clone();
 
         if self.registry.get(&id).is_ok() {
@@ -74,6 +79,7 @@ impl AgentSpawner {
             .unwrap_or(4) as usize;
         let handle = Arc::new(AgentHandle {
             id: id.clone(),
+            kind,
             config: entry.clone(),
             tx,
             concurrency: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
