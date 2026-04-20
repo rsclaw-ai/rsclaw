@@ -47,4 +47,4 @@ src-tauri/        # Tauri shell
 
 ## License
 
-AGPL-3.0 -- see [LICENSE](../LICENSE)
+MIT OR Apache-2.0 dual license — see [LICENSE-MIT](../LICENSE-MIT) and [LICENSE-APACHE](../LICENSE-APACHE)
