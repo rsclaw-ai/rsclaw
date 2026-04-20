@@ -68,6 +68,14 @@ pub enum BrowserCommand {
         #[arg(default_value = "screenshot.png")]
         path: String,
     },
+    /// Take an annotated screenshot with numbered element labels.
+    Annotate {
+        /// Output path (default: annotated.png).
+        #[arg(default_value = "annotated.png")]
+        path: String,
+    },
+    /// Open Chrome DevTools inspector for the active page.
+    Inspect,
     /// Get page text content.
     Text,
     /// Get current URL.

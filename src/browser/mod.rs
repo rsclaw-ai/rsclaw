@@ -878,6 +878,8 @@ impl BrowserSession {
             "scrollintoview" | "scroll_into_view" => self.cmd_scroll_into_view(args).await,
             "scroll" => self.cmd_scroll(args).await,
             "screenshot" => self.cmd_screenshot(args).await,
+            "annotate" => self.cmd_annotate().await,
+            "inspect" => self.cmd_inspect().await,
             "pdf" => self.cmd_pdf().await,
             "back" => self.cmd_back().await,
             "forward" => self.cmd_forward().await,
@@ -2721,6 +2723,67 @@ impl BrowserSession {
     // -----------------------------------------------------------------------
     // Console — get browser console messages
     // -----------------------------------------------------------------------
+
+    /// Take an annotated screenshot — interactive elements are labeled with numbers.
+    async fn cmd_annotate(&mut self) -> Result<Value> {
+        // Inject numbered overlays on all interactive elements.
+        let inject_js = r#"(function(){
+            var labels = document.querySelectorAll('.__rsclaw_label');
+            labels.forEach(function(l){ l.remove(); });
+            var sels = 'a,button,input,select,textarea,[role=button],[role=link],[contenteditable=true],[onclick]';
+            var els = document.querySelectorAll(sels);
+            var n = 0;
+            els.forEach(function(el){
+                var r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return;
+                if (r.bottom < 0 || r.top > window.innerHeight) return;
+                n++;
+                var label = document.createElement('div');
+                label.className = '__rsclaw_label';
+                label.textContent = n;
+                label.style.cssText = 'position:fixed;z-index:999999;background:#ff3333;color:#fff;font:bold 11px/14px Arial;padding:1px 4px;border-radius:7px;pointer-events:none;min-width:14px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.5);left:'+(r.left-2)+'px;top:'+(r.top-16)+'px;';
+                document.body.appendChild(label);
+            });
+            return n;
+        })()"#;
+
+        let count_result = self.cdp.send("Runtime.evaluate", json!({"expression": inject_js})).await?;
+        let count = count_result["result"]["value"].as_u64().unwrap_or(0);
+
+        // Take screenshot with labels.
+        let screenshot = self.cmd_screenshot(&json!({})).await?;
+
+        // Remove labels.
+        let cleanup_js = "document.querySelectorAll('.__rsclaw_label').forEach(function(l){ l.remove(); })";
+        let _ = self.cdp.send("Runtime.evaluate", json!({"expression": cleanup_js})).await;
+
+        let mut result = screenshot;
+        result["action"] = json!("annotate");
+        result["labels"] = json!(count);
+        Ok(result)
+    }
+
+    /// Open Chrome DevTools for the active page.
+    async fn cmd_inspect(&self) -> Result<Value> {
+        // Get the target ID to open DevTools.
+        let port = self.debug_port;
+        let url = format!("http://127.0.0.1:{port}/json");
+        let targets: Vec<Value> = reqwest::get(&url).await?.json().await?;
+        let target_id = targets.iter()
+            .find(|t| t["type"].as_str() == Some("page"))
+            .and_then(|t| t["id"].as_str())
+            .unwrap_or("unknown");
+
+        let devtools_url = format!(
+            "devtools://devtools/bundled/inspector.html?ws=127.0.0.1:{port}/devtools/page/{target_id}"
+        );
+
+        Ok(json!({
+            "action": "inspect",
+            "devtools_url": devtools_url,
+            "hint": "Open this URL in Chrome to inspect the page"
+        }))
+    }
 
     /// Get recent console messages (log, warn, error, info).
     async fn cmd_console(&self, args: &Value) -> Result<Value> {

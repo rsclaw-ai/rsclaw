@@ -251,7 +251,7 @@ async fn dispatch_and_print(
     let (action, args) = to_action_args(sub);
 
     // For screenshot: extract save path before execute.
-    let screenshot_path = if action == "screenshot" {
+    let screenshot_path = if action == "screenshot" || action == "annotate" {
         args.get("path").and_then(|v| v.as_str()).map(String::from)
     } else {
         None
@@ -271,6 +271,24 @@ async fn dispatch_and_print(
                     std::fs::write(&path, &bytes)?;
                     eprintln!("Screenshot saved to {path} ({} bytes)", bytes.len());
                 }
+            }
+        }
+        "annotate" => {
+            if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                if let Some(data_uri) = result.get("image").and_then(|v| v.as_str()) {
+                    let b64 = data_uri.split(',').nth(1).unwrap_or(data_uri);
+                    use base64::Engine;
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(b64)
+                        .map_err(|e| anyhow!("failed to decode: {e}"))?;
+                    std::fs::write(path, &bytes)?;
+                    let labels = result.get("labels").and_then(|v| v.as_u64()).unwrap_or(0);
+                    eprintln!("Annotated screenshot saved to {path} ({labels} labels)");
+                }
+            }
+        }
+        "inspect" => {
+            if let Some(url) = result.get("devtools_url").and_then(|v| v.as_str()) {
+                println!("{url}");
             }
         }
         "open" | "navigate" => {
@@ -354,6 +372,8 @@ fn to_action_args(sub: BrowserCommand) -> (&'static str, serde_json::Value) {
         BrowserCommand::Press { key } => ("press", json!({"key": key})),
         BrowserCommand::Scroll { direction, amount } => ("scroll", json!({"direction": direction, "amount": amount})),
         BrowserCommand::Screenshot { path } => ("screenshot", json!({"path": path})),
+        BrowserCommand::Annotate { path } => ("annotate", json!({"path": path})),
+        BrowserCommand::Inspect => ("inspect", json!({})),
         BrowserCommand::Text => ("get_text", json!({})),
         BrowserCommand::Url => ("get_url", json!({})),
         BrowserCommand::Title => ("get_title", json!({})),
