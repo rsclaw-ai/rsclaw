@@ -427,10 +427,31 @@ impl AgentRuntime {
             }
         }
 
-        // --- Auto-fetch top 5 results for deeper content ---
-        let fetch_count = results.len().min(5);
+        // --- Auto-fetch relevant results for deeper content ---
+        // Score each result by relevance to the query, only deep-fetch those
+        // that are likely useful.  This avoids wasting time on unrelated pages.
+        let query_terms: Vec<String> = query.to_lowercase()
+            .split_whitespace()
+            .filter(|w| w.len() > 1)
+            .map(String::from)
+            .collect();
+
         let fetch_urls: Vec<String> = results.iter()
-            .take(fetch_count)
+            .filter(|r| {
+                let title = r["title"].as_str().unwrap_or("").to_lowercase();
+                let snippet = r["snippet"].as_str().unwrap_or("").to_lowercase();
+                let haystack = format!("{title} {snippet}");
+
+                // Count how many query terms appear in title+snippet.
+                let hits = query_terms.iter()
+                    .filter(|t| haystack.contains(t.as_str()))
+                    .count();
+
+                // Require at least half the query terms to match, or always
+                // include the first 2 results as fallback.
+                hits * 2 >= query_terms.len() || hits > 0
+            })
+            .take(5)
             .filter_map(|r| r["url"].as_str().map(String::from))
             .collect();
 
