@@ -1113,8 +1113,10 @@ fn compute_next_run_from_expr(cron_expr: &str, from_ms: u64, tz: Option<&str>) -
     // Current minute in the target timezone
     let local_now = utc_dt.with_timezone(&tz_for_search);
     let mut cand = local_now
-        .with_second(0).expect("second 0 always valid")
-        .with_nanosecond(0).expect("nanosecond 0 always valid");
+        .with_second(0)
+        .expect("second 0 always valid")
+        .with_nanosecond(0)
+        .expect("nanosecond 0 always valid");
     cand += chrono::Duration::minutes(1);
 
     // Search up to 1 year ahead (in local time)
@@ -1248,10 +1250,21 @@ async fn run_cron_job(
     let agent_channel = delivery_channel
         .clone()
         .unwrap_or_else(|| "cron".to_string());
-    let agent_peer_id = delivery_channel
-        .clone()
-        .map(|ch| format!("{}:{}", ch, job.id))
-        .unwrap_or_else(|| format!("cron:{}", job.id));
+
+    // Use delivery.to as peer_id if available (valid channel ID format like "ou_xxx" for feishu)
+    // Otherwise construct a fallback peer_id
+    let agent_peer_id = job
+        .delivery
+        .as_ref()
+        .and_then(|d| d.to.clone())
+        .or_else(|| default_delivery.as_ref().and_then(|d| d.to.clone()))
+        .unwrap_or_else(|| {
+            if delivery_channel.is_some() {
+                format!("{}:{}", delivery_channel.unwrap(), job.id)
+            } else {
+                format!("cron:{}", job.id)
+            }
+        });
 
     // Run turn directly (bypass inbox queue)
     let result = tokio::time::timeout(
