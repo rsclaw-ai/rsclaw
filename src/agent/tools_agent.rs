@@ -107,17 +107,17 @@ impl AgentRuntime {
         };
         spawner.spawn_agent_with_kind(entry.clone(), kind)?;
 
-        // Write full system prompt (base + role) as SOUL.md in the new agent's workspace.
-        let ws_path = crate::config::loader::base_dir().join(format!("workspace-{id}"));
-        if let Err(e) = tokio::fs::create_dir_all(&ws_path).await {
-            warn!("agent_spawn: failed to create workspace for {id}: {e:#}");
-        }
-        let soul_path = ws_path.join("SOUL.md");
-        let full_prompt = self.build_subagent_system_prompt(&system);
-        if let Err(e) = tokio::fs::write(&soul_path, format!("# Agent: {id}\n\n{full_prompt}\n")).await {
-            warn!("agent_spawn: failed to write SOUL.md for {id}: {e:#}");
-        }
         if persistent {
+            // Named agent: write SOUL.md and workspace, persist to config.
+            let ws_path = crate::config::loader::base_dir().join(format!("workspace-{id}"));
+            if let Err(e) = tokio::fs::create_dir_all(&ws_path).await {
+                warn!("agent_spawn: failed to create workspace for {id}: {e:#}");
+            }
+            let soul_path = ws_path.join("SOUL.md");
+            let full_prompt = self.build_subagent_system_prompt(&system);
+            if let Err(e) = tokio::fs::write(&soul_path, format!("# Agent: {id}\n\n{full_prompt}\n")).await {
+                warn!("agent_spawn: failed to write SOUL.md for {id}: {e:#}");
+            }
             if let Err(e) = persist_agent_to_config(&entry).await {
                 warn!("agent_spawn: failed to persist to config: {e:#}");
             }
@@ -255,7 +255,7 @@ impl AgentRuntime {
             .defaults
             .timeout_seconds
             .unwrap_or(DEFAULT_TIMEOUT_SECONDS as u32) as u64;
-        let task_timeout = timeout_secs.min(300); // up to 5 min for background tasks
+        let task_timeout = timeout_secs; // use configured timeout, no hard cap
 
         tokio::spawn(async move {
             let result_text = match tokio::time::timeout(
@@ -264,7 +264,14 @@ impl AgentRuntime {
             ).await {
                 Ok(Ok(reply)) => reply.text,
                 Ok(Err(_)) => "[task agent channel closed unexpectedly]".to_owned(),
-                Err(_) => format!("[task {task_id} timed out after {task_timeout}s]"),
+                Err(_) => {
+                    // Timeout: kill the task agent to free resources.
+                    if let Some(ref reg) = agents {
+                        reg.remove_handle(&task_id);
+                    }
+                    info!(task = %task_id, timeout = task_timeout, "task agent timed out and killed");
+                    format!("[task {task_id} timed out after {task_timeout}s and was terminated]")
+                }
             };
 
             // Store result for main agent to pick up when run_turn fires.
@@ -388,7 +395,7 @@ impl AgentRuntime {
             .defaults
             .timeout_seconds
             .unwrap_or(DEFAULT_TIMEOUT_SECONDS as u32) as u64;
-        let send_timeout = timeout_secs.min(300);
+        let send_timeout = timeout_secs;
         let send_id = format!("send-{target_id}-{short_id}");
         let send_id_bg = send_id.clone();
         let target_id_bg = target_id.clone();
