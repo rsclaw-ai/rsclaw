@@ -580,25 +580,51 @@ impl BrowserSession {
     /// Connect to an existing Chrome instance (user's daily browser).
     /// Does NOT launch or own a Chrome process -- will not kill it on drop.
     pub(crate) async fn connect_existing(browser_ws_url: &str) -> Result<Self> {
+        Self::connect_existing_inner(browser_ws_url, false).await
+    }
+
+    /// Connect to existing Chrome, reusing the active tab instead of creating a new one.
+    pub(crate) async fn connect_existing_reuse(browser_ws_url: &str) -> Result<Self> {
+        Self::connect_existing_inner(browser_ws_url, true).await
+    }
+
+    async fn connect_existing_inner(browser_ws_url: &str, reuse_tab: bool) -> Result<Self> {
         // Extract port from browser WS URL (ws://127.0.0.1:PORT/devtools/browser/...)
         let port = parse_port_from_ws_url(browser_ws_url)?;
 
-        // Connect browser-level CDP to create a new tab.
-        let browser_cdp = CdpClient::connect(browser_ws_url).await?;
-        let result = browser_cdp.send("Target.createTarget", json!({"url": "about:blank"})).await?;
-        let target_id = result.get("targetId")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("Target.createTarget did not return targetId"))?;
-        debug!(target_id, "created new tab in external Chrome");
-
-        // Discover the new tab's webSocketDebuggerUrl from /json endpoint.
         let discovery_url = format!("http://127.0.0.1:{port}/json");
         let targets: Vec<Value> = reqwest::get(&discovery_url).await?.json().await?;
-        let tab_ws_url = targets.iter()
-            .find(|t| t["id"].as_str() == Some(target_id))
-            .and_then(|t| t["webSocketDebuggerUrl"].as_str())
-            .ok_or_else(|| anyhow!("new tab {} not found in /json target list", target_id))?
-            .to_owned();
+
+        let tab_ws_url = if reuse_tab {
+            // Reuse the first existing page tab.
+            targets.iter()
+                .find(|t| t["type"].as_str() == Some("page"))
+                .and_then(|t| t["webSocketDebuggerUrl"].as_str())
+                .map(|s| s.to_owned())
+        } else {
+            None
+        };
+
+        let tab_ws_url = if let Some(url) = tab_ws_url {
+            debug!("reusing existing tab");
+            url
+        } else {
+            // Create a new tab.
+            let browser_cdp = CdpClient::connect(browser_ws_url).await?;
+            let result = browser_cdp.send("Target.createTarget", json!({"url": "about:blank"})).await?;
+            let target_id = result.get("targetId")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("Target.createTarget did not return targetId"))?;
+            debug!(target_id, "created new tab in external Chrome");
+
+            // Re-fetch targets to find the new tab.
+            let targets: Vec<Value> = reqwest::get(&discovery_url).await?.json().await?;
+            targets.iter()
+                .find(|t| t["id"].as_str() == Some(target_id))
+                .and_then(|t| t["webSocketDebuggerUrl"].as_str())
+                .ok_or_else(|| anyhow!("new tab not found in target list"))?
+                .to_owned()
+        };
 
         // Connect CDP to the tab.
         let cdp = CdpClient::connect(&tab_ws_url).await?;

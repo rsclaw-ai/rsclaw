@@ -9,10 +9,10 @@ pub async fn cmd_browser(sub: BrowserCommand) -> Result<()> {
     let ports = &[9222_u16, 9223];
     let mut session = if let Some(ws_url) = crate::browser::detect_existing_chrome(ports).await {
         eprintln!("Connected to existing Chrome");
-        crate::browser::BrowserSession::connect_existing(&ws_url).await?
+        crate::browser::BrowserSession::connect_existing_reuse(&ws_url).await?
     } else {
         let chrome_path = crate::agent::platform::detect_chrome()
-            .ok_or_else(|| anyhow::anyhow!("Chrome not found. Start Chrome with --remote-debugging-port=9222 or install Chrome."))?;
+            .ok_or_else(|| anyhow::anyhow!("Chrome not found. Install with: rsclaw tools install chrome"))?;
         eprintln!("Launching headless Chrome");
         crate::browser::BrowserSession::start(&chrome_path, false, None).await?
     };
