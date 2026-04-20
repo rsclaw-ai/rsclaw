@@ -865,6 +865,28 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
         // Fix orphaned tool_calls/tool_results: some providers (MiniMax) require
         // strict assistant(tool_calls) → tool(result) pairing with no gaps.
         fix_tool_call_pairing(msgs);
+
+        // Extra safety: ensure no tool message appears without an immediately
+        // preceding assistant message with tool_calls. Compaction can break this.
+        let mut i = 0;
+        while i < msgs.len() {
+            if msgs[i].get("role").and_then(|r| r.as_str()) == Some("tool") {
+                // Check if previous message is assistant with tool_calls
+                let prev_ok = i > 0
+                    && msgs[i - 1].get("role").and_then(|r| r.as_str()) == Some("assistant")
+                    && msgs[i - 1].get("tool_calls").and_then(|v| v.as_array()).is_some();
+                if !prev_ok {
+                    // Also allow consecutive tool messages (multiple results for one call)
+                    let prev_tool = i > 0
+                        && msgs[i - 1].get("role").and_then(|r| r.as_str()) == Some("tool");
+                    if !prev_tool {
+                        msgs.remove(i);
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
     }
 
     Ok(body)
