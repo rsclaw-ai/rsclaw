@@ -3,7 +3,7 @@
 **拥有长期记忆与自我学习能力的 AI 智能体引擎 — 15MB 单文件、13 消息通道、15 LLM 提供商、A2A 跨机编排、浏览器自动化，纯 Rust 构建。你的 AI 不再健忘，越用越懂你。**
 
 [![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
+[![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue)](../../README.md#license)
 [![Binary Size](https://img.shields.io/badge/binary-~15MB-green)]()
 
 **中文** | [English](../../README.md) | [日本語](README_ja.md) | [한국어](README_ko.md) | [ไทย](README_th.md) | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | [Русский](README_ru.md)
@@ -864,6 +864,6 @@ rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
 
 ## 许可证
 
-本项目使用 [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE) 许可。
+本项目采用 MIT OR Apache-2.0 双协议授权。详见 [英文 README](../../README.md#license)。
 
 这意味着你可以自由使用、修改和分发本软件，但任何修改版本（包括通过网络提供服务）都必须以相同许可证开源。

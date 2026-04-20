@@ -1,18 +1,26 @@
 # RsClaw
 
-**AI Agent Engine with long-term memory and self-learning — one 15MB binary, 13 channels, 15 LLM providers, A2A cross-machine orchestration, browser automation, all in pure Rust. Your AI never forgets and gets better the more you use it.**
+> **An AI agent engine that remembers — and gets better the more you use it.**  
+> One 15MB binary · 13 channels · 15 LLM providers · Multi-backend agents · OpenCLI-ready · Built in pure Rust.
 
-[![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Binary Size](https://img.shields.io/badge/binary-~15MB-green)]()
+[![GitHub Stars](https://img.shields.io/github/stars/rsclaw-ai/rsclaw?style=flat&logo=github)](https://github.com/rsclaw-ai/rsclaw/stargazers)
+[![Crates.io](https://img.shields.io/crates/v/rsclaw?style=flat&logo=rust)](https://crates.io/crates/rsclaw)
+[![Release](https://img.shields.io/github/v/release/rsclaw-ai/rsclaw)](https://github.com/rsclaw-ai/rsclaw/releases)
+[![Downloads](https://img.shields.io/crates/d/rsclaw?style=flat)](https://crates.io/crates/rsclaw)
+[![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue)](#license)
+[![Rust](https://img.shields.io/badge/Rust-1.91%2B-orange?logo=rust)](https://www.rust-lang.org/)
 
-**English** | [中文](docs/lang/README_cn.md) | [日本語](docs/lang/README_ja.md) | [한국어](docs/lang/README_ko.md) | [ไทย](docs/lang/README_th.md) | [Tiếng Việt](docs/lang/README_vi.md) | [Français](docs/lang/README_fr.md) | [Deutsch](docs/lang/README_de.md) | [Español](docs/lang/README_es.md) | [Русский](docs/lang/README_ru.md)
-
-RsClaw (Crab AI / 螃蟹 AI) is an AI agent engine that remembers. A single 15MB native executable that connects 13 messaging channels to AI agents with persistent long-term memory — backed by a three-layer store (redb KV + tantivy full-text + hnsw_rs vector search) — and self-learning from your usage patterns. Orchestrates agents across machines via A2A, automates browsers, and runs 24/7 reliably. Built from scratch in Rust with one-click OpenClaw migration and zero Node.js dependency.
+**🇺🇸 English** · [🇨🇳 中文](docs/lang/README_cn.md) · [🇯🇵 日本語](docs/lang/README_ja.md) · [🇰🇷 한국어](docs/lang/README_ko.md) · [More languages ▾](docs/lang/)
 
 <p align="center">
   <img src="docs/images/en.gif" alt="RsClaw Preview" width="800" />
 </p>
+
+Most AI agents forget everything between sessions. Every new conversation starts from zero — your preferences, your context, your workflow, all gone.
+
+**RsClaw doesn't forget.**
+
+Built from scratch in Rust, RsClaw (Crab AI / 螃蟹 AI) persists every interaction through a three-layer memory store (redb + tantivy + hnsw_rs), learns from your usage patterns, and ships as a single 15MB binary running on ~20MB RAM. Four agent lifetime modes (Main/Named/Sub/Task), four execution backends (Native Rust/Claude Code/OpenCode/ACP), 13 messaging channels, 15 LLM providers, A2A cross-machine orchestration — all without a line of Node.js. Drop-in OpenClaw replacement.
 
 💬 [Join Community](https://rsclaw.ai/en/community) — WeChat / Feishu / QQ / Telegram
 
@@ -20,30 +28,39 @@ RsClaw (Crab AI / 螃蟹 AI) is an AI agent engine that remembers. A single 15MB
 
 ## Install
 
+### 👉 New users
+
 ```bash
 # macOS / Linux
 curl -fsSL https://app.rsclaw.ai/scripts/install.sh | bash
 
 # Windows (PowerShell)
 irm https://app.rsclaw.ai/scripts/install.ps1 | iex
-
-# From source
-git clone https://github.com/rsclaw-ai/rsclaw.git && cd rsclaw
-cargo build --release
 ```
 
-Desktop app (.dmg / .msi / .deb): [Releases](https://github.com/rsclaw-ai/rsclaw/releases)
+Then initialize:
 
 ```bash
-# Migrate from OpenClaw
-rsclaw setup      # detects OpenClaw data, offers import
-rsclaw start      # config already imported, ready to go
-
-# New install
-rsclaw setup      # initialize ~/.rsclaw/
-rsclaw onboard    # interactive wizard: provider, channels, etc.
+rsclaw setup      # Initialize ~/.rsclaw/
+rsclaw onboard    # Interactive wizard: provider, channels, etc.
 rsclaw start
 ```
+
+### 👉 Migrating from OpenClaw
+
+```bash
+openclaw gateway stop
+rsclaw setup      # Detects OpenClaw data, offers one-click import
+rsclaw start      # Everything just works — channels, agents, sessions
+```
+
+Your `~/.openclaw/` is never modified. See [Migrate from OpenClaw](#migrate-from-openclaw) below for details.
+
+### Other install options
+
+- **Desktop app** — `.dmg` / `.msi` / `.deb` from [Releases](https://github.com/rsclaw-ai/rsclaw/releases)
+- **Via Cargo** — `cargo install rsclaw`
+- **From source** — `git clone https://github.com/rsclaw-ai/rsclaw.git && cd rsclaw && cargo build --release`
 
 ---
 
@@ -256,6 +273,23 @@ Import copies config, workspace, and sessions into `~/.rsclaw/`. OpenClaw data i
 | Browser | built-in CDP | -- |
 | Exec safety | deny/confirm/allow | -- |
 
+### FAQ
+
+**Can I run RsClaw and OpenClaw simultaneously?**  
+Yes. RsClaw uses port 18888 by default, OpenClaw uses 18789. They have separate data directories (`~/.rsclaw/` vs `~/.openclaw/`) and can run side by side without conflict.
+
+**Will RsClaw modify my OpenClaw data?**  
+Never. Import mode is strictly read-only on `~/.openclaw/`. All RsClaw data goes to `~/.rsclaw/`.
+
+**How do I switch back to OpenClaw?**  
+`rsclaw stop && openclaw gateway start`. Your `~/.openclaw/` is untouched.
+
+**Does it work offline?**  
+Yes — with Ollama for local models, or any OpenAI-compatible local endpoint. Voice STT can also run fully local via Candle Whisper.
+
+**Can I use RsClaw in my commercial product?**  
+Yes, freely. RsClaw is dual-licensed under MIT OR Apache-2.0 — you can build proprietary products, run SaaS services, or redistribute modified versions without open-source obligations.
+
 ---
 
 ## Development
@@ -292,6 +326,38 @@ Requirements: Rust 1.91+, macOS / Linux / Windows. Optional: ffmpeg, Chrome.
 
 ---
 
+## Support the project
+
+If RsClaw saves you hours, consider:
+
+- ⭐ **Star this repo** — helps other developers discover RsClaw
+- 🐛 **Report bugs** via [GitHub Issues](https://github.com/rsclaw-ai/rsclaw/issues)
+- 💬 **Join the community** — [WeChat / Feishu / QQ / Telegram](https://rsclaw.ai/en/community)
+- 🤝 **Contribute** — see [CONTRIBUTING.md](CONTRIBUTING.md)
+
 ## License
 
-[AGPL-3.0](LICENSE) — Free to use, modify, and distribute. Network services must open-source modifications under the same license.
+Licensed under either of
+
+- **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- **MIT license** ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+### What this means
+
+- ✅ **Use freely** in personal, commercial, and enterprise projects
+- ✅ **Modify and redistribute** without any obligation to open-source your changes
+- ✅ **Build proprietary products** on top of RsClaw
+- ✅ **Run as a SaaS service** without any licensing requirements
+- ✅ **No copyleft** — your derivative work stays yours
+
+This is the same dual-license used by the Rust language itself, Tokio, Serde, Axum, and most of the Rust ecosystem.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+
+---
+
+Built with 🦀 in Rust. Inspired by the OpenClaw community.
