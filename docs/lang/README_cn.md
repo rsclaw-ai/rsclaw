@@ -1,6 +1,6 @@
 # RsClaw
 
-**AI 自动化管家 — 单文件，13 消息通道，15 LLM 提供商，原生长期记忆，自我进化，A2A 跨机编排，分布式 Agent 调度，浏览器自动化，纯 Rust 构建。**
+**拥有长期记忆与自我学习能力的 AI 智能体引擎 — 15MB 单文件、13 消息通道、15 LLM 提供商、A2A 跨机编排、浏览器自动化，纯 Rust 构建。你的 AI 不再健忘，越用越懂你。**
 
 [![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
@@ -8,7 +8,7 @@
 
 **中文** | [English](../../README.md) | [日本語](README_ja.md) | [한국어](README_ko.md) | [ไทย](README_th.md) | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | [Русский](README_ru.md)
 
-螃蟹 AI（RsClaw）是你的个人 AI 自动化管家。15MB 单文件原生可执行程序，连接 13 种消息通道与 AI 智能体 — 处理任务、浏览网页、全天候管理对话。永不遗忘上下文，越用越智能，跨机器协调分布式 Agent。支持 OpenClaw 一键迁移，零 Node.js 依赖。
+螃蟹 AI（RsClaw）是一个会记住的 AI 智能体引擎。15MB 单文件原生可执行程序，连接 13 种消息通道与 AI 智能体，配备持久化长期记忆 — 基于 redb KV + tantivy 全文索引 + hnsw_rs 向量检索的三层存储架构 — 并能从你的使用习惯中自我学习。支持 A2A 协议跨机器编排 Agent、浏览器自动化、7×24 稳定运行。Rust 从零构建，OpenClaw 一键迁移，零 Node.js 依赖。
 
 <p align="center">
   <img src="../images/cn.gif" alt="RsClaw 预览" width="800" />

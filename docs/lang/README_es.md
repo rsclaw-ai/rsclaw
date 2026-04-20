@@ -1,6 +1,6 @@
 # RsClaw
 
-**Your AI Automation Butler — one binary, 13 channels, 15 LLM providers, native long-term memory, self-evolution, A2A cross-machine orchestration, distributed agent scheduling, browser automation, all in pure Rust.**
+**AI Agent Engine with long-term memory and self-learning — one 15MB binary, 13 channels, 15 LLM providers, A2A cross-machine orchestration, browser automation, all in pure Rust. Your AI never forgets and gets better the more you use it.**
 
 [![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)

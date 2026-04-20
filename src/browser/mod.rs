@@ -891,7 +891,7 @@ impl BrowserSession {
             "wait" => self.cmd_wait(args).await,
             "evaluate" => self.cmd_evaluate(args).await,
             "cookies" => self.cmd_cookies(args).await,
-            "press" => self.cmd_press(args).await,
+            "press" | "key" => self.cmd_press(args).await,
             "set_viewport" => self.cmd_set_viewport(args).await,
             "dialog" => self.cmd_dialog(args).await,
             "new_tab" => self.cmd_new_tab(args).await,

@@ -1,6 +1,6 @@
 # RsClaw
 
-**Your AI Automation Butler — one binary, 13 channels, 15 LLM providers, native long-term memory, self-evolution, A2A cross-machine orchestration, distributed agent scheduling, browser automation, all in pure Rust.**
+**AI Agent Engine with long-term memory and self-learning — one 15MB binary, 13 channels, 15 LLM providers, A2A cross-machine orchestration, browser automation, all in pure Rust. Your AI never forgets and gets better the more you use it.**
 
 [![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
@@ -8,7 +8,7 @@
 
 **English** | [中文](docs/lang/README_cn.md) | [日本語](docs/lang/README_ja.md) | [한국어](docs/lang/README_ko.md) | [ไทย](docs/lang/README_th.md) | [Tiếng Việt](docs/lang/README_vi.md) | [Français](docs/lang/README_fr.md) | [Deutsch](docs/lang/README_de.md) | [Español](docs/lang/README_es.md) | [Русский](docs/lang/README_ru.md)
 
-RsClaw (Crab AI / 螃蟹 AI 自动化管家) is your personal AI automation butler. A single 15MB native executable that connects 13 messaging channels to AI agents — handling tasks, browsing the web, and managing conversations around the clock. It never forgets context, gets smarter over time, and coordinates agents across multiple machines. One-click migration from OpenClaw, zero Node.js dependency.
+RsClaw (Crab AI / 螃蟹 AI) is an AI agent engine that remembers. A single 15MB native executable that connects 13 messaging channels to AI agents with persistent long-term memory — backed by a three-layer store (redb KV + tantivy full-text + hnsw_rs vector search) — and self-learning from your usage patterns. Orchestrates agents across machines via A2A, automates browsers, and runs 24/7 reliably. Built from scratch in Rust with one-click OpenClaw migration and zero Node.js dependency.
 
 <p align="center">
   <img src="docs/images/en.gif" alt="RsClaw Preview" width="800" />
