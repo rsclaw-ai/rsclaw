@@ -67,11 +67,23 @@ impl super::runtime::AgentRuntime {
                     job["schedule"] = json!({"kind": "once", "atMs": at_ms});
                 } else if let Some(sched) = schedule {
                     // Standard cron expression or interval.
-                    if let Some(tz_val) = tz {
-                        job["schedule"] = json!({"kind": "cron", "expr": sched, "tz": tz_val});
-                    } else {
-                        job["schedule"] = json!({"kind": "cron", "expr": sched});
-                    }
+                    // Always include timezone. Use LLM-provided, config, or auto-detected.
+                    let tz_val = tz
+                        .map(String::from)
+                        .or_else(|| self.config.agents.defaults.timezone.clone())
+                        .unwrap_or_else(|| {
+                            // Auto-detect from system offset
+                            let offset = chrono::Local::now().offset().local_minus_utc();
+                            match offset {
+                                25200 => "Asia/Bangkok",
+                                28800 => "Asia/Shanghai",
+                                32400 => "Asia/Tokyo",
+                                -18000 => "US/Eastern",
+                                -28800 => "US/Pacific",
+                                _ => "UTC",
+                            }.to_owned()
+                        });
+                    job["schedule"] = json!({"kind": "cron", "expr": sched, "tz": tz_val});
                 } else {
                     return Err(anyhow!("cron add: `schedule` or `delay_ms` required"));
                 }
