@@ -647,19 +647,9 @@ impl AgentRuntime {
             .ok_or_else(|| anyhow!("tts: `text` required"))?;
         let voice = args["voice"].as_str().unwrap_or("default");
 
-        // Auto-detect Chinese text and use Chinese voice on macOS.
-        let has_cjk = text.chars().any(|c| {
-            matches!(c, '\u{4e00}'..='\u{9fff}' | '\u{3400}'..='\u{4dbf}')
-        });
-        let effective_voice = if voice == "default" && has_cjk {
-            "Tingting" // macOS Chinese (Mandarin) voice
-        } else {
-            voice
-        };
-
         let ts = chrono::Utc::now().timestamp_millis();
         let tmp_dir = std::env::temp_dir();
-        // Output mp3 (most compatible). Feishu converts to opus at send time.
+        // Final output is always mp3 for IM platform compatibility.
         let out_path = tmp_dir.join(format!("rsclaw_tts_{ts}.mp3"));
         let out_path_str = out_path.to_string_lossy().to_string();
 
@@ -667,11 +657,12 @@ impl AgentRuntime {
         let is_windows = cfg!(target_os = "windows");
 
         if is_macos {
+            // macOS `say` outputs aiff, then convert to mp3 via ffmpeg.
             let aiff_path = tmp_dir.join(format!("rsclaw_tts_{ts}.aiff"));
             let aiff_str = aiff_path.to_string_lossy().to_string();
             let mut cmd = tokio::process::Command::new("say");
-            if effective_voice != "default" {
-                cmd.args(["-v", effective_voice]);
+            if voice != "default" {
+                cmd.args(["-v", voice]);
             }
             cmd.args(["-o", &aiff_str, text]);
             let output = cmd
@@ -682,8 +673,7 @@ impl AgentRuntime {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(anyhow!("tts: say failed: {stderr}"));
             }
-            // Convert aiff to mp3 via ffmpeg (most compatible format).
-            // Feishu converts to opus at send time.
+            // Convert aiff to mp3 via ffmpeg (required for feishu/weixin/etc.)
             let ffmpeg = tokio::process::Command::new("ffmpeg")
                 .args(["-i", &aiff_str, "-y", "-q:a", "4", &out_path_str])
                 .output()
@@ -693,8 +683,21 @@ impl AgentRuntime {
                     let _ = std::fs::remove_file(&aiff_path);
                 }
                 _ => {
-                    tracing::warn!("tts: ffmpeg not available, using aiff");
-                    let _ = std::fs::rename(&aiff_path, &out_path);
+                    // ffmpeg not available — try afconvert (macOS built-in)
+                    let afconvert = tokio::process::Command::new("afconvert")
+                        .args(["-f", "mp4f", "-d", "aac", &aiff_str, &out_path_str])
+                        .output()
+                        .await;
+                    match afconvert {
+                        Ok(o) if o.status.success() => {
+                            let _ = std::fs::remove_file(&aiff_path);
+                        }
+                        _ => {
+                            // Fallback: send aiff as-is (some platforms may not play it)
+                            tracing::warn!("tts: ffmpeg/afconvert not available, using aiff");
+                            let _ = std::fs::rename(&aiff_path, &out_path);
+                        }
+                    }
                 }
             }
         } else if is_windows {
@@ -737,21 +740,10 @@ $synth.Speak('{}')
             }
         }
 
-        // Return with __send_file so the file is auto-sent to the user
-        // without requiring the LLM to call send_file separately.
-        let filename = std::path::Path::new(&out_path_str)
-            .file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_else(|| "tts.mp3".to_owned());
         Ok(json!({
-            "__send_file": true,
-            "path": out_path_str,
-            "filename": filename,
             "audio_file": out_path_str,
-            "voice": effective_voice,
-            "chars": text.len(),
-            "auto_sent": true,
-            "note": "Audio file has been auto-sent to the user. Do NOT call send_file again."
+            "voice": voice,
+            "chars": text.len()
         }))
     }
 
@@ -827,7 +819,6 @@ $synth.Speak('{}')
                     .collect();
                 Ok(json!({"adapters": adapters}))
             }
-
             "info" => {
                 let adapter_name = args["adapter"]
                     .as_str()
@@ -835,7 +826,6 @@ $synth.Speak('{}')
                     .ok_or_else(|| anyhow!("anycli info: `adapter` required"))?;
                 let registry = anycli::Registry::load()?;
                 let adapter = registry.find(adapter_name)?;
-
                 let commands: serde_json::Map<String, serde_json::Value> = adapter
                     .commands
                     .iter()
@@ -852,21 +842,11 @@ $synth.Speak('{}')
                                 }))
                             })
                             .collect();
-                        (name.clone(), json!({
-                            "description": cmd.description,
-                            "params": params,
-                        }))
+                        (name.clone(), json!({"description": cmd.description, "params": params}))
                     })
                     .collect();
-
-                Ok(json!({
-                    "name": adapter.name,
-                    "description": adapter.description,
-                    "base_url": adapter.base_url,
-                    "commands": commands,
-                }))
+                Ok(json!({"name": adapter.name, "description": adapter.description, "base_url": adapter.base_url, "commands": commands}))
             }
-
             "run" => {
                 let adapter_name = args["adapter"]
                     .as_str()
@@ -874,11 +854,8 @@ $synth.Speak('{}')
                 let command = args["command"]
                     .as_str()
                     .ok_or_else(|| anyhow!("anycli run: `command` required"))?;
-
                 let registry = anycli::Registry::load()?;
                 let adapter = registry.find(adapter_name)?;
-
-                // Build params from the JSON object.
                 let mut params_vec: Vec<(String, String)> = Vec::new();
                 if let Some(obj) = args["params"].as_object() {
                     for (k, v) in obj {
@@ -889,51 +866,26 @@ $synth.Speak('{}')
                         params_vec.push((k.clone(), val));
                     }
                 }
-
-                let param_refs: Vec<(&str, &str)> = params_vec
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), v.as_str()))
-                    .collect();
-
+                let param_refs: Vec<(&str, &str)> = params_vec.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
                 let result = anycli::Pipeline::execute(adapter, command, &param_refs).await?;
-
                 let fmt_str = args["format"].as_str().unwrap_or("json");
-                let fmt: anycli::OutputFormat = fmt_str.parse()
-                    .unwrap_or(anycli::OutputFormat::Json);
-
-                Ok(json!({
-                    "adapter": result.adapter,
-                    "command": result.command,
-                    "count": result.count,
-                    "data": result.format(fmt)?,
-                }))
+                let fmt: anycli::OutputFormat = fmt_str.parse().unwrap_or(anycli::OutputFormat::Json);
+                Ok(json!({"adapter": result.adapter, "command": result.command, "count": result.count, "data": result.format(fmt)?}))
             }
-
             "search" => {
-                let query = args["query"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("anycli search: `query` required"))?;
+                let query = args["query"].as_str().ok_or_else(|| anyhow!("anycli search: `query` required"))?;
                 let hub = anycli::Hub::new()?;
                 let results = hub.search(query).await?;
-                let entries: Vec<serde_json::Value> = results
-                    .iter()
-                    .map(|e| json!({"name": e.name, "description": e.description}))
-                    .collect();
+                let entries: Vec<serde_json::Value> = results.iter().map(|e| json!({"name": e.name, "description": e.description})).collect();
                 Ok(json!({"results": entries, "count": entries.len()}))
             }
-
             "install" => {
-                let name = args["name"]
-                    .as_str()
-                    .or_else(|| args["adapter"].as_str())
-                    .ok_or_else(|| anyhow!("anycli install: `name` required"))?;
+                let name = args["name"].as_str().or_else(|| args["adapter"].as_str()).ok_or_else(|| anyhow!("anycli install: `name` required"))?;
                 let hub = anycli::Hub::new()?;
-                let dir = anycli::hub::default_adapters_dir()
-                    .ok_or_else(|| anyhow!("cannot determine home directory"))?;
+                let dir = anycli::hub::default_adapters_dir().ok_or_else(|| anyhow!("cannot determine home directory"))?;
                 let path = hub.install(name, &dir).await?;
                 Ok(json!({"installed": name, "path": path.display().to_string()}))
             }
-
             other => Err(anyhow!("anycli: unknown action `{other}`")),
         }
     }
@@ -942,17 +894,12 @@ $synth.Speak('{}')
     // Clarify — ask the user a question before proceeding
     // -------------------------------------------------------------------
 
-    /// Present a clarifying question to the user.  The formatted question is
-    /// returned as the tool result so the LLM includes it in its response text,
-    /// which then gets delivered to the user through the normal channel.  The
-    /// user's next message becomes the answer.
+    /// Present a clarifying question to the user.
     pub(crate) async fn tool_clarify(&self, args: Value) -> Result<Value> {
         let question = args["question"]
             .as_str()
             .ok_or_else(|| anyhow!("clarify: `question` required"))?;
-
         let mut formatted = String::from(question);
-
         if let Some(options) = args["options"].as_array() {
             formatted.push('\n');
             for (i, opt) in options.iter().enumerate() {
@@ -961,12 +908,7 @@ $synth.Speak('{}')
                 }
             }
         }
-
-        Ok(json!({
-            "action": "clarify",
-            "question": formatted,
-            "waiting_for_user": true
-        }))
+        Ok(json!({"action": "clarify", "question": formatted, "waiting_for_user": true}))
     }
 
     // -------------------------------------------------------------------

@@ -122,12 +122,15 @@ impl AgentRuntime {
             .cloned()
             .unwrap_or(CompactionMode::Layered);
         let compaction_model = cfg.model.as_deref().unwrap_or(model);
-        // Tail token budget: keep recent messages up to 20% of context window.
-        // This adapts to content — short messages keep more turns, long tool
-        // results naturally get fewer turns preserved.
-        let tail_token_budget = cfg.keep_recent_pairs
-            .map(|p| p as usize * 500) // legacy: convert pairs to rough token budget
-            .unwrap_or(context_tokens / 5); // default: 20% of context
+        // Dynamic keepRecentPairs: reduce when token pressure is high.
+        let configured_pairs = cfg.keep_recent_pairs.unwrap_or(5) as usize;
+        let keep_pairs = if total_tokens > token_threshold * 3 {
+            1.max(configured_pairs / 3) // extreme pressure: keep 1-2 pairs
+        } else if total_tokens > token_threshold * 2 {
+            1.max(configured_pairs / 2) // high pressure: keep 2-3 pairs
+        } else {
+            configured_pairs // normal: use configured value
+        };
         let extract_facts = cfg.extract_facts.unwrap_or(true);
 
         let msgs_to_text = |msgs: &[Message]| -> String {
@@ -169,19 +172,16 @@ impl AgentRuntime {
                 }
             };
 
-            // Tail: keep recent messages up to tail_token_budget tokens.
-            // Walk backwards from the end, accumulating tokens until budget
-            // is exhausted. This adapts to content length — more short
-            // messages are kept, fewer long tool results.
-            let mut tail_tokens = 0usize;
+            // Tail: count user-assistant pairs from the end.
+            let mut pair_count = 0usize;
             let mut split_idx = msgs.len();
-            for i in (head_end..msgs.len()).rev() {
-                let cost = msg_tokens(&msgs[i]);
-                if tail_tokens + cost > tail_token_budget {
-                    break;
+            let mut i = msgs.len();
+            while i > head_end && pair_count < keep_pairs {
+                i -= 1;
+                if msgs[i].role == Role::User {
+                    pair_count += 1;
+                    split_idx = i;
                 }
-                tail_tokens += cost;
-                split_idx = i;
             }
             // Ensure split doesn't overlap with head.
             split_idx = split_idx.max(head_end);
@@ -394,7 +394,7 @@ impl AgentRuntime {
             session = session_key,
             tokens_before = total_tokens,
             tokens_after = new_tokens,
-            tail_token_budget,
+            keep_pairs,
             "auto-compaction complete (layered)"
         );
 
