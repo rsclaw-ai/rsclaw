@@ -492,6 +492,8 @@ impl AgentRuntime {
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None,
+            kv_cache_mode: 0,
+            session_key: None,
         };
 
         let providers = Arc::clone(&self.providers);
@@ -3119,6 +3121,7 @@ impl AgentRuntime {
                 Some(0.6)
             };
 
+            let kv_cache_mode = self.config.agents.defaults.kv_cache_mode.unwrap_or(1);
             let req = LlmRequest {
                 model: model.to_owned(),
                 messages,
@@ -3128,6 +3131,8 @@ impl AgentRuntime {
                 temperature,
                 frequency_penalty: self.config.agents.defaults.frequency_penalty,
                 thinking_budget,
+                kv_cache_mode,
+                session_key: if kv_cache_mode >= 2 { Some(ctx.session_key.clone()) } else { None },
             };
 
             // Update live status: LLM call starting.

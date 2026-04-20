@@ -635,7 +635,7 @@ impl AgentRuntime {
             max_tokens: Some(4096),
             temperature: None,
             frequency_penalty: None,
-            thinking_budget: None,
+            thinking_budget: None, kv_cache_mode: 0, session_key: None,
         };
 
         let providers = Arc::clone(&self.providers);
@@ -749,7 +749,7 @@ impl AgentRuntime {
             max_tokens: Some(4096),
             temperature: None,
             frequency_penalty: None,
-            thinking_budget: None,
+            thinking_budget: None, kv_cache_mode: 0, session_key: None,
         };
 
         let providers = Arc::clone(&self.providers);
@@ -816,7 +816,7 @@ impl AgentRuntime {
             max_tokens: Some(1024),
             temperature: None,
             frequency_penalty: None,
-            thinking_budget: None,
+            thinking_budget: None, kv_cache_mode: 0, session_key: None,
         };
 
         let providers = Arc::clone(&self.providers);

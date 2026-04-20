@@ -6,10 +6,21 @@
 //!   - Ollama (same completions wire format, custom base_url)
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result};
+use dashmap::DashMap;
 use futures::{StreamExt, TryStreamExt, future::BoxFuture};
 use serde_json::{Value, json};
+
+/// Per-session cache for kv_cache_mode=2 (incremental messages).
+struct SessionMessageCache {
+    cache_id: String,
+    messages: Vec<Value>,
+}
+
+static SESSION_CACHES: LazyLock<DashMap<String, SessionMessageCache>> =
+    LazyLock::new(DashMap::new);
 
 use super::{
     ContentPart, LlmProvider, LlmRequest, LlmStream, Message, MessageContent, Role, StreamEvent,
@@ -166,7 +177,62 @@ impl LlmProvider for OpenAiProvider {
                 return self.stream_responses(&req).await;
             }
 
-            let body = build_request_body(&req)?;
+            let mut body = build_request_body(&req)?;
+
+            // kv_cache_mode=2: incremental messages via cache_id.
+            if req.kv_cache_mode >= 2 {
+                if let Some(ref session_key) = req.session_key {
+                    let current_messages = body["messages"].as_array().cloned().unwrap_or_default();
+
+                    if let Some(cached) = SESSION_CACHES.get(session_key) {
+                        // Compute delta: messages beyond what was cached.
+                        let cached_len = cached.messages.len();
+                        if current_messages.len() > cached_len
+                            && current_messages[..cached_len] == cached.messages[..]
+                        {
+                            // Prefix matches — send only the new messages.
+                            let append = current_messages[cached_len..].to_vec();
+                            body.as_object_mut().map(|m| m.remove("messages"));
+                            body["cache_id"] = json!(cached.cache_id);
+                            body["messages_append"] = json!(append);
+                            tracing::debug!(
+                                session_key,
+                                cache_id = cached.cache_id.as_str(),
+                                cached = cached_len,
+                                append = append.len(),
+                                "kv_cache=2: sending incremental"
+                            );
+                        } else {
+                            // Prefix changed (compaction or edit) — send full, update cache.
+                            let cache_id = cached.cache_id.clone();
+                            drop(cached);
+                            SESSION_CACHES.insert(session_key.clone(), SessionMessageCache {
+                                cache_id: cache_id.clone(),
+                                messages: current_messages,
+                            });
+                            body["cache_id"] = json!(cache_id);
+                            tracing::debug!(session_key, "kv_cache=2: prefix changed, sending full");
+                        }
+                    } else {
+                        // First request for this session — send full, create cache.
+                        let cache_id = format!("c-{:016x}", {
+                            use std::hash::{Hash, Hasher};
+                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                            session_key.hash(&mut h);
+                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default().as_nanos().hash(&mut h);
+                            h.finish()
+                        });
+                        SESSION_CACHES.insert(session_key.clone(), SessionMessageCache {
+                            cache_id: cache_id.clone(),
+                            messages: current_messages,
+                        });
+                        body["cache_id"] = json!(cache_id);
+                        tracing::debug!(session_key, cache_id = cache_id.as_str(), "kv_cache=2: new session cache");
+                    }
+                }
+            }
+
             let body_str = serde_json::to_string(&body).unwrap_or_default();
             tracing::debug!(
                 model = %req.model,

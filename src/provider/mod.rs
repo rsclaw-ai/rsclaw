@@ -104,6 +104,10 @@ pub struct LlmRequest {
     pub frequency_penalty: Option<f32>,
     /// If > 0, the provider should enable extended thinking with this budget.
     pub thinking_budget: Option<u32>,
+    /// KV cache mode: 0=off, 1=append-only (default), 2=incremental (cache_id + delta).
+    pub kv_cache_mode: u8,
+    /// Session key for cache_id tracking (used when kv_cache_mode=2).
+    pub session_key: Option<String>,
 }
 
 /// A single streaming delta event from the LLM.

@@ -864,7 +864,7 @@ impl AgentRuntime {
             max_tokens: Some(2000),
             temperature: None,
             frequency_penalty: None,
-            thinking_budget: None,
+            thinking_budget: None, kv_cache_mode: 0, session_key: None,
         };
 
         match provider.stream(req).await {
