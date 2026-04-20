@@ -4348,6 +4348,17 @@ impl AgentRuntime {
         if let Some((plugin_name, tool_name_inner)) = name.split_once('.') {
             for wp in self.wasm_plugins.iter() {
                 if wp.name == plugin_name {
+                    // Set notification context so WASM plugin can send progress messages
+                    let notif_target = if !ctx.chat_id.is_empty() {
+                        ctx.chat_id.clone()
+                    } else {
+                        ctx.peer_id.clone()
+                    };
+                    wp.set_notification_async(
+                        self.notification_tx.clone(),
+                        notif_target,
+                        ctx.channel.clone(),
+                    ).await;
                     let result = wp.call_tool(tool_name_inner, args).await?;
                     return Ok(result);
                 }
