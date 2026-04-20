@@ -32,6 +32,13 @@ AI Agent Engine with long-term memory, self-learning, and multi-agent orchestrat
 - System-level: notifications, clipboard, global hotkeys, file system monitoring
 - Native OS integration (macOS Accessibility API, Windows UI Automation)
 
+**Mobile Native App (iOS / Android)**
+- Tauri v2 mobile build: one codebase → desktop + iOS + Android
+- Android: native binary (Termux) or Tauri app
+- iOS: Tauri v2 app (lib crate already exposed)
+- Mobile-optimized UI (touch, compact layout)
+- Background agent service with push notifications
+
 **Mobile Device Interaction**
 - iOS/Android screen mirroring + touch control
 - Cross-device task delegation: phone captures → desktop processes → results pushed back
