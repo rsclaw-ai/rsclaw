@@ -52,12 +52,35 @@ pub async fn cmd_browser(sub: BrowserCommand) -> Result<()> {
         }
     };
 
+    // For screenshot: extract save path before execute.
+    let screenshot_path = if action == "screenshot" {
+        args.get("path").and_then(|v| v.as_str()).map(String::from)
+    } else {
+        None
+    };
+
     let result = session.execute(action, &args).await?;
 
-    // Pretty print result.
-    if let Some(text) = result.get("text").and_then(|v| v.as_str()) {
+    // CLI-specific output handling.
+    if let Some(path) = screenshot_path {
+        // Screenshot: decode base64 data URI and save to file.
+        if let Some(data_uri) = result.get("image").and_then(|v| v.as_str()) {
+            // Strip "data:image/png;base64," prefix.
+            let b64 = data_uri.split(',').nth(1).unwrap_or(data_uri);
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD.decode(b64)
+                .map_err(|e| anyhow::anyhow!("failed to decode screenshot: {e}"))?;
+            std::fs::write(&path, &bytes)?;
+            println!("Screenshot saved to {path} ({} bytes)", bytes.len());
+        } else {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+    } else if let Some(text) = result.get("text").and_then(|v| v.as_str()) {
         // Snapshot/text output: print raw text.
         println!("{text}");
+    } else if let Some(html) = result.get("html").and_then(|v| v.as_str()) {
+        // Content: print HTML.
+        println!("{html}");
     } else {
         println!("{}", serde_json::to_string_pretty(&result)?);
     }
