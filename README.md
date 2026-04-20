@@ -80,9 +80,9 @@ Features: failover with exponential backoff, model fallback chains, thinking bud
 
 ## Key Features
 
-### Built-in Tools (32)
+### Built-in Tools (36)
 
-File read/write, shell exec (with safety rules), web search/fetch, CDP browser automation (20 actions), memory CRUD, document extraction (PDF/DOCX/XLSX/PPTX), image compression, voice STT (Whisper/SenseVoice), TTS, computer_use, cron jobs, multi-agent spawn.
+File read/write/search, shell exec (with safety rules), web search/fetch/download, CDP browser automation (50+ actions), memory CRUD, document extraction/creation (PDF/DOCX/XLSX/PPTX), image/video generation, voice STT (Whisper/SenseVoice), TTS, computer_use, cron jobs (recurring + one-shot timer), multi-agent spawn/task, clarify (interactive Q&A), anycli (structured web data extraction).
 
 ### Pre-parsed Commands (40+)
 
@@ -100,31 +100,67 @@ Local commands that bypass the LLM — zero token cost, sub-millisecond:
 ### Browser Automation (CDP)
 
 Built-in headless Chrome — no ChromeDriver, no Playwright, no Node.js:
-- 20 actions: open, snapshot, click, fill, scroll, screenshot, evaluate, etc.
+- 50+ actions: open, snapshot, click, fill, scroll, screenshot, evaluate, annotate, capture_video, etc.
 - Accessibility tree snapshots with `@e1` refs for LLM interaction
+- Semantic locators: getbytext, getbyrole, getbylabel
+- One-click video download: `rsclaw browser download-video <url>`
+- Auth persistence: state save/load for login session reuse
 - Memory-adaptive instance limits, 5-min idle timeout, crash auto-restart
+- CLI: `rsclaw browser open/snapshot/click/screenshot/...` (full agent-browser parity)
 
 ### Long-term Memory
 
 Three-layer storage: redb (hot KV), tantivy (full-text search), hnsw_rs (vector similarity). Session compaction at 80% context window, `/compact` manual compression with memory save, `/clear` preserves conversation summary.
 
-### Multi-Agent
+### Multi-Agent Architecture
+
+Four agent types with up to 4-layer delegation:
+
+| Type | Created by | Lifetime | Persisted |
+|------|-----------|----------|-----------|
+| **Main** | System | Forever | Config (`default: true`) |
+| **Named** | User | Permanent | Config file (survives restart) |
+| **Sub** | LLM | Session | Memory only (gone on restart) |
+| **Task** | LLM | One-shot | Auto-destroyed after completion |
+
+```
+Main ──spawn──→ Named "pm" (persistent, in config)
+                 └─spawn──→ Sub "analyst" (temporary)
+                              ├─task──→ Task "search-jd" (parallel)
+                              └─task──→ Task "search-tb" (parallel)
+```
+
+Each agent can use a different execution backend:
+
+| Backend | Description |
+|---------|-------------|
+| **Native Rust** | Built-in LLM runtime (default, fastest) |
+| **Claude Code** | Claude Agent SDK via ACP protocol |
+| **OpenCode** | Open-source coding agent |
+| **ACP** | Any Agent Client Protocol compliant agent |
 
 ```json5
 {
   agents: {
     list: [
-      { id: "main", model: { primary: "anthropic/claude-sonnet-4-5" }, allowed_commands: "*" },
-      { id: "coder", model: { primary: "deepseek/deepseek-chat" }, allowed_commands: "read|write|exec" },
+      { id: "main", default: true, model: { primary: "qwen-plus" } },
+      { id: "coder", model: { primary: "deepseek-chat", toolset: "code" },
+        claudecode: { command: "claude-agent-acp" } },  // uses Claude Code backend
     ],
     external: [
-      { id: "remote", url: "https://remote-gateway.example.com", auth_token: "${TOKEN}" },
+      { id: "gpu-worker", url: "http://gpu-server:18888", token: "${TOKEN}" },
     ],
   },
 }
 ```
 
-Collaboration modes: sequential (chain), parallel (fan-out), orchestrated (LLM-driven tool calls).
+Collaboration modes: sequential (chain), parallel (fan-out), orchestrated (LLM-driven `agent_<id>` tool calls).
+
+Permission model:
+- **Toolset** per agent: `minimal` (12 tools) / `web` / `code` / `standard` (16) / `full` (all)
+- **Exec safety**: 50+ global deny patterns apply to ALL agents (cannot be bypassed)
+- **Main cannot be killed**; Named/Sub/Task can be killed by their creator
+- Agents cannot communicate upward or sideways — delegation is strictly top-down
 
 ### A2A Protocol
 
