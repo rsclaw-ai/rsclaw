@@ -694,13 +694,6 @@ impl super::runtime::AgentRuntime {
             let agent_channel = ctx.channel.clone();
             let agent_peer_id = ctx.peer_id.clone();
             let agent_chat_id = ctx.chat_id.clone();
-            let notification_tx = self.notification_tx.clone();
-
-            // Clone for use after AgentMessage is created
-            let session_key_for_check = session_key.clone();
-            let agent_channel_for_notif = agent_channel.clone();
-            let agent_peer_id_for_notif = agent_peer_id.clone();
-            let agent_chat_id_for_notif = agent_chat_id.clone();
 
             // Register task as running BEFORE spawn so is_running() works
             ctx.exec_pool.register_running(task_id.clone()).await;
@@ -764,130 +757,63 @@ impl super::runtime::AgentRuntime {
                 pool.add_pending_for_session(session_key.clone(), exec_result)
                     .await;
 
-                // For cron sessions: directly send stdout to delivery channel (bypass agent to avoid exec loop)
-                // For regular sessions: inject result to agent inbox for further processing
-                let is_cron_session = session_key_for_check.starts_with("cron:");
-
-                if is_cron_session && exit_code == Some(0) {
-                    // Direct delivery for cron jobs - send stdout directly to channel
-                    if let Some(ref ntx) = notification_tx {
-                        let target = if !agent_chat_id_for_notif.is_empty() {
-                            agent_chat_id_for_notif.clone()
-                        } else {
-                            agent_peer_id_for_notif.clone()
-                        };
-                        let channel = agent_channel_for_notif.clone();
-                        let truncated = if stdout.chars().count() > 4000 {
-                            let cutoff = stdout
-                                .char_indices()
-                                .nth(4000)
-                                .map(|(i, _)| i)
-                                .unwrap_or(stdout.len());
-                            stdout[..cutoff].to_string()
-                        } else {
-                            stdout.clone()
-                        };
-                        let _ = ntx.send(crate::channel::OutboundMessage {
-                            target_id: target.clone(),
-                            is_group: false,
-                            text: truncated.clone(),
-                            reply_to: None,
-                            images: vec![],
-                            files: vec![],
-                            channel: Some(channel.clone()),
-                        });
-                        tracing::info!(
-                            task_id = %tid,
-                            channel = %channel,
-                            target = %target,
-                            text_len = truncated.len(),
-                            "exec: sent cron background result directly to delivery channel"
-                        );
-                    }
+                // Proactive injection: send result directly to agent inbox
+                // This triggers immediate processing without waiting for next user message
+                // IMPORTANT: Do NOT forward this to the user. This is an internal notification.
+                // For cron sessions: do NOT send stdout directly to channel - let agent decide the reply.
+                let result_summary = if exit_code == Some(0) {
+                    let truncated = if stdout.chars().count() > 3000 {
+                        let cutoff = stdout
+                            .char_indices()
+                            .nth(3000)
+                            .map(|(i, _)| i)
+                            .unwrap_or(stdout.len());
+                        &stdout[..cutoff]
+                    } else {
+                        &stdout
+                    };
+                    format!(
+                        "[SYSTEM: Background exec result - DO NOT send this to user]\n\
+                        task_id={}\ncommand: {}\nexit_code: 0\n\
+                        stdout (truncated if >3000 chars):\n{}\n\
+                        [END OF SYSTEM MESSAGE - Continue with your other tasks, do not forward stdout to user]",
+                        tid, command_owned, truncated
+                    )
                 } else {
-                    // Regular session or failed exec: inject result to agent inbox for processing
-                    let result_summary = if exit_code == Some(0) {
-                        let truncated = if stdout.chars().count() > 3000 {
-                            let cutoff = stdout
-                                .char_indices()
-                                .nth(3000)
-                                .map(|(i, _)| i)
-                                .unwrap_or(stdout.len());
-                            &stdout[..cutoff]
-                        } else {
-                            &stdout
-                        };
-                        format!(
-                            "[SYSTEM: Background exec COMPLETED - This task is DONE. DO NOT call exec again for this command.]\n\
-                            task_id={}\ncommand: {}\nexit_code: 0\n\
-                            stdout:\n{}\n\
-                            [Generate a brief summary for the user based on this output. DO NOT execute any more commands.]",
-                            tid, command_owned, truncated
-                        )
-                    } else {
-                        format!(
-                            "[SYSTEM: Background exec FAILED - DO NOT retry the same command.]\n\
-                            task_id={}\ncommand: {}\nexit_code: {}\n\
-                            stderr: {}\nstdout: {}\n\
-                            [Report failure briefly to user. DO NOT retry.]",
-                            tid,
-                            command_owned,
-                            exit_code.unwrap_or(-1),
-                            stderr,
-                            stdout
-                        )
-                    };
+                    format!(
+                        "[SYSTEM: Background exec FAILED - DO NOT send raw output to user, summarize the error]\n\
+                        task_id={}\ncommand: {}\nexit_code: {}\n\
+                        stderr: {}\nstdout: {}\n\
+                        [END OF SYSTEM MESSAGE - Report failure briefly to user if relevant]",
+                        tid,
+                        command_owned,
+                        exit_code.unwrap_or(-1),
+                        stderr,
+                        stdout
+                    )
+                };
 
-                    use super::registry::{AgentMessage, AgentReply};
-                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
-                    let inject_msg = AgentMessage {
-                        session_key,
-                        text: result_summary,
-                        channel: agent_channel,
-                        peer_id: agent_peer_id,
-                        chat_id: agent_chat_id,
-                        reply_tx,
-                        extra_tools: vec![],
-                        images: vec![],
-                        files: vec![],
-                        is_internal: true,  // Do NOT send reply to channel
-                    };
+                use super::registry::{AgentMessage, AgentReply};
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
+                let inject_msg = AgentMessage {
+                    session_key,
+                    text: result_summary,
+                    channel: agent_channel,
+                    peer_id: agent_peer_id,
+                    chat_id: agent_chat_id,
+                    reply_tx,
+                    extra_tools: vec![],
+                    images: vec![],
+                    files: vec![],
+                    is_internal: true,  // Do NOT send reply to channel
+                };
 
-                    if agent_tx.send(inject_msg).await.is_ok() {
-                        tracing::info!(task_id = %tid, "exec: result injected to agent inbox for proactive processing");
-                        // Wait for agent to process and get reply
-                        if let Ok(Ok(reply)) = tokio::time::timeout(Duration::from_secs(60), reply_rx).await {
-                            // For non-cron sessions, optionally send reply to channel if not empty
-                            if !is_cron_session && !reply.is_empty && !reply.text.is_empty() {
-                                if let Some(ref ntx) = notification_tx {
-                                    let target = if !agent_chat_id_for_notif.is_empty() {
-                                        agent_chat_id_for_notif.clone()
-                                    } else {
-                                        agent_peer_id_for_notif.clone()
-                                    };
-                                    let channel = agent_channel_for_notif.clone();
-                                    let _ = ntx.send(crate::channel::OutboundMessage {
-                                        target_id: target.clone(),
-                                        is_group: false,
-                                        text: reply.text.clone(),
-                                        reply_to: None,
-                                        images: reply.images.clone(),
-                                        files: reply.files.clone(),
-                                        channel: Some(channel.clone()),
-                                    });
-                                    tracing::info!(
-                                        task_id = %tid,
-                                        channel = %channel,
-                                        target = %target,
-                                        text_len = reply.text.len(),
-                                        "exec: sent background result reply to channel"
-                                    );
-                                }
-                            }
-                        }
-                    } else {
-                        tracing::warn!(task_id = %tid, "exec: failed to inject result to agent inbox");
-                    }
+                if agent_tx.send(inject_msg).await.is_ok() {
+                    tracing::info!(task_id = %tid, "exec: result injected to agent inbox for proactive processing");
+                    // Wait a bit for agent to process (optional)
+                    let _ = tokio::time::timeout(Duration::from_secs(60), reply_rx).await;
+                } else {
+                    tracing::warn!(task_id = %tid, "exec: failed to inject result to agent inbox");
                 }
             });
 
