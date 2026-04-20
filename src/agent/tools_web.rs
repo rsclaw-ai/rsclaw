@@ -975,6 +975,7 @@ impl AgentRuntime {
             req = req.header("Referer", referer);
         } else if let Ok(parsed) = reqwest::Url::parse(url) {
             if let Some(host) = parsed.host_str() {
+                // For known CDN domains, use their parent service as referer
                 let referer = if host.contains("byteimg.com") || host.contains("dreamina") {
                     "https://jimeng.jianying.com/".to_string()
                 } else {
