@@ -101,6 +101,8 @@ pub struct AppState {
     pub cron_reload: broadcast::Sender<()>,
     /// Notification sender — routes OutboundMessage to the correct channel.
     pub notification_tx: broadcast::Sender<crate::channel::OutboundMessage>,
+    /// WASM plugins for direct tool execution via API.
+    pub wasm_plugins: Arc<Vec<crate::plugin::WasmPlugin>>,
 }
 
 // AgentEvent is defined in crate::events to avoid circular deps with agent.
@@ -199,7 +201,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/workspace/files", get(list_workspace_files))
         .route("/workspace/files/{*path}", get(read_workspace_file).put(write_workspace_file))
         .route("/stream", get(stream_sse))
-        .route("/a2a", post(crate::a2a::server::a2a_rpc_handler));
+        .route("/a2a", post(crate::a2a::server::a2a_rpc_handler))
+        .route("/tools/execute", post(execute_tool));
 
     Router::new()
         .nest("/api/v1", api)
@@ -606,6 +609,37 @@ async fn delete_agent(State(_state): State<AppState>, Path(id): Path<String>) ->
             Json(serde_json::json!({ "error": e.to_string() })),
         ).into_response(),
     }
+}
+
+/// Execute a tool directly via HTTP — for debugging and testing.
+/// POST /api/v1/tools/execute
+/// Body: {"tool": "web_browser", "args": {"action": "open", "url": "..."}}
+///   or: {"tool": "jimeng.txt2img", "args": {"prompt": "..."}}
+async fn execute_tool(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let tool_name = body.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+    let args = body.get("args").cloned().unwrap_or(serde_json::json!({}));
+
+    if tool_name.is_empty() {
+        return Json(serde_json::json!({"error": "tool name required"}));
+    }
+
+    // Check WASM plugins
+    if let Some((plugin_name, tool_inner)) = tool_name.split_once('.') {
+        for wp in state.wasm_plugins.iter() {
+            if wp.name == plugin_name {
+                match wp.call_tool(tool_inner, args.clone()).await {
+                    Ok(result) => return Json(serde_json::json!({"ok": true, "result": result})),
+                    Err(e) => return Json(serde_json::json!({"ok": false, "error": format!("{e:#}")})),
+                }
+            }
+        }
+        return Json(serde_json::json!({"error": format!("plugin '{}' not found", plugin_name)}));
+    }
+
+    Json(serde_json::json!({"error": "use 'plugin.tool' format, e.g. 'jimeng.txt2img'"}))
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {

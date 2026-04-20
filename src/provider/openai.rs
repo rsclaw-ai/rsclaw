@@ -6,10 +6,21 @@
 //!   - Ollama (same completions wire format, custom base_url)
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result};
+use dashmap::DashMap;
 use futures::{StreamExt, TryStreamExt, future::BoxFuture};
 use serde_json::{Value, json};
+
+/// Per-session cache for kv_cache_mode=2 (incremental messages).
+struct SessionMessageCache {
+    cache_id: String,
+    messages: Vec<Value>,
+}
+
+static SESSION_CACHES: LazyLock<DashMap<String, SessionMessageCache>> =
+    LazyLock::new(DashMap::new);
 
 use super::{
     ContentPart, LlmProvider, LlmRequest, LlmStream, Message, MessageContent, Role, StreamEvent,
@@ -166,7 +177,41 @@ impl LlmProvider for OpenAiProvider {
                 return self.stream_responses(&req).await;
             }
 
-            let body = build_request_body(&req)?;
+            let mut body = build_request_body(&req)?;
+
+            // kv_cache_mode=2: incremental messages via cache_id (server-generated).
+            let kv2_session_key = if req.kv_cache_mode >= 2 { req.session_key.clone() } else { None };
+            if let Some(ref session_key) = kv2_session_key {
+                let current_messages = body["messages"].as_array().cloned().unwrap_or_default();
+
+                if let Some(cached) = SESSION_CACHES.get(session_key) {
+                    // We have a server-assigned cache_id from a previous response.
+                    let cached_len = cached.messages.len();
+                    if current_messages.len() > cached_len
+                        && current_messages[..cached_len] == cached.messages[..]
+                    {
+                        // Prefix matches — send only the new messages.
+                        let append = current_messages[cached_len..].to_vec();
+                        body.as_object_mut().map(|m| m.remove("messages"));
+                        body["cache_id"] = json!(cached.cache_id);
+                        body["messages_append"] = json!(append);
+                        tracing::debug!(
+                            session_key,
+                            cache_id = cached.cache_id.as_str(),
+                            cached = cached_len,
+                            append = append.len(),
+                            "kv_cache=2: sending incremental"
+                        );
+                    } else {
+                        // Prefix changed (compaction) — send full with same cache_id.
+                        body["cache_id"] = json!(cached.cache_id);
+                        tracing::debug!(session_key, "kv_cache=2: prefix changed, sending full");
+                    }
+                }
+                // else: first request — no cache_id, send full messages.
+                // Server will generate cache_id and return it in X-Cache-Id header.
+            }
+
             let body_str = serde_json::to_string(&body).unwrap_or_default();
             tracing::debug!(
                 model = %req.model,
@@ -204,6 +249,36 @@ impl LlmProvider for OpenAiProvider {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_owned();
+
+            // kv_cache_mode=2: extract server-generated cache_id and update local cache.
+            if let Some(ref session_key) = kv2_session_key {
+                let server_cache_id = resp.headers()
+                    .get("x-cache-id")
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from);
+                if let Some(cache_id) = server_cache_id {
+                    let current_messages = body.get("messages")
+                        .and_then(|m| m.as_array())
+                        .cloned()
+                        .or_else(|| {
+                            // Incremental mode: reconstruct from cached + append.
+                            SESSION_CACHES.get(session_key).map(|c| {
+                                let mut msgs = c.messages.clone();
+                                if let Some(append) = body.get("messages_append").and_then(|a| a.as_array()) {
+                                    msgs.extend(append.iter().cloned());
+                                }
+                                msgs
+                            })
+                        })
+                        .unwrap_or_default();
+
+                    SESSION_CACHES.insert(session_key.clone(), SessionMessageCache {
+                        cache_id,
+                        messages: current_messages,
+                    });
+                }
+            }
+
             tracing::info!(
                 %status,
                 content_type = %content_type,
@@ -706,32 +781,53 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
     let model_lower = req.model.to_lowercase();
     let is_minimax = model_lower.contains("minimax");
 
-    match req.thinking_budget {
-        Some(budget) if budget > 0 => {
-            body["enable_thinking"] = json!(true);
-            body["thinking_budget"] = json!(budget);
-            body["chat_template_kwargs"] = json!({"enable_thinking": true});
-        }
-        _ => {
-            // Disable thinking for models that support it (DashScope, llama.cpp).
-            body["enable_thinking"] = json!(false);
-            body["chat_template_kwargs"] = json!({"enable_thinking": false});
-        }
-    }
-
-    // MiniMax: always split reasoning into reasoning_content field so <think>
-    // tags don't leak into content. Works regardless of thinking_budget.
+    // MiniMax does not support thinking/reasoning params — skip entirely.
     if is_minimax {
         body["reasoning_split"] = json!(true);
+    } else {
+        match req.thinking_budget {
+            Some(budget) if budget > 0 => {
+                body["enable_thinking"] = json!(true);
+                body["thinking_budget"] = json!(budget);
+                body["chat_template_kwargs"] = json!({"enable_thinking": true});
+            }
+            _ => {
+                // Disable thinking for models that support it (DashScope, llama.cpp).
+                body["enable_thinking"] = json!(false);
+                body["chat_template_kwargs"] = json!({"enable_thinking": false});
+            }
+        }
     }
 
     if let Some(sys) = &req.system {
-        // Always prepend the main system prompt as the first message.
-        // Other system messages (plugins, skills) may already be present
-        // but the main prompt must come first for KV cache prefix stability.
+        // Prepend the main system prompt, then merge all system messages
+        // into a single message. Some models (e.g. older Llama) don't
+        // support multiple system messages scattered through the array.
+        // Merge order: main prompt + plugins + skills + trailing system,
+        // joined by "\n". The main prompt is always the prefix, so the
+        // KV cache prefix stays stable when only trailing parts change.
         let mut msgs = vec![json!({"role": "system", "content": sys})];
         msgs.extend(body["messages"].as_array().cloned().unwrap_or_default());
-        body["messages"] = json!(msgs);
+
+        // Collect all system message contents in order, then keep only
+        // non-system messages.
+        let mut system_parts: Vec<String> = Vec::new();
+        let mut non_system: Vec<Value> = Vec::new();
+        for msg in &msgs {
+            if msg["role"].as_str() == Some("system") {
+                if let Some(c) = msg["content"].as_str() {
+                    if !c.is_empty() {
+                        system_parts.push(c.to_owned());
+                    }
+                }
+            } else {
+                non_system.push(msg.clone());
+            }
+        }
+
+        let mut merged = vec![json!({"role": "system", "content": system_parts.join("\n")})];
+        merged.extend(non_system);
+        body["messages"] = json!(merged);
     }
 
     if let Some(t) = req.temperature {
@@ -766,6 +862,9 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
     // sort tool_call arguments keys for bit-perfect prefix matching across turns.
     if let Some(msgs) = body["messages"].as_array_mut() {
         normalize_messages_for_cache(msgs);
+        // Fix orphaned tool_calls/tool_results: some providers (MiniMax) require
+        // strict assistant(tool_calls) → tool(result) pairing with no gaps.
+        fix_tool_call_pairing(msgs);
     }
 
     Ok(body)
@@ -795,6 +894,67 @@ fn normalize_messages_for_cache(messages: &mut [Value]) {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Fix tool_call / tool_result pairing issues.
+///
+/// Some providers (MiniMax error 2013) require that every `role: tool` message
+/// immediately follows an `assistant` message containing the matching `tool_calls`,
+/// and vice versa. After compaction or session manipulation, orphaned entries
+/// can appear. This function removes them.
+fn fix_tool_call_pairing(messages: &mut Vec<Value>) {
+    // Collect all tool_call_ids from assistant messages
+    let mut valid_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for msg in messages.iter() {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                for tc in tcs {
+                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                        valid_call_ids.insert(id.to_owned());
+                    }
+                }
+            }
+        }
+    }
+
+    // Collect all tool_call_ids that have a matching tool result
+    let mut result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for msg in messages.iter() {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("tool") {
+            if let Some(id) = msg.get("tool_call_id").and_then(|v| v.as_str()) {
+                result_ids.insert(id.to_owned());
+            }
+        }
+    }
+
+    // Remove orphaned tool results (no matching tool_call)
+    messages.retain(|msg| {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("tool") {
+            if let Some(id) = msg.get("tool_call_id").and_then(|v| v.as_str()) {
+                return valid_call_ids.contains(id);
+            }
+        }
+        true
+    });
+
+    // Remove tool_calls from assistant messages where results are missing
+    for msg in messages.iter_mut() {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()).cloned() {
+                let filtered: Vec<Value> = tcs.into_iter().filter(|tc| {
+                    tc.get("id").and_then(|v| v.as_str())
+                        .map(|id| result_ids.contains(id))
+                        .unwrap_or(true)
+                }).collect();
+                if filtered.is_empty() {
+                    // No tool_calls left — remove the field entirely
+                    msg.as_object_mut().map(|m| m.remove("tool_calls"));
+                } else if filtered.len() != msg["tool_calls"].as_array().map(|a| a.len()).unwrap_or(0) {
+                    msg["tool_calls"] = json!(filtered);
                 }
             }
         }

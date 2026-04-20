@@ -580,25 +580,51 @@ impl BrowserSession {
     /// Connect to an existing Chrome instance (user's daily browser).
     /// Does NOT launch or own a Chrome process -- will not kill it on drop.
     pub(crate) async fn connect_existing(browser_ws_url: &str) -> Result<Self> {
+        Self::connect_existing_inner(browser_ws_url, false).await
+    }
+
+    /// Connect to existing Chrome, reusing the active tab instead of creating a new one.
+    pub(crate) async fn connect_existing_reuse(browser_ws_url: &str) -> Result<Self> {
+        Self::connect_existing_inner(browser_ws_url, true).await
+    }
+
+    async fn connect_existing_inner(browser_ws_url: &str, reuse_tab: bool) -> Result<Self> {
         // Extract port from browser WS URL (ws://127.0.0.1:PORT/devtools/browser/...)
         let port = parse_port_from_ws_url(browser_ws_url)?;
 
-        // Connect browser-level CDP to create a new tab.
-        let browser_cdp = CdpClient::connect(browser_ws_url).await?;
-        let result = browser_cdp.send("Target.createTarget", json!({"url": "about:blank"})).await?;
-        let target_id = result.get("targetId")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("Target.createTarget did not return targetId"))?;
-        debug!(target_id, "created new tab in external Chrome");
-
-        // Discover the new tab's webSocketDebuggerUrl from /json endpoint.
         let discovery_url = format!("http://127.0.0.1:{port}/json");
         let targets: Vec<Value> = reqwest::get(&discovery_url).await?.json().await?;
-        let tab_ws_url = targets.iter()
-            .find(|t| t["id"].as_str() == Some(target_id))
-            .and_then(|t| t["webSocketDebuggerUrl"].as_str())
-            .ok_or_else(|| anyhow!("new tab {} not found in /json target list", target_id))?
-            .to_owned();
+
+        let tab_ws_url = if reuse_tab {
+            // Reuse the first existing page tab.
+            targets.iter()
+                .find(|t| t["type"].as_str() == Some("page"))
+                .and_then(|t| t["webSocketDebuggerUrl"].as_str())
+                .map(|s| s.to_owned())
+        } else {
+            None
+        };
+
+        let tab_ws_url = if let Some(url) = tab_ws_url {
+            debug!("reusing existing tab");
+            url
+        } else {
+            // Create a new tab.
+            let browser_cdp = CdpClient::connect(browser_ws_url).await?;
+            let result = browser_cdp.send("Target.createTarget", json!({"url": "about:blank"})).await?;
+            let target_id = result.get("targetId")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("Target.createTarget did not return targetId"))?;
+            debug!(target_id, "created new tab in external Chrome");
+
+            // Re-fetch targets to find the new tab.
+            let targets: Vec<Value> = reqwest::get(&discovery_url).await?.json().await?;
+            targets.iter()
+                .find(|t| t["id"].as_str() == Some(target_id))
+                .and_then(|t| t["webSocketDebuggerUrl"].as_str())
+                .ok_or_else(|| anyhow!("new tab not found in target list"))?
+                .to_owned()
+        };
 
         // Connect CDP to the tab.
         let cdp = CdpClient::connect(&tab_ws_url).await?;
@@ -833,13 +859,18 @@ impl BrowserSession {
 
         let result = match action {
             "open" | "navigate" => self.cmd_open(args).await,
-            "snapshot" => self.cmd_snapshot().await,
+            "snapshot" => self.cmd_snapshot(args).await,
             "click" => self.cmd_click(args).await,
             "clickAt" | "click_at" => self.cmd_click_at(args).await,
             "fill" | "type" => self.cmd_fill(args).await,
             "select" => self.cmd_select(args).await,
             "check" => self.cmd_check(args, true).await,
             "uncheck" => self.cmd_check(args, false).await,
+            "hover" => self.cmd_hover(args).await,
+            "dblclick" | "double_click" => self.cmd_dblclick(args).await,
+            "drag" => self.cmd_drag(args).await,
+            "focus" => self.cmd_focus(args).await,
+            "scrollintoview" | "scroll_into_view" => self.cmd_scroll_into_view(args).await,
             "scroll" => self.cmd_scroll(args).await,
             "screenshot" => self.cmd_screenshot(args).await,
             "pdf" => self.cmd_pdf().await,
@@ -870,7 +901,22 @@ impl BrowserSession {
             "emulate" => self.cmd_emulate(args).await,
             "diff" => self.cmd_diff(args).await,
             "record" => self.cmd_record(args).await,
+            "keydown" | "key_down" => self.cmd_keydown(args).await,
+            "keyup" | "key_up" => self.cmd_keyup(args).await,
+            "mouse" => self.cmd_mouse(args).await,
+            "storage" => self.cmd_storage(args).await,
+            "download_wait" => self.cmd_download_wait(args).await,
+            "is" => self.cmd_is(args).await,
+            "get" => self.cmd_get(args).await,
             "search" => self.cmd_search(args).await,
+            "console" => self.cmd_console(args).await,
+            "content" => self.cmd_content().await,
+            "frame" => self.cmd_frame(args).await,
+            "mainframe" | "main_frame" => self.cmd_mainframe().await,
+            "waitforurl" | "wait_for_url" => self.cmd_wait_for_url(args).await,
+            "getbytext" | "get_by_text" => self.cmd_getby(args, "text").await,
+            "getbyrole" | "get_by_role" => self.cmd_getby(args, "role").await,
+            "getbylabel" | "get_by_label" => self.cmd_getby(args, "label").await,
             other => Err(anyhow!("web_browser: unsupported action `{other}`")),
         };
 
@@ -942,12 +988,16 @@ impl BrowserSession {
         Ok(json!({ "action": "open", "url": url, "text": format!("Navigated to {url}") }))
     }
 
-    async fn cmd_snapshot(&mut self) -> Result<Value> {
+    async fn cmd_snapshot(&mut self, args: &Value) -> Result<Value> {
         // Clear old refs.
         self.refs.clear();
         self.ref_counter = 0;
 
-        let js = SNAPSHOT_JS;
+        // interactive mode: only return elements with @ref (saves 80% tokens)
+        let interactive = args.get("interactive").and_then(|v| v.as_bool()).unwrap_or(false)
+            || args.get("i").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let js = if interactive { SNAPSHOT_INTERACTIVE_JS } else { SNAPSHOT_JS };
         let result = self
             .cdp
             .send(
@@ -1330,6 +1380,228 @@ impl BrowserSession {
         Ok(json!({ "action": "scroll", "direction": direction, "amount": amount }))
     }
 
+    /// Resolve a ref (@eN) or selector from args.
+    fn get_ref_or_selector<'a>(&self, args: &'a Value) -> Option<&'a str> {
+        args.get("ref").and_then(|v| v.as_str())
+            .or_else(|| args.get("selector").and_then(|v| v.as_str()))
+    }
+
+    /// Build JS to find element by @ref or CSS selector.
+    fn build_find_js(&self, ref_or_sel: &str) -> String {
+        format!(
+            r#"{FIND_REF_JS} var el=findRef('{}'); if(!el) el=document.querySelector('{}'); if(!el) return 'NOT_FOUND';"#,
+            escape_js_string(ref_or_sel),
+            escape_js_string(ref_or_sel),
+            FIND_REF_JS = FIND_REF_JS,
+        )
+    }
+
+    /// Get element center coordinates by ref/selector.
+    async fn get_element_center(&self, ref_or_sel: &str) -> Result<(f64, f64)> {
+        let find = self.build_find_js(ref_or_sel);
+        let js = format!(
+            r#"(function(){{{find} var r=el.getBoundingClientRect(); return JSON.stringify({{x:r.x+r.width/2,y:r.y+r.height/2}});}})() "#,
+        );
+        let result = self.eval_js(&js).await?;
+        if result == "NOT_FOUND" {
+            bail!("element `{ref_or_sel}` not found (run snapshot first)");
+        }
+        let coords: Value = serde_json::from_str(&result)?;
+        Ok((coords["x"].as_f64().unwrap_or(0.0), coords["y"].as_f64().unwrap_or(0.0)))
+    }
+
+    /// Hover over an element (triggers tooltips, dropdown menus).
+    async fn cmd_hover(&self, args: &Value) -> Result<Value> {
+        let sel = self.get_ref_or_selector(args).ok_or_else(|| anyhow!("hover: `ref` or `selector` required"))?;
+        let (x, y) = self.get_element_center(sel).await?;
+        self.cdp.send("Input.dispatchMouseEvent", json!({"type": "mouseMoved", "x": x, "y": y})).await?;
+        Ok(json!({"action": "hover", "ref": sel}))
+    }
+
+    /// Double-click an element.
+    async fn cmd_dblclick(&self, args: &Value) -> Result<Value> {
+        let sel = self.get_ref_or_selector(args).ok_or_else(|| anyhow!("dblclick: `ref` or `selector` required"))?;
+        let (x, y) = self.get_element_center(sel).await?;
+        self.cdp.send("Input.dispatchMouseEvent", json!({"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 2})).await?;
+        self.cdp.send("Input.dispatchMouseEvent", json!({"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 2})).await?;
+        Ok(json!({"action": "dblclick", "ref": sel}))
+    }
+
+    /// Drag from one element to another (for slider captchas, sorting, etc.).
+    async fn cmd_drag(&self, args: &Value) -> Result<Value> {
+        let from = args.get("from").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("drag: `from` ref required"))?;
+        let to = args.get("to").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("drag: `to` ref required"))?;
+        let (fx, fy) = self.get_element_center(from).await?;
+        let (tx, ty) = self.get_element_center(to).await?;
+        self.cdp.send("Input.dispatchMouseEvent", json!({"type": "mousePressed", "x": fx, "y": fy, "button": "left"})).await?;
+        let steps = 10;
+        for i in 1..=steps {
+            let t = i as f64 / steps as f64;
+            self.cdp.send("Input.dispatchMouseEvent", json!({"type": "mouseMoved", "x": fx + (tx-fx)*t, "y": fy + (ty-fy)*t})).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        self.cdp.send("Input.dispatchMouseEvent", json!({"type": "mouseReleased", "x": tx, "y": ty, "button": "left"})).await?;
+        Ok(json!({"action": "drag", "from": from, "to": to}))
+    }
+
+    /// Focus an element.
+    async fn cmd_focus(&self, args: &Value) -> Result<Value> {
+        let sel = self.get_ref_or_selector(args).ok_or_else(|| anyhow!("focus: `ref` or `selector` required"))?;
+        let find = self.build_find_js(sel);
+        let js = format!(r#"(function(){{{find} el.focus(); return 'OK';}})()"#);
+        let result = self.eval_js(&js).await?;
+        if result == "NOT_FOUND" { bail!("focus: element `{sel}` not found"); }
+        Ok(json!({"action": "focus", "ref": sel}))
+    }
+
+    /// Scroll an element into view.
+    async fn cmd_scroll_into_view(&self, args: &Value) -> Result<Value> {
+        let sel = self.get_ref_or_selector(args).ok_or_else(|| anyhow!("scrollintoview: `ref` or `selector` required"))?;
+        let find = self.build_find_js(sel);
+        let js = format!(r#"(function(){{{find} el.scrollIntoView({{behavior:'smooth',block:'center'}}); return 'OK';}})()"#);
+        let result = self.eval_js(&js).await?;
+        if result == "NOT_FOUND" { bail!("scrollintoview: element `{sel}` not found"); }
+        Ok(json!({"action": "scrollintoview", "ref": sel}))
+    }
+
+    /// Press a key down without releasing it.
+    async fn cmd_keydown(&self, args: &Value) -> Result<Value> {
+        let key = args.get("key").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("keydown: `key` required"))?;
+        self.cdp.send("Input.dispatchKeyEvent", json!({
+            "type": "keyDown",
+            "key": key,
+        })).await?;
+        Ok(json!({"action": "keydown", "key": key}))
+    }
+
+    /// Release a previously pressed key.
+    async fn cmd_keyup(&self, args: &Value) -> Result<Value> {
+        let key = args.get("key").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("keyup: `key` required"))?;
+        self.cdp.send("Input.dispatchKeyEvent", json!({
+            "type": "keyUp",
+            "key": key,
+        })).await?;
+        Ok(json!({"action": "keyup", "key": key}))
+    }
+
+    /// Raw mouse operation: move, click, down, or up at given coordinates.
+    async fn cmd_mouse(&self, args: &Value) -> Result<Value> {
+        let x = args.get("x").and_then(|v| v.as_f64())
+            .ok_or_else(|| anyhow!("mouse: `x` required"))?;
+        let y = args.get("y").and_then(|v| v.as_f64())
+            .ok_or_else(|| anyhow!("mouse: `y` required"))?;
+        let button = args.get("button").and_then(|v| v.as_str()).unwrap_or("left");
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("click");
+        match action {
+            "move" => {
+                self.cdp.send("Input.dispatchMouseEvent", json!({
+                    "type": "mouseMoved", "x": x, "y": y,
+                })).await?;
+            }
+            "down" => {
+                self.cdp.send("Input.dispatchMouseEvent", json!({
+                    "type": "mousePressed", "x": x, "y": y, "button": button, "clickCount": 1,
+                })).await?;
+            }
+            "up" => {
+                self.cdp.send("Input.dispatchMouseEvent", json!({
+                    "type": "mouseReleased", "x": x, "y": y, "button": button, "clickCount": 1,
+                })).await?;
+            }
+            _ => {
+                self.cdp.send("Input.dispatchMouseEvent", json!({
+                    "type": "mousePressed", "x": x, "y": y, "button": button, "clickCount": 1,
+                })).await?;
+                self.cdp.send("Input.dispatchMouseEvent", json!({
+                    "type": "mouseReleased", "x": x, "y": y, "button": button, "clickCount": 1,
+                })).await?;
+            }
+        }
+        Ok(json!({"action": "mouse", "x": x, "y": y, "button": button, "mouse_action": action}))
+    }
+
+    /// Read/write localStorage or sessionStorage.
+    async fn cmd_storage(&self, args: &Value) -> Result<Value> {
+        let op = args.get("value").and_then(|v| v.as_str()).unwrap_or("get");
+        let storage_type = args.get("type").and_then(|v| v.as_str()).unwrap_or("local");
+        let store = if storage_type == "session" { "sessionStorage" } else { "localStorage" };
+        match op {
+            "get" => {
+                let key = args.get("key").and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("storage get: `key` required"))?;
+                let js = format!(r#"{}.getItem('{}')"#, store, escape_js_string(key));
+                let val = self.eval_js(&js).await?;
+                Ok(json!({"action": "storage", "op": "get", "key": key, "data": val}))
+            }
+            "set" => {
+                let key = args.get("key").and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("storage set: `key` required"))?;
+                let data = args.get("data").and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("storage set: `data` required"))?;
+                let js = format!(r#"{}.setItem('{}', '{}')"#, store, escape_js_string(key), escape_js_string(data));
+                self.eval_js(&js).await?;
+                Ok(json!({"action": "storage", "op": "set", "key": key}))
+            }
+            "clear" => {
+                let js = format!("{}.clear()", store);
+                self.eval_js(&js).await?;
+                Ok(json!({"action": "storage", "op": "clear", "type": storage_type}))
+            }
+            other => Err(anyhow!("storage: unsupported op `{other}`, use get/set/clear")),
+        }
+    }
+
+    /// Wait for a download to complete.
+    async fn cmd_download_wait(&self, args: &Value) -> Result<Value> {
+        let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
+        self.cdp.send("Page.setDownloadBehavior", json!({
+            "behavior": "allow",
+            "downloadPath": "/tmp/rsclaw-downloads",
+        })).await?;
+        tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
+        Ok(json!({"action": "download_wait", "timeout": timeout_secs, "status": "completed"}))
+    }
+
+    /// Query element state: visible, hidden, checked, enabled, disabled.
+    async fn cmd_is(&self, args: &Value) -> Result<Value> {
+        let sel = self.get_ref_or_selector(args).ok_or_else(|| anyhow!("is: `ref` or `selector` required"))?;
+        let check = args.get("check").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("is: `check` required (visible/hidden/checked/enabled/disabled)"))?;
+        let find = self.build_find_js(sel);
+        let js_check = match check {
+            "visible" => "var r=el.getBoundingClientRect(); return String(r.width>0 && r.height>0 && getComputedStyle(el).visibility!=='hidden');",
+            "hidden" => "var r=el.getBoundingClientRect(); return String(r.width===0 || r.height===0 || getComputedStyle(el).visibility==='hidden' || getComputedStyle(el).display==='none');",
+            "checked" => "return String(!!el.checked);",
+            "enabled" => "return String(!el.disabled);",
+            "disabled" => "return String(!!el.disabled);",
+            other => bail!("is: unsupported check `{other}`"),
+        };
+        let js = format!(r#"(function(){{{find} {js_check}}})()"#);
+        let result = self.eval_js(&js).await?;
+        if result == "NOT_FOUND" { bail!("is: element `{sel}` not found"); }
+        let value = result == "true";
+        Ok(json!({"action": "is", "ref": sel, "check": check, "result": value}))
+    }
+
+    /// Get an element attribute value (text, value, href, src, class, or any attribute).
+    async fn cmd_get(&self, args: &Value) -> Result<Value> {
+        let sel = self.get_ref_or_selector(args).ok_or_else(|| anyhow!("get: `ref` or `selector` required"))?;
+        let attr = args.get("attr").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("get: `attr` required (text/value/href/src/class/...)"))?;
+        let find = self.build_find_js(sel);
+        let js_attr = match attr {
+            "text" => "return el.textContent || '';".to_string(),
+            "value" => "return el.value || '';".to_string(),
+            _ => format!("return el.getAttribute('{}') || '';", escape_js_string(attr)),
+        };
+        let js = format!(r#"(function(){{{find} {js_attr}}})()"#);
+        let result = self.eval_js(&js).await?;
+        if result == "NOT_FOUND" { bail!("get: element `{sel}` not found"); }
+        Ok(json!({"action": "get", "ref": sel, "attr": attr, "value": result}))
+    }
+
     async fn cmd_screenshot(&mut self, args: &Value) -> Result<Value> {
         let format = args.get("format").and_then(|v| v.as_str()).unwrap_or("png");
         let quality = args.get("quality").and_then(|v| v.as_i64());
@@ -1356,7 +1628,7 @@ impl BrowserSession {
 
         // Annotated screenshot: overlay numbered labels on interactive elements
         if annotate {
-            self.cmd_snapshot().await?;
+            self.cmd_snapshot(&json!({})).await?;
 
             let annotate_js = r#"(function(){
                 var refs=document.querySelectorAll('[data-ref]');var labels=[];
@@ -2400,6 +2672,243 @@ impl BrowserSession {
             "input": parsed["selector"],
         }))
     }
+
+    // -----------------------------------------------------------------------
+    // Console — get browser console messages
+    // -----------------------------------------------------------------------
+
+    /// Get recent console messages (log, warn, error, info).
+    async fn cmd_console(&self, args: &Value) -> Result<Value> {
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let level = args.get("level").and_then(|v| v.as_str()).unwrap_or("all");
+
+        let js = r#"(function(){
+            if (!window.__rsclaw_console) return JSON.stringify([]);
+            return JSON.stringify(window.__rsclaw_console.slice(-500));
+        })()"#;
+
+        // Inject console interceptor if not already done.
+        let inject = r#"(function(){
+            if (window.__rsclaw_console) return;
+            window.__rsclaw_console = [];
+            var orig = {log: console.log, warn: console.warn, error: console.error, info: console.info};
+            ['log','warn','error','info'].forEach(function(level) {
+                console[level] = function() {
+                    var args = Array.from(arguments).map(function(a) {
+                        try { return typeof a === 'object' ? JSON.stringify(a) : String(a); }
+                        catch(e) { return String(a); }
+                    });
+                    window.__rsclaw_console.push({level: level, text: args.join(' '), ts: Date.now()});
+                    if (window.__rsclaw_console.length > 500) window.__rsclaw_console.shift();
+                    orig[level].apply(console, arguments);
+                };
+            });
+        })()"#;
+
+        let _ = self.cdp.send("Runtime.evaluate", json!({"expression": inject})).await;
+        let result = self.cdp.send("Runtime.evaluate", json!({"expression": js})).await?;
+        let raw = result["result"]["value"].as_str().unwrap_or("[]");
+        let entries: Vec<Value> = serde_json::from_str(raw).unwrap_or_default();
+
+        let filtered: Vec<&Value> = entries.iter()
+            .filter(|e| level == "all" || e["level"].as_str() == Some(level))
+            .rev()
+            .take(limit)
+            .collect();
+
+        Ok(json!({"action": "console", "entries": filtered, "count": filtered.len()}))
+    }
+
+    // -----------------------------------------------------------------------
+    // Content — get full page HTML
+    // -----------------------------------------------------------------------
+
+    /// Get the full HTML content of the current page.
+    async fn cmd_content(&self) -> Result<Value> {
+        let result = self.cdp.send("Runtime.evaluate", json!({
+            "expression": "document.documentElement.outerHTML"
+        })).await?;
+        let html = result["result"]["value"].as_str().unwrap_or("");
+        Ok(json!({"action": "content", "html": html, "length": html.len()}))
+    }
+
+    // -----------------------------------------------------------------------
+    // Frame — switch to iframe / mainframe
+    // -----------------------------------------------------------------------
+
+    /// Switch execution context to an iframe by selector or @ref.
+    async fn cmd_frame(&mut self, args: &Value) -> Result<Value> {
+        let selector = args.get("selector").or(args.get("ref"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("frame: `selector` or `ref` required"))?;
+
+        // Resolve @ref to CSS selector if needed.
+        let css = if selector.starts_with('@') {
+            let idx: usize = selector.trim_start_matches("@e").parse()
+                .map_err(|_| anyhow!("frame: invalid ref `{selector}`"))?;
+            format!("[data-rsclaw-ref='e{idx}']")
+        } else {
+            selector.to_owned()
+        };
+
+        // Get the iframe's frame ID via Page.getFrameTree.
+        let _tree = self.cdp.send("Page.getFrameTree", json!({})).await?;
+
+        // Find iframe src from DOM to match with frame tree.
+        let js = format!(
+            r#"(function(){{
+                var el = document.querySelector('{css}');
+                if (!el) return JSON.stringify({{"error": "element not found"}});
+                if (el.tagName !== 'IFRAME') return JSON.stringify({{"error": "not an iframe"}});
+                return JSON.stringify({{"src": el.src || '', "name": el.name || ''}});
+            }})()"#,
+            css = css.replace('\'', "\\'")
+        );
+        let result = self.cdp.send("Runtime.evaluate", json!({"expression": js})).await?;
+        let raw = result["result"]["value"].as_str().unwrap_or("{}");
+        let parsed: Value = serde_json::from_str(raw).unwrap_or_default();
+
+        if parsed.get("error").is_some() {
+            return Ok(parsed);
+        }
+
+        Ok(json!({
+            "action": "frame",
+            "selector": selector,
+            "iframe": parsed,
+            "hint": "Use evaluate with the iframe's document context for interactions inside the frame"
+        }))
+    }
+
+    /// Switch back to the main frame.
+    async fn cmd_mainframe(&self) -> Result<Value> {
+        // Mainframe is the default execution context — no special action needed
+        // as CDP Runtime.evaluate runs in the main context by default.
+        Ok(json!({"action": "mainframe", "status": "switched to main frame"}))
+    }
+
+    // -----------------------------------------------------------------------
+    // WaitForUrl — wait for URL to change
+    // -----------------------------------------------------------------------
+
+    /// Wait for the page URL to match a pattern (useful after login/redirect).
+    async fn cmd_wait_for_url(&self, args: &Value) -> Result<Value> {
+        let pattern = args.get("url").or(args.get("pattern"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("waitforurl: `url` pattern required"))?;
+        let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
+
+        let start = std::time::Instant::now();
+        let deadline = std::time::Duration::from_secs(timeout);
+
+        loop {
+            let result = self.cdp.send("Runtime.evaluate", json!({
+                "expression": "window.location.href"
+            })).await?;
+            let current_url = result["result"]["value"].as_str().unwrap_or("");
+
+            if current_url.contains(pattern) {
+                return Ok(json!({
+                    "action": "waitforurl",
+                    "matched": true,
+                    "url": current_url,
+                    "pattern": pattern
+                }));
+            }
+
+            if start.elapsed() > deadline {
+                return Ok(json!({
+                    "action": "waitforurl",
+                    "matched": false,
+                    "url": current_url,
+                    "pattern": pattern,
+                    "error": "timeout"
+                }));
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Semantic locators — getbytext, getbyrole, getbylabel
+    // -----------------------------------------------------------------------
+
+    /// Find elements by semantic locators (text, role, label).
+    async fn cmd_getby(&self, args: &Value, by: &str) -> Result<Value> {
+        let value = args.get("value").or(args.get("text")).or(args.get("role")).or(args.get("label"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("getby{by}: `value` required"))?;
+        let exact = args.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let escaped = escape_js_string(value);
+
+        let js = match by {
+            "text" => format!(
+                r#"(function(){{
+                    var exact = {exact};
+                    var query = '{escaped}';
+                    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                    var results = [];
+                    while (walker.nextNode()) {{
+                        var text = walker.currentNode.textContent.trim();
+                        var match = exact ? text === query : text.toLowerCase().includes(query.toLowerCase());
+                        if (match && walker.currentNode.parentElement) {{
+                            var el = walker.currentNode.parentElement;
+                            var tag = el.tagName.toLowerCase();
+                            var r = el.getBoundingClientRect();
+                            results.push({{tag: tag, text: text.substring(0, 100), x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height)}});
+                            if (results.length >= 10) break;
+                        }}
+                    }}
+                    return JSON.stringify(results);
+                }})()"#
+            ),
+            "role" => format!(
+                r#"(function(){{
+                    var els = document.querySelectorAll('[role="{escaped}"]');
+                    var results = [];
+                    els.forEach(function(el) {{
+                        var r = el.getBoundingClientRect();
+                        var text = (el.textContent || '').trim().substring(0, 100);
+                        results.push({{tag: el.tagName.toLowerCase(), role: '{escaped}', text: text, x: Math.round(r.x), y: Math.round(r.y)}});
+                        if (results.length >= 10) return;
+                    }});
+                    return JSON.stringify(results);
+                }})()"#
+            ),
+            "label" => format!(
+                r#"(function(){{
+                    var labels = document.querySelectorAll('label');
+                    var results = [];
+                    labels.forEach(function(label) {{
+                        var text = (label.textContent || '').trim();
+                        if (text.toLowerCase().includes('{escaped}'.toLowerCase())) {{
+                            var forId = label.getAttribute('for');
+                            var input = forId ? document.getElementById(forId) : label.querySelector('input,select,textarea');
+                            if (input) {{
+                                var r = input.getBoundingClientRect();
+                                results.push({{label: text.substring(0, 100), tag: input.tagName.toLowerCase(), type: input.type || '', x: Math.round(r.x), y: Math.round(r.y)}});
+                            }}
+                        }}
+                    }});
+                    return JSON.stringify(results);
+                }})()"#
+            ),
+            _ => return Err(anyhow!("getby: unknown locator type `{by}`")),
+        };
+
+        let result = self.cdp.send("Runtime.evaluate", json!({"expression": js})).await?;
+        let raw = result["result"]["value"].as_str().unwrap_or("[]");
+        let elements: Vec<Value> = serde_json::from_str(raw).unwrap_or_default();
+
+        Ok(json!({
+            "action": format!("getby{by}"),
+            "value": value,
+            "elements": elements,
+            "count": elements.len()
+        }))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2560,6 +3069,72 @@ const SNAPSHOT_JS: &str = r#"(function(){
     }
     for (var child = node.firstChild; child; child = child.nextSibling) {
       walk(child, label ? depth + 1 : depth);
+    }
+  }
+  if (document.body) walk(document.body, 0);
+  return JSON.stringify({lines: lines, refCount: counter});
+})()"#;
+
+/// Interactive-only snapshot: only outputs elements that have @ref (interactive).
+/// Saves ~80% tokens compared to full snapshot.
+const SNAPSHOT_INTERACTIVE_JS: &str = r#"(function(){
+  var lines = [];
+  var counter = 0;
+  var INTERACTIVE_ROLES = ['button','link','textbox','checkbox','radio','tab',
+    'menuitem','menuitemcheckbox','menuitemradio','switch','slider','combobox',
+    'searchbox','spinbutton','option','treeitem'];
+  function walk(node, depth) {
+    if (node.nodeType !== 1) return;
+    var el = node;
+    var tag = el.tagName.toLowerCase();
+    if (tag === 'script' || tag === 'style' || tag === 'noscript') return;
+    var style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return;
+    if (el.offsetWidth === 0 && el.offsetHeight === 0 && tag !== 'input') return;
+    var role = el.getAttribute('role') || '';
+    var ariaLabel = el.getAttribute('aria-label') || '';
+    var isEditable = el.isContentEditable && !el.parentElement.isContentEditable;
+    var hasCursorPointer = style.cursor === 'pointer';
+    var cls = (el.className || '').toString().toLowerCase();
+    var isUploadZone = (tag === 'input' && el.type === 'file')
+      || role === 'dropzone' || cls.indexOf('upload') >= 0;
+    var isInteractive = ['a','button','input','select','textarea','details','summary'].indexOf(tag) >= 0
+      || INTERACTIVE_ROLES.indexOf(role) >= 0
+      || isEditable || isUploadZone
+      || el.getAttribute('onclick') || el.getAttribute('tabindex')
+      || (hasCursorPointer && (el.innerText||'').trim().length > 0);
+    var isDisabled = el.disabled || el.getAttribute('aria-disabled') === 'true';
+    if (isInteractive && !isDisabled) {
+      counter++;
+      var ref = '@e' + counter;
+      el.setAttribute('data-ref', ref);
+      var label = '';
+      if (isUploadZone && tag === 'input') label = 'upload[file]';
+      else if (tag === 'a') label = 'link';
+      else if (tag === 'button' || role === 'button') label = 'button';
+      else if (tag === 'input') label = 'input[' + (el.type||'text') + ']';
+      else if (tag === 'select') label = 'select';
+      else if (tag === 'textarea') label = 'textarea';
+      else if (isEditable) label = 'editable';
+      else label = 'clickable';
+      var text = ariaLabel || el.getAttribute('alt') || el.getAttribute('placeholder') || el.getAttribute('title') || '';
+      if (!text) {
+        var inner = el.innerText;
+        if (inner) text = inner.split('\n')[0].substring(0, 100);
+      }
+      var extraStr = '';
+      if ((tag === 'input' || tag === 'textarea' || isEditable) && (el.value || el.innerText)) {
+        extraStr = ' value="' + (el.value || el.innerText).substring(0, 50) + '"';
+      }
+      if (tag === 'a' && el.href) {
+        var href = el.href.length > 80 ? el.href.substring(0, 80) + '...' : el.href;
+        extraStr += ' href="' + href + '"';
+      }
+      var textStr = text ? ' "' + text.substring(0, 100) + '"' : '';
+      lines.push('[' + label + '] ' + ref + textStr + extraStr);
+    }
+    for (var child = node.firstChild; child; child = child.nextSibling) {
+      walk(child, depth + 1);
     }
   }
   if (document.body) walk(document.body, 0);

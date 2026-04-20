@@ -364,10 +364,15 @@ pub fn tool_prompts_for_system(base_dir: &Path, _lang: Option<&str>) -> String {
          ## Tool Selection\n\
          | Need | Tool |\n\
          |------|------|\n\
-         | Search/discover info | web_search |\n\
-         | Read known URL (static) | web_fetch |\n\
+         | Structured data from websites | anycli (PREFERRED — use `list` action to check available adapters) |\n\
+         | Search/discover info from unknown sources | web_search |\n\
+         | Read known URL (static page) | web_fetch |\n\
          | Login required, interactive, anti-crawl | web_browser |\n\
          | Form submission, file upload, dynamic pages | web_browser |\n\
+         \n\
+         **anycli priority**: When user mentions a website, first call anycli with action=list \
+         to check if an adapter exists. If yes, use it — structured data is far better than raw HTML. \
+         If no adapter exists, try anycli search action, then fall back to web_search/web_fetch.\n\
          \n\
          ## web_browser Core Flow\n\
          1. `open` URL -> 2. `snapshot` (get refs @e1...) -> 3. interact via refs -> 4. re-snapshot\n\

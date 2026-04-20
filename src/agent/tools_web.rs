@@ -427,10 +427,31 @@ impl AgentRuntime {
             }
         }
 
-        // --- Auto-fetch top 3 results for deeper content ---
-        let fetch_count = results.len().min(3);
+        // --- Auto-fetch relevant results for deeper content ---
+        // Score each result by relevance to the query, only deep-fetch those
+        // that are likely useful.  This avoids wasting time on unrelated pages.
+        let query_terms: Vec<String> = query.to_lowercase()
+            .split_whitespace()
+            .filter(|w| w.len() > 1)
+            .map(String::from)
+            .collect();
+
         let fetch_urls: Vec<String> = results.iter()
-            .take(fetch_count)
+            .filter(|r| {
+                let title = r["title"].as_str().unwrap_or("").to_lowercase();
+                let snippet = r["snippet"].as_str().unwrap_or("").to_lowercase();
+                let haystack = format!("{title} {snippet}");
+
+                // Count how many query terms appear in title+snippet.
+                let hits = query_terms.iter()
+                    .filter(|t| haystack.contains(t.as_str()))
+                    .count();
+
+                // Require at least half the query terms to match, or always
+                // include the first 2 results as fallback.
+                hits * 2 >= query_terms.len() || hits > 0
+            })
+            .take(5)
             .filter_map(|r| r["url"].as_str().map(String::from))
             .collect();
 
@@ -698,15 +719,16 @@ impl AgentRuntime {
             var el = document.querySelector('article') || document.querySelector('main')
                 || document.querySelector('.content') || document.body;
             var title = document.title || '';
-            var text = el ? el.innerText || '' : '';
-            return JSON.stringify({title: title, text: text});
+            var html = el ? el.innerHTML || '' : '';
+            return JSON.stringify({title: title, html: html});
         })()"#;
         let result = tab.evaluate(js).await?;
         let result_str = result.as_str().unwrap_or("{}");
         let parsed: Value = serde_json::from_str(result_str).unwrap_or_default();
         let title = parsed["title"].as_str().unwrap_or("").to_owned();
-        let text = parsed["text"].as_str().unwrap_or("").to_owned();
-        Ok((title, text))
+        let html = parsed["html"].as_str().unwrap_or("");
+        let md = htmd::convert(html).unwrap_or_else(|_| strip_html(html));
+        Ok((title, md))
     }
 
     /// Browser-based search fallback: open a search engine in the shared browser pool,
@@ -842,7 +864,7 @@ impl AgentRuntime {
             max_tokens: Some(2000),
             temperature: None,
             frequency_penalty: None,
-            thinking_budget: None,
+            thinking_budget: None, kv_cache_mode: 0, session_key: None,
         };
 
         match provider.stream(req).await {
@@ -947,10 +969,18 @@ impl AgentRuntime {
         if !cookie_header.is_empty() {
             req = req.header("Cookie", &cookie_header);
         }
-        // Set Referer from URL origin — many CDNs (douyin, etc.) require it.
-        if let Ok(parsed) = reqwest::Url::parse(url) {
-            if let Some(origin) = parsed.host_str() {
-                req = req.header("Referer", format!("{}://{}/", parsed.scheme(), origin));
+        // Set Referer — use custom referer if provided, otherwise derive from URL.
+        // Jimeng CDN (byteimg.com) requires Referer from jimeng.jianying.com.
+        if let Some(referer) = args["referer"].as_str() {
+            req = req.header("Referer", referer);
+        } else if let Ok(parsed) = reqwest::Url::parse(url) {
+            if let Some(host) = parsed.host_str() {
+                let referer = if host.contains("byteimg.com") || host.contains("dreamina") {
+                    "https://jimeng.jianying.com/".to_string()
+                } else {
+                    format!("{}://{}/", parsed.scheme(), host)
+                };
+                req = req.header("Referer", referer);
             }
         }
         if existing_size > 0 {

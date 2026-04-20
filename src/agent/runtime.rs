@@ -247,6 +247,8 @@ pub struct AgentRuntime {
     pub plugins: Option<Arc<PluginRegistry>>,
     /// MCP server registry — None when no MCP servers are configured.
     pub mcp: Option<Arc<crate::mcp::McpRegistry>>,
+    /// WASM plugin instances for tool dispatch (shared across agents).
+    pub wasm_plugins: Arc<Vec<crate::plugin::WasmPlugin>>,
     /// CDP browser session -- lazy-initialized on first web_browser tool call.
     /// Stored as Option so it can be dropped (killing Chrome) when idle expires.
     pub(crate) browser: Arc<tokio::sync::Mutex<Option<crate::browser::BrowserSession>>>,
@@ -345,6 +347,7 @@ impl AgentRuntime {
             spawner,
             plugins,
             mcp,
+            wasm_plugins: Arc::new(Vec::new()),
             live_status,
             browser: Arc::new(tokio::sync::Mutex::new(None)),
             sessions: std::collections::HashMap::new(),
@@ -490,6 +493,8 @@ impl AgentRuntime {
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None,
+            kv_cache_mode: 0,
+            session_key: None,
         };
 
         let providers = Arc::clone(&self.providers);
@@ -3272,6 +3277,7 @@ impl AgentRuntime {
                 Some(0.6)
             };
 
+            let kv_cache_mode = self.config.agents.defaults.kv_cache_mode.unwrap_or(1);
             let req = LlmRequest {
                 model: model.to_owned(),
                 messages,
@@ -3281,6 +3287,8 @@ impl AgentRuntime {
                 temperature,
                 frequency_penalty: self.config.agents.defaults.frequency_penalty,
                 thinking_budget,
+                kv_cache_mode,
+                session_key: if kv_cache_mode >= 2 { Some(ctx.session_key.clone()) } else { None },
             };
 
             // Update live status: LLM call starting.
@@ -3766,8 +3774,11 @@ impl AgentRuntime {
             }
 
             // Push assistant message with tool_calls as Parts.
+            // Intermediate text (e.g. "好的，我来帮你搜索") is NOT saved to session —
+            // it's already sent to the user above but pollutes context quality.
             let mut parts: Vec<crate::provider::ContentPart> = Vec::new();
-            if !text_buf.is_empty() {
+            if !text_buf.is_empty() && tool_calls.is_empty() {
+                // Only save text if there are no tool calls (final reply).
                 parts.push(crate::provider::ContentPart::Text { text: text_buf });
             }
             for (id, name, input) in &tool_calls {
@@ -4457,6 +4468,8 @@ impl AgentRuntime {
             "pdf" => return self.tool_pdf(args).await,
             "text_to_voice" | "text_to_speech" | "tts" => return self.tool_tts(args).await,
             "send_message" | "message" => return self.tool_message(args).await,
+            "clarify" => return self.tool_clarify(args).await,
+            "anycli" | "opencli" => return self.tool_anycli(args).await,
             "cron" => return self.tool_cron(args, ctx).await,
             "gateway" => return self.tool_gateway(args).await,
             "pairing" => return self.tool_pairing(args).await,

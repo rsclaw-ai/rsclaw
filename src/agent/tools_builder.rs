@@ -18,7 +18,7 @@ pub(crate) fn toolset_allowed_names(
     toolset: &str,
     custom_tools: Option<&Vec<String>>,
 ) -> Option<std::collections::HashSet<String>> {
-    const MINIMAL: &[&str] = &["execute_command", "read_file", "write_file", "send_file", "list_dir", "search_file", "search_content", "web_search", "web_fetch", "memory"];
+    const MINIMAL: &[&str] = &["execute_command", "read_file", "write_file", "send_file", "list_dir", "search_file", "search_content", "web_search", "web_fetch", "memory", "clarify", "anycli"];
     const WEB: &[&str] = &["web_search", "web_fetch", "web_download", "read_file", "write_file", "list_dir", "search_file", "memory"];
     const CODE: &[&str] = &["execute_command", "read_file", "write_file", "list_dir", "search_file", "search_content", "memory"];
     const STANDARD: &[&str] = &[
@@ -37,6 +37,8 @@ pub(crate) fn toolset_allowed_names(
         "channel",
         "cron",
         "computer_use",
+        "clarify",
+        "anycli",
     ];
 
     let base: Option<&[&str]> = match toolset {
@@ -355,12 +357,18 @@ pub(crate) fn build_tool_list(
         name: "web_browser".to_owned(),
         description: "Control a web browser. Core workflow:\n\
             1. `open` — navigate to a URL\n\
-            2. `snapshot` — get page content with interactive element refs (@e1, @e2...)\n\
-            3. `click` ref=@e1 / `fill` ref=@e2 text='...' — interact using refs from snapshot\n\
+            2. `snapshot` — get page structure with interactive element refs (@e1, @e2...). Use `interactive: true` to only get actionable elements (saves tokens).\n\
+            3. `click` ref=@e1 / `fill` ref=@e2 text='...' — interact using refs\n\
             4. Re-snapshot after any page change to get updated refs\n\
-            Quick search: `search` — auto-find search box on ANY site, fill text, submit, return results. Use this for site-specific searches (Douyin, Taobao, JD, etc.).\n\
+            Interaction: hover (triggers menus/tooltips), dblclick, drag (from=@e1 to=@e2, for sliders), focus, scrollintoview.\n\
+            Quick search: `search` — auto-find search box on ANY site, fill text, submit, return results.\n\
             `clickAt` ref=@e1 or x=100 y=200 — real mouse click via CDP (for file dialogs, anti-bot sites).\n\
-            Other actions: type, select, check, scroll, screenshot, pdf, press, back, forward, reload, wait, evaluate, cookies, get_text, get_url, get_title, find, get_article, upload, new_tab, switch_tab, close_tab.\n\
+            Semantic locators: `getbytext` value='Submit', `getbyrole` value='button', `getbylabel` value='Email' — find elements without @ref.\n\
+            Frame: `frame` selector=@e1 (switch to iframe), `mainframe` (switch back).\n\
+            Console: `console` — get browser console messages (log/warn/error).\n\
+            Content: `content` — get full page HTML.\n\
+            WaitForUrl: `waitforurl` url='dashboard' — wait for URL change (after login/redirect).\n\
+            Other: type, select, check, scroll, screenshot, pdf, press, back, forward, reload, wait, evaluate, cookies, get_text, get_url, get_title, find, get_article, upload, new_tab, switch_tab, close_tab.\n\
             IMPORTANT: Always snapshot BEFORE clicking/filling. Element refs change after page updates.".to_owned(),
         parameters: json!({
             "type": "object",
@@ -368,15 +376,20 @@ pub(crate) fn build_tool_list(
                 "action":     {"type": "string", "enum": [
                     "open", "navigate", "snapshot", "click", "clickAt", "fill", "type",
                     "select", "check", "uncheck", "scroll", "screenshot", "pdf",
+                    "hover", "dblclick", "drag", "focus", "scrollintoview",
                     "back", "forward", "reload", "get_text", "get_url", "get_title",
                     "wait", "evaluate", "cookies", "press", "set_viewport",
                     "dialog", "state", "network", "new_tab", "list_tabs",
                     "switch_tab", "close_tab", "highlight", "clipboard", "find",
                     "get_article", "upload", "context", "emulate", "diff", "record",
-                    "search"
+                    "search", "console", "content", "frame", "mainframe",
+                    "waitforurl", "getbytext", "getbyrole", "getbylabel"
                 ]},
                 "url":        {"type": "string", "description": "URL for open/navigate"},
+                "interactive":{"type": "boolean", "description": "For snapshot: only return actionable elements (saves ~80% tokens). Default: false"},
                 "ref":        {"type": "string", "description": "Element ref like @e3 from snapshot"},
+                "from":       {"type": "string", "description": "Source element ref for drag"},
+                "to":         {"type": "string", "description": "Target element ref for drag"},
                 "x":          {"type": "number", "description": "X pixel coordinate for clickAt"},
                 "y":          {"type": "number", "description": "Y pixel coordinate for clickAt"},
                 "text":       {"type": "string", "description": "Text for fill/type/click-by-text/clipboard/dialog"},
@@ -526,12 +539,17 @@ pub(crate) fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "cron".to_owned(),
-        description: "List, add, edit, remove, enable or disable cron jobs. For edit/remove/enable/disable, prefer using `index` from the list output instead of `id` to avoid ID truncation issues.".to_owned(),
+        description: "List, add, edit, remove, enable or disable cron jobs.\n\
+            Supports both recurring (cron expression) and one-shot (delay_ms) schedules.\n\
+            For one-shot: set delay_ms instead of schedule. Example: delay_ms=1200000 for 20 minutes.\n\
+            One-shot jobs auto-remove after execution.\n\
+            For edit/remove/enable/disable, prefer using `index` from the list output instead of `id`.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "action":   {"type": "string", "enum": ["list", "add", "edit", "remove", "enable", "disable"], "description": "Action to perform"},
-                "schedule": {"type": "string", "description": "Cron schedule expression (for add, edit)"},
+                "schedule": {"type": "string", "description": "Cron schedule expression (for add/edit recurring jobs)"},
+                "delay_ms": {"type": "number", "description": "Delay in milliseconds for one-shot timer (e.g., 1200000 = 20 min). Use instead of schedule for reminders/timers."},
                 "message":  {"type": "string", "description": "Message or task to run (for add, edit)"},
                 "index":    {"type": "number", "description": "Job index from list (1-based, for edit/remove/enable/disable - preferred)"},
                 "id":       {"type": "string", "description": "Job ID (for edit/remove/enable/disable - use index instead if possible)"},
@@ -609,6 +627,47 @@ pub(crate) fn build_tool_list(
         }),
     });
 
+    tools.push(ToolDef {
+        name: "anycli".to_owned(),
+        description: "Extract structured data from websites using declarative adapters.\n\
+            Actions:\n\
+            - run: Execute an adapter command (e.g., hackernews top, bilibili hot)\n\
+            - list: List all available adapters\n\
+            - info: Show adapter details and available commands\n\
+            - search: Search community hub for adapters\n\
+            - install: Install an adapter from the hub\n\
+            Built-in adapters: hackernews, bilibili, arxiv, wikipedia, github-trending.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "action":  {"type": "string", "enum": ["run", "list", "info", "search", "install"], "description": "Action to perform"},
+                "adapter": {"type": "string", "description": "Adapter name (for run/info)"},
+                "command": {"type": "string", "description": "Command name within adapter (for run)"},
+                "params":  {"type": "object", "description": "Key-value parameters (for run), e.g. {\"limit\": \"10\", \"query\": \"rust\"}"},
+                "query":   {"type": "string", "description": "Search query (for search)"},
+                "name":    {"type": "string", "description": "Adapter name (for install)"},
+                "format":  {"type": "string", "enum": ["json", "table", "csv", "markdown"], "description": "Output format (for run, default: json)"}
+            },
+            "required": ["action"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "clarify".to_owned(),
+        description: "Ask the user a clarifying question before proceeding. Use when:\n\
+            - The request is ambiguous and multiple valid interpretations exist\n\
+            - A choice is needed (e.g., which file, which format, which approach)\n\
+            - Destructive or irreversible action needs confirmation\n\
+            Provide options for quick selection or leave open-ended for free-form answers.\n\
+            IMPORTANT: Do NOT use this for simple confirmations. Only when genuine ambiguity exists.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "The question to ask the user"},
+                "options":  {"type": "array", "items": {"type": "string"}, "description": "Optional list of choices. Omit for open-ended questions."}
+            },
+            "required": ["question"]
+        }),
+    });
     tools.push(ToolDef {
         name: "pairing".to_owned(),
         description: "Manage channel pairing (dmPolicy=pairing). Actions: list (show pending codes and approved peers), approve (approve a pairing code), revoke (revoke an approved peer).".to_owned(),

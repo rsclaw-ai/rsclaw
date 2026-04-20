@@ -93,6 +93,15 @@ pub enum CronSchedule {
         #[serde(default, alias = "anchorMs")]
         anchor_ms: Option<u64>,
     },
+    /// One-shot schedule: fires once then auto-removes.
+    /// { kind: "once", atMs: 1713600000000 } — absolute timestamp
+    /// { kind: "once", delayMs: 1200000 }   — relative delay from creation
+    Once {
+        #[serde(default, alias = "atMs")]
+        at_ms: Option<u64>,
+        #[serde(default, alias = "delayMs")]
+        delay_ms: Option<u64>,
+    },
 }
 
 impl CronSchedule {
@@ -101,6 +110,7 @@ impl CronSchedule {
             CronSchedule::Flat(s) => s,
             CronSchedule::Nested { expr, .. } => expr,
             CronSchedule::Every { .. } => "every",
+            CronSchedule::Once { .. } => "once",
         }
     }
 
@@ -109,7 +119,13 @@ impl CronSchedule {
             CronSchedule::Flat(_) => None,
             CronSchedule::Nested { tz, .. } => tz.as_deref(),
             CronSchedule::Every { .. } => None,
+            CronSchedule::Once { .. } => None,
         }
+    }
+
+    /// Whether this is a one-shot schedule (auto-remove after execution).
+    pub fn is_once(&self) -> bool {
+        matches!(self, CronSchedule::Once { .. })
     }
 
     /// Compute the next run timestamp (ms) from the given `from_ms`.
@@ -139,6 +155,21 @@ impl CronSchedule {
                     let elapsed = from_ms - anchor;
                     let n = (elapsed / every_ms) + 1;
                     Some(anchor + n * every_ms)
+                }
+            }
+            CronSchedule::Once { at_ms, delay_ms } => {
+                // Absolute timestamp takes priority over delay.
+                if let Some(at) = at_ms {
+                    if *at > from_ms { Some(*at) } else { None }
+                } else if let Some(delay) = delay_ms {
+                    // delay_ms is relative to creation, but compute_next_run
+                    // is always called with current time.  The actual fire time
+                    // is set in tool_cron when creating the job (createdAtMs + delayMs),
+                    // stored as at_ms.  If we reach here, treat from_ms + delay as fallback.
+                    let target = from_ms + delay;
+                    if target > from_ms { Some(target) } else { None }
+                } else {
+                    None
                 }
             }
         }
@@ -775,9 +806,26 @@ impl CronRunner {
                 handles.push(handle);
             }
 
-            // Wait for all jobs to complete and update state
-            for handle in handles {
-                if let Ok((job_id, success, duration_ms, started_at, error_msg)) = handle.await {
+            // Wait for all jobs to complete and update state.
+            // Use select to also listen for reload signals, so deletions
+            // are not delayed until all running jobs finish.
+            let all_handles = futures::future::join_all(handles);
+            let results = tokio::select! {
+                r = all_handles => r,
+                _ = reload_rx.recv() => {
+                    // Reload triggered while jobs are running — apply immediately
+                    info!("cron: reload signal during job execution, reloading now");
+                    let new_jobs = crate::cron::load_cron_jobs();
+                    let now_ms = current_timestamp_ms();
+                    jobs = self.merge_jobs(&jobs, new_jobs, now_ms);
+                    if let Err(e) = self.save_store(&jobs).await {
+                        warn!(err = %e, "cron: failed to save store after mid-execution reload");
+                    }
+                    continue; // back to top of loop, running tasks finish on their own
+                }
+            };
+            for result in results {
+                if let Ok((job_id, success, duration_ms, started_at, error_msg)) = result {
                     if let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) {
                         if let Some(state) = job.state.as_mut() {
                             state.running_at_ms = None;
@@ -791,9 +839,16 @@ impl CronRunner {
                                 state.last_run_status = Some("ok".to_string());
                                 state.last_status = Some("ok".to_string());
                                 state.last_error = None;
-                                // Compute next run normally
-                                state.next_run_at_ms =
-                                    job.schedule.compute_next_run(completion_time);
+
+                                // One-shot: disable after successful execution (will be removed below)
+                                if job.schedule.is_once() {
+                                    info!(job_id = %job.id, "cron: one-shot job completed, marking for removal");
+                                    state.next_run_at_ms = None;
+                                    job.enabled = false;
+                                } else {
+                                    // Compute next run normally
+                                    state.next_run_at_ms = job.schedule.compute_next_run(completion_time);
+                                }
                             } else {
                                 state.consecutive_errors += 1;
                                 state.last_run_status = Some("error".to_string());
@@ -832,6 +887,13 @@ impl CronRunner {
                         }
                     }
                 }
+            }
+
+            // Remove completed one-shot jobs
+            let before = jobs.len();
+            jobs.retain(|j| !(j.schedule.is_once() && !j.enabled));
+            if jobs.len() < before {
+                info!(removed = before - jobs.len(), "cron: cleaned up completed one-shot jobs");
             }
 
             // Persist updated state

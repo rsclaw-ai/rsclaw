@@ -880,7 +880,7 @@ pub(crate) async fn extract_entities_via_llm(
         max_tokens: Some(512),
         temperature: Some(0.0),
         frequency_penalty: None,
-        thinking_budget: None,
+        thinking_budget: None, kv_cache_mode: 0, session_key: None,
     };
 
     let mut stream = match failover.call(req, providers).await {
@@ -1031,7 +1031,7 @@ pub(crate) async fn describe_image_via_llm(
         max_tokens: Some(300),
         temperature: Some(0.0),
         frequency_penalty: None,
-        thinking_budget: None,
+        thinking_budget: None, kv_cache_mode: 0, session_key: None,
     };
 
     let mut stream = match failover.call(req, providers).await {

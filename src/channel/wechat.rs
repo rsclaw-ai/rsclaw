@@ -1417,46 +1417,8 @@ impl Channel for WeChatPersonalChannel {
                     }
                 };
 
-                // Audio files: convert to SILK and send as voice message
-                let is_audio = mime.starts_with("audio/")
-                    || filename.ends_with(".mp3")
-                    || filename.ends_with(".wav")
-                    || filename.ends_with(".ogg")
-                    || filename.ends_with(".aiff")
-                    || filename.ends_with(".silk");
-                if is_audio {
-                    let ext = filename.rsplit('.').next().unwrap_or("mp3");
-
-                    // Try silk encoding first, fallback to raw audio upload
-                    let (voice_bytes, duration_ms) = if ext == "silk" {
-                        let dur = (bytes.len() as u64 * 1000) / 3000;
-                        (bytes.clone(), dur.max(1000))
-                    } else {
-                        match Self::convert_to_silk(&bytes, ext) {
-                            Ok(pair) => pair,
-                            Err(e) => {
-                                warn!(index = idx, "wechat: silk conversion failed, uploading raw audio: {e:#}");
-                                // Estimate duration from mp3 size (~128kbps = 16KB/s)
-                                let dur = (bytes.len() as u64 * 1000) / 16_000;
-                                (bytes.clone(), dur.max(1000))
-                            }
-                        }
-                    };
-
-                    match self.upload_media(&voice_bytes, &msg.target_id, UploadMediaType::Voice).await {
-                        Ok(uploaded) => {
-                            if let Err(e) = self.send_voice_message(&msg.target_id, &uploaded, duration_ms).await {
-                                warn!(index = idx, "wechat: send voice message failed: {e:#}");
-                            } else {
-                                info!(index = idx, duration_ms, "wechat: voice message sent");
-                            }
-                        }
-                        Err(e) => {
-                            warn!(index = idx, "wechat: voice upload failed: {e:#}");
-                        }
-                    }
-                    continue;
-                }
+                // Audio files: send as file attachment (ilink bot API does not support voice send).
+                // User can click the file to play audio.
 
                 // Video files: upload as Video type and send as video message
                 let is_video = mime.starts_with("video/")
