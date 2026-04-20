@@ -7,6 +7,7 @@ pub mod acp;
 pub mod agent_turn;
 pub mod agents;
 pub mod anycli;
+pub mod browser;
 pub mod approvals;
 pub mod channels;
 pub mod completion;
@@ -40,6 +41,7 @@ pub use acp::{AcpCommand, AgentCommand};
 pub use agent_turn::AgentTurnArgs;
 pub use agents::{AgentsCommand, BindArgs};
 pub use anycli::AnycliCommand;
+pub use browser::BrowserCommand;
 pub use approvals::ApprovalsCommand;
 pub use channels::ChannelsCommand;
 pub use completion::CompletionArgs;
@@ -279,6 +281,10 @@ pub enum Command {
     /// Extract structured data from websites using declarative adapters.
     #[command(subcommand)]
     Anycli(AnycliCommand),
+
+    /// Control a web browser directly (open, snapshot, click, fill, etc.).
+    #[command(subcommand)]
+    Browser(BrowserCommand),
 
     /// DNS helpers for Tailscale wide-area discovery.
     #[command(subcommand)]

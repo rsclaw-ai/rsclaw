@@ -17,7 +17,7 @@ use anyhow::Result;
 use clap::Parser;
 use cli::{AcpCommand, Cli, Command};
 use cmd::{
-    cmd_agent_turn, cmd_agents, cmd_anycli, cmd_approvals, cmd_backup, cmd_channels, cmd_completion,
+    cmd_agent_turn, cmd_agents, cmd_anycli, cmd_browser, cmd_approvals, cmd_backup, cmd_channels, cmd_completion,
     cmd_config, cmd_configure, cmd_cron, cmd_daemon, cmd_dashboard, cmd_devices, cmd_directory,
     cmd_dns, cmd_docs, cmd_doctor, cmd_gateway, cmd_health, cmd_hooks, cmd_logs, cmd_memory,
     cmd_message, cmd_migrate, cmd_models, cmd_onboard, cmd_plugins, cmd_qr, cmd_reset, cmd_sandbox,
@@ -186,6 +186,7 @@ async fn run() -> Result<()> {
         Command::Devices(sub) => cmd_devices(sub).await,
         Command::Directory(sub) => cmd_directory(sub).await,
         Command::Anycli(sub) => cmd_anycli(sub).await,
+        Command::Browser(sub) => cmd_browser(sub).await,
         Command::Dns(sub) => cmd_dns(sub).await,
         Command::AgentTurn(args) => cmd_agent_turn(args).await,
         Command::Completion(args) => cmd_completion(args).await,

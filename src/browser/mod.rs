@@ -2726,7 +2726,7 @@ impl BrowserSession {
         };
 
         // Get the iframe's frame ID via Page.getFrameTree.
-        let tree = self.cdp.send("Page.getFrameTree", json!({})).await?;
+        let _tree = self.cdp.send("Page.getFrameTree", json!({})).await?;
 
         // Find iframe src from DOM to match with frame tree.
         let js = format!(
