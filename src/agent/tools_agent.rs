@@ -473,14 +473,9 @@ impl AgentRuntime {
     pub(crate) async fn tool_agent_consolidated(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let action = args["action"].as_str().unwrap_or("list");
 
-        // Permission check: only Main can spawn/task/kill.
-        // Named agents can only send and list (team communication).
-        let is_main = self.handle.config.default.unwrap_or(false);
-        if !is_main && matches!(action, "spawn" | "task" | "kill") {
-            return Ok(json!({
-                "error": format!("agent {}: only the main agent can {action}. Use 'send' to communicate with other agents.", ctx.agent_id)
-            }));
-        }
+        // Permission check: only Main can kill other agents.
+        // Named agents can spawn/task/send/list but not kill Main.
+        // Sub/Task agents don't have the agent tool at all (filtered by toolset).
 
         match action {
             "spawn" => self.tool_agent_spawn(args).await,
