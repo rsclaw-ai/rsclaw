@@ -46,7 +46,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "longDescription": "RsClaw AI Automation Manager - manage intelligent agents, model routing, and multi-channel messaging.",
+    "longDescription": "RsClaw AI Agent Engine - manage intelligent agents, model routing, and multi-channel messaging.",
     "macOS": {
       "entitlements": null,
       "exceptionDomain": "",
@@ -55,7 +55,7 @@
       "signingIdentity": null
     },
     "resources": ["icons/icon.png", "icons/icon-tray.png", "icons/icon-tray@2x.png"],
-    "shortDescription": "RsClaw AI Automation Manager",
+    "shortDescription": "RsClaw AI Agent Engine",
     "targets": "all",
     "windows": {
       "certificateThumbprint": null,

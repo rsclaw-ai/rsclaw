@@ -20,7 +20,7 @@ const en: LocaleType = {
     Later: "Later",
     SaasTips: "Too Complex, Use Immediately Now",
     TopTips:
-      "RsClaw AI Automation Manager - route to any model through a single endpoint",
+      "RsClaw AI Agent Engine - route to any model through a single endpoint",
   },
   ChatItem: {
     ChatItemCount: (count: number) => `${count} messages`,
@@ -316,7 +316,7 @@ const en: LocaleType = {
         Title: "Use RsClaw AI",
         Label: "",
         SubTitle:
-          "RsClaw AI Automation Manager - unified access to all models",
+          "RsClaw AI Agent Engine - unified access to all models",
         ChatNow: "Start Now",
       },
       AccessCode: {
@@ -926,13 +926,13 @@ const en: LocaleType = {
   },
 
   RsClawPanel: {
-    Splash: "Welcome to Your AI Automation Manager!",
+    Splash: "Welcome to Your AI Agent Engine!",
     Title: "RsClaw Console",
     BackToChat: "Back to Chat",
     Running: "running",
     Offline: "offline",
 
-    SubTitle: "Your AI Automation Manager",
+    SubTitle: "Your AI Agent Engine",
     Sidebar: {
       Service: "Gateway",
       ServiceTitle: "Gateway Status",

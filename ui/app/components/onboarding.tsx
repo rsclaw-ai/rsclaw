@@ -97,7 +97,7 @@ interface WizText {
 const T: Record<WizLang, WizText> = {
   cn: {
     welcome: "\u5F00\u59CB\u8BBE\u7F6E",
-    subtitle: "\u8783\u87F9AI\u81EA\u52A8\u5316\u7BA1\u5BB6 \u00B7 Your AI Automation Manager",
+    subtitle: "\u8783\u87F9AI\u667A\u80FD\u4F53\u5F15\u64CE \u00B7 Your AI Agent Engine",
     step1Title: "\u68C0\u6D4B\u73AF\u5883",
     step1Sub: "\u68C0\u67E5 rsclaw \u662F\u5426\u5DF2\u5B89\u88C5\uFF0C\u4EE5\u53CA\u662F\u5426\u6709 OpenClaw \u6570\u636E\u53EF\u8FC1\u79FB\u3002",
     step2Title: "\u9009\u62E9 LLM \u63D0\u4F9B\u5546",
@@ -159,7 +159,7 @@ const T: Record<WizLang, WizText> = {
   },
   en: {
     welcome: "Get started",
-    subtitle: "Your AI Automation Manager",
+    subtitle: "Your AI Agent Engine",
     step1Title: "Environment check",
     step1Sub: "Check if rsclaw is installed and if there is OpenClaw data to migrate.",
     step2Title: "Choose LLM provider",
@@ -345,7 +345,7 @@ const T: Record<WizLang, WizText> = {
   },
   de: {
     welcome: "Einrichtung starten",
-    subtitle: "Your AI Automation Manager",
+    subtitle: "Your AI Agent Engine",
     step1Title: "Umgebung pr\u00FCfen",
     step1Sub: "Pr\u00FCft, ob rsclaw installiert ist.",
     step2Title: "LLM-Anbieter w\u00E4hlen",
@@ -407,7 +407,7 @@ const T: Record<WizLang, WizText> = {
   },
   fr: {
     welcome: "Commencer",
-    subtitle: "Your AI Automation Manager",
+    subtitle: "Your AI Agent Engine",
     step1Title: "V\u00E9rification",
     step1Sub: "V\u00E9rifier si rsclaw est install\u00E9.",
     step2Title: "Choisir un fournisseur LLM",
@@ -469,7 +469,7 @@ const T: Record<WizLang, WizText> = {
   },
   es: {
     welcome: "Comenzar",
-    subtitle: "Your AI Automation Manager",
+    subtitle: "Your AI Agent Engine",
     step1Title: "Verificar entorno",
     step1Sub: "Verificar si rsclaw est\u00E1 instalado.",
     step2Title: "Elegir proveedor LLM",
@@ -593,7 +593,7 @@ const T: Record<WizLang, WizText> = {
   },
   th: {
     welcome: "\u0E40\u0E23\u0E34\u0E48\u0E21\u0E15\u0E31\u0E49\u0E07\u0E04\u0E48\u0E32",
-    subtitle: "Your AI Automation Manager",
+    subtitle: "Your AI Agent Engine",
     step1Title: "\u0E15\u0E23\u0E27\u0E08\u0E2A\u0E2D\u0E1A\u0E2A\u0E20\u0E32\u0E1E\u0E41\u0E27\u0E14\u0E25\u0E49\u0E2D\u0E21",
     step1Sub: "\u0E15\u0E23\u0E27\u0E08\u0E2A\u0E2D\u0E1A\u0E27\u0E48\u0E32 rsclaw \u0E15\u0E34\u0E14\u0E15\u0E31\u0E49\u0E07\u0E41\u0E25\u0E49\u0E27\u0E2B\u0E23\u0E37\u0E2D\u0E44\u0E21\u0E48",
     step2Title: "\u0E40\u0E25\u0E37\u0E2D\u0E01\u0E1C\u0E39\u0E49\u0E43\u0E2B\u0E49\u0E1A\u0E23\u0E34\u0E01\u0E32\u0E23 LLM",
@@ -655,7 +655,7 @@ const T: Record<WizLang, WizText> = {
   },
   vi: {
     welcome: "B\u1EAFt \u0111\u1EA7u thi\u1EBFt l\u1EADp",
-    subtitle: "Your AI Automation Manager",
+    subtitle: "Your AI Agent Engine",
     step1Title: "Ki\u1EC3m tra m\u00F4i tr\u01B0\u1EDDng",
     step1Sub: "Ki\u1EC3m tra xem rsclaw \u0111\u00E3 c\u00E0i \u0111\u1EB7t ch\u01B0a.",
     step2Title: "Ch\u1ECDn nh\u00E0 cung c\u1EA5p LLM",
@@ -2307,7 +2307,7 @@ export function OnboardingPage() {
             </div>
             {step === 0 ? (
               <div style={{ fontSize: 11, color: V.t2, textAlign: "center", lineHeight: 1.6, maxWidth: 380 }}>
-                {"\u8783\u87F9AI\u81EA\u52A8\u5316\u7BA1\u5BB6 \u00B7 Your AI Automation Manager"}
+                {"\u8783\u87F9AI\u667A\u80FD\u4F53\u5F15\u64CE \u00B7 Your AI Agent Engine"}
               </div>
             ) : (
               <div style={S.logoSub}>
