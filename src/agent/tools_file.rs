@@ -804,6 +804,7 @@ impl super::runtime::AgentRuntime {
                     extra_tools: vec![],
                     images: vec![],
                     files: vec![],
+                    is_internal: true,  // Do NOT send reply to channel
                 };
 
                 if agent_tx.send(inject_msg).await.is_ok() {

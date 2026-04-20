@@ -449,6 +449,7 @@ impl AgentRuntime {
                 extra_tools: vec![],
                 images: vec![],
                 files: vec![],
+                is_internal: false,
             };
             if self_tx.send(inject_msg).await.is_err() {
                 tracing::warn!("tool_opencode: failed to inject result back to agent inbox");
@@ -952,6 +953,7 @@ impl AgentRuntime {
                         extra_tools: vec![],
                         images: vec![],
                         files: vec![],
+                        is_internal: false,
                     };
                     if self_tx.send(inject_msg).await.is_err() {
                         tracing::warn!("tool_claudecode: failed to inject result back to agent inbox");

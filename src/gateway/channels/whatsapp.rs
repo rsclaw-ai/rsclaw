@@ -227,6 +227,7 @@ pub(crate) fn start_whatsapp_if_configured(
                                 extra_tools: vec![],
                                 images,
                                 files: vec![],
+                                is_internal: false,
                             };
                             if handle.tx.send(msg).await.is_err() {
                                 return;
@@ -355,6 +356,7 @@ pub(crate) fn start_whatsapp_if_configured(
                                 extra_tools: vec![],
                                 images,
                                 files: vec![],
+                                is_internal: false,
                             };
                             if handle.tx.send(msg).await.is_err() {
                                 return;

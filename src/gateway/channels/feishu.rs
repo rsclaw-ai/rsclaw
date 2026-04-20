@@ -378,6 +378,7 @@ pub(crate) fn start_feishu_if_configured(
                                         extra_tools: vec![],
                                         images,
                                         files: file_attachments,
+                                        is_internal: false,
                                     };
                                     if handle.tx.send(msg).await.is_err() {
                                         error!(user = %sender_id, "feishu: agent channel closed, message dropped");
@@ -531,7 +532,8 @@ pub(crate) fn start_feishu_if_configured(
                                 extra_tools: vec![],
                                 images,
                                 files: file_attachments,
-                            };
+                            is_internal: false,
+                        };
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }

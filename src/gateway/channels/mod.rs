@@ -127,6 +127,7 @@ pub(crate) fn start_channels(
                     extra_tools: vec![],
                     images: vec![],
                     files: vec![],
+                    is_internal: false,
                 };
                 if handle.tx.send(msg).await.is_err() {
                     return;

@@ -133,6 +133,7 @@ impl AgentSpawner {
                     images,
                     files,
                     chat_id: _,
+                    is_internal,
                 } = msg;
                 let result = runtime
                     .run_turn(
@@ -143,6 +144,7 @@ impl AgentSpawner {
                         extra_tools,
                         images,
                         files,
+                        is_internal,
                     )
                     .await;
                 let reply = result.unwrap_or_else(|e| {

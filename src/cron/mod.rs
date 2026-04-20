@@ -1277,6 +1277,7 @@ async fn run_cron_job(
             vec![], // extra_tools
             vec![], // images
             vec![], // files
+            false,  // is_internal
         ),
     )
     .await;

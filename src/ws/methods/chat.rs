@@ -72,6 +72,7 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
         extra_tools: vec![],
         images: vec![],
         files: vec![],
+        is_internal: false,
     };
 
     agent

@@ -105,6 +105,9 @@ pub struct AgentMessage {
     pub images: Vec<ImageAttachment>,
     /// File attachments (raw bytes). Empty for text-only messages.
     pub files: Vec<FileAttachment>,
+    /// Internal message flag. When true, agent processes the message but
+    /// does NOT send reply to channel (for background exec result injection).
+    pub is_internal: bool,
 }
 
 /// Deferred file analysis that the per-user worker should process after

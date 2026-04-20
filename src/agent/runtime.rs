@@ -218,6 +218,8 @@ pub struct RunContext {
     pub recalled_memory_ids: std::collections::HashSet<String>,
     /// Whether a loop-detection warning was triggered during this turn.
     pub loop_warning_triggered: bool,
+    /// Internal message flag. When true, do NOT send intermediate text to channel.
+    pub is_internal: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -535,6 +537,7 @@ impl AgentRuntime {
         extra_tools: Vec<ToolDef>,
         images: Vec<super::registry::ImageAttachment>,
         files: Vec<super::registry::FileAttachment>,
+        is_internal: bool,
     ) -> Result<AgentReply> {
         // Resolve session key alias: if this key maps to a canonical (migrated)
         // key, use that so all messages stay under one session.
@@ -1454,6 +1457,7 @@ impl AgentRuntime {
                             parse_error_count: 0,
                             recalled_memory_ids: std::collections::HashSet::new(),
                             loop_warning_triggered: false,
+                            is_internal: false,
                         },
                         "",
                         &tool,
@@ -1663,6 +1667,7 @@ impl AgentRuntime {
                     extra_tools,
                     images,
                     vec![],
+                    is_internal,
                 ))
                 .await;
             } else if !transcriptions.is_empty() {
@@ -1680,6 +1685,7 @@ impl AgentRuntime {
                     extra_tools,
                     images,
                     files,
+                    is_internal,
                 ))
                 .await;
             }
@@ -2280,6 +2286,7 @@ impl AgentRuntime {
             parse_error_count: 0,
             recalled_memory_ids: auto_recalled_ids,
             loop_warning_triggered: false,
+            is_internal,
         };
 
         // --- Plugins & Skills: cached, frozen at session start ---
@@ -3728,13 +3735,14 @@ impl AgentRuntime {
             // Send intermediate text to user immediately (progress feedback).
             // Model often says "好的，我来帮你搜索" before calling tools — send it now
             // instead of waiting for the entire turn to complete.
+            // Skip for internal messages (background exec result injection).
             let intermediate_enabled = self
                 .config
                 .agents
                 .defaults
                 .intermediate_output
                 .unwrap_or(true);
-            if intermediate_enabled && !text_buf.is_empty() && !tool_calls.is_empty() {
+            if intermediate_enabled && !ctx.is_internal && !text_buf.is_empty() && !tool_calls.is_empty() {
                 if let Some(ref ntx) = self.notification_tx {
                     let notif_target = if !ctx.chat_id.is_empty() {
                         ctx.chat_id.clone()
@@ -4579,6 +4587,7 @@ impl AgentRuntime {
                 extra_tools: vec![],
                 images: vec![],
                 files: vec![],
+                is_internal: false,
             };
 
             target

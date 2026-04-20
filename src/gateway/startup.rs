@@ -653,6 +653,7 @@ fn spawn_agent_tasks(
                     extra_tools,
                     images,
                     files,
+                    is_internal,
                 } = msg;
                 let result = runtime
                     .run_turn(
@@ -663,6 +664,7 @@ fn spawn_agent_tasks(
                         extra_tools,
                         images,
                         files,
+                        is_internal,
                     )
                     .await;
                 let reply = result.unwrap_or_else(|e| {
@@ -819,6 +821,7 @@ pub(crate) async fn handle_pending_analysis(
         extra_tools: vec![],
         images: vec![],
         files: vec![],
+        is_internal: false,
     };
     if handle.tx.send(msg).await.is_err() {
         let _ = out_tx

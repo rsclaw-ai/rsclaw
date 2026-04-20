@@ -356,6 +356,7 @@ async fn send_message(
         extra_tools: vec![],
         images: vec![],
         files: vec![],
+        is_internal: false,
     };
 
     if handle.tx.send(msg).await.is_err() {
@@ -972,6 +973,7 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
             extra_tools: vec![],
             images: vec![],
             files: vec![],
+            is_internal: false,
         };
         if handle.tx.send(msg).await.is_ok() {
             // Deliver agent reply through the job's delivery config.
@@ -1366,6 +1368,7 @@ async fn openai_chat_completions(
         extra_tools,
         images: vec![],
         files: vec![],
+        is_internal: false,
     };
 
     // Subscribe to event_bus BEFORE sending message to agent,

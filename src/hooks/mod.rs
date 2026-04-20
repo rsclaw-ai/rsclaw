@@ -177,6 +177,7 @@ pub async fn handle_webhook(
         extra_tools: vec![],
         images: vec![],
         files: vec![],
+        is_internal: false,
     };
 
     if handle.tx.send(msg).await.is_err() {

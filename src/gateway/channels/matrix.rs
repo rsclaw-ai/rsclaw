@@ -279,6 +279,7 @@ pub(crate) fn start_matrix_if_configured(
                                 extra_tools: vec![],
                                 images,
                                 files,
+                                is_internal: false,
                             };
                             if handle.tx.send(msg).await.is_err() {
                                 return;
@@ -418,6 +419,7 @@ pub(crate) fn start_matrix_if_configured(
                                 extra_tools: vec![],
                                 images,
                                 files,
+                                is_internal: false,
                             };
                             if handle.tx.send(msg).await.is_err() {
                                 return;

@@ -52,6 +52,7 @@ impl AgentRuntime {
             extra_tools: vec![],
             images: vec![],
             files: vec![],
+            is_internal: false,
         };
 
         target

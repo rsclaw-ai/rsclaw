@@ -77,6 +77,7 @@ fn spawn_wechat_user_worker(
                     extra_tools: vec![],
                     images,
                     files: file_attachments,
+                    is_internal: false,
                 };
                 if handle.tx.send(msg).await.is_err() {
                     return;
@@ -447,7 +448,8 @@ pub(crate) fn start_wechat_personal_if_configured(
                                 extra_tools: vec![],
                                 images,
                                 files: file_attachments,
-                            };
+                            is_internal: false,
+                        };
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }

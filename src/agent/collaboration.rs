@@ -221,6 +221,7 @@ pub(crate) async fn invoke_agent(
             extra_tools: vec![],
             images: vec![],
             files: vec![],
+            is_internal: false,
         })
         .await
         .map_err(|_| anyhow::anyhow!("agent `{}` mailbox closed", handle.id))?;
