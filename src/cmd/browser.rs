@@ -161,14 +161,19 @@ async fn dispatch_and_print(
                 return Ok(());
             }
 
-            // 2. Pick the best URL (prefer mp4/playaddr, largest, video over audio).
+            // 2. Pick the best URL — filter out noise, prefer real video streams.
+            let bad_patterns = ["static", "douyinstatic", "poster", "cover", "thumbnail",
+                "preview", "placeholder", "loading", "uuu_", "ad.", "advert"];
             let best = urls.iter()
                 .filter_map(|u| u.as_str())
                 .filter(|u| !u.contains("audio"))
+                .filter(|u| !bad_patterns.iter().any(|p| u.contains(p)))
                 .max_by_key(|u| {
                     let mut score = 0i32;
+                    if u.contains("playaddr") || u.contains("play_addr") { score += 20; }
+                    if u.contains("douyinvod") || u.contains("bilivideo") { score += 15; }
                     if u.contains(".mp4") { score += 10; }
-                    if u.contains("playaddr") || u.contains("play_addr") { score += 5; }
+                    if u.contains(".m4s") { score += 8; }
                     if u.contains("1080") { score += 3; }
                     if u.contains("720") { score += 2; }
                     score

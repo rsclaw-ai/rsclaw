@@ -2914,12 +2914,13 @@ impl BrowserSession {
         // Inject fetch/XHR interceptor that checks Content-Type for media.
         let inject_js = r#"(function(){
             window.__mediaUrls=[];
+            var bad=/static|douyinstatic|poster|cover|thumbnail|preview|placeholder|loading|advert/;
             var ff=window.fetch;
             window.fetch=function(){
                 var p=ff.apply(this,arguments);
                 p.then(function(r){
                     var ct=(r.headers.get('content-type')||'').toLowerCase();
-                    if(/video\/|audio\/|octet-stream|mpegurl|mp2t/.test(ct)&&r.url)
+                    if(/video\/|audio\/|octet-stream|mpegurl|mp2t/.test(ct)&&r.url&&!bad.test(r.url))
                         window.__mediaUrls.push(r.url);
                 }).catch(function(){});
                 return p;
@@ -2930,8 +2931,9 @@ impl BrowserSession {
                 var s=this;
                 s.addEventListener('load',function(){
                     var ct=(s.getResponseHeader('content-type')||'').toLowerCase();
-                    if(/video\/|audio\/|octet-stream|mpegurl|mp2t/.test(ct)&&s.__u)
-                        window.__mediaUrls.push(s.__u.toString());
+                    var u=s.__u?s.__u.toString():'';
+                    if(/video\/|audio\/|octet-stream|mpegurl|mp2t/.test(ct)&&u&&!bad.test(u))
+                        window.__mediaUrls.push(u);
                 });
                 return xs.apply(this,arguments);
             };
