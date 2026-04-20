@@ -104,7 +104,7 @@ const HEARTBEAT_DEFAULT: &str = "\
 ---
 every: 30m
 active_hours: 09:00-22:00
-timezone: Asia/Shanghai
+timezone: auto
 ---
 
 # Heartbeat Checklist
@@ -119,7 +119,7 @@ const HEARTBEAT_MEDITATE: &str = "\
 every: 6h
 type: meditate
 active_hours: 02:00-06:00
-timezone: Asia/Shanghai
+timezone: auto
 ---
 
 Memory maintenance: deduplicate near-identical memories, clean up crystallized sources.

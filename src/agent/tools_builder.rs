@@ -557,7 +557,7 @@ pub(crate) fn build_tool_list(
                 "index":    {"type": "number", "description": "Job index from list (1-based, for edit/remove/enable/disable - preferred)"},
                 "id":       {"type": "string", "description": "Job ID (for edit/remove/enable/disable - use index instead if possible)"},
                 "name":     {"type": "string", "description": "Job name (for add, edit)"},
-                "tz":       {"type": "string", "description": "Timezone e.g. Asia/Shanghai (for add, edit)"},
+                "tz":       {"type": "string", "description": "Timezone IANA name. Auto-detected if omitted. Only set if user explicitly requests a different timezone."},
                 "agentId":  {"type": "string", "description": "Agent ID to run the job (for add, edit, default: main)"}
             },
             "required": ["action"]

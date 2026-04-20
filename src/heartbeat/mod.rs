@@ -99,10 +99,22 @@ pub fn parse_heartbeat_md(raw: &str) -> Result<HeartbeatSpec> {
         .transpose()?;
 
     let timezone: Tz = match timezone_raw.as_deref() {
+        Some("auto") | None => {
+            // Auto-detect from system offset.
+            let offset = chrono::Local::now().offset().local_minus_utc();
+            match offset {
+                25200 => chrono_tz::Asia::Bangkok,
+                28800 => chrono_tz::Asia::Shanghai,
+                32400 => chrono_tz::Asia::Tokyo,
+                -18000 => chrono_tz::US::Eastern,
+                -28800 => chrono_tz::US::Pacific,
+                0 => chrono_tz::UTC,
+                _ => chrono_tz::UTC,
+            }
+        }
         Some(tz_str) => tz_str
             .parse()
             .map_err(|_| anyhow!("Unknown timezone: '{}'", tz_str))?,
-        None => chrono_tz::Asia::Shanghai,
     };
 
     let spec_type = match type_raw.as_deref() {
