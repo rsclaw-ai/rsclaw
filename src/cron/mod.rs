@@ -577,7 +577,8 @@ impl CronRunner {
             }
 
             if reload_triggered {
-                // Reload jobs from file
+                // Reload jobs from file - use current time for next_run calculation
+                let reload_now_ms = current_timestamp_ms();
                 let old_count = jobs.len();
                 let new_jobs = crate::cron::load_cron_jobs();
                 let file_count = new_jobs.len();
@@ -590,7 +591,7 @@ impl CronRunner {
                     .collect();
                 info!(old_count, new_count = new_jobs.len(), file_count, disabled=?disabled_in_file, "cron: reload triggered, reloading from file");
 
-                jobs = self.merge_jobs(&jobs, new_jobs, now_ms);
+                jobs = self.merge_jobs(&jobs, new_jobs, reload_now_ms);
 
                 // Debug: check enabled state after merge
                 let disabled_after_merge: Vec<_> = jobs
