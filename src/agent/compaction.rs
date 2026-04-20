@@ -216,6 +216,16 @@ impl AgentRuntime {
             // Ensure split doesn't overlap with head.
             split_idx = split_idx.max(head_end);
 
+            // Don't split inside a tool_call/tool_result group.
+            // If split_idx lands on tool results, move it back to include the
+            // preceding assistant(tool_calls) message so the pair stays together.
+            while split_idx > head_end
+                && split_idx < msgs.len()
+                && msgs[split_idx].role == Role::Tool
+            {
+                split_idx -= 1;
+            }
+
             let head = msgs[..head_end].to_vec();
             let mut old_portion = msgs[head_end..split_idx].to_vec();
             let recent = msgs[split_idx..].to_vec();
