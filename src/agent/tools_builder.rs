@@ -853,7 +853,7 @@ pub(crate) fn build_tool_list(
     }
 
     // WASM plugin tools — replace built-in equivalents.
-    let mut wasm_replaces: Vec<String> = Vec::new();
+    let _wasm_replaces: Vec<String> = Vec::new();
     for plugin in wasm_plugins {
         for tool in &plugin.tools {
             let full_name = format!("{}.{}", plugin.name, tool.name);

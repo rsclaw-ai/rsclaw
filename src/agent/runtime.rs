@@ -2267,7 +2267,7 @@ impl AgentRuntime {
         // Detect newly added skills since cache was frozen.
         // New skills are appended as trailing system messages, not merged
         // into the cached [2] — this preserves KV cache prefix.
-        let mut new_skills_tail: Vec<String> = Vec::new();
+        let new_skills_tail: Vec<String> = Vec::new();
         {
             // Active skill matching — inject matched skills into dynamic context.
             let matched = super::platform::match_skills(text, &self.skills);

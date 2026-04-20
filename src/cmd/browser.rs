@@ -106,7 +106,7 @@ async fn dispatch_and_print(
     // Commands that don't go through execute().
     match &sub {
         BrowserCommand::Close => {
-            drop(session);
+            let _ = &session;
             eprintln!("Browser closed");
             return Ok(());
         }
