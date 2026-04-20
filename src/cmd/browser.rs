@@ -4,6 +4,10 @@ use serde_json::json;
 use crate::cli::browser::BrowserCommand;
 
 /// Handle `rsclaw browser` subcommands.
+///
+/// CLI output convention (matches agent-browser):
+/// - stdout: pure data (text, HTML, JSON values)
+/// - stderr: status messages (Connected, Navigated, etc.)
 pub async fn cmd_browser(sub: BrowserCommand) -> Result<()> {
     // Try to connect to existing Chrome (remote debugging), otherwise launch new.
     let ports = &[9222_u16, 9223];
@@ -61,28 +65,72 @@ pub async fn cmd_browser(sub: BrowserCommand) -> Result<()> {
 
     let result = session.execute(action, &args).await?;
 
-    // CLI-specific output handling.
-    if let Some(path) = screenshot_path {
-        // Screenshot: decode base64 data URI and save to file.
-        if let Some(data_uri) = result.get("image").and_then(|v| v.as_str()) {
-            // Strip "data:image/png;base64," prefix.
-            let b64 = data_uri.split(',').nth(1).unwrap_or(data_uri);
-            use base64::Engine;
-            let bytes = base64::engine::general_purpose::STANDARD.decode(b64)
-                .map_err(|e| anyhow::anyhow!("failed to decode screenshot: {e}"))?;
-            std::fs::write(&path, &bytes)?;
-            println!("Screenshot saved to {path} ({} bytes)", bytes.len());
-        } else {
+    // CLI output: pure data to stdout, status to stderr.
+    match action {
+        "screenshot" => {
+            if let Some(path) = screenshot_path {
+                if let Some(data_uri) = result.get("image").and_then(|v| v.as_str()) {
+                    let b64 = data_uri.split(',').nth(1).unwrap_or(data_uri);
+                    use base64::Engine;
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(b64)
+                        .map_err(|e| anyhow::anyhow!("failed to decode screenshot: {e}"))?;
+                    std::fs::write(&path, &bytes)?;
+                    eprintln!("Screenshot saved to {path} ({} bytes)", bytes.len());
+                }
+            }
+        }
+        "open" | "navigate" => {
+            // Status only — navigated URL to stderr.
+            if let Some(url) = result.get("url").and_then(|v| v.as_str()) {
+                eprintln!("Navigated to {url}");
+            }
+        }
+        "snapshot" => {
+            // Raw snapshot text to stdout.
+            if let Some(text) = result.get("text").and_then(|v| v.as_str()) {
+                print!("{text}");
+            }
+        }
+        "get_text" => {
+            if let Some(text) = result.get("text").and_then(|v| v.as_str()) {
+                print!("{text}");
+            }
+        }
+        "get_url" => {
+            if let Some(url) = result.get("url").and_then(|v| v.as_str()) {
+                print!("{url}");
+            }
+        }
+        "get_title" => {
+            if let Some(title) = result.get("title").and_then(|v| v.as_str()) {
+                print!("{title}");
+            }
+        }
+        "content" => {
+            if let Some(html) = result.get("html").and_then(|v| v.as_str()) {
+                print!("{html}");
+            }
+        }
+        "evaluate" => {
+            // Raw JS return value — string without JSON wrapper.
+            if let Some(val) = result.get("result") {
+                match val {
+                    serde_json::Value::String(s) => print!("{s}"),
+                    other => print!("{}", serde_json::to_string_pretty(other).unwrap_or_default()),
+                }
+            }
+        }
+        // click, fill, press, scroll, etc. — status to stderr.
+        "click" | "clickAt" | "fill" | "press" | "scroll" | "back" | "forward" | "reload"
+        | "check" | "uncheck" | "hover" | "focus" | "dialog" => {
+            if let Some(action_name) = result.get("action").and_then(|v| v.as_str()) {
+                eprintln!("{action_name}: ok");
+            }
+        }
+        // Everything else: JSON to stdout.
+        _ => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-    } else if let Some(text) = result.get("text").and_then(|v| v.as_str()) {
-        // Snapshot/text output: print raw text.
-        println!("{text}");
-    } else if let Some(html) = result.get("html").and_then(|v| v.as_str()) {
-        // Content: print HTML.
-        println!("{html}");
-    } else {
-        println!("{}", serde_json::to_string_pretty(&result)?);
     }
 
     Ok(())
