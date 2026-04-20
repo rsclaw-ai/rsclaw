@@ -119,6 +119,14 @@ pub enum BrowserCommand {
         #[arg(long)]
         exact: bool,
     },
+    /// Capture video URLs from a page (inject interceptor, wait, collect).
+    CaptureVideo {
+        /// Video page URL.
+        url: String,
+        /// Wait time in milliseconds for video to load (default: 8000).
+        #[arg(long, default_value = "8000")]
+        wait: u64,
+    },
     /// Find elements by ARIA role.
     GetByRole {
         /// Role name (e.g., button, link, textbox).

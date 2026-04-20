@@ -880,6 +880,7 @@ impl BrowserSession {
             "screenshot" => self.cmd_screenshot(args).await,
             "annotate" => self.cmd_annotate().await,
             "inspect" => self.cmd_inspect().await,
+            "capture_video" => self.cmd_capture_video(args).await,
             "pdf" => self.cmd_pdf().await,
             "back" => self.cmd_back().await,
             "forward" => self.cmd_forward().await,
@@ -2894,6 +2895,83 @@ impl BrowserSession {
             "action": "inspect",
             "devtools_url": devtools_url,
             "hint": "Open this URL in Chrome to inspect the page"
+        }))
+    }
+
+    /// Capture video URLs from a page by injecting request interceptors.
+    async fn cmd_capture_video(&mut self, args: &Value) -> Result<Value> {
+        let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        if url.is_empty() {
+            return Err(anyhow!("capture_video: `url` required"));
+        }
+        let wait_ms = args.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(8000);
+
+        let inject_js = r#"(function(){
+            window.__vUrls=[];
+            var xo=XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open=function(m,u){
+                if(u&&typeof u==='string'&&/video|mp4|m3u8|m4s|flv|playaddr|play_addr|pcdn|bilivideo/.test(u))
+                    window.__vUrls.push(u);
+                return xo.apply(this,arguments);
+            };
+            var ff=window.fetch;
+            window.fetch=function(u){
+                var s=typeof u==='string'?u:(u&&u.url||'');
+                if(/video|mp4|m3u8|m4s|flv|playaddr|play_addr|pcdn|bilivideo/.test(s))
+                    window.__vUrls.push(s);
+                return ff.apply(this,arguments);
+            };
+            return 'interceptor_ready';
+        })()"#;
+
+        let collect_js = r#"(function(){
+            var urls = (window.__vUrls||[]).slice();
+            try {
+                performance.getEntriesByType('resource').forEach(function(e){
+                    if(e.name && /video|mp4|m3u8|m4s|flv|playaddr|play_addr|pcdn|bilivideo/.test(e.name)
+                       && e.name.startsWith('http')
+                       && !/poster|cover|thumbnail|preview/.test(e.name))
+                        urls.push(e.name);
+                });
+            } catch(e){}
+            document.querySelectorAll('video,source').forEach(function(el){
+                var s = el.src || el.currentSrc || '';
+                if(s && s.startsWith('http')) urls.push(s);
+            });
+            return JSON.stringify([...new Set(urls)]);
+        })()"#;
+
+        // Navigate and inject interceptor (use cmd_* directly to avoid recursion).
+        self.cmd_open(&json!({"url": url})).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        let _ = self.cmd_evaluate(&json!({"js": inject_js})).await;
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+
+        // Collect URLs.
+        let result = self.cmd_evaluate(&json!({"js": collect_js})).await?;
+        let urls_str = result.get("result").and_then(|v| v.as_str()).unwrap_or("[]");
+        let urls: Vec<String> = serde_json::from_str(urls_str).unwrap_or_default();
+
+        // If empty, retry with reload.
+        if urls.is_empty() {
+            let _ = self.cmd_evaluate(&json!({"js": "window.__vUrls=[];location.reload()"})).await;
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+            let _ = self.cmd_evaluate(&json!({"js": inject_js})).await;
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+            let result2 = self.cmd_evaluate(&json!({"js": collect_js})).await?;
+            let urls_str2 = result2.get("result").and_then(|v| v.as_str()).unwrap_or("[]");
+            let urls2: Vec<String> = serde_json::from_str(urls_str2).unwrap_or_default();
+            return Ok(json!({
+                "action": "capture_video",
+                "video_urls": urls2,
+                "hint": if urls2.is_empty() { "No video URLs found." } else { "Pick the URL containing mp4/playaddr for download." }
+            }));
+        }
+
+        Ok(json!({
+            "action": "capture_video",
+            "video_urls": urls,
+            "hint": "Pick the URL containing mp4/playaddr for download. Use web_download with use_browser_cookies=true."
         }))
     }
 

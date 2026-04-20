@@ -382,6 +382,7 @@ fn to_action_args(sub: BrowserCommand) -> (&'static str, serde_json::Value) {
         BrowserCommand::Wait { target, timeout } => ("wait", json!({"target": target, "timeout": timeout})),
         BrowserCommand::WaitForUrl { pattern, timeout } => ("waitforurl", json!({"url": pattern, "timeout": timeout})),
         BrowserCommand::Evaluate { js } => ("evaluate", json!({"js": js})),
+        BrowserCommand::CaptureVideo { url, wait } => ("capture_video", json!({"url": url, "wait_ms": wait})),
         BrowserCommand::GetByText { text, exact } => ("getbytext", json!({"value": text, "exact": exact})),
         BrowserCommand::GetByRole { role } => ("getbyrole", json!({"value": role})),
         BrowserCommand::GetByLabel { label } => ("getbylabel", json!({"value": label})),
