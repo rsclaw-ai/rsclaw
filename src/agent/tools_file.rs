@@ -759,6 +759,7 @@ impl super::runtime::AgentRuntime {
 
                 // Proactive injection: send result directly to agent inbox
                 // This triggers immediate processing without waiting for next user message
+                // IMPORTANT: Do NOT forward this to the user. This is an internal notification.
                 let result_summary = if exit_code == Some(0) {
                     let truncated = if stdout.chars().count() > 3000 {
                         let cutoff = stdout
@@ -771,12 +772,18 @@ impl super::runtime::AgentRuntime {
                         &stdout
                     };
                     format!(
-                        "[Background exec completed] task_id={}\ncommand: {}\nexit_code: 0\nstdout:\n{}",
+                        "[SYSTEM: Background exec result - DO NOT send this to user]\n\
+                        task_id={}\ncommand: {}\nexit_code: 0\n\
+                        stdout (truncated if >3000 chars):\n{}\n\
+                        [END OF SYSTEM MESSAGE - Continue with your other tasks, do not forward stdout to user]",
                         tid, command_owned, truncated
                     )
                 } else {
                     format!(
-                        "[Background exec completed] task_id={}\ncommand: {}\nexit_code: {}\nstderr: {}\nstdout: {}",
+                        "[SYSTEM: Background exec FAILED - DO NOT send raw output to user, summarize the error]\n\
+                        task_id={}\ncommand: {}\nexit_code: {}\n\
+                        stderr: {}\nstdout: {}\n\
+                        [END OF SYSTEM MESSAGE - Report failure briefly to user if relevant]",
                         tid,
                         command_owned,
                         exit_code.unwrap_or(-1),
