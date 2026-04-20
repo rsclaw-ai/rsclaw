@@ -26,6 +26,16 @@ Built from scratch in Rust, RsClaw (Crab AI / 螃蟹 AI) persists every interact
 
 ---
 
+## Why RsClaw
+
+- 🧠 **Three-layer persistent memory** — redb KV + tantivy full-text + hnsw_rs vector search, built in, fully local
+- 🔌 **Four agent backends in one gateway** — mix Native Rust, Claude Code, OpenCode, and any ACP-compatible agent in a single workflow
+- 🌐 **A2A cross-machine orchestration** — agents on different machines collaborate via [Google A2A v0.3](https://a2a-protocol.org/)
+- 🪶 **15MB binary, ~20MB idle RAM** — runs reliably on low-spec servers and edge devices
+- 🔒 **Local-first** — memory and data stay in `~/.rsclaw/`, never leave your machine
+
+---
+
 ## Install
 
 ### 👉 New users
