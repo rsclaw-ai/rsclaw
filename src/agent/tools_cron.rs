@@ -66,6 +66,15 @@ impl super::runtime::AgentRuntime {
                     let at_ms = now_ms + delay;
                     job["schedule"] = json!({"kind": "once", "atMs": at_ms});
                 } else if let Some(sched) = schedule {
+                    // Validate cron expression has exactly 5 fields
+                    let fields: Vec<&str> = sched.split_whitespace().collect();
+                    if fields.len() != 5 {
+                        return Err(anyhow!(
+                            "cron add: schedule must have exactly 5 fields (min hr dom mon dow), got {} fields: '{}'",
+                            fields.len(),
+                            sched
+                        ));
+                    }
                     // Standard cron expression or interval.
                     if let Some(tz_val) = tz {
                         job["schedule"] = json!({"kind": "cron", "expr": sched, "tz": tz_val});

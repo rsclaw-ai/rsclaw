@@ -169,6 +169,16 @@ pub async fn cron_add(ctx: MethodCtx) -> MethodResult {
     let agent_id = params["agentId"].as_str();
     let name = params["name"].as_str();
 
+    // Validate cron expression has exactly 5 fields
+    let fields: Vec<&str> = schedule.split_whitespace().collect();
+    if fields.len() != 5 {
+        return Err(ErrorShape::bad_request(format!(
+            "schedule must have exactly 5 fields (min hr dom mon dow), got {} fields: '{}'",
+            fields.len(),
+            schedule
+        )));
+    }
+
     let mut jobs = crate::cron::load_cron_jobs();
     let count = jobs.len();
     let id = format!("job-{}", count + 1);
