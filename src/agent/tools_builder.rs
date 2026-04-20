@@ -39,6 +39,8 @@ pub(crate) fn toolset_allowed_names(
         "computer_use",
         "clarify",
         "anycli",
+        "agent",    // enables Main ↔ Named bidirectional communication
+        "session",
     ];
 
     let base: Option<&[&str]> = match toolset {
