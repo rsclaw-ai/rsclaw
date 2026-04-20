@@ -153,10 +153,20 @@ pub enum BrowserCommand {
     Auth(AuthCommand),
     /// List available Chrome profiles.
     Profiles,
-    /// Connect to a specific Chrome DevTools Protocol port.
+    /// Connect to a browser via CDP (port number or ws:// URL).
     Connect {
-        /// CDP port number.
-        port: u16,
+        /// CDP port number or WebSocket URL (e.g., 9222 or ws://127.0.0.1:9222/...).
+        target: String,
+    },
+    /// Save browser state (cookies + localStorage) to a JSON file.
+    StateSave {
+        /// Output file path.
+        path: String,
+    },
+    /// Load browser state (cookies + localStorage) from a JSON file.
+    StateLoad {
+        /// Input file path.
+        path: String,
     },
     /// Run any browser action with JSON args (advanced).
     Raw {

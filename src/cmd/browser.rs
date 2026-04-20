@@ -114,12 +114,71 @@ async fn dispatch_and_print(
         BrowserCommand::Auth(auth_cmd) => {
             return cmd_auth(auth_cmd).await;
         }
-        BrowserCommand::Connect { port } => {
-            let ports = [*port];
-            let ws_url = crate::browser::detect_existing_chrome(&ports)
-                .await
-                .ok_or_else(|| anyhow!("no Chrome found on port {port}"))?;
-            eprintln!("Connected to Chrome on port {port}: {ws_url}");
+        BrowserCommand::Connect { target } => {
+            if target.starts_with("ws://") || target.starts_with("wss://") {
+                // Direct WebSocket URL.
+                let _session = crate::browser::BrowserSession::connect_existing_reuse(target).await?;
+                eprintln!("Connected to Chrome via {target}");
+            } else if let Ok(port) = target.parse::<u16>() {
+                let ports = [port];
+                let ws_url = crate::browser::detect_existing_chrome(&ports)
+                    .await
+                    .ok_or_else(|| anyhow!("no Chrome found on port {port}"))?;
+                eprintln!("Connected to Chrome on port {port}: {ws_url}");
+            } else {
+                return Err(anyhow!("connect: expected port number or ws:// URL, got '{target}'"));
+            }
+            return Ok(());
+        }
+        BrowserCommand::StateSave { path } => {
+            // Save cookies + localStorage to JSON file.
+            let cookies = session.execute("cookies", &json!({"value": "get"})).await?;
+            let storage = session.execute("storage", &json!({"value": "get", "type": "local"})).await?;
+            let state = json!({
+                "cookies": cookies.get("cookies").cloned().unwrap_or(json!([])),
+                "localStorage": storage.get("data").cloned().unwrap_or(json!({})),
+                "url": session.execute("get_url", &json!({})).await.ok()
+                    .and_then(|r| r.get("url").and_then(|v| v.as_str()).map(String::from))
+                    .unwrap_or_default(),
+            });
+            std::fs::write(path, serde_json::to_string_pretty(&state)?)?;
+            eprintln!("State saved to {path}");
+            return Ok(());
+        }
+        BrowserCommand::StateLoad { path } => {
+            // Load cookies + localStorage from JSON file.
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| anyhow!("failed to read {path}: {e}"))?;
+            let state: serde_json::Value = serde_json::from_str(&content)
+                .map_err(|e| anyhow!("invalid state file: {e}"))?;
+
+            // Restore cookies.
+            if let Some(cookies) = state.get("cookies").and_then(|v| v.as_array()) {
+                for cookie in cookies {
+                    let _ = session.execute("cookies", &json!({"value": "set", "cookie": cookie})).await;
+                }
+            }
+
+            // Navigate to saved URL to apply cookies, then restore localStorage.
+            if let Some(url) = state.get("url").and_then(|v| v.as_str()) {
+                if !url.is_empty() {
+                    let _ = session.execute("open", &json!({"url": url})).await;
+                }
+            }
+
+            if let Some(storage) = state.get("localStorage").and_then(|v| v.as_object()) {
+                for (k, v) in storage {
+                    let val = v.as_str().unwrap_or("");
+                    let js = format!(
+                        "localStorage.setItem('{}', '{}')",
+                        k.replace('\'', "\\'"),
+                        val.replace('\'', "\\'")
+                    );
+                    let _ = session.execute("evaluate", &json!({"js": js})).await;
+                }
+            }
+
+            eprintln!("State loaded from {path}");
             return Ok(());
         }
         _ => {}
@@ -275,6 +334,8 @@ fn to_action_args(sub: BrowserCommand) -> (&'static str, serde_json::Value) {
         // These are handled before reaching to_action_args.
         BrowserCommand::Close
         | BrowserCommand::Batch { .. }
+        | BrowserCommand::StateSave { .. }
+        | BrowserCommand::StateLoad { .. }
         | BrowserCommand::Auth(_)
         | BrowserCommand::Profiles
         | BrowserCommand::Connect { .. } => unreachable!(),
