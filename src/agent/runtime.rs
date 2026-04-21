@@ -2865,10 +2865,10 @@ impl AgentRuntime {
         let configured_complex: usize = self.config.agents.defaults.max_iterations
             .map(|v| v as usize)
             .unwrap_or(30);
-        // Track consecutive same-tool calls to detect loops even when args differ slightly.
-        let mut last_tool_name = String::new();
-        let mut same_tool_streak: usize = 0;
-        const MAX_SAME_TOOL_STREAK: usize = 8;
+        // Track consecutive identical tool calls (same name + same args).
+        let mut last_tool_key = String::new();
+        let mut same_call_streak: usize = 0;
+        const MAX_SAME_CALL_STREAK: usize = 5;
         let mut max_iterations = BASE_ITERATIONS;
         let mut iteration = 0usize;
 
@@ -3779,19 +3779,19 @@ impl AgentRuntime {
 
                 debug!(tool = %tool_name, "dispatching tool call");
 
-                // Detect consecutive same-tool loops (catches cases where args differ
-                // slightly each time, bypassing hash-based loop detection).
-                if tool_name == last_tool_name {
-                    same_tool_streak += 1;
-                    if same_tool_streak >= MAX_SAME_TOOL_STREAK {
+                // Detect consecutive identical tool calls (same name + same args).
+                let call_key = crate::agent::loop_detection::hash_tool_call(&tool_name, &tool_input);
+                if call_key == last_tool_key {
+                    same_call_streak += 1;
+                    if same_call_streak >= MAX_SAME_CALL_STREAK {
                         warn!(
                             tool = %tool_name,
-                            streak = same_tool_streak,
-                            "agent_loop: same tool called {} times consecutively, breaking loop",
-                            same_tool_streak
+                            streak = same_call_streak,
+                            "agent_loop: identical tool call repeated {} times, breaking loop",
+                            same_call_streak
                         );
                         return Ok(AgentReply {
-                            text: format!("I noticed I was repeating the same operation ({tool_name}) without making progress. Let me try a different approach or ask you for clarification."),
+                            text: crate::i18n::t("agent_loop_detected", crate::i18n::default_lang()).to_owned(),
                             is_empty: false,
                             tool_calls: None,
                             images: vec![],
@@ -3801,8 +3801,8 @@ impl AgentRuntime {
                         });
                     }
                 } else {
-                    last_tool_name = tool_name.clone();
-                    same_tool_streak = 1;
+                    last_tool_key = call_key;
+                    same_call_streak = 1;
                 }
 
                 // Upgrade iteration limit when complex or multi-step tools are used.
