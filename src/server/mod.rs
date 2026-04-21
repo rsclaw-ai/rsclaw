@@ -63,6 +63,9 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 /// Compare two strings in constant time to prevent timing side-channel attacks.
+/// Note: length difference is still detectable via timing (early return), but for
+/// auth tokens of known format this is acceptable. The byte comparison itself
+/// does not short-circuit.
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
@@ -1268,7 +1271,9 @@ async fn save_config(
     // Backup current file.
     // TODO: add full schema validation before saving (beyond JSON5 parse check).
     let backup = config_path.with_extension("json5.bak");
-    let _ = std::fs::copy(&config_path, &backup);
+    if let Err(e) = std::fs::copy(&config_path, &backup) {
+        tracing::warn!(error = %e, "failed to create config backup before save");
+    }
 
     // Write new config.
     if let Err(e) = std::fs::write(&config_path, &req.raw) {

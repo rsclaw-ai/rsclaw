@@ -76,25 +76,33 @@ pub fn cmd_tray() -> Result<()> {
         if let Ok(event) = MenuEvent::receiver().try_recv() {
             let id = event.id;
             if id == start_id {
-                let _ = std::process::Command::new(std::env::current_exe().expect("failed to get current exe path"))
+                if let Err(e) = std::process::Command::new(std::env::current_exe().expect("failed to get current exe path"))
                     .args(["gateway", "start"])
-                    .spawn();
+                    .spawn() {
+                    eprintln!("failed to start gateway: {e}");
+                }
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 update_status(&status_item, &start_item, &stop_item, &restart_item);
             } else if id == stop_id {
-                let _ = std::process::Command::new(std::env::current_exe().expect("failed to get current exe path"))
+                if let Err(e) = std::process::Command::new(std::env::current_exe().expect("failed to get current exe path"))
                     .args(["gateway", "stop"])
-                    .status();
+                    .status() {
+                    eprintln!("failed to stop gateway: {e}");
+                }
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 update_status(&status_item, &start_item, &stop_item, &restart_item);
             } else if id == restart_id {
-                let _ = std::process::Command::new(std::env::current_exe().expect("failed to get current exe path"))
+                if let Err(e) = std::process::Command::new(std::env::current_exe().expect("failed to get current exe path"))
                     .args(["gateway", "stop"])
-                    .status();
+                    .status() {
+                    eprintln!("failed to stop gateway: {e}");
+                }
                 std::thread::sleep(std::time::Duration::from_millis(500));
-                let _ = std::process::Command::new(std::env::current_exe().expect("failed to get current exe path"))
+                if let Err(e) = std::process::Command::new(std::env::current_exe().expect("failed to get current exe path"))
                     .args(["gateway", "start"])
-                    .spawn();
+                    .spawn() {
+                    eprintln!("failed to start gateway: {e}");
+                }
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 update_status(&status_item, &start_item, &stop_item, &restart_item);
             } else if id == logs_id {
