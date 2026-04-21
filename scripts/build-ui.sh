@@ -153,6 +153,14 @@ log "Building Tauri app (${PROFILE})..."
 
 # --- Done ---
 echo ""
+# Re-sign with stable identifier so macOS permissions persist across builds
+APP_BUNDLE="$TAURI_DIR/target/${TARGET}/${PROFILE_DIR}/bundle/macos/RsClaw.app"
+[[ ! -d "$APP_BUNDLE" ]] && APP_BUNDLE="$TAURI_DIR/target/${PROFILE_DIR}/bundle/macos/RsClaw.app"
+if [[ -d "$APP_BUNDLE" ]]; then
+    log "Re-signing with stable identifier (ai.rsclaw.app)..."
+    codesign --force --deep --sign - --identifier "ai.rsclaw.app" "$APP_BUNDLE" 2>&1 || true
+fi
+
 log "Build complete!"
 echo ""
 
