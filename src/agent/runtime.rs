@@ -4071,7 +4071,9 @@ impl AgentRuntime {
                 let max_chars = match tool_name.as_str() {
                     "web_search" => limits.and_then(|l| l.web_search).unwrap_or(2000),
                     "web_fetch" => limits.and_then(|l| l.web_fetch).unwrap_or(5000),
+                    "web_browser" | "browser" => limits.and_then(|l| l.web_browser).unwrap_or(1500),
                     "execute_command" | "exec" => limits.and_then(|l| l.exec).unwrap_or(3000),
+                    "read_file" | "read" => limits.and_then(|l| l.default).unwrap_or(3000),
                     _ => limits.and_then(|l| l.default).unwrap_or(3000),
                 };
                 let session_text = if result_text.len() > max_chars {

@@ -1315,6 +1315,9 @@ pub struct SessionResultLimits {
     pub web_search: Option<usize>,
     /// web_fetch result max chars in session (default: 5000)
     pub web_fetch: Option<usize>,
+    /// web_browser snapshot/action max chars in session (default: 1500)
+    /// Browser snapshots are large but mostly ephemeral (refs expire after page change).
+    pub web_browser: Option<usize>,
     /// exec result max chars in session (default: 3000)
     pub exec: Option<usize>,
     /// Default for all other tools (default: 3000)
