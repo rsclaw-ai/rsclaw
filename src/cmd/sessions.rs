@@ -40,7 +40,7 @@ pub async fn cmd_sessions(sub: SessionsCommand) -> Result<()> {
                 if args.json {
                     println!("[]");
                 } else {
-                    banner(&format!("rsclaw sessions v{}", env!("RSCLAW_BUILD_VERSION")));
+                    banner(&format!("rsclaw sessions v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
                     warn_msg("no sessions");
                 }
             } else if args.json {
@@ -50,7 +50,7 @@ pub async fn cmd_sessions(sub: SessionsCommand) -> Result<()> {
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&arr)?);
             } else {
-                banner(&format!("rsclaw sessions v{}", env!("RSCLAW_BUILD_VERSION")));
+                banner(&format!("rsclaw sessions v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
                 kv("total", &bold(&sessions.len().to_string()));
                 println!();
                 for s in &sessions {

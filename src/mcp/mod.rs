@@ -112,7 +112,7 @@ impl McpClient {
                     "capabilities": {},
                     "clientInfo": {
                         "name": "rsclaw",
-                        "version": env!("RSCLAW_BUILD_VERSION")
+                        "version": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
                     }
                 }),
             )

@@ -61,7 +61,7 @@ pub async fn cmd_logs(args: LogsArgs) -> Result<()> {
 }
 
 pub async fn cmd_status(args: StatusArgs) -> Result<()> {
-    let version = env!("RSCLAW_BUILD_VERSION");
+    let version = option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev");
     if args.json {
         let mut info = serde_json::json!({
             "version": version,

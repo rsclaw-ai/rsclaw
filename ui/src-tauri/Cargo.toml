@@ -1,13 +1,13 @@
 [package]
 name = "rsclaw-ui"
-version = "0.1.0"
-description = "RsClaw AI Agent Engine"
+version = "26.4.20"
+description = "AI Agent Engine Compatible with OpenClaw"
 authors = ["RsClaw Contributors"]
-license = "mit"
-repository = ""
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rsclaw-ai/rsclaw"
 default-run = "rsclaw-ui"
-edition = "2021"
-rust-version = "1.60"
+edition = "2024"
+rust-version = "1.91"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

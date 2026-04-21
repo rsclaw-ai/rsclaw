@@ -8,7 +8,7 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
     let config = config::load()?;
     match sub {
         ChannelsCommand::List | ChannelsCommand::Status => {
-            banner(&format!("rsclaw channels v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!("rsclaw channels v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
             let ch = &config.channel.channels;
             let is_on = |b: Option<&crate::config::schema::ChannelBase>| {
                 b.is_some_and(|b| b.enabled.unwrap_or(true))
@@ -79,7 +79,7 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
         }
         ChannelsCommand::Login { channel, quiet } => {
             if !quiet {
-                banner(&format!("rsclaw channel login v{}", env!("RSCLAW_BUILD_VERSION")));
+                banner(&format!("rsclaw channel login v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
             }
             match channel.as_str() {
                 "wechat" | "weixin" | "openclaw-weixin" => {
@@ -339,7 +339,7 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
         }
 
         ChannelsCommand::Capabilities { channel } => {
-            banner(&format!("rsclaw channel capabilities v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!("rsclaw channel capabilities v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
             let caps = match channel.as_str() {
                 "telegram" => vec!["text", "image", "audio", "video", "document", "sticker", "location", "inline-query", "dm", "group"],
                 "discord" => vec!["text", "image", "audio", "video", "embed", "reaction", "dm", "group", "thread"],
@@ -392,7 +392,7 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
             }
         }
         ChannelsCommand::Paired { channel } => {
-            banner(&format!("rsclaw paired peers v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!("rsclaw paired peers v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
             let channels_to_check: Vec<String> = if let Some(ch) = channel {
                 vec![ch]
             } else {

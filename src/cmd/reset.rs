@@ -12,7 +12,7 @@ pub async fn cmd_reset(args: ResetArgs) -> Result<()> {
     let scope = args.scope.as_deref().unwrap_or("full");
 
     if args.dry_run {
-        banner(&format!("rsclaw reset (dry run) v{}", env!("RSCLAW_BUILD_VERSION")));
+        banner(&format!("rsclaw reset (dry run) v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
         match scope {
             "config" => {
                 if let Some(path) = config::loader::detect_config_path() {
@@ -39,7 +39,7 @@ pub async fn cmd_reset(args: ResetArgs) -> Result<()> {
         return Ok(());
     }
 
-    banner(&format!("rsclaw reset v{}", env!("RSCLAW_BUILD_VERSION")));
+    banner(&format!("rsclaw reset v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
     println!("  {}", red("WARNING: This is a destructive operation!"));
     println!();
 
@@ -77,7 +77,7 @@ pub async fn cmd_update(sub: UpdateCommand) -> Result<()> {
         UpdateCommand::Wizard => {
             banner(&format!(
                 "rsclaw update wizard v{}",
-                env!("RSCLAW_BUILD_VERSION")
+                option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
             ));
             warn_msg("update wizard: not yet implemented");
             println!("  {}", dim("use `rsclaw update run` for now"));
@@ -101,7 +101,7 @@ fn proxy_url(url: &str) -> String {
 
 fn build_update_client(timeout_secs: u64) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
-        .user_agent(concat!("rsclaw/", env!("RSCLAW_BUILD_VERSION")))
+        .user_agent("rsclaw/dev")
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()?)
 }
@@ -109,7 +109,7 @@ fn build_update_client(timeout_secs: u64) -> Result<reqwest::Client> {
 async fn do_update(args: &UpdateArgs) -> Result<()> {
     banner(&format!(
         "rsclaw update v{}",
-        env!("RSCLAW_BUILD_VERSION")
+        option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
     ));
 
     let timeout_secs = args.timeout.unwrap_or(30);
@@ -146,7 +146,7 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
         .unwrap_or("")
         .trim_start_matches('v')
         .to_owned();
-    let current = env!("RSCLAW_BUILD_VERSION");
+    let current = option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev");
 
     kv("Current:", current);
     kv("Latest:", &latest_version);
@@ -283,12 +283,12 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
 async fn update_status() -> Result<()> {
     banner(&format!(
         "rsclaw update status v{}",
-        env!("RSCLAW_BUILD_VERSION")
+        option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
     ));
 
     let client = build_update_client(10)?;
 
-    kv("Current:", env!("RSCLAW_BUILD_VERSION"));
+    kv("Current:", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"));
 
     // Try app.rsclaw.ai first, fallback to GitHub releases list
     // Both return the same format: array of release objects with tag_name
@@ -321,7 +321,7 @@ async fn update_status() -> Result<()> {
         Some(tag) => {
             let latest = tag.trim_start_matches('v');
             kv("Latest:", latest);
-            if latest == env!("RSCLAW_BUILD_VERSION") {
+            if latest == option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev") {
                 println!("  {} up to date", green("[ok]"));
             } else {
                 println!("  {} update available: {latest}", yellow("[!]"));

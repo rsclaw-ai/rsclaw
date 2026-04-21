@@ -18,7 +18,7 @@ async fn cmd_backup_create(args: crate::cli::BackupCreateArgs) -> Result<()> {
     use flate2::{Compression, write::GzEncoder};
     use sha2::{Digest, Sha256};
 
-    banner(&format!("rsclaw backup create v{}", env!("RSCLAW_BUILD_VERSION")));
+    banner(&format!("rsclaw backup create v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
 
     let base = crate::config::loader::base_dir();
 
@@ -102,7 +102,7 @@ fn redact_config(raw: &str) -> String {
 async fn cmd_backup_verify(file: &str) -> Result<()> {
     use sha2::{Digest, Sha256};
 
-    banner(&format!("rsclaw backup verify v{}", env!("RSCLAW_BUILD_VERSION")));
+    banner(&format!("rsclaw backup verify v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
 
     let archive_path = std::path::Path::new(file);
     if !archive_path.exists() {

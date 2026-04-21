@@ -24,12 +24,12 @@ pub async fn cmd_memory(sub: MemoryCommand) -> Result<()> {
             if args.json {
                 println!("{}", serde_json::json!({"documents": count}));
             } else {
-                banner(&format!("rsclaw memory v{}", env!("RSCLAW_BUILD_VERSION")));
+                banner(&format!("rsclaw memory v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
                 kv("documents", &bold(&count.to_string()));
             }
         }
         MemoryCommand::Search(args) => {
-            banner(&format!("rsclaw memory search v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!("rsclaw memory search v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
             // Read-only: won't conflict with running gateway.
             let mut mem =
                 agent::memory::MemoryStore::open_readonly(&data_dir, Some(&model_dir), search_cfg)

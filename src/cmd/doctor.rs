@@ -3,7 +3,7 @@
 use super::style::{bold, dim, green, red, yellow, banner};
 use crate::{cli::DoctorArgs, config};
 
-const VERSION: &str = env!("RSCLAW_BUILD_VERSION");
+const VERSION: &str = match option_env!("RSCLAW_BUILD_VERSION") { Some(v) => v, None => "dev" };
 
 // ---------------------------------------------------------------------------
 // Issue -- a detected problem with an optional auto-fix

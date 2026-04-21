@@ -20,7 +20,7 @@ pub async fn cmd_security(sub: SecurityCommand) -> Result<()> {
 
 #[cfg(unix)]
 async fn cmd_security_audit(args: crate::cli::SecurityAuditArgs) -> Result<()> {
-    banner(&format!("rsclaw security audit v{}", env!("RSCLAW_BUILD_VERSION")));
+    banner(&format!("rsclaw security audit v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
 
     let base = crate::config::loader::base_dir();
     let mut issues: Vec<String> = Vec::new();

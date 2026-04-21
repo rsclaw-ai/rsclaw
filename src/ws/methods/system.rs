@@ -39,8 +39,8 @@ pub async fn health(ctx: MethodCtx) -> MethodResult {
 
     Ok(serde_json::json!({
         "status": "ok",
-        "version": env!("RSCLAW_BUILD_VERSION"),
-        "runtimeVersion": env!("RSCLAW_BUILD_VERSION"),
+        "version": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
+        "runtimeVersion": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
         // Uptime / tick info used by Overview and Debug pages.
         "uptime": uptime.as_secs(),
         "uptimeFormatted": format_duration(uptime),
@@ -285,9 +285,9 @@ pub async fn logs_tail(ctx: MethodCtx) -> MethodResult {
 
 pub async fn system_update_check(_ctx: MethodCtx) -> MethodResult {
     Ok(serde_json::json!({
-        "currentVersion": env!("RSCLAW_BUILD_VERSION"),
+        "currentVersion": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
         "updateAvailable": false,
-        "latestVersion": env!("RSCLAW_BUILD_VERSION"),
+        "latestVersion": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
     }))
 }
 
@@ -345,7 +345,7 @@ pub async fn system_presence(ctx: MethodCtx) -> MethodResult {
         "instances": [{
             "id": "gateway",
             "type": "gateway",
-            "version": env!("RSCLAW_BUILD_VERSION"),
+            "version": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
             "uptime": uptime.as_secs(),
             "status": "online",
         }],
@@ -441,8 +441,8 @@ pub async fn system_snapshot(ctx: MethodCtx) -> MethodResult {
     let now = chrono::Utc::now().to_rfc3339();
     Ok(serde_json::json!({
         "status": "ok",
-        "runtimeVersion": env!("RSCLAW_BUILD_VERSION"),
-        "version": env!("RSCLAW_BUILD_VERSION"),
+        "runtimeVersion": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
+        "version": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
         // Uptime — emit both field names used across openclaw versions.
         "uptime": uptime.as_secs(),
         "uptimeSeconds": uptime.as_secs(),
@@ -496,13 +496,13 @@ pub async fn status(ctx: MethodCtx) -> MethodResult {
     let uptime = ctx.state.started_at.elapsed();
     Ok(serde_json::json!({
         "status": "ok",
-        "version": env!("RSCLAW_BUILD_VERSION"),
+        "version": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
         "uptime": uptime.as_secs(),
         "cwd": std::env::current_dir()
             .map(|p| crate::config::loader::path_to_forward_slash(&p))
             .unwrap_or_default(),
         "platform": std::env::consts::OS,
-        "nodeVersion": format!("rust-{}", env!("RSCLAW_BUILD_VERSION")),
+        "nodeVersion": format!("rust-{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")),
     }))
 }
 

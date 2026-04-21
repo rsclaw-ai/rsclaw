@@ -50,7 +50,7 @@ impl AgentRuntime {
 
         let client = crate::acp::client::AcpClient::spawn(&command, &args).await?;
         client
-            .initialize("rsclaw", env!("RSCLAW_BUILD_VERSION"))
+            .initialize("rsclaw", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"))
             .await?;
 
         // Create session with model from config or environment
@@ -514,7 +514,7 @@ impl AgentRuntime {
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let client = crate::acp::client::AcpClient::spawn(&command, &args_ref).await?;
         client
-            .initialize("rsclaw", env!("RSCLAW_BUILD_VERSION"))
+            .initialize("rsclaw", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"))
             .await?;
 
         // Create session with model if configured

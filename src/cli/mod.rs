@@ -84,7 +84,7 @@ pub use webhooks::WebhooksCommand;
 #[derive(Parser, Debug)]
 #[command(
     name = "rsclaw",
-    version = concat!("v", env!("RSCLAW_BUILD_VERSION")),
+    version = option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
     about = "AI Agent Engine Compatible with OpenClaw",
     long_about = None,
 )]

@@ -671,7 +671,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let port = state.live.gateway.read().await.port;
     Json(serde_json::json!({
         "status": "ok",
-        "version": env!("RSCLAW_BUILD_VERSION"),
+        "version": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
         "port": port,
         "uptime": format!("{:02}:{:02}:{:02}", hours, mins, secs),
     }))
@@ -744,7 +744,7 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
     };
 
     Json(serde_json::json!({
-        "version": env!("RSCLAW_BUILD_VERSION"),
+        "version": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
         "agents": state.agents.len(),
         "port": port,
         "uptime": uptime,

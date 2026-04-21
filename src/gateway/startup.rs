@@ -526,7 +526,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
         let client = reqwest::Client::builder()
-            .user_agent(concat!("rsclaw/", env!("RSCLAW_BUILD_VERSION")))
+            .user_agent("rsclaw/dev")
             .timeout(std::time::Duration::from_secs(10))
             .build();
 
@@ -542,7 +542,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 let latest_raw = release["tag_name"]
                     .as_str()
                     .unwrap_or("");
-                let current_raw = env!("RSCLAW_BUILD_VERSION");
+                let current_raw = option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev");
                 // Extract bare version: "2026.4.1 (abc123)" -> "2026.4.1",
                 // "2026.4.1-beta" -> "2026.4.1".
                 fn strip_ver(s: &str) -> &str {

@@ -902,7 +902,7 @@ impl AgentRuntime {
                             .unwrap_or("en");
                         build_help_text_filtered(allowed, lang)
                     }
-                    "__VERSION__" => format!("rsclaw {}", env!("RSCLAW_BUILD_VERSION")),
+                    "__VERSION__" => format!("rsclaw {}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")),
                     "__STATUS__" => {
                         let model = self.resolve_model_name();
                         let sessions = self.sessions.len();
@@ -947,7 +947,7 @@ impl AgentRuntime {
                             msg_tokens as f64 / 1000.0,
                             all_tokens as f64 / 1000.0,
                             ctx_limit as f64 / 1000.0,
-                            env!("RSCLAW_BUILD_VERSION")
+                            option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
                         )
                     }
                     "__HEALTH__" => {
@@ -960,7 +960,7 @@ impl AgentRuntime {
                             model,
                             if provider_ok { "ok" } else { "unavailable" },
                             self.handle.id,
-                            env!("RSCLAW_BUILD_VERSION"),
+                            option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
                         )
                     }
                     "__UPTIME__" => format_duration(self.started_at.elapsed()),

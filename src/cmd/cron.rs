@@ -7,7 +7,7 @@ use crate::{cli::CronCommand, config};
 pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
     match sub {
         CronCommand::List | CronCommand::Status => {
-            banner(&format!("rsclaw cron v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!("rsclaw cron v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
             let jobs = crate::cron::load_cron_jobs();
             if jobs.is_empty() {
                 warn_msg("no cron jobs configured");

@@ -130,7 +130,7 @@ pub async fn root_handler() -> impl IntoResponse {
         <p>WebSocket endpoint. Connect with a compatible client.</p>\
         <p><a href=\"/api/v1/health\">Health</a></p>\
         </body></html>",
-        env!("RSCLAW_BUILD_VERSION"),
+        option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
     ))
 }
 
@@ -295,7 +295,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         protocol: PROTOCOL_VERSION,
         server: ServerInfo {
             name: "rsclaw".to_owned(),
-            version: env!("RSCLAW_BUILD_VERSION").to_owned(),
+            version: option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev").to_owned(),
             agent_count,
         },
         features: FeaturesInfo {

@@ -11,7 +11,7 @@ use crate::cli::MigrateArgs;
 use crate::migrate::openclaw::{self, ImportStats};
 use crate::migrate::{MigrateMode, detect_openclaw_dir};
 
-const VERSION: &str = env!("RSCLAW_BUILD_VERSION");
+const VERSION: &str = match option_env!("RSCLAW_BUILD_VERSION") { Some(v) => v, None => "dev" };
 
 pub async fn cmd_migrate(args: MigrateArgs) -> Result<()> {
     banner(&format!("rsclaw migrate v{VERSION}"));

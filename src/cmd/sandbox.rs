@@ -7,7 +7,7 @@ pub async fn cmd_sandbox(sub: SandboxCommand) -> Result<()> {
     let config = config::load()?;
     match sub {
         SandboxCommand::List => {
-            banner(&format!("rsclaw sandbox v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!("rsclaw sandbox v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
             match config.ops.sandbox.as_ref() {
                 Some(sb) => {
                     let mode = sb
@@ -33,7 +33,7 @@ pub async fn cmd_sandbox(sub: SandboxCommand) -> Result<()> {
             }
         }
         SandboxCommand::Explain => {
-            banner(&format!("rsclaw sandbox explain v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!("rsclaw sandbox explain v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
             println!("  Each agent runs in its own isolated environment.");
             println!(
                 "  Configure via {} in rsclaw.json5 / openclaw.json",
