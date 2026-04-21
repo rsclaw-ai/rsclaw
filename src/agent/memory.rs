@@ -765,8 +765,12 @@ impl MemoryStore {
 
         // Ensure table exists (skip if readonly — open() would have failed anyway).
         if let Ok(write) = db.begin_write() {
-            let _ = write.open_table(REDB_TABLE);
-            let _ = write.commit();
+            if let Err(e) = write.open_table(REDB_TABLE) {
+                tracing::warn!(error = %e, "memory: failed to create table");
+            }
+            if let Err(e) = write.commit() {
+                tracing::warn!(error = %e, "memory: failed to commit table creation");
+            }
         }
 
         // Load existing docs and rebuild HNSW index.
