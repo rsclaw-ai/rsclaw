@@ -1,5 +1,9 @@
 //! Channel subsystem.
 //!
+//! TODO: Channel instances are stored behind `OnceCell` (set once at startup).
+//! This prevents hot-adding or replacing channels at runtime. Migrate to
+//! `ArcSwap` to support the channel hot-add feature (see feature backlog).
+//!
 //! A *channel* is an integration point where messages arrive (Telegram,
 //! Discord, CLI, etc.). Each channel implementation:
 //!   1. Receives inbound messages and forwards them to the gateway router.
@@ -87,6 +91,9 @@ pub struct OutboundMessage {
 // Channel trait
 // ---------------------------------------------------------------------------
 
+// BoxFuture is required here because this trait is used as `dyn Channel`
+// (see ChannelManager, gateway/channels). Native async fn in traits
+// does not support dynamic dispatch.
 /// Every channel integration implements this trait.
 pub trait Channel: Send + Sync {
     /// Human-readable name of this channel, e.g. "telegram", "discord".

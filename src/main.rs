@@ -1,4 +1,4 @@
-#![allow(clippy::all, unused)]
+#![allow(unused)]
 //! rsclaw — AI Agent Engine Compatible with OpenClaw
 //!
 //! Architecture reference: AGENTS.md
@@ -12,6 +12,21 @@
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
+// Pre-existing pedantic lints — fix incrementally.
+#![allow(
+    clippy::collapsible_if,
+    clippy::needless_borrow,
+    clippy::needless_borrows_for_generic_args,
+    clippy::redundant_closure,
+    clippy::redundant_closure_for_method_calls,
+    clippy::useless_format,
+    clippy::type_complexity,
+    clippy::uninlined_format_args,
+    clippy::unused_async,
+    clippy::match_wildcard_for_single_variants,
+    clippy::map_unwrap_or,
+    clippy::doc_markdown,
+)]
 
 use anyhow::Result;
 use clap::Parser;
@@ -105,8 +120,6 @@ async fn run() -> Result<()> {
     // Initialise logging.
     init_tracing(&cli);
 
-    // SAFETY: single-threaded at this point (before tokio spawns).
-
     // Apply --base-dir / --dev / --profile instance isolation (AGENTS.md §26).
     let (base_dir, port) = resolve_instance(&cli);
     if cli.base_dir.is_some() || cli.dev || cli.profile.is_some() {
@@ -118,6 +131,7 @@ async fn run() -> Result<()> {
             "profile: {label}  base: {}  port: {port}",
             base_dir.display()
         );
+        // SAFETY: called before tokio runtime starts, single-threaded at this point
         unsafe {
             std::env::set_var("RSCLAW_BASE_DIR", base_dir.as_os_str());
             std::env::set_var("RSCLAW_PORT", port.to_string());

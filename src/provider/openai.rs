@@ -22,6 +22,24 @@ struct SessionMessageCache {
 static SESSION_CACHES: LazyLock<DashMap<String, SessionMessageCache>> =
     LazyLock::new(DashMap::new);
 
+/// Cap SESSION_CACHES to avoid unbounded memory growth.
+const SESSION_CACHES_MAX: usize = 10_000;
+
+fn evict_session_caches_if_needed() {
+    if SESSION_CACHES.len() > SESSION_CACHES_MAX {
+        // Remove roughly half the entries to amortize eviction cost.
+        let to_remove: Vec<String> = SESSION_CACHES
+            .iter()
+            .take(SESSION_CACHES_MAX / 2)
+            .map(|e| e.key().clone())
+            .collect();
+        for key in to_remove {
+            SESSION_CACHES.remove(&key);
+        }
+        tracing::info!(remaining = SESSION_CACHES.len(), "evicted stale session caches");
+    }
+}
+
 use super::{
     ContentPart, LlmProvider, LlmRequest, LlmStream, Message, MessageContent, Role, StreamEvent,
     TokenUsage,
@@ -37,6 +55,8 @@ pub enum OpenAiMode {
     Responses,  // /responses (newer format)
 }
 
+// TODO(M-17): consolidate 7 constructors into a builder pattern
+// (e.g. OpenAiProvider::builder().base_url(...).mode(...).build()).
 pub struct OpenAiProvider {
     client: reqwest::Client,
     api_key: Option<String>,
@@ -186,9 +206,10 @@ impl LlmProvider for OpenAiProvider {
 
                 if let Some(cached) = SESSION_CACHES.get(session_key) {
                     // We have a server-assigned cache_id from a previous response.
-                    let cached_len = cached.messages.len();
+                    // Clamp to current length to avoid out-of-bounds if messages were truncated.
+                    let cached_len = cached.messages.len().min(current_messages.len());
                     if current_messages.len() > cached_len
-                        && current_messages[..cached_len] == cached.messages[..]
+                        && current_messages[..cached_len] == cached.messages[..cached_len]
                     {
                         // Prefix matches — send only the new messages.
                         let append = current_messages[cached_len..].to_vec();
@@ -220,12 +241,6 @@ impl LlmProvider for OpenAiProvider {
                 body_len = body_str.len(),
                 "openai: request prepared"
             );
-            // Dump full body to temp file for debugging.
-            let _ = std::fs::write(
-                "/tmp/debug_rsclaw_llm.json",
-                serde_json::to_string_pretty(&body).unwrap_or_default(),
-            );
-
             let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
             let mut builder = self
                 .client
@@ -272,6 +287,7 @@ impl LlmProvider for OpenAiProvider {
                         })
                         .unwrap_or_default();
 
+                    evict_session_caches_if_needed();
                     SESSION_CACHES.insert(session_key.clone(), SessionMessageCache {
                         cache_id,
                         messages: current_messages,
@@ -369,7 +385,8 @@ impl OpenAiProvider {
             // Extract images into separate "images" field.
             if let Some(content) = m.get("content") {
                 if content.is_array() {
-                    let parts = content.as_array().unwrap();
+                    let empty = Vec::new();
+                    let parts = content.as_array().unwrap_or(&empty);
                     let mut texts = Vec::new();
                     let mut images = Vec::new();
                     for p in parts {
@@ -438,10 +455,6 @@ impl OpenAiProvider {
             normalize_messages_for_cache(msgs);
         }
 
-        let _ = std::fs::write(
-            "/tmp/debug_rsclaw_llm.json",
-            serde_json::to_string_pretty(&body).unwrap_or_default(),
-        );
         tracing::debug!(
             tools_count = req.tools.len(),
             think = req.tools.is_empty(),
@@ -673,11 +686,6 @@ impl OpenAiProvider {
             body_len = body_str.len(),
             "openai-responses: request prepared"
         );
-        let _ = std::fs::write(
-            "/tmp/debug_rsclaw_llm.json",
-            serde_json::to_string_pretty(&body).unwrap_or_default(),
-        );
-
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
 
         let mut builder = self
@@ -1124,6 +1132,7 @@ fn serialize_part(part: &ContentPart) -> Value {
 
 // ---------------------------------------------------------------------------
 // SSE parser with line buffering (handles chunks that split lines)
+// TODO: SSE buffered parsing is duplicated across openai.rs, anthropic.rs, gemini.rs — extract shared utility
 // ---------------------------------------------------------------------------
 
 /// Parse SSE chunk with line buffering.

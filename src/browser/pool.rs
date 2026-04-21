@@ -290,7 +290,11 @@ impl Drop for TabSession {
         let port = self.port;
         debug!(target_id = %target_id, "pool: releasing tab");
         // Spawn async cleanup (can't await in drop).
-        tokio::spawn(async move {
+        // Guard against being called outside a tokio runtime (e.g. during shutdown).
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
             let browser_ws = format!("http://127.0.0.1:{port}/json/version");
             if let Ok(resp) = reqwest::get(&browser_ws).await {
                 if let Ok(info) = resp.json::<Value>().await {

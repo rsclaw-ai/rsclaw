@@ -2,20 +2,13 @@
 
 mod common;
 
-use std::sync::Once;
-
-static INIT_TLS: Once = Once::new();
-fn init_tls() {
-    INIT_TLS.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    });
-}
+use common::init_tls;
 
 use rsclaw::provider::{
     LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
     gemini::GeminiProvider,
 };
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::mock_provider::{
@@ -169,14 +162,14 @@ async fn request_url_includes_model() {
 }
 
 #[tokio::test]
-async fn api_key_in_query_params() {
+async fn api_key_in_header() {
     init_tls();
     let server = MockServer::start().await;
 
-    // Match on the API key query parameter
+    // Match on the API key header (moved from query param for security)
     Mock::given(method("POST"))
         .and(path("/v1beta/models/gemini-2.0-flash:streamGenerateContent"))
-        .and(query_param("key", "my-secret-gemini-key"))
+        .and(header("x-goog-api-key", "my-secret-gemini-key"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(
@@ -193,7 +186,7 @@ async fn api_key_in_query_params() {
     let result = provider.stream(simple_request("gemini-2.0-flash")).await;
     assert!(
         result.is_ok(),
-        "request should include API key in query params: {:?}",
+        "request should include API key in header: {:?}",
         result.err()
     );
 }

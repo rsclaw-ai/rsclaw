@@ -17,6 +17,7 @@ import { ErrorBoundary } from "./error";
 import { ToastContainer } from "./toast-container";
 import { isFirstLaunch, resetSetup } from "../lib/first-launch";
 import { setGatewayUrl, setAuthToken } from "../lib/rsclaw-api";
+import { useNotificationWs } from "../hooks/useNotificationWs";
 import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
 
 import { getISOLang, getLang } from "../locales";
@@ -323,6 +324,7 @@ export function Home() {
   useSwitchTheme();
   useLoadData();
   useHtmlLang();
+  useNotificationWs();
 
   useEffect(() => {
     console.log("[Config] got config from build time", getClientConfig());

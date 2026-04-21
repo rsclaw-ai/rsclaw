@@ -2,14 +2,7 @@
 
 mod common;
 
-use std::sync::Once;
-
-static INIT_TLS: Once = Once::new();
-fn init_tls() {
-    INIT_TLS.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    });
-}
+use common::init_tls;
 
 use rsclaw::provider::{
     LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent, ToolDef,

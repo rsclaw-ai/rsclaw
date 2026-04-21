@@ -439,9 +439,9 @@ impl ClawhubClient {
     ) -> Result<LockedSkill> {
         let url = format!(
             "https://skills.sh/api/download/{}/{}/{}",
-            urlencoding_encode(owner),
-            urlencoding_encode(repo),
-            urlencoding_encode(skill_id),
+            super::registry::url_encode(owner),
+            super::registry::url_encode(repo),
+            super::registry::url_encode(skill_id),
         );
 
         debug!(url, "downloading from skills.sh");
@@ -691,22 +691,6 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{digest:x}"))
 }
 
-fn urlencoding_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 3);
-    for byte in s.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char);
-            }
-            _ => {
-                out.push('%');
-                out.push(char::from(b"0123456789ABCDEF"[(byte >> 4) as usize]));
-                out.push(char::from(b"0123456789ABCDEF"[(byte & 0xf) as usize]));
-            }
-        }
-    }
-    out
-}
 
 // ---------------------------------------------------------------------------
 // Tests

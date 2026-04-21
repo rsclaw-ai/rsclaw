@@ -854,8 +854,8 @@ mod tests {
                 version: "1.0.0".to_string(),
             },
         };
-        let json = serde_json::to_string(&req).unwrap();
-        let parsed: InitializeRequest = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&req).expect("serialize InitializeRequest");
+        let parsed: InitializeRequest = serde_json::from_str(&json).expect("deserialize InitializeRequest");
         assert_eq!(parsed.client_info.name, "test-client");
         assert_eq!(parsed.protocol_version, 1);
     }
@@ -871,8 +871,8 @@ mod tests {
             },
             auth_methods: vec![],
         };
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: InitializeResponse = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&resp).expect("serialize InitializeResponse");
+        let parsed: InitializeResponse = serde_json::from_str(&json).expect("deserialize InitializeResponse");
         assert_eq!(parsed.agent_info.name, "rsclaw");
         assert_eq!(parsed.protocol_version, 1);
     }
@@ -884,8 +884,8 @@ mod tests {
             mcp_servers: None,
             _meta: None,
         };
-        let json = serde_json::to_string(&req).unwrap();
-        let parsed: NewSessionRequest = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&req).expect("serialize NewSessionRequest");
+        let parsed: NewSessionRequest = serde_json::from_str(&json).expect("deserialize NewSessionRequest");
         assert_eq!(parsed.cwd, "/project");
     }
 
@@ -898,8 +898,8 @@ mod tests {
             }],
             _meta: None,
         };
-        let json = serde_json::to_string(&req).unwrap();
-        let parsed: PromptRequest = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&req).expect("serialize PromptRequest");
+        let parsed: PromptRequest = serde_json::from_str(&json).expect("deserialize PromptRequest");
         assert_eq!(parsed.session_id, "sess_abc123");
     }
 
@@ -911,8 +911,8 @@ mod tests {
             StopReason::Cancelled,
             StopReason::Incomplete,
         ] {
-            let json = serde_json::to_string(&reason).unwrap();
-            let parsed: StopReason = serde_json::from_str(&json).unwrap();
+            let json = serde_json::to_string(&reason).expect("serialize StopReason");
+            let parsed: StopReason = serde_json::from_str(&json).expect("deserialize StopReason");
             assert_eq!(reason, parsed);
         }
     }
@@ -920,9 +920,9 @@ mod tests {
     #[test]
     fn test_session_id_type() {
         let sid: SessionId = "custom_session_123".to_string();
-        let json = serde_json::to_string(&sid).unwrap();
+        let json = serde_json::to_string(&sid).expect("serialize SessionId");
         assert_eq!(json, "\"custom_session_123\"");
-        let parsed: SessionId = serde_json::from_str(&json).unwrap();
+        let parsed: SessionId = serde_json::from_str(&json).expect("deserialize SessionId");
         assert_eq!(parsed, "custom_session_123");
     }
 
@@ -931,9 +931,9 @@ mod tests {
         let text = ContentBlock::Text {
             text: "Hello".to_string(),
         };
-        let json = serde_json::to_string(&text).unwrap();
+        let json = serde_json::to_string(&text).expect("serialize ContentBlock");
         assert!(json.contains("\"type\":\"text\""));
-        let parsed: ContentBlock = serde_json::from_str(&json).unwrap();
+        let parsed: ContentBlock = serde_json::from_str(&json).expect("deserialize ContentBlock");
         assert!(matches!(parsed, ContentBlock::Text { .. }));
     }
 
@@ -944,10 +944,10 @@ mod tests {
             name: Some("Interactive Login".to_string()),
             description: None,
         };
-        let json = serde_json::to_string(&method).unwrap();
-        let parsed: AuthMethod = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&method).expect("serialize AuthMethod");
+        let parsed: AuthMethod = serde_json::from_str(&json).expect("deserialize AuthMethod");
         assert_eq!(parsed.id, "interactive");
-        assert_eq!(parsed.name.unwrap(), "Interactive Login");
+        assert_eq!(parsed.name.expect("name should be Some"), "Interactive Login");
     }
 
     #[test]
@@ -963,8 +963,8 @@ mod tests {
             ToolKind::Fetch,
             ToolKind::Other,
         ] {
-            let json = serde_json::to_string(&kind).unwrap();
-            let parsed: ToolKind = serde_json::from_str(&json).unwrap();
+            let json = serde_json::to_string(&kind).expect("serialize ToolKind");
+            let parsed: ToolKind = serde_json::from_str(&json).expect("deserialize ToolKind");
             assert_eq!(kind, parsed);
         }
     }
@@ -972,8 +972,8 @@ mod tests {
     #[test]
     fn test_role_variants() {
         for role in [Role::User, Role::Assistant] {
-            let json = serde_json::to_string(&role).unwrap();
-            let parsed: Role = serde_json::from_str(&json).unwrap();
+            let json = serde_json::to_string(&role).expect("serialize Role");
+            let parsed: Role = serde_json::from_str(&json).expect("deserialize Role");
             assert_eq!(role, parsed);
         }
     }
@@ -990,14 +990,14 @@ mod tests {
         let req = ReadTextFileRequest {
             path: "/etc/passwd".to_string(),
         };
-        let json = serde_json::to_string(&req).unwrap();
-        let parsed: ReadTextFileRequest = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&req).expect("serialize ReadTextFileRequest");
+        let parsed: ReadTextFileRequest = serde_json::from_str(&json).expect("deserialize ReadTextFileRequest");
         assert_eq!(parsed.path, "/etc/passwd");
 
         let resp = ReadTextFileResponse {
             contents: "file contents".to_string(),
         };
-        let json = serde_json::to_string(&resp).unwrap();
+        let json = serde_json::to_string(&resp).expect("serialize ReadTextFileResponse");
         assert!(json.contains("file contents"));
     }
 
@@ -1008,15 +1008,15 @@ mod tests {
             command: Some("bash".to_string()),
             args: Some(vec!["-c".to_string(), "ls".to_string()]),
         };
-        let json = serde_json::to_string(&req).unwrap();
-        let parsed: CreateTerminalRequest = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&req).expect("serialize CreateTerminalRequest");
+        let parsed: CreateTerminalRequest = serde_json::from_str(&json).expect("deserialize CreateTerminalRequest");
         assert!(parsed.args.is_some());
 
         let resp = CreateTerminalResponse {
             terminal_id: "term_1".to_string(),
         };
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: CreateTerminalResponse = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&resp).expect("serialize CreateTerminalResponse");
+        let parsed: CreateTerminalResponse = serde_json::from_str(&json).expect("deserialize CreateTerminalResponse");
         assert_eq!(parsed.terminal_id, "term_1");
     }
 }

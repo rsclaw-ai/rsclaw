@@ -184,6 +184,9 @@ fn split_system_messages<'a>(
     (system, conv)
 }
 
+// TODO: Tool role maps to "user" but loses the tool_use_id, which Anthropic
+// requires for tool_result blocks. This may cause issues with multi-turn
+// tool-use conversations.
 fn serialize_message(msg: &Message) -> Value {
     let role = match msg.role {
         Role::User | Role::Tool => "user",
@@ -310,6 +313,7 @@ fn tag_last_content_block(msg: &mut Value, marker: &Value) {
 // ---------------------------------------------------------------------------
 
 /// Buffered SSE parser — handles TCP chunk boundaries that split lines.
+// TODO: SSE buffered parsing is duplicated across openai.rs, anthropic.rs, gemini.rs — extract shared utility
 async fn parse_sse_chunk_buffered(
     chunk: Result<bytes::Bytes>,
     line_buffer: &tokio::sync::Mutex<String>,
@@ -459,11 +463,11 @@ mod tests {
             ],
             ..make_request()
         };
-        let body = build_request_body(&req).unwrap();
-        let msgs = body["messages"].as_array().unwrap();
+        let body = build_request_body(&req).expect("build request body");
+        let msgs = body["messages"].as_array().expect("messages is array");
         assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0]["role"].as_str().unwrap(), "user");
-        assert_eq!(msgs[1]["role"].as_str().unwrap(), "assistant");
+        assert_eq!(msgs[0]["role"].as_str().expect("role is str"), "user");
+        assert_eq!(msgs[1]["role"].as_str().expect("role is str"), "assistant");
     }
 
     #[test]
@@ -472,13 +476,13 @@ mod tests {
             system: Some("hello".to_owned()),
             ..make_request()
         };
-        let body = build_request_body(&req).unwrap();
+        let body = build_request_body(&req).expect("build request body");
         // After cache_control injection, system is an array of content blocks.
         let blocks = body["system"].as_array().expect("system should be content-block array");
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0]["text"].as_str().unwrap(), "hello");
+        assert_eq!(blocks[0]["text"].as_str().expect("text is str"), "hello");
         assert_eq!(
-            blocks[0]["cache_control"]["type"].as_str().unwrap(),
+            blocks[0]["cache_control"]["type"].as_str().expect("cache_control type is str"),
             "ephemeral"
         );
     }
@@ -511,17 +515,17 @@ mod tests {
             ],
             ..make_request()
         };
-        let body = build_request_body(&req).unwrap();
+        let body = build_request_body(&req).expect("build request body");
 
         // System should have cache_control.
         let sys_blocks = body["system"].as_array().expect("system content blocks");
         assert_eq!(
-            sys_blocks[0]["cache_control"]["type"].as_str().unwrap(),
+            sys_blocks[0]["cache_control"]["type"].as_str().expect("cache_control type"),
             "ephemeral"
         );
 
         // Last 3 messages (m3, m4, m5) should have cache_control.
-        let msgs = body["messages"].as_array().unwrap();
+        let msgs = body["messages"].as_array().expect("messages is array");
         assert_eq!(msgs.len(), 5);
 
         // m1, m2: no cache_control
@@ -532,12 +536,12 @@ mod tests {
         for i in 2..5 {
             let content = &msgs[i]["content"];
             let block = if content.is_array() {
-                content.as_array().unwrap().last().unwrap()
+                content.as_array().expect("content is array").last().expect("content not empty")
             } else {
                 panic!("expected content to be converted to array for cached message");
             };
             assert_eq!(
-                block["cache_control"]["type"].as_str().unwrap(),
+                block["cache_control"]["type"].as_str().expect("cache_control type"),
                 "ephemeral",
                 "message index {i} should have cache_control"
             );
@@ -555,13 +559,13 @@ mod tests {
             ],
             ..make_request()
         };
-        let body = build_request_body(&req).unwrap();
-        let msgs = body["messages"].as_array().unwrap();
+        let body = build_request_body(&req).expect("build request body");
+        let msgs = body["messages"].as_array().expect("messages is array");
         // Single message should still get cache_control.
         let content = &msgs[0]["content"];
         assert!(content.is_array());
         assert_eq!(
-            content[0]["cache_control"]["type"].as_str().unwrap(),
+            content[0]["cache_control"]["type"].as_str().expect("cache_control type"),
             "ephemeral"
         );
     }
@@ -572,8 +576,8 @@ mod tests {
             temperature: Some(0.7),
             ..make_request()
         };
-        let body = build_request_body(&req).unwrap();
-        let t = body["temperature"].as_f64().unwrap();
+        let body = build_request_body(&req).expect("build request body");
+        let t = body["temperature"].as_f64().expect("temperature is f64");
         assert!((t - 0.7).abs() < 1e-4);
     }
 }

@@ -51,6 +51,10 @@ fn total_system_memory_bytes() -> u64 {
         let mut size: u64 = 0;
         let mut len = std::mem::size_of::<u64>();
         let name = c"hw.memsize";
+        // SAFETY: sysctl with hw.memsize reads a single u64 value.
+        // `size` and `len` are stack-local with correct alignment/size.
+        // `name` is a valid NUL-terminated C string for this sysctl.
+        // No mutable aliasing; the kernel writes exactly `len` bytes into `size`.
         unsafe {
             libc::sysctl(
                 name.as_ptr() as *mut _,
@@ -65,6 +69,8 @@ fn total_system_memory_bytes() -> u64 {
     }
     #[cfg(target_os = "linux")]
     {
+        // SAFETY: sysinfo writes into a zeroed, stack-local struct with no aliasing.
+        // libc::sysinfo is a well-defined syscall that fills the struct in-place.
         let info = unsafe {
             let mut info: libc::sysinfo = std::mem::zeroed();
             libc::sysinfo(&mut info);

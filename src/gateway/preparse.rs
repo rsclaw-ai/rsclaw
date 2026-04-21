@@ -72,36 +72,36 @@ pub(crate) async fn try_preparse_locally(
     }
     // /abort — set all abort flags
     if lower == "/abort" {
-        let flags = handle.abort_flags.read().unwrap();
+        let flags = handle.abort_flags.read().expect("abort_flags lock poisoned");
         let count = flags.len();
         for f in flags.values() { f.store(true, Ordering::SeqCst); }
-        return Some(txt(if count > 0 { format!("✓ abort signal sent ({count} session(s))") } else { "nothing to abort".to_owned() }));
+        return Some(txt(if count > 0 { format!("abort signal sent ({count} session(s))") } else { "nothing to abort".to_owned() }));
     }
     // /clear — abort running turns + signal session clear (fully non-blocking)
     if lower == "/clear" {
         // 1. Abort all running turns
-        let flags = handle.abort_flags.read().unwrap();
+        let flags = handle.abort_flags.read().expect("abort_flags lock poisoned");
         for f in flags.values() { f.store(true, Ordering::SeqCst); }
         drop(flags);
         // 2. Signal runtime to clear sessions at next opportunity
         handle.clear_signal.store(true, Ordering::SeqCst);
-        return Some(txt("✓ Session cleared.".to_owned()));
+        return Some(txt("Session cleared.".to_owned()));
     }
     // /new — start a fresh conversation (new generation, no summary)
     if lower == "/new" {
-        let flags = handle.abort_flags.read().unwrap();
+        let flags = handle.abort_flags.read().expect("abort_flags lock poisoned");
         for f in flags.values() { f.store(true, Ordering::SeqCst); }
         drop(flags);
         handle.new_session_signal.store(true, Ordering::SeqCst);
-        return Some(txt("✓ New session started.".to_owned()));
+        return Some(txt("New session started.".to_owned()));
     }
     // /reset — reset current session (no summary, same generation)
     if lower == "/reset" {
-        let flags = handle.abort_flags.read().unwrap();
+        let flags = handle.abort_flags.read().expect("abort_flags lock poisoned");
         for f in flags.values() { f.store(true, Ordering::SeqCst); }
         drop(flags);
         handle.reset_signal.store(true, Ordering::SeqCst);
-        return Some(txt("✓ Session reset.".to_owned()));
+        return Some(txt("Session reset.".to_owned()));
     }
     // /status
     if lower == "/status" {
@@ -322,6 +322,8 @@ $g.Dispose();$b.Dispose()"#
         None
     };
     if let Some(cmd) = shell_cmd {
+        tracing::warn!(command = %cmd, "executing shell command via preparse (open dmPolicy)");
+
         let (shell, arg) = if cfg!(target_os = "windows") {
             ("powershell", "-Command")
         } else {

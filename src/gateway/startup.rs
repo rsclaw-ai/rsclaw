@@ -125,6 +125,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 match download_bge_model(&dl_dir, search_cfg_clone.as_ref(), cfg_lang.as_deref()).await {
                     Ok(()) => {
                         info!("BGE model downloaded. Notifying user to restart.");
+                        // receiver may have been dropped
                         let _ = ntx.send(crate::channel::OutboundMessage {
                             target_id: String::new(),
                             is_group: false,
@@ -137,6 +138,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                     }
                     Err(e) => {
                         warn!("BGE model auto-download failed: {e:#}");
+                        // receiver may have been dropped
                         let _ = ntx.send(crate::channel::OutboundMessage {
                             target_id: String::new(),
                             is_group: false,
@@ -175,6 +177,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         && !plugin_registry.slots.has_memory()
     {
         let slot = MemoryStoreSlot::new(Arc::clone(mem_arc));
+        // slot may already be set by a plugin; ignore if so
         let _ = plugin_registry.slots.set_memory(Arc::new(slot), "built-in");
     }
     info!(
@@ -301,24 +304,28 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 if let Some(ref ch_name) = msg.channel {
                     // Get sender BEFORE any await — drop guard immediately after cloning sender
                     let tx = {
-                        let senders_guard = senders.read().unwrap();
+                        let senders_guard = senders.read().expect("channel_senders RwLock poisoned");
                         senders_guard.get(ch_name).cloned()
                     };
                     if let Some(tx) = tx {
                         info!(channel = %ch_name, target_id = %msg.target_id, "routing notification");
-                        let _ = tx.send(msg.clone()).await;
+                        if let Err(e) = tx.send(msg.clone()).await {
+                            tracing::warn!(error = %e, "notification send failed");
+                        }
                     } else {
                         warn!(channel = %ch_name, "no channel sender registered for notification");
                     }
                 } else {
                     // No channel specified — send to first registered channel (default)
                     let first = {
-                        let guard = senders.read().unwrap();
+                        let guard = senders.read().expect("channel_senders RwLock poisoned");
                         guard.iter().next().map(|(k, v)| (k.clone(), v.clone()))
                     };
                     if let Some((ch_name, tx)) = first {
                         info!(channel = %ch_name, "routing notification to default channel");
-                        let _ = tx.send(msg.clone()).await;
+                        if let Err(e) = tx.send(msg.clone()).await {
+                            tracing::warn!(error = %e, "notification send failed");
+                        }
                     } else {
                         warn!("notification: no channels registered");
                     }
@@ -352,7 +359,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // 11. Write PID file early so the hot-reload task can clean it on restart.
     let pid_file = crate::config::loader::pid_file();
     if let Some(parent) = pid_file.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warn!("could not create PID file directory: {e}");
+        }
     }
     let pid = std::process::id();
     if let Err(e) = std::fs::write(&pid_file, pid.to_string()) {
@@ -384,7 +393,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                             ?fields,
                             "config change requires restart — restarting gateway"
                         );
-                        let _ = std::fs::remove_file(&pid_file_restart);
+                        if let Err(e) = std::fs::remove_file(&pid_file_restart) {
+                            warn!("could not remove PID file on restart: {e}");
+                        }
                         match std::env::current_exe() {
                             Ok(exe) => {
                                 let args: Vec<String> = std::env::args().skip(1).collect();
@@ -573,7 +584,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let result = serve(state, bind_addr).await;
 
     // Clean up PID file on exit.
-    let _ = std::fs::remove_file(&pid_file);
+    if let Err(e) = std::fs::remove_file(&pid_file) {
+        warn!("could not remove PID file on exit: {e}");
+    }
     result
 }
 
@@ -685,6 +698,7 @@ fn spawn_agent_tasks(
                 // duplicate done frame to WS clients).
                 if reply.was_preparse {
                     if !reply.text.is_empty() {
+                        // receiver may have been dropped
                         let _ = event_tx_task.send(crate::events::AgentEvent {
                             session_id: session_key.clone(),
                             agent_id: handle.id.clone(),
@@ -692,6 +706,7 @@ fn spawn_agent_tasks(
                             done: false,
                         });
                     }
+                    // receiver may have been dropped
                     let _ = event_tx_task.send(crate::events::AgentEvent {
                         session_id: session_key.clone(),
                         agent_id: handle.id.clone(),
@@ -699,6 +714,7 @@ fn spawn_agent_tasks(
                         done: true,
                     });
                 }
+                // receiver may have been dropped (e.g. channel timeout)
                 let _ = reply_tx.send(reply);
             }
             info!(agent_id = %handle.id, "agent runtime task ended (channel closed)");
@@ -824,6 +840,7 @@ pub(crate) async fn handle_pending_analysis(
         files: vec![],
     };
     if handle.tx.send(msg).await.is_err() {
+        // receiver may have been dropped
         let _ = out_tx
             .send(crate::channel::OutboundMessage {
                 target_id,
@@ -839,6 +856,7 @@ pub(crate) async fn handle_pending_analysis(
     }
     match tokio::time::timeout(Duration::from_secs(600), reply_rx).await {
         Ok(Ok(r)) if !r.text.is_empty() || !r.images.is_empty() || !r.files.is_empty() => {
+            // receiver may have been dropped
             let _ = out_tx
                 .send(crate::channel::OutboundMessage {
                     target_id,
@@ -852,6 +870,7 @@ pub(crate) async fn handle_pending_analysis(
         }
         Ok(Ok(_)) => {} // empty reply, nothing to send
         Ok(Err(_)) => {
+            // receiver may have been dropped
             let _ = out_tx
                 .send(crate::channel::OutboundMessage {
                     target_id,
@@ -865,6 +884,7 @@ pub(crate) async fn handle_pending_analysis(
                 .await;
         }
         Err(_) => {
+            // receiver may have been dropped
             let _ = out_tx
                 .send(crate::channel::OutboundMessage {
                     target_id,
@@ -1007,8 +1027,10 @@ async fn download_bge_model(
         }
 
         if !success {
-            // Clean up partial file on final failure.
-            let _ = tokio::fs::remove_file(&partial).await;
+            // Clean up partial file on final failure (best-effort, about to bail anyway).
+            if let Err(e) = tokio::fs::remove_file(&partial).await {
+                warn!("could not remove partial download file: {e}");
+            }
             anyhow::bail!("failed to download {filename} after 3 attempts");
         }
     }

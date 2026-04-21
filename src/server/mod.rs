@@ -1,3 +1,4 @@
+// TODO: split into sub-modules (routes, handlers, middleware)
 //! Axum HTTP gateway — OpenClaw-compatible REST API + SSE streaming.
 //!
 //! Endpoints:
@@ -56,6 +57,24 @@ use crate::{
     gateway::LiveConfig,
     store::Store,
 };
+
+// ---------------------------------------------------------------------------
+// Timing-safe token comparison
+// ---------------------------------------------------------------------------
+
+/// Compare two strings in constant time to prevent timing side-channel attacks.
+/// Note: length difference is still detectable via timing (early return), but for
+/// auth tokens of known format this is acceptable. The byte comparison itself
+/// does not short-circuit.
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -288,7 +307,7 @@ async fn auth_middleware(
         .and_then(|v| v.strip_prefix("Bearer "));
 
     match provided {
-        Some(token) if token == expected => next.run(request).await,
+        Some(token) if constant_time_eq(token, &expected) => next.run(request).await,
         _ => {
             warn!(path = %path, "auth rejected: missing or invalid Bearer token");
             (
@@ -1083,13 +1102,19 @@ async fn channels_pair(
     }
 
     // Collect enforcers outside the lock to avoid holding it across await.
-    let enforcers: Vec<(String, Arc<crate::channel::DmPolicyEnforcer>)> = state
+    let enforcers: Vec<(String, Arc<crate::channel::DmPolicyEnforcer>)> = match state
         .dm_enforcers
         .read()
-        .unwrap()
-        .iter()
-        .map(|(k, v)| (k.clone(), Arc::clone(v)))
-        .collect();
+    {
+        Ok(guard) => guard.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal lock error"})),
+            )
+                .into_response();
+        }
+    };
 
     for (channel, enforcer) in &enforcers {
         if let Some(peer_id) = enforcer.approve_pairing(code).await {
@@ -1125,13 +1150,19 @@ async fn channels_unpair(
     }
 
     // Revoke from in-memory enforcer.
-    let enforcers: Vec<(String, Arc<crate::channel::DmPolicyEnforcer>)> = state
+    let enforcers: Vec<(String, Arc<crate::channel::DmPolicyEnforcer>)> = match state
         .dm_enforcers
         .read()
-        .unwrap()
-        .iter()
-        .map(|(k, v)| (k.clone(), Arc::clone(v)))
-        .collect();
+    {
+        Ok(guard) => guard.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal lock error"})),
+            )
+                .into_response();
+        }
+    };
 
     let mut found = false;
     for (ch, enforcer) in &enforcers {
@@ -1159,13 +1190,19 @@ async fn channels_unpair(
 }
 
 async fn list_pairings(State(state): State<AppState>) -> Response {
-    let enforcers: Vec<(String, Arc<crate::channel::DmPolicyEnforcer>)> = state
+    let enforcers: Vec<(String, Arc<crate::channel::DmPolicyEnforcer>)> = match state
         .dm_enforcers
         .read()
-        .unwrap()
-        .iter()
-        .map(|(k, v)| (k.clone(), Arc::clone(v)))
-        .collect();
+    {
+        Ok(guard) => guard.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal lock error"})),
+            )
+                .into_response();
+        }
+    };
 
     let mut pending = Vec::new();
     let mut approved = Vec::new();
@@ -1232,8 +1269,11 @@ async fn save_config(
     }
 
     // Backup current file.
+    // TODO: add full schema validation before saving (beyond JSON5 parse check).
     let backup = config_path.with_extension("json5.bak");
-    let _ = std::fs::copy(&config_path, &backup);
+    if let Err(e) = std::fs::copy(&config_path, &backup) {
+        tracing::warn!(error = %e, "failed to create config backup before save");
+    }
 
     // Write new config.
     if let Err(e) = std::fs::write(&config_path, &req.raw) {
@@ -1270,29 +1310,8 @@ async fn get_session_messages(
     }
 }
 
-/// Returns true if the JSON message value is a compaction summary (internal only).
-fn is_compaction_message(v: &serde_json::Value) -> bool {
-    let obj = match v.as_object() {
-        Some(o) => o,
-        None => return false,
-    };
-    let role = obj.get("role").and_then(|r| r.as_str()).unwrap_or("");
-    if role != "user" {
-        return false;
-    }
-    if let Some(text) = obj.get("content").and_then(|c| c.as_str()) {
-        return text.starts_with("[CONTEXT COMPACTION");
-    }
-    if let Some(parts) = obj.get("content").and_then(|c| c.as_array()) {
-        if let Some(first_text) = parts.first()
-            .and_then(|p| p.get("text"))
-            .and_then(|t| t.as_str())
-        {
-            return first_text.starts_with("[CONTEXT COMPACTION");
-        }
-    }
-    false
-}
+// is_compaction_message moved to crate::agent::compaction::is_compaction_message
+use crate::agent::compaction::is_compaction_message;
 
 async fn clear_session(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     // Delete and re-create the session with empty messages.
@@ -2080,9 +2099,11 @@ async fn run_doctor_cmd(fix: bool) -> Response {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             // Parse output lines into structured results.
             let mut checks: Vec<serde_json::Value> = Vec::new();
-            let ansi_re = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+            static ANSI_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+                regex::Regex::new(r"\x1b\[[0-9;]*m").expect("ansi escape regex")
+            });
             for line in stdout.lines() {
-                let clean = ansi_re.replace_all(line, "");
+                let clean = ANSI_RE.replace_all(line, "");
                 let clean = clean.trim();
                 if let Some(msg) = clean.strip_prefix("[ok]") {
                     checks.push(serde_json::json!({"status": "ok", "message": msg.trim()}));
@@ -2129,13 +2150,15 @@ async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
     };
 
     // Strip ANSI escape codes.
-    let ansi_re = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+    static ANSI_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\x1b\[[0-9;]*m").expect("ansi escape regex")
+    });
 
     let lines: Vec<&str> = content.lines().rev().take(limit).collect();
     let mut logs: Vec<serde_json::Value> = Vec::new();
 
     for line in lines.into_iter().rev() {
-        let clean = ansi_re.replace_all(line, "");
+        let clean = ANSI_RE.replace_all(line, "");
         let clean = clean.trim();
         if clean.is_empty() {
             continue;

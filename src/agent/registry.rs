@@ -296,7 +296,7 @@ impl AgentRegistry {
             .unwrap_or(DEFAULT_MAX_CONCURRENT) as usize;
 
         {
-            let mut inner = registry.inner.write().unwrap();
+            let mut inner = registry.inner.write().expect("agent registry lock poisoned");
 
             for entry in &agent_list {
                 let (tx, rx) = mpsc::channel::<AgentMessage>(32);
@@ -343,13 +343,13 @@ impl AgentRegistry {
 
     /// Insert a dynamically spawned agent handle.
     pub fn insert_handle(&self, handle: Arc<AgentHandle>) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().expect("agent registry lock poisoned");
         inner.agents.insert(handle.id.clone(), handle);
     }
 
     /// Remove an agent handle by ID (used for task agents after completion).
     pub fn remove_handle(&self, id: &str) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().expect("agent registry lock poisoned");
         inner.agents.remove(id);
     }
 
@@ -357,7 +357,7 @@ impl AgentRegistry {
     pub fn get(&self, id: &str) -> Result<Arc<AgentHandle>> {
         self.inner
             .read()
-            .unwrap()
+            .expect("agent registry lock poisoned")
             .agents
             .get(id)
             .cloned()
@@ -366,7 +366,7 @@ impl AgentRegistry {
 
     /// Return the default agent.
     pub fn default_agent(&self) -> Result<Arc<AgentHandle>> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().expect("agent registry lock poisoned");
         let id = inner
             .default_id
             .as_deref()
@@ -392,7 +392,7 @@ impl AgentRegistry {
     ///   2. Agents with `channels` containing `"channel"` (bare channel match).
     ///   3. Default agent (fallback).
     pub fn route_account(&self, channel: &str, account: Option<&str>) -> Result<Arc<AgentHandle>> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().expect("agent registry lock poisoned");
 
         // Build the qualified key "channel:account" for exact matching.
         let qualified = account.map(|a| format!("{channel}:{a}"));
@@ -442,17 +442,17 @@ impl AgentRegistry {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().unwrap().agents.len()
+        self.inner.read().expect("agent registry lock poisoned").agents.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.read().unwrap().agents.is_empty()
+        self.inner.read().expect("agent registry lock poisoned").agents.is_empty()
     }
 
     pub fn all(&self) -> Vec<Arc<AgentHandle>> {
         self.inner
             .read()
-            .unwrap()
+            .expect("agent registry lock poisoned")
             .agents
             .values()
             .cloned()

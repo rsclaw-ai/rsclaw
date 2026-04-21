@@ -35,11 +35,11 @@ const SEND_TIMEOUT_MS: u64 = 15_000;
 /// Build the common ilink API headers.
 fn ilink_headers(token: &str, body_len: usize) -> reqwest::header::HeaderMap {
     let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert("Content-Type", "application/json".parse().unwrap());
-    headers.insert("AuthorizationType", "ilink_bot_token".parse().unwrap());
-    headers.insert("Content-Length", body_len.to_string().parse().unwrap());
+    headers.insert("Content-Type", "application/json".parse().expect("valid hardcoded header value"));
+    headers.insert("AuthorizationType", "ilink_bot_token".parse().expect("valid hardcoded header value"));
+    headers.insert("Content-Length", body_len.to_string().parse().expect("valid Content-Length"));
     if !token.is_empty() {
-        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        headers.insert("Authorization", format!("Bearer {token}").parse().expect("valid Authorization header"));
     }
     // X-WECHAT-UIN: random uint32 → decimal string → base64 (simple inline)
     let uin: u32 = rand::random();
@@ -65,7 +65,7 @@ fn ilink_headers(token: &str, body_len: usize) -> reqwest::header::HeaderMap {
             '='
         });
     }
-    headers.insert("X-WECHAT-UIN", b64.parse().unwrap());
+    headers.insert("X-WECHAT-UIN", b64.parse().expect("valid base64 header value"));
     headers
 }
 

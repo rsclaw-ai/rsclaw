@@ -27,6 +27,8 @@ pub const LONG_TIMEOUT: Duration = Duration::from_secs(300);
 // ---------------------------------------------------------------------------
 
 /// Handler for Agent → Client requests (permissions, fs, terminal)
+/// Note: async_trait is required here because this trait is used as dyn AcpCallbackHandler.
+/// Native async fn in trait is not object-safe in stable Rust.
 #[async_trait]
 pub trait AcpCallbackHandler: Send + Sync {
     /// Handle permission request from agent
@@ -81,7 +83,10 @@ pub trait AcpCallbackHandler: Send + Sync {
     ) -> Result<Option<i32>>;
 }
 
-/// Default callback handler that auto-approves everything
+/// Default callback handler that auto-approves everything.
+// TODO(H-21): DefaultAcpHandler and DefaultAcpHandlerWithTerminal share nearly
+// identical handle_request_permission / handle_read_text_file / handle_write_text_file
+// implementations.  Extract a shared helper or blanket impl to reduce duplication.
 pub struct DefaultAcpHandler;
 
 #[async_trait]
@@ -289,7 +294,8 @@ impl AcpCallbackHandler for DefaultAcpHandlerWithTerminal {
         command: Option<&str>,
         _args: Option<Vec<String>>,
     ) -> Result<String> {
-        let shell = command.unwrap_or("powershell.exe");
+        let default_shell = if cfg!(target_os = "windows") { "powershell.exe" } else { "sh" };
+        let shell = command.unwrap_or(default_shell);
         let mut cmd = Command::new(shell);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())

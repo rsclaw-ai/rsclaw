@@ -152,7 +152,7 @@ pub fn apply_proxy_env(config: &RuntimeConfig) {
 
     if allow.is_none() || allow.as_deref() == Some("*") {
         // Simple mode: proxy everything except deny list → use env vars.
-        // SAFETY: called once at startup before spawning threads.
+        // SAFETY: called before tokio runtime starts, single-threaded at this point
         unsafe {
             std::env::set_var("HTTP_PROXY", &proxy_url);
             std::env::set_var("HTTPS_PROXY", &proxy_url);
@@ -177,6 +177,9 @@ pub fn apply_proxy_env(config: &RuntimeConfig) {
     }
 }
 
+// TODO: OnceLock means proxy settings cannot be changed at runtime after
+// initial configuration. If runtime proxy reconfiguration is needed,
+// migrate to ArcSwap or a Mutex-guarded config cell.
 static PROXY_ALLOW: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static PROXY_DENY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static PROXY_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -211,4 +214,33 @@ pub fn build_proxy_client() -> reqwest::ClientBuilder {
         builder = builder.proxy(proxy);
     }
     builder
+}
+
+/// Detect the system timezone from the `TZ` env var or the local UTC offset.
+///
+/// Shared helper used by heartbeat and cron modules to avoid duplication.
+pub fn system_tz() -> chrono_tz::Tz {
+    // Try TZ env var first (works on Linux/macOS with IANA names like "Asia/Shanghai")
+    if let Ok(tz_name) = std::env::var("TZ") {
+        if let Ok(tz) = tz_name.parse() {
+            return tz;
+        }
+    }
+    // Fall back to detecting system offset and mapping to a timezone
+    let local_offset = chrono::Local::now().offset().local_minus_utc();
+    match local_offset {
+        25200 => chrono_tz::Asia::Bangkok,     // +07:00
+        28800 => chrono_tz::Asia::Shanghai,    // +08:00
+        32400 => chrono_tz::Asia::Tokyo,       // +09:00
+        36000 => chrono_tz::Australia::Sydney,  // +10:00
+        -18000 => chrono_tz::US::Eastern,      // -05:00
+        -21600 => chrono_tz::US::Central,      // -06:00
+        -25200 => chrono_tz::US::Mountain,     // -07:00
+        -28800 => chrono_tz::US::Pacific,      // -08:00
+        0 => chrono_tz::UTC,
+        _ => {
+            tracing::warn!(offset_secs = local_offset, "unknown system timezone offset, using UTC. Set TZ env var for accuracy.");
+            chrono_tz::UTC
+        }
+    }
 }

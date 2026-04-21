@@ -19,6 +19,9 @@ use serde_json::Value;
 // ---------------------------------------------------------------------------
 
 /// A plugin filling the `memory` slot must implement this trait.
+///
+/// Methods return `BoxFuture` because this trait is used as `dyn MemorySlot`
+/// (see `SlotRegistry`), which requires object-safe async via boxing.
 pub trait MemorySlot: Send + Sync {
     /// Store a memory record.
     fn store<'a>(
@@ -40,6 +43,8 @@ pub trait MemorySlot: Send + Sync {
 
 /// A plugin filling the `context_engine` slot can transform the message
 /// list before it is sent to the LLM.
+///
+/// Returns `BoxFuture` for dyn-safety (used as `dyn ContextEngineSlot` in `SlotRegistry`).
 pub trait ContextEngineSlot: Send + Sync {
     /// Called before each LLM invocation.
     /// `messages` is the full conversation history (mutable).

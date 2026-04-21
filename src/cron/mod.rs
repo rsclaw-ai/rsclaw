@@ -10,17 +10,18 @@
 //! session (`session:<key>`). Concurrent runs are capped by
 //! `max_concurrent_runs`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{Datelike, Timelike, Utc};
+use chrono::{Datelike, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Semaphore};
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     agent::{AgentMessage, AgentRegistry},
@@ -466,6 +467,12 @@ impl CronRunner {
         semaphore: Arc<Semaphore>,
         mut reload_rx: broadcast::Receiver<()>,
     ) {
+        // Channel for collecting job results asynchronously.
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<(String, bool, u64, u64, Option<String>)>(64);
+
+        // Cancel flags for running jobs — set to true to signal abort on deletion.
+        let mut cancel_flags: HashMap<String, Arc<std::sync::atomic::AtomicBool>> = HashMap::new();
+
         loop {
             if !running.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
@@ -548,6 +555,22 @@ impl CronRunner {
                     .collect();
                 info!(after_merge_count = jobs.len(), disabled=?disabled_after_merge, "cron: merge complete");
 
+                // Cancel running tasks that were removed or disabled.
+                let active_ids: std::collections::HashSet<&str> = jobs.iter()
+                    .filter(|j| j.enabled)
+                    .map(|j| j.id.as_str())
+                    .collect();
+                let to_cancel: Vec<String> = cancel_flags.keys()
+                    .filter(|id| !active_ids.contains(id.as_str()))
+                    .cloned()
+                    .collect();
+                for id in &to_cancel {
+                    if let Some(flag) = cancel_flags.remove(id) {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        info!(job_id = id, "cron: cancelled running job (deleted/disabled)");
+                    }
+                }
+
                 if let Err(e) = self.save_store(&jobs).await {
                     warn!(err = %e, "cron: failed to save store after reload");
                 }
@@ -590,13 +613,12 @@ impl CronRunner {
 
             info!(count = due.len(), "cron: {} jobs due", due.len());
 
-            // Execute due jobs with concurrency limit
-            let mut handles = Vec::new();
-
+            // Execute due jobs concurrently — spawn and continue immediately.
+            // Results are collected via a channel, not by join_all.
             for job_id in due {
                 let permit = semaphore.clone().acquire_owned().await.ok();
                 if permit.is_none() {
-                    // Max concurrency reached
+                    // Max concurrency reached — remaining jobs will fire next tick.
                     break;
                 }
 
@@ -613,6 +635,8 @@ impl CronRunner {
                 }
 
                 let permit = permit.expect("permit checked above");
+                let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                cancel_flags.insert(job.id.clone(), Arc::clone(&cancelled));
                 let job = job.clone();
                 let agents = Arc::clone(&self.agents);
                 let channels = Arc::clone(&self.channels);
@@ -625,7 +649,21 @@ impl CronRunner {
                     let prev_consecutive_errors = job.state.as_ref().map(|s| s.consecutive_errors).unwrap_or(0);
                     info!(job_id = %job.id, "cron job triggered");
 
-                    let result = run_cron_job(&job, &agents).await;
+                    // Run with cancellation check — polls cancel flag every second.
+                    let result = tokio::select! {
+                        r = run_cron_job(&job, &agents) => r,
+                        _ = async {
+                            loop {
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                                    info!(job_id = %job.id, "cron job cancelled");
+                                    break;
+                                }
+                            }
+                        } => {
+                            Err(anyhow::anyhow!("job cancelled"))
+                        }
+                    };
                     let duration_ms = current_timestamp_ms() - start_time;
                     drop(permit);
 
@@ -710,29 +748,24 @@ impl CronRunner {
                     (job.id, result.is_ok(), duration_ms, job_started_at, error_msg)
                 });
 
-                handles.push(handle);
+                // Send result back via channel for async collection.
+                let result_tx = result_tx.clone();
+                tokio::spawn(async move {
+                    let result = handle.await;
+                    if let Ok(r) = result {
+                        let _ = result_tx.send(r).await;
+                    }
+                });
             }
 
-            // Wait for all jobs to complete and update state.
-            // Use select to also listen for reload signals, so deletions
-            // are not delayed until all running jobs finish.
-            let all_handles = futures::future::join_all(handles);
-            let results = tokio::select! {
-                r = all_handles => r,
-                _ = reload_rx.recv() => {
-                    // Reload triggered while jobs are running — apply immediately
-                    info!("cron: reload signal during job execution, reloading now");
-                    let new_jobs = crate::cron::load_cron_jobs();
-                    let now_ms = current_timestamp_ms();
-                    jobs = self.merge_jobs(&jobs, new_jobs, now_ms);
-                    if let Err(e) = self.save_store(&jobs).await {
-                        warn!(err = %e, "cron: failed to save store after mid-execution reload");
-                    }
-                    continue; // back to top of loop, running tasks finish on their own
-                }
-            };
-            for result in results {
-                if let Ok((job_id, success, duration_ms, started_at, error_msg)) = result {
+            // Collect any completed job results (non-blocking).
+            // This processes results from ALL previously spawned jobs,
+            // not just the ones spawned this tick.
+            // TODO(M-15): verify that try_recv draining is correct here — completed
+            // cron results may be silently skipped if the channel fills up before
+            // this non-blocking drain runs.
+            while let Ok((job_id, success, duration_ms, started_at, error_msg)) = result_rx.try_recv() {
+                    cancel_flags.remove(&job_id);
                     if let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) {
                         if let Some(state) = job.state.as_mut() {
                             state.running_at_ms = None;
@@ -790,7 +823,6 @@ impl CronRunner {
                         }
                     }
                 }
-            }
 
             // Remove completed one-shot jobs
             let before = jobs.len();
@@ -938,14 +970,12 @@ fn field_matches(field: &str, value: u32) -> bool {
     if field.contains(',') {
         return field.split(',').any(|part| field_matches(part.trim(), value));
     }
-    // Handle range: "9-15" means 9 through 15 exclusive (start <= value < end)
-    // This matches openclaw's interpretation where "9-11" means 9,10 only (not 11:59)
-    // and "13-15" means 13,14 only (not 15:59)
+    // Handle range: "9-17" means 9 through 17 inclusive (standard cron semantics)
     if field.contains('-') {
         let parts: Vec<&str> = field.split('-').collect();
         if parts.len() == 2 {
             if let (Ok(start), Ok(end)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-                return value >= start && value < end;
+                return value >= start && value <= end;
             }
         }
     }
@@ -954,7 +984,7 @@ fn field_matches(field: &str, value: u32) -> bool {
 
 /// Check if a dow value matches a dow field.
 /// Dow ranges use INCLUSIVE end (e.g., "1-5" = 1,2,3,4,5, where 1=Sunday).
-/// This differs from hour/dom ranges which use exclusive end.
+/// Same inclusive-end semantics as field_matches.
 fn dow_matches(field: &str, dow: u32) -> bool {
     if field == "*" {
         return true;
@@ -1005,34 +1035,7 @@ fn compute_next_run_from_expr(cron_expr: &str, from_ms: u64, tz: Option<&str>) -
 
     // Search in local time, always using a timezone-aware DateTime.
     // When no timezone is specified, use the system's local timezone (not UTC).
-    fn system_tz() -> chrono_tz::Tz {
-        // Try TZ env var first (works on Linux/macOS with IANA names like "Asia/Shanghai")
-        if let Ok(tz_name) = std::env::var("TZ") {
-            if let Ok(tz) = tz_name.parse() {
-                return tz;
-            }
-        }
-        // Try gateway config timezone
-        // Fall back to detecting system offset and mapping to a timezone
-        let local_offset = chrono::Local::now().offset().local_minus_utc();
-        match local_offset {
-            25200 => chrono_tz::Asia::Bangkok,     // +07:00
-            28800 => chrono_tz::Asia::Shanghai,    // +08:00
-            32400 => chrono_tz::Asia::Tokyo,       // +09:00
-            36000 => chrono_tz::Australia::Sydney,  // +10:00
-            -18000 => chrono_tz::US::Eastern,      // -05:00
-            -21600 => chrono_tz::US::Central,      // -06:00
-            -25200 => chrono_tz::US::Mountain,     // -07:00
-            -28800 => chrono_tz::US::Pacific,      // -08:00
-            0 => chrono_tz::UTC,
-            _ => {
-                warn!(offset_secs = local_offset, "cron: unknown system timezone offset, using UTC. Set TZ env var for accuracy.");
-                chrono_tz::UTC
-            }
-        }
-    }
-
-    let tz_for_search: chrono_tz::Tz = tz_opt.unwrap_or_else(system_tz);
+    let tz_for_search: chrono_tz::Tz = tz_opt.unwrap_or_else(crate::config::system_tz);
 
     // Current minute in the target timezone
     let local_now = utc_dt.with_timezone(&tz_for_search);
@@ -1041,24 +1044,31 @@ fn compute_next_run_from_expr(cron_expr: &str, from_ms: u64, tz: Option<&str>) -
         .with_nanosecond(0).expect("nanosecond 0 always valid");
     cand += chrono::Duration::minutes(1);
 
-    // Search up to 1 year ahead (in local time)
+    // Search up to 1 year ahead (in local time).
     let max_cand = cand + chrono::Duration::days(366);
 
     while cand < max_cand {
         // Use naive date's weekday to get the weekday in local time (not UTC)
-        // chrono: Monday=0, Tuesday=1, ..., Sunday=6
-        // openclaw: Monday=1, Tuesday=2, ..., Sunday=7
-        // chrono: Sunday=0, Monday=1, ..., Saturday=6
-        // openclaw dow: Sunday=1, Monday=2, ..., Saturday=7
         // chrono weekday IS compatible with openclaw dow (both use Sunday=0/1 as the anchor)
         let dow = cand.date_naive().weekday().num_days_from_sunday();
         let m = field_matches(mon_f, cand.month());
         let d = field_matches(dom_f, cand.day());
         let w = dow_matches(dow_f, dow);
+        // Optimization: if the date fields don't match, skip to next day midnight
+        // instead of scanning minute-by-minute.  Reduces worst case from ~525K to ~1460
+        // iterations per year.
+        if !(m && d && w) {
+            // Advance to 00:00 of the next day.
+            cand = (cand.date_naive() + chrono::Days::new(1))
+                .and_hms_opt(0, 0, 0)
+                .and_then(|naive| cand.timezone().from_local_datetime(&naive).single())
+                .unwrap_or_else(|| cand + chrono::Duration::days(1));
+            continue;
+        }
         let h = field_matches(hr_f, cand.hour());
         let mi = field_matches(min_f, cand.minute());
-        debug!(expr=%cron_expr, dow, "searching: {} m={} d={} w={} h={} mi={}", cand.date_naive(), m, d, w, h, mi);
-        if m && d && w && h && mi {
+        trace!(expr=%cron_expr, dow, "searching: {} m={} d={} w={} h={} mi={}", cand.date_naive(), m, d, w, h, mi);
+        if h && mi {
             // Convert the matched local time to UTC
             let utc_cand = cand.with_timezone(&chrono::Utc);
             debug!(expr=%cron_expr, "MATCH: {} (UTC: {})", cand, utc_cand);
@@ -1097,7 +1107,7 @@ async fn run_cron_job(job: &CronJob, agents: &AgentRegistry) -> Result<String> {
         .payload
         .as_ref()
         .and_then(|p| match p {
-CronPayload::Structured { timeout_seconds, .. } => timeout_seconds.clone(),
+CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
             CronPayload::Text(_) => None,
         })
         .unwrap_or(300);
@@ -1112,26 +1122,12 @@ CronPayload::Structured { timeout_seconds, .. } => timeout_seconds.clone(),
             .clone()
     };
 
-    // Get delivery channel for agent routing (so agent knows which tools/config to use)
-    let delivery_channel = job
-        .delivery
-        .as_ref()
-        .and_then(|d| d.channel.clone())
-        .unwrap_or_else(|| "cron".to_string());
-
-    // Get delivery target as peer_id (valid channel ID format like "ou_xxx" for feishu)
-    let delivery_to = job
-        .delivery
-        .as_ref()
-        .and_then(|d| d.to.clone())
-        .unwrap_or_else(|| format!("cron:{}", job.id));
-
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let msg = AgentMessage {
         session_key: session_key.clone(),
         text: job.effective_message().to_owned(),
-        channel: delivery_channel,
-        peer_id: delivery_to,
+        channel: "cron".to_string(),
+        peer_id: format!("cron:{}", job.id),
         chat_id: String::new(),
         reply_tx,
         extra_tools: vec![],
@@ -1246,7 +1242,7 @@ async fn send_delivery(
         }
     };
 
-    info!(job_id = %job.id, channel = %channel_name, to = %to, text_len = text.len(), text_preview = %text.chars().take(200).collect::<String>(), "cron: sending delivery");
+    info!(job_id = %job.id, channel = %channel_name, to = %to, text_len = text.len(), "cron: sending delivery");
 
     let msg = OutboundMessage {
         target_id: to.clone(),

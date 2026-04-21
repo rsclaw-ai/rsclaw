@@ -292,10 +292,14 @@ impl RedbStore {
                         let suffix = key.strip_prefix(&format!("{session_key}:")).unwrap_or("0");
                         let archive_key = format!("archive:{session_key}:gen1:{suffix}");
                         let json_str = serde_json::to_string(val).unwrap_or_default();
-                        let _ = msgs_table.insert(archive_key.as_str(), json_str.as_str());
+                        if let Err(e) = msgs_table.insert(archive_key.as_str(), json_str.as_str()) {
+                            tracing::error!(error = %e, key = %archive_key, "failed to insert archive entry");
+                        }
                     }
                 }
-                let _ = write.commit();
+                if let Err(e) = write.commit() {
+                    tracing::error!(error = %e, "failed to commit archive backfill transaction");
+                }
                 debug!("backfilled {} archive entries for session {session_key}", messages.len());
             }
         }
@@ -330,6 +334,7 @@ impl RedbStore {
     }
 
     /// List all approved peer IDs for a channel.
+    // TODO: use prefix range query (range(prefix..prefix_end)) instead of full table scan
     pub fn list_pairings(&self, channel: &str) -> Result<Vec<String>> {
         let prefix = format!("{channel}:");
         let read = self.db.begin_read()?;

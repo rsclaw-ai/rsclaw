@@ -1149,7 +1149,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
 
     // -- gateway --
     let gateway = val
-        .as_object_mut().unwrap()
+        .as_object_mut().expect("config must be a JSON object")
         .entry("gateway").or_insert_with(|| json!({}));
     if let Some(gw) = gateway.as_object_mut() {
         gw.insert("port".into(), json!(port));
@@ -1161,11 +1161,11 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
 
     // -- models.providers.<name> --
     if !val.get("models").is_some_and(|v| v.is_object()) {
-        val.as_object_mut().unwrap().insert("models".into(), json!({}));
+        val.as_object_mut().expect("config must be a JSON object").insert("models".into(), json!({}));
     }
-    let models = val.as_object_mut().unwrap().get_mut("models").unwrap();
+    let models = val.as_object_mut().expect("config must be a JSON object").get_mut("models").expect("models key must exist");
     let providers_obj = models
-        .as_object_mut().unwrap()
+        .as_object_mut().expect("config must be a JSON object")
         .entry("providers").or_insert_with(|| json!({}));
     if let Some(provs) = providers_obj.as_object_mut() {
         let prov_entry = provs
