@@ -3050,7 +3050,20 @@ impl AgentRuntime {
             let tools_tokens: usize = tools.iter()
                 .map(|t| estimate_tokens(&t.name) + estimate_tokens(&t.description) + estimate_tokens(&t.parameters.to_string()))
                 .sum();
-            let approx_tokens = msg_tokens_sum + sys_tokens + tools_tokens;
+            // Use the larger of: component-based estimate vs JSON body estimate.
+            // Component estimate misses JSON structure overhead, message formatting,
+            // and chat template tokens. JSON body estimate (bytes / 3) is conservative
+            // but never underestimates.
+            let component_est = msg_tokens_sum + sys_tokens + tools_tokens;
+            let body_est = {
+                let msgs_json = serde_json::to_string(&messages).unwrap_or_default();
+                let tools_json = serde_json::to_string(&tools).unwrap_or_default();
+                // Use estimate_tokens on the full JSON body — handles CJK vs ASCII correctly.
+                // Add per-message overhead for chat template tokens (~10 per message).
+                estimate_tokens(&msgs_json) + estimate_tokens(system_prompt)
+                    + estimate_tokens(&tools_json) + msg_count * 10
+            };
+            let approx_tokens = component_est.max(body_est);
             self.handle.last_ctx_tokens.store(approx_tokens, std::sync::atomic::Ordering::Relaxed);
             info!(session = %ctx.session_key, msg_count, approx_tokens, sys_tokens, tools_tokens, msg_tokens = msg_tokens_sum, model = %model, "LLM call: context size");
 
