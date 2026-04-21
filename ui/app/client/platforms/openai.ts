@@ -197,8 +197,7 @@ export class ChatGPTApi implements LLMApi {
       const lastMsg = options.messages[options.messages.length - 1];
       let text = typeof lastMsg.content === "string" ? lastMsg.content : getMessageTextContent(lastMsg);
 
-      // File references: convert [file:path] markers to readable format for agent
-      text = text.replace(/\[file:([^\]]+)\]/g, "[Attached file: $1]");
+      // File references: keep [file:path] markers as-is — backend extracts them.
 
       const session = useChatStore.getState().currentSession();
       const agentId = session.agentId || "main";

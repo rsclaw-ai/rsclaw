@@ -118,6 +118,80 @@ pub struct AgentMessage {
     pub files: Vec<FileAttachment>,
 }
 
+/// Extract `[file:path]` references from user text, read the files from disk,
+/// and return (cleaned_text, images, files).
+///
+/// Image files (jpg/png/gif/webp) become `ImageAttachment`; everything else
+/// becomes `FileAttachment`. The `[file:...]` markers are removed from the
+/// returned text.
+pub fn extract_file_refs(text: &str) -> (String, Vec<ImageAttachment>, Vec<FileAttachment>) {
+    use base64::Engine as _;
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\[file:([^\]]+)\]").expect("file ref regex")
+    });
+
+    let mut images = Vec::new();
+    let mut files = Vec::new();
+
+    for cap in RE.captures_iter(text) {
+        let path_str = cap[1].trim();
+        let path = std::path::Path::new(path_str);
+        let Ok(data) = std::fs::read(path) else {
+            tracing::warn!(path = path_str, "file ref: cannot read file");
+            continue;
+        };
+
+        let lower = path_str.to_lowercase();
+        let is_image = lower.ends_with(".jpg")
+            || lower.ends_with(".jpeg")
+            || lower.ends_with(".png")
+            || lower.ends_with(".gif")
+            || lower.ends_with(".webp");
+
+        if is_image {
+            let mime = if lower.ends_with(".png") {
+                "image/png"
+            } else if lower.ends_with(".gif") {
+                "image/gif"
+            } else if lower.ends_with(".webp") {
+                "image/webp"
+            } else {
+                "image/jpeg"
+            };
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+            images.push(ImageAttachment {
+                data: format!("data:{mime};base64,{b64}"),
+                mime_type: mime.to_owned(),
+            });
+        } else {
+            let filename = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path_str.to_owned());
+            let mime = match lower.rsplit('.').next() {
+                Some("pdf") => "application/pdf",
+                Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                Some("txt" | "md" | "rs" | "py" | "js" | "ts" | "json" | "toml" | "yaml" | "yml") => "text/plain",
+                Some("mp4") => "video/mp4",
+                Some("mp3") => "audio/mpeg",
+                Some("wav") => "audio/wav",
+                _ => "application/octet-stream",
+            }.to_owned();
+            files.push(FileAttachment {
+                filename,
+                data,
+                mime_type: mime,
+            });
+        }
+    }
+
+    let cleaned = RE.replace_all(text, "").to_string();
+    let cleaned = cleaned.trim().to_owned();
+    (cleaned, images, files)
+}
+
 /// Deferred file analysis that the per-user worker should process after
 /// sending the initial "analyzing..." reply.
 #[derive(Debug)]

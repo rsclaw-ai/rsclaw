@@ -348,17 +348,20 @@ async fn send_message(
         .clone()
         .unwrap_or_else(|| format!("api:{}", uuid::Uuid::new_v4()));
 
+    // Extract [file:path] references from user text.
+    let (text, file_images, file_files) = crate::agent::registry::extract_file_refs(&req.text);
+
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let msg = AgentMessage {
         session_key: session_key.clone(),
-        text: req.text,
+        text,
         channel: req.channel.unwrap_or_else(|| "api".to_string()),
         peer_id: req.peer_id.unwrap_or_else(|| "api-client".to_string()),
         chat_id: String::new(),
         reply_tx,
         extra_tools: vec![],
-        images: vec![],
-        files: vec![],
+        images: file_images,
+        files: file_files,
     };
 
     if handle.tx.send(msg).await.is_err() {
@@ -1415,6 +1418,9 @@ async fn openai_chat_completions(
         .unwrap_or("desktop")
         .to_owned();
 
+    // Extract [file:path] references from user text.
+    let (text, file_images, file_files) = crate::agent::registry::extract_file_refs(&text);
+
     let extra_tools = parse_oai_tools(req.tools.as_ref());
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let msg = AgentMessage {
@@ -1429,8 +1435,8 @@ async fn openai_chat_completions(
         chat_id: String::new(),
         reply_tx,
         extra_tools,
-        images: vec![],
-        files: vec![],
+        images: file_images,
+        files: file_files,
     };
 
     // Subscribe to event_bus BEFORE sending message to agent,
