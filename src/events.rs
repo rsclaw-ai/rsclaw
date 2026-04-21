@@ -2,6 +2,14 @@
 //!
 //! Defined here (not in `server`) to avoid a circular dependency:
 //!   agent → events ← server
+//!
+//! TODO: Current limitations and improvement plan:
+//! - AgentEvent is a flat struct; richer event types (tool calls, errors,
+//!   usage updates) require either new structs or an enum-based approach.
+//! - The broadcast channel drops events when subscribers lag; consider a
+//!   bounded replay buffer or per-subscriber mpsc for guaranteed delivery.
+//! - No event filtering: every subscriber receives every agent's events.
+//!   Add topic-based or session-based filtering when load requires it.
 
 use serde::Serialize;
 

@@ -178,7 +178,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             Err(_elapsed) => {
                 warn!("ws: handshake timed out waiting for connect request");
                 drop(outbound_tx);
-                let _ = write_task.await;
+                let _ = write_task.await; // task cleanup, result irrelevant
                 return;
             }
             Ok(frame) => match frame {
@@ -198,16 +198,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 req.id,
                                 ErrorShape::bad_request("expected method=connect as first request"),
                             );
-                            let _ = send_serialized(&outbound_tx, &err).await;
+                            let _ = send_serialized(&outbound_tx, &err).await; // best-effort error reply
                             drop(outbound_tx);
-                            let _ = write_task.await;
+                            let _ = write_task.await; // task cleanup, result irrelevant
                             return;
                         }
                         Err(e) => {
                             let err = ResFrame::err("0", ErrorShape::bad_request(e.to_string()));
-                            let _ = send_serialized(&outbound_tx, &err).await;
+                            let _ = send_serialized(&outbound_tx, &err).await; // best-effort error reply
                             drop(outbound_tx);
-                            let _ = write_task.await;
+                            let _ = write_task.await; // task cleanup, result irrelevant
                             return;
                         }
                     }
@@ -215,7 +215,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 Some(Ok(Message::Ping(_))) => continue,
                 Some(Ok(Message::Close(_))) | None => {
                     drop(outbound_tx);
-                    let _ = write_task.await;
+                    let _ = write_task.await; // task cleanup, result irrelevant
                     return;
                 }
                 _ => continue,
@@ -242,9 +242,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 retry_after_ms: 0,
             },
         );
-        let _ = send_serialized(&outbound_tx, &err).await;
+        let _ = send_serialized(&outbound_tx, &err).await; // best-effort error reply
         drop(outbound_tx);
-        let _ = write_task.await;
+        let _ = write_task.await; // task cleanup, result irrelevant
         return;
     }
 
@@ -272,9 +272,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         if !authed {
             warn!("ws: auth failed");
             let err = ResFrame::err(&req_id, ErrorShape::unauthorized("auth_failed"));
-            let _ = send_serialized(&outbound_tx, &err).await;
+            let _ = send_serialized(&outbound_tx, &err).await; // best-effort error reply
             drop(outbound_tx);
-            let _ = write_task.await;
+            let _ = write_task.await; // task cleanup, result irrelevant
             return;
         }
     }
@@ -315,7 +315,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let res = ResFrame::ok(&req_id, hello_value);
     if send_serialized(&outbound_tx, &res).await.is_err() {
         drop(outbound_tx);
-        let _ = write_task.await;
+        let _ = write_task.await; // task cleanup, result irrelevant
         return;
     }
 
@@ -332,7 +332,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         })
         .collect();
     let presence = EventFrame::new("presence", json!({ "agents": agents_list }), 0);
-    let _ = send_frame(&outbound_tx, &presence).await;
+    let _ = send_frame(&outbound_tx, &presence).await; // receiver may have disconnected
 
     // 7. Register this connection in the ConnRegistry.
     let conn_id: ConnId = uuid::Uuid::new_v4().to_string();
@@ -427,7 +427,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     retry_after_ms: 2000,
                                 },
                             );
-                            let _ = send_serialized(&outbound_tx, &err).await;
+                            let _ = send_serialized(&outbound_tx, &err).await; // best-effort error reply
                             continue;
                         }
 
@@ -441,12 +441,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             Ok(p) => ResFrame::ok(id, p),
                             Err(e) => ResFrame::err(id, e),
                         };
-                        let _ = send_serialized(&outbound_tx, &frame).await;
+                        let _ = send_serialized(&outbound_tx, &frame).await; // receiver may have disconnected
                     }
                     Err(e) => {
                         warn!("ws parse error: {e} — raw: {}", &raw[..raw.len().min(200)]);
                         let err = ResFrame::err("0", ErrorShape::bad_request(e.to_string()));
-                        let _ = send_serialized(&outbound_tx, &err).await;
+                        let _ = send_serialized(&outbound_tx, &err).await; // best-effort error reply
                     }
                 }
             }
@@ -462,7 +462,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     state.ws_conns.unregister(&conn_id).await;
     info!("ws: connection {conn_id} disconnected");
     drop(outbound_tx);
-    let _ = write_task.await;
+    let _ = write_task.await; // task cleanup, result irrelevant
 }
 
 // ---------------------------------------------------------------------------

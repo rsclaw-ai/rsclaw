@@ -853,7 +853,7 @@ fn edit_word(args: &Value, path: &Path) -> Result<Value> {
         // Full replacement: just create a new doc with the given content.
         let title = args["title"].as_str().unwrap_or("");
         let mut new_args = args.clone();
-        new_args["content"] = Value::String(replace_text.unwrap().to_owned());
+        new_args["content"] = Value::String(replace_text.expect("replace_text checked above").to_owned());
         if !title.is_empty() {
             new_args["title"] = Value::String(title.to_owned());
         }
@@ -867,7 +867,7 @@ fn edit_word(args: &Value, path: &Path) -> Result<Value> {
     }
 
     // Append mode: read existing document.xml from the zip, add paragraphs, repack.
-    let append_text = append_text.unwrap();
+    let append_text = append_text.expect("append_text checked above");
 
     let file = std::fs::File::open(path)
         .map_err(|e| anyhow!("edit_word: cannot open '{}': {e}", path.display()))?;
@@ -1370,22 +1370,22 @@ mod tests {
     #[tokio::test]
     async fn test_create_word_and_read_back() {
         let dir = std::env::temp_dir().join("rsclaw_doc_test");
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).expect("create test dir");
         let path = dir.join("test.docx");
 
         let args = json!({
             "action": "create_word",
-            "path": path.to_str().unwrap(),
+            "path": path.to_str().expect("path to str"),
             "content": TEST_CONTENT,
             "title": "Meeting Notice"
         });
-        let result = handle(&args, &path).await.unwrap();
+        let result = handle(&args, &path).await.expect("handle create_word");
         assert_eq!(result["created"], true, "create_word failed: {result}");
         assert!(path.exists(), "docx file not created");
 
         // Read back
-        let read_args = json!({"action": "read_doc", "path": path.to_str().unwrap()});
-        let read_result = handle(&read_args, &path).await.unwrap();
+        let read_args = json!({"action": "read_doc", "path": path.to_str().expect("path to str")});
+        let read_result = handle(&read_args, &path).await.expect("handle read_doc");
         let text = read_result["text"].as_str().unwrap_or("");
         assert!(text.contains("135"), "docx missing '135': {text}");
         assert!(text.contains("168"), "docx missing '168': {text}");
@@ -1397,23 +1397,23 @@ mod tests {
     #[tokio::test]
     async fn test_create_pdf_and_read_back() {
         let dir = std::env::temp_dir().join("rsclaw_pdf_test");
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).expect("create test dir");
         let path = dir.join("test.pdf");
 
         let args = json!({
             "action": "create_pdf",
-            "path": path.to_str().unwrap(),
+            "path": path.to_str().expect("path to str"),
             "content": TEST_CONTENT,
             "title": "Meeting Notice"
         });
-        let result = handle(&args, &path).await.unwrap();
+        let result = handle(&args, &path).await.expect("handle create_pdf");
         assert_eq!(result["created"], true, "create_pdf failed: {result}");
         assert!(path.exists(), "pdf file not created");
-        assert!(path.metadata().unwrap().len() > 0, "pdf file is empty");
+        assert!(path.metadata().expect("pdf metadata").len() > 0, "pdf file is empty");
 
         // Read back via read_doc
-        let read_args = json!({"action": "read_doc", "path": path.to_str().unwrap()});
-        let read_result = handle(&read_args, &path).await.unwrap();
+        let read_args = json!({"action": "read_doc", "path": path.to_str().expect("path to str")});
+        let read_result = handle(&read_args, &path).await.expect("handle read_doc");
         let text = read_result["text"].as_str().unwrap_or("");
         println!("PDF read_doc text: '{text}'");
         // PDF text extraction may have spacing differences, just check numbers exist
@@ -1426,21 +1426,21 @@ mod tests {
     #[tokio::test]
     async fn test_create_excel_and_read_back() {
         let dir = std::env::temp_dir().join("rsclaw_xlsx_test");
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).expect("create test dir");
         let path = dir.join("test.xlsx");
 
         let args = json!({
             "action": "create_excel",
-            "path": path.to_str().unwrap(),
+            "path": path.to_str().expect("path to str"),
             "sheets": [{"name": "Sheet1", "headers": ["Name","Phone"], "rows": [["Zhang","13800138000"],["Li","15912345678"]]}]
         });
-        let result = handle(&args, &path).await.unwrap();
+        let result = handle(&args, &path).await.expect("handle create_excel");
         assert_eq!(result["created"], true, "create_excel failed: {result}");
         assert!(path.exists(), "xlsx file not created");
 
         // Read back — xlsx returns {"sheets": [{"rows": [...]}]}, not "text"
-        let read_args = json!({"action": "read_doc", "path": path.to_str().unwrap()});
-        let read_result = handle(&read_args, &path).await.unwrap();
+        let read_args = json!({"action": "read_doc", "path": path.to_str().expect("path to str")});
+        let read_result = handle(&read_args, &path).await.expect("handle read_doc");
         let sheets_json = serde_json::to_string(&read_result["sheets"]).unwrap_or_default();
         assert!(sheets_json.contains("13800138000"), "xlsx missing phone: {sheets_json}");
 
@@ -1451,11 +1451,11 @@ mod tests {
     #[tokio::test]
     async fn test_create_word_empty_content_rejected() {
         let dir = std::env::temp_dir().join("rsclaw_empty_test");
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).expect("create test dir");
         let path = dir.join("empty.docx");
 
-        let args = json!({"action": "create_word", "path": path.to_str().unwrap()});
-        let result = handle(&args, &path).await.unwrap();
+        let args = json!({"action": "create_word", "path": path.to_str().expect("path to str")});
+        let result = handle(&args, &path).await.expect("handle create_word empty");
         assert!(result.get("error").is_some(), "empty content should return error: {result}");
 
         std::fs::remove_dir_all(&dir).ok();

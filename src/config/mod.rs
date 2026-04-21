@@ -177,6 +177,9 @@ pub fn apply_proxy_env(config: &RuntimeConfig) {
     }
 }
 
+// TODO: OnceLock means proxy settings cannot be changed at runtime after
+// initial configuration. If runtime proxy reconfiguration is needed,
+// migrate to ArcSwap or a Mutex-guarded config cell.
 static PROXY_ALLOW: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static PROXY_DENY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static PROXY_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();

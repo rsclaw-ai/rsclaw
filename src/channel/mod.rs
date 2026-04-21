@@ -1,5 +1,9 @@
 //! Channel subsystem.
 //!
+//! TODO: Channel instances are stored behind `OnceCell` (set once at startup).
+//! This prevents hot-adding or replacing channels at runtime. Migrate to
+//! `ArcSwap` to support the channel hot-add feature (see feature backlog).
+//!
 //! A *channel* is an integration point where messages arrive (Telegram,
 //! Discord, CLI, etc.). Each channel implementation:
 //!   1. Receives inbound messages and forwards them to the gateway router.

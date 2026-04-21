@@ -7,6 +7,12 @@ pub mod mock_provider;
 
 use std::{net::SocketAddr, sync::Arc};
 
+/// Initialize TLS crypto provider (rustls + aws-lc-rs).
+/// Safe to call multiple times; only the first call installs the provider.
+pub fn init_tls() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 use rsclaw::{
     MemoryTier,
     agent::AgentRegistry,

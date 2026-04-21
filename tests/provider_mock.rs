@@ -3,14 +3,9 @@
 //! No network calls, no wiremock. These verify that providers can be
 //! constructed and that `LlmRequest` fields round-trip as expected.
 
-use std::sync::Once;
+mod common;
 
-static INIT_TLS: Once = Once::new();
-fn init_tls() {
-    INIT_TLS.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    });
-}
+use common::init_tls;
 
 use rsclaw::provider::{
     LlmProvider, LlmRequest, Message, MessageContent, Role, anthropic::AnthropicProvider,
