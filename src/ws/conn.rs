@@ -36,7 +36,7 @@ impl ConnHandle {
     }
 
     pub fn next_seq(&mut self) -> u64 {
-        self.seq += 1;
+        self.seq = self.seq.wrapping_add(1);
         self.seq
     }
 }

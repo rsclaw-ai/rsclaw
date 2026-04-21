@@ -334,6 +334,7 @@ impl RedbStore {
     }
 
     /// List all approved peer IDs for a channel.
+    // TODO: use prefix range query (range(prefix..prefix_end)) instead of full table scan
     pub fn list_pairings(&self, channel: &str) -> Result<Vec<String>> {
         let prefix = format!("{channel}:");
         let read = self.db.begin_read()?;

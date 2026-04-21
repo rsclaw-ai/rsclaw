@@ -25,6 +25,34 @@ they were already addressed. \
 Your current task is in the '## Active Task' section - resume from there. \
 Respond ONLY to the latest user message that appears AFTER this summary.";
 
+/// Returns true if a JSON message value represents a compaction summary (internal only).
+/// Used by both the REST API (server/mod.rs) and WebSocket chat handler to filter
+/// compaction messages from user-visible history.
+pub fn is_compaction_message(v: &serde_json::Value) -> bool {
+    let obj = match v.as_object() {
+        Some(o) => o,
+        None => return false,
+    };
+    let role = obj.get("role").and_then(|r| r.as_str()).unwrap_or("");
+    if role != "user" {
+        return false;
+    }
+    // Content can be a plain string or an array of parts.
+    if let Some(text) = obj.get("content").and_then(|c| c.as_str()) {
+        return text.starts_with("[CONTEXT COMPACTION");
+    }
+    if let Some(parts) = obj.get("content").and_then(|c| c.as_array()) {
+        if let Some(first_text) = parts
+            .first()
+            .and_then(|p| p.get("text"))
+            .and_then(|t| t.as_str())
+        {
+            return first_text.starts_with("[CONTEXT COMPACTION");
+        }
+    }
+    false
+}
+
 impl AgentRuntime {
     /// Summarise the session history via LLM when the total character count
     /// approaches `reserveTokensFloor` (approximated as floor * 4 chars/token,

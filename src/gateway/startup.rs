@@ -301,7 +301,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 if let Some(ref ch_name) = msg.channel {
                     // Get sender BEFORE any await — drop guard immediately after cloning sender
                     let tx = {
-                        let senders_guard = senders.read().expect("channel_senders lock poisoned");
+                        let senders_guard = senders.read().expect("channel_senders RwLock poisoned");
                         senders_guard.get(ch_name).cloned()
                     };
                     if let Some(tx) = tx {
@@ -315,7 +315,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 } else {
                     // No channel specified — send to first registered channel (default)
                     let first = {
-                        let guard = senders.read().expect("channel_senders lock poisoned");
+                        let guard = senders.read().expect("channel_senders RwLock poisoned");
                         guard.iter().next().map(|(k, v)| (k.clone(), v.clone()))
                     };
                     if let Some((ch_name, tx)) = first {

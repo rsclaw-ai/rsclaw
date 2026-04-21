@@ -232,27 +232,5 @@ pub async fn chat_abort(ctx: MethodCtx) -> MethodResult {
     }))
 }
 
-/// Returns true if the JSON message value is a compaction summary (internal only).
-fn is_compaction_message(v: &serde_json::Value) -> bool {
-    let obj = match v.as_object() {
-        Some(o) => o,
-        None => return false,
-    };
-    let role = obj.get("role").and_then(|r| r.as_str()).unwrap_or("");
-    if role != "user" {
-        return false;
-    }
-    // Content can be a plain string or an array of parts.
-    if let Some(text) = obj.get("content").and_then(|c| c.as_str()) {
-        return text.starts_with("[CONTEXT COMPACTION");
-    }
-    if let Some(parts) = obj.get("content").and_then(|c| c.as_array()) {
-        if let Some(first_text) = parts.first()
-            .and_then(|p| p.get("text"))
-            .and_then(|t| t.as_str())
-        {
-            return first_text.starts_with("[CONTEXT COMPACTION");
-        }
-    }
-    false
-}
+// is_compaction_message moved to crate::agent::compaction::is_compaction_message
+use crate::agent::compaction::is_compaction_message;

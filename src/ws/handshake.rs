@@ -72,15 +72,15 @@ impl DeviceStore {
     async fn persist(&self) {
         let guard = self.tokens.read().await;
         if let Ok(json) = serde_json::to_string_pretty(&*guard) {
-            if let Err(e) = std::fs::write(&self.path, json) {
+            if let Err(e) = tokio::fs::write(&self.path, &json).await {
                 tracing::warn!(error = %e, "device store write failed");
             }
             // SECURITY: restrict file permissions to owner-only
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                if let Err(e) = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600)) {
-                    tracing::warn!(error = %e, "device store write failed");
+                if let Err(e) = tokio::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600)).await {
+                    tracing::warn!(error = %e, "device store set_permissions failed");
                 }
             }
         }

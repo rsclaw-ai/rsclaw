@@ -461,7 +461,10 @@ impl TelegramChannel {
         }
 
         let file_path = match resp.result {
-            Some(f) if f.file_path.is_some() => f.file_path.unwrap(),
+            Some(f) if f.file_path.is_some() => {
+                // SAFETY of expect: guarded by is_some() above
+                f.file_path.expect("guarded by is_some")
+            }
             Some(_) => {
                 warn!(file_id = file_id, "Telegram getFile: no file_path (file may exceed 20MB bot limit)");
                 anyhow::bail!("Telegram getFile returned no file_path");

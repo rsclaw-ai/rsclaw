@@ -120,8 +120,6 @@ async fn run() -> Result<()> {
     // Initialise logging.
     init_tracing(&cli);
 
-    // SAFETY: single-threaded at this point (before tokio spawns).
-
     // Apply --base-dir / --dev / --profile instance isolation (AGENTS.md §26).
     let (base_dir, port) = resolve_instance(&cli);
     if cli.base_dir.is_some() || cli.dev || cli.profile.is_some() {
@@ -133,6 +131,7 @@ async fn run() -> Result<()> {
             "profile: {label}  base: {}  port: {port}",
             base_dir.display()
         );
+        // SAFETY: called before tokio runtime starts, single-threaded at this point
         unsafe {
             std::env::set_var("RSCLAW_BASE_DIR", base_dir.as_os_str());
             std::env::set_var("RSCLAW_PORT", port.to_string());

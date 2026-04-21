@@ -159,6 +159,7 @@ pub async fn a2a_rpc_handler(
                 return Json(JsonRpcResponse::err(id, -32603, "agent inbox closed"));
             }
 
+            // Safe widening cast: timeout_seconds is u32, as u64 cannot truncate.
             let timeout_secs = state.config.agents.defaults.timeout_seconds.unwrap_or(600) as u64;
 
             let reply =

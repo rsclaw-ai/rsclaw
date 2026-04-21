@@ -78,6 +78,8 @@ impl RateLimiter {
                 | "cron.add"
                 | "cron.remove"
                 | "cron.run"
+                | "cron.update"
+                | "cron.delete"
                 | "memory.store"
                 | "exec.approval.set"
                 | "exec.approval.resolve"

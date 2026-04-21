@@ -1,3 +1,4 @@
+// TODO: split into sub-modules (routes, handlers, middleware)
 //! Axum HTTP gateway — OpenClaw-compatible REST API + SSE streaming.
 //!
 //! Endpoints:
@@ -1304,29 +1305,8 @@ async fn get_session_messages(
     }
 }
 
-/// Returns true if the JSON message value is a compaction summary (internal only).
-fn is_compaction_message(v: &serde_json::Value) -> bool {
-    let obj = match v.as_object() {
-        Some(o) => o,
-        None => return false,
-    };
-    let role = obj.get("role").and_then(|r| r.as_str()).unwrap_or("");
-    if role != "user" {
-        return false;
-    }
-    if let Some(text) = obj.get("content").and_then(|c| c.as_str()) {
-        return text.starts_with("[CONTEXT COMPACTION");
-    }
-    if let Some(parts) = obj.get("content").and_then(|c| c.as_array()) {
-        if let Some(first_text) = parts.first()
-            .and_then(|p| p.get("text"))
-            .and_then(|t| t.as_str())
-        {
-            return first_text.starts_with("[CONTEXT COMPACTION");
-        }
-    }
-    false
-}
+// is_compaction_message moved to crate::agent::compaction::is_compaction_message
+use crate::agent::compaction::is_compaction_message;
 
 async fn clear_session(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     // Delete and re-create the session with empty messages.
@@ -2114,9 +2094,11 @@ async fn run_doctor_cmd(fix: bool) -> Response {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             // Parse output lines into structured results.
             let mut checks: Vec<serde_json::Value> = Vec::new();
-            let ansi_re = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+            static ANSI_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+                regex::Regex::new(r"\x1b\[[0-9;]*m").expect("ansi escape regex")
+            });
             for line in stdout.lines() {
-                let clean = ansi_re.replace_all(line, "");
+                let clean = ANSI_RE.replace_all(line, "");
                 let clean = clean.trim();
                 if let Some(msg) = clean.strip_prefix("[ok]") {
                     checks.push(serde_json::json!({"status": "ok", "message": msg.trim()}));
@@ -2163,13 +2145,15 @@ async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
     };
 
     // Strip ANSI escape codes.
-    let ansi_re = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+    static ANSI_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\x1b\[[0-9;]*m").expect("ansi escape regex")
+    });
 
     let lines: Vec<&str> = content.lines().rev().take(limit).collect();
     let mut logs: Vec<serde_json::Value> = Vec::new();
 
     for line in lines.into_iter().rev() {
-        let clean = ansi_re.replace_all(line, "");
+        let clean = ANSI_RE.replace_all(line, "");
         let clean = clean.trim();
         if clean.is_empty() {
             continue;

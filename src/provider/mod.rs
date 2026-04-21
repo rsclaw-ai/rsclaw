@@ -142,6 +142,9 @@ pub type LlmStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 // Provider trait
 // ---------------------------------------------------------------------------
 
+// BoxFuture is required here because this trait is used as `dyn LlmProvider`
+// (see ProviderRegistry, gateway/providers.rs). Native async fn in traits
+// does not support dynamic dispatch.
 pub trait LlmProvider: Send + Sync {
     /// Provider name, e.g. "anthropic", "openai".
     fn name(&self) -> &str;

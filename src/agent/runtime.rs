@@ -373,6 +373,7 @@ impl AgentRuntime {
 
         // Spawn a background task that periodically checks for idle browser
         // sessions and drops them to release Chrome memory.  Runs every 60s.
+        // TODO: this spawned task has no JoinHandle and cannot be cancelled on shutdown
         {
             let browser_handle = Arc::clone(&rt.browser);
             tokio::spawn(async move {

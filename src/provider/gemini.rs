@@ -191,12 +191,26 @@ fn serialize_message(msg: &Message) -> Value {
 fn serialize_part(part: &ContentPart) -> Value {
     match part {
         ContentPart::Text { text } => json!({ "text": text }),
-        ContentPart::Image { url } => json!({
-            "inlineData": {
-                "mimeType": "image/png",
-                "data": url,
-            }
-        }),
+        ContentPart::Image { url } => {
+            // Parse MIME type from data URI prefix (e.g. "data:image/jpeg;base64,..."),
+            // falling back to image/png for raw base64 without a prefix.
+            let (mime, data) = if let Some(rest) = url.strip_prefix("data:") {
+                if let Some((header, b64)) = rest.split_once(',') {
+                    let m = header.split(';').next().unwrap_or("image/png");
+                    (m, b64)
+                } else {
+                    ("image/png", url.as_str())
+                }
+            } else {
+                ("image/png", url.as_str())
+            };
+            json!({
+                "inlineData": {
+                    "mimeType": mime,
+                    "data": data,
+                }
+            })
+        }
         ContentPart::ToolUse { name, input, .. } => json!({
             "functionCall": {
                 "name": name,
@@ -221,6 +235,7 @@ fn serialize_part(part: &ContentPart) -> Value {
 // ---------------------------------------------------------------------------
 
 /// Buffered SSE parser — handles TCP chunk boundaries that split lines.
+// TODO: SSE buffered parsing is duplicated across openai.rs, anthropic.rs, gemini.rs — extract shared utility
 async fn parse_sse_chunk_buffered(
     chunk: Result<bytes::Bytes>,
     line_buffer: &tokio::sync::Mutex<String>,

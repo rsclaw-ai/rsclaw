@@ -85,6 +85,7 @@ pub fn build_runtime(_tier: MemoryTier) -> Result<tokio::runtime::Runtime> {
     // This is a workaround for Windows debug build stack size issues.
     Ok(tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        // TODO: scale worker threads based on CPU count
         .worker_threads(1)
         .thread_stack_size(8 * 1024 * 1024) // 8MB stack per thread
         .build()?)

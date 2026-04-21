@@ -184,6 +184,9 @@ fn split_system_messages<'a>(
     (system, conv)
 }
 
+// TODO: Tool role maps to "user" but loses the tool_use_id, which Anthropic
+// requires for tool_result blocks. This may cause issues with multi-turn
+// tool-use conversations.
 fn serialize_message(msg: &Message) -> Value {
     let role = match msg.role {
         Role::User | Role::Tool => "user",
@@ -310,6 +313,7 @@ fn tag_last_content_block(msg: &mut Value, marker: &Value) {
 // ---------------------------------------------------------------------------
 
 /// Buffered SSE parser — handles TCP chunk boundaries that split lines.
+// TODO: SSE buffered parsing is duplicated across openai.rs, anthropic.rs, gemini.rs — extract shared utility
 async fn parse_sse_chunk_buffered(
     chunk: Result<bytes::Bytes>,
     line_buffer: &tokio::sync::Mutex<String>,

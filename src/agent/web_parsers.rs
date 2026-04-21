@@ -2,7 +2,55 @@
 //!
 //! Extracted from `runtime.rs` to reduce file size.
 
+use std::sync::LazyLock;
+
+use regex::Regex;
 use serde_json::{Value, json};
+
+// Pre-compiled regexes for HTML parsing — avoids recompilation on every call.
+
+static DDG_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<a\s+class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>"#)
+        .expect("ddg link regex")
+});
+static DDG_SNIPPET_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<a\s+class="result__snippet"[^>]*>(.*?)</a>"#)
+        .expect("ddg snippet regex")
+});
+static BING_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<a[^>]*href="(https?://[^"]*)"[^>]*>(.*?)</a>"#)
+        .expect("bing link regex")
+});
+static BING_SNIPPET_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<p[^>]*>(.*?)</p>"#).expect("bing snippet regex")
+});
+static BAIDU_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<h3[^>]*>\s*<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>"#)
+        .expect("baidu link regex")
+});
+static BAIDU_SNIPPET_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<span[^>]*class="content-right[^"]*"[^>]*>(.*?)</span>"#)
+        .expect("baidu snippet regex")
+});
+static SOGOU_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<h3[^>]*>\s*<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>"#)
+        .expect("sogou link regex")
+});
+static STRIP_TAGS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"<[^>]+>").expect("strip tags regex")
+});
+static TITLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?is)<title[^>]*>(.*?)</title>").expect("title regex")
+});
+static SCRIPT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?is)<script[^>]*>.*?</script>").expect("script regex")
+});
+static STYLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?is)<style[^>]*>.*?</style>").expect("style regex")
+});
+static WHITESPACE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\s+").expect("whitespace regex")
+});
 
 /// Look up search engine URL template from defaults.toml.
 pub(crate) fn search_engine_url(name: &str) -> &'static str {
@@ -80,14 +128,8 @@ pub(crate) fn lang_to_bing_mkt(lang: &str) -> &'static str {
 pub(crate) fn parse_ddg_results(html: &str, limit: usize) -> Vec<Value> {
     let mut results = Vec::new();
 
-    // Match result links: <a class="result__a" href="...">title</a>
-    let link_re =
-        regex::Regex::new(r#"<a\s+class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>"#).unwrap();
-    // Match snippets: <a class="result__snippet"...>snippet</a>
-    let snippet_re = regex::Regex::new(r#"<a\s+class="result__snippet"[^>]*>(.*?)</a>"#).unwrap();
-
-    let link_caps: Vec<_> = link_re.captures_iter(html).collect();
-    let snippet_caps: Vec<_> = snippet_re.captures_iter(html).collect();
+    let link_caps: Vec<_> = DDG_LINK_RE.captures_iter(html).collect();
+    let snippet_caps: Vec<_> = DDG_SNIPPET_RE.captures_iter(html).collect();
 
     for (i, cap) in link_caps.iter().enumerate().take(limit) {
         let raw_url = cap.get(1).map(|m| m.as_str()).unwrap_or("");
@@ -124,11 +166,8 @@ pub(crate) fn parse_ddg_results(html: &str, limit: usize) -> Vec<Value> {
 pub(crate) fn parse_bing_html_results(html: &str, limit: usize) -> Vec<Value> {
     let mut results = Vec::new();
     let parts: Vec<&str> = html.split("class=\"b_algo\"").collect();
-    let link_re = regex::Regex::new(r#"<a[^>]*href="(https?://[^"]*)"[^>]*>(.*?)</a>"#).unwrap();
-    let snippet_re = regex::Regex::new(r#"<p[^>]*>(.*?)</p>"#).unwrap();
-
     for block in parts.iter().skip(1).take(limit) {
-        let (url, title) = link_re
+        let (url, title) = BING_LINK_RE
             .captures(block)
             .map(|c| {
                 (
@@ -137,7 +176,7 @@ pub(crate) fn parse_bing_html_results(html: &str, limit: usize) -> Vec<Value> {
                 )
             })
             .unwrap_or(("", ""));
-        let snippet = snippet_re
+        let snippet = BING_SNIPPET_RE
             .captures(block)
             .and_then(|c| c.get(1))
             .map(|m| m.as_str())
@@ -156,12 +195,9 @@ pub(crate) fn parse_bing_html_results(html: &str, limit: usize) -> Vec<Value> {
 /// Parse Baidu HTML search results.
 pub(crate) fn parse_baidu_results(html: &str, limit: usize) -> Vec<Value> {
     let mut results = Vec::new();
-    let link_re = regex::Regex::new(r#"<h3[^>]*>\s*<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>"#).unwrap();
-    let snippet_re =
-        regex::Regex::new(r#"<span[^>]*class="content-right[^"]*"[^>]*>(.*?)</span>"#).unwrap();
 
-    let links: Vec<_> = link_re.captures_iter(html).collect();
-    let snippets: Vec<_> = snippet_re.captures_iter(html).collect();
+    let links: Vec<_> = BAIDU_LINK_RE.captures_iter(html).collect();
+    let snippets: Vec<_> = BAIDU_SNIPPET_RE.captures_iter(html).collect();
 
     for (i, cap) in links.iter().enumerate().take(limit) {
         let url = cap.get(1).map(|m| m.as_str()).unwrap_or("");
@@ -185,8 +221,7 @@ pub(crate) fn parse_baidu_results(html: &str, limit: usize) -> Vec<Value> {
 /// Parse Sogou HTML search results.
 pub(crate) fn parse_sogou_results(html: &str, limit: usize) -> Vec<Value> {
     let mut results = Vec::new();
-    let link_re = regex::Regex::new(r#"<h3[^>]*>\s*<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>"#).unwrap();
-    for cap in link_re.captures_iter(html).take(limit) {
+    for cap in SOGOU_LINK_RE.captures_iter(html).take(limit) {
         let url = cap.get(1).map(|m| m.as_str()).unwrap_or("");
         let title = cap.get(2).map(|m| m.as_str()).unwrap_or("");
         if !url.is_empty() {
@@ -235,8 +270,7 @@ pub(crate) fn percent_decode(s: &str) -> String {
 
 /// Strip inline HTML tags (bold, italic, etc.) from a snippet.
 pub(crate) fn strip_inline_tags(s: &str) -> String {
-    let re = regex::Regex::new(r"<[^>]+>").unwrap();
-    let text = re.replace_all(s, "");
+    let text = STRIP_TAGS_RE.replace_all(s, "");
     decode_html_entities(&text)
 }
 
@@ -253,8 +287,7 @@ pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
 
 /// Extract `<title>` content from HTML.
 pub(crate) fn extract_html_title(html: &str) -> String {
-    let re = regex::Regex::new(r"(?is)<title[^>]*>(.*?)</title>").unwrap();
-    re.captures(html)
+    TITLE_RE.captures(html)
         .and_then(|c| c.get(1))
         .map(|m| decode_html_entities(m.as_str().trim()))
         .unwrap_or_default()
@@ -263,21 +296,14 @@ pub(crate) fn extract_html_title(html: &str) -> String {
 /// Strip all HTML to plain text.
 pub(crate) fn strip_html(html: &str) -> String {
     // Remove script and style blocks.
-    let no_script = regex::Regex::new(r"(?is)<script[^>]*>.*?</script>")
-        .unwrap()
-        .replace_all(html, "");
-    let no_style = regex::Regex::new(r"(?is)<style[^>]*>.*?</style>")
-        .unwrap()
-        .replace_all(&no_script, "");
+    let no_script = SCRIPT_RE.replace_all(html, "");
+    let no_style = STYLE_RE.replace_all(&no_script, "");
     // Remove all remaining tags.
-    let no_tags = regex::Regex::new(r"<[^>]+>")
-        .unwrap()
-        .replace_all(&no_style, " ");
+    let no_tags = STRIP_TAGS_RE.replace_all(&no_style, " ");
     // Decode entities.
     let decoded = decode_html_entities(&no_tags);
     // Collapse whitespace.
-    regex::Regex::new(r"\s+")
-        .unwrap()
+    WHITESPACE_RE
         .replace_all(&decoded, " ")
         .trim()
         .to_owned()

@@ -55,6 +55,8 @@ pub enum OpenAiMode {
     Responses,  // /responses (newer format)
 }
 
+// TODO(M-17): consolidate 7 constructors into a builder pattern
+// (e.g. OpenAiProvider::builder().base_url(...).mode(...).build()).
 pub struct OpenAiProvider {
     client: reqwest::Client,
     api_key: Option<String>,
@@ -1130,6 +1132,7 @@ fn serialize_part(part: &ContentPart) -> Value {
 
 // ---------------------------------------------------------------------------
 // SSE parser with line buffering (handles chunks that split lines)
+// TODO: SSE buffered parsing is duplicated across openai.rs, anthropic.rs, gemini.rs — extract shared utility
 // ---------------------------------------------------------------------------
 
 /// Parse SSE chunk with line buffering.

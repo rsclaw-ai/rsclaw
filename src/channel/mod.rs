@@ -87,6 +87,9 @@ pub struct OutboundMessage {
 // Channel trait
 // ---------------------------------------------------------------------------
 
+// BoxFuture is required here because this trait is used as `dyn Channel`
+// (see ChannelManager, gateway/channels). Native async fn in traits
+// does not support dynamic dispatch.
 /// Every channel integration implements this trait.
 pub trait Channel: Send + Sync {
     /// Human-readable name of this channel, e.g. "telegram", "discord".
