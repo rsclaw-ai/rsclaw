@@ -49,7 +49,6 @@ async fn tts_openai(text: &str, client: &reqwest::Client) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[allow(unused_variables)]
 async fn tts_system(text: &str) -> Result<Vec<u8>> {
     #[cfg(target_os = "macos")]
     {

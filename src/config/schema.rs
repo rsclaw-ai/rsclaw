@@ -1306,18 +1306,6 @@ pub struct ToolsConfig {
     /// Max chars to keep in session history per tool result.
     /// Prevents session bloat from large web_fetch/web_search results.
     pub session_result_limits: Option<SessionResultLimits>,
-    /// ACP tools (OpenCode, Claude Code) timeout settings.
-    pub acp: Option<AcpConfig>,
-}
-
-/// ACP tool configuration (OpenCode, Claude Code).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AcpConfig {
-    /// Timeout for waiting for main agent to process ACP result and reply.
-    /// In seconds. Default: 300 (5 minutes).
-    /// If the main agent is busy with other tasks, this timeout may fire.
-    pub reply_timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1329,8 +1317,6 @@ pub struct SessionResultLimits {
     pub web_fetch: Option<usize>,
     /// exec result max chars in session (default: 3000)
     pub exec: Option<usize>,
-    /// ACP tools (opencode, claudecode) result max chars (default: 2000)
-    pub acp: Option<usize>,
     /// Default for all other tools (default: 3000)
     pub default: Option<usize>,
 }
@@ -1354,8 +1340,6 @@ pub struct ExecToolConfig {
     /// Timeout for exec commands in seconds (default: 1800 = 30 minutes).
     /// Matches openclaw's defaultTimeoutSec.
     pub timeout_seconds: Option<u64>,
-    /// Max concurrent background exec tasks (default: 4).
-    pub max_concurrent: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

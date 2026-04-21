@@ -20,8 +20,6 @@ interface host-runtime {
     log: func(level: string, msg: string);
     sleep: func(ms: u32);
     read-file: func(path: string) -> result<string, string>;
-    /// Send a progress/notification message to the user during long operations.
-    notify: func(message: string) -> result<string, string>;
 }
 
 interface plugin-api {

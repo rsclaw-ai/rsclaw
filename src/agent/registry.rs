@@ -25,19 +25,6 @@ const DEFAULT_MAX_CONCURRENT: u32 = 4;
 // AgentHandle
 // ---------------------------------------------------------------------------
 
-/// The four kinds of agent in the system.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub enum AgentKind {
-    /// The default entry point. Cannot be deleted. `default: true` in config.
-    Main,
-    /// User-created persistent agent. Saved to config file, survives restarts.
-    Named,
-    /// LLM-spawned temporary agent (`persistent: false`). Lives in memory, gone on restart.
-    Sub,
-    /// One-shot task agent. Automatically destroyed after completion.
-    Task,
-}
-
 /// A lightweight handle to a running agent.
 ///
 /// The actual agent loop lives in a tokio task; communication happens
@@ -45,7 +32,6 @@ pub enum AgentKind {
 #[derive(Clone)]
 pub struct AgentHandle {
     pub id: String,
-    pub kind: AgentKind,
     pub config: AgentEntry,
     /// Sender to the agent's message queue.
     pub tx: mpsc::Sender<AgentMessage>,
@@ -58,9 +44,6 @@ pub struct AgentHandle {
     /// Per-session abort flags: session_key -> atomic abort flag.
     /// Uses std::sync::RwLock (not tokio) so it can be accessed in Drop impls.
     pub abort_flags: Arc<std::sync::RwLock<HashMap<String, Arc<AtomicBool>>>>,
-    /// ACP tasks currently running: session_key -> (tool_name, start_time).
-    /// Used to prevent duplicate ACP submissions from same session.
-    pub acp_running_tasks: Arc<std::sync::RwLock<HashMap<String, (String, Instant)>>>,
     /// When this agent handle was created (for /status uptime).
     pub started_at: Instant,
     /// Number of active sessions (updated after each turn for /status).
@@ -119,9 +102,6 @@ pub struct AgentMessage {
     pub images: Vec<ImageAttachment>,
     /// File attachments (raw bytes). Empty for text-only messages.
     pub files: Vec<FileAttachment>,
-    /// Internal message flag. When true, agent processes the message but
-    /// does NOT send reply to channel (for background exec result injection).
-    pub is_internal: bool,
 }
 
 /// Deferred file analysis that the per-user worker should process after
@@ -250,14 +230,8 @@ impl AgentRegistry {
                     .lane_concurrency
                     .map(|n| n as usize)
                     .unwrap_or(max_concurrent);
-                let kind = if entry.default.unwrap_or(false) {
-                    AgentKind::Main
-                } else {
-                    AgentKind::Named
-                };
                 let handle = Arc::new(AgentHandle {
                     id: entry.id.clone(),
-                    kind,
                     config: entry.clone(),
                     tx,
                     concurrency: Arc::new(tokio::sync::Semaphore::new(permits)),
@@ -266,7 +240,6 @@ impl AgentRegistry {
                     ),
                     providers: Arc::clone(&providers),
                     abort_flags: Arc::new(std::sync::RwLock::new(HashMap::new())),
-                    acp_running_tasks: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     started_at: Instant::now(),
                     session_count: Arc::new(AtomicUsize::new(0)),
                     last_ctx_tokens: Arc::new(AtomicUsize::new(0)),

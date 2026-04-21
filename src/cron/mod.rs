@@ -10,31 +10,22 @@
 //! session (`session:<key>`). Concurrent runs are capped by
 //! `max_concurrent_runs`.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use chrono::{Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{broadcast, Semaphore};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{Semaphore, broadcast};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use crate::{
-    agent::{AgentMessage, AgentRegistry, AgentReply, AgentRuntime},
+    agent::{AgentMessage, AgentRegistry},
     channel::{ChannelManager, OutboundMessage},
-    config::{
-        runtime::RuntimeConfig,
-        schema::{CronConfig, CronDelivery, CronJobConfig},
-    },
-    events::AgentEvent,
-    plugin::PluginRegistry,
-    provider::registry::ProviderRegistry,
-    skill::SkillRegistry,
-    store::Store,
+    config::schema::{CronConfig, CronDelivery, CronJobConfig},
 };
 
 // ---------------------------------------------------------------------------
@@ -140,10 +131,7 @@ impl CronSchedule {
             CronSchedule::Nested { expr, tz, .. } => {
                 crate::cron::compute_next_run_from_expr(expr, from_ms, tz.as_deref())
             }
-            CronSchedule::Every {
-                every_ms,
-                anchor_ms,
-            } => {
+            CronSchedule::Every { every_ms, anchor_ms } => {
                 let every_ms = every_ms.unwrap_or(0);
                 if every_ms == 0 {
                     return None;
@@ -295,10 +283,7 @@ impl From<&CronJobConfig> for CronJob {
         Self {
             id: cfg.id.clone(),
             name: cfg.name.clone(),
-            agent_id: cfg
-                .agent_id
-                .clone()
-                .unwrap_or_else(|| "default".to_string()),
+            agent_id: cfg.agent_id.clone().unwrap_or_else(|| "default".to_string()),
             session_key,
             enabled: cfg.enabled.unwrap_or(true),
             schedule,
@@ -326,10 +311,7 @@ struct CronStore {
 
 impl Default for CronStore {
     fn default() -> Self {
-        Self {
-            version: 1,
-            jobs: Vec::new(),
-        }
+        Self { version: 1, jobs: Vec::new() }
     }
 }
 
@@ -362,21 +344,9 @@ pub struct CronRunner {
     semaphore: Arc<Semaphore>,
     default_delivery: Option<CronDelivery>,
     reload_tx: broadcast::Sender<()>,
-    /// Dependencies for creating temporary AgentRuntime instances.
-    config: Arc<RuntimeConfig>,
-    providers: Arc<ProviderRegistry>,
-    skills: Arc<SkillRegistry>,
-    store: Arc<Store>,
-    memory: Option<Arc<tokio::sync::Mutex<crate::agent::MemoryStore>>>,
-    event_tx: broadcast::Sender<AgentEvent>,
-    spawner: Option<Arc<crate::agent::AgentSpawner>>,
-    plugins: Option<Arc<PluginRegistry>>,
-    mcp: Option<Arc<crate::mcp::McpRegistry>>,
-    notification_tx: Option<broadcast::Sender<OutboundMessage>>,
 }
 
 impl CronRunner {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: &CronConfig,
         jobs: Vec<CronJob>,
@@ -384,17 +354,6 @@ impl CronRunner {
         channels: Arc<ChannelManager>,
         data_dir: PathBuf,
         reload_tx: broadcast::Sender<()>,
-        // Additional dependencies for direct AgentRuntime creation
-        runtime_config: Arc<RuntimeConfig>,
-        providers: Arc<ProviderRegistry>,
-        skills: Arc<SkillRegistry>,
-        store: Arc<Store>,
-        memory: Option<Arc<tokio::sync::Mutex<crate::agent::MemoryStore>>>,
-        event_tx: broadcast::Sender<AgentEvent>,
-        spawner: Option<Arc<crate::agent::AgentSpawner>>,
-        plugins: Option<Arc<PluginRegistry>>,
-        mcp: Option<Arc<crate::mcp::McpRegistry>>,
-        notification_tx: Option<broadcast::Sender<OutboundMessage>>,
     ) -> Self {
         let run_log_dir = data_dir.join("cron");
         let store_path = data_dir.join("cron_store.json");
@@ -409,17 +368,7 @@ impl CronRunner {
             store_path,
             semaphore: Arc::new(Semaphore::new(4)),
             default_delivery: config.default_delivery.clone(),
-            reload_tx: reload_tx.clone(),
-            config: runtime_config,
-            providers,
-            skills,
-            store,
-            memory,
-            event_tx,
-            spawner,
-            plugins,
-            mcp,
-            notification_tx,
+            reload_tx,
         }
     }
 
@@ -471,11 +420,7 @@ impl CronRunner {
         info!(
             total = jobs.len(),
             enabled = enabled_count,
-            next_wake = jobs
-                .iter()
-                .filter_map(|j| j.state.as_ref().and_then(|s| s.next_run_at_ms))
-                .min()
-                .unwrap_or(0),
+            next_wake = jobs.iter().filter_map(|j| j.state.as_ref().and_then(|s| s.next_run_at_ms)).min().unwrap_or(0),
             "cron scheduler started"
         );
 
@@ -487,9 +432,7 @@ impl CronRunner {
 
         let runner = self.clone();
         let timer_handle = tokio::spawn(async move {
-            runner
-                .timer_loop(jobs, running_clone, semaphore, reload_rx)
-                .await;
+            runner.timer_loop(jobs, running_clone, semaphore, reload_rx).await;
         });
 
         tokio::signal::ctrl_c().await?;
@@ -511,12 +454,6 @@ impl CronRunner {
         semaphore: Arc<Semaphore>,
         mut reload_rx: broadcast::Receiver<()>,
     ) {
-        // Channel for collecting job results asynchronously.
-        let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<(String, bool, u64, u64, Option<String>)>(64);
-
-        // Cancel flags for running jobs — set to true to signal abort on deletion.
-        let mut cancel_flags: HashMap<String, Arc<std::sync::atomic::AtomicBool>> = HashMap::new();
-
         loop {
             if !running.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
@@ -524,25 +461,17 @@ impl CronRunner {
 
             let now_ms = current_timestamp_ms();
 
-            // Find next wake time among enabled jobs that are NOT currently running.
-            // Running jobs have their next_run_at_ms in the past but should not be
-            // counted as "due" again until they complete and update their next run time.
+            // Find next wake time among enabled jobs
             let next_wake = jobs
                 .iter()
-                .filter(|j| j.enabled && j.state.as_ref().and_then(|s| s.running_at_ms).is_none())
+                .filter(|j| j.enabled)
                 .filter_map(|j| j.state.as_ref().and_then(|s| s.next_run_at_ms))
                 .min();
 
             // DEBUG: log next_wake to diagnose early firing
-            debug!(
-                next_wake = next_wake.unwrap_or(0),
-                now_ms, "cron: timer tick"
-            );
+            debug!(next_wake = next_wake.unwrap_or(0), now_ms, "cron: timer tick");
             if next_wake.map(|t| t <= now_ms).unwrap_or(false) {
-                warn!(
-                    next_wake = next_wake.unwrap_or(0),
-                    now_ms, "cron: next_wake is in the past!"
-                );
+                warn!(next_wake = next_wake.unwrap_or(0), now_ms, "cron: next_wake is in the past!");
             }
 
             let delay_ms = match next_wake {
@@ -561,93 +490,23 @@ impl CronRunner {
                 }
             };
 
-            // Use tokio::select! to wait for either timer, reload signal, or job completion
-            let select_result: Result<(), bool> = tokio::select! {
+            // Use tokio::select! to wait for either timer or reload signal
+            let reload_triggered = tokio::select! {
                 _ = sleep(Duration::from_millis(delay_ms)) => {
-                    Ok(()) // Timer fired, proceed to check due jobs
+                    false
                 }
                 result = reload_rx.recv() => {
                     match result {
-                        Ok(()) => Err(true), // Reload triggered
+                        Ok(()) => true,
                         Err(broadcast::error::RecvError::Closed) => {
                             // Channel closed, exit loop
                             return;
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            Err(true) // Lagged, but still reload
+                            // Lagged, but still reload
+                            true
                         }
                     }
-                }
-                result = result_rx.recv() => {
-                    // Job completed — process result immediately
-                    if let Some((job_id, success, duration_ms, started_at, error_msg)) = result {
-                        cancel_flags.remove(&job_id);
-                        if let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) {
-                            if let Some(state) = job.state.as_mut() {
-                                state.running_at_ms = None;
-                                state.last_run_at_ms = Some(current_timestamp_ms());
-                                state.last_duration_ms = Some(duration_ms);
-
-                                let completion_time = started_at + duration_ms;
-
-                                if success {
-                                    state.consecutive_errors = 0;
-                                    state.last_run_status = Some("ok".to_string());
-                                    state.last_status = Some("ok".to_string());
-                                    state.last_error = None;
-
-                                    if job.schedule.is_once() {
-                                        info!(job_id = %job.id, "cron: one-shot job completed, marking for removal");
-                                        state.next_run_at_ms = None;
-                                        job.enabled = false;
-                                    } else {
-                                        state.next_run_at_ms = job.schedule.compute_next_run(completion_time);
-                                    }
-                                } else {
-                                    state.consecutive_errors += 1;
-                                    state.last_run_status = Some("error".to_string());
-                                    state.last_status = Some("error".to_string());
-                                    state.last_error = error_msg;
-
-                                    let backoff = error_backoff_ms(state.consecutive_errors);
-                                    let backoff_next = completion_time + backoff;
-                                    let normal_next = job.schedule.compute_next_run(completion_time);
-                                    state.next_run_at_ms = Some(
-                                        normal_next
-                                            .map(|n| n.max(backoff_next))
-                                            .unwrap_or(backoff_next),
-                                    );
-
-                                    info!(
-                                        job_id = %job.id,
-                                        consecutive_errors = state.consecutive_errors,
-                                        backoff_ms = backoff,
-                                        next_run_at_ms = state.next_run_at_ms,
-                                        "cron: applying error backoff"
-                                    );
-
-                                    if state.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                                        warn!(
-                                            job_id = %job.id,
-                                            consecutive_errors = state.consecutive_errors,
-                                            "cron: disabling job after repeated failures"
-                                        );
-                                        job.enabled = false;
-                                    }
-                                }
-                            }
-                        }
-                        // Remove completed one-shot jobs
-                        let before = jobs.len();
-                        jobs.retain(|j| !(j.schedule.is_once() && !j.enabled));
-                        if jobs.len() < before {
-                            info!(removed = before - jobs.len(), "cron: cleaned up completed one-shot jobs");
-                        }
-                        if let Err(e) = self.save_store(&jobs).await {
-                            warn!(err = %e, "cron: failed to save store after job completion");
-                        }
-                    }
-                    Err(false) // Job result processed, continue loop without reload
                 }
             };
 
@@ -655,65 +514,33 @@ impl CronRunner {
                 break;
             }
 
-            match select_result {
-                Ok(()) => {}, // Timer fired, proceed to check due jobs
-                Err(reload_triggered) => {
-                    if reload_triggered {
-                        // Reload jobs from file - use current time for next_run calculation
-                        let reload_now_ms = current_timestamp_ms();
-                        let old_count = jobs.len();
-                        let new_jobs = crate::cron::load_cron_jobs();
-                        let file_count = new_jobs.len();
+            if reload_triggered {
+                // Reload jobs from file
+                let old_count = jobs.len();
+                let new_jobs = crate::cron::load_cron_jobs();
+                let file_count = new_jobs.len();
 
-                        // Debug: check if disabled job is in new_jobs
-                        let disabled_in_file: Vec<_> = new_jobs
-                            .iter()
-                            .filter(|j| !j.enabled)
-                            .map(|j| (&j.id, j.enabled))
-                            .collect();
-                        info!(old_count, new_count = new_jobs.len(), file_count, disabled=?disabled_in_file, "cron: reload triggered, reloading from file");
+                // Debug: check if disabled job is in new_jobs
+                let disabled_in_file: Vec<_> = new_jobs.iter()
+                    .filter(|j| !j.enabled)
+                    .map(|j| (&j.id, j.enabled))
+                    .collect();
+                info!(old_count, new_count = new_jobs.len(), file_count, disabled=?disabled_in_file, "cron: reload triggered, reloading from file");
 
-                        jobs = self.merge_jobs(&jobs, new_jobs, reload_now_ms);
+                jobs = self.merge_jobs(&jobs, new_jobs, now_ms);
 
-                        // Debug: check enabled state after merge
-                        let disabled_after_merge: Vec<_> = jobs
-                            .iter()
-                            .filter(|j| !j.enabled)
-                            .map(|j| (&j.id, j.enabled))
-                            .collect();
-                        info!(after_merge_count = jobs.len(), disabled=?disabled_after_merge, "cron: merge complete");
+                // Debug: check enabled state after merge
+                let disabled_after_merge: Vec<_> = jobs.iter()
+                    .filter(|j| !j.enabled)
+                    .map(|j| (&j.id, j.enabled))
+                    .collect();
+                info!(after_merge_count = jobs.len(), disabled=?disabled_after_merge, "cron: merge complete");
 
-                        // Cancel running tasks that were removed or disabled.
-                        let active_ids: std::collections::HashSet<&str> = jobs.iter()
-                            .filter(|j| j.enabled)
-                            .map(|j| j.id.as_str())
-                            .collect();
-                        let to_cancel: Vec<String> = cancel_flags.keys()
-                            .filter(|id| !active_ids.contains(id.as_str()))
-                            .cloned()
-                            .collect();
-                        for id in &to_cancel {
-                            if let Some(flag) = cancel_flags.remove(id) {
-                                flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                                info!(job_id = id, "cron: cancelled running job (deleted/disabled)");
-                            }
-                        }
-
-                        if let Err(e) = self.save_store(&jobs).await {
-                            warn!(err = %e, "cron: failed to save store after reload");
-                        }
-                        info!(
-                            old_count,
-                            new_count = jobs.len(),
-                            file_count,
-                            "cron jobs reloaded"
-                        );
-                        continue;
-                    } else {
-                        // Job result processed, continue loop
-                        continue;
-                    }
+                if let Err(e) = self.save_store(&jobs).await {
+                    warn!(err = %e, "cron: failed to save store after reload");
                 }
+                info!(old_count, new_count = jobs.len(), file_count, "cron jobs reloaded");
+                continue;
             }
 
             // Collect jobs that are due and not already running
@@ -726,23 +553,18 @@ impl CronRunner {
                             .and_then(|s| s.next_run_at_ms)
                             .map(|t| t <= now_ms)
                             .unwrap_or(false)
-                        && j.state.as_ref().and_then(|s| s.running_at_ms).is_none()
+                        && j.state
+                            .as_ref()
+                            .and_then(|s| s.running_at_ms)
+                            .is_none()
                 })
                 .map(|j| j.id.clone())
                 .collect();
 
             // Debug: log enabled state of all jobs that are due but shouldn't fire
             if !due.is_empty() {
-                let disabled_due: Vec<_> = jobs
-                    .iter()
-                    .filter(|j| {
-                        !j.enabled
-                            && j.state
-                                .as_ref()
-                                .and_then(|s| s.next_run_at_ms)
-                                .map(|t| t <= now_ms)
-                                .unwrap_or(false)
-                    })
+                let disabled_due: Vec<_> = jobs.iter()
+                    .filter(|j| !j.enabled && j.state.as_ref().and_then(|s| s.next_run_at_ms).map(|t| t <= now_ms).unwrap_or(false))
                     .map(|j| j.id.clone())
                     .collect();
                 if !disabled_due.is_empty() {
@@ -756,12 +578,13 @@ impl CronRunner {
 
             info!(count = due.len(), "cron: {} jobs due", due.len());
 
-            // Execute due jobs concurrently — spawn and continue immediately.
-            // Results are collected via a channel, not by join_all.
+            // Execute due jobs with concurrency limit
+            let mut handles = Vec::new();
+
             for job_id in due {
                 let permit = semaphore.clone().acquire_owned().await.ok();
                 if permit.is_none() {
-                    // Max concurrency reached — remaining jobs will fire next tick.
+                    // Max concurrency reached
                     break;
                 }
 
@@ -778,64 +601,19 @@ impl CronRunner {
                 }
 
                 let permit = permit.expect("permit checked above");
-                let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                cancel_flags.insert(job.id.clone(), Arc::clone(&cancelled));
                 let job = job.clone();
                 let agents = Arc::clone(&self.agents);
                 let channels = Arc::clone(&self.channels);
                 let run_log_dir = self.run_log_dir.clone();
                 let default_delivery = self.default_delivery.clone();
-                // Clone dependencies for run_cron_job
-                let config = Arc::clone(&self.config);
-                let providers = Arc::clone(&self.providers);
-                let skills = Arc::clone(&self.skills);
-                let store = Arc::clone(&self.store);
-                let memory = self.memory.clone();
-                let event_tx = self.event_tx.clone();
-                let spawner = self.spawner.clone();
-                let plugins = self.plugins.clone();
-                let mcp = self.mcp.clone();
-                let notification_tx = self.notification_tx.clone();
 
                 let handle = tokio::spawn(async move {
                     let start_time = current_timestamp_ms();
                     let job_started_at = started_at;
-                    let prev_consecutive_errors = job
-                        .state
-                        .as_ref()
-                        .map(|s| s.consecutive_errors)
-                        .unwrap_or(0);
+                    let prev_consecutive_errors = job.state.as_ref().map(|s| s.consecutive_errors).unwrap_or(0);
                     info!(job_id = %job.id, "cron job triggered");
 
-// Run with cancellation check — polls cancel flag every second.
-                    let result = tokio::select! {
-                        r = run_cron_job(
-                            &job,
-                            &agents,
-                            &config,
-                            &providers,
-                            &skills,
-                            &store,
-                            &memory,
-                            &event_tx,
-                            &spawner,
-                            &plugins,
-                            &mcp,
-                            &notification_tx,
-                            &default_delivery,
-                        ) => r,
-                        _ = async {
-                            loop {
-                                tokio::time::sleep(Duration::from_secs(1)).await;
-                                if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
-                                    info!(job_id = %job.id, "cron job cancelled");
-                                    break;
-                                }
-                            }
-                        } => {
-                            Err(anyhow::anyhow!("job cancelled"))
-                        }
-                    };
+                    let result = run_cron_job(&job, &agents).await;
                     let duration_ms = current_timestamp_ms() - start_time;
                     drop(permit);
 
@@ -872,12 +650,17 @@ impl CronRunner {
                             if will_disable {
                                 format!(
                                     "❌ 定时任务执行失败\n\n**任务**: {}\n**连续失败**: {} 次\n**错误**: {}\n\n⚠️ 任务已被自动禁用，请检查配置后手动启用。",
-                                    job_name, consecutive, e
+                                    job_name,
+                                    consecutive,
+                                    e
                                 )
                             } else {
                                 format!(
                                     "❌ 定时任务执行失败\n\n**任务**: {}\n**连续失败**: {} 次\n**下次重试**: {}后\n**错误**: {}",
-                                    job_name, consecutive, backoff_text, e
+                                    job_name,
+                                    consecutive,
+                                    backoff_text,
+                                    e
                                 )
                             }
                         }
@@ -912,23 +695,89 @@ impl CronRunner {
                     }
 
                     let error_msg = result.as_ref().err().map(|e| e.to_string());
-                    (
-                        job.id,
-                        result.is_ok(),
-                        duration_ms,
-                        job_started_at,
-                        error_msg,
-                    )
+                    (job.id, result.is_ok(), duration_ms, job_started_at, error_msg)
                 });
 
-                // Send result back via channel for async collection.
-                let result_tx = result_tx.clone();
-                tokio::spawn(async move {
-                    let result = handle.await;
-                    if let Ok(r) = result {
-                        let _ = result_tx.send(r).await;
+                handles.push(handle);
+            }
+
+            // Wait for all jobs to complete and update state.
+            // Use select to also listen for reload signals, so deletions
+            // are not delayed until all running jobs finish.
+            let all_handles = futures::future::join_all(handles);
+            let results = tokio::select! {
+                r = all_handles => r,
+                _ = reload_rx.recv() => {
+                    // Reload triggered while jobs are running — apply immediately
+                    info!("cron: reload signal during job execution, reloading now");
+                    let new_jobs = crate::cron::load_cron_jobs();
+                    let now_ms = current_timestamp_ms();
+                    jobs = self.merge_jobs(&jobs, new_jobs, now_ms);
+                    if let Err(e) = self.save_store(&jobs).await {
+                        warn!(err = %e, "cron: failed to save store after mid-execution reload");
                     }
-                });
+                    continue; // back to top of loop, running tasks finish on their own
+                }
+            };
+            for result in results {
+                if let Ok((job_id, success, duration_ms, started_at, error_msg)) = result {
+                    if let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) {
+                        if let Some(state) = job.state.as_mut() {
+                            state.running_at_ms = None;
+                            state.last_run_at_ms = Some(current_timestamp_ms());
+                            state.last_duration_ms = Some(duration_ms);
+
+                            let completion_time = started_at + duration_ms;
+
+                            if success {
+                                state.consecutive_errors = 0;
+                                state.last_run_status = Some("ok".to_string());
+                                state.last_status = Some("ok".to_string());
+                                state.last_error = None;
+
+                                // One-shot: disable after successful execution (will be removed below)
+                                if job.schedule.is_once() {
+                                    info!(job_id = %job.id, "cron: one-shot job completed, marking for removal");
+                                    state.next_run_at_ms = None;
+                                    job.enabled = false;
+                                } else {
+                                // Compute next run normally
+                                state.next_run_at_ms = job.schedule.compute_next_run(completion_time);
+                                }
+                            } else {
+                                state.consecutive_errors += 1;
+                                state.last_run_status = Some("error".to_string());
+                                state.last_status = Some("error".to_string());
+                                state.last_error = error_msg;
+
+                                // Apply exponential backoff for errored jobs
+                                let backoff = error_backoff_ms(state.consecutive_errors);
+                                let backoff_next = completion_time + backoff;
+                                let normal_next = job.schedule.compute_next_run(completion_time);
+                                // Use whichever is later: the natural next run or the backoff delay
+                                state.next_run_at_ms = Some(normal_next.map(|n| n.max(backoff_next)).unwrap_or(backoff_next));
+
+                                info!(
+                                    job_id = %job.id,
+                                    consecutive_errors = state.consecutive_errors,
+                                    backoff_ms = backoff,
+                                    next_run_at_ms = state.next_run_at_ms,
+                                    "cron: applying error backoff"
+                                );
+
+                                // Auto-disable after max consecutive errors
+                                if state.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                                    warn!(
+                                        job_id = %job.id,
+                                        consecutive_errors = state.consecutive_errors,
+                                        "cron: disabling job after repeated failures"
+                                    );
+                                    job.enabled = false;
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // Remove completed one-shot jobs
@@ -955,27 +804,8 @@ impl CronRunner {
 
         info!(job_id = %job.id, "manually triggering cron job");
         let _permit = self.semaphore.acquire().await?;
-        let prev_consecutive_errors = job
-            .state
-            .as_ref()
-            .map(|s| s.consecutive_errors)
-            .unwrap_or(0);
-        let result = run_cron_job(
-            job,
-            &self.agents,
-            &self.config,
-            &self.providers,
-            &self.skills,
-            &self.store,
-            &self.memory,
-            &self.event_tx,
-            &self.spawner,
-            &self.plugins,
-            &self.mcp,
-            &self.notification_tx,
-            &self.default_delivery,
-        )
-        .await;
+        let prev_consecutive_errors = job.state.as_ref().map(|s| s.consecutive_errors).unwrap_or(0);
+        let result = run_cron_job(job, &self.agents).await;
         let success = result.is_ok();
 
         // Build delivery message with execution summary
@@ -1017,50 +847,25 @@ impl CronRunner {
     /// Preserves running state and error counts for existing jobs.
     /// Jobs in old_jobs but NOT in new_jobs are dropped (deleted from file).
     /// Takes `now_ms` from the caller (timer_loop) to avoid redundant calls.
-    fn merge_jobs(
-        &self,
-        old_jobs: &[CronJob],
-        new_jobs: Vec<CronJob>,
-        now_ms: u64,
-    ) -> Vec<CronJob> {
+    fn merge_jobs(&self, old_jobs: &[CronJob], new_jobs: Vec<CronJob>, now_ms: u64) -> Vec<CronJob> {
         let mut result = Vec::with_capacity(new_jobs.len());
 
         for mut new_job in new_jobs {
-            // Try to find existing job by ID
+            // Try to find existing job by ID and preserve its state
             if let Some(old_job) = old_jobs.iter().find(|j| j.id == new_job.id) {
-                // Check if schedule changed - must recompute next_run_at_ms
-                let schedule_changed = old_job.schedule.expr() != new_job.schedule.expr()
-                    || old_job.schedule.tz() != new_job.schedule.tz();
-
-                if schedule_changed {
-                    // Schedule changed - always recompute next_run time
-                    info!(
-                        job_id = %new_job.id,
-                        old_expr = %old_job.schedule.expr(),
-                        new_expr = %new_job.schedule.expr(),
-                        "cron: schedule changed, recomputing next_run_at_ms"
-                    );
-                    // Preserve old state but update next_run_at_ms
-                    let mut state = old_job.state.clone().unwrap_or_default();
-                    state.next_run_at_ms = new_job.schedule.compute_next_run(now_ms);
-                    state.running_at_ms = None; // Clear running marker
-                    new_job.state = Some(state);
-                } else {
-                    // Schedule unchanged - preserve state
-                    new_job.state = old_job.state.clone();
-                }
+                // Preserve state from old job
+                new_job.state = old_job.state.clone();
             } else {
                 // New job - initialize state
                 if new_job.state.is_none() {
                     new_job.state = Some(CronJobState {
                         consecutive_errors: 0,
-                        next_run_at_ms: new_job.schedule.compute_next_run(now_ms),
                         ..Default::default()
                     });
                 }
             }
 
-            // Ensure next_run_at_ms is set (fallback)
+            // Ensure next_run_at_ms is set
             if let Some(ref mut state) = new_job.state {
                 if state.next_run_at_ms.is_none() {
                     state.next_run_at_ms = new_job.schedule.compute_next_run(now_ms);
@@ -1097,17 +902,6 @@ impl Clone for CronRunner {
             semaphore: Arc::clone(&self.semaphore),
             default_delivery: self.default_delivery.clone(),
             reload_tx: self.reload_tx.clone(),
-            // Clone new dependencies
-            config: Arc::clone(&self.config),
-            providers: Arc::clone(&self.providers),
-            skills: Arc::clone(&self.skills),
-            store: Arc::clone(&self.store),
-            memory: self.memory.clone(),
-            event_tx: self.event_tx.clone(),
-            spawner: self.spawner.clone(),
-            plugins: self.plugins.clone(),
-            mcp: self.mcp.clone(),
-            notification_tx: self.notification_tx.clone(),
         }
     }
 }
@@ -1130,9 +924,7 @@ fn field_matches(field: &str, value: u32) -> bool {
     }
     // Handle comma-separated lists (each part may be a value, range, or step)
     if field.contains(',') {
-        return field
-            .split(',')
-            .any(|part| field_matches(part.trim(), value));
+        return field.split(',').any(|part| field_matches(part.trim(), value));
     }
     // Handle range: "9-15" means 9 through 15 exclusive (start <= value < end)
     // This matches openclaw's interpretation where "9-11" means 9,10 only (not 11:59)
@@ -1217,10 +1009,8 @@ fn compute_next_run_from_expr(cron_expr: &str, from_ms: u64, tz: Option<&str>) -
     // Current minute in the target timezone
     let local_now = utc_dt.with_timezone(&tz_for_search);
     let mut cand = local_now
-        .with_second(0)
-        .expect("second 0 always valid")
-        .with_nanosecond(0)
-        .expect("nanosecond 0 always valid");
+        .with_second(0).expect("second 0 always valid")
+        .with_nanosecond(0).expect("nanosecond 0 always valid");
     cand += chrono::Duration::minutes(1);
 
     // Search up to 1 year ahead (in local time)
@@ -1264,25 +1054,7 @@ fn current_timestamp_ms() -> u64 {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Run a cron job by creating a temporary AgentRuntime and calling run_turn directly.
-/// This bypasses the agent inbox queue, so cron jobs execute immediately without
-/// waiting for other messages in the queue.
-#[allow(clippy::too_many_arguments)]
-async fn run_cron_job(
-    job: &CronJob,
-    agents: &Arc<AgentRegistry>,
-    config: &Arc<RuntimeConfig>,
-    providers: &Arc<ProviderRegistry>,
-    skills: &Arc<SkillRegistry>,
-    store: &Arc<Store>,
-    memory: &Option<Arc<tokio::sync::Mutex<crate::agent::MemoryStore>>>,
-    event_tx: &broadcast::Sender<AgentEvent>,
-    spawner: &Option<Arc<crate::agent::AgentSpawner>>,
-    plugins: &Option<Arc<PluginRegistry>>,
-    mcp: &Option<Arc<crate::mcp::McpRegistry>>,
-    notification_tx: &Option<broadcast::Sender<OutboundMessage>>,
-    default_delivery: &Option<CronDelivery>,
-) -> Result<String> {
+async fn run_cron_job(job: &CronJob, agents: &AgentRegistry) -> Result<String> {
     let session_key = job
         .session_key
         .clone()
@@ -1297,26 +1069,14 @@ async fn run_cron_job(
         .payload
         .as_ref()
         .and_then(|p| match p {
-            CronPayload::Structured {
-                timeout_seconds, ..
-            } => timeout_seconds.clone(),
+CronPayload::Structured { timeout_seconds, .. } => timeout_seconds.clone(),
             CronPayload::Text(_) => None,
         })
         .unwrap_or(300);
 
-    // Get delivery channel for agent notification routing
-    // Priority: job.delivery.channel > default_delivery.channel > "cron" (no notification)
-    let delivery_channel = job
-        .delivery
-        .as_ref()
-        .and_then(|d| d.channel.clone())
-        .or_else(|| default_delivery.as_ref().and_then(|d| d.channel.clone()));
-
-    // Register abort flag for this session before running
+    // Register abort flag for this session before dispatching
     let abort_flag = {
-        let mut flags = handle
-            .abort_flags
-            .write()
+        let mut flags = handle.abort_flags.write()
             .expect("abort_flags lock poisoned");
         flags
             .entry(session_key.clone())
@@ -1324,91 +1084,75 @@ async fn run_cron_job(
             .clone()
     };
 
-    // Get fallback models from agent config
-    let fallback_models = handle
-        .config
-        .model
+    // Get delivery channel for agent routing (so agent knows which tools/config to use)
+    let delivery_channel = job
+        .delivery
         .as_ref()
-        .and_then(|m| m.fallbacks.clone())
-        .unwrap_or_default();
-
-    // Create a temporary AgentRuntime for this cron job
-    let mut runtime = AgentRuntime::new(
-        Arc::clone(&handle),
-        Arc::clone(config),
-        Arc::clone(providers),
-        fallback_models,
-        Arc::clone(skills),
-        Arc::clone(store),
-        memory.clone(),
-        Some(Arc::clone(agents)),
-        Some(event_tx.clone()),
-        spawner.clone(),
-        plugins.clone(),
-        mcp.clone(),
-        notification_tx.clone(), // Enable notifications if delivery channel is configured
-    );
-
-    // Use delivery channel for agent run_turn if configured
-    // This allows agent tools (OpenCode, send_file, etc.) to send notifications to the correct channel
-    let agent_channel = delivery_channel
-        .clone()
+        .and_then(|d| d.channel.clone())
         .unwrap_or_else(|| "cron".to_string());
 
-    // Use delivery.to as peer_id if available (valid channel ID format like "ou_xxx" for feishu)
-    // Otherwise construct a fallback peer_id
-    let agent_peer_id = job
+    // Get delivery target as peer_id (valid channel ID format like "ou_xxx" for feishu)
+    let delivery_to = job
         .delivery
         .as_ref()
         .and_then(|d| d.to.clone())
-        .or_else(|| default_delivery.as_ref().and_then(|d| d.to.clone()))
-        .unwrap_or_else(|| {
-            if delivery_channel.is_some() {
-                format!("{}:{}", delivery_channel.unwrap(), job.id)
-            } else {
-                format!("cron:{}", job.id)
-            }
-        });
+        .unwrap_or_else(|| format!("cron:{}", job.id));
 
-    // Run turn directly (bypass inbox queue)
-    let result = tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        runtime.run_turn(
-            &session_key,
-            job.effective_message(),
-            &agent_channel,
-            &agent_peer_id,
-            vec![], // extra_tools
-            vec![], // images
-            vec![], // files
-            false,  // is_internal
-        ),
-    )
-    .await;
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let msg = AgentMessage {
+        session_key: session_key.clone(),
+        text: job.effective_message().to_owned(),
+        channel: delivery_channel,
+        peer_id: delivery_to,
+        chat_id: String::new(),
+        reply_tx,
+        extra_tools: vec![],
+        images: vec![],
+        files: vec![],
+    };
 
-    // Clear abort flag after completion
-    abort_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+    handle.tx.send(msg).await.context("agent inbox closed")?;
 
-    match result {
-        Ok(Ok(reply)) => {
-            if reply.is_empty {
-                debug!(job_id = %job.id, "cron job returned no output");
-                Ok(String::new())
-            } else {
-                info!(job_id = %job.id, len = reply.text.len(), "cron job completed");
-                Ok(reply.text)
-            }
-        }
-        Ok(Err(e)) => {
-            warn!(job_id = %job.id, error = %e, "cron job failed");
-            Err(e)
-        }
-        Err(_) => {
-            // Timeout fired: abort the agent execution
+    let reply = tokio::time::timeout(Duration::from_secs(timeout_secs), reply_rx)
+        .await
+        .map_err(|_| {
+            // Timeout fired: abort the agent execution and capture status for error reporting.
             abort_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             warn!(job_id = %job.id, session = %session_key, "cron: timeout fired, aborting agent");
-            anyhow::bail!("cron job timed out after {}s", timeout_secs)
-        }
+
+            let agent_status = handle
+                .live_status
+                .try_read()
+                .map(|s| {
+                    let task = if s.current_task.is_empty() {
+                        "none".to_string()
+                    } else {
+                        s.current_task.chars().take(100).collect::<String>()
+                    };
+                    let tools = if s.tool_history.is_empty() {
+                        "none".to_string()
+                    } else {
+                        s.tool_history.join(", ")
+                    };
+                    format!(
+                        " (state: {}, task: \"{}\", tools called: [{}])",
+                        s.state, task, tools
+                    )
+                })
+                .unwrap_or_default();
+            anyhow!("cron job timed out after {}s{}", timeout_secs, agent_status)
+        })?
+        .context("agent dropped reply channel")?;
+
+    // Clear abort flag after successful completion
+    abort_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    if reply.is_empty {
+        debug!(job_id = %job.id, "cron job returned no output");
+        Ok(String::new())
+    } else {
+        info!(job_id = %job.id, len = reply.text.len(), "cron job completed");
+        Ok(reply.text)
     }
 }
 
@@ -1474,7 +1218,7 @@ async fn send_delivery(
         }
     };
 
-    info!(job_id = %job.id, channel = %channel_name, to = %to, text_len = text.len(), "cron: sending delivery");
+    info!(job_id = %job.id, channel = %channel_name, to = %to, text_len = text.len(), text_preview = %text.chars().take(200).collect::<String>(), "cron: sending delivery");
 
     let msg = OutboundMessage {
         target_id: to.clone(),
@@ -1502,7 +1246,11 @@ async fn send_delivery(
     }
 }
 
-fn build_run_log_entry(job: &CronJob, success: bool, error: Option<anyhow::Error>) -> RunLogEntry {
+fn build_run_log_entry(
+    job: &CronJob,
+    success: bool,
+    error: Option<anyhow::Error>,
+) -> RunLogEntry {
     RunLogEntry {
         id: uuid::Uuid::new_v4().to_string(),
         job_id: job.id.clone(),
@@ -1603,9 +1351,7 @@ pub fn load_cron_jobs() -> Vec<CronJob> {
         Err(_) => return Vec::new(),
     };
 
-    let parsed: serde_json::Value = json5::from_str(&raw)
-        .or_else(|_| serde_json::from_str(&raw))
-        .unwrap_or_default();
+    let parsed: serde_json::Value = json5::from_str(&raw).or_else(|_| serde_json::from_str(&raw)).unwrap_or_default();
 
     let jobs_array = if let Some(arr) = parsed.get("jobs").and_then(|v| v.as_array()) {
         arr.clone()
@@ -1644,8 +1390,8 @@ pub fn save_cron_jobs(jobs: &[CronJob]) -> anyhow::Result<()> {
         "jobs": jobs,
     });
 
-    let json =
-        serde_json::to_string_pretty(&store).context("failed to serialize cron jobs to JSON")?;
+    let json = serde_json::to_string_pretty(&store)
+        .context("failed to serialize cron jobs to JSON")?;
 
     // Ensure directory exists
     if let Some(parent) = cron_file.parent() {

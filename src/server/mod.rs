@@ -359,7 +359,6 @@ async fn send_message(
         extra_tools: vec![],
         images: vec![],
         files: vec![],
-        is_internal: false,
     };
 
     if handle.tx.send(msg).await.is_err() {
@@ -842,21 +841,6 @@ async fn cron_create(
     }
     // Normalize schedule: accept both flat string and nested object
     if let Some(sched) = body.get("schedule").and_then(|s| s.as_str()).map(|s| s.to_owned()) {
-        // Validate cron expression has exactly 5 fields
-        let fields: Vec<&str> = sched.split_whitespace().collect();
-        if fields.len() != 5 {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "schedule must have exactly 5 fields (min hr dom mon dow), got {} fields: '{}'",
-                        fields.len(),
-                        sched
-                    )
-                })),
-            )
-                .into_response();
-        }
         let tz = body.get("timezone").and_then(|t| t.as_str()).map(|t| t.to_owned());
         if let Some(tz) = tz {
             body["schedule"] = serde_json::json!({"kind": "cron", "expr": sched, "tz": tz});
@@ -1022,7 +1006,6 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
             extra_tools: vec![],
             images: vec![],
             files: vec![],
-            is_internal: false,
         };
         if handle.tx.send(msg).await.is_ok() {
             // Deliver agent reply through the job's delivery config.
@@ -1417,7 +1400,6 @@ async fn openai_chat_completions(
         extra_tools,
         images: vec![],
         files: vec![],
-        is_internal: false,
     };
 
     // Subscribe to event_bus BEFORE sending message to agent,

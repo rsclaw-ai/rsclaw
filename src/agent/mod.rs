@@ -39,7 +39,6 @@ pub mod workspace;
 
 pub use bootstrap::{seed_tools, seed_workspace, seed_workspace_with_lang};
 pub use collaboration::CollabMode;
-pub use exec_pool::ExecPool;
 pub use loop_detection::LoopDetector;
 pub use memory::{MemoryDoc, MemoryStore};
 pub use permission::{

@@ -121,7 +121,6 @@ fn start_custom_webhook(
                 extra_tools: vec![],
                 images: vec![],
                 files: vec![],
-                is_internal: false,
             };
             if handle.tx.send(msg).await.is_err() {
                 return;
@@ -238,7 +237,6 @@ fn start_custom_websocket(
                 extra_tools: vec![],
                 images: vec![],
                 files: vec![],
-                is_internal: false,
             };
             if handle.tx.send(msg).await.is_err() {
                 return;

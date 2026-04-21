@@ -85,18 +85,10 @@ impl ProviderRegistry {
             }
         }
         let (provider, model_id) = Self::parse_model(model);
-
-        // If the inferred provider is registered, use it.
-        if self.providers.contains_key(provider) {
-            return (provider, model_id);
-        }
-
-        // No fallback found, return as-is and let caller handle the error.
-        tracing::warn!(
-            model,
-            inferred_provider = provider,
-            "resolve_model: no registered provider or alias fallback found"
-        );
+        // Return the resolved provider if registered; otherwise return as-is
+        // and let the caller handle the "provider not found" error.
+        // Do NOT silently fallback to custom/ollama/openai — that causes
+        // requests to be routed to the wrong provider.
         (provider, model_id)
     }
 }

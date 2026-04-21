@@ -12,15 +12,6 @@ pub enum BrowserCommand {
         /// Only show interactive/actionable elements.
         #[arg(long, short)]
         interactive: bool,
-        /// Remove empty structural elements (no text content).
-        #[arg(long, short)]
-        compact: bool,
-        /// Limit tree depth.
-        #[arg(long, short)]
-        depth: Option<u32>,
-        /// Scope snapshot to a CSS selector.
-        #[arg(long, short = 'S')]
-        selector: Option<String>,
     },
     /// Click an element by @ref.
     Click {
@@ -68,14 +59,6 @@ pub enum BrowserCommand {
         #[arg(default_value = "screenshot.png")]
         path: String,
     },
-    /// Take an annotated screenshot with numbered element labels.
-    Annotate {
-        /// Output path (default: annotated.png).
-        #[arg(default_value = "annotated.png")]
-        path: String,
-    },
-    /// Open Chrome DevTools inspector for the active page.
-    Inspect,
     /// Get page text content.
     Text,
     /// Get current URL.
@@ -119,25 +102,6 @@ pub enum BrowserCommand {
         #[arg(long)]
         exact: bool,
     },
-    /// Capture video URLs from a page (inject interceptor, wait, collect).
-    CaptureVideo {
-        /// Video page URL.
-        url: String,
-        /// Wait time in milliseconds for video to load (default: 8000).
-        #[arg(long, default_value = "8000")]
-        wait: u64,
-    },
-    /// Download video from a page (capture URL + download with cookies).
-    DownloadVideo {
-        /// Video page URL.
-        url: String,
-        /// Output file path.
-        #[arg(short, long, default_value = "video.mp4")]
-        output: String,
-        /// Wait time in milliseconds for video to load (default: 8000).
-        #[arg(long, default_value = "8000")]
-        wait: u64,
-    },
     /// Find elements by ARIA role.
     GetByRole {
         /// Role name (e.g., button, link, textbox).
@@ -148,77 +112,12 @@ pub enum BrowserCommand {
         /// Label text.
         label: String,
     },
-    /// Find element by text content or label.
-    Find {
-        /// Text or label to search for.
-        text: String,
-    },
     /// Navigate back.
     Back,
     /// Navigate forward.
     Forward,
     /// Reload page.
     Reload,
-    /// Close the browser.
-    Close,
-    /// Tab management subcommands.
-    #[command(subcommand)]
-    Tab(TabCommand),
-    /// Get element property (text, html, value, attribute, count, bounding box).
-    #[command(subcommand)]
-    Get(GetCommand),
-    /// Get page errors.
-    Errors,
-    /// Execute multiple browser commands in a single session.
-    Batch {
-        /// Commands to execute, each as a quoted string (e.g., "open https://example.com" "snapshot -i").
-        commands: Vec<String>,
-    },
-    /// Keyboard input subcommands.
-    #[command(subcommand)]
-    Keyboard(KeyboardCommand),
-    /// Download a file by clicking an element.
-    Download {
-        /// Element selector or @ref to click.
-        selector: String,
-        /// Output file path.
-        path: String,
-    },
-    /// Auth vault management for saved credentials.
-    #[command(subcommand)]
-    Auth(AuthCommand),
-    /// List available Chrome profiles.
-    Profiles,
-    /// Connect to a browser via CDP (port number or ws:// URL).
-    Connect {
-        /// CDP port number or WebSocket URL (e.g., 9222 or ws://127.0.0.1:9222/...).
-        target: String,
-    },
-    /// Save browser state (cookies + localStorage) to a JSON file.
-    StateSave {
-        /// Output file path.
-        path: String,
-    },
-    /// Load browser state (cookies + localStorage) from a JSON file.
-    StateLoad {
-        /// Input file path.
-        path: String,
-    },
-    /// List network requests from the page.
-    Requests {
-        /// Clear request history after listing.
-        #[arg(long)]
-        clear: bool,
-        /// Filter requests by URL pattern.
-        #[arg(long)]
-        filter: Option<String>,
-    },
-    /// Show or list browser sessions/targets.
-    Session {
-        /// Action: show (current session info) or list (all debugging targets).
-        #[arg(default_value = "show")]
-        action: String,
-    },
     /// Run any browser action with JSON args (advanced).
     Raw {
         /// Action name.
@@ -226,112 +125,5 @@ pub enum BrowserCommand {
         /// JSON arguments.
         #[arg(default_value = "{}")]
         args: String,
-    },
-}
-
-/// Tab management subcommands.
-#[derive(Subcommand, Debug)]
-pub enum TabCommand {
-    /// Open a new tab.
-    New {
-        /// Optional URL to open in the new tab.
-        url: Option<String>,
-    },
-    /// List all open tabs.
-    List,
-    /// Close a tab by index.
-    Close {
-        /// Tab index (0-based).
-        index: u32,
-    },
-    /// Switch to a tab by index.
-    Switch {
-        /// Tab index (0-based).
-        index: u32,
-    },
-}
-
-/// Get element property subcommands.
-#[derive(Subcommand, Debug)]
-pub enum GetCommand {
-    /// Get element text content.
-    Text {
-        /// CSS selector or @ref.
-        selector: Option<String>,
-    },
-    /// Get element inner HTML.
-    Html {
-        /// CSS selector or @ref.
-        selector: Option<String>,
-    },
-    /// Get input element value.
-    Value {
-        /// CSS selector or @ref.
-        selector: Option<String>,
-    },
-    /// Get element attribute value.
-    Attr {
-        /// Attribute name.
-        name: String,
-        /// CSS selector or @ref.
-        selector: Option<String>,
-    },
-    /// Count elements matching a selector.
-    Count {
-        /// CSS selector.
-        selector: String,
-    },
-    /// Get element bounding box.
-    Box {
-        /// CSS selector or @ref.
-        selector: Option<String>,
-    },
-}
-
-/// Keyboard input subcommands.
-#[derive(Subcommand, Debug)]
-pub enum KeyboardCommand {
-    /// Type text with key events (keyDown/keyUp per character).
-    Type {
-        /// Text to type.
-        text: String,
-    },
-    /// Insert text directly (bypasses key events).
-    Inserttext {
-        /// Text to insert.
-        text: String,
-    },
-}
-
-/// Auth vault subcommands.
-#[derive(Subcommand, Debug)]
-pub enum AuthCommand {
-    /// Save credentials to the vault.
-    Save {
-        /// Site domain or identifier.
-        site: String,
-        /// Username.
-        #[arg(long)]
-        username: String,
-        /// Password.
-        #[arg(long)]
-        password: String,
-    },
-    /// Auto-login using saved credentials.
-    Login {
-        /// Site domain or identifier.
-        site: String,
-    },
-    /// List saved credential entries.
-    List,
-    /// Show details for a saved credential.
-    Show {
-        /// Site domain or identifier.
-        site: String,
-    },
-    /// Delete a saved credential.
-    Delete {
-        /// Site domain or identifier.
-        site: String,
     },
 }

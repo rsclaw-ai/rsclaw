@@ -87,44 +87,6 @@ impl AgentRuntime {
             .map(crate::i18n::resolve_lang)
             .unwrap_or("en");
 
-        // Check if there's already an ACP task running for this session
-        // Also check if the task has been running too long (auto-clear stale markers)
-        {
-            let mut running = self.handle.acp_running_tasks.write().unwrap();
-            if let Some((tool_name, start_time)) = running.get(&ctx.session_key) {
-                let elapsed = start_time.elapsed().as_secs();
-                // Auto-clear stale markers if task has been running for more than 10 minutes
-                // This handles cases where opencode/claudecode process hangs
-                if elapsed > 600 {
-                    tracing::warn!(
-                        session = %ctx.session_key,
-                        tool = %tool_name,
-                        elapsed_secs = elapsed,
-                        "tool_opencode: clearing stale ACP task marker (task may have hung)"
-                    );
-                    running.remove(&ctx.session_key);
-                } else {
-                    tracing::warn!(
-                        session = %ctx.session_key,
-                        tool = %tool_name,
-                        elapsed_secs = elapsed,
-                        "tool_opencode: duplicate submission blocked - task already running"
-                    );
-                    return Ok(serde_json::json!({
-                        "output": crate::i18n::t_fmt("acp_already_running", lang, &[("name", "OpenCode"), ("elapsed", &elapsed.to_string())]),
-                        "status": "blocked",
-                        "message": "An OpenCode task is already running for this session. Please wait for it to complete before submitting a new task.",
-                        "elapsed_seconds": elapsed
-                    }));
-                }
-            }
-        }
-        // Mark this session as having an ACP task running
-        {
-            let mut running = self.handle.acp_running_tasks.write().unwrap();
-            running.insert(ctx.session_key.clone(), ("opencode".to_string(), std::time::Instant::now()));
-        }
-
         // Get notification sender early for error reporting
         let notif_tx = self.notification_tx.clone();
         let target_id = ctx.peer_id.clone();
@@ -135,11 +97,6 @@ impl AgentRuntime {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("tool_opencode: get_client failed: {}", e);
-                // Clear the ACP running task marker on error
-                {
-                    let mut running = self.handle.acp_running_tasks.write().unwrap();
-                    running.remove(&ctx.session_key);
-                }
                 if let Some(ref tx) = notif_tx {
                     let _ = tx.send(crate::channel::OutboundMessage {
                         target_id: target_id.clone(),
@@ -180,23 +137,9 @@ impl AgentRuntime {
         // Clone agent's own inbox for result injection after completion.
         let self_tx = self.handle.tx.clone();
         let self_session = ctx.session_key.clone();
-        let self_acp_tasks = self.handle.acp_running_tasks.clone();
         let self_channel = ctx.channel.clone();
         let self_peer_id = ctx.peer_id.clone();
         let self_chat_id = ctx.chat_id.clone();
-        // Extract configurable reply timeout BEFORE spawn (config read needs self, can't be inside spawn)
-        let reply_timeout_secs = self.config.ext.tools.as_ref()
-            .and_then(|t| t.acp.as_ref())
-            .and_then(|a| a.reply_timeout_seconds)
-            .unwrap_or(300);
-        // Extract ACP result truncation limit from config
-        let acp_result_limit = self.config.ext.tools.as_ref()
-            .and_then(|t| t.session_result_limits.as_ref())
-            .and_then(|l| l.acp)
-            .or_else(|| self.config.raw.tools.as_ref()
-                .and_then(|t| t.session_result_limits.as_ref())
-                .and_then(|l| l.acp))
-            .unwrap_or(100000);
         tokio::spawn(async move {
             tracing::info!("tool_opencode: background task started");
             // Start event collection FIRST (in parallel with send_prompt)
@@ -349,10 +292,10 @@ impl AgentRuntime {
 
                     let summary = if !result_content.is_empty() {
                         // Show result, truncated if too long (character-safe truncation)
-                        let truncated = if result_content.chars().count() > acp_result_limit {
+                        let truncated = if result_content.chars().count() > 2000 {
                             let cutoff = result_content
                                 .char_indices()
-                                .nth(acp_result_limit)
+                                .nth(2000)
                                 .map(|(i, _)| i)
                                 .unwrap_or(result_content.len());
                             crate::i18n::t_fmt("acp_truncated", lang_bg, &[("content", &result_content[..cutoff])])
@@ -379,7 +322,7 @@ impl AgentRuntime {
                     result_files = notif_files.clone();
 
                     // Send notification to user
-                    tracing::info!(
+                    tracing::debug!(
                         "tool_opencode: sending completion notification, summary_len={}, files={}",
                         summary.len(), notif_files.len()
                     );
@@ -387,14 +330,14 @@ impl AgentRuntime {
                         match tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
-                            text: summary.clone(),
+                            text: summary,
                             reply_to: None,
                             images: vec![],
                             files: notif_files,
                             channel: Some(channel_bg.clone()),
                         }) {
                             Ok(_) => {
-                                tracing::info!("tool_opencode: notification sent successfully: {}", summary)
+                                tracing::debug!("tool_opencode: notification sent successfully")
                             }
                             Err(e) => {
                                 tracing::error!("tool_opencode: failed to send notification: {}", e)
@@ -420,11 +363,6 @@ impl AgentRuntime {
                 }
             }
             tracing::info!("tool_opencode: background task finished");
-            // Clear the ACP running task marker
-            {
-                let mut running = self_acp_tasks.write().unwrap();
-                running.remove(&self_session);
-            }
             // IMPORTANT: DON'T await event_collector - it runs forever waiting
             // for more events The collected events are already in
             // `events` variable
@@ -440,7 +378,7 @@ impl AgentRuntime {
             };
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
             let inject_msg = AgentMessage {
-                session_key: self_session.clone(),
+                session_key: self_session,
                 text: inject_text,
                 channel: self_channel.clone(),
                 peer_id: self_peer_id,
@@ -449,15 +387,13 @@ impl AgentRuntime {
                 extra_tools: vec![],
                 images: vec![],
                 files: vec![],
-                is_internal: false,
             };
             if self_tx.send(inject_msg).await.is_err() {
                 tracing::warn!("tool_opencode: failed to inject result back to agent inbox");
             } else {
                 tracing::info!("tool_opencode: result injected back to agent, waiting for reply");
                 // Wait for agent's reply and forward it (text + files) to user via notification.
-                // Timeout value extracted before spawn (see reply_timeout_secs variable)
-                match tokio::time::timeout(Duration::from_secs(reply_timeout_secs), reply_rx).await {
+                match tokio::time::timeout(Duration::from_secs(300), reply_rx).await {
                     Ok(Ok(reply)) => {
                         if !reply.text.is_empty() || !reply.files.is_empty() || !reply.images.is_empty() {
                             if let Some(ref tx) = notif_tx_bg {
@@ -475,7 +411,7 @@ impl AgentRuntime {
                         }
                     }
                     Ok(Err(_)) => tracing::warn!("tool_opencode: reply channel dropped"),
-                    Err(_) => tracing::warn!("tool_opencode: reply timed out after {}s", reply_timeout_secs),
+                    Err(_) => tracing::warn!("tool_opencode: reply timed out after 300s"),
                 }
             }
         });
@@ -483,9 +419,7 @@ impl AgentRuntime {
         Ok(serde_json::json!({
             "output": crate::i18n::t_fmt("acp_queued", lang, &[("name", "OpenCode")]),
             "status": "submitted",
-            "session_id": session_id_clone,
-            "message": "Task submitted to OpenCode. It is running in background. DO NOT submit again - wait for the completion notification. You can continue with other tasks while waiting.",
-            "note": "The result will be delivered automatically when OpenCode completes. No need to poll or resubmit."
+            "session_id": session_id_clone
         }))
     }
 
@@ -624,44 +558,6 @@ impl AgentRuntime {
             .map(crate::i18n::resolve_lang)
             .unwrap_or("en");
 
-        // Check if there's already an ACP task running for this session
-        // Also check if the task has been running too long (auto-clear stale markers)
-        {
-            let mut running = self.handle.acp_running_tasks.write().unwrap();
-            if let Some((tool_name, start_time)) = running.get(&ctx.session_key) {
-                let elapsed = start_time.elapsed().as_secs();
-                // Auto-clear stale markers if task has been running for more than 10 minutes
-                // This handles cases where opencode/claudecode process hangs
-                if elapsed > 600 {
-                    tracing::warn!(
-                        session = %ctx.session_key,
-                        tool = %tool_name,
-                        elapsed_secs = elapsed,
-                        "tool_claudecode: clearing stale ACP task marker (task may have hung)"
-                    );
-                    running.remove(&ctx.session_key);
-                } else {
-                    tracing::warn!(
-                        session = %ctx.session_key,
-                        tool = %tool_name,
-                        elapsed_secs = elapsed,
-                        "tool_claudecode: duplicate submission blocked - task already running"
-                    );
-                    return Ok(serde_json::json!({
-                        "output": crate::i18n::t_fmt("acp_already_running", lang, &[("name", "Claude Code"), ("elapsed", &elapsed.to_string())]),
-                        "status": "blocked",
-                        "message": "A Claude Code task is already running for this session. Please wait for it to complete before submitting a new task.",
-                        "elapsed_seconds": elapsed
-                    }));
-                }
-            }
-        }
-        // Mark this session as having an ACP task running
-        {
-            let mut running = self.handle.acp_running_tasks.write().unwrap();
-            running.insert(ctx.session_key.clone(), ("claudecode".to_string(), std::time::Instant::now()));
-        }
-
         // Get notification sender early for error reporting
         let notif_tx = self.notification_tx.clone();
         let target_id = ctx.peer_id.clone();
@@ -672,11 +568,6 @@ impl AgentRuntime {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("tool_claudecode: get_client failed: {}", e);
-                // Clear the ACP running task marker on error
-                {
-                    let mut running = self.handle.acp_running_tasks.write().unwrap();
-                    running.remove(&ctx.session_key);
-                }
                 if let Some(ref tx) = notif_tx {
                     let _ = tx.send(crate::channel::OutboundMessage {
                         target_id: target_id.clone(),
@@ -714,26 +605,6 @@ impl AgentRuntime {
         let target_id_bg = target_id.clone();
         let channel_bg = channel_name.clone();
         let lang_bg = lang;
-        // Clone agent's own inbox for result injection after completion.
-        let self_tx = self.handle.tx.clone();
-        let self_session = ctx.session_key.clone();
-        let self_acp_tasks = self.handle.acp_running_tasks.clone();
-        let self_channel = ctx.channel.clone();
-        let self_peer_id = ctx.peer_id.clone();
-        let self_chat_id = ctx.chat_id.clone();
-        // Extract configurable reply timeout BEFORE spawn (config read needs self, can't be inside spawn)
-        let reply_timeout_secs = self.config.ext.tools.as_ref()
-            .and_then(|t| t.acp.as_ref())
-            .and_then(|a| a.reply_timeout_seconds)
-            .unwrap_or(300);
-        // Extract ACP result truncation limit from config
-        let acp_result_limit = self.config.ext.tools.as_ref()
-            .and_then(|t| t.session_result_limits.as_ref())
-            .and_then(|l| l.acp)
-            .or_else(|| self.config.raw.tools.as_ref()
-                .and_then(|t| t.session_result_limits.as_ref())
-                .and_then(|l| l.acp))
-            .unwrap_or(100000);
         tokio::spawn(async move {
             // Start event collection FIRST (in parallel with send_prompt)
             let mut event_rx = client.subscribe_events();
@@ -879,15 +750,15 @@ impl AgentRuntime {
 
                     let summary = if !result_content.is_empty() {
                         // Show result, truncated if too long (character-safe truncation)
-                        let truncated = if result_content.chars().count() > acp_result_limit {
+                        let truncated = if result_content.chars().count() > 2000 {
                             let cutoff = result_content
                                 .char_indices()
-                                .nth(acp_result_limit)
+                                .nth(2000)
                                 .map(|(i, _)| i)
                                 .unwrap_or(result_content.len());
                             crate::i18n::t_fmt("acp_truncated", lang_bg, &[("content", &result_content[..cutoff])])
                         } else {
-                            result_content.clone()
+                            result_content
                         };
                         crate::i18n::t_fmt("acp_done_result", lang_bg, &[
                             ("status", status_icon), ("name", "Claude Code"),
@@ -904,12 +775,8 @@ impl AgentRuntime {
                         ])
                     };
 
-                    // Store for agent re-inject after notification.
-                    let result_summary = summary.clone();
-                    let result_files = notif_files.clone();
-
                     // Send notification to user
-                    tracing::info!(
+                    tracing::debug!(
                         "tool_claudecode: sending completion notification, summary_len={}, files={}",
                         summary.len(), notif_files.len()
                     );
@@ -917,14 +784,14 @@ impl AgentRuntime {
                         match tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
-                            text: summary.clone(),
+                            text: summary,
                             reply_to: None,
                             images: vec![],
                             files: notif_files,
                             channel: Some(channel_bg.clone()),
                         }) {
                             Ok(_) => {
-                                tracing::info!("tool_claudecode: notification sent successfully: {}", summary)
+                                tracing::debug!("tool_claudecode: notification sent successfully")
                             }
                             Err(e) => {
                                 tracing::error!("tool_claudecode: failed to send notification: {}", e)
@@ -932,55 +799,6 @@ impl AgentRuntime {
                         }
                     } else {
                         tracing::warn!("tool_claudecode: no notification channel available");
-                    }
-
-                    // Inject result back into main agent's inbox so it can act on the result
-                    let file_paths: Vec<String> = result_files.iter().map(|(_, _, p)| p.clone()).collect();
-                    let inject_text = if file_paths.is_empty() {
-                        format!("[Claude Code completed] {}", if result_summary.is_empty() { "Task finished.".to_owned() } else { result_summary })
-                    } else {
-                        format!("[Claude Code completed] Files ready: {}. Please send them to the user with send_file.",
-                            file_paths.join(", "))
-                    };
-                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
-                    let inject_msg = AgentMessage {
-                        session_key: self_session.clone(),
-                        text: inject_text,
-                        channel: self_channel.clone(),
-                        peer_id: self_peer_id,
-                        chat_id: self_chat_id,
-                        reply_tx,
-                        extra_tools: vec![],
-                        images: vec![],
-                        files: vec![],
-                        is_internal: false,
-                    };
-                    if self_tx.send(inject_msg).await.is_err() {
-                        tracing::warn!("tool_claudecode: failed to inject result back to agent inbox");
-                    } else {
-                        tracing::info!("tool_claudecode: result injected back to agent, waiting for reply");
-                        // Wait for agent's reply and forward it (text + files) to user via notification.
-                        // Timeout value extracted before spawn (see reply_timeout_secs variable)
-                        match tokio::time::timeout(Duration::from_secs(reply_timeout_secs), reply_rx).await {
-                            Ok(Ok(reply)) => {
-                                if !reply.text.is_empty() || !reply.files.is_empty() || !reply.images.is_empty() {
-                                    if let Some(ref tx) = notif_tx_bg {
-                                        let _ = tx.send(crate::channel::OutboundMessage {
-                                            target_id: target_id_bg.clone(),
-                                            is_group: false,
-                                            text: reply.text,
-                                            reply_to: None,
-                                            images: reply.images,
-                                            files: reply.files,
-                                            channel: Some(self_channel),
-                                        });
-                                        tracing::info!("tool_claudecode: forwarded agent reply to user");
-                                    }
-                                }
-                            }
-                            Ok(Err(_)) => tracing::warn!("tool_claudecode: reply channel dropped"),
-                            Err(_) => tracing::warn!("tool_claudecode: reply timed out after {}s", reply_timeout_secs),
-                        }
                     }
                 }
                 Err(e) => {
@@ -998,20 +816,13 @@ impl AgentRuntime {
                     }
                 }
             }
-            // Clear the ACP running task marker
-            {
-                let mut running = self_acp_tasks.write().unwrap();
-                running.remove(&self_session);
-            }
             // DON'T await event_collector - it runs forever
         });
 
         Ok(serde_json::json!({
             "output": crate::i18n::t_fmt("acp_queued", lang, &[("name", "Claude Code")]),
             "status": "submitted",
-            "session_id": session_id_clone,
-            "message": "Task submitted to Claude Code. It is running in background. DO NOT submit again - wait for the completion notification. You can continue with other tasks while waiting.",
-            "note": "The result will be delivered automatically when Claude Code completes. No need to poll or resubmit."
+            "session_id": session_id_clone
         }))
     }
 }

@@ -32,23 +32,6 @@ const FIELD_SCOPE: &str = "scope";
 const FIELD_CONTENT: &str = "content";
 const FIELD_KIND: &str = "kind";
 
-/// Special characters that need escaping in tantivy query grammar.
-const TANTIVY_SPECIAL_CHARS: &[char] = &[
-    '+', '-', '&', '|', '!', '(', ')', '{', '}', '[', ']', '^', '"', '~', '*', '?', ':', '\\', '/',
-];
-
-/// Escape special characters in query string for tantivy parser.
-fn escape_query(query: &str) -> String {
-    let mut escaped = String::with_capacity(query.len() * 2);
-    for ch in query.chars() {
-        if TANTIVY_SPECIAL_CHARS.contains(&ch) {
-            escaped.push('\\');
-        }
-        escaped.push(ch);
-    }
-    escaped
-}
-
 // ---------------------------------------------------------------------------
 // SearchIndex
 // ---------------------------------------------------------------------------
@@ -169,12 +152,10 @@ impl SearchIndex {
         let search_fields = vec![content_field];
         let parser = QueryParser::for_index(&self.index, search_fields);
 
-        // Escape special characters and prepend field name to prevent
-        // "Exist query without a field" panic in tantivy parser.
-        let escaped_query = escape_query(query);
+        // Combine content query with optional scope filter.
         let query_str = match scope {
-            Some(s) => format!("content:{} AND scope:{}", escaped_query, s),
-            None => format!("content:{}", escaped_query),
+            Some(s) => format!("{query} AND scope:{s}"),
+            None => query.to_owned(),
         };
 
         let parsed = parser

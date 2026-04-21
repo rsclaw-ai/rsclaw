@@ -44,20 +44,6 @@ impl ExecPool {
         })
     }
 
-    /// Register a task as running. Call this BEFORE spawning.
-    pub async fn register_running(&self, task_id: String) {
-        tracing::debug!(task_id = %task_id, "exec_pool: task registered as running");
-        let mut tasks = self.tasks.write().await;
-        tasks.insert(task_id, Instant::now());
-    }
-
-    /// Unregister a task (mark as no longer running). Call this AFTER completion.
-    pub async fn unregister_running(&self, task_id: &str) {
-        let mut tasks = self.tasks.write().await;
-        tasks.remove(task_id);
-        tracing::debug!(task_id = %task_id, "exec_pool: task unregistered (no longer running)");
-    }
-
     /// Spawn a command in the background. The result will be stored
     /// in `pending_results` keyed by session_key and can be retrieved
     /// via `collect_pending_for_session()`.
@@ -160,13 +146,8 @@ impl ExecPool {
         tracing::info!(task_id = %task_id, "exec background spawned");
     }
 
-    /// Add a pending result for a task (for polling by task_id).
-    pub async fn add_pending_for_task(&self, task_id: &str, result: ExecResult) {
-        tracing::info!(
-            task_id = %task_id,
-            exit_code = ?result.exit_code,
-            "exec_pool: adding pending result for task (polling)"
-        );
+    /// Add a pending result for a task (internal use).
+    async fn add_pending_for_task(self: &Arc<Self>, task_id: &str, result: ExecResult) {
         let mut pending = self.pending_results.write().await;
         pending
             .entry(format!("task:{}", task_id))

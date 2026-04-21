@@ -1946,19 +1946,6 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "ru" => "Задача {name} отправлена. Результат будет отправлен по завершении.",
     );
 
-    msg!("acp_already_running",
-        "en" => "{name} task is already running (started {elapsed}s ago). Please wait for it to complete.",
-        "zh" => "{name} 任务已在运行中（已运行 {elapsed} 秒）。请等待完成后再提交新任务。",
-        "ja" => "{name} タスクは既に実行中（{elapsed}秒前開始）。完了を待ってください。",
-        "ko" => "{name} 작업이 이미 실행 중입니다 ({elapsed}초 전 시작). 완료를 기다리세요.",
-        "fr" => "Une tâche {name} est déjà en cours (démarrée {elapsed}s ago). Veuillez attendre.",
-        "de" => "{name}-Aufgabe läuft bereits (vor {elapsed}s gestartet). Bitte warten.",
-        "th" => "งาน {name} กำลังทำงานอยู่ (เริ่ม {elapsed} วินาทีที่แล้ว) กรุณารอให้เสร็จ",
-        "vi" => "Tác vụ {name} đang chạy (bắt đầu {elapsed}s trước). Vui lòng đợi.",
-        "es" => "Una tarea {name} ya está ejecutándose (iniciada {elapsed}s ago). Espere.",
-        "ru" => "Задача {name} уже выполняется (начата {elapsed}s назад). Пожалуйста, ждите.",
-    );
-
     msg!("acp_done_result",
         "en" => "{status} {name} done\n\n**Tools called**: {count}\n\n**Result**:\n{result}",
         "zh" => "{status} {name} 完成\n\n**调用工具**: {count} 个\n\n**结果**:\n{result}",

@@ -590,19 +590,14 @@ fn init_tracing(cli: &Cli) {
     if cli.json {
         tracing_subscriber::fmt()
             .json()
-            .with_writer(std::io::stderr)
             .with_env_filter(filter)
             .init();
     } else if cli.no_color {
         tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
             .with_env_filter(filter)
             .with_ansi(false)
             .init();
     } else {
-        tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_env_filter(filter)
-            .init();
+        tracing_subscriber::fmt().with_env_filter(filter).init();
     }
 }

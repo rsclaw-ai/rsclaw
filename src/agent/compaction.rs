@@ -1,5 +1,6 @@
 //! Session compaction — LLM-based context summarization and transcript logging.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -13,6 +14,111 @@ use super::runtime::AgentRuntime;
 use crate::provider::{
     ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent,
 };
+
+/// Collect all tool_use_ids from ToolResult messages in a slice.
+fn collect_tool_result_ids(msgs: &[Message]) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for msg in msgs {
+        if msg.role != Role::Tool {
+            continue;
+        }
+        match &msg.content {
+            MessageContent::Parts(parts) => {
+                for part in parts {
+                    if let ContentPart::ToolResult { tool_use_id, .. } = part {
+                        ids.insert(tool_use_id.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    ids
+}
+
+/// Collect all tool_use_ids from ToolUse calls in a slice.
+fn collect_tool_use_ids(msgs: &[Message]) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for msg in msgs {
+        if msg.role != Role::Assistant {
+            continue;
+        }
+        match &msg.content {
+            MessageContent::Parts(parts) => {
+                for part in parts {
+                    if let ContentPart::ToolUse { id, .. } = part {
+                        ids.insert(id.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    ids
+}
+
+/// Adjust split_idx to ensure ToolUse-ToolResult pairing integrity.
+/// If a ToolUse is before split_idx but its ToolResult is after,
+/// move split_idx backward to include both in old_portion.
+/// If a ToolResult is after split_idx but its ToolUse is before,
+/// move split_idx forward to include both in recent.
+fn adjust_split_for_tool_pairing(msgs: &[Message], initial_split: usize, head_end: usize) -> usize {
+    let mut split_idx = initial_split;
+
+    // Collect ToolUse IDs before split (in old_portion)
+    let old_tool_uses = collect_tool_use_ids(&msgs[head_end..split_idx]);
+    // Collect ToolResult IDs after split (in recent)
+    let recent_tool_results = collect_tool_result_ids(&msgs[split_idx..]);
+
+    // Case 1: ToolUse before split, ToolResult after split
+    // Move split forward to include ToolResult in recent (orphaned ToolResult is worse)
+    for tool_id in &old_tool_uses {
+        if recent_tool_results.contains(tool_id) {
+            // Find where this ToolResult appears and move split past it
+            for i in split_idx..msgs.len() {
+                if msgs[i].role == Role::Tool {
+                    if let MessageContent::Parts(parts) = &msgs[i].content {
+                        for part in parts {
+                            if let ContentPart::ToolResult { tool_use_id, .. } = part {
+                                if tool_use_id == tool_id {
+                                    // Move split to include this ToolResult
+                                    split_idx = i + 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Case 2: ToolResult before split, ToolUse after split
+    // This is less common but should be handled too
+    let old_tool_results = collect_tool_result_ids(&msgs[head_end..split_idx]);
+    let recent_tool_uses = collect_tool_use_ids(&msgs[split_idx..]);
+
+    for tool_id in &recent_tool_uses {
+        if old_tool_results.contains(tool_id) {
+            // Find where this ToolResult is and move split back before it
+            for i in (head_end..split_idx).rev() {
+                if msgs[i].role == Role::Tool {
+                    if let MessageContent::Parts(parts) = &msgs[i].content {
+                        for part in parts {
+                            if let ContentPart::ToolResult { tool_use_id, .. } = part {
+                                if tool_use_id == tool_id {
+                                    // Move split to exclude this orphaned ToolResult
+                                    split_idx = i;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    split_idx.max(head_end).min(msgs.len())
+}
 
 /// Prefix for compaction summaries. Tells the LLM that the summary is
 /// reference material from a previous context window, NOT active instructions.
@@ -40,31 +146,6 @@ impl AgentRuntime {
     /// Force compaction regardless of threshold (used by /compact).
     pub(crate) async fn compact_force(&mut self, session_key: &str, model: &str) {
         self.compact_inner(session_key, model, true).await;
-    }
-
-    /// Estimate the fixed token overhead from system prompt, tools, and skills.
-    /// This overhead is always present regardless of conversation length.
-    pub(crate) fn estimate_fixed_overhead(&self) -> usize {
-        let mut overhead = 0usize;
-
-        // System prompt.
-        if let Some(ref sys) = self.cached_system_prompt {
-            overhead += estimate_tokens(sys);
-        }
-
-        // Tool definitions.
-        for tool in &self.cached_tools {
-            overhead += estimate_tokens(&tool.name);
-            overhead += estimate_tokens(&tool.description);
-            overhead += estimate_tokens(&tool.parameters.to_string());
-        }
-
-        // Skills loaded in system prompt (rough estimate from skill count).
-        let skill_count = self.skills.len();
-        // Average skill prompt is ~500 tokens.
-        overhead += skill_count * 500;
-
-        overhead
     }
 
     pub(crate) async fn compact_inner(&mut self, session_key: &str, model: &str, force: bool) {
@@ -96,16 +177,11 @@ impl AgentRuntime {
             default_threshold
         };
 
-        // Estimate fixed overhead: system prompt + tools + skills.
-        // This is NOT in the session messages but still counts towards context.
-        let overhead_tokens = self.estimate_fixed_overhead();
-
-        let session_tokens: usize = self
+        let total_tokens: usize = self
             .sessions
             .get(session_key)
             .map(|msgs| msgs.iter().map(msg_tokens).sum())
             .unwrap_or(0);
-        let total_tokens = session_tokens + overhead_tokens;
 
         let turns = self
             .compaction_state
@@ -215,6 +291,12 @@ impl AgentRuntime {
             }
             // Ensure split doesn't overlap with head.
             split_idx = split_idx.max(head_end);
+
+            // Adjust split to preserve ToolUse-ToolResult pairing integrity.
+            // If a ToolUse is before split_idx but its ToolResult is after,
+            // the orphaned ToolResult would be discarded, and the LLM would
+            // not see the error feedback — leading to infinite retry loops.
+            split_idx = adjust_split_for_tool_pairing(&msgs, split_idx, head_end);
 
             let head = msgs[..head_end].to_vec();
             let mut old_portion = msgs[head_end..split_idx].to_vec();

@@ -268,7 +268,6 @@ pub(crate) fn start_qq_if_configured(
                                     extra_tools: vec![],
                                     images,
                                     files: file_attachments,
-                                    is_internal: false,
                                 };
                                 if handle.tx.send(msg).await.is_err() {
                                     error!("qq: agent inbox closed");
@@ -407,8 +406,7 @@ pub(crate) fn start_qq_if_configured(
                                 extra_tools: vec![],
                                 images,
                                 files: file_attachments,
-                            is_internal: false,
-                        };
+                            };
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }

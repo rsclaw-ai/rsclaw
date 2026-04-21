@@ -975,7 +975,6 @@ impl AgentRuntime {
             req = req.header("Referer", referer);
         } else if let Ok(parsed) = reqwest::Url::parse(url) {
             if let Some(host) = parsed.host_str() {
-                // For known CDN domains, use their parent service as referer
                 let referer = if host.contains("byteimg.com") || host.contains("dreamina") {
                     "https://jimeng.jianying.com/".to_string()
                 } else {
@@ -1132,8 +1131,93 @@ impl AgentRuntime {
             }
         }
 
-        // capture_video is now handled by the browser module directly.
-        // Falls through to the browser execute() call below.
+        // Special action: capture_video — open page, inject interceptor, wait, collect video URLs.
+        if action == "capture_video" {
+            let url = args["url"].as_str().unwrap_or("");
+            if url.is_empty() {
+                bail!("capture_video: `url` required");
+            }
+            let wait_ms = args["wait_ms"].as_u64().unwrap_or(8000);
+
+            let mut browser = self.browser.lock().await;
+            let session = browser.as_mut().unwrap();
+
+            // 1. Inject interceptor BEFORE navigating (catches all requests from start).
+            let inject_js = r#"(function(){
+                window.__vUrls=[];
+                var xo=XMLHttpRequest.prototype.open;
+                XMLHttpRequest.prototype.open=function(m,u){
+                    if(u&&typeof u==='string'&&/video|mp4|m3u8|m4s|flv|playaddr|play_addr|pcdn|bilivideo/.test(u))
+                        window.__vUrls.push(u);
+                    return xo.apply(this,arguments);
+                };
+                var ff=window.fetch;
+                window.fetch=function(u){
+                    var s=typeof u==='string'?u:(u&&u.url||'');
+                    if(/video|mp4|m3u8|m4s|flv|playaddr|play_addr|pcdn|bilivideo/.test(s))
+                        window.__vUrls.push(s);
+                    return ff.apply(this,arguments);
+                };
+                return 'interceptor_ready';
+            })()"#;
+
+            // 2. Navigate to the video page.
+            session.execute("open", &json!({"url": url})).await?;
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+
+            // 3. Inject interceptor (page scripts may have already loaded, so also check performance).
+            let _ = session.execute("evaluate", &json!({"js": inject_js})).await;
+
+            // 4. Wait for video to load/play.
+            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+
+            // 5. Collect captured URLs + performance entries + video element src.
+            let collect_js = r#"(function(){
+                var urls = (window.__vUrls||[]).slice();
+                try {
+                    performance.getEntriesByType('resource').forEach(function(e){
+                        if(e.name && /video|mp4|m3u8|m4s|flv|playaddr|play_addr|pcdn|bilivideo/.test(e.name)
+                           && e.name.startsWith('http')
+                           && !/poster|cover|thumbnail|preview/.test(e.name))
+                            urls.push(e.name);
+                    });
+                } catch(e){}
+                document.querySelectorAll('video,source').forEach(function(el){
+                    var s = el.src || el.currentSrc || '';
+                    if(s && s.startsWith('http')) urls.push(s);
+                });
+                return JSON.stringify([...new Set(urls)]);
+            })()"#;
+
+            let result = session.execute("evaluate", &json!({"js": collect_js})).await?;
+            let urls_str = result["result"].as_str()
+                .or_else(|| result.as_str())
+                .unwrap_or("[]");
+
+            let urls: Vec<String> = serde_json::from_str(urls_str).unwrap_or_default();
+
+            // 6. If empty, try reload + re-collect.
+            if urls.is_empty() {
+                let _ = session.execute("evaluate", &json!({"js": "window.__vUrls=[];location.reload()"})).await;
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                let _ = session.execute("evaluate", &json!({"js": inject_js})).await;
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                let result2 = session.execute("evaluate", &json!({"js": collect_js})).await?;
+                let urls_str2 = result2["result"].as_str()
+                    .or_else(|| result2.as_str())
+                    .unwrap_or("[]");
+                let urls2: Vec<String> = serde_json::from_str(urls_str2).unwrap_or_default();
+                return Ok(json!({
+                    "video_urls": urls2,
+                    "hint": if urls2.is_empty() { "No video URLs found. The page may require login or the video is DRM-protected." } else { "Pick the URL containing mp4/playaddr for download." }
+                }));
+            }
+
+            return Ok(json!({
+                "video_urls": urls,
+                "hint": "Pick the URL containing mp4/playaddr for download. Use web_download with use_browser_cookies=true."
+            }));
+        }
 
         // Now lock again for execute -- guard is dropped, avoiding borrow issues.
         let mut browser = self.browser.lock().await;

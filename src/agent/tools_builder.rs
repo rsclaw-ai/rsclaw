@@ -41,9 +41,6 @@ pub(crate) fn toolset_allowed_names(
         "anycli",
     ];
 
-    // `agent` and `session` are always available regardless of toolset.
-    // Permission control is handled at dispatch time based on AgentKind.
-
     let base: Option<&[&str]> = match toolset {
         "minimal" => Some(MINIMAL),
         "web" => Some(WEB),
@@ -79,7 +76,6 @@ pub(crate) fn build_tool_list(
     agents: Option<&AgentRegistry>,
     caller_id: &str,
     external_agents: &[ExternalAgentConfig],
-    wasm_plugins: &[crate::plugin::WasmPlugin],
 ) -> Vec<ToolDef> {
     let mut tools = Vec::new();
 
@@ -208,14 +204,13 @@ pub(crate) fn build_tool_list(
             Tips:\n\
             - Use task for independent, parallelizable work. You can dispatch multiple tasks at once.\n\
             - Always specify toolset matching the task (web for search, code for file ops).\n\
-            - After dispatching, tell the user what you delegated and continue with other work.\n\
-            - Do NOT specify a model parameter — the system automatically uses the current model.".to_owned(),
+            - After dispatching, tell the user what you delegated and continue with other work.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "action":  {"type": "string", "enum": ["spawn", "task", "send", "list", "kill"], "description": "Action to perform"},
                 "id":      {"type": "string", "description": "Agent ID (for spawn/send/kill)"},
-                "model":   {"type": "string", "description": "Optional model override. Leave empty to use current model. Do NOT guess or invent model names."},
+                "model":   {"type": "string", "description": "Model string (for spawn/task)"},
                 "system":  {"type": "string", "description": "Role description (for spawn/task)"},
                 "message": {"type": "string", "description": "Message to send (for task/send)"},
                 "toolset": {"type": "string", "enum": ["minimal", "standard", "web", "code", "full"], "description": "Tool access level. Default: standard."}
@@ -852,19 +847,6 @@ pub(crate) fn build_tool_list(
                     .input_schema
                     .clone()
                     .unwrap_or_else(|| Value::Object(Default::default())),
-            });
-        }
-    }
-
-    // WASM plugin tools — replace built-in equivalents.
-    let _wasm_replaces: Vec<String> = Vec::new();
-    for plugin in wasm_plugins {
-        for tool in &plugin.tools {
-            let full_name = format!("{}.{}", plugin.name, tool.name);
-            tools.push(ToolDef {
-                name: full_name,
-                description: tool.description.clone(),
-                parameters: tool.parameters.clone(),
             });
         }
     }

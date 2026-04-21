@@ -460,6 +460,8 @@ impl FeishuChannel {
             "content": card_str,
         });
 
+        info!(target_id, text_preview = %text.chars().take(100).collect::<String>(), "feishu: send_text_chunk sending");
+
         let resp = self
             .client
             .post(&url)
@@ -470,6 +472,7 @@ impl FeishuChannel {
             .context("feishu: send message")?;
 
         let status = resp.status();
+        info!(target_id, status = %status.as_u16(), "feishu: send_text_chunk response");
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("feishu: send_message failed {status}: {body}");
