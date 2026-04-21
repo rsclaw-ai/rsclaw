@@ -67,7 +67,6 @@ impl super::runtime::AgentRuntime {
                     let short_threshold_ms = 30 * 60 * 1000; // 30 minutes
                     if delay <= short_threshold_ms {
                         let msg_text = message.to_owned();
-                        let peer_id = ctx.peer_id.clone();
                         let event_bus = self.event_bus.clone();
                         let session_key = ctx.session_key.clone();
                         let delay_dur = Duration::from_millis(delay);
