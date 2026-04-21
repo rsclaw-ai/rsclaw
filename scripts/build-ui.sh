@@ -89,12 +89,14 @@ fi
 # --- Step 1: Build rsclaw CLI ---
 log "Building rsclaw CLI (${PROFILE})..."
 
-VERSION="$(git -C "$ROOT_DIR" describe --tags --always 2>/dev/null || echo "dev")"
+VERSION="$(grep '^version' "$ROOT_DIR/Cargo.toml" | head -1 | sed 's/.*"\(.*\)"/\1/')"
 BUILD_DATE="$(date +%Y-%m-%d)"
+
+log "Version: ${CYAN}${VERSION}${NC}"
 
 (
     cd "$ROOT_DIR"
-    RSCLAW_BUILD_VERSION="v${VERSION}" \
+    RSCLAW_BUILD_VERSION="${VERSION}" \
     RSCLAW_BUILD_DATE="$BUILD_DATE" \
     cargo build $CARGO_FLAGS --target "$TARGET" 2>&1
 ) || {
@@ -103,7 +105,7 @@ BUILD_DATE="$(date +%Y-%m-%d)"
         log "Retrying without explicit --target..."
         (
             cd "$ROOT_DIR"
-            RSCLAW_BUILD_VERSION="v${VERSION}" \
+            RSCLAW_BUILD_VERSION="${VERSION}" \
             RSCLAW_BUILD_DATE="$BUILD_DATE" \
             cargo build $CARGO_FLAGS 2>&1
         )
