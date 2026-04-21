@@ -3144,7 +3144,9 @@ impl AgentRuntime {
                 .map(|msgs| msgs.iter().map(super::context_mgr::msg_tokens).sum())
                 .unwrap_or(0);
             let total_est = overhead + session_tokens;
-            if total_est > context_limit.saturating_sub(2000) {
+            // Use 80% of context limit as threshold to account for token estimation
+            // inaccuracy (estimate is ~char/3.5, actual tokenization may differ by 10-15%).
+            if total_est > (context_limit * 80 / 100) {
                 warn!(
                     session = %ctx.session_key,
                     total_est,
@@ -3181,7 +3183,24 @@ impl AgentRuntime {
             }
 
             let providers = Arc::clone(&self.providers);
-            let mut stream = self.failover.call(req, &providers).await?;
+            let stream_result = self.failover.call(req.clone(), &providers).await;
+
+            // If the LLM rejects for context overflow, compact and retry once.
+            let mut stream = match stream_result {
+                Err(ref e) if e.to_string().contains("exceed") || e.to_string().contains("context") => {
+                    warn!(session = %ctx.session_key, error = %e, "LLM context overflow, compacting and retrying");
+                    self.compact_inner(&ctx.session_key, &model, true).await;
+                    // Rebuild messages after compaction.
+                    let compacted = self.sessions
+                        .get(&ctx.session_key)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut retry_req = req.clone();
+                    retry_req.messages = compacted;
+                    self.failover.call(retry_req, &providers).await?
+                }
+                other => other?,
+            };
             let mut text_buf = String::new();
             let mut reasoning_buf = String::new();
             let mut tool_calls: Vec<(String, String, Value)> = Vec::new();
