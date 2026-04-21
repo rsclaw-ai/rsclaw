@@ -561,23 +561,93 @@ impl CronRunner {
                 }
             };
 
-            // Use tokio::select! to wait for either timer or reload signal
-            let reload_triggered = tokio::select! {
+            // Use tokio::select! to wait for either timer, reload signal, or job completion
+            let select_result: Result<(), bool> = tokio::select! {
                 _ = sleep(Duration::from_millis(delay_ms)) => {
-                    false
+                    Ok(()) // Timer fired, proceed to check due jobs
                 }
                 result = reload_rx.recv() => {
                     match result {
-                        Ok(()) => true,
+                        Ok(()) => Err(true), // Reload triggered
                         Err(broadcast::error::RecvError::Closed) => {
                             // Channel closed, exit loop
                             return;
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            // Lagged, but still reload
-                            true
+                            Err(true) // Lagged, but still reload
                         }
                     }
+                }
+                result = result_rx.recv() => {
+                    // Job completed — process result immediately
+                    if let Some((job_id, success, duration_ms, started_at, error_msg)) = result {
+                        cancel_flags.remove(&job_id);
+                        if let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) {
+                            if let Some(state) = job.state.as_mut() {
+                                state.running_at_ms = None;
+                                state.last_run_at_ms = Some(current_timestamp_ms());
+                                state.last_duration_ms = Some(duration_ms);
+
+                                let completion_time = started_at + duration_ms;
+
+                                if success {
+                                    state.consecutive_errors = 0;
+                                    state.last_run_status = Some("ok".to_string());
+                                    state.last_status = Some("ok".to_string());
+                                    state.last_error = None;
+
+                                    if job.schedule.is_once() {
+                                        info!(job_id = %job.id, "cron: one-shot job completed, marking for removal");
+                                        state.next_run_at_ms = None;
+                                        job.enabled = false;
+                                    } else {
+                                        state.next_run_at_ms = job.schedule.compute_next_run(completion_time);
+                                    }
+                                } else {
+                                    state.consecutive_errors += 1;
+                                    state.last_run_status = Some("error".to_string());
+                                    state.last_status = Some("error".to_string());
+                                    state.last_error = error_msg;
+
+                                    let backoff = error_backoff_ms(state.consecutive_errors);
+                                    let backoff_next = completion_time + backoff;
+                                    let normal_next = job.schedule.compute_next_run(completion_time);
+                                    state.next_run_at_ms = Some(
+                                        normal_next
+                                            .map(|n| n.max(backoff_next))
+                                            .unwrap_or(backoff_next),
+                                    );
+
+                                    info!(
+                                        job_id = %job.id,
+                                        consecutive_errors = state.consecutive_errors,
+                                        backoff_ms = backoff,
+                                        next_run_at_ms = state.next_run_at_ms,
+                                        "cron: applying error backoff"
+                                    );
+
+                                    if state.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                                        warn!(
+                                            job_id = %job.id,
+                                            consecutive_errors = state.consecutive_errors,
+                                            "cron: disabling job after repeated failures"
+                                        );
+                                        job.enabled = false;
+                                    }
+                                }
+                            }
+                        }
+                        // Remove completed one-shot jobs
+                        let before = jobs.len();
+                        jobs.retain(|j| !(j.schedule.is_once() && !j.enabled));
+                        if jobs.len() < before {
+                            info!(removed = before - jobs.len(), "cron: cleaned up completed one-shot jobs");
+                        }
+                        if let Err(e) = self.save_store(&jobs).await {
+                            warn!(err = %e, "cron: failed to save store after job completion");
+                        }
+                    }
+                    Err(false) // Job result processed, continue loop without reload
                 }
             };
 
@@ -585,57 +655,65 @@ impl CronRunner {
                 break;
             }
 
-            if reload_triggered {
-                // Reload jobs from file - use current time for next_run calculation
-                let reload_now_ms = current_timestamp_ms();
-                let old_count = jobs.len();
-                let new_jobs = crate::cron::load_cron_jobs();
-                let file_count = new_jobs.len();
+            match select_result {
+                Ok(()) => {}, // Timer fired, proceed to check due jobs
+                Err(reload_triggered) => {
+                    if reload_triggered {
+                        // Reload jobs from file - use current time for next_run calculation
+                        let reload_now_ms = current_timestamp_ms();
+                        let old_count = jobs.len();
+                        let new_jobs = crate::cron::load_cron_jobs();
+                        let file_count = new_jobs.len();
 
-                // Debug: check if disabled job is in new_jobs
-                let disabled_in_file: Vec<_> = new_jobs
-                    .iter()
-                    .filter(|j| !j.enabled)
-                    .map(|j| (&j.id, j.enabled))
-                    .collect();
-                info!(old_count, new_count = new_jobs.len(), file_count, disabled=?disabled_in_file, "cron: reload triggered, reloading from file");
+                        // Debug: check if disabled job is in new_jobs
+                        let disabled_in_file: Vec<_> = new_jobs
+                            .iter()
+                            .filter(|j| !j.enabled)
+                            .map(|j| (&j.id, j.enabled))
+                            .collect();
+                        info!(old_count, new_count = new_jobs.len(), file_count, disabled=?disabled_in_file, "cron: reload triggered, reloading from file");
 
-                jobs = self.merge_jobs(&jobs, new_jobs, reload_now_ms);
+                        jobs = self.merge_jobs(&jobs, new_jobs, reload_now_ms);
 
-                // Debug: check enabled state after merge
-                let disabled_after_merge: Vec<_> = jobs
-                    .iter()
-                    .filter(|j| !j.enabled)
-                    .map(|j| (&j.id, j.enabled))
-                    .collect();
-                info!(after_merge_count = jobs.len(), disabled=?disabled_after_merge, "cron: merge complete");
+                        // Debug: check enabled state after merge
+                        let disabled_after_merge: Vec<_> = jobs
+                            .iter()
+                            .filter(|j| !j.enabled)
+                            .map(|j| (&j.id, j.enabled))
+                            .collect();
+                        info!(after_merge_count = jobs.len(), disabled=?disabled_after_merge, "cron: merge complete");
 
-                // Cancel running tasks that were removed or disabled.
-                let active_ids: std::collections::HashSet<&str> = jobs.iter()
-                    .filter(|j| j.enabled)
-                    .map(|j| j.id.as_str())
-                    .collect();
-                let to_cancel: Vec<String> = cancel_flags.keys()
-                    .filter(|id| !active_ids.contains(id.as_str()))
-                    .cloned()
-                    .collect();
-                for id in &to_cancel {
-                    if let Some(flag) = cancel_flags.remove(id) {
-                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                        info!(job_id = id, "cron: cancelled running job (deleted/disabled)");
+                        // Cancel running tasks that were removed or disabled.
+                        let active_ids: std::collections::HashSet<&str> = jobs.iter()
+                            .filter(|j| j.enabled)
+                            .map(|j| j.id.as_str())
+                            .collect();
+                        let to_cancel: Vec<String> = cancel_flags.keys()
+                            .filter(|id| !active_ids.contains(id.as_str()))
+                            .cloned()
+                            .collect();
+                        for id in &to_cancel {
+                            if let Some(flag) = cancel_flags.remove(id) {
+                                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                                info!(job_id = id, "cron: cancelled running job (deleted/disabled)");
+                            }
+                        }
+
+                        if let Err(e) = self.save_store(&jobs).await {
+                            warn!(err = %e, "cron: failed to save store after reload");
+                        }
+                        info!(
+                            old_count,
+                            new_count = jobs.len(),
+                            file_count,
+                            "cron jobs reloaded"
+                        );
+                        continue;
+                    } else {
+                        // Job result processed, continue loop
+                        continue;
                     }
                 }
-
-                if let Err(e) = self.save_store(&jobs).await {
-                    warn!(err = %e, "cron: failed to save store after reload");
-                }
-                info!(
-                    old_count,
-                    new_count = jobs.len(),
-                    file_count,
-                    "cron jobs reloaded"
-                );
-                continue;
             }
 
             // Collect jobs that are due and not already running
@@ -852,73 +930,6 @@ impl CronRunner {
                     }
                 });
             }
-
-            // Collect any completed job results (non-blocking).
-            // This processes results from ALL previously spawned jobs,
-            // not just the ones spawned this tick.
-            while let Ok((job_id, success, duration_ms, started_at, error_msg)) = result_rx.try_recv() {
-                    cancel_flags.remove(&job_id);
-                    if let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) {
-                        if let Some(state) = job.state.as_mut() {
-                            state.running_at_ms = None;
-                            state.last_run_at_ms = Some(current_timestamp_ms());
-                            state.last_duration_ms = Some(duration_ms);
-
-                            let completion_time = started_at + duration_ms;
-
-                            if success {
-                                state.consecutive_errors = 0;
-                                state.last_run_status = Some("ok".to_string());
-                                state.last_status = Some("ok".to_string());
-                                state.last_error = None;
-
-                                // One-shot: disable after successful execution (will be removed below)
-                                if job.schedule.is_once() {
-                                    info!(job_id = %job.id, "cron: one-shot job completed, marking for removal");
-                                    state.next_run_at_ms = None;
-                                    job.enabled = false;
-                                } else {
-                                    // Compute next run normally
-                                    state.next_run_at_ms = job.schedule.compute_next_run(completion_time);
-                                }
-                            } else {
-                                state.consecutive_errors += 1;
-                                state.last_run_status = Some("error".to_string());
-                                state.last_status = Some("error".to_string());
-                                state.last_error = error_msg;
-
-                                // Apply exponential backoff for errored jobs
-                                let backoff = error_backoff_ms(state.consecutive_errors);
-                                let backoff_next = completion_time + backoff;
-                                let normal_next = job.schedule.compute_next_run(completion_time);
-                                // Use whichever is later: the natural next run or the backoff delay
-                                state.next_run_at_ms = Some(
-                                    normal_next
-                                        .map(|n| n.max(backoff_next))
-                                        .unwrap_or(backoff_next),
-                                );
-
-                                info!(
-                                    job_id = %job.id,
-                                    consecutive_errors = state.consecutive_errors,
-                                    backoff_ms = backoff,
-                                    next_run_at_ms = state.next_run_at_ms,
-                                    "cron: applying error backoff"
-                                );
-
-                                // Auto-disable after max consecutive errors
-                                if state.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                                    warn!(
-                                        job_id = %job.id,
-                                        consecutive_errors = state.consecutive_errors,
-                                        "cron: disabling job after repeated failures"
-                                    );
-                                    job.enabled = false;
-                                }
-                            }
-                        }
-                    }
-                }
 
             // Remove completed one-shot jobs
             let before = jobs.len();
