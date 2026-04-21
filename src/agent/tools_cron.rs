@@ -62,7 +62,41 @@ impl super::runtime::AgentRuntime {
                 let schedule = args["schedule"].as_str();
 
                 if let Some(delay) = delay_ms {
-                    // One-shot: fire once after delay_ms, then auto-remove.
+                    // Short delays (<=30min): use in-memory timer, skip cron.json5.
+                    // Longer delays: persist to cron.json5 (survives restart).
+                    let short_threshold_ms = 30 * 60 * 1000; // 30 minutes
+                    if delay <= short_threshold_ms {
+                        let msg_text = message.to_owned();
+                        let peer_id = ctx.peer_id.clone();
+                        let event_bus = self.event_bus.clone();
+                        let session_key = ctx.session_key.clone();
+                        let delay_dur = Duration::from_millis(delay);
+                        let timer_name = name.unwrap_or("reminder").to_owned();
+                        debug!(delay_ms = delay, name = %timer_name, "cron: using in-memory timer (short delay)");
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay_dur).await;
+                            // Emit via event_bus so WS auto-relay delivers to connected UI.
+                            if let Some(bus) = event_bus {
+                                // Send text delta with reminder content
+                                let _ = bus.send(crate::events::AgentEvent {
+                                    session_id: session_key.clone(),
+                                    agent_id: "cron".to_owned(),
+                                    delta: msg_text,
+                                    done: false,
+                                });
+                                // Send done signal
+                                let _ = bus.send(crate::events::AgentEvent {
+                                    session_id: session_key,
+                                    agent_id: "cron".to_owned(),
+                                    delta: String::new(),
+                                    done: true,
+                                });
+                            }
+                        });
+                        return Ok(json!({"added": id, "type": "in-memory timer", "delay_ms": delay, "message": message}));
+                    }
+
+                    // Long delay: persist to cron.json5
                     let at_ms = now_ms + delay;
                     job["schedule"] = json!({"kind": "once", "atMs": at_ms});
                 } else if let Some(sched) = schedule {
