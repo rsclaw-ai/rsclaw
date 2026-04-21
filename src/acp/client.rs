@@ -27,6 +27,8 @@ pub const LONG_TIMEOUT: Duration = Duration::from_secs(300);
 // ---------------------------------------------------------------------------
 
 /// Handler for Agent → Client requests (permissions, fs, terminal)
+/// Note: async_trait is required here because this trait is used as dyn AcpCallbackHandler.
+/// Native async fn in trait is not object-safe in stable Rust.
 #[async_trait]
 pub trait AcpCallbackHandler: Send + Sync {
     /// Handle permission request from agent

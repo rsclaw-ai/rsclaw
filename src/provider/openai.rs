@@ -220,12 +220,6 @@ impl LlmProvider for OpenAiProvider {
                 body_len = body_str.len(),
                 "openai: request prepared"
             );
-            // Dump full body to temp file for debugging.
-            let _ = std::fs::write(
-                "/tmp/debug_rsclaw_llm.json",
-                serde_json::to_string_pretty(&body).unwrap_or_default(),
-            );
-
             let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
             let mut builder = self
                 .client
@@ -438,10 +432,6 @@ impl OpenAiProvider {
             normalize_messages_for_cache(msgs);
         }
 
-        let _ = std::fs::write(
-            "/tmp/debug_rsclaw_llm.json",
-            serde_json::to_string_pretty(&body).unwrap_or_default(),
-        );
         tracing::debug!(
             tools_count = req.tools.len(),
             think = req.tools.is_empty(),
@@ -673,11 +663,6 @@ impl OpenAiProvider {
             body_len = body_str.len(),
             "openai-responses: request prepared"
         );
-        let _ = std::fs::write(
-            "/tmp/debug_rsclaw_llm.json",
-            serde_json::to_string_pretty(&body).unwrap_or_default(),
-        );
-
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
 
         let mut builder = self

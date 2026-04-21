@@ -23,6 +23,8 @@ pub struct FailoverManager {
     order: HashMap<String, Vec<String>>,
     /// profile_id → cooldown_until
     cooldowns: HashMap<String, Instant>,
+    /// profile_id → consecutive failure count
+    failure_counts: HashMap<String, u32>,
     /// profile_id → api_key
     #[allow(dead_code)]
     api_keys: HashMap<String, String>,
@@ -43,6 +45,7 @@ impl FailoverManager {
             api_keys,
             fallbacks,
             cooldowns: HashMap::new(),
+            failure_counts: HashMap::new(),
             retry: RetryConfig::default(),
         }
     }
@@ -82,6 +85,7 @@ impl FailoverManager {
 
                 match provider.stream(req.clone()).await {
                     Ok(stream) => {
+                        self.failure_counts.remove(profile_id);
                         info!(
                             provider = provider_name,
                             model = model_id,
@@ -126,16 +130,12 @@ impl FailoverManager {
     fn set_cooldown(&mut self, profile_id: &str, delay: Duration) {
         self.cooldowns
             .insert(profile_id.to_owned(), Instant::now() + delay);
+        *self.failure_counts.entry(profile_id.to_owned()).or_insert(0) += 1;
     }
 
-    /// Returns the current hit count for a profile (0 = first failure).
+    /// Returns the current consecutive failure count for a profile (0 = no recent failures).
     fn hit_count(&self, profile_id: &str) -> u32 {
-        self.cooldowns.get(profile_id).map_or(
-            0u32,
-            |&until| {
-                if Instant::now() < until { 1 } else { 0 }
-            },
-        )
+        self.failure_counts.get(profile_id).copied().unwrap_or(0)
     }
 }
 

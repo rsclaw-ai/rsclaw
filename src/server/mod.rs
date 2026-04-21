@@ -1083,13 +1083,19 @@ async fn channels_pair(
     }
 
     // Collect enforcers outside the lock to avoid holding it across await.
-    let enforcers: Vec<(String, Arc<crate::channel::DmPolicyEnforcer>)> = state
+    let enforcers: Vec<(String, Arc<crate::channel::DmPolicyEnforcer>)> = match state
         .dm_enforcers
         .read()
-        .unwrap()
-        .iter()
-        .map(|(k, v)| (k.clone(), Arc::clone(v)))
-        .collect();
+    {
+        Ok(guard) => guard.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal lock error"})),
+            )
+                .into_response();
+        }
+    };
 
     for (channel, enforcer) in &enforcers {
         if let Some(peer_id) = enforcer.approve_pairing(code).await {
@@ -1125,13 +1131,19 @@ async fn channels_unpair(
     }
 
     // Revoke from in-memory enforcer.
-    let enforcers: Vec<(String, Arc<crate::channel::DmPolicyEnforcer>)> = state
+    let enforcers: Vec<(String, Arc<crate::channel::DmPolicyEnforcer>)> = match state
         .dm_enforcers
         .read()
-        .unwrap()
-        .iter()
-        .map(|(k, v)| (k.clone(), Arc::clone(v)))
-        .collect();
+    {
+        Ok(guard) => guard.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal lock error"})),
+            )
+                .into_response();
+        }
+    };
 
     let mut found = false;
     for (ch, enforcer) in &enforcers {
@@ -1159,13 +1171,19 @@ async fn channels_unpair(
 }
 
 async fn list_pairings(State(state): State<AppState>) -> Response {
-    let enforcers: Vec<(String, Arc<crate::channel::DmPolicyEnforcer>)> = state
+    let enforcers: Vec<(String, Arc<crate::channel::DmPolicyEnforcer>)> = match state
         .dm_enforcers
         .read()
-        .unwrap()
-        .iter()
-        .map(|(k, v)| (k.clone(), Arc::clone(v)))
-        .collect();
+    {
+        Ok(guard) => guard.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal lock error"})),
+            )
+                .into_response();
+        }
+    };
 
     let mut pending = Vec::new();
     let mut approved = Vec::new();

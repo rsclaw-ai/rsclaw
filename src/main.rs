@@ -1,4 +1,4 @@
-#![allow(clippy::all, unused)]
+#![allow(unused)]
 //! rsclaw — AI Agent Engine Compatible with OpenClaw
 //!
 //! Architecture reference: AGENTS.md
@@ -12,6 +12,21 @@
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
+// Pre-existing pedantic lints — fix incrementally.
+#![allow(
+    clippy::collapsible_if,
+    clippy::needless_borrow,
+    clippy::needless_borrows_for_generic_args,
+    clippy::redundant_closure,
+    clippy::redundant_closure_for_method_calls,
+    clippy::useless_format,
+    clippy::type_complexity,
+    clippy::uninlined_format_args,
+    clippy::unused_async,
+    clippy::match_wildcard_for_single_variants,
+    clippy::map_unwrap_or,
+    clippy::doc_markdown,
+)]
 
 use anyhow::Result;
 use clap::Parser;

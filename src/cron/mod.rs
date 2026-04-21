@@ -967,14 +967,12 @@ fn field_matches(field: &str, value: u32) -> bool {
     if field.contains(',') {
         return field.split(',').any(|part| field_matches(part.trim(), value));
     }
-    // Handle range: "9-15" means 9 through 15 exclusive (start <= value < end)
-    // This matches openclaw's interpretation where "9-11" means 9,10 only (not 11:59)
-    // and "13-15" means 13,14 only (not 15:59)
+    // Handle range: "9-17" means 9 through 17 inclusive (standard cron semantics)
     if field.contains('-') {
         let parts: Vec<&str> = field.split('-').collect();
         if parts.len() == 2 {
             if let (Ok(start), Ok(end)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-                return value >= start && value < end;
+                return value >= start && value <= end;
             }
         }
     }
@@ -983,7 +981,7 @@ fn field_matches(field: &str, value: u32) -> bool {
 
 /// Check if a dow value matches a dow field.
 /// Dow ranges use INCLUSIVE end (e.g., "1-5" = 1,2,3,4,5, where 1=Sunday).
-/// This differs from hour/dom ranges which use exclusive end.
+/// Same inclusive-end semantics as field_matches.
 fn dow_matches(field: &str, dow: u32) -> bool {
     if field == "*" {
         return true;
