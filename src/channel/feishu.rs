@@ -281,9 +281,9 @@ fn build_feishu_card(text: &str, brand: &str) -> serde_json::Value {
     let cleaned = text;
 
     let title = if brand == "lark" {
-        "\u{1F980}rsclaw.ai | RsClaw AI Automation Butler"
+        "\u{1F980}rsclaw.ai | RsClaw AI Agent Engine"
     } else {
-        "\u{1F980}rsclaw.ai | \u{8783}\u{87F9}AI\u{81EA}\u{52A8}\u{5316}\u{7BA1}\u{5BB6}"
+        "\u{1F980}rsclaw.ai | \u{8783}\u{87F9}AI\u{667A}\u{80FD}\u{4F53}\u{5F15}\u{64CE}"
     };
     json!({
         "msg_type": "interactive",

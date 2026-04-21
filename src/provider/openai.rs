@@ -320,12 +320,14 @@ impl LlmProvider for OpenAiProvider {
             // This is critical for correctness: SSE data can be split across
             // multiple chunks, and we must buffer incomplete lines.
             let line_buffer = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+            let utf8_remainder = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
             let event_stream = byte_stream
                 .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
                 .then(move |chunk| {
                     let line_buffer = line_buffer.clone();
+                    let utf8_remainder = utf8_remainder.clone();
                     async move {
-                        parse_sse_chunk_with_buffer(chunk, &line_buffer).await
+                        parse_sse_chunk_with_buffer(chunk, &line_buffer, &utf8_remainder).await
                     }
                 })
                 .flat_map(|events| futures::stream::iter(events));
@@ -743,12 +745,14 @@ impl OpenAiProvider {
         // Without buffering, TCP chunk boundaries can split SSE lines,
         // causing JSON parse failures and lost content.
         let line_buffer = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let utf8_remainder = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
         let event_stream = byte_stream
             .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
             .then(move |chunk| {
                 let line_buffer = line_buffer.clone();
+                let utf8_remainder = utf8_remainder.clone();
                 async move {
-                    parse_responses_sse_chunk_buffered(chunk, &line_buffer).await
+                    parse_responses_sse_chunk_buffered(chunk, &line_buffer, &utf8_remainder).await
                 }
             })
             .flat_map(|events| futures::stream::iter(events));
@@ -865,6 +869,11 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
         // Fix orphaned tool_calls/tool_results: some providers (MiniMax) require
         // strict assistant(tool_calls) → tool(result) pairing with no gaps.
         fix_tool_call_pairing(msgs);
+
+        // Reorder messages: ensure every tool result immediately follows its
+        // corresponding assistant(tool_calls). Parallel tool execution and
+        // compaction can scatter them.
+        reorder_tool_messages(msgs);
     }
 
     Ok(body)
@@ -958,6 +967,56 @@ fn fix_tool_call_pairing(messages: &mut Vec<Value>) {
                 }
             }
         }
+    }
+}
+
+/// Reorder tool result messages so each immediately follows its assistant(tool_calls).
+///
+/// Parallel tool execution can scatter results throughout the message list.
+/// This rebuilds the list with correct ordering:
+///   assistant(tool_calls=[A,B]) → tool(A) → tool(B) → next message
+fn reorder_tool_messages(messages: &mut Vec<Value>) {
+    // Extract all tool results by call_id.
+    let mut tool_results: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
+    let mut non_tool: Vec<Value> = Vec::new();
+
+    for msg in messages.drain(..) {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("tool") {
+            if let Some(id) = msg.get("tool_call_id").and_then(|v| v.as_str()) {
+                tool_results.entry(id.to_owned()).or_default().push(msg);
+            }
+            // orphaned tool (no id) is dropped
+        } else {
+            non_tool.push(msg);
+        }
+    }
+
+    // Rebuild: insert tool results right after their assistant(tool_calls).
+    for msg in non_tool {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                let call_ids: Vec<String> = tcs.iter()
+                    .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()).map(String::from))
+                    .collect();
+                messages.push(msg);
+                // Insert results in the same order as tool_calls.
+                for cid in &call_ids {
+                    if let Some(results) = tool_results.remove(cid) {
+                        messages.extend(results);
+                    }
+                }
+                continue;
+            }
+        }
+        messages.push(msg);
+    }
+
+    // Any remaining orphaned tool results (no matching assistant) are dropped.
+    if !tool_results.is_empty() {
+        tracing::debug!(
+            orphaned = tool_results.len(),
+            "reorder_tool_messages: dropped orphaned tool results"
+        );
     }
 }
 
@@ -1074,18 +1133,40 @@ fn serialize_part(part: &ContentPart) -> Value {
 async fn parse_sse_chunk_with_buffer(
     chunk: Result<bytes::Bytes>,
     line_buffer: &tokio::sync::Mutex<String>,
+    utf8_remainder: &tokio::sync::Mutex<Vec<u8>>,
 ) -> Vec<Result<StreamEvent>> {
     let bytes = match chunk {
         Ok(b) => b,
         Err(e) => return vec![Err(e)],
     };
 
-    let text = match std::str::from_utf8(&bytes) {
-        Ok(t) => std::borrow::Cow::Borrowed(t),
+    // Prepend any leftover bytes from the previous chunk (incomplete UTF-8 sequence).
+    let mut remainder = utf8_remainder.lock().await;
+    let full_bytes = if remainder.is_empty() {
+        bytes.to_vec()
+    } else {
+        let mut combined = std::mem::take(&mut *remainder);
+        combined.extend_from_slice(&bytes);
+        combined
+    };
+
+    let text = match std::str::from_utf8(&full_bytes) {
+        Ok(t) => {
+            drop(remainder);
+            std::borrow::Cow::Owned(t.to_owned())
+        }
         Err(e) => {
-            // Log and replace invalid bytes with U+FFFD so the stream continues.
-            tracing::warn!("openai: UTF-8 decode error at byte {}, replacing with �: {}", e.valid_up_to(), e);
-            std::borrow::Cow::Owned(String::from_utf8_lossy(&bytes).into_owned())
+            let valid_up_to = e.valid_up_to();
+            *remainder = full_bytes[valid_up_to..].to_vec();
+            drop(remainder);
+            if valid_up_to == 0 {
+                return vec![];
+            }
+            std::borrow::Cow::Owned(
+                std::str::from_utf8(&full_bytes[..valid_up_to])
+                    .expect("valid_up_to guarantees valid UTF-8")
+                    .to_owned(),
+            )
         }
     };
 
@@ -1488,20 +1569,40 @@ fn serialize_media_for_responses(url: &str, file_id_map: &HashMap<String, String
 async fn parse_responses_sse_chunk_buffered(
     chunk: Result<bytes::Bytes>,
     line_buffer: &tokio::sync::Mutex<String>,
+    utf8_remainder: &tokio::sync::Mutex<Vec<u8>>,
 ) -> Vec<Result<StreamEvent>> {
     let bytes = match chunk {
         Ok(b) => b,
         Err(e) => return vec![Err(e)],
     };
 
-    let text = match std::str::from_utf8(&bytes) {
-        Ok(t) => std::borrow::Cow::Borrowed(t),
+    // Prepend any leftover bytes from the previous chunk (incomplete UTF-8 sequence).
+    let mut remainder = utf8_remainder.lock().await;
+    let full_bytes = if remainder.is_empty() {
+        bytes.to_vec()
+    } else {
+        let mut combined = std::mem::take(&mut *remainder);
+        combined.extend_from_slice(&bytes);
+        combined
+    };
+
+    let text = match std::str::from_utf8(&full_bytes) {
+        Ok(t) => {
+            drop(remainder);
+            std::borrow::Cow::Owned(t.to_owned())
+        }
         Err(e) => {
-            tracing::warn!(
-                "openai-responses: UTF-8 decode error at byte {}, replacing: {}",
-                e.valid_up_to(), e,
-            );
-            std::borrow::Cow::Owned(String::from_utf8_lossy(&bytes).into_owned())
+            let valid_up_to = e.valid_up_to();
+            *remainder = full_bytes[valid_up_to..].to_vec();
+            drop(remainder);
+            if valid_up_to == 0 {
+                return vec![];
+            }
+            std::borrow::Cow::Owned(
+                std::str::from_utf8(&full_bytes[..valid_up_to])
+                    .expect("valid_up_to guarantees valid UTF-8")
+                    .to_owned(),
+            )
         }
     };
 
@@ -1700,6 +1801,8 @@ mod tests {
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None,
+            kv_cache_mode: 0,
+            session_key: None,
         }
     }
 
@@ -1741,6 +1844,8 @@ mod tests {
                 temperature: None,
                 frequency_penalty: None,
                 thinking_budget: None,
+                kv_cache_mode: 0,
+                session_key: None,
             }
         }
 
@@ -1889,7 +1994,7 @@ mod tests {
             let raw = b"event: response.output_text.delta\ndata: {\"delta\":\"hi\"}\n\nevent: response.completed\ndata: {\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n";
             let buffer = tokio::sync::Mutex::new(String::new());
             let events = parse_responses_sse_chunk_buffered(
-                Ok(bytes::Bytes::from_static(raw)), &buffer,
+                Ok(bytes::Bytes::from_static(raw)), &buffer, &tokio::sync::Mutex::new(Vec::new()),
             ).await;
             assert_eq!(events.len(), 2);
             assert!(matches!(&events[0], Ok(StreamEvent::TextDelta(t)) if t == "hi"));
@@ -1902,7 +2007,7 @@ mod tests {
             let raw = b"event: response.output_text.delta\ndata: {\"delta\":42}\n\n";
             let buffer = tokio::sync::Mutex::new(String::new());
             let events = parse_responses_sse_chunk_buffered(
-                Ok(bytes::Bytes::from_static(raw)), &buffer,
+                Ok(bytes::Bytes::from_static(raw)), &buffer, &tokio::sync::Mutex::new(Vec::new()),
             ).await;
             assert_eq!(events.len(), 1);
             assert!(matches!(&events[0], Ok(StreamEvent::TextDelta(t)) if t == "42"));
@@ -1913,11 +2018,12 @@ mod tests {
     async fn sse_line_buffer_handles_split_lines() {
         // Test that SSE data split across chunks is correctly reassembled
         let buffer = tokio::sync::Mutex::new(String::new());
+        let utf8_rem = tokio::sync::Mutex::new(Vec::new());
 
         let chunk1 = Ok(bytes::Bytes::from(
             r#"data: {"choices":[{"delta":{"content":"he"#,
         ));
-        let events1 = parse_sse_chunk_with_buffer(chunk1, &buffer).await;
+        let events1 = parse_sse_chunk_with_buffer(chunk1, &buffer, &utf8_rem).await;
         assert!(events1.is_empty(), "Expected no events from incomplete chunk, got {:?}", events1);
 
         {
@@ -1926,7 +2032,7 @@ mod tests {
         }
 
         let chunk2 = Ok(bytes::Bytes::from("l\"}}]}\n"));
-        let events2 = parse_sse_chunk_with_buffer(chunk2, &buffer).await;
+        let events2 = parse_sse_chunk_with_buffer(chunk2, &buffer, &utf8_rem).await;
         assert_eq!(events2.len(), 1, "Expected 1 event, got {:?}", events2);
         match &events2[0] {
             Ok(StreamEvent::TextDelta(text)) => assert_eq!(text, "hel"),
@@ -1937,12 +2043,13 @@ mod tests {
     #[tokio::test]
     async fn sse_line_buffer_handles_multiple_lines() {
         let buffer = tokio::sync::Mutex::new(String::new());
+        let utf8_rem = tokio::sync::Mutex::new(Vec::new());
 
         let chunk = Ok(bytes::Bytes::from(
             "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\
              data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n",
         ));
-        let events = parse_sse_chunk_with_buffer(chunk, &buffer).await;
+        let events = parse_sse_chunk_with_buffer(chunk, &buffer, &utf8_rem).await;
         assert_eq!(events.len(), 2);
         match &events[0] {
             Ok(StreamEvent::TextDelta(text)) => assert_eq!(text, "hello"),
@@ -1957,16 +2064,17 @@ mod tests {
     #[tokio::test]
     async fn sse_line_buffer_handles_trailing_incomplete_line() {
         let buffer = tokio::sync::Mutex::new(String::new());
+        let utf8_rem = tokio::sync::Mutex::new(Vec::new());
 
         let chunk1 = Ok(bytes::Bytes::from(
             "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\
              data: {\"choices\":[{\"delta\":{\"content\":\"incom",
         ));
-        let events1 = parse_sse_chunk_with_buffer(chunk1, &buffer).await;
+        let events1 = parse_sse_chunk_with_buffer(chunk1, &buffer, &utf8_rem).await;
         assert_eq!(events1.len(), 1);
 
         let chunk2 = Ok(bytes::Bytes::from("plete\"}}]}\n"));
-        let events2 = parse_sse_chunk_with_buffer(chunk2, &buffer).await;
+        let events2 = parse_sse_chunk_with_buffer(chunk2, &buffer, &utf8_rem).await;
         assert_eq!(events2.len(), 1);
         match &events2[0] {
             Ok(StreamEvent::TextDelta(text)) => assert_eq!(text, "incomplete"),

@@ -379,6 +379,45 @@ export function Settings() {
           </ListItem>
         </List>
 
+        <List>
+          <ListItem
+            title={Locale.Settings.BtwTokens.Title}
+            subTitle={Locale.Settings.BtwTokens.SubTitle}
+          >
+            <input
+              aria-label={Locale.Settings.BtwTokens.Title}
+              type="number"
+              min={1000}
+              max={50000}
+              step={1000}
+              value={config.modelConfig.btwTokens ?? 10000}
+              onChange={(e) =>
+                config.update(
+                  (config) => (config.modelConfig.btwTokens = e.currentTarget.valueAsNumber),
+                )
+              }
+            ></input>
+          </ListItem>
+          <ListItem
+            title={Locale.Settings.KvCacheMode.Title}
+            subTitle={Locale.Settings.KvCacheMode.SubTitle}
+          >
+            <Select
+              aria-label={Locale.Settings.KvCacheMode.Title}
+              value={(config.modelConfig.kvCacheMode ?? 1).toString()}
+              onChange={(e) =>
+                config.update(
+                  (config) => (config.modelConfig.kvCacheMode = parseInt(e.currentTarget.value)),
+                )
+              }
+            >
+              <option value="0">0 - Off</option>
+              <option value="1">1 - Full</option>
+              <option value="2">2 - Delta</option>
+            </Select>
+          </ListItem>
+        </List>
+
         {/* Re-run setup wizard */}
         <List>
           <ListItem

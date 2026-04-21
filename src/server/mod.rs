@@ -348,17 +348,20 @@ async fn send_message(
         .clone()
         .unwrap_or_else(|| format!("api:{}", uuid::Uuid::new_v4()));
 
+    // Extract [file:path] references from user text.
+    let (text, file_images, file_files) = crate::agent::registry::extract_file_refs(&req.text);
+
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let msg = AgentMessage {
         session_key: session_key.clone(),
-        text: req.text,
+        text,
         channel: req.channel.unwrap_or_else(|| "api".to_string()),
         peer_id: req.peer_id.unwrap_or_else(|| "api-client".to_string()),
         chat_id: String::new(),
         reply_tx,
         extra_tools: vec![],
-        images: vec![],
-        files: vec![],
+        images: file_images,
+        files: file_files,
     };
 
     if handle.tx.send(msg).await.is_err() {
@@ -1251,13 +1254,44 @@ async fn get_session_messages(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match state.store.db.load_messages(&id) {
-        Ok(messages) => Json(serde_json::json!({"messages": messages})).into_response(),
+        Ok(messages) => {
+            // Filter out compaction summary messages — internal only.
+            let visible: Vec<_> = messages
+                .into_iter()
+                .filter(|v| !is_compaction_message(v))
+                .collect();
+            Json(serde_json::json!({"messages": visible})).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response(),
     }
+}
+
+/// Returns true if the JSON message value is a compaction summary (internal only).
+fn is_compaction_message(v: &serde_json::Value) -> bool {
+    let obj = match v.as_object() {
+        Some(o) => o,
+        None => return false,
+    };
+    let role = obj.get("role").and_then(|r| r.as_str()).unwrap_or("");
+    if role != "user" {
+        return false;
+    }
+    if let Some(text) = obj.get("content").and_then(|c| c.as_str()) {
+        return text.starts_with("[CONTEXT COMPACTION");
+    }
+    if let Some(parts) = obj.get("content").and_then(|c| c.as_array()) {
+        if let Some(first_text) = parts.first()
+            .and_then(|p| p.get("text"))
+            .and_then(|t| t.as_str())
+        {
+            return first_text.starts_with("[CONTEXT COMPACTION");
+        }
+    }
+    false
 }
 
 async fn clear_session(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
@@ -1384,6 +1418,9 @@ async fn openai_chat_completions(
         .unwrap_or("desktop")
         .to_owned();
 
+    // Extract [file:path] references from user text.
+    let (text, file_images, file_files) = crate::agent::registry::extract_file_refs(&text);
+
     let extra_tools = parse_oai_tools(req.tools.as_ref());
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let msg = AgentMessage {
@@ -1398,8 +1435,8 @@ async fn openai_chat_completions(
         chat_id: String::new(),
         reply_tx,
         extra_tools,
-        images: vec![],
-        files: vec![],
+        images: file_images,
+        files: file_files,
     };
 
     // Subscribe to event_bus BEFORE sending message to agent,

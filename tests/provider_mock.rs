@@ -71,6 +71,8 @@ fn llm_request_fields_are_accessible() {
         temperature: Some(0.5),
         frequency_penalty: None,
         thinking_budget: None,
+        kv_cache_mode: 0,
+        session_key: None,
     };
 
     assert_eq!(req.model, "claude-3-5-sonnet-20241022");
@@ -92,6 +94,8 @@ fn llm_request_defaults_are_none() {
         temperature: None,
         frequency_penalty: None,
         thinking_budget: None,
+        kv_cache_mode: 0,
+        session_key: None,
     };
 
     assert!(req.system.is_none());
@@ -214,6 +218,8 @@ fn llm_request_with_tools() {
         temperature: None,
         frequency_penalty: None,
         thinking_budget: None,
+        kv_cache_mode: 0,
+        session_key: None,
     };
     assert_eq!(req.tools.len(), 2);
     assert_eq!(req.tools[0].name, "search");
@@ -231,6 +237,8 @@ fn llm_request_with_thinking_budget() {
         temperature: None,
         frequency_penalty: None,
         thinking_budget: Some(10000),
+        kv_cache_mode: 0,
+        session_key: None,
     };
     assert_eq!(req.thinking_budget, Some(10000));
 }
@@ -249,6 +257,8 @@ fn llm_request_clone_independence() {
         temperature: Some(0.5),
         frequency_penalty: None,
         thinking_budget: Some(5000),
+        kv_cache_mode: 0,
+        session_key: None,
     };
 
     let mut cloned = original.clone();

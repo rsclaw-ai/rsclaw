@@ -155,6 +155,7 @@ async fn start_echo_server(addr: SocketAddr) {
         custom_webhooks: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         cron_reload: broadcast::channel(1).0,
         notification_tx: broadcast::channel(16).0,
+        wasm_plugins: Arc::new(Vec::new()),
     };
 
     // Leak the tempdir so the store stays valid for the server's lifetime.

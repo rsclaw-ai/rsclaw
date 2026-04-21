@@ -16,6 +16,12 @@ import { showConfirm, showToast } from "./ui-lib";
 
 const GATEWAY_BASE = "http://localhost:18888/api/v1";
 
+interface CronDelivery {
+  channel?: string;
+  to?: string;
+  mode?: string;
+}
+
 interface CronJob {
   id: string;
   name: string;
@@ -27,6 +33,7 @@ interface CronJob {
   last_run?: string;
   next_run?: string;
   run_count: number;
+  delivery?: CronDelivery;
 }
 
 interface RunHistoryItem {
@@ -41,6 +48,8 @@ interface CronFormData {
   schedule: string;
   message: string;
   timezone: string;
+  deliveryChannel: string;
+  deliveryTo: string;
 }
 
 const EMPTY_FORM: CronFormData = {
@@ -49,6 +58,8 @@ const EMPTY_FORM: CronFormData = {
   schedule: "",
   message: "",
   timezone: "Asia/Shanghai",
+  deliveryChannel: "",
+  deliveryTo: "",
 };
 
 export function CronManagerPage() {
@@ -113,6 +124,8 @@ export function CronManagerPage() {
       schedule: job.schedule,
       message: job.message,
       timezone: job.timezone,
+      deliveryChannel: job.delivery?.channel || "",
+      deliveryTo: job.delivery?.to || "",
     });
     setShowForm(true);
   };
@@ -165,13 +178,20 @@ export function CronManagerPage() {
       return;
     }
 
-    const payload = {
+    const payload: Record<string, any> = {
       id: form.id || form.name.toLowerCase().replace(/\s+/g, "-"),
       name: form.name,
       schedule: form.schedule,
       message: form.message,
       timezone: form.timezone,
     };
+    if (form.deliveryChannel) {
+      payload.delivery = {
+        channel: form.deliveryChannel,
+        to: form.deliveryTo,
+        mode: "always",
+      };
+    }
 
     try {
       const method = editingId ? "PUT" : "POST";
@@ -277,6 +297,34 @@ export function CronManagerPage() {
                   onChange={(e) => updateForm({ timezone: e.target.value })}
                 />
               </div>
+              <div className={styles["form-group"]}>
+                <div className={styles["form-label"]}>Delivery Channel</div>
+                <select
+                  value={form.deliveryChannel}
+                  onChange={(e) => updateForm({ deliveryChannel: e.target.value })}
+                >
+                  <option value="">None (no push)</option>
+                  <option value="telegram">Telegram</option>
+                  <option value="feishu">Feishu</option>
+                  <option value="weixin">WeChat</option>
+                  <option value="discord">Discord</option>
+                  <option value="slack">Slack</option>
+                  <option value="dingtalk">DingTalk</option>
+                  <option value="qq">QQ</option>
+                  <option value="wecom">WeCom</option>
+                </select>
+              </div>
+              {form.deliveryChannel && (
+                <div className={styles["form-group"]}>
+                  <div className={styles["form-label"]}>Delivery Target (user/group ID)</div>
+                  <input
+                    type="text"
+                    placeholder="Target user or group ID"
+                    value={form.deliveryTo}
+                    onChange={(e) => updateForm({ deliveryTo: e.target.value })}
+                  />
+                </div>
+              )}
               <div className={styles["form-actions"]}>
                 <IconButton
                   icon={<CloseIcon />}

@@ -1,6 +1,5 @@
 //! Session compaction — LLM-based context summarization and transcript logging.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -14,111 +13,6 @@ use super::runtime::AgentRuntime;
 use crate::provider::{
     ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent,
 };
-
-/// Collect all tool_use_ids from ToolResult messages in a slice.
-fn collect_tool_result_ids(msgs: &[Message]) -> HashSet<String> {
-    let mut ids = HashSet::new();
-    for msg in msgs {
-        if msg.role != Role::Tool {
-            continue;
-        }
-        match &msg.content {
-            MessageContent::Parts(parts) => {
-                for part in parts {
-                    if let ContentPart::ToolResult { tool_use_id, .. } = part {
-                        ids.insert(tool_use_id.clone());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    ids
-}
-
-/// Collect all tool_use_ids from ToolUse calls in a slice.
-fn collect_tool_use_ids(msgs: &[Message]) -> HashSet<String> {
-    let mut ids = HashSet::new();
-    for msg in msgs {
-        if msg.role != Role::Assistant {
-            continue;
-        }
-        match &msg.content {
-            MessageContent::Parts(parts) => {
-                for part in parts {
-                    if let ContentPart::ToolUse { id, .. } = part {
-                        ids.insert(id.clone());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    ids
-}
-
-/// Adjust split_idx to ensure ToolUse-ToolResult pairing integrity.
-/// If a ToolUse is before split_idx but its ToolResult is after,
-/// move split_idx backward to include both in old_portion.
-/// If a ToolResult is after split_idx but its ToolUse is before,
-/// move split_idx forward to include both in recent.
-fn adjust_split_for_tool_pairing(msgs: &[Message], initial_split: usize, head_end: usize) -> usize {
-    let mut split_idx = initial_split;
-
-    // Collect ToolUse IDs before split (in old_portion)
-    let old_tool_uses = collect_tool_use_ids(&msgs[head_end..split_idx]);
-    // Collect ToolResult IDs after split (in recent)
-    let recent_tool_results = collect_tool_result_ids(&msgs[split_idx..]);
-
-    // Case 1: ToolUse before split, ToolResult after split
-    // Move split forward to include ToolResult in recent (orphaned ToolResult is worse)
-    for tool_id in &old_tool_uses {
-        if recent_tool_results.contains(tool_id) {
-            // Find where this ToolResult appears and move split past it
-            for i in split_idx..msgs.len() {
-                if msgs[i].role == Role::Tool {
-                    if let MessageContent::Parts(parts) = &msgs[i].content {
-                        for part in parts {
-                            if let ContentPart::ToolResult { tool_use_id, .. } = part {
-                                if tool_use_id == tool_id {
-                                    // Move split to include this ToolResult
-                                    split_idx = i + 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Case 2: ToolResult before split, ToolUse after split
-    // This is less common but should be handled too
-    let old_tool_results = collect_tool_result_ids(&msgs[head_end..split_idx]);
-    let recent_tool_uses = collect_tool_use_ids(&msgs[split_idx..]);
-
-    for tool_id in &recent_tool_uses {
-        if old_tool_results.contains(tool_id) {
-            // Find where this ToolResult is and move split back before it
-            for i in (head_end..split_idx).rev() {
-                if msgs[i].role == Role::Tool {
-                    if let MessageContent::Parts(parts) = &msgs[i].content {
-                        for part in parts {
-                            if let ContentPart::ToolResult { tool_use_id, .. } = part {
-                                if tool_use_id == tool_id {
-                                    // Move split to exclude this orphaned ToolResult
-                                    split_idx = i;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    split_idx.max(head_end).min(msgs.len())
-}
 
 /// Prefix for compaction summaries. Tells the LLM that the summary is
 /// reference material from a previous context window, NOT active instructions.
@@ -292,11 +186,15 @@ impl AgentRuntime {
             // Ensure split doesn't overlap with head.
             split_idx = split_idx.max(head_end);
 
-            // Adjust split to preserve ToolUse-ToolResult pairing integrity.
-            // If a ToolUse is before split_idx but its ToolResult is after,
-            // the orphaned ToolResult would be discarded, and the LLM would
-            // not see the error feedback — leading to infinite retry loops.
-            split_idx = adjust_split_for_tool_pairing(&msgs, split_idx, head_end);
+            // Don't split inside a tool_call/tool_result group.
+            // If split_idx lands on tool results, move it back to include the
+            // preceding assistant(tool_calls) message so the pair stays together.
+            while split_idx > head_end
+                && split_idx < msgs.len()
+                && msgs[split_idx].role == Role::Tool
+            {
+                split_idx -= 1;
+            }
 
             let head = msgs[..head_end].to_vec();
             let mut old_portion = msgs[head_end..split_idx].to_vec();

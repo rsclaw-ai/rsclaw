@@ -24,6 +24,7 @@ import MinIcon from "../icons/min.svg";
 import ResetIcon from "../icons/reload.svg";
 import ReloadIcon from "../icons/reload.svg";
 import BreakIcon from "../icons/break.svg";
+import UploadIcon from "../icons/upload.svg";
 import SettingsIcon from "../icons/chat-settings.svg";
 import DeleteIcon from "../icons/clear.svg";
 import PinIcon from "../icons/pin.svg";
@@ -439,6 +440,7 @@ function useScrollToBottom(
 
 export function ChatActions(props: {
   uploadImage: () => void;
+  attachFile: () => void;
   setAttachImages: (images: string[]) => void;
   setUploading: (uploading: boolean) => void;
   showPromptModal: () => void;
@@ -564,6 +566,11 @@ export function ChatActions(props: {
             icon={props.uploading ? <LoadingButtonIcon /> : <ImageIcon />}
           />
         )}
+        <ChatAction
+          onClick={props.attachFile}
+          text={Locale.Chat.InputActions.AttachFile}
+          icon={<UploadIcon />}
+        />
         <ChatAction
           onClick={props.showPromptHints}
           text={Locale.Chat.InputActions.Prompt}
@@ -1933,6 +1940,27 @@ function _Chat() {
 
               <ChatActions
                 uploadImage={uploadImage}
+                attachFile={() => {
+                  // Tauri: open file dialog, insert path reference
+                  if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+                    import("@tauri-apps/plugin-dialog").then(({ open }) => {
+                      open({ multiple: true }).then((files) => {
+                        if (files) {
+                          const paths = Array.isArray(files) ? files : [files];
+                          const refs = paths.map((f: any) => `[file:${typeof f === "string" ? f : f.path}]`).join(" ");
+                          setUserInput((prev: string) => prev + (prev ? " " : "") + refs);
+                        }
+                      });
+                    }).catch(() => {
+                      // Fallback: prompt for path
+                      const path = prompt("Enter file path:");
+                      if (path) setUserInput((prev: string) => prev + (prev ? " " : "") + `[file:${path}]`);
+                    });
+                  } else {
+                    const path = prompt("Enter file path:");
+                    if (path) setUserInput((prev: string) => prev + (prev ? " " : "") + `[file:${path}]`);
+                  }
+                }}
                 setAttachImages={setAttachImages}
                 setUploading={setUploading}
                 showPromptModal={() => setShowPromptModal(true)}

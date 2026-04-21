@@ -3,7 +3,7 @@ name = "rsclaw"
 version = "2026.4.20"
 edition = "2024"
 rust-version = "1.91"
-description = "AI Automation Manager Compatible with OpenClaw"
+description = "AI Agent Engine Compatible with OpenClaw"
 repository = "https://github.com/rsclaw-ai/rsclaw"
 license = "MIT OR Apache-2.0"
 

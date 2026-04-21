@@ -51,7 +51,7 @@ pub async fn agent_card_handler(State(state): State<AppState>) -> impl IntoRespo
     let card = AgentCard {
         protocol_version: "0.3".to_owned(),
         name: "rsclaw".to_owned(),
-        description: Some("AI Automation Manager Compatible with OpenClaw".to_owned()),
+        description: Some("AI Agent Engine Compatible with OpenClaw".to_owned()),
         url: base_url,
         capabilities: AgentCapabilities {
             streaming: true,

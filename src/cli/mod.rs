@@ -84,8 +84,8 @@ pub use webhooks::WebhooksCommand;
 #[derive(Parser, Debug)]
 #[command(
     name = "rsclaw",
-    version = env!("RSCLAW_BUILD_VERSION"),
-    about = "AI Automation Manager Compatible with OpenClaw",
+    version = concat!("v", env!("RSCLAW_BUILD_VERSION")),
+    about = "AI Agent Engine Compatible with OpenClaw",
     long_about = None,
 )]
 pub struct Cli {

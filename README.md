@@ -26,6 +26,16 @@ Built from scratch in Rust, RsClaw (Crab AI / 螃蟹 AI) persists every interact
 
 ---
 
+## Why RsClaw
+
+- 🧠 **Three-layer persistent memory** — redb KV + tantivy full-text + hnsw_rs vector search, built in, fully local
+- 🔌 **Four agent backends in one gateway** — mix Native Rust, Claude Code, OpenCode, and any ACP-compatible agent in a single workflow
+- 🌐 **A2A cross-machine orchestration** — agents on different machines collaborate via [Google A2A v0.3](https://a2a-protocol.org/)
+- 🪶 **15MB binary, ~20MB idle RAM** — runs reliably on low-spec servers and edge devices
+- 🔒 **Local-first** — memory and data stay in `~/.rsclaw/`, never leave your machine
+
+---
+
 ## Install
 
 ### 👉 New users
@@ -262,16 +272,19 @@ rsclaw start
 
 Import copies config, workspace, and sessions into `~/.rsclaw/`. OpenClaw data is never modified. All OpenClaw config fields are supported.
 
-| Feature | RsClaw | OpenClaw |
-|---------|--------|----------|
-| Language | Rust | TypeScript |
-| Binary | ~15MB | ~300MB+ (node_modules) |
-| Startup | ~26ms | 2-5s |
-| Memory | ~20MB idle | ~1000MB+ |
-| Channels | 13 + custom | 8 |
-| A2A protocol | v0.3 | -- |
-| Browser | built-in CDP | -- |
-| Exec safety | deny/confirm/allow | -- |
+### What you gain
+
+| | RsClaw | OpenClaw |
+|---|---|---|
+| **Binary size** | ~15MB | ~300MB+ (node_modules) |
+| **Startup** | ~26ms | 2–5s |
+| **Idle memory** | ~20MB | ~1000MB+ |
+| **Long-term memory** | Three-layer (redb + tantivy + hnsw_rs) | — |
+| **Self-learning** | Learns from your usage patterns | — |
+| **Multi-backend agents** | Native Rust / Claude Code / OpenCode / ACP | — |
+| **A2A cross-machine** | Google A2A v0.3 | — |
+| **Browser automation** | Built-in headless Chrome (CDP) | — |
+| **Exec safety** | 50+ deny patterns, deny/confirm/allow | — |
 
 ### FAQ
 

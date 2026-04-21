@@ -35,6 +35,8 @@ fn simple_request(model: &str) -> LlmRequest {
         temperature: None,
         frequency_penalty: None,
         thinking_budget: None,
+        kv_cache_mode: 0,
+        session_key: None,
     }
 }
 

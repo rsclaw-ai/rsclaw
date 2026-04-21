@@ -187,10 +187,17 @@ pub async fn chat_history(ctx: MethodCtx) -> MethodResult {
         .load_messages(sk)
         .map_err(|e| ErrorShape::internal(e.to_string()))?;
 
-    let messages: Vec<_> = if all_messages.len() > limit {
-        all_messages[all_messages.len() - limit..].to_vec()
+    // Filter out compaction summary messages — they are internal-only
+    // and should not be displayed to the user.
+    let filtered: Vec<_> = all_messages
+        .into_iter()
+        .filter(|v| !is_compaction_message(v))
+        .collect();
+
+    let messages: Vec<_> = if filtered.len() > limit {
+        filtered[filtered.len() - limit..].to_vec()
     } else {
-        all_messages
+        filtered
     };
 
     Ok(serde_json::json!({
@@ -221,4 +228,29 @@ pub async fn chat_abort(ctx: MethodCtx) -> MethodResult {
         "aborted": true,
         "sessionKey": sk
     }))
+}
+
+/// Returns true if the JSON message value is a compaction summary (internal only).
+fn is_compaction_message(v: &serde_json::Value) -> bool {
+    let obj = match v.as_object() {
+        Some(o) => o,
+        None => return false,
+    };
+    let role = obj.get("role").and_then(|r| r.as_str()).unwrap_or("");
+    if role != "user" {
+        return false;
+    }
+    // Content can be a plain string or an array of parts.
+    if let Some(text) = obj.get("content").and_then(|c| c.as_str()) {
+        return text.starts_with("[CONTEXT COMPACTION");
+    }
+    if let Some(parts) = obj.get("content").and_then(|c| c.as_array()) {
+        if let Some(first_text) = parts.first()
+            .and_then(|p| p.get("text"))
+            .and_then(|t| t.as_str())
+        {
+            return first_text.starts_with("[CONTEXT COMPACTION");
+        }
+    }
+    false
 }

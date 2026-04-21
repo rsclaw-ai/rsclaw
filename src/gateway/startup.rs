@@ -421,6 +421,14 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Arc::clone(&custom_webhooks),
     );
 
+    // Register desktop channel — routes cron delivery to connected WS clients.
+    {
+        let desktop_ch = Arc::new(crate::channel::desktop::DesktopChannel::new(Arc::clone(&ws_conns)));
+        if let Err(e) = channel_manager.register(desktop_ch as Arc<dyn crate::channel::Channel>) {
+            warn!("failed to register desktop channel: {e}");
+        }
+    }
+
     // All channels registered - now wrap for sharing with cron runner
     let channel_manager = Arc::new(channel_manager);
 

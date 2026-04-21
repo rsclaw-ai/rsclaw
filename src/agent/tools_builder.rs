@@ -156,28 +156,51 @@ pub(crate) fn build_tool_list(
             "Run a shell command (PowerShell) on Windows.\n\
              IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`. Only use exec for commands that have no dedicated tool.\n\
              Use exec for: git operations, running scripts (node/python/cargo), system info (systeminfo, ipconfig, Get-Process), package management (npm/pip), process management (Start-Process, Stop-Process, taskkill).\n\
-             PowerShell tips:\n\
+             \n\
+             Tool selection: PowerShell for file/system ops; python for data processing (CSV/JSON/API/automation); node for quick HTTP/web scraping.\n\
+             Check tool availability first (`Get-Command python`, `Get-Command node`). Use `install_tool` for system tools.\n\
+             \n\
+             PowerShell patterns:\n\
              - Pipes: Get-Process | Sort-Object CPU -Descending | Select-Object -First 10\n\
              - Network: Test-NetConnection host -Port 80; Invoke-WebRequest -Uri <url>\n\
              - Text: (Get-Content file) -replace 'old','new'\n\
              - Dates: Get-Date -Format 'yyyy-MM-dd'; [DateTimeOffset]::Now.ToUnixTimeSeconds()\n\
-             - Do NOT wrap commands in extra cmd /c or powershell -Command layers.\n\
-             - Do NOT use exec for destructive operations on personal directories (Desktop, Downloads, Documents).\n\
-             - Commands run in background by default (wait=false). Use wait=true only for short commands where you need the output immediately.\n\
-             - If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user."
+             Python patterns: `python -c \"import json; ...\"` for one-liners, write to $env:TEMP\\script.py for multi-line.\n\
+             Node patterns: `node -e \"fetch(url).then(r=>r.json()).then(console.log)\"` (Node 18+), `npx <pkg>` for one-shot tools.\n\
+             \n\
+             Best practices: Do NOT wrap commands in extra cmd /c or powershell -Command layers. Use `| Select-Object -First 10` to limit output.\n\
+             Do NOT use exec for destructive operations on personal directories (Desktop, Downloads, Documents).\n\
+             Commands run in background by default (wait=false). Use wait=true only for short commands where you need the output immediately.\n\
+             If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user."
                 .to_owned()
         } else if cfg!(target_os = "macos") {
             "Run a shell command (bash/zsh) on macOS.\n\
              IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`. Only use exec for commands that have no dedicated tool.\n\
              Use exec for: git operations, running scripts (node/python/cargo), system info (uname, df, top), package management (brew/npm/pip), process management (ps, kill).\n\
-             Tips: Use `date +%s` for Unix timestamps (never calculate manually). Use `| head -n 20` to limit output.\n\
+             \n\
+             Tool selection: bash for file/text/system ops; python3 for data processing (CSV/JSON/API/automation); node for quick HTTP/web scraping.\n\
+             Check tool availability first (`which python3`, `which node`). Use `install_tool` for system tools.\n\
+             \n\
+             Bash patterns: `| head -n 20` to limit output, `date +%s` for timestamps, `find . -name '*.py' -mtime -7`, `curl -s URL | python3 -m json.tool`.\n\
+             Python patterns: `python3 -c \"import json; ...\"` for one-liners, write to /tmp/script.py for multi-line, `pip install` for packages.\n\
+             Node patterns: `node -e \"fetch(url).then(r=>r.json()).then(console.log)\"` (Node 18+), `npx <pkg>` for one-shot tools.\n\
+             \n\
+             Best practices: pipe large output through head/tail, use wait=false for long tasks, never run destructive commands on personal dirs.\n\
              If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user."
                 .to_owned()
         } else {
             "Run a shell command (bash/sh) on Linux.\n\
              IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`. Only use exec for commands that have no dedicated tool.\n\
              Use exec for: git operations, running scripts (node/python/cargo), system info (uname, df, top), package management (apt/npm/pip), process management (ps, kill).\n\
-             Tips: Use `date +%s` for Unix timestamps (never calculate manually). Use `| head -n 20` to limit output.\n\
+             \n\
+             Tool selection: bash for file/text/system ops; python3 for data processing (CSV/JSON/API/automation); node for quick HTTP/web scraping.\n\
+             Check tool availability first (`which python3`, `which node`). Use `install_tool` for system tools.\n\
+             \n\
+             Bash patterns: `| head -n 20` to limit output, `date +%s` for timestamps, `find . -name '*.py' -mtime -7`, `curl -s URL | python3 -m json.tool`.\n\
+             Python patterns: `python3 -c \"import json; ...\"` for one-liners, write to /tmp/script.py for multi-line, `pip install` for packages.\n\
+             Node patterns: `node -e \"fetch(url).then(r=>r.json()).then(console.log)\"` (Node 18+), `npx <pkg>` for one-shot tools.\n\
+             \n\
+             Best practices: pipe large output through head/tail, use wait=false for long tasks, never run destructive commands on personal dirs.\n\
              If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user."
                 .to_owned()
         },
@@ -553,7 +576,7 @@ pub(crate) fn build_tool_list(
                 "index":    {"type": "number", "description": "Job index from list (1-based, for edit/remove/enable/disable - preferred)"},
                 "id":       {"type": "string", "description": "Job ID (for edit/remove/enable/disable - use index instead if possible)"},
                 "name":     {"type": "string", "description": "Job name (for add, edit)"},
-                "tz":       {"type": "string", "description": "Timezone e.g. Asia/Shanghai (for add, edit)"},
+                "tz":       {"type": "string", "description": "Timezone IANA name. Auto-detected if omitted. Only set if user explicitly requests a different timezone."},
                 "agentId":  {"type": "string", "description": "Agent ID to run the job (for add, edit, default: main)"}
             },
             "required": ["action"]
