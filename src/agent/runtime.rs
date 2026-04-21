@@ -1077,7 +1077,7 @@ impl AgentRuntime {
                     "__ABORT__" => {
                         // Set abort flag for this session to interrupt running turn
                         let resolved_key = self.resolve_session_key(session_key);
-                        let flags = self.handle.abort_flags.write().unwrap();
+                        let flags = self.handle.abort_flags.write().expect("abort_flags lock poisoned");
                         if let Some(flag) = flags.get(resolved_key) {
                             flag.store(true, std::sync::atomic::Ordering::SeqCst);
                             "Abort signal sent. The running task will stop shortly.".to_owned()
@@ -3539,10 +3539,12 @@ impl AgentRuntime {
                         role: Role::Assistant,
                         content: MessageContent::Text(text_buf.clone()),
                     };
-                    let _ = self.store.db.append_message(
+                    if let Err(e) = self.store.db.append_message(
                         &ctx.session_key,
                         &serde_json::to_value(&assistant_msg).unwrap_or_default(),
-                    );
+                    ) {
+                        tracing::error!(error = %e, "failed to persist message");
+                    }
                     if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
                         sess.push(assistant_msg);
                     }
@@ -3634,10 +3636,12 @@ impl AgentRuntime {
                 role: Role::Assistant,
                 content: MessageContent::Parts(parts),
             };
-            let _ = self.store.db.append_message(
+            if let Err(e) = self.store.db.append_message(
                 &ctx.session_key,
                 &serde_json::to_value(&assistant_msg).unwrap_or_default(),
-            );
+            ) {
+                tracing::error!(error = %e, "failed to persist message");
+            }
             if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
                 sess.push(assistant_msg);
             }
@@ -3724,10 +3728,12 @@ impl AgentRuntime {
                             },
                         ]),
                     };
-                    let _ = self.store.db.append_message(
+                    if let Err(e) = self.store.db.append_message(
                         &ctx.session_key,
                         &serde_json::to_value(&tool_msg).unwrap_or_default(),
-                    );
+                    ) {
+                        tracing::error!(error = %e, "failed to persist message");
+                    }
                     if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
                         sess.push(tool_msg);
                     }
@@ -4096,10 +4102,12 @@ impl AgentRuntime {
                         },
                     ]),
                 };
-                let _ = self.store.db.append_message(
+                if let Err(e) = self.store.db.append_message(
                     &ctx.session_key,
                     &serde_json::to_value(&tool_msg).unwrap_or_default(),
-                );
+                ) {
+                    tracing::error!(error = %e, "failed to persist message");
+                }
                 if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
                     sess.push(tool_msg);
                 }

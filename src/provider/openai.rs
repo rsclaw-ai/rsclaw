@@ -22,6 +22,24 @@ struct SessionMessageCache {
 static SESSION_CACHES: LazyLock<DashMap<String, SessionMessageCache>> =
     LazyLock::new(DashMap::new);
 
+/// Cap SESSION_CACHES to avoid unbounded memory growth.
+const SESSION_CACHES_MAX: usize = 10_000;
+
+fn evict_session_caches_if_needed() {
+    if SESSION_CACHES.len() > SESSION_CACHES_MAX {
+        // Remove roughly half the entries to amortize eviction cost.
+        let to_remove: Vec<String> = SESSION_CACHES
+            .iter()
+            .take(SESSION_CACHES_MAX / 2)
+            .map(|e| e.key().clone())
+            .collect();
+        for key in to_remove {
+            SESSION_CACHES.remove(&key);
+        }
+        tracing::info!(remaining = SESSION_CACHES.len(), "evicted stale session caches");
+    }
+}
+
 use super::{
     ContentPart, LlmProvider, LlmRequest, LlmStream, Message, MessageContent, Role, StreamEvent,
     TokenUsage,
@@ -186,9 +204,10 @@ impl LlmProvider for OpenAiProvider {
 
                 if let Some(cached) = SESSION_CACHES.get(session_key) {
                     // We have a server-assigned cache_id from a previous response.
-                    let cached_len = cached.messages.len();
+                    // Clamp to current length to avoid out-of-bounds if messages were truncated.
+                    let cached_len = cached.messages.len().min(current_messages.len());
                     if current_messages.len() > cached_len
-                        && current_messages[..cached_len] == cached.messages[..]
+                        && current_messages[..cached_len] == cached.messages[..cached_len]
                     {
                         // Prefix matches — send only the new messages.
                         let append = current_messages[cached_len..].to_vec();
@@ -266,6 +285,7 @@ impl LlmProvider for OpenAiProvider {
                         })
                         .unwrap_or_default();
 
+                    evict_session_caches_if_needed();
                     SESSION_CACHES.insert(session_key.clone(), SessionMessageCache {
                         cache_id,
                         messages: current_messages,
@@ -363,7 +383,8 @@ impl OpenAiProvider {
             // Extract images into separate "images" field.
             if let Some(content) = m.get("content") {
                 if content.is_array() {
-                    let parts = content.as_array().unwrap();
+                    let empty = Vec::new();
+                    let parts = content.as_array().unwrap_or(&empty);
                     let mut texts = Vec::new();
                     let mut images = Vec::new();
                     for p in parts {

@@ -41,6 +41,10 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 pub struct McpClient {
     pub name: String,
+    // TODO(H-19): stdin and stdout are independently locked, but JSON-RPC
+    // request/response pairing assumes serial access.  Concurrent rpc_call
+    // invocations may read each other's responses.  Needs a proper
+    // request-multiplexer (e.g. channel-per-id) if concurrency is required.
     stdin: Arc<Mutex<ChildStdin>>,
     stdout: Arc<Mutex<BufReader<ChildStdout>>>,
     child: Arc<Mutex<Child>>,
@@ -171,7 +175,9 @@ impl McpClient {
     /// Shutdown the MCP server.
     pub async fn shutdown(&self) {
         let mut child = self.child.lock().await;
-        let _ = child.kill().await;
+        if let Err(e) = child.kill().await {
+            tracing::debug!(error = %e, "mcp: child process kill failed");
+        }
         info!(name = %self.name, "MCP server stopped");
     }
 

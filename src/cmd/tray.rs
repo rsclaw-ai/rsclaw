@@ -76,23 +76,23 @@ pub fn cmd_tray() -> Result<()> {
         if let Ok(event) = MenuEvent::receiver().try_recv() {
             let id = event.id;
             if id == start_id {
-                let _ = std::process::Command::new(std::env::current_exe().unwrap())
+                let _ = std::process::Command::new(std::env::current_exe().expect("failed to get current exe path"))
                     .args(["gateway", "start"])
                     .spawn();
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 update_status(&status_item, &start_item, &stop_item, &restart_item);
             } else if id == stop_id {
-                let _ = std::process::Command::new(std::env::current_exe().unwrap())
+                let _ = std::process::Command::new(std::env::current_exe().expect("failed to get current exe path"))
                     .args(["gateway", "stop"])
                     .status();
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 update_status(&status_item, &start_item, &stop_item, &restart_item);
             } else if id == restart_id {
-                let _ = std::process::Command::new(std::env::current_exe().unwrap())
+                let _ = std::process::Command::new(std::env::current_exe().expect("failed to get current exe path"))
                     .args(["gateway", "stop"])
                     .status();
                 std::thread::sleep(std::time::Duration::from_millis(500));
-                let _ = std::process::Command::new(std::env::current_exe().unwrap())
+                let _ = std::process::Command::new(std::env::current_exe().expect("failed to get current exe path"))
                     .args(["gateway", "start"])
                     .spawn();
                 std::thread::sleep(std::time::Duration::from_secs(1));
@@ -175,7 +175,7 @@ fn load_icon() -> tray_icon::Icon {
 
 #[cfg(feature = "tray")]
 fn open_terminal_with(args: &[&str]) {
-    let exe = std::env::current_exe().unwrap();
+    let exe = std::env::current_exe().expect("failed to get current exe path");
 
     #[cfg(target_os = "macos")]
     {
@@ -199,7 +199,7 @@ fn open_terminal_with(args: &[&str]) {
         // Try common terminal emulators
         for term in &["x-terminal-emulator", "gnome-terminal", "xterm"] {
             if std::process::Command::new(term)
-                .args(["--", exe.to_str().unwrap()])
+                .args(["--", exe.to_str().expect("exe path not valid UTF-8")])
                 .args(args)
                 .spawn()
                 .is_ok()

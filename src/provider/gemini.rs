@@ -66,14 +66,15 @@ impl LlmProvider for GeminiProvider {
         Box::pin(async move {
             let body = build_request_body(&req)?;
             let url = format!(
-                "{}/models/{}:streamGenerateContent?alt=sse&key={}",
-                self.base_url, req.model, self.api_key
+                "{}/models/{}:streamGenerateContent?alt=sse",
+                self.base_url, req.model
             );
 
             let resp = self
                 .client
                 .post(&url)
                 .header("content-type", "application/json")
+                .header("x-goog-api-key", &self.api_key)
                 .header(
                     "user-agent",
                     self.user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT),

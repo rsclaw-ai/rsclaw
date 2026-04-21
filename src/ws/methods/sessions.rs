@@ -14,6 +14,8 @@ pub async fn sessions_list(ctx: MethodCtx) -> MethodResult {
         .list_sessions()
         .map_err(|e| ErrorShape::internal(e.to_string()))?;
 
+    // TODO(perf): O(N*M) — loads all messages for every session to compute token
+    // estimates.  Should store token/char counts in session metadata instead.
     let sessions: Vec<serde_json::Value> = keys
         .into_iter()
         .map(|k| {

@@ -72,13 +72,16 @@ impl DeviceStore {
     async fn persist(&self) {
         let guard = self.tokens.read().await;
         if let Ok(json) = serde_json::to_string_pretty(&*guard) {
-            let _ = std::fs::write(&self.path, json);
+            if let Err(e) = std::fs::write(&self.path, json) {
+                tracing::warn!(error = %e, "device store write failed");
+            }
             // SECURITY: restrict file permissions to owner-only
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+                if let Err(e) = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600)) {
+                    tracing::warn!(error = %e, "device store write failed");
+                }
             }
         }
     }
@@ -166,47 +169,57 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     }
 
     // 2. Wait for the first text frame — must be a req with method="connect".
+    //    Apply a 30-second timeout so stale connections don't hang forever.
     let connect_params: ConnectParams;
     let req_id: String;
+    let handshake_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        match read_half.next().await {
-            Some(Ok(Message::Text(text))) => {
-                match serde_json::from_str::<InboundFrame>(&text.to_string()) {
-                    Ok(InboundFrame::Req(req)) if req.method == "connect" => {
-                        req_id = req.id.clone();
-                        connect_params = req
-                            .params
-                            .as_ref()
-                            .and_then(|v| serde_json::from_value::<ConnectParams>(v.clone()).ok())
-                            .unwrap_or_default();
-                        break;
-                    }
-                    Ok(InboundFrame::Req(req)) => {
-                        let err = ResFrame::err(
-                            req.id,
-                            ErrorShape::bad_request("expected method=connect as first request"),
-                        );
-                        let _ = send_serialized(&outbound_tx, &err).await;
-                        drop(outbound_tx);
-                        let _ = write_task.await;
-                        return;
-                    }
-                    Err(e) => {
-                        let err = ResFrame::err("0", ErrorShape::bad_request(e.to_string()));
-                        let _ = send_serialized(&outbound_tx, &err).await;
-                        drop(outbound_tx);
-                        let _ = write_task.await;
-                        return;
-                    }
-                }
-            }
-            Some(Ok(Message::Ping(_))) => continue,
-            Some(Ok(Message::Close(_))) | None => {
+        match tokio::time::timeout_at(handshake_deadline, read_half.next()).await {
+            Err(_elapsed) => {
+                warn!("ws: handshake timed out waiting for connect request");
                 drop(outbound_tx);
                 let _ = write_task.await;
                 return;
             }
-            _ => continue,
+            Ok(frame) => match frame {
+                Some(Ok(Message::Text(text))) => {
+                    match serde_json::from_str::<InboundFrame>(&text.to_string()) {
+                        Ok(InboundFrame::Req(req)) if req.method == "connect" => {
+                            req_id = req.id.clone();
+                            connect_params = req
+                                .params
+                                .as_ref()
+                                .and_then(|v| serde_json::from_value::<ConnectParams>(v.clone()).ok())
+                                .unwrap_or_default();
+                            break;
+                        }
+                        Ok(InboundFrame::Req(req)) => {
+                            let err = ResFrame::err(
+                                req.id,
+                                ErrorShape::bad_request("expected method=connect as first request"),
+                            );
+                            let _ = send_serialized(&outbound_tx, &err).await;
+                            drop(outbound_tx);
+                            let _ = write_task.await;
+                            return;
+                        }
+                        Err(e) => {
+                            let err = ResFrame::err("0", ErrorShape::bad_request(e.to_string()));
+                            let _ = send_serialized(&outbound_tx, &err).await;
+                            drop(outbound_tx);
+                            let _ = write_task.await;
+                            return;
+                        }
+                    }
+                }
+                Some(Ok(Message::Ping(_))) => continue,
+                Some(Ok(Message::Close(_))) | None => {
+                    drop(outbound_tx);
+                    let _ = write_task.await;
+                    return;
+                }
+                _ => continue,
+            },
         }
     }
 
@@ -253,7 +266,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
         // Fall back to bearer token.
         if !authed && let Some(ref t) = auth.token {
-            authed = t == &expected;
+            authed = crate::server::constant_time_eq(t, &expected);
         }
 
         if !authed {
@@ -332,6 +345,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // 8. Auto-relay: forward ALL AgentEvents to this WS connection. OpenClaw WebUI
     //    sends messages via HTTP and receives events via WS.
+    // NOTE(H-18): This relay duplicates the per-request relay in ws/methods/chat.rs.
+    // Both are intentional: this one covers HTTP-initiated requests, chat.rs covers
+    // WS-initiated requests. Removing either would break a client path.
     {
         let rx = state.event_bus.subscribe();
         let relay_tx = outbound_tx.clone();

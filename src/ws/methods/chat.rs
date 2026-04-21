@@ -83,6 +83,8 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
     // Spawn relay task: emit OpenClaw-format "chat" events back to the WS
     // client that initiated the request.  The payload uses the `event:chat`
     // wire format expected by the WebUI Chat component.
+    // NOTE(H-18): This relay runs alongside the auto-relay in handshake.rs.
+    // Both are needed — see comment there for rationale.
     tokio::spawn(async move {
         use futures::StreamExt;
         let mut stream = tokio_stream::wrappers::BroadcastStream::new(rx);

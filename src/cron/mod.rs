@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{Datelike, Timelike, Utc};
+use chrono::{Datelike, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Semaphore};
 use tokio::io::AsyncWriteExt;
@@ -1068,24 +1068,31 @@ fn compute_next_run_from_expr(cron_expr: &str, from_ms: u64, tz: Option<&str>) -
         .with_nanosecond(0).expect("nanosecond 0 always valid");
     cand += chrono::Duration::minutes(1);
 
-    // Search up to 1 year ahead (in local time)
+    // Search up to 1 year ahead (in local time).
     let max_cand = cand + chrono::Duration::days(366);
 
     while cand < max_cand {
         // Use naive date's weekday to get the weekday in local time (not UTC)
-        // chrono: Monday=0, Tuesday=1, ..., Sunday=6
-        // openclaw: Monday=1, Tuesday=2, ..., Sunday=7
-        // chrono: Sunday=0, Monday=1, ..., Saturday=6
-        // openclaw dow: Sunday=1, Monday=2, ..., Saturday=7
         // chrono weekday IS compatible with openclaw dow (both use Sunday=0/1 as the anchor)
         let dow = cand.date_naive().weekday().num_days_from_sunday();
         let m = field_matches(mon_f, cand.month());
         let d = field_matches(dom_f, cand.day());
         let w = dow_matches(dow_f, dow);
+        // Optimization: if the date fields don't match, skip to next day midnight
+        // instead of scanning minute-by-minute.  Reduces worst case from ~525K to ~1460
+        // iterations per year.
+        if !(m && d && w) {
+            // Advance to 00:00 of the next day.
+            cand = (cand.date_naive() + chrono::Days::new(1))
+                .and_hms_opt(0, 0, 0)
+                .and_then(|naive| cand.timezone().from_local_datetime(&naive).single())
+                .unwrap_or_else(|| cand + chrono::Duration::days(1));
+            continue;
+        }
         let h = field_matches(hr_f, cand.hour());
         let mi = field_matches(min_f, cand.minute());
         debug!(expr=%cron_expr, dow, "searching: {} m={} d={} w={} h={} mi={}", cand.date_naive(), m, d, w, h, mi);
-        if m && d && w && h && mi {
+        if h && mi {
             // Convert the matched local time to UTC
             let utc_cand = cand.with_timezone(&chrono::Utc);
             debug!(expr=%cron_expr, "MATCH: {} (UTC: {})", cand, utc_cand);

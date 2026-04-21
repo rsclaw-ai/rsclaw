@@ -301,24 +301,28 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 if let Some(ref ch_name) = msg.channel {
                     // Get sender BEFORE any await — drop guard immediately after cloning sender
                     let tx = {
-                        let senders_guard = senders.read().unwrap();
+                        let senders_guard = senders.read().expect("channel_senders lock poisoned");
                         senders_guard.get(ch_name).cloned()
                     };
                     if let Some(tx) = tx {
                         info!(channel = %ch_name, target_id = %msg.target_id, "routing notification");
-                        let _ = tx.send(msg.clone()).await;
+                        if let Err(e) = tx.send(msg.clone()).await {
+                            tracing::warn!(error = %e, "notification send failed");
+                        }
                     } else {
                         warn!(channel = %ch_name, "no channel sender registered for notification");
                     }
                 } else {
                     // No channel specified — send to first registered channel (default)
                     let first = {
-                        let guard = senders.read().unwrap();
+                        let guard = senders.read().expect("channel_senders lock poisoned");
                         guard.iter().next().map(|(k, v)| (k.clone(), v.clone()))
                     };
                     if let Some((ch_name, tx)) = first {
                         info!(channel = %ch_name, "routing notification to default channel");
-                        let _ = tx.send(msg.clone()).await;
+                        if let Err(e) = tx.send(msg.clone()).await {
+                            tracing::warn!(error = %e, "notification send failed");
+                        }
                     } else {
                         warn!("notification: no channels registered");
                     }

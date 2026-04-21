@@ -58,6 +58,21 @@ use crate::{
 };
 
 // ---------------------------------------------------------------------------
+// Timing-safe token comparison
+// ---------------------------------------------------------------------------
+
+/// Compare two strings in constant time to prevent timing side-channel attacks.
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+// ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
 
@@ -288,7 +303,7 @@ async fn auth_middleware(
         .and_then(|v| v.strip_prefix("Bearer "));
 
     match provided {
-        Some(token) if token == expected => next.run(request).await,
+        Some(token) if constant_time_eq(token, &expected) => next.run(request).await,
         _ => {
             warn!(path = %path, "auth rejected: missing or invalid Bearer token");
             (
@@ -1250,6 +1265,7 @@ async fn save_config(
     }
 
     // Backup current file.
+    // TODO: add full schema validation before saving (beyond JSON5 parse check).
     let backup = config_path.with_extension("json5.bak");
     let _ = std::fs::copy(&config_path, &backup);
 
