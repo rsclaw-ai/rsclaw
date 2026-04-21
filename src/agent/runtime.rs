@@ -2860,11 +2860,15 @@ impl AgentRuntime {
         }
 
         // Dynamic iteration limit based on task complexity.
-        // Default: 15 iterations. Complex tools (browser/opencode/exec): up to configured max.
+        // Default: 20 iterations. Complex tools (browser/opencode/exec): up to configured max.
         const BASE_ITERATIONS: usize = 20;
         let configured_complex: usize = self.config.agents.defaults.max_iterations
             .map(|v| v as usize)
-            .unwrap_or(50);
+            .unwrap_or(30);
+        // Track consecutive same-tool calls to detect loops even when args differ slightly.
+        let mut last_tool_name = String::new();
+        let mut same_tool_streak: usize = 0;
+        const MAX_SAME_TOOL_STREAK: usize = 8;
         let mut max_iterations = BASE_ITERATIONS;
         let mut iteration = 0usize;
 
@@ -3774,6 +3778,32 @@ impl AgentRuntime {
                 }
 
                 debug!(tool = %tool_name, "dispatching tool call");
+
+                // Detect consecutive same-tool loops (catches cases where args differ
+                // slightly each time, bypassing hash-based loop detection).
+                if tool_name == last_tool_name {
+                    same_tool_streak += 1;
+                    if same_tool_streak >= MAX_SAME_TOOL_STREAK {
+                        warn!(
+                            tool = %tool_name,
+                            streak = same_tool_streak,
+                            "agent_loop: same tool called {} times consecutively, breaking loop",
+                            same_tool_streak
+                        );
+                        return Ok(AgentReply {
+                            text: format!("I noticed I was repeating the same operation ({tool_name}) without making progress. Let me try a different approach or ask you for clarification."),
+                            is_empty: false,
+                            tool_calls: None,
+                            images: vec![],
+                            files: vec![],
+                            pending_analysis: None,
+                            was_preparse: false,
+                        });
+                    }
+                } else {
+                    last_tool_name = tool_name.clone();
+                    same_tool_streak = 1;
+                }
 
                 // Upgrade iteration limit when complex or multi-step tools are used.
                 if matches!(tool_name.as_str(),
