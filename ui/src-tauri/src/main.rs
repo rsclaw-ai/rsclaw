@@ -1074,6 +1074,40 @@ fn main() {
                 })
                 .build(app)?;
 
+            // Gateway health watchdog: check every 10s, auto-restart if crashed.
+            // Disabled when user manually stops gateway (GATEWAY_USER_STOPPED).
+            std::thread::spawn(|| {
+                let mut fail_count: u32 = 0;
+                const MAX_FAILS: u32 = 3;
+                // Wait for initial startup
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    if GATEWAY_USER_STOPPED.load(Ordering::Relaxed) || APP_EXITING.load(Ordering::Relaxed) {
+                        fail_count = 0;
+                        continue;
+                    }
+                    // Simple TCP connect check — if gateway is listening, it's alive.
+                    let healthy = std::net::TcpStream::connect_timeout(
+                        &"127.0.0.1:18888".parse().expect("valid addr"),
+                        std::time::Duration::from_secs(2),
+                    ).is_ok();
+                    if healthy {
+                        fail_count = 0;
+                    } else {
+                        fail_count += 1;
+                        eprintln!("[watchdog] gateway health check failed ({fail_count}/{MAX_FAILS})");
+                        if fail_count >= MAX_FAILS {
+                            eprintln!("[watchdog] restarting gateway...");
+                            let _ = start_gateway();
+                            fail_count = 0;
+                            // Wait for restart
+                            std::thread::sleep(std::time::Duration::from_secs(10));
+                        }
+                    }
+                }
+            });
+
             Ok(())
         })
         .build(tauri::generate_context!())
