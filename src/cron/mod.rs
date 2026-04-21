@@ -487,11 +487,29 @@ impl CronRunner {
                 .filter_map(|j| j.state.as_ref().and_then(|s| s.next_run_at_ms))
                 .min();
 
-            // DEBUG: log next_wake to diagnose early firing
-            debug!(next_wake = next_wake.unwrap_or(0), now_ms, "cron: timer tick");
-            if next_wake.map(|t| t <= now_ms).unwrap_or(false) {
-                warn!(next_wake = next_wake.unwrap_or(0), now_ms, "cron: next_wake is in the past!");
+            // Auto-remove expired once jobs (past due by > 5 minutes).
+            // This prevents stale once jobs from spamming "next_wake in the past" warnings.
+            let expired_threshold_ms = 5 * 60 * 1000;
+            let before_len = jobs.len();
+            jobs.retain(|j| {
+                if !j.schedule.is_once() || !j.enabled { return true; }
+                if let Some(state) = &j.state {
+                    if let Some(next_at) = state.next_run_at_ms {
+                        if now_ms > next_at + expired_threshold_ms {
+                            info!(job_id = %j.id, name = ?j.name, "cron: removing expired once job (past due by {}s)", (now_ms - next_at) / 1000);
+                            return false;
+                        }
+                    }
+                }
+                true
+            });
+            if jobs.len() < before_len {
+                if let Err(e) = self.save_store(&jobs).await {
+                    warn!(err = %e, "cron: failed to persist after expired job cleanup");
+                }
             }
+
+            debug!(next_wake = next_wake.unwrap_or(0), now_ms, "cron: timer tick");
 
             let delay_ms = match next_wake {
                 Some(next_wake) => {
