@@ -1037,17 +1037,24 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
             let ntx = state.notification_tx.clone();
             let job_id = id.clone();
             let ws_conns = state.ws_conns.clone();
+            let job_name = job["name"].as_str().unwrap_or(&id).to_owned();
             tokio::spawn(async move {
                 if let Ok(reply) = reply_rx.await {
-                    if !reply.text.is_empty() {
-                        // Push result to desktop via WebSocket notification
-                        let frame = EventFrame::new(
-                            "notification",
-                            serde_json::json!({ "text": reply.text }),
-                            0,
-                        );
-                        ws_conns.broadcast_all(frame).await;
+                    // Build notification text: use reply if non-empty, else fallback summary
+                    let notify_text = if !reply.text.is_empty() {
+                        reply.text.clone()
+                    } else {
+                        format!("定时任务执行完成: {}", job_name)
+                    };
+                    // Push result to desktop via WebSocket notification
+                    let frame = EventFrame::new(
+                        "notification",
+                        serde_json::json!({ "text": notify_text }),
+                        0,
+                    );
+                    ws_conns.broadcast_all(frame).await;
 
+                    if !reply.text.is_empty() {
                         if let (Some(ch), Some(to)) = (delivery_channel, delivery_to) {
                             let _ = ntx.send(crate::channel::OutboundMessage {
                                 target_id: to,
