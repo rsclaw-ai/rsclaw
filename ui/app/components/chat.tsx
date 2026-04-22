@@ -292,6 +292,8 @@ export function PromptHints(props: {
       } else if (e.key === "ArrowDown") {
         changeIndex(-1);
       } else if (e.key === "Enter") {
+        e.stopPropagation();
+        e.preventDefault();
         const selectedPrompt = props.prompts.at(selectIndex);
         if (selectedPrompt) {
           props.onPromptSelect(selectedPrompt);
@@ -1084,8 +1086,10 @@ function _Chat() {
           setUserInput("");
           doSubmit("/pair");
         } else if (cmd === "/reset" || cmd === "/clear") {
+          setUserInput("");
           chatStore.resetSession(chatStore.currentSession());
         } else if (cmd === "/new") {
+          setUserInput("");
           chatStore.newSession(undefined);
         } else if (cmd === "/compact") {
           // Send as message to trigger compaction

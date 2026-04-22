@@ -1391,6 +1391,7 @@ function ConfigEditorPage() {
 // ══════════════════════════════════════════════════════════
 
 function AgentWorkspaceEditor({ agentId }: { agentId: string }) {
+  const zh = getLang() === "cn";
   const [files, setFiles] = useState<string[]>([]);
   const [activeFile, setActiveFile] = useState("");
   const [content, setContent] = useState("");
@@ -1401,6 +1402,10 @@ function AgentWorkspaceEditor({ agentId }: { agentId: string }) {
   const [showTemplates, setShowTemplates] = useState(false);
 
   const applyTemplate = async (tpl: AgentTemplate) => {
+    if (files.length > 0) {
+      const ok = window.confirm(zh ? `应用模板将覆盖现有 ${files.length} 个文件，确定继续吗？` : `Apply template will overwrite ${files.length} existing file(s). Continue?`);
+      if (!ok) return;
+    }
     for (const [fileName, fileContent] of Object.entries(tpl.files)) {
       await writeWorkspaceFile(fileName, fileContent, agentId);
     }
@@ -1951,7 +1956,7 @@ function AgentManagerPage() {
           onClick={openAddModal}
           style={{ padding: "8px 16px", borderRadius: 9, border: "none", background: "#f97316", color: "#fff", fontSize: 12, fontWeight: 700, boxShadow: "0 2px 8px rgba(249,115,22,.28)", cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}
         >
-          + {Locale.RsClawPanel.Agents.NewAgent}
+          {Locale.RsClawPanel.Agents.NewAgent}
         </button>
       </div>
 
@@ -3785,6 +3790,17 @@ function TauriConfigPageInner() {
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.compaction.keepRecentPairs</div>
               </div>
               <input style={{ ...fInput, minWidth: 100 }} type="number" value={getVal("agents.defaults.compaction.keepRecentPairs", 5)} onChange={(e) => updateConfig("agents.defaults.compaction.keepRecentPairs", parseInt(e.target.value) || 5)} />
+            </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "KV Cache 模式" : "KV Cache Mode"}</div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.kv_cache_mode</div>
+              </div>
+              <select style={{ ...fSelect, minWidth: 240 }} value={getVal("agents.defaults.kv_cache_mode", 1)} onChange={(e) => updateConfig("agents.defaults.kv_cache_mode", parseInt(e.target.value))}>
+                <option value={0}>0 {zh ? "— 关闭" : "— off"}</option>
+                <option value={1}>1 {zh ? "— 追加模式（推荐）" : "— append-only (recommended)"}</option>
+                <option value={2}>2 {zh ? "— 增量模式" : "— incremental (cache_id)"}</option>
+              </select>
             </div>
             <div style={fieldRow}>
               <div style={{ flex: 1 }}>
