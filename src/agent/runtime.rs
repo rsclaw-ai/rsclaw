@@ -3940,7 +3940,8 @@ impl AgentRuntime {
                 {
                     let args_str = tool_input_str;
                     let out_str = if result_text.len() > 4000 {
-                        format!("{}…(truncated)", &result_text[..4000])
+                        let truncated: String = result_text.chars().take(2000).collect();
+                        format!("{}…(truncated)", truncated)
                     } else {
                         result_text.clone()
                     };
