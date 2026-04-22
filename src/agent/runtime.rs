@@ -4008,7 +4008,7 @@ impl AgentRuntime {
                 )
                 .await;
 
-                let (result_text, result_images) = match result {
+                let (mut result_text, result_images) = match result {
                     Ok(v) => {
                         // Reset parse error counter on successful tool execution
                         ctx.parse_error_count = 0;
