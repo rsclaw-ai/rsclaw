@@ -529,6 +529,79 @@ impl AgentRuntime {
         })
     }
 
+    /// Compress a web tool result for session storage via an ephemeral LLM call.
+    ///
+    /// Only the extracted answer is stored in session history — raw web content
+    /// (HTML, search results, screenshots) is never concatenated into the
+    /// conversation. Returns the extracted text; error means caller should fall
+    /// back to plain truncation.
+    async fn compress_tool_result_for_session(
+        &mut self,
+        session_key: &str,
+        tool_name: &str,
+        result_text: &str,
+    ) -> Result<String> {
+        // Get the last user message for extraction context.
+        let user_question: String = self
+            .sessions
+            .get(session_key)
+            .and_then(|msgs| msgs.iter().rev().find(|m| m.role == Role::User))
+            .map(|m| match &m.content {
+                MessageContent::Text(t) => t.chars().take(500).collect(),
+                _ => String::new(),
+            })
+            .unwrap_or_default();
+
+        // Cap raw content sent to the compression LLM.
+        let raw: String = result_text.chars().take(20_000).collect();
+
+        let prompt = if user_question.is_empty() {
+            format!("Tool: {tool_name}\n\nContent:\n{raw}")
+        } else {
+            format!("User question: {user_question}\n\nTool ({tool_name}) returned:\n{raw}")
+        };
+
+        let model = self.resolve_model_name();
+        let req = LlmRequest {
+            model,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text(prompt),
+            }],
+            tools: vec![],
+            system: Some(
+                "Extract only the information from the tool output that directly answers the \
+                 user's question. Be concise. Plain text only — no code blocks or markdown. \
+                 If the content is not relevant, write a single sentence describing what was found. \
+                 Reply in the same language as the user's question."
+                    .to_owned(),
+            ),
+            max_tokens: Some(800),
+            temperature: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            kv_cache_mode: 0,
+            session_key: None,
+        };
+
+        let providers = Arc::clone(&self.providers);
+        let mut stream = self.failover.call(req, &providers).await?;
+        let mut buf = String::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(StreamEvent::TextDelta(d)) => buf.push_str(&d),
+                Ok(StreamEvent::Done { .. }) | Ok(StreamEvent::Error(_)) => break,
+                Ok(_) => {}
+                Err(e) => return Err(anyhow!("compress stream error: {e}")),
+            }
+        }
+
+        if buf.is_empty() {
+            return Err(anyhow!("empty response from compression LLM"));
+        }
+        Ok(buf)
+    }
+
     /// Drive a single conversation turn.
     ///
     /// Takes individual fields (not the full `AgentMessage`) so callers can
@@ -4142,35 +4215,85 @@ impl AgentRuntime {
                     }
                 }
 
-                // Truncate tool result for session storage (prevent bloat).
-                // Current LLM round already has full result via tool dispatch.
-                let limits = self
-                    .config
-                    .ext
-                    .tools
-                    .as_ref()
-                    .and_then(|t| t.session_result_limits.as_ref());
-                let max_chars = match tool_name.as_str() {
-                    "web_search" => limits.and_then(|l| l.web_search).unwrap_or(2000),
-                    "web_fetch" => limits.and_then(|l| l.web_fetch).unwrap_or(5000),
-                    "web_browser" | "browser" => limits.and_then(|l| l.web_browser).unwrap_or(1500),
-                    "execute_command" | "exec" => limits.and_then(|l| l.exec).unwrap_or(3000),
-                    "read_file" | "read" => limits.and_then(|l| l.default).unwrap_or(3000),
-                    _ => limits.and_then(|l| l.default).unwrap_or(3000),
-                };
-                let session_text = if result_text.len() > max_chars {
-                    let truncated = &result_text[..result_text
-                        .char_indices()
-                        .nth(max_chars)
-                        .map(|(i, _)| i)
-                        .unwrap_or(result_text.len())];
-                    format!(
-                        "{truncated}\n[...truncated, {}/{} chars]",
-                        max_chars,
-                        result_text.len()
-                    )
-                } else {
-                    result_text.clone()
+                // Compress or truncate tool result for session storage.
+                //
+                // Web tools (web_fetch / web_browser / web_search) with large
+                // results go through an ephemeral LLM call that extracts only
+                // the answer.  Raw HTML / search-result JSON never enters the
+                // conversation history.  Other tools are truncated as before.
+                let session_text = {
+                    const WEB_COMPRESS_THRESHOLD: usize = 1000;
+                    let is_web_tool = matches!(
+                        tool_name.as_str(),
+                        "web_fetch" | "web_browser" | "browser" | "web_search"
+                    );
+
+                    if is_web_tool && result_text.len() > WEB_COMPRESS_THRESHOLD {
+                        let sk = ctx.session_key.clone();
+                        let tn = tool_name.clone();
+                        match self.compress_tool_result_for_session(&sk, &tn, &result_text).await {
+                            Ok(summary) => {
+                                debug!(
+                                    tool = %tn,
+                                    orig = result_text.len(),
+                                    compressed = summary.len(),
+                                    "tool result compressed for session"
+                                );
+                                summary
+                            }
+                            Err(e) => {
+                                warn!(tool = %tn, error = %e, "tool result compression failed, truncating");
+                                let max = 3000usize;
+                                if result_text.len() > max {
+                                    let end = result_text
+                                        .char_indices()
+                                        .nth(max)
+                                        .map(|(i, _)| i)
+                                        .unwrap_or(result_text.len());
+                                    format!(
+                                        "{}\n[...truncated, {}/{} chars]",
+                                        &result_text[..end],
+                                        max,
+                                        result_text.len()
+                                    )
+                                } else {
+                                    result_text.clone()
+                                }
+                            }
+                        }
+                    } else {
+                        // Non-web tools: keep existing per-tool limits.
+                        let limits = self
+                            .config
+                            .ext
+                            .tools
+                            .as_ref()
+                            .and_then(|t| t.session_result_limits.as_ref());
+                        let max_chars = match tool_name.as_str() {
+                            "execute_command" | "exec" => {
+                                limits.and_then(|l| l.exec).unwrap_or(3000)
+                            }
+                            "read_file" | "read" => {
+                                limits.and_then(|l| l.default).unwrap_or(3000)
+                            }
+                            _ => limits.and_then(|l| l.default).unwrap_or(3000),
+                        };
+                        if result_text.len() > max_chars {
+                            let end = result_text
+                                .char_indices()
+                                .nth(max_chars)
+                                .map(|(i, _)| i)
+                                .unwrap_or(result_text.len());
+                            format!(
+                                "{}\n[...truncated, {}/{} chars]",
+                                &result_text[..end],
+                                max_chars,
+                                result_text.len()
+                            )
+                        } else {
+                            result_text.clone()
+                        }
+                    }
                 };
 
                 // Inject loop detection warning if present (so LLM sees it and can stop)
