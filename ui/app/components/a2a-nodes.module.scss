@@ -1,0 +1,354 @@
+@import "../styles/animation.scss";
+
+.a2a-page {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.a2a-body {
+  flex: 1;
+  padding: 20px;
+  overflow-y: auto;
+  animation: slide-in ease 0.3s;
+}
+
+/* Overview cards */
+.overview {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-bottom: 20px;
+
+  @media (max-width: 600px) {
+    grid-template-columns: 1fr;
+  }
+}
+
+.stat-card {
+  padding: 16px 20px;
+  background: var(--white);
+  border: var(--border-in-light);
+  border-radius: 10px;
+
+  .stat-value {
+    font-size: 26px;
+    font-weight: 700;
+    color: var(--black);
+  }
+
+  .stat-label {
+    font-size: 12px;
+    color: var(--black);
+    opacity: 0.55;
+    margin-top: 4px;
+  }
+}
+
+/* Section title */
+.section-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--black);
+  opacity: 0.7;
+  margin: 20px 0 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+
+  .section-sub {
+    font-weight: 400;
+    opacity: 0.7;
+    margin-left: 6px;
+  }
+}
+
+/* Node cards */
+.node-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-bottom: 10px;
+
+  .node-card {
+    padding: 14px 18px;
+    background: var(--white);
+    border: var(--border-in-light);
+
+    &:not(:last-child) {
+      border-bottom: 0;
+    }
+
+    &:first-child {
+      border-top-left-radius: 10px;
+      border-top-right-radius: 10px;
+    }
+
+    &:last-child {
+      border-bottom-left-radius: 10px;
+      border-bottom-right-radius: 10px;
+    }
+
+    .node-card-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 14px;
+
+      .node-icon {
+        font-size: 16px;
+      }
+
+      .node-name {
+        font-weight: 600;
+        color: var(--black);
+      }
+
+      .node-url {
+        font-family: var(--font-mono, monospace);
+        font-size: 12px;
+        color: var(--black);
+        opacity: 0.55;
+      }
+
+      .node-status {
+        margin-left: auto;
+        font-size: 12px;
+        font-weight: 600;
+      }
+    }
+
+    .node-meta {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      font-size: 12px;
+      color: var(--black);
+      opacity: 0.7;
+      margin-top: 6px;
+
+      .dot {
+        opacity: 0.4;
+      }
+
+      .warn-text {
+        color: #f59e0b;
+      }
+
+      .latency {
+        font-family: var(--font-mono, monospace);
+
+        &.good {
+          color: #10b981;
+        }
+        &.warn {
+          color: #f59e0b;
+        }
+        &.bad {
+          color: #ef4444;
+        }
+      }
+    }
+
+    .node-actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 10px;
+
+      button {
+        padding: 4px 12px;
+        font-size: 12px;
+        border: var(--border-in-light);
+        border-radius: 6px;
+        background: var(--white);
+        color: var(--black);
+        cursor: pointer;
+        transition: all 0.15s;
+
+        &:hover {
+          background: var(--hover-color);
+        }
+
+        &.danger:hover {
+          color: #e11d48;
+          border-color: #e11d48;
+        }
+      }
+    }
+  }
+}
+
+/* Task flow list */
+.flow-list {
+  background: var(--white);
+  border: var(--border-in-light);
+  border-radius: 10px;
+  padding: 6px 0;
+  font-family: var(--font-mono, monospace);
+
+  .flow-row {
+    display: grid;
+    grid-template-columns: 90px 1fr 1.6fr auto;
+    gap: 12px;
+    align-items: center;
+    padding: 8px 18px;
+    font-size: 12px;
+    color: var(--black);
+
+    &:not(:last-child) {
+      border-bottom: var(--border-in-light);
+    }
+
+    .flow-time {
+      opacity: 0.55;
+    }
+
+    .flow-name {
+      font-weight: 600;
+    }
+
+    .flow-route {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      opacity: 0.85;
+
+      .flow-arrow {
+        color: var(--primary);
+        font-weight: 600;
+      }
+    }
+
+    .flow-status {
+      font-weight: 600;
+
+      &.flow-running {
+        color: var(--primary);
+      }
+      &.flow-done {
+        color: #10b981;
+      }
+      &.flow-failed {
+        color: #ef4444;
+      }
+    }
+
+    @media (max-width: 600px) {
+      grid-template-columns: 1fr;
+      gap: 2px;
+    }
+  }
+}
+
+/* Modal */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  animation: fade-in 0.2s ease;
+}
+
+.modal {
+  background: var(--white);
+  border-radius: 12px;
+  padding: 24px;
+  width: 480px;
+  max-width: 90vw;
+  border: var(--border-in-light);
+  box-shadow: var(--shadow);
+  animation: slide-in 0.2s ease;
+}
+
+.modal-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--black);
+}
+
+.modal-hint {
+  font-size: 12px;
+  color: var(--black);
+  opacity: 0.6;
+  margin-top: 6px;
+  margin-bottom: 16px;
+
+  code {
+    background: var(--hover-color);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 11px;
+  }
+}
+
+.modal-label {
+  display: block;
+  font-size: 12px;
+  color: var(--black);
+  opacity: 0.7;
+  margin-top: 12px;
+  margin-bottom: 4px;
+}
+
+.modal-input {
+  width: 100%;
+  padding: 8px 12px;
+  font-size: 13px;
+  border: var(--border-in-light);
+  border-radius: 6px;
+  background: var(--white);
+  color: var(--black);
+  outline: none;
+  font-family: var(--font-mono, monospace);
+
+  &:focus {
+    border-color: var(--primary);
+  }
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 20px;
+
+  button {
+    padding: 6px 14px;
+    font-size: 13px;
+    border: var(--border-in-light);
+    border-radius: 6px;
+    background: var(--white);
+    color: var(--black);
+    cursor: pointer;
+
+    &:hover:not(:disabled) {
+      background: var(--hover-color);
+    }
+
+    &:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    &.primary {
+      background: var(--primary);
+      color: white;
+      border-color: var(--primary);
+
+      &:hover:not(:disabled) {
+        filter: brightness(0.95);
+      }
+    }
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}

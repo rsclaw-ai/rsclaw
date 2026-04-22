@@ -14,9 +14,9 @@ use tracing::{info, warn};
 use super::platform::{detect_chrome, has_display};
 use super::runtime::{AgentRuntime, RunContext, expand_tilde};
 use super::web_parsers::{
-    extract_html_title, is_captcha_page, lang_to_bing_mkt,
+    extract_html_title, html_dehydrate_to_text, is_captcha_page, lang_to_bing_mkt,
     parse_baidu_results, parse_bing_html_results, parse_ddg_results, parse_sogou_results,
-    search_engine_url, strip_html, truncate_chars, urlencoding,
+    search_engine_url, truncate_chars, urlencoding,
 };
 use crate::provider::{Message, MessageContent, Role, StreamEvent};
 
@@ -473,7 +473,7 @@ impl AgentRuntime {
                     let html = resp.text().await.ok()?;
                     let content_type = "text/html"; // assume HTML
                     let md = if content_type.contains("text/html") {
-                        htmd::convert(&html).unwrap_or_else(|_| strip_html(&html))
+                        html_dehydrate_to_text(&html)
                     } else {
                         html
                     };
@@ -673,15 +673,20 @@ impl AgentRuntime {
 
         let title = extract_html_title(&html);
 
-        // Convert HTML -> Markdown (htmd, Turndown-inspired).
+        // Convert HTML → clean plain text via lol-html structural dehydration.
+        // Removes script/style/nav/footer/aside entirely, strips all non-semantic
+        // attributes, then strips remaining tags and collapses whitespace.
+        // This reliably eliminates JS bundles and CSS noise without the
+        // htmd Markdown conversion overhead.
         let markdown = if content_type.contains("text/html") {
-            htmd::convert(&html).unwrap_or_else(|_| strip_html(&html))
+            html_dehydrate_to_text(&html)
         } else {
             html.clone()
         };
 
         // Detect SPA (large HTML but almost no text) -> fallback to browser.
-        let plain_len = strip_html(&html).trim().len();
+        // Use the already-computed dehydrated text length for the check.
+        let plain_len = markdown.trim().len();
         let is_spa = content_type.contains("text/html") && plain_len < 200 && html.len() > 10_000;
 
         let (final_title, final_md) = if is_spa {
@@ -727,7 +732,7 @@ impl AgentRuntime {
         let parsed: Value = serde_json::from_str(result_str).unwrap_or_default();
         let title = parsed["title"].as_str().unwrap_or("").to_owned();
         let html = parsed["html"].as_str().unwrap_or("");
-        let md = htmd::convert(html).unwrap_or_else(|_| strip_html(html));
+        let md = html_dehydrate_to_text(html);
         Ok((title, md))
     }
 

@@ -104,7 +104,8 @@ mime = "0.3"
 matrix-sdk = { version = "0.9", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "sqlite"] }
 fs2 = "0.4.3"
 rusqlite = { version = "0.32", optional = true, features = ["bundled"] }
-htmd = "0.5"
+htmd    = "0.5"
+lol_html = "1.2"
 wasmtime = { version = "29", features = ["async"] }
 wasmtime-wasi = "29"
 moka = { version = "0.12", features = ["future"] }

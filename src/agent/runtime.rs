@@ -541,7 +541,35 @@ impl AgentRuntime {
         tool_name: &str,
         result_text: &str,
     ) -> Result<String> {
-        // Get the last user message for extraction context.
+        use super::web_parsers::html_dehydrate_to_text;
+
+        // Step 1: extract the prose content from structured JSON results.
+        // web_fetch → {url, title, text, length}; web_browser → {action, text, ...}
+        let extracted = if let Ok(v) = serde_json::from_str::<serde_json::Value>(result_text) {
+            v.get("text")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_owned())
+                .unwrap_or_else(|| result_text.to_owned())
+        } else {
+            result_text.to_owned()
+        };
+
+        // Step 2: strip any residual HTML.
+        // web_fetch now outputs lol-html plain text, but web_browser DOM snapshots
+        // can still contain HTML-like fragments.
+        let clean = if extracted.contains('<') && extracted.contains('>') {
+            html_dehydrate_to_text(&extracted)
+        } else {
+            extracted
+        };
+
+        // Step 3: cap at ~10k tokens before sending to the compression LLM.
+        // 40k chars covers: ASCII-heavy (10k tokens × 4 chars) and CJK-heavy
+        // (10k tokens × 1.5 chars ≈ 15k chars), with margin in between.
+        const TOKEN_CAP_CHARS: usize = 40_000;
+        let capped: String = clean.chars().take(TOKEN_CAP_CHARS).collect();
+
+        // Step 4: get the user's question for context.
         let user_question: String = self
             .sessions
             .get(session_key)
@@ -552,15 +580,14 @@ impl AgentRuntime {
             })
             .unwrap_or_default();
 
-        // Cap raw content sent to the compression LLM.
-        let raw: String = result_text.chars().take(20_000).collect();
-
         let prompt = if user_question.is_empty() {
-            format!("Tool: {tool_name}\n\nContent:\n{raw}")
+            format!("Tool: {tool_name}\n\nContent:\n{capped}")
         } else {
-            format!("User question: {user_question}\n\nTool ({tool_name}) returned:\n{raw}")
+            format!("User question: {user_question}\n\nTool ({tool_name}) returned:\n{capped}")
         };
 
+        // Step 5: single LLM call — extract the answer, no cache markers,
+        // no tools.  Like vision: raw content goes in, structured answer comes out.
         let model = self.resolve_model_name();
         let req = LlmRequest {
             model,
@@ -570,13 +597,15 @@ impl AgentRuntime {
             }],
             tools: vec![],
             system: Some(
-                "Extract only the information from the tool output that directly answers the \
-                 user's question. Be concise. Plain text only — no code blocks or markdown. \
-                 If the content is not relevant, write a single sentence describing what was found. \
-                 Reply in the same language as the user's question."
+                "You are an information extractor. Given tool output and a user question, \
+                 extract the facts that directly answer the question. \
+                 Output structured plain text: a direct answer paragraph, then bullet points \
+                 for key facts. No HTML, no JSON, no code blocks. \
+                 If the content does not answer the question, summarize what was found in \
+                 1-2 sentences. Reply in the same language as the user's question."
                     .to_owned(),
             ),
-            max_tokens: Some(800),
+            max_tokens: Some(1000),
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None,
@@ -2811,6 +2840,15 @@ impl AgentRuntime {
         let mut tool_files: Vec<(String, String, String)> = Vec::new();
         let mut tool_log: Vec<(String, String, String)> = Vec::new();
 
+        // Scratch-paper buffer for this turn's tool-call/tool-result messages.
+        //
+        // Tool calls and their results are "working notes" — they are needed by
+        // the LLM during the current turn but should NOT pollute the persistent
+        // session history.  Only the final assistant text reply is stored in
+        // self.sessions / redb; everything else lives here and is discarded when
+        // the turn ends.
+        let mut turn_scratchpad: Vec<Message> = Vec::new();
+
         // Inject completed async task results into the session.
         {
             let mut pending = self.pending_task_results.lock().unwrap_or_else(|e| e.into_inner());
@@ -3001,20 +3039,31 @@ impl AgentRuntime {
             }
 
             // Apply context-budget-aware trimming: trim oldest messages so the
-            // total history fits within the model's context window minus reserves
-            // for the system prompt, tools, and reply generation.
+            // persistent session fits within the context window.  The scratchpad
+            // (current-turn working buffer) is NOT trimmed but its token cost is
+            // subtracted from the available budget so session is trimmed enough.
+            let scratchpad_tokens: usize = turn_scratchpad.iter().map(msg_tokens).sum();
             if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
-                apply_context_budget_trim(sess, context_tokens, &system_prompt, &tools);
+                apply_context_budget_trim(
+                    sess,
+                    context_tokens,
+                    &system_prompt,
+                    &tools,
+                    scratchpad_tokens,
+                );
             }
 
-            // Build API copy of messages — clone from session, then inject
-            // dynamic context and vision images. Session storage is NOT modified.
+            // Build API copy of messages — clone from session, then append
+            // this turn's scratch-paper buffer, then inject dynamic context and
+            // vision images. Session storage is NOT modified.
             let mut messages = {
                 let mut raw = self
                     .sessions
                     .get(&ctx.session_key)
                     .cloned()
                     .unwrap_or_default();
+                // Append current-turn working messages (tool calls + results).
+                raw.extend(turn_scratchpad.clone());
 
                 // For vision models: replace last user message with multimodal
                 // version containing original images (only for this API call).
@@ -3072,20 +3121,11 @@ impl AgentRuntime {
                 // Repair transcript: ensure all tool_calls have matching tool_results.
                 let repair_result = repair_tool_result_pairing(raw);
 
-                // Persist any synthetic tool results to session storage
-                // so they don't need to be added again on the next turn.
+                // Synthetic tool results (generated by repair to fix broken
+                // pairs) go into the scratch-paper buffer, not the persistent
+                // session.  They are working-turn artefacts; no need to persist.
                 if !repair_result.synthetic_messages.is_empty() {
-                    for synthetic in &repair_result.synthetic_messages {
-                        if let Err(e) = self.store.db.append_message(
-                            &ctx.session_key,
-                            &serde_json::to_value(synthetic).unwrap_or_default(),
-                        ) {
-                            tracing::warn!("failed to persist synthetic message: {e:#}");
-                        }
-                    }
-                    if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
-                        sess.extend(repair_result.synthetic_messages.clone());
-                    }
+                    turn_scratchpad.extend(repair_result.synthetic_messages.clone());
                 }
 
                 repair_result.messages
@@ -3756,15 +3796,9 @@ impl AgentRuntime {
                 role: Role::Assistant,
                 content: MessageContent::Parts(parts),
             };
-            if let Err(e) = self.store.db.append_message(
-                &ctx.session_key,
-                &serde_json::to_value(&assistant_msg).unwrap_or_default(),
-            ) {
-                tracing::error!(error = %e, "failed to persist message");
-            }
-            if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
-                sess.push(assistant_msg);
-            }
+            // Tool-use responses are scratch-paper: the LLM needs to see them
+            // in this turn's messages, but they must not persist in session history.
+            turn_scratchpad.push(assistant_msg);
 
             // Check if any tool call targets an external (caller-provided) tool.
             // If so, return early with the OAI tool_calls payload — the caller
@@ -3837,7 +3871,7 @@ impl AgentRuntime {
                     // Record for loop detection so error doesn't count as a "different result"
                     ctx.loop_detector.record_result(&serde_json::json!({"error": err_msg}));
 
-                    // Directly return error to session without executing the tool
+                    // Directly return error to scratch-paper buffer without executing the tool.
                     let tool_msg = Message {
                         role: Role::Tool,
                         content: MessageContent::Parts(vec![
@@ -3848,15 +3882,7 @@ impl AgentRuntime {
                             },
                         ]),
                     };
-                    if let Err(e) = self.store.db.append_message(
-                        &ctx.session_key,
-                        &serde_json::to_value(&tool_msg).unwrap_or_default(),
-                    ) {
-                        tracing::error!(error = %e, "failed to persist message");
-                    }
-                    if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
-                        sess.push(tool_msg);
-                    }
+                    turn_scratchpad.push(tool_msg);
                     continue;
                 }
 
@@ -4329,15 +4355,10 @@ impl AgentRuntime {
                         },
                     ]),
                 };
-                if let Err(e) = self.store.db.append_message(
-                    &ctx.session_key,
-                    &serde_json::to_value(&tool_msg).unwrap_or_default(),
-                ) {
-                    tracing::error!(error = %e, "failed to persist message");
-                }
-                if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
-                    sess.push(tool_msg);
-                }
+                // Tool results are scratch-paper: keep in the working buffer for
+                // this turn's LLM iterations but never persist to session / redb.
+                // Only the final assistant text reply enters the conversation history.
+                turn_scratchpad.push(tool_msg);
             }
         }
     }
