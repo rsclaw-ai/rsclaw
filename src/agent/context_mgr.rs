@@ -215,18 +215,6 @@ pub(crate) fn apply_context_budget_trim(
             "context budget trim: removed {remove_count} oldest messages"
         );
         messages.drain(..remove_count);
-
-        // Insert a system-like marker so the model knows history was truncated.
-        messages.insert(0, Message {
-            role: Role::User,
-            content: MessageContent::Text(
-                "[System: earlier conversation history was trimmed to fit context window. Continue naturally from the messages below.]".to_owned()
-            ),
-        });
-        messages.insert(1, Message {
-            role: Role::Assistant,
-            content: MessageContent::Text("Understood.".to_owned()),
-        });
     }
 }
 
