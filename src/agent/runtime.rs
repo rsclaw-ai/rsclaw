@@ -282,6 +282,7 @@ pub struct AgentRuntime {
     pub(crate) notification_tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
     pub(crate) opencode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
     pub(crate) claudecode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
+    pub(crate) codex_client: Arc<tokio::sync::OnceCell<crate::acp::CodexClient>>,
     /// In-memory session alias cache: alias_key → canonical session_key.
     /// Loaded from redb on first use, avoids repeated DB lookups.
     session_aliases: std::collections::HashMap<String, String>,
@@ -367,6 +368,7 @@ impl AgentRuntime {
             notification_tx,
             opencode_client: Arc::new(tokio::sync::OnceCell::new()),
             claudecode_client: Arc::new(tokio::sync::OnceCell::new()),
+            codex_client: Arc::new(tokio::sync::OnceCell::new()),
             session_aliases,
             exec_pool,
         };
@@ -3745,7 +3747,25 @@ impl AgentRuntime {
                         ctx.parse_error_count = 0;
                         // Record result for progress-aware loop detection.
                         // Same args + different results = making progress, not a loop.
-                        ctx.loop_detector.record_result(&v);
+                        // For exec tool: exclude task_id (uuid changes each call) to properly detect loops.
+                        let result_for_loop = if tool_name == "exec" || tool_name == "execute_command" {
+                            // Strip task_id from exec results - it's a uuid that changes every call
+                            match &v {
+                                serde_json::Value::Object(obj) => {
+                                    let mut cleaned = serde_json::Map::new();
+                                    for (k, val) in obj.iter() {
+                                        if k != "task_id" {
+                                            cleaned.insert(k.clone(), val.clone());
+                                        }
+                                    }
+                                    serde_json::Value::Object(cleaned)
+                                }
+                                _ => v.clone()
+                            }
+                        } else {
+                            v.clone()
+                        };
+                        ctx.loop_detector.record_result(&result_for_loop);
                         // Loop A: capture recalled memory IDs from search results.
                         if tool_name == "memory" || tool_name == "memory_search" {
                             if let Some(results) = v.get("results").and_then(|r| r.as_array()) {
@@ -4162,6 +4182,7 @@ impl AgentRuntime {
             }
             "opencode" => return self.tool_opencode(ctx, args).await,
             "claudecode" => return self.tool_claudecode(ctx, args).await,
+            "codex" => return self.tool_codex(ctx, args).await,
             _ => {}
         }
 

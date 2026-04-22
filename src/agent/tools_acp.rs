@@ -825,4 +825,185 @@ impl AgentRuntime {
             "session_id": session_id_clone
         }))
     }
+
+    // -----------------------------------------------------------------------
+    // Codex MCP integration
+    // -----------------------------------------------------------------------
+
+    /// Get or create the Codex MCP client.
+    /// Uses Codex CLI's MCP server mode (codex mcp-server).
+    pub(crate) async fn get_codex_client(&self) -> Result<crate::acp::CodexClient> {
+        if let Some(client) = self.codex_client.get() {
+            return Ok(client.clone());
+        }
+
+        // Find codex executable
+        let command = self
+            .handle
+            .config
+            .codex
+            .as_ref()
+            .and_then(|c| c.command.clone())
+            .or_else(|| which::which("codex").map(|p| p.to_string_lossy().to_string()).ok())
+            .or_else(|| std::env::var("CODEX_PATH").ok())
+            .unwrap_or_else(|| "codex".to_string());
+
+        // Use agent's workspace directory
+        let cwd = self
+            .handle
+            .config
+            .workspace
+            .as_deref()
+            .or(self.config.agents.defaults.workspace.as_deref())
+            .map(expand_tilde)
+            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+
+        // Get model from config or environment
+        let model = self
+            .handle
+            .config
+            .codex
+            .as_ref()
+            .and_then(|c| c.model.clone())
+            .or_else(|| std::env::var("CODEX_MODEL").ok());
+
+        tracing::info!(command = %command, cwd = %cwd.display(), model = ?model, "Codex: starting MCP server");
+
+        let client = crate::acp::CodexClient::spawn(cwd, Some(&command), model.as_deref()).await?;
+
+        self.codex_client.set(client.clone()).ok();
+        Ok(client)
+    }
+
+    /// Tool handler for Codex MCP calls - runs asynchronously.
+    /// Results are delivered via notification channel when complete.
+    /// Codex uses MCP protocol (not ACP), so it's simpler - no event streaming.
+    pub(crate) async fn tool_codex(&self, ctx: &RunContext, args: Value) -> Result<Value> {
+        let task = args["task"]
+            .as_str()
+            .ok_or_else(|| anyhow!("codex tool requires 'task' argument"))?;
+
+        tracing::info!(task = %task, "tool_codex: starting");
+
+        let lang = self.config.raw.gateway.as_ref()
+            .and_then(|g| g.language.as_deref())
+            .map(crate::i18n::resolve_lang)
+            .unwrap_or("en");
+
+        // Get notification sender early for error reporting
+        let notif_tx = self.notification_tx.clone();
+        let target_id = ctx.peer_id.clone();
+        let channel_name = ctx.channel.clone();
+
+        // Try to get client, send error notification if failed
+        let client = match self.get_codex_client().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("tool_codex: get_client failed: {}", e);
+                if let Some(ref tx) = notif_tx {
+                    let _ = tx.send(crate::channel::OutboundMessage {
+                        target_id: target_id.clone(),
+                        is_group: false,
+                        text: crate::i18n::t_fmt("acp_start_failed", lang, &[("name", "Codex"), ("error", &e.to_string())]),
+                        reply_to: None,
+                        images: vec![],
+                        files: vec![],
+                        channel: Some(channel_name.clone()),
+                    });
+                }
+                return Err(e);
+            }
+        };
+
+        let task_str = task.to_string();
+
+        // Send initial notification
+        if let Some(ref tx) = notif_tx {
+            let _ = tx.send(crate::channel::OutboundMessage {
+                target_id: target_id.clone(),
+                is_group: false,
+                text: crate::i18n::t_fmt("acp_submitted", lang, &[("name", "Codex")]),
+                reply_to: None,
+                images: vec![],
+                files: vec![],
+                channel: Some(channel_name.clone()),
+            });
+        }
+
+        // Spawn background task
+        let notif_tx_bg = notif_tx.clone();
+        let target_id_bg = target_id.clone();
+        let channel_bg = channel_name.clone();
+        let lang_bg = lang;
+        tokio::spawn(async move {
+            tracing::info!("tool_codex: background task started, calling execute");
+
+            let result = client.execute(&task_str).await;
+
+            match result {
+                Ok(codex_result) => {
+                    tracing::info!(
+                        thread_id = ?codex_result.thread_id,
+                        content_len = codex_result.content.len(),
+                        "tool_codex: execute completed"
+                    );
+
+                    // Build summary
+                    let content = codex_result.content;
+                    let truncated = if content.chars().count() > 2000 {
+                        let cutoff = content
+                            .char_indices()
+                            .nth(2000)
+                            .map(|(i, _)| i)
+                            .unwrap_or(content.len());
+                        crate::i18n::t_fmt("acp_truncated", lang_bg, &[("content", &content[..cutoff])])
+                    } else {
+                        content.clone()
+                    };
+
+                    let summary = if content.is_empty() {
+                        crate::i18n::t_fmt("acp_done_empty", lang_bg, &[("status", "✅"), ("name", "Codex")])
+                    } else {
+                        crate::i18n::t_fmt("acp_done_result", lang_bg, &[
+                            ("status", "✅"), ("name", "Codex"),
+                            ("count", "0"), ("result", &truncated),
+                        ])
+                    };
+
+                    // Send notification to user
+                    if let Some(ref tx) = notif_tx_bg {
+                        let _ = tx.send(crate::channel::OutboundMessage {
+                            target_id: target_id_bg.clone(),
+                            is_group: false,
+                            text: summary,
+                            reply_to: None,
+                            images: vec![],
+                            files: vec![],
+                            channel: Some(channel_bg.clone()),
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("tool_codex: execute failed: {}", e);
+                    if let Some(ref tx) = notif_tx_bg {
+                        let _ = tx.send(crate::channel::OutboundMessage {
+                            target_id: target_id_bg.clone(),
+                            is_group: false,
+                            text: crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "Codex"), ("error", &e.to_string())]),
+                            reply_to: None,
+                            images: vec![],
+                            files: vec![],
+                            channel: Some(channel_bg.clone()),
+                        });
+                    }
+                }
+            }
+            tracing::info!("tool_codex: background task finished");
+        });
+
+        Ok(serde_json::json!({
+            "output": crate::i18n::t_fmt("acp_queued", lang, &[("name", "Codex")]),
+            "status": "submitted"
+        }))
+    }
 }

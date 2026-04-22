@@ -4,6 +4,7 @@
 //! Protocol spec: https://agentclientprotocol.com
 
 pub mod client;
+pub mod codex_client;
 pub mod gateway;
 pub mod gateway_client;
 pub mod jsonrpc;
@@ -13,6 +14,7 @@ pub mod stream;
 pub mod types;
 
 pub use client::{AcpCallbackHandler, AcpClient, DefaultAcpHandler, SessionEvent};
+pub use codex_client::{CodexClient, CodexResult};
 pub use gateway::client::GatewayClient;
 pub use jsonrpc::{
     Id, JsonRpcError, JsonRpcErrorResponse, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,

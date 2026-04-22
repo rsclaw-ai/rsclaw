@@ -634,6 +634,17 @@ pub(crate) fn build_tool_list(
         }),
     });
     tools.push(ToolDef {
+        name: "codex".to_owned(),
+        description: "Execute coding tasks using OpenAI Codex CLI (MCP Server mode). Uses OpenAI's coding capabilities with sandboxed file operations. IMPORTANT: When creating new projects or files, ALWAYS create a dedicated project directory first. Requires Codex CLI installation: npm install -g @openai/codex. The task will run asynchronously and results will be sent when complete.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "The coding task to execute. Be specific about requirements and file paths."}
+            },
+            "required": ["task"]
+        }),
+    });
+    tools.push(ToolDef {
         name: "channel".to_owned(),
         description: "Perform channel-specific actions (send, reply, pin, delete messages). Channel is auto-detected from current session or can be specified explicitly: telegram, discord, slack, whatsapp, feishu, weixin, qq, dingtalk.".to_owned(),
         parameters: json!({

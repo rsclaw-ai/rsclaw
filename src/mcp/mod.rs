@@ -39,6 +39,7 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 // McpClient
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct McpClient {
     pub name: String,
     // TODO(H-19): stdin and stdout are independently locked, but JSON-RPC

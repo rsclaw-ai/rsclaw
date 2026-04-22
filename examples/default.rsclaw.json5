@@ -165,6 +165,38 @@
       //   system: "You are a research assistant.",
       //   channels: ["telegram"],
       // },
+      // --- OpenCode ACP agent (uses opencode CLI via ACP protocol) ---
+      // {
+      //   id: "opencode-coder",
+      //   channels: ["feishu", "telegram"],
+      //   opencode: {
+      //     command: "opencode",      // optional, defaults to "opencode"
+      //     args: ["acp"],            // optional, defaults to ["acp"]
+      //     cwd: "./workspace",       // optional, defaults to agent's workspace
+      //     model: "opencode/big-pickle",  // optional, e.g. "alibaba/qwen3.5-plus"
+      //   },
+      // },
+      // --- Claude Code ACP agent (uses Claude Agent SDK via ACP protocol) ---
+      // {
+      //   id: "claudecoder",
+      //   channels: ["telegram"],
+      //   claudecode: {
+      //     command: "claude-agent-acp",  // optional, defaults to "claude-agent-acp"
+      //     cwd: "./workspace",           // optional, defaults to agent's workspace
+      //     model: "claude-sonnet-4-6",   // optional, e.g. "claude-opus-4-6"
+      //   },
+      // },
+      // --- Codex MCP agent (uses OpenAI Codex CLI via MCP protocol) ---
+      // {
+      //   id: "codex-coder",
+      //   channels: ["telegram"],
+      //   codex: {
+      //     command: "codex",          // optional, defaults to "codex"
+      //     args: ["mcp-server"],      // optional, defaults to ["mcp-server"]
+      //     cwd: "./workspace",        // optional, defaults to agent's workspace
+      //     model: "gpt-5.2",          // optional, uses Codex default if unset
+      //   },
+      // },
     ],
     // External agents (A2A cross-machine collaboration)
     // external: [

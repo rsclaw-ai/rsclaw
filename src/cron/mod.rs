@@ -473,6 +473,32 @@ impl CronRunner {
         // Cancel flags for running jobs — set to true to signal abort on deletion.
         let mut cancel_flags: HashMap<String, Arc<std::sync::atomic::AtomicBool>> = HashMap::new();
 
+        // Clear orphaned running_at_ms states from previous app run.
+        // When the app restarts, any jobs that were running at shutdown will have
+        // running_at_ms set but no actual spawned task, causing them to be stuck.
+        let orphan_count = jobs.iter_mut()
+            .filter(|j| j.state.as_ref().and_then(|s| s.running_at_ms).is_some())
+            .count();
+        if orphan_count > 0 {
+            warn!(count = orphan_count, "cron: clearing orphaned running_at_ms states from previous run");
+            for job in jobs.iter_mut() {
+                if let Some(state) = job.state.as_mut() {
+                    if state.running_at_ms.is_some() {
+                        info!(job_id = %job.id, "cron: clearing orphaned running_at_ms");
+                        state.running_at_ms = None;
+                        // Recompute next_run_at_ms if needed
+                        if state.next_run_at_ms.is_none() || state.next_run_at_ms.map(|t| t <= current_timestamp_ms()).unwrap_or(true) {
+                            state.next_run_at_ms = job.schedule.compute_next_run(current_timestamp_ms());
+                        }
+                    }
+                }
+            }
+            // Save the cleaned state
+            if let Err(e) = self.save_store(&jobs).await {
+                warn!(err = %e, "cron: failed to save store after clearing orphaned states");
+            }
+        }
+
         loop {
             if !running.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
@@ -481,16 +507,22 @@ impl CronRunner {
             let now_ms = current_timestamp_ms();
 
             // Find next wake time among enabled jobs
-            let next_wake = jobs
+            let next_wake_job = jobs
                 .iter()
                 .filter(|j| j.enabled)
-                .filter_map(|j| j.state.as_ref().and_then(|s| s.next_run_at_ms))
-                .min();
+                .filter_map(|j| {
+                    j.state.as_ref().and_then(|s| s.next_run_at_ms).map(|t| (t, &j.id, &j.name))
+                })
+                .min_by_key(|(t, _, _)| *t);
+
+            let next_wake = next_wake_job.map(|(t, _, _)| t);
 
             // DEBUG: log next_wake to diagnose early firing
             debug!(next_wake = next_wake.unwrap_or(0), now_ms, "cron: timer tick");
             if next_wake.map(|t| t <= now_ms).unwrap_or(false) {
-                warn!(next_wake = next_wake.unwrap_or(0), now_ms, "cron: next_wake is in the past!");
+                if let Some((t, id, name)) = next_wake_job {
+                    warn!(next_wake = t, now_ms, job_id = %id, job_name = %name.as_deref().unwrap_or("unknown"), "cron: next_wake is in the past!");
+                }
             }
 
             let delay_ms = match next_wake {
@@ -578,7 +610,80 @@ impl CronRunner {
                 continue;
             }
 
-            // Collect jobs that are due and not already running
+            // Collect any completed job results FIRST, before checking due.
+            // This is critical: if we skip try_recv when due.is_empty(), runningAtMs
+            // will never be cleared, causing the job to be stuck forever.
+            let mut collected_count = 0;
+            while let Ok((job_id, success, duration_ms, started_at, error_msg)) = result_rx.try_recv() {
+                collected_count += 1;
+                info!(job_id = %job_id, success, duration_ms, "cron: collected job result via try_recv");
+                cancel_flags.remove(&job_id);
+                if let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) {
+                    if let Some(state) = job.state.as_mut() {
+                        state.running_at_ms = None;
+                        state.last_run_at_ms = Some(current_timestamp_ms());
+                        state.last_duration_ms = Some(duration_ms);
+
+                        let completion_time = started_at + duration_ms;
+
+                        if success {
+                            state.consecutive_errors = 0;
+                            state.last_run_status = Some("ok".to_string());
+                            state.last_status = Some("ok".to_string());
+                            state.last_error = None;
+
+                            // One-shot: disable after successful execution (will be removed below)
+                            if job.schedule.is_once() {
+                                info!(job_id = %job.id, "cron: one-shot job completed, marking for removal");
+                                state.next_run_at_ms = None;
+                                job.enabled = false;
+                            } else {
+                            // Compute next run normally
+                            state.next_run_at_ms = job.schedule.compute_next_run(completion_time);
+                            }
+                            info!(job_id = %job.id, next_run_at_ms = state.next_run_at_ms, "cron: updated next_run_at_ms after success");
+                        } else {
+                            state.consecutive_errors += 1;
+                            state.last_run_status = Some("error".to_string());
+                            state.last_status = Some("error".to_string());
+                            state.last_error = error_msg;
+
+                            // Apply exponential backoff for errored jobs
+                            let backoff = error_backoff_ms(state.consecutive_errors);
+                            let backoff_next = completion_time + backoff;
+                            let normal_next = job.schedule.compute_next_run(completion_time);
+                            // Use whichever is later: the natural next run or the backoff delay
+                            state.next_run_at_ms = Some(normal_next.map(|n| n.max(backoff_next)).unwrap_or(backoff_next));
+
+                            info!(
+                                job_id = %job.id,
+                                consecutive_errors = state.consecutive_errors,
+                                backoff_ms = backoff,
+                                next_run_at_ms = state.next_run_at_ms,
+                                "cron: applying error backoff"
+                            );
+
+                            // Auto-disable after max consecutive errors
+                            if state.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                                warn!(
+                                    job_id = %job.id,
+                                    consecutive_errors = state.consecutive_errors,
+                                    "cron: disabling job after repeated failures"
+                                );
+                                job.enabled = false;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Persist updated state if any results were collected
+            if collected_count > 0 {
+                if let Err(e) = self.save_store(&jobs).await {
+                    warn!(err = %e, "cron: failed to save store after collecting results");
+                }
+            }
+
             let due: Vec<_> = jobs
                 .iter_mut()
                 .filter(|j| {
@@ -637,6 +742,7 @@ impl CronRunner {
                 let permit = permit.expect("permit checked above");
                 let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 cancel_flags.insert(job.id.clone(), Arc::clone(&cancelled));
+                let job_id_for_log = job.id.clone();  // Clone BEFORE async move
                 let job = job.clone();
                 let agents = Arc::clone(&self.agents);
                 let channels = Arc::clone(&self.channels);
@@ -752,94 +858,28 @@ impl CronRunner {
                 let result_tx = result_tx.clone();
                 tokio::spawn(async move {
                     let result = handle.await;
-                    if let Ok(r) = result {
-                        let _ = result_tx.send(r).await;
+                    match result {
+                        Ok(r) => {
+                            tracing::info!(job_id = %job_id_for_log, success = r.1, duration_ms = r.2, "cron: result sender got result, sending to channel");
+                            if let Err(e) = result_tx.send(r).await {
+                                tracing::warn!(job_id = %job_id_for_log, "cron: failed to send result to channel: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(job_id = %job_id_for_log, "cron: handle.await failed (spawn error): {}", e);
+                        }
                     }
                 });
             }
 
-            // Collect any completed job results (non-blocking).
-            // This processes results from ALL previously spawned jobs,
-            // not just the ones spawned this tick.
-            // TODO(M-15): verify that try_recv draining is correct here — completed
-            // cron results may be silently skipped if the channel fills up before
-            // this non-blocking drain runs.
-            let mut collected_count = 0;
-            while let Ok((job_id, success, duration_ms, started_at, error_msg)) = result_rx.try_recv() {
-                    collected_count += 1;
-                    info!(job_id = %job_id, success, duration_ms, "cron: collected job result via try_recv");
-                    cancel_flags.remove(&job_id);
-                    if let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) {
-                        if let Some(state) = job.state.as_mut() {
-                            state.running_at_ms = None;
-                            state.last_run_at_ms = Some(current_timestamp_ms());
-                            state.last_duration_ms = Some(duration_ms);
-
-                            let completion_time = started_at + duration_ms;
-
-                            if success {
-                                state.consecutive_errors = 0;
-                                state.last_run_status = Some("ok".to_string());
-                                state.last_status = Some("ok".to_string());
-                                state.last_error = None;
-
-                                // One-shot: disable after successful execution (will be removed below)
-                                if job.schedule.is_once() {
-                                    info!(job_id = %job.id, "cron: one-shot job completed, marking for removal");
-                                    state.next_run_at_ms = None;
-                                    job.enabled = false;
-                                } else {
-                                // Compute next run normally
-                                state.next_run_at_ms = job.schedule.compute_next_run(completion_time);
-                                }
-                            } else {
-                                state.consecutive_errors += 1;
-                                state.last_run_status = Some("error".to_string());
-                                state.last_status = Some("error".to_string());
-                                state.last_error = error_msg;
-
-                                // Apply exponential backoff for errored jobs
-                                let backoff = error_backoff_ms(state.consecutive_errors);
-                                let backoff_next = completion_time + backoff;
-                                let normal_next = job.schedule.compute_next_run(completion_time);
-                                // Use whichever is later: the natural next run or the backoff delay
-                                state.next_run_at_ms = Some(normal_next.map(|n| n.max(backoff_next)).unwrap_or(backoff_next));
-
-                                info!(
-                                    job_id = %job.id,
-                                    consecutive_errors = state.consecutive_errors,
-                                    backoff_ms = backoff,
-                                    next_run_at_ms = state.next_run_at_ms,
-                                    "cron: applying error backoff"
-                                );
-
-                                // Auto-disable after max consecutive errors
-                                if state.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                                    warn!(
-                                        job_id = %job.id,
-                                        consecutive_errors = state.consecutive_errors,
-                                        "cron: disabling job after repeated failures"
-                                    );
-                                    job.enabled = false;
-                                }
-                            }
-                        }
-                    }
-                }
-
-            // Remove completed one-shot jobs
+            // Remove completed one-shot jobs (already disabled in try_recv handler above)
             let before = jobs.len();
             jobs.retain(|j| !(j.schedule.is_once() && !j.enabled));
             if jobs.len() < before {
                 info!(removed = before - jobs.len(), "cron: cleaned up completed one-shot jobs");
-            }
-
-            // Persist updated state
-            if collected_count > 0 {
-                info!(collected_count, "cron: collected job results this tick");
-            }
-            if let Err(e) = self.save_store(&jobs).await {
-                warn!(err = %e, "cron: failed to persist state");
+                if let Err(e) = self.save_store(&jobs).await {
+                    warn!(err = %e, "cron: failed to save store after removing one-shot jobs");
+                }
             }
         }
     }
@@ -1181,6 +1221,51 @@ CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
         debug!(job_id = %job.id, "cron job returned no output");
         Ok(String::new())
     } else {
+        // Check for exec tool failure in the reply.
+        // The agent formats exec results as: "[stderr] ... [exit code: X]"
+        // or returns JSON like: {"exit_code": 1, "stderr": "..."}
+        let text = reply.text.clone();
+
+        // Check formatted string pattern: [exit code: X] where X != 0
+        if let Some(exit_match) = text.lines().rev().find(|line| line.contains("[exit code:")) {
+            if let Some(code_str) = exit_match.split(':').nth(1) {
+                if let Ok(code) = code_str.trim().replace(']', "").parse::<i64>() {
+                    if code != 0 {
+                        let error_detail = text.lines()
+                            .filter(|l| !l.contains("[exit code:"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let error_msg = if error_detail.is_empty() {
+                            "command failed with no output".to_string()
+                        } else {
+                            error_detail
+                        };
+                        info!(job_id = %job.id, exit_code = code, "cron job exec failed");
+                        return Err(anyhow!("command exit_code={}, error: {}", code, error_msg));
+                    }
+                }
+            }
+        }
+
+        // Also check JSON format (fallback): {"exit_code": 1, ...}
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(exit_code) = json.get("exit_code").and_then(|v| v.as_i64()) {
+                if exit_code != 0 {
+                    let stderr = json.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+                    let stdout = json.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+                    let error_detail = if !stderr.is_empty() {
+                        stderr
+                    } else if !stdout.is_empty() {
+                        stdout
+                    } else {
+                        "command failed with no output"
+                    };
+                    info!(job_id = %job.id, exit_code, "cron job exec failed");
+                    return Err(anyhow!("command exit_code={}, error: {}", exit_code, error_detail));
+                }
+            }
+        }
+
         info!(job_id = %job.id, len = reply.text.len(), "cron job completed");
         Ok(reply.text)
     }

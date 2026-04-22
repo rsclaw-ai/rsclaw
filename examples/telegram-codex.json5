@@ -1,0 +1,40 @@
+{
+  // Example: Use OpenAI Codex MCP for coding tasks
+  // Requires: npm install -g @openai/codex
+  // Authentication: Codex CLI handles OpenAI API key or ChatGPT login automatically
+
+  "agents": {
+    "list": [
+      {
+        "id": "main",
+        "default": true,
+        "channels": ["telegram"],
+        "model": {
+          "primary": "anthropic/claude-sonnet-4-6"
+        }
+      },
+      {
+        "id": "codex-coder",
+        "channels": ["telegram"],
+        "codex": {
+          "command": "codex",
+          "args": ["mcp-server"],
+          "cwd": "./workspace",
+          // Optional: override model (uses Codex default if unset)
+          // "model": "gpt-5.2"
+        }
+      }
+    ],
+    "defaults": {
+      "workspace": "~/.rsclaw/workspace"
+    }
+  },
+
+  "channels": {
+    "telegram": {
+      "botToken": "${TELEGRAM_BOT_TOKEN}",
+      "dmPolicy": "open",
+      "groupPolicy": "allowlist"
+    }
+  }
+}

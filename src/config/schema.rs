@@ -328,6 +328,11 @@ pub struct AgentEntry {
     /// Uses the official Claude Agent SDK via ACP protocol.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claudecode: Option<ClaudeCodeConfig>,
+    /// rsclaw extension: use Codex MCP client instead of LLM
+    /// When set, this agent spawns codex mcp-server subprocess and routes all prompts through it.
+    /// Uses OpenAI Codex CLI via MCP protocol.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex: Option<CodexConfig>,
     /// OpenClaw-specific
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_dir: Option<String>,
@@ -362,6 +367,22 @@ pub struct ClaudeCodeConfig {
     /// Workspace directory for claude code (default: agent's workspace)
     pub cwd: Option<String>,
     /// Claude model ID (e.g., "claude-sonnet-4-6", "claude-opus-4-6")
+    pub model: Option<String>,
+}
+
+/// Codex MCP configuration for an agent.
+/// Uses Codex CLI's MCP server mode (codex mcp-server).
+/// Codex provides tools: `codex` (start session) and `codex-reply` (continue session).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexConfig {
+    /// Path to codex binary (default: "codex")
+    pub command: Option<String>,
+    /// Arguments passed to codex (default: ["mcp-server"])
+    pub args: Option<Vec<String>>,
+    /// Workspace directory for codex (default: agent's workspace)
+    pub cwd: Option<String>,
+    /// OpenAI model ID (optional, uses Codex default)
     pub model: Option<String>,
 }
 
