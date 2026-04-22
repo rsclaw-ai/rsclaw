@@ -56,6 +56,7 @@ use crate::{
     config::runtime::RuntimeConfig,
     gateway::LiveConfig,
     store::Store,
+    ws::types::EventFrame,
 };
 
 // ---------------------------------------------------------------------------
@@ -1035,9 +1036,18 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
             let delivery_to = job["delivery"]["to"].as_str().map(|s| s.to_owned());
             let ntx = state.notification_tx.clone();
             let job_id = id.clone();
+            let ws_conns = state.ws_conns.clone();
             tokio::spawn(async move {
                 if let Ok(reply) = reply_rx.await {
                     if !reply.text.is_empty() {
+                        // Push result to desktop via WebSocket notification
+                        let frame = EventFrame::new(
+                            "notification",
+                            serde_json::json!({ "text": reply.text }),
+                            0,
+                        );
+                        ws_conns.broadcast_all(frame).await;
+
                         if let (Some(ch), Some(to)) = (delivery_channel, delivery_to) {
                             let _ = ntx.send(crate::channel::OutboundMessage {
                                 target_id: to,

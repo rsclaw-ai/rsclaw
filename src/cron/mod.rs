@@ -357,6 +357,7 @@ pub struct CronRunner {
     semaphore: Arc<Semaphore>,
     default_delivery: Option<CronDelivery>,
     reload_tx: broadcast::Sender<()>,
+    ws_conns: Arc<crate::ws::ConnRegistry>,
 }
 
 impl CronRunner {
@@ -367,6 +368,7 @@ impl CronRunner {
         channels: Arc<ChannelManager>,
         data_dir: PathBuf,
         reload_tx: broadcast::Sender<()>,
+        ws_conns: Arc<crate::ws::ConnRegistry>,
     ) -> Self {
         let run_log_dir = data_dir.join("cron");
         let store_path = data_dir.join("cron_store.json");
@@ -382,6 +384,7 @@ impl CronRunner {
             semaphore: Arc::new(Semaphore::new(4)),
             default_delivery: config.default_delivery.clone(),
             reload_tx,
+            ws_conns,
         }
     }
 
@@ -660,6 +663,7 @@ impl CronRunner {
                 let channels = Arc::clone(&self.channels);
                 let run_log_dir = self.run_log_dir.clone();
                 let default_delivery = self.default_delivery.clone();
+                let ws_conns = Arc::clone(&self.ws_conns);
 
                 let handle = tokio::spawn(async move {
                     let start_time = current_timestamp_ms();
@@ -733,6 +737,14 @@ impl CronRunner {
                             }
                         }
                     };
+
+                    // Broadcast result to desktop via WebSocket
+                    let frame = crate::ws::types::EventFrame::new(
+                        "notification",
+                        serde_json::json!({ "text": delivery_text }),
+                        0,
+                    );
+                    ws_conns.broadcast_all(frame).await;
 
                     // Spawn delivery as a detached task so it doesn't block.
                     // The result is logged but we don't wait for it.
@@ -889,6 +901,14 @@ impl CronRunner {
             }
         };
 
+        // Broadcast result to desktop via WebSocket
+        let frame = crate::ws::types::EventFrame::new(
+            "notification",
+            serde_json::json!({ "text": delivery_text }),
+            0,
+        );
+        self.ws_conns.broadcast_all(frame).await;
+
         if let Err(e) =
             send_delivery(&self.channels, job, &self.default_delivery, &delivery_text).await
         {
@@ -964,6 +984,7 @@ impl Clone for CronRunner {
             semaphore: Arc::clone(&self.semaphore),
             default_delivery: self.default_delivery.clone(),
             reload_tx: self.reload_tx.clone(),
+            ws_conns: Arc::clone(&self.ws_conns),
         }
     }
 }

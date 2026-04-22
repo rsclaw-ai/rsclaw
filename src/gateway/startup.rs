@@ -476,6 +476,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 Arc::clone(&channel_manager),
                 cron_data_dir,
                 cron_reload_tx.clone(),
+                Arc::clone(&ws_conns),
             );
             tokio::spawn(async move {
                 if let Err(e) = runner.run().await {
