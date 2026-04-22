@@ -6,13 +6,9 @@ import {
 } from "../constant";
 import { getClientConfig } from "../config/client";
 import { createPersistStore } from "../utils/store";
-import { clientUpdate } from "../utils";
-import ChatGptIcon from "../icons/chatgpt.png";
-import Locale from "../locales";
 import { ClientApi } from "../client/api";
 
 const ONE_MINUTE = 60 * 1000;
-const isApp = !!getClientConfig()?.isApp;
 
 function formatVersionDate(t: string) {
   const d = new Date(+t);
@@ -121,36 +117,6 @@ export const useUpdateStore = createPersistStore(
         set(() => ({
           remoteVersion: remoteId,
         }));
-        if (isApp) {
-          try {
-            const {
-              isPermissionGranted,
-              requestPermission,
-              sendNotification,
-            } = await import("@tauri-apps/plugin-notification");
-            const granted = await isPermissionGranted();
-            if (!granted) {
-              const perm = await requestPermission();
-              if (perm !== "granted") return;
-            }
-            if (version === remoteId) {
-              sendNotification({
-                title: "RsClaw",
-                body: `${Locale.Settings.Update.IsLatest}`,
-              });
-            } else {
-              const updateMessage =
-                Locale.Settings.Update.FoundUpdate(`${remoteId}`);
-              sendNotification({
-                title: "RsClaw",
-                body: updateMessage,
-              });
-              clientUpdate();
-            }
-          } catch (e) {
-            console.warn("Notification error:", e);
-          }
-        }
         console.log("[Got Upstream] ", remoteId);
       } catch (error) {
         console.error("[Fetch Upstream Commit Id]", error);
