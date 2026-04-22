@@ -4906,9 +4906,13 @@ function CronTaskPage() {
               <div style={{ marginBottom: 0 }}>
                 <div style={{ fontSize: 10, color: "#2e2c3a", letterSpacing: 0.4, marginBottom: 5, fontFamily: "'JetBrains Mono', monospace" }}>{zh ? "\u7ED3\u679C\u63A8\u9001" : "DELIVERY"} <span style={{ color: "#4a4858" }}>({zh ? "\u53EF\u9009" : "optional"})</span></div>
                 <div style={{ display: "flex", gap: 8 }}>
-                  <select value={form.deliveryChannel} onChange={(e) => setForm({ ...form, deliveryChannel: e.target.value })}
+                  <select value={form.deliveryChannel} onChange={(e) => {
+                    const ch = e.target.value;
+                    setForm({ ...form, deliveryChannel: ch, deliveryTo: ch === "desktop" ? "desktop-user" : form.deliveryTo });
+                  }}
                     style={{ flex: 1, padding: "8px 10px", borderRadius: 7, border: "1px solid rgba(255,255,255,.09)", background: "#1f2126", color: "#eceaf4", fontSize: 11, outline: "none", cursor: "pointer" }}>
                     <option value="">{zh ? "\u65E0\u63A8\u9001" : "No delivery"}</option>
+                    <option value="desktop">{zh ? "\u684C\u9762\u7AEF" : "Desktop"}</option>
                     <option value="feishu">{zh ? "\u98DE\u4E66" : "Feishu"}</option>
                     <option value="telegram">Telegram</option>
                     <option value="wechat">{zh ? "\u5FAE\u4FE1" : "WeChat"}</option>
@@ -4917,8 +4921,10 @@ function CronTaskPage() {
                     <option value="slack">Slack</option>
                     <option value="qq">QQ</option>
                   </select>
-                  <input value={form.deliveryTo} onChange={(e) => setForm({ ...form, deliveryTo: e.target.value })} placeholder={zh ? "\u76EE\u6807 ID (\u7528\u6237/\u7FA4)" : "Target ID (user/group)"}
-                    style={{ flex: 2, padding: "8px 10px", borderRadius: 7, border: "1px solid rgba(255,255,255,.09)", background: "#1f2126", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11, outline: "none" }} />
+                  {form.deliveryChannel !== "desktop" && (
+                    <input value={form.deliveryTo} onChange={(e) => setForm({ ...form, deliveryTo: e.target.value })} placeholder={zh ? "\u76EE\u6807 ID (\u7528\u6237/\u7FA4)" : "Target ID (user/group)"}
+                      style={{ flex: 2, padding: "8px 10px", borderRadius: 7, border: "1px solid rgba(255,255,255,.09)", background: "#1f2126", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11, outline: "none" }} />
+                  )}
                 </div>
               </div>
             </div>

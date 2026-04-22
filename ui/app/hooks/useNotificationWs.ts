@@ -35,7 +35,7 @@ export function useNotificationWs() {
             params: {
               client: "desktop-ui",
               version: "1.0.0",
-              token: token || undefined,
+              auth: token ? { token } : undefined,
             },
           };
           ws.send(JSON.stringify(connectMsg));
