@@ -764,7 +764,10 @@ impl CronRunner {
             // TODO(M-15): verify that try_recv draining is correct here — completed
             // cron results may be silently skipped if the channel fills up before
             // this non-blocking drain runs.
+            let mut collected_count = 0;
             while let Ok((job_id, success, duration_ms, started_at, error_msg)) = result_rx.try_recv() {
+                    collected_count += 1;
+                    info!(job_id = %job_id, success, duration_ms, "cron: collected job result via try_recv");
                     cancel_flags.remove(&job_id);
                     if let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) {
                         if let Some(state) = job.state.as_mut() {
@@ -832,6 +835,9 @@ impl CronRunner {
             }
 
             // Persist updated state
+            if collected_count > 0 {
+                info!(collected_count, "cron: collected job results this tick");
+            }
             if let Err(e) = self.save_store(&jobs).await {
                 warn!(err = %e, "cron: failed to persist state");
             }
