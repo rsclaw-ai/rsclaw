@@ -5154,6 +5154,74 @@ const MAX_FILE_CONTENT_CHARS: usize = 20_000;
 // Persist dynamic agent to config file
 // ---------------------------------------------------------------------------
 
+/// Patch fields of an existing `AgentEntry` in `agents.list` in the config file.
+///
+/// - `model`: `Some("")` or `Some("default")` removes the field (agent falls back to defaults).
+///            `Some("provider/model")` sets `model.primary`.
+///            `None` leaves it untouched.
+/// - `name`:  `Some("")` removes the field. `Some(x)` sets it. `None` leaves it.
+///
+/// The config hot-reload watcher picks up the change automatically — no restart needed.
+pub(crate) async fn update_agent_in_config(
+    id: &str,
+    model: Option<&str>,
+    name: Option<&str>,
+) -> anyhow::Result<serde_json::Value> {
+    use serde_json::json;
+
+    let config_path = crate::config::loader::detect_config_path()
+        .ok_or_else(|| anyhow!("no config file found"))?;
+    let raw = tokio::fs::read_to_string(&config_path).await?;
+    let mut doc: serde_json::Value = json5::from_str(&raw)
+        .map_err(|e| anyhow!("parse config: {e}"))?;
+
+    let list = doc
+        .pointer_mut("/agents/list")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| anyhow!("agents.list not found in config"))?;
+
+    let entry = list
+        .iter_mut()
+        .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(id))
+        .ok_or_else(|| anyhow!("agent not found: {id}"))?;
+
+    let mut changes: Vec<String> = vec![];
+
+    if let Some(m) = model {
+        if m.is_empty() || m == "default" {
+            if entry.as_object_mut().and_then(|o| o.remove("model")).is_some() {
+                changes.push("model removed (falls back to defaults)".to_owned());
+            }
+        } else {
+            entry["model"] = json!({"primary": m});
+            changes.push(format!("model → {m}"));
+        }
+    }
+
+    if let Some(n) = name {
+        if n.is_empty() {
+            entry.as_object_mut().map(|o| o.remove("name"));
+        } else {
+            entry["name"] = json!(n);
+        }
+        changes.push("name updated".to_owned());
+    }
+
+    if changes.is_empty() {
+        return Ok(json!({"warning": "nothing to update — provide model and/or name"}));
+    }
+
+    let output = serde_json::to_string_pretty(&doc)?;
+    tokio::fs::write(&config_path, output).await?;
+    tracing::info!(agent_id = %id, ?changes, "agent config updated");
+
+    Ok(json!({
+        "updated": id,
+        "changes": changes,
+        "note": "saved — hot-reload applies within seconds"
+    }))
+}
+
 /// Append an AgentEntry to the `agents.list` array in the config file.
 /// The hot-reload watcher will pick up the change automatically.
 pub(crate) async fn persist_agent_to_config(entry: &crate::config::schema::AgentEntry) -> anyhow::Result<()> {

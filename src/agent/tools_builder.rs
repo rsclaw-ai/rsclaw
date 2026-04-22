@@ -227,6 +227,7 @@ pub(crate) fn build_tool_list(
             - spawn: Create a persistent agent (survives across turns).\n\
             - send: Send a message to an existing agent (async, result delivered when done).\n\
             - list: List all registered agents.\n\
+            - update: Edit a named agent's config (model, name). Pass model=\"\" to remove and fall back to defaults. Hot-reloads automatically.\n\
             - kill: Stop an agent.\n\
             Tips:\n\
             - Use task for independent, parallelizable work. You can dispatch multiple tasks at once.\n\
@@ -235,9 +236,10 @@ pub(crate) fn build_tool_list(
         parameters: json!({
             "type": "object",
             "properties": {
-                "action":  {"type": "string", "enum": ["spawn", "task", "send", "list", "kill"], "description": "Action to perform"},
-                "id":      {"type": "string", "description": "Agent ID (for spawn/send/kill)"},
-                "model":   {"type": "string", "description": "Model string (for spawn/task)"},
+                "action":  {"type": "string", "enum": ["spawn", "task", "send", "list", "update", "kill"], "description": "Action to perform"},
+                "id":      {"type": "string", "description": "Agent ID (for spawn/send/update/kill)"},
+                "model":   {"type": "string", "description": "Model string (for spawn/task/update). Pass \"\" to remove per-agent model override."},
+                "name":    {"type": "string", "description": "Display name (for update)"},
                 "system":  {"type": "string", "description": "Role description (for spawn/task)"},
                 "message": {"type": "string", "description": "Message to send (for task/send)"},
                 "toolset": {"type": "string", "enum": ["minimal", "standard", "web", "code", "full"], "description": "Tool access level. Default: standard."}
