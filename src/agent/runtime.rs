@@ -2755,96 +2755,6 @@ impl AgentRuntime {
             }
         }
 
-        // Check for pending exec results from background tasks.
-        let pending_results = self.exec_pool.collect_pending_for_session(&ctx.session_key).await;
-        if !pending_results.is_empty() {
-            info!(session = %ctx.session_key, count = pending_results.len(), "exec_pool: collected pending results");
-            if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
-                // Collect existing ToolUse IDs in session
-                let session_tool_ids: std::collections::HashSet<String> = sess.iter()
-                    .filter_map(|m| {
-                        if m.role == Role::Assistant {
-                            if let MessageContent::Parts(parts) = &m.content {
-                                Some(parts.iter().filter_map(|p| {
-                                    if let ContentPart::ToolUse { id, .. } = p { Some(id.clone()) } else { None }
-                                }).collect::<Vec<_>>())
-                            } else { None }
-                        } else { None }
-                    })
-                    .flatten()
-                    .collect();
-
-                // Find running ToolResults to replace
-                let running_ids: std::collections::HashSet<String> = sess.iter()
-                    .filter_map(|m| {
-                        if m.role == Role::Tool {
-                            if let MessageContent::Parts(parts) = &m.content {
-                                for p in parts {
-                                    if let ContentPart::ToolResult { tool_use_id, content, .. } = p {
-                                        if content.contains("\"status\":\"running\"") || content.contains("\"status\": \"running\"") {
-                                            return Some(tool_use_id.clone());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        None
-                    })
-                    .collect();
-
-                // Remove running status ToolResults that will be replaced
-                let ids_to_replace: std::collections::HashSet<String> = pending_results.iter()
-                    .map(|r| r.tool_call_id.clone())
-                    .filter(|id| running_ids.contains(id))
-                    .collect();
-                if !ids_to_replace.is_empty() {
-                    sess.retain(|m| {
-                        if m.role == Role::Tool {
-                            if let MessageContent::Parts(parts) = &m.content {
-                                for p in parts {
-                                    if let ContentPart::ToolResult { tool_use_id, content, .. } = p {
-                                        if ids_to_replace.contains(tool_use_id) && (content.contains("\"status\":\"running\"") || content.contains("\"status\": \"running\"")) {
-                                            return false;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        true
-                    });
-                }
-
-                for result in pending_results {
-                    let tool_call_id = result.tool_call_id.clone();
-                    // If ToolUse not in history, inject synthetic one
-                    if !session_tool_ids.contains(&tool_call_id) {
-                        sess.push(Message {
-                            role: Role::Assistant,
-                            content: MessageContent::Parts(vec![ContentPart::ToolUse {
-                                id: tool_call_id.clone(),
-                                name: "exec".to_owned(),
-                                input: serde_json::json!({"command": result.command, "_synthetic": true}),
-                            }]),
-                        });
-                    }
-                    let is_error = result.exit_code.map(|c| c != 0).unwrap_or(true);
-                    let content = serde_json::json!({
-                        "exit_code": result.exit_code,
-                        "stdout": result.stdout,
-                        "stderr": result.stderr,
-                    }).to_string();
-                    sess.push(Message {
-                        role: Role::Tool,
-                        content: MessageContent::Parts(vec![ContentPart::ToolResult {
-                            tool_use_id: tool_call_id,
-                            content,
-                            is_error: Some(is_error),
-                        }]),
-                    });
-                }
-            }
-        }
-
         // Dynamic iteration limit based on task complexity.
         // Default: 15 iterations. Complex tools (browser/opencode/exec): up to configured max.
         const BASE_ITERATIONS: usize = 20;
@@ -2903,6 +2813,99 @@ impl AgentRuntime {
                     was_preparse: false,
                 });
             }
+
+            // Check for pending exec results from background tasks at each iteration.
+            // This must be inside the loop because background tasks complete during
+            // the loop iterations, not before the loop starts.
+            let pending_results = self.exec_pool.collect_pending_for_session(&ctx.session_key).await;
+            if !pending_results.is_empty() {
+                info!(session = %ctx.session_key, count = pending_results.len(), "exec_pool: collected pending results in loop");
+                if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
+                    // Collect existing ToolUse IDs in session
+                    let session_tool_ids: std::collections::HashSet<String> = sess.iter()
+                        .filter_map(|m| {
+                            if m.role == Role::Assistant {
+                                if let MessageContent::Parts(parts) = &m.content {
+                                    Some(parts.iter().filter_map(|p| {
+                                        if let ContentPart::ToolUse { id, .. } = p { Some(id.clone()) } else { None }
+                                    }).collect::<Vec<_>>())
+                                } else { None }
+                            } else { None }
+                        })
+                        .flatten()
+                        .collect();
+
+                    // Find running ToolResults to replace
+                    let running_ids: std::collections::HashSet<String> = sess.iter()
+                        .filter_map(|m| {
+                            if m.role == Role::Tool {
+                                if let MessageContent::Parts(parts) = &m.content {
+                                    for p in parts {
+                                        if let ContentPart::ToolResult { tool_use_id, content, .. } = p {
+                                            if content.contains("\"status\":\"running\"") || content.contains("\"status\": \"running\"") {
+                                                return Some(tool_use_id.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            None
+                        })
+                        .collect();
+
+                    // Remove running status ToolResults that will be replaced
+                    let ids_to_replace: std::collections::HashSet<String> = pending_results.iter()
+                        .map(|r| r.tool_call_id.clone())
+                        .filter(|id| running_ids.contains(id))
+                        .collect();
+                    if !ids_to_replace.is_empty() {
+                        sess.retain(|m| {
+                            if m.role == Role::Tool {
+                                if let MessageContent::Parts(parts) = &m.content {
+                                    for p in parts {
+                                        if let ContentPart::ToolResult { tool_use_id, content, .. } = p {
+                                            if ids_to_replace.contains(tool_use_id) && (content.contains("\"status\":\"running\"") || content.contains("\"status\": \"running\"")) {
+                                                return false;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            true
+                        });
+                    }
+
+                    for result in pending_results {
+                        let tool_call_id = result.tool_call_id.clone();
+                        // If ToolUse not in history, inject synthetic one
+                        if !session_tool_ids.contains(&tool_call_id) {
+                            sess.push(Message {
+                                role: Role::Assistant,
+                                content: MessageContent::Parts(vec![ContentPart::ToolUse {
+                                    id: tool_call_id.clone(),
+                                    name: "exec".to_owned(),
+                                    input: serde_json::json!({"command": result.command, "_synthetic": true}),
+                                }]),
+                            });
+                        }
+                        let is_error = result.exit_code.map(|c| c != 0).unwrap_or(true);
+                        let content = serde_json::json!({
+                            "exit_code": result.exit_code,
+                            "stdout": result.stdout,
+                            "stderr": result.stderr,
+                        }).to_string();
+                        sess.push(Message {
+                            role: Role::Tool,
+                            content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                                tool_use_id: tool_call_id,
+                                content,
+                                is_error: Some(is_error),
+                            }]),
+                        });
+                    }
+                }
+            }
+
             // Apply legacy context pruning (hard clear / soft trim) as fallback.
             if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
                 apply_context_pruning(sess, pruning_cfg.as_ref());
