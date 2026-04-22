@@ -1493,11 +1493,17 @@ async fn openai_chat_completions(
                     let event = msg.ok()?;
                     if event.session_id != sid { return None; }
                     if event.done {
-                        let stop = serde_json::json!({
+                        let mut stop = serde_json::json!({
                             "id": cid, "object": "chat.completion.chunk",
                             "created": now, "model": model_str,
                             "choices": [{"index":0,"delta":{},"finish_reason":"stop"}]
                         });
+                        if !event.files.is_empty() {
+                            stop["rsclaw_files"] = serde_json::json!(event.files);
+                        }
+                        if !event.images.is_empty() {
+                            stop["rsclaw_images"] = serde_json::json!(event.images);
+                        }
                         return Some(format!("data: {stop}\n\ndata: [DONE]\n\n"));
                     }
                     if event.delta.is_empty() { return None; }

@@ -3271,6 +3271,8 @@ impl AgentRuntime {
                                     agent_id: ctx.agent_id.clone(),
                                     delta: std::mem::take(&mut delta_buf),
                                     done: false,
+                                    files: vec![],
+                                    images: vec![],
                                 });
                             }
                             last_delta_flush = now;
@@ -3401,6 +3403,8 @@ impl AgentRuntime {
                         agent_id: ctx.agent_id.clone(),
                         delta: delta_buf,
                         done: false,
+                        files: vec![],
+                        images: vec![],
                     });
                 }
             }
@@ -3597,6 +3601,8 @@ impl AgentRuntime {
                         agent_id: ctx.agent_id.clone(),
                         delta: String::new(),
                         done: true,
+                        files: tool_files.clone(),
+                        images: tool_images.clone(),
                     });
                 }
 

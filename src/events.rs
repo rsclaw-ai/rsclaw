@@ -23,4 +23,12 @@ pub struct AgentEvent {
     pub delta: String,
     /// `true` on the final "turn complete" event.
     pub done: bool,
+    /// File attachments produced this turn: (filename, mime_type, local_path_or_url).
+    /// Non-empty only on the final `done = true` event.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<(String, String, String)>,
+    /// Image attachments (base64 data URIs or local paths).
+    /// Non-empty only on the final `done = true` event.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
 }

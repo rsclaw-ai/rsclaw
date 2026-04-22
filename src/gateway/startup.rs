@@ -704,6 +704,8 @@ fn spawn_agent_tasks(
                             agent_id: handle.id.clone(),
                             delta: reply.text.clone(),
                             done: false,
+                            files: vec![],
+                            images: vec![],
                         });
                     }
                     // receiver may have been dropped
@@ -712,6 +714,8 @@ fn spawn_agent_tasks(
                         agent_id: handle.id.clone(),
                         delta: String::new(),
                         done: true,
+                        files: vec![],
+                        images: vec![],
                     });
                 }
                 // receiver may have been dropped (e.g. channel timeout)

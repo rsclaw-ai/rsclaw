@@ -82,6 +82,8 @@ impl super::runtime::AgentRuntime {
                                     agent_id: "cron".to_owned(),
                                     delta: msg_text,
                                     done: false,
+                                    files: vec![],
+                                    images: vec![],
                                 });
                                 // Send done signal
                                 let _ = bus.send(crate::events::AgentEvent {
@@ -89,6 +91,8 @@ impl super::runtime::AgentRuntime {
                                     agent_id: "cron".to_owned(),
                                     delta: String::new(),
                                     done: true,
+                                    files: vec![],
+                                    images: vec![],
                                 });
                             }
                         });
