@@ -1018,9 +1018,6 @@ impl AcpClient {
             id
         };
 
-        let guard = self.cmd_tx.lock().await;
-        let tx = guard.as_ref().context("Subprocess task died")?;
-
         let (resp_tx, mut resp_rx) = mpsc::channel(1);
 
         let request = serde_json::to_string(&serde_json::json!({
@@ -1032,12 +1029,17 @@ impl AcpClient {
 
         tracing::debug!(method, id, request = %request, "ACP sending request");
 
-        tx.send(SubprocessCmd::SendRequest {
-            request,
-            response_tx: resp_tx,
-        })
-        .await
-        .context("Failed to send request")?;
+        // Send request while holding the lock, then release lock before waiting for response
+        {
+            let guard = self.cmd_tx.lock().await;
+            let tx = guard.as_ref().context("Subprocess task died")?;
+            tx.send(SubprocessCmd::SendRequest {
+                request,
+                response_tx: resp_tx,
+            })
+            .await
+            .context("Failed to send request")?;
+        } // Lock released here
 
         let resp = timeout(LONG_TIMEOUT, resp_rx.recv())
             .await
@@ -1062,9 +1064,6 @@ impl AcpClient {
             id
         };
 
-        let guard = self.cmd_tx.lock().await;
-        let tx = guard.as_ref().context("Subprocess task died")?;
-
         let (resp_tx, mut resp_rx) = mpsc::channel(1);
 
         let request = serde_json::to_string(&serde_json::json!({
@@ -1076,12 +1075,17 @@ impl AcpClient {
 
         tracing::debug!(method, id, request = %request, "ACP sending request (no timeout)");
 
-        tx.send(SubprocessCmd::SendRequest {
-            request,
-            response_tx: resp_tx,
-        })
-        .await
-        .context("Failed to send request")?;
+        // Send request while holding the lock, then release lock before waiting for response
+        {
+            let guard = self.cmd_tx.lock().await;
+            let tx = guard.as_ref().context("Subprocess task died")?;
+            tx.send(SubprocessCmd::SendRequest {
+                request,
+                response_tx: resp_tx,
+            })
+            .await
+            .context("Failed to send request")?;
+        } // Lock released here
 
         // Wait indefinitely for response (session/prompt can take very long)
         let resp = resp_rx
@@ -1095,9 +1099,6 @@ impl AcpClient {
 
     /// Send a notification (no response expected)
     async fn send_notification(&self, method: &str, params: serde_json::Value) -> Result<()> {
-        let guard = self.cmd_tx.lock().await;
-        let tx = guard.as_ref().context("Subprocess task died")?;
-
         let notification = serde_json::to_string(&serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -1107,12 +1108,17 @@ impl AcpClient {
         // Send as request but don't wait for response
         let (resp_tx, _) = mpsc::channel(1);
 
-        tx.send(SubprocessCmd::SendRequest {
-            request: notification,
-            response_tx: resp_tx,
-        })
-        .await
-        .context("Failed to send notification")?;
+        // Send request while holding the lock, then release immediately
+        {
+            let guard = self.cmd_tx.lock().await;
+            let tx = guard.as_ref().context("Subprocess task died")?;
+            tx.send(SubprocessCmd::SendRequest {
+                request: notification,
+                response_tx: resp_tx,
+            })
+            .await
+            .context("Failed to send notification")?;
+        } // Lock released here
 
         Ok(())
     }
