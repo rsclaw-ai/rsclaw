@@ -418,6 +418,21 @@ impl AgentRuntime {
             .to_owned()
     }
 
+    /// Estimate fixed context overhead: system prompt + tools tokens.
+    /// Used for pre-flight context budget check before LLM call.
+    fn estimate_fixed_overhead(&self) -> usize {
+        // Estimate system prompt from last known size (more accurate than guessing).
+        let sys_tokens = self.handle.last_sys_tokens.load(Ordering::Relaxed);
+        let tools_tokens = self.handle.last_tools_tokens.load(Ordering::Relaxed);
+        if sys_tokens + tools_tokens > 0 {
+            sys_tokens + tools_tokens
+        } else {
+            // Fallback: rough estimate when no LLM call has happened yet.
+            // Typical system prompt ~3.5k tokens, tools ~1-2k.
+            3500 + 1000
+        }
+    }
+
     /// Resolve the "flash" (cheap/fast) model used for internal sub-tasks
     /// like query planning and intent classification. Resolution order:
     ///   1. `agents.<id>.flash_model`
