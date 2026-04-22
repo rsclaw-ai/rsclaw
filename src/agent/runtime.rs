@@ -2781,7 +2781,7 @@ impl AgentRuntime {
                             if let MessageContent::Parts(parts) = &m.content {
                                 for p in parts {
                                     if let ContentPart::ToolResult { tool_use_id, content, .. } = p {
-                                        if content.contains("\"status\": \"running\"") {
+                                        if content.contains("\"status\":\"running\"") || content.contains("\"status\": \"running\"") {
                                             return Some(tool_use_id.clone());
                                         }
                                     }
@@ -2803,7 +2803,7 @@ impl AgentRuntime {
                             if let MessageContent::Parts(parts) = &m.content {
                                 for p in parts {
                                     if let ContentPart::ToolResult { tool_use_id, content, .. } = p {
-                                        if ids_to_replace.contains(tool_use_id) && content.contains("\"status\": \"running\"") {
+                                        if ids_to_replace.contains(tool_use_id) && (content.contains("\"status\":\"running\"") || content.contains("\"status\": \"running\"")) {
                                             return false;
                                         }
                                     }
