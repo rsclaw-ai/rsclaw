@@ -31,4 +31,8 @@ pub struct AgentEvent {
     /// Non-empty only on the final `done = true` event.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+    /// Tool call log for this turn: (name, args_json, output_text).
+    /// Non-empty only on the final `done = true` event.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_log: Vec<(String, String, String)>,
 }

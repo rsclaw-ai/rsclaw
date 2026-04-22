@@ -3804,6 +3804,13 @@ function TauriConfigPageInner() {
             </div>
             <div style={fieldRow}>
               <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "旁路上下文预算" : "Bypass Context Budget"}</div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.btw_tokens ({zh ? "tokens" : "tokens"})</div>
+              </div>
+              <input style={{ ...fInput, minWidth: 100 }} type="number" min={1000} max={50000} step={1000} value={getVal("agents.defaults.btw_tokens", 10000)} onChange={(e) => updateConfig("agents.defaults.btw_tokens", parseInt(e.target.value) || 10000)} />
+            </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u8BF7\u6C42\u8D85\u65F6" : "Timeout"}</div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.timeoutSeconds ({zh ? "\u79D2" : "sec"})</div>
               </div>

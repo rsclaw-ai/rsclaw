@@ -2736,6 +2736,7 @@ impl AgentRuntime {
 
         let mut tool_images: Vec<String> = Vec::new();
         let mut tool_files: Vec<(String, String, String)> = Vec::new();
+        let mut tool_log: Vec<(String, String, String)> = Vec::new();
 
         // Inject completed async task results into the session.
         {
@@ -3273,6 +3274,7 @@ impl AgentRuntime {
                                     done: false,
                                     files: vec![],
                                     images: vec![],
+                                    tool_log: vec![],
                                 });
                             }
                             last_delta_flush = now;
@@ -3405,6 +3407,7 @@ impl AgentRuntime {
                         done: false,
                         files: vec![],
                         images: vec![],
+                        tool_log: vec![],
                     });
                 }
             }
@@ -3603,6 +3606,7 @@ impl AgentRuntime {
                         done: true,
                         files: tool_files.clone(),
                         images: tool_images.clone(),
+                        tool_log: tool_log.clone(),
                     });
                 }
 
@@ -3835,6 +3839,7 @@ impl AgentRuntime {
                 )
                 .await;
 
+                let tool_input_str = tool_input.to_string();
                 let result = self
                     .dispatch_tool(ctx, &tool_id, &tool_name, tool_input)
                     .await;
@@ -3929,6 +3934,33 @@ impl AgentRuntime {
                 };
 
                 tool_images.extend(result_images);
+
+                // Record tool call for frontend display (truncated to 4000 chars).
+                // Also emit immediately so the desktop chat shows results in real time.
+                {
+                    let args_str = tool_input_str;
+                    let out_str = if result_text.len() > 4000 {
+                        format!("{}…(truncated)", &result_text[..4000])
+                    } else {
+                        result_text.clone()
+                    };
+                    tool_log.push((tool_name.clone(), args_str, out_str.clone()));
+                    if let Some(ref bus) = self.event_bus {
+                        let marker = format!(
+                            "<rstool name=\"{}\">{}</rstool>",
+                            tool_name, out_str
+                        );
+                        let _ = bus.send(AgentEvent {
+                            session_id: ctx.session_key.clone(),
+                            agent_id: ctx.agent_id.clone(),
+                            delta: marker,
+                            done: false,
+                            files: vec![],
+                            images: vec![],
+                            tool_log: vec![],
+                        });
+                    }
+                }
 
                 // Auto-send files: any tool returning __send_file=true queues the
                 // file for delivery. Images go to tool_images, others to tool_files.

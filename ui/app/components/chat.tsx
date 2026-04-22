@@ -118,6 +118,40 @@ import clsx from "clsx";
 
 const localStorage = safeLocalStorage();
 
+/** Extract `<rstools>` tool call log appended by the agent runtime. */
+function extractRsTools(content: string): {
+  cleanContent: string;
+  rsTools: [string, string, string][];
+} {
+  const match = content.match(/<rstools>([\s\S]*?)<\/rstools>/);
+  if (!match) return { cleanContent: content, rsTools: [] };
+  try {
+    const data: [string, string, string][] = JSON.parse(match[1]);
+    return {
+      cleanContent: content.replace(/<rstools>[\s\S]*?<\/rstools>/, "").trimEnd(),
+      rsTools: Array.isArray(data) ? data : [],
+    };
+  } catch {
+    return { cleanContent: content, rsTools: [] };
+  }
+}
+
+/** Expand/collapse single tool output block. */
+function ToolOutputBlock({ name, args, output }: { name: string; args: string; output: string }) {
+  const [open, setOpen] = React.useState(false);
+  return (
+    <div className={styles["chat-tool-block"]}>
+      <div className={styles["chat-tool-block-header"]} onClick={() => setOpen((v) => !v)}>
+        <span className={styles["chat-tool-block-name"]}>{name}</span>
+        <span className={styles["chat-tool-block-toggle"]}>{open ? "▲" : "▼"}</span>
+      </div>
+      {open && (
+        <pre className={styles["chat-tool-block-output"]}>{output}</pre>
+      )}
+    </div>
+  );
+}
+
 /** Extract `<rsfiles>` attachment metadata appended by the agent runtime. */
 function extractRsFiles(content: string): {
   cleanContent: string;
@@ -1886,7 +1920,7 @@ function _Chat() {
                           <div className={styles["chat-message-item"]}>
                             <Markdown
                               key={message.streaming ? "loading" : "done"}
-                              content={extractRsFiles(!isUser ? getMessageContentOnly(message) : getMessageTextContent(message)).cleanContent}
+                              content={extractRsFiles(extractRsTools(!isUser ? getMessageContentOnly(message) : getMessageTextContent(message)).cleanContent).cleanContent}
                               loading={
                                 (message.preview || message.streaming) &&
                                 message.content.length === 0 &&
@@ -1939,30 +1973,35 @@ function _Chat() {
                             )}
                           </div>
                           {!isUser && !message.streaming && (() => {
-                            const { rsFiles, rsImages } = extractRsFiles(getMessageContentOnly(message));
-                            return (rsFiles.length > 0 || rsImages.length > 0) ? (
-                              <div className={styles["chat-file-chips"]}>
-                                {rsFiles.map(([name, , path], idx) => (
-                                  <span
-                                    key={idx}
-                                    className={styles["chat-file-chip"]}
-                                    title={path}
-                                    onClick={() => (window as any).__TAURI__?.invoke?.("open_path", { path })}
-                                  >
-                                    {name || path.split("/").pop() || path}
-                                  </span>
-                                ))}
-                                {rsImages.map((imgPath, idx) => (
-                                  <span
-                                    key={`img-${idx}`}
-                                    className={styles["chat-file-chip"]}
-                                    title={imgPath}
-                                    onClick={() => (window as any).__TAURI__?.invoke?.("open_path", { path: imgPath })}
-                                  >
-                                    {imgPath.split("/").pop() || imgPath}
-                                  </span>
-                                ))}
-                              </div>
+                            const raw = getMessageContentOnly(message);
+                            const { rsTools } = extractRsTools(raw);
+                            const { rsFiles, rsImages } = extractRsFiles(raw);
+                            return (rsTools.length > 0 || rsFiles.length > 0 || rsImages.length > 0) ? (
+                              <>
+                                {rsTools.length > 0 && (
+                                  <div className={styles["chat-tool-blocks"]}>
+                                    {rsTools.map(([name, args, output], idx) => (
+                                      <ToolOutputBlock key={idx} name={name} args={args} output={output} />
+                                    ))}
+                                  </div>
+                                )}
+                                {(rsFiles.length > 0 || rsImages.length > 0) && (
+                                  <div className={styles["chat-file-chips"]}>
+                                    {rsFiles.map(([name, , path], idx) => (
+                                      <span key={idx} className={styles["chat-file-chip"]} title={path}
+                                        onClick={() => (window as any).__TAURI__?.invoke?.("open_path", { path })}>
+                                        {name || path.split("/").pop() || path}
+                                      </span>
+                                    ))}
+                                    {rsImages.map((imgPath, idx) => (
+                                      <span key={`img-${idx}`} className={styles["chat-file-chip"]} title={imgPath}
+                                        onClick={() => (window as any).__TAURI__?.invoke?.("open_path", { path: imgPath })}>
+                                        {imgPath.split("/").pop() || imgPath}
+                                      </span>
+                                    ))}
+                                  </div>
+                                )}
+                              </>
                             ) : null;
                           })()}
                           {message?.audio_url && (

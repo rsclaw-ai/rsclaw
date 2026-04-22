@@ -706,6 +706,7 @@ fn spawn_agent_tasks(
                             done: false,
                             files: vec![],
                             images: vec![],
+                            tool_log: vec![],
                         });
                     }
                     // receiver may have been dropped
@@ -716,6 +717,7 @@ fn spawn_agent_tasks(
                         done: true,
                         files: vec![],
                         images: vec![],
+                        tool_log: vec![],
                     });
                 }
                 // receiver may have been dropped (e.g. channel timeout)

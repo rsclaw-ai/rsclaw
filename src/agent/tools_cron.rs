@@ -84,6 +84,7 @@ impl super::runtime::AgentRuntime {
                                     done: false,
                                     files: vec![],
                                     images: vec![],
+                                    tool_log: vec![],
                                 });
                                 // Send done signal
                                 let _ = bus.send(crate::events::AgentEvent {
@@ -93,6 +94,7 @@ impl super::runtime::AgentRuntime {
                                     done: true,
                                     files: vec![],
                                     images: vec![],
+                                    tool_log: vec![],
                                 });
                             }
                         });

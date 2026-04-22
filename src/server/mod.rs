@@ -1504,6 +1504,9 @@ async fn openai_chat_completions(
                         if !event.images.is_empty() {
                             stop["rsclaw_images"] = serde_json::json!(event.images);
                         }
+                        if !event.tool_log.is_empty() {
+                            stop["rsclaw_tool_log"] = serde_json::json!(event.tool_log);
+                        }
                         return Some(format!("data: {stop}\n\ndata: [DONE]\n\n"));
                     }
                     if event.delta.is_empty() { return None; }

@@ -256,13 +256,17 @@ export class ChatGPTApi implements LLMApi {
                   fullText += delta;
                   options.onUpdate?.(fullText, delta);
                 }
-                // Attach file/image paths produced by agent tools.
+                // Attach file/image paths and tool log produced by agent tools.
                 const finishReason = parsed.choices?.[0]?.finish_reason;
                 if (finishReason === "stop") {
                   const files: [string, string, string][] = parsed.rsclaw_files || [];
                   const images: string[] = parsed.rsclaw_images || [];
                   if (files.length > 0 || images.length > 0) {
                     fullText += `\n\n<rsfiles>${JSON.stringify({ f: files, i: images })}</rsfiles>`;
+                  }
+                  const toolLog: [string, string, string][] = parsed.rsclaw_tool_log || [];
+                  if (toolLog.length > 0) {
+                    fullText += `\n\n<rstools>${JSON.stringify(toolLog)}</rstools>`;
                   }
                 }
               } catch {
