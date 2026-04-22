@@ -29,21 +29,30 @@ export function useNotificationWs() {
 
         ws.onopen = () => {
           retryRef.current = 0;
-          // Send hello/connect handshake
-          const connectMsg = {
-            method: "connect",
-            params: {
-              client: "desktop-ui",
-              version: "1.0.0",
-              auth: token ? { token } : undefined,
-            },
-          };
-          ws.send(JSON.stringify(connectMsg));
+          // Wait for connect.challenge before sending connect req
         };
 
         ws.onmessage = (event) => {
           try {
             const data = JSON.parse(event.data);
+
+            // Step 1: server sends connect.challenge — respond with connect req
+            if (data.event === "connect.challenge") {
+              const connectReq = {
+                type: "req",
+                id: "1",
+                method: "connect",
+                params: {
+                  client: "desktop-ui",
+                  min_protocol: 3,
+                  max_protocol: 3,
+                  auth: token ? { token } : undefined,
+                },
+              };
+              ws.send(JSON.stringify(connectReq));
+              return;
+            }
+
             // Handle notification events from cron/system
             if (data.event === "notification" || data.type === "notification") {
               const text =
@@ -53,7 +62,6 @@ export function useNotificationWs() {
                 "";
               if (text) {
                 showToast(text, undefined, 10000);
-                // Also try browser notification if permitted
                 if (Notification?.permission === "granted") {
                   new Notification("RsClaw", { body: text });
                 }
