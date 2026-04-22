@@ -192,7 +192,7 @@ impl ClawhubClient {
         let token = std::env::var("CLAWHUB_TOKEN").ok();
         Self {
             client: Client::builder()
-                .user_agent(concat!("rsclaw/", env!("RSCLAW_BUILD_VERSION")))
+                .user_agent("rsclaw/dev")
                 .build()
                 .expect("reqwest client"),
             base_url: CLAWHUB_API_BASE.to_owned(),

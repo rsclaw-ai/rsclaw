@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 use super::prompt_builder::build_base_system_prompt;
 use super::registry::{AgentMessage, AgentReply};
-use super::runtime::{persist_agent_to_config, AgentRuntime, RunContext, DEFAULT_TIMEOUT_SECONDS};
+use super::runtime::{persist_agent_to_config, update_agent_in_config, AgentRuntime, RunContext, DEFAULT_TIMEOUT_SECONDS};
 
 impl AgentRuntime {
     // -------------------------------------------------------------------
@@ -84,6 +84,7 @@ impl AgentRuntime {
                 context_tokens: None,
                 max_tokens: None,
             }),
+            flash_model: None,
             lane: None,
             lane_concurrency: None,
             group_chat: None,
@@ -190,6 +191,7 @@ impl AgentRuntime {
                 context_tokens: None,
                 max_tokens: None,
             }),
+            flash_model: None,
             lane: None,
             lane_concurrency: None,
             group_chat: None,
@@ -436,6 +438,17 @@ impl AgentRuntime {
         }))
     }
 
+    /// Update fields of a named agent in the config file (model, name).
+    /// The hot-reload watcher applies the change within seconds — no restart needed.
+    async fn tool_agent_update(&self, args: Value) -> Result<Value> {
+        let id = args["id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("agent_update: `id` required"))?;
+        let model = args["model"].as_str();
+        let name = args["name"].as_str();
+        update_agent_in_config(id, model, name).await
+    }
+
     async fn tool_agent_list(&self) -> Result<Value> {
         let agents = match &self.agents {
             Some(reg) => reg
@@ -462,6 +475,7 @@ impl AgentRuntime {
             "task" => self.tool_agent_task(ctx, args).await,
             "send" => self.tool_agent_send(ctx, args).await,
             "list" => self.tool_agent_list().await,
+            "update" => self.tool_agent_update(args).await,
             "kill" => {
                 let id = args["id"]
                     .as_str()
@@ -472,7 +486,7 @@ impl AgentRuntime {
                     "note": "agent termination not yet implemented; agent will stop on next idle timeout"
                 }))
             }
-            _ => bail!("agent: unknown action '{action}' (spawn, task, list, kill)"),
+            _ => bail!("agent: unknown action '{action}' (spawn, task, send, list, update, kill)"),
         }
     }
 }

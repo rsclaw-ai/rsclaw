@@ -9,7 +9,7 @@
 use std::{collections::HashMap, process::Stdio, sync::Arc};
 
 use anyhow::{Context, Result};
-use async_trait::async_trait;
+use futures::future::BoxFuture;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
@@ -26,61 +26,59 @@ pub const LONG_TIMEOUT: Duration = Duration::from_secs(300);
 // Callback Handlers (Agent → Client)
 // ---------------------------------------------------------------------------
 
-/// Handler for Agent → Client requests (permissions, fs, terminal)
-/// Note: async_trait is required here because this trait is used as dyn AcpCallbackHandler.
-/// Native async fn in trait is not object-safe in stable Rust.
-#[async_trait]
+/// Handler for Agent -> Client requests (permissions, fs, terminal).
+/// Uses BoxFuture for dyn-safety (used as `dyn AcpCallbackHandler`).
 pub trait AcpCallbackHandler: Send + Sync {
     /// Handle permission request from agent
-    async fn handle_request_permission(
+    fn handle_request_permission(
         &self,
         session_id: &SessionId,
         tool_call_id: &str,
         options: Vec<PermissionOption>,
-    ) -> RequestPermissionOutcome;
+    ) -> BoxFuture<'_, RequestPermissionOutcome>;
 
     /// Handle file read request from agent
-    async fn handle_read_text_file(&self, session_id: &SessionId, path: &str) -> Result<String>;
+    fn handle_read_text_file(&self, session_id: &SessionId, path: &str) -> BoxFuture<'_, Result<String>>;
 
     /// Handle file write request from agent
-    async fn handle_write_text_file(
+    fn handle_write_text_file(
         &self,
         session_id: &SessionId,
         path: &str,
         contents: &str,
-    ) -> Result<()>;
+    ) -> BoxFuture<'_, Result<()>>;
 
     /// Handle terminal create request from agent
-    async fn handle_terminal_create(
+    fn handle_terminal_create(
         &self,
         session_id: &SessionId,
         command: Option<&str>,
         args: Option<Vec<String>>,
-    ) -> Result<String>;
+    ) -> BoxFuture<'_, Result<String>>;
 
     /// Handle terminal output request from agent
-    async fn handle_terminal_output(
+    fn handle_terminal_output(
         &self,
         session_id: &SessionId,
         terminal_id: &str,
-    ) -> Result<TerminalOutputResponse>;
+    ) -> BoxFuture<'_, Result<TerminalOutputResponse>>;
 
     /// Handle terminal kill request from agent
-    async fn handle_terminal_kill(&self, session_id: &SessionId, terminal_id: &str) -> Result<()>;
+    fn handle_terminal_kill(&self, session_id: &SessionId, terminal_id: &str) -> BoxFuture<'_, Result<()>>;
 
     /// Handle terminal release request from agent
-    async fn handle_terminal_release(
+    fn handle_terminal_release(
         &self,
         session_id: &SessionId,
         terminal_id: &str,
-    ) -> Result<()>;
+    ) -> BoxFuture<'_, Result<()>>;
 
     /// Handle terminal wait for exit request from agent
-    async fn handle_terminal_wait_for_exit(
+    fn handle_terminal_wait_for_exit(
         &self,
         session_id: &SessionId,
         terminal_id: &str,
-    ) -> Result<Option<i32>>;
+    ) -> BoxFuture<'_, Result<Option<i32>>>;
 }
 
 /// Default callback handler that auto-approves everything.
@@ -89,117 +87,135 @@ pub trait AcpCallbackHandler: Send + Sync {
 // implementations.  Extract a shared helper or blanket impl to reduce duplication.
 pub struct DefaultAcpHandler;
 
-#[async_trait]
 impl AcpCallbackHandler for DefaultAcpHandler {
-    async fn handle_request_permission(
+    fn handle_request_permission(
         &self,
         _session_id: &SessionId,
         _tool_call_id: &str,
         options: Vec<PermissionOption>,
-    ) -> RequestPermissionOutcome {
-        // Log all options for debugging
-        tracing::debug!(
-            options = ?options.iter().map(|o| (&o.option_id, &o.kind)).collect::<Vec<_>>(),
-            "handle_request_permission: received options"
-        );
+    ) -> BoxFuture<'_, RequestPermissionOutcome> {
+        Box::pin(async move {
+            // Log all options for debugging
+            tracing::debug!(
+                options = ?options.iter().map(|o| (&o.option_id, &o.kind)).collect::<Vec<_>>(),
+                "handle_request_permission: received options"
+            );
 
-        // Auto-approve any non-reject option (more lenient for different agent implementations)
-        for opt in options {
-            // Match any "allow" type option
-            if matches!(
-                opt.kind,
-                PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways
-            ) {
-                tracing::debug!(
-                    option_id = %opt.option_id,
-                    kind = ?opt.kind,
-                    "handle_request_permission: auto-approving"
-                );
-                return RequestPermissionOutcome::Selected {
-                    option_id: opt.option_id,
-                };
+            // Auto-approve any non-reject option (more lenient for different agent implementations)
+            for opt in options {
+                // Match any "allow" type option
+                if matches!(
+                    opt.kind,
+                    PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways
+                ) {
+                    tracing::debug!(
+                        option_id = %opt.option_id,
+                        kind = ?opt.kind,
+                        "handle_request_permission: auto-approving"
+                    );
+                    return RequestPermissionOutcome::Selected {
+                        option_id: opt.option_id,
+                    };
+                }
+                // Also approve if option_id contains "allow" or "accept" (fallback for non-standard formats)
+                if opt.option_id.contains("allow") || opt.option_id.contains("accept") {
+                    tracing::debug!(
+                        option_id = %opt.option_id,
+                        "handle_request_permission: auto-approving by option_id pattern"
+                    );
+                    return RequestPermissionOutcome::Selected {
+                        option_id: opt.option_id,
+                    };
+                }
             }
-            // Also approve if option_id contains "allow" or "accept" (fallback for non-standard formats)
-            if opt.option_id.contains("allow") || opt.option_id.contains("accept") {
-                tracing::debug!(
-                    option_id = %opt.option_id,
-                    "handle_request_permission: auto-approving by option_id pattern"
-                );
-                return RequestPermissionOutcome::Selected {
-                    option_id: opt.option_id,
-                };
-            }
-        }
-        tracing::warn!("handle_request_permission: no matching allow option found, cancelling");
-        RequestPermissionOutcome::Cancelled
+            tracing::warn!("handle_request_permission: no matching allow option found, cancelling");
+            RequestPermissionOutcome::Cancelled
+        })
     }
 
-    async fn handle_read_text_file(&self, _session_id: &SessionId, path: &str) -> Result<String> {
-        tokio::fs::read_to_string(path)
-            .await
-            .context("Failed to read file")
+    fn handle_read_text_file(&self, _session_id: &SessionId, path: &str) -> BoxFuture<'_, Result<String>> {
+        let path = path.to_owned();
+        Box::pin(async move {
+            tokio::fs::read_to_string(&path)
+                .await
+                .context("Failed to read file")
+        })
     }
 
-    async fn handle_write_text_file(
+    fn handle_write_text_file(
         &self,
         _session_id: &SessionId,
         path: &str,
         contents: &str,
-    ) -> Result<()> {
-        tokio::fs::write(path, contents)
-            .await
-            .context("Failed to write file")
+    ) -> BoxFuture<'_, Result<()>> {
+        let path = path.to_owned();
+        let contents = contents.to_owned();
+        Box::pin(async move {
+            tokio::fs::write(&path, &contents)
+                .await
+                .context("Failed to write file")
+        })
     }
 
-    async fn handle_terminal_create(
+    fn handle_terminal_create(
         &self,
         _session_id: &SessionId,
         _command: Option<&str>,
         _args: Option<Vec<String>>,
-    ) -> Result<String> {
-        Err(anyhow::anyhow!(
-            "Terminal operations not implemented in DefaultAcpHandler. Implement custom AcpCallbackHandler to enable terminal support."
-        ))
+    ) -> BoxFuture<'_, Result<String>> {
+        Box::pin(async move {
+            Err(anyhow::anyhow!(
+                "Terminal operations not implemented in DefaultAcpHandler. Implement custom AcpCallbackHandler to enable terminal support."
+            ))
+        })
     }
 
-    async fn handle_terminal_output(
+    fn handle_terminal_output(
         &self,
         _session_id: &SessionId,
         _terminal_id: &str,
-    ) -> Result<TerminalOutputResponse> {
-        Err(anyhow::anyhow!(
-            "Terminal operations not implemented in DefaultAcpHandler"
-        ))
+    ) -> BoxFuture<'_, Result<TerminalOutputResponse>> {
+        Box::pin(async move {
+            Err(anyhow::anyhow!(
+                "Terminal operations not implemented in DefaultAcpHandler"
+            ))
+        })
     }
 
-    async fn handle_terminal_kill(
+    fn handle_terminal_kill(
         &self,
         _session_id: &SessionId,
         _terminal_id: &str,
-    ) -> Result<()> {
-        Err(anyhow::anyhow!(
-            "Terminal operations not implemented in DefaultAcpHandler"
-        ))
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            Err(anyhow::anyhow!(
+                "Terminal operations not implemented in DefaultAcpHandler"
+            ))
+        })
     }
 
-    async fn handle_terminal_release(
+    fn handle_terminal_release(
         &self,
         _session_id: &SessionId,
         _terminal_id: &str,
-    ) -> Result<()> {
-        Err(anyhow::anyhow!(
-            "Terminal operations not implemented in DefaultAcpHandler"
-        ))
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            Err(anyhow::anyhow!(
+                "Terminal operations not implemented in DefaultAcpHandler"
+            ))
+        })
     }
 
-    async fn handle_terminal_wait_for_exit(
+    fn handle_terminal_wait_for_exit(
         &self,
         _session_id: &SessionId,
         _terminal_id: &str,
-    ) -> Result<Option<i32>> {
-        Err(anyhow::anyhow!(
-            "Terminal operations not implemented in DefaultAcpHandler"
-        ))
+    ) -> BoxFuture<'_, Result<Option<i32>>> {
+        Box::pin(async move {
+            Err(anyhow::anyhow!(
+                "Terminal operations not implemented in DefaultAcpHandler"
+            ))
+        })
     }
 }
 
@@ -226,177 +242,200 @@ impl DefaultAcpHandlerWithTerminal {
     }
 }
 
-#[async_trait]
 impl AcpCallbackHandler for DefaultAcpHandlerWithTerminal {
-    async fn handle_request_permission(
+    fn handle_request_permission(
         &self,
         _session_id: &SessionId,
         _tool_call_id: &str,
         options: Vec<PermissionOption>,
-    ) -> RequestPermissionOutcome {
-        // Log all options for debugging
-        tracing::debug!(
-            options = ?options.iter().map(|o| (&o.option_id, &o.kind)).collect::<Vec<_>>(),
-            "handle_request_permission: received options"
-        );
+    ) -> BoxFuture<'_, RequestPermissionOutcome> {
+        Box::pin(async move {
+            // Log all options for debugging
+            tracing::debug!(
+                options = ?options.iter().map(|o| (&o.option_id, &o.kind)).collect::<Vec<_>>(),
+                "handle_request_permission: received options"
+            );
 
-        // Auto-approve any non-reject option (more lenient for different agent implementations)
-        for opt in options {
-            // Match any "allow" type option
-            if matches!(
-                opt.kind,
-                PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways
-            ) {
-                tracing::debug!(
-                    option_id = %opt.option_id,
-                    kind = ?opt.kind,
-                    "handle_request_permission: auto-approving"
-                );
-                return RequestPermissionOutcome::Selected {
-                    option_id: opt.option_id,
-                };
+            // Auto-approve any non-reject option (more lenient for different agent implementations)
+            for opt in options {
+                // Match any "allow" type option
+                if matches!(
+                    opt.kind,
+                    PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways
+                ) {
+                    tracing::debug!(
+                        option_id = %opt.option_id,
+                        kind = ?opt.kind,
+                        "handle_request_permission: auto-approving"
+                    );
+                    return RequestPermissionOutcome::Selected {
+                        option_id: opt.option_id,
+                    };
+                }
+                // Also approve if option_id contains "allow" or "accept" (fallback for non-standard formats)
+                if opt.option_id.contains("allow") || opt.option_id.contains("accept") {
+                    tracing::debug!(
+                        option_id = %opt.option_id,
+                        "handle_request_permission: auto-approving by option_id pattern"
+                    );
+                    return RequestPermissionOutcome::Selected {
+                        option_id: opt.option_id,
+                    };
+                }
             }
-            // Also approve if option_id contains "allow" or "accept" (fallback for non-standard formats)
-            if opt.option_id.contains("allow") || opt.option_id.contains("accept") {
-                tracing::debug!(
-                    option_id = %opt.option_id,
-                    "handle_request_permission: auto-approving by option_id pattern"
-                );
-                return RequestPermissionOutcome::Selected {
-                    option_id: opt.option_id,
-                };
-            }
-        }
-        tracing::warn!("handle_request_permission: no matching allow option found, cancelling");
-        RequestPermissionOutcome::Cancelled
+            tracing::warn!("handle_request_permission: no matching allow option found, cancelling");
+            RequestPermissionOutcome::Cancelled
+        })
     }
 
-    async fn handle_read_text_file(&self, _session_id: &SessionId, path: &str) -> Result<String> {
-        tokio::fs::read_to_string(path)
-            .await
-            .context("Failed to read file")
+    fn handle_read_text_file(&self, _session_id: &SessionId, path: &str) -> BoxFuture<'_, Result<String>> {
+        let path = path.to_owned();
+        Box::pin(async move {
+            tokio::fs::read_to_string(&path)
+                .await
+                .context("Failed to read file")
+        })
     }
 
-    async fn handle_write_text_file(
+    fn handle_write_text_file(
         &self,
         _session_id: &SessionId,
         path: &str,
         contents: &str,
-    ) -> Result<()> {
-        tokio::fs::write(path, contents)
-            .await
-            .context("Failed to write file")
+    ) -> BoxFuture<'_, Result<()>> {
+        let path = path.to_owned();
+        let contents = contents.to_owned();
+        Box::pin(async move {
+            tokio::fs::write(&path, &contents)
+                .await
+                .context("Failed to write file")
+        })
     }
 
-    async fn handle_terminal_create(
+    fn handle_terminal_create(
         &self,
         _session_id: &SessionId,
         command: Option<&str>,
         _args: Option<Vec<String>>,
-    ) -> Result<String> {
-        let default_shell = if cfg!(target_os = "windows") { "powershell.exe" } else { "sh" };
-        let shell = command.unwrap_or(default_shell);
-        let mut cmd = Command::new(shell);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        let child = cmd.spawn()
-            .context("Failed to spawn terminal process")?;
-        let terminal_id = format!("terminal-{}", uuid::Uuid::new_v4());
+    ) -> BoxFuture<'_, Result<String>> {
+        let command = command.map(|s| s.to_owned());
+        Box::pin(async move {
+            let default_shell = if cfg!(target_os = "windows") { "powershell.exe" } else { "sh" };
+            let shell = command.as_deref().unwrap_or(default_shell);
+            let mut cmd = Command::new(shell);
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x08000000;
+                cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+            let child = cmd.spawn()
+                .context("Failed to spawn terminal process")?;
+            let terminal_id = format!("terminal-{}", uuid::Uuid::new_v4());
 
-        let mut state = self.state.lock().await;
-        state.terminals.insert(terminal_id.clone(), child);
+            let mut state = self.state.lock().await;
+            state.terminals.insert(terminal_id.clone(), child);
 
-        tracing::info!(terminal_id = %terminal_id, "terminal created");
-        Ok(terminal_id)
-    }
-
-    async fn handle_terminal_output(
-        &self,
-        _session_id: &SessionId,
-        terminal_id: &str,
-    ) -> Result<TerminalOutputResponse> {
-        let mut state = self.state.lock().await;
-
-        let child = state
-            .terminals
-            .get_mut(terminal_id)
-            .ok_or_else(|| anyhow::anyhow!("terminal not found: {}", terminal_id))?;
-
-        let mut stdout_buf = String::new();
-        let mut stderr_buf = String::new();
-
-        if let Some(stdout) = child.stdout.as_mut() {
-            let mut reader = BufReader::new(stdout);
-            reader.read_line(&mut stdout_buf).await.ok();
-        }
-
-        if let Some(stderr) = child.stderr.as_mut() {
-            let mut reader = BufReader::new(stderr);
-            reader.read_line(&mut stderr_buf).await.ok();
-        }
-
-        let exit = match child.try_wait()? {
-            Some(status) => status.code(),
-            None => None,
-        };
-
-        tracing::debug!(terminal_id = %terminal_id, "terminal output read");
-
-        Ok(TerminalOutputResponse {
-            exit,
-            stdout: stdout_buf,
-            stderr: stderr_buf,
+            tracing::info!(terminal_id = %terminal_id, "terminal created");
+            Ok(terminal_id)
         })
     }
 
-    async fn handle_terminal_kill(&self, _session_id: &SessionId, terminal_id: &str) -> Result<()> {
-        let mut state = self.state.lock().await;
-
-        if let Some(mut child) = state.terminals.remove(terminal_id) {
-            child.kill().await.ok();
-            tracing::info!(terminal_id = %terminal_id, "terminal killed");
-        }
-
-        Ok(())
-    }
-
-    async fn handle_terminal_release(
+    fn handle_terminal_output(
         &self,
         _session_id: &SessionId,
         terminal_id: &str,
-    ) -> Result<()> {
-        let mut state = self.state.lock().await;
+    ) -> BoxFuture<'_, Result<TerminalOutputResponse>> {
+        let terminal_id = terminal_id.to_owned();
+        Box::pin(async move {
+            let mut state = self.state.lock().await;
 
-        if let Some(mut child) = state.terminals.remove(terminal_id) {
-            child.wait().await.ok();
-            tracing::info!(terminal_id = %terminal_id, "terminal released");
-        }
+            let child = state
+                .terminals
+                .get_mut(&terminal_id)
+                .ok_or_else(|| anyhow::anyhow!("terminal not found: {}", terminal_id))?;
 
-        Ok(())
+            let mut stdout_buf = String::new();
+            let mut stderr_buf = String::new();
+
+            if let Some(stdout) = child.stdout.as_mut() {
+                let mut reader = BufReader::new(stdout);
+                reader.read_line(&mut stdout_buf).await.ok();
+            }
+
+            if let Some(stderr) = child.stderr.as_mut() {
+                let mut reader = BufReader::new(stderr);
+                reader.read_line(&mut stderr_buf).await.ok();
+            }
+
+            let exit = match child.try_wait()? {
+                Some(status) => status.code(),
+                None => None,
+            };
+
+            tracing::debug!(terminal_id = %terminal_id, "terminal output read");
+
+            Ok(TerminalOutputResponse {
+                exit,
+                stdout: stdout_buf,
+                stderr: stderr_buf,
+            })
+        })
     }
 
-    async fn handle_terminal_wait_for_exit(
+    fn handle_terminal_kill(&self, _session_id: &SessionId, terminal_id: &str) -> BoxFuture<'_, Result<()>> {
+        let terminal_id = terminal_id.to_owned();
+        Box::pin(async move {
+            let mut state = self.state.lock().await;
+
+            if let Some(mut child) = state.terminals.remove(&terminal_id) {
+                child.kill().await.ok();
+                tracing::info!(terminal_id = %terminal_id, "terminal killed");
+            }
+
+            Ok(())
+        })
+    }
+
+    fn handle_terminal_release(
         &self,
         _session_id: &SessionId,
         terminal_id: &str,
-    ) -> Result<Option<i32>> {
-        let mut state = self.state.lock().await;
+    ) -> BoxFuture<'_, Result<()>> {
+        let terminal_id = terminal_id.to_owned();
+        Box::pin(async move {
+            let mut state = self.state.lock().await;
 
-        if let Some(child) = state.terminals.get_mut(terminal_id) {
-            let status = child.wait().await.context("Failed to wait for terminal")?;
-            let code = status.code();
-            tracing::info!(terminal_id = %terminal_id, exit_code = ?code, "terminal exited");
-            return Ok(code);
-        }
+            if let Some(mut child) = state.terminals.remove(&terminal_id) {
+                child.wait().await.ok();
+                tracing::info!(terminal_id = %terminal_id, "terminal released");
+            }
 
-        Ok(None)
+            Ok(())
+        })
+    }
+
+    fn handle_terminal_wait_for_exit(
+        &self,
+        _session_id: &SessionId,
+        terminal_id: &str,
+    ) -> BoxFuture<'_, Result<Option<i32>>> {
+        let terminal_id = terminal_id.to_owned();
+        Box::pin(async move {
+            let mut state = self.state.lock().await;
+
+            if let Some(child) = state.terminals.get_mut(&terminal_id) {
+                let status = child.wait().await.context("Failed to wait for terminal")?;
+                let code = status.code();
+                tracing::info!(terminal_id = %terminal_id, exit_code = ?code, "terminal exited");
+                return Ok(code);
+            }
+
+            Ok(None)
+        })
     }
 }
 

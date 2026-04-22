@@ -10,7 +10,7 @@ pub async fn cmd_secrets(sub: SecretsCommand) -> Result<()> {
             ok("secrets reloaded -- restart the gateway to apply (hot reload not supported for secrets)");
         }
         SecretsCommand::Audit => {
-            banner(&format!("rsclaw secrets audit v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!("rsclaw secrets audit v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
             let secrets = config.ops.secrets.as_ref();
             if let Some(s) = secrets {
                 println!(
@@ -26,7 +26,7 @@ pub async fn cmd_secrets(sub: SecretsCommand) -> Result<()> {
             }
         }
         SecretsCommand::Configure => {
-            banner(&format!("rsclaw secrets configure v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!("rsclaw secrets configure v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
             println!("  Add a secrets provider to rsclaw.json5:");
             println!();
             println!("  {}", dim(r#"secrets: {"#));

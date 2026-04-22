@@ -1206,7 +1206,7 @@ async fn parse_sse_chunk_with_buffer(
                 if let Some(event) = parse_event(data) {
                     events.push(Ok(event));
                 } else {
-                    tracing::warn!(data, "openai: unparsed SSE data");
+                    tracing::debug!(data, "openai: unparsed SSE data");
                 }
             }
         }

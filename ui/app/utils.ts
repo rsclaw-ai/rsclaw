@@ -6,6 +6,7 @@ import {
   REQUEST_TIMEOUT_MS,
   REQUEST_TIMEOUT_MS_FOR_THINKING,
   ServiceProvider,
+  RELEASE_URL,
 } from "./constant";
 import { fetch as tauriStreamFetch } from "./utils/stream";
 import { isTauri } from "./utils/tauri";
@@ -500,18 +501,16 @@ export function getOperationId(operation: {
 }
 
 export async function clientUpdate() {
-  // Updater not currently active — stub for future use
-  if (!isTauri) return;
   try {
-    const { check } = await import("@tauri-apps/plugin-updater");
-    const update = await check();
-    if (update) {
-      await update.downloadAndInstall();
-      showToast(Locale.Settings.Update.Success);
+    if (isTauri) {
+      const { open } = await import("@tauri-apps/plugin-shell");
+      await open(RELEASE_URL);
+    } else {
+      window.open(RELEASE_URL, "_blank");
     }
   } catch (e) {
     console.error("[Update Error]", e);
-    showToast(Locale.Settings.Update.Failed);
+    window.open(RELEASE_URL, "_blank");
   }
 }
 

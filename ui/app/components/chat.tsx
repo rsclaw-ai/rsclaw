@@ -32,6 +32,8 @@ import ConfirmIcon from "../icons/confirm.svg";
 import CloseIcon from "../icons/close.svg";
 import CancelIcon from "../icons/cancel.svg";
 import ImageIcon from "../icons/image.svg";
+import ToolIcon from "../icons/tool.svg";
+import AddIcon from "../icons/add.svg";
 
 import LightIcon from "../icons/light.svg";
 import DarkIcon from "../icons/dark.svg";
@@ -117,6 +119,224 @@ import { getModelProvider } from "../utils/model";
 import clsx from "clsx";
 
 const localStorage = safeLocalStorage();
+
+type ChatChunk =
+  | { kind: "text"; content: string }
+  | { kind: "tool"; name: string; output: string };
+
+/** Parse an assistant message into a sequence of text and inline tool chunks.
+ *  Tool chunks come from `<rstool name="...">output</rstool>` markers emitted
+ *  by the agent runtime during streaming. Handles unclosed tags at the end so
+ *  partial tool output renders inline while still streaming.
+ *  Text chunks are cleaned of `<rstools>` / `<rsfiles>` wrappers (those are
+ *  end-of-turn metadata consumed separately). */
+function parseAssistantChunks(content: string): ChatChunk[] {
+  const chunks: ChatChunk[] = [];
+  let idx = 0;
+  const openRe = /<rstool\s+name="([^"]*)"\s*>/;
+
+  while (idx < content.length) {
+    const rest = content.slice(idx);
+    const m = openRe.exec(rest);
+    if (!m) {
+      chunks.push({ kind: "text", content: rest });
+      break;
+    }
+    if (m.index > 0) {
+      chunks.push({ kind: "text", content: rest.slice(0, m.index) });
+    }
+    const start = idx + m.index + m[0].length;
+    const closeIdx = content.indexOf("</rstool>", start);
+    if (closeIdx === -1) {
+      // Streaming: unclosed tag — show partial output as a tool block
+      chunks.push({ kind: "tool", name: m[1], output: content.slice(start) });
+      break;
+    }
+    chunks.push({ kind: "tool", name: m[1], output: content.slice(start, closeIdx) });
+    idx = closeIdx + "</rstool>".length;
+  }
+
+  return chunks
+    .map((c) =>
+      c.kind === "text"
+        ? {
+            kind: "text" as const,
+            content: c.content
+              .replace(/<rstools>[\s\S]*?<\/rstools>/g, "")
+              .replace(/<rsfiles>[\s\S]*?<\/rsfiles>/g, ""),
+          }
+        : c,
+    )
+    .filter((c) => c.kind !== "text" || c.content.trim().length > 0);
+}
+
+/** Back-compat wrapper: returns cleanContent + tool list.
+ *  Kept for the "file chips below" rendering path; tools are now rendered
+ *  inline via parseAssistantChunks so callers that only need cleanContent
+ *  still get accurate stripped text. */
+function extractRsTools(content: string): {
+  cleanContent: string;
+  rsTools: [string, string, string][];
+} {
+  const chunks = parseAssistantChunks(content);
+  const textParts: string[] = [];
+  const tools: [string, string, string][] = [];
+  for (const c of chunks) {
+    if (c.kind === "text") textParts.push(c.content);
+    else tools.push([c.name, "", c.output]);
+  }
+  return { cleanContent: textParts.join("").trimEnd(), rsTools: tools };
+}
+
+/** Animated chevron SVG used for collapse/expand controls. */
+function ChevronSvg({ open, className }: { open: boolean; className?: string }) {
+  return (
+    <svg
+      className={className}
+      data-open={open ? "true" : "false"}
+      width="12"
+      height="12"
+      viewBox="0 0 12 12"
+      fill="none"
+    >
+      <path
+        d="M2.5 4L6 7.5L9.5 4"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+/** Extract first `$ ...` command line for header preview. */
+function extractCmdPreview(output: string): string {
+  const line = output.split("\n").find((l) => /^\$\s/.test(l));
+  if (!line) return "";
+  return line.replace(/^\$\s*/, "").slice(0, 72);
+}
+
+/** Expand/collapse single tool output block. */
+function ToolOutputBlock({ name, args, output }: { name: string; args: string; output: string }) {
+  const [open, setOpen] = React.useState(false);
+
+  const lines = output.split("\n");
+  const cmdPreview = extractCmdPreview(output);
+
+  function lineClass(line: string): string {
+    if (/^\$\s|^>\s/.test(line)) return styles["tool-line-cmd"];
+    if (/^\[stderr\]|^\[error\]|^error:/i.test(line)) return styles["tool-line-err"];
+    if (/^\[exit code:/i.test(line)) return styles["tool-line-exit"];
+    return styles["tool-line-out"];
+  }
+
+  return (
+    <div className={styles["chat-tool-block"]}>
+      <div className={styles["chat-tool-block-header"]} onClick={() => setOpen((v) => !v)}>
+        <ToolIcon className={styles["chat-tool-block-icon"]} />
+        <div className={styles["chat-tool-block-title"]}>
+          <span className={styles["chat-tool-block-name"]}>{name}</span>
+          {cmdPreview && (
+            <span className={styles["chat-tool-block-cmd"]}>{cmdPreview}</span>
+          )}
+        </div>
+        <ChevronSvg open={open} className={styles["chat-tool-block-chevron"]} />
+      </div>
+      {open && (
+        <div className={styles["chat-tool-block-output"]}>
+          {lines.map((line, i) => (
+            <div key={i} className={lineClass(line)}>
+              {line || "\u00a0"}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Group consecutive tool chunks for display, mirroring Claude Code's "Ran N tools" pattern. */
+type ToolItem = { name: string; output: string };
+type RenderGroup =
+  | { kind: "text"; content: string; idx: number }
+  | { kind: "tools"; items: ToolItem[]; startIdx: number };
+
+function groupChatChunks(chunks: ChatChunk[]): RenderGroup[] {
+  const result: RenderGroup[] = [];
+  let i = 0;
+  while (i < chunks.length) {
+    const c = chunks[i];
+    if (c.kind === "text") {
+      result.push({ kind: "text", content: c.content, idx: i });
+      i++;
+    } else {
+      const items: ToolItem[] = [];
+      const startIdx = i;
+      while (i < chunks.length && chunks[i].kind === "tool") {
+        const tc = chunks[i] as { kind: "tool"; name: string; output: string };
+        items.push({ name: tc.name, output: tc.output });
+        i++;
+      }
+      result.push({ kind: "tools", items, startIdx });
+    }
+  }
+  return result;
+}
+
+/** Renders a group of one or more consecutive tool calls. */
+function ToolGroupBlock({ items, streaming }: { items: ToolItem[]; streaming?: boolean }) {
+  const [open, setOpen] = useState(false);
+  const isCn = getLang() === "cn";
+
+  if (items.length === 1) {
+    return (
+      <div className={styles["chat-tool-blocks"]}>
+        <ToolOutputBlock name={items[0].name} args="" output={items[0].output} />
+      </div>
+    );
+  }
+
+  const label = isCn
+    ? `执行了 ${items.length} 个工具`
+    : `Ran ${items.length} tools`;
+
+  return (
+    <div className={styles["chat-tool-group"]}>
+      <div className={styles["chat-tool-group-header"]} onClick={() => setOpen((v) => !v)}>
+        <span className={styles["chat-tool-group-label"]}>{label}</span>
+        <ChevronSvg open={open} className={styles["chat-tool-group-chevron"]} />
+      </div>
+      {open && (
+        <div className={styles["chat-tool-group-items"]}>
+          {items.map((t, idx) => (
+            <ToolOutputBlock key={idx} name={t.name} args="" output={t.output} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Extract `<rsfiles>` attachment metadata appended by the agent runtime. */
+function extractRsFiles(content: string): {
+  cleanContent: string;
+  rsFiles: [string, string, string][];
+  rsImages: string[];
+} {
+  const match = content.match(/<rsfiles>([\s\S]*?)<\/rsfiles>/);
+  if (!match) return { cleanContent: content, rsFiles: [], rsImages: [] };
+  try {
+    const data = JSON.parse(match[1]);
+    return {
+      cleanContent: content.replace(/<rsfiles>[\s\S]*?<\/rsfiles>/, "").trimEnd(),
+      rsFiles: data.f || [],
+      rsImages: data.i || [],
+    };
+  } catch {
+    return { cleanContent: content, rsFiles: [], rsImages: [] };
+  }
+}
 
 const Markdown = dynamic(async () => (await import("./markdown")).Markdown, {
   loading: () => <LoadingIcon />,
@@ -292,6 +512,8 @@ export function PromptHints(props: {
       } else if (e.key === "ArrowDown") {
         changeIndex(-1);
       } else if (e.key === "Enter") {
+        e.stopPropagation();
+        e.preventDefault();
         const selectedPrompt = props.prompts.at(selectIndex);
         if (selectedPrompt) {
           props.onPromptSelect(selectedPrompt);
@@ -441,6 +663,7 @@ function useScrollToBottom(
 export function ChatActions(props: {
   uploadImage: () => void;
   attachFile: () => void;
+  attachFolder: () => void;
   setAttachImages: (images: string[]) => void;
   setUploading: (uploading: boolean) => void;
   showPromptModal: () => void;
@@ -501,6 +724,19 @@ export function ChatActions(props: {
   }, [models, currentModel, currentProviderName]);
   const [showModelSelector, setShowModelSelector] = useState(false);
   const [showUploadImage, setShowUploadImage] = useState(false);
+  const [showAttachMenu, setShowAttachMenu] = useState(false);
+  const attachMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!showAttachMenu) return;
+    const handler = (e: MouseEvent) => {
+      if (attachMenuRef.current && !attachMenuRef.current.contains(e.target as Node)) {
+        setShowAttachMenu(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [showAttachMenu]);
 
   const [showSizeSelector, setShowSizeSelector] = useState(false);
   const [showQualitySelector, setShowQualitySelector] = useState(false);
@@ -566,11 +802,35 @@ export function ChatActions(props: {
             icon={props.uploading ? <LoadingButtonIcon /> : <ImageIcon />}
           />
         )}
-        <ChatAction
-          onClick={props.attachFile}
-          text={Locale.Chat.InputActions.AttachFile}
-          icon={<UploadIcon />}
-        />
+        <div className={styles["attach-btn-wrapper"]} ref={attachMenuRef}>
+          <ChatAction
+            onClick={() => setShowAttachMenu((v) => !v)}
+            text={Locale.Chat.InputActions.AttachFile}
+            icon={<AddIcon />}
+          />
+          {showAttachMenu && (
+            <div className={styles["attach-dropdown"]}>
+              <button
+                className={styles["attach-dropdown-item"]}
+                onClick={() => { props.attachFile(); setShowAttachMenu(false); }}
+              >
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
+                  <path d="M9.293 0H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V4.707L9.293 0zM9.5 3.5v-2l3 3h-2a1 1 0 0 1-1-1z"/>
+                </svg>
+                {getLang() === "cn" ? "\u5F15\u7528\u6587\u4EF6" : "File"}
+              </button>
+              <button
+                className={styles["attach-dropdown-item"]}
+                onClick={() => { props.attachFolder(); setShowAttachMenu(false); }}
+              >
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
+                  <path d="M.54 3.87.5 3a2 2 0 0 1 2-2h3.19a2 2 0 0 1 1.345.51l.53.48A1 1 0 0 0 8.2 2h5.8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V4a2 2 0 0 1 .54-1.13z"/>
+                </svg>
+                {getLang() === "cn" ? "\u5F15\u7528\u6587\u4EF6\u5939" : "Folder"}
+              </button>
+            </div>
+          )}
+        </div>
         <ChatAction
           onClick={props.showPromptHints}
           text={Locale.Chat.InputActions.Prompt}
@@ -848,8 +1108,8 @@ function ThinkBlock({ message }: { message: any }) {
   const [elapsed, setElapsed] = useState(0);
   const startTime = useRef<number>(0);
   const [wasThinking, setWasThinking] = useState(false);
+  const [expanded, setExpanded] = useState(false);
 
-  // Once we see think content, mark as "was thinking"
   useEffect(() => {
     if (thinkContent && !wasThinking) {
       setWasThinking(true);
@@ -857,7 +1117,6 @@ function ThinkBlock({ message }: { message: any }) {
     }
   }, [thinkContent, wasThinking]);
 
-  // Timer: stop when streaming ends or main content appears
   const mainContent = getMessageContentOnly(message);
   const thinkDone = !isStreaming || mainContent.length > 0;
 
@@ -868,61 +1127,39 @@ function ThinkBlock({ message }: { message: any }) {
       }, 100);
       return () => clearInterval(timer);
     }
-    // Freeze elapsed when done
     if (thinkDone && startTime.current && elapsed === 0) {
       setElapsed((Date.now() - startTime.current) / 1000);
     }
   }, [wasThinking, thinkDone, isStreaming]);
 
-  // Auto-scroll during streaming
   useEffect(() => {
     if (isStreaming && thinkRef.current) {
       thinkRef.current.scrollTop = thinkRef.current.scrollHeight;
     }
   }, [thinkContent, isStreaming]);
 
-  const [expanded, setExpanded] = useState(false);
-
   if (!thinkContent) return null;
 
   const done = !isStreaming || thinkDone;
-  const timeStr = elapsed > 0 ? ` (${elapsed.toFixed(1)} seconds)` : "";
+  const isCn = getLang() === "cn";
+  const timeStr = elapsed > 0 ? ` (${elapsed.toFixed(1)} ${isCn ? "\u79D2" : "s"})` : "";
+  const title = done
+    ? (isCn ? "\u6DF1\u5EA6\u601D\u8003" : "Thought") + timeStr
+    : (isCn ? "\u601D\u8003\u4E2D" : "Thinking") + timeStr;
 
-  if (!done) {
-    // Streaming: fixed height, scroll to bottom, click to expand
-    return (
-      <div className={`${styles["chat-message-think"]} ${styles["thinking-active"]}`}>
-        <div className={styles["think-header"]}>
-          <span className={styles["think-icon"]}>💭</span>
-          <span className={styles["think-title"]}>{getLang() === "cn" ? "\u601D\u8003\u4E2D" : "Thinking"}{timeStr ? ` (${elapsed.toFixed(1)} ${getLang() === "cn" ? "\u79D2" : "s"})` : ""}</span>
-          <button
-            className={styles["think-expand-btn"]}
-            onClick={() => setExpanded(!expanded)}
-          >
-            {expanded ? "▼" : "▶"}
-          </button>
-        </div>
-        <div
-          className={`${styles["chat-message-think-content"]} ${expanded ? styles["think-expanded"] : ""}`}
-          ref={thinkRef}
-        >
+  return (
+    <div className={`${styles["chat-message-think"]} ${!done ? styles["thinking-active"] : ""}`}>
+      <div className={styles["think-header"]} onClick={() => setExpanded((v) => !v)}>
+        <BrainIcon className={styles["think-icon"]} />
+        <span className={styles["think-title"]}>{title}</span>
+        <ChevronSvg open={expanded} className={styles["think-chevron"]} />
+      </div>
+      {expanded && (
+        <div className={styles["chat-message-think-content"]} ref={thinkRef}>
           {thinkContent}
         </div>
-      </div>
-    );
-  }
-
-  // Done: collapsed summary, click to expand
-  return (
-    <details className={styles["chat-message-think"]}>
-      <summary className={styles["think-header"]}>
-        <span className={styles["think-icon"]}>💭</span>
-        <span className={styles["think-title"]}>{getLang() === "cn" ? "\u6DF1\u5EA6\u601D\u8003" : "Deeply thought"}{timeStr ? ` (${elapsed.toFixed(1)} ${getLang() === "cn" ? "\u79D2" : "s"})` : ""}</span>
-      </summary>
-      <div className={`${styles["chat-message-think-content"]} ${styles["think-expanded"]}`}>
-        {thinkContent}
-      </div>
-    </details>
+      )}
+    </div>
   );
 }
 
@@ -971,6 +1208,7 @@ function _Chat() {
   const navigate = useNavigate();
   const [attachImages, setAttachImages] = useState<string[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [fileRefs, setFileRefs] = useState<string[]>([]);
 
   // prompt hints
   const promptStore = usePromptStore();
@@ -1050,7 +1288,8 @@ function _Chat() {
   };
 
   const doSubmit = (userInput: string) => {
-    if (userInput.trim() === "" && isEmpty(attachImages)) return;
+    const hasRefs = fileRefs.length > 0;
+    if (userInput.trim() === "" && isEmpty(attachImages) && !hasRefs) return;
     const matchCommand = chatCommands.match(userInput);
     if (matchCommand.matched) {
       setUserInput("");
@@ -1058,11 +1297,26 @@ function _Chat() {
       matchCommand.invoke();
       return;
     }
+    // Wrap paths that contain spaces/special chars in single quotes so the
+    // LLM naturally copies them into shell commands as a single argument.
+    // Single-quote is safest in bash; escape embedded apostrophes as
+    // `'\''` per POSIX convention.
+    const quoteIfNeeded = (p: string) => {
+      const needsQuote = /[\s"'`$\\(){}[\]&|;<>*?!]/.test(p);
+      if (!needsQuote) return p;
+      const esc = p.replace(/'/g, "'\\''");
+      return `'${esc}'`;
+    };
+    const finalInput = hasRefs
+      ? (userInput ? userInput + "\n" : "") +
+        fileRefs.map((p) => `[file:${quoteIfNeeded(p)}]`).join(" ")
+      : userInput;
     setIsLoading(true);
     chatStore
-      .onUserInput(userInput, attachImages)
+      .onUserInput(finalInput, attachImages)
       .then(() => setIsLoading(false));
     setAttachImages([]);
+    setFileRefs([]);
     chatStore.setLastInput(userInput);
     setUserInput("");
     setPromptHints([]);
@@ -1084,8 +1338,10 @@ function _Chat() {
           setUserInput("");
           doSubmit("/pair");
         } else if (cmd === "/reset" || cmd === "/clear") {
+          setUserInput("");
           chatStore.resetSession(chatStore.currentSession());
         } else if (cmd === "/new") {
+          setUserInput("");
           chatStore.newSession(undefined);
         } else if (cmd === "/compact") {
           // Send as message to trigger compaction
@@ -1860,24 +2116,107 @@ function _Chat() {
                           )}
                           {!isUser && <ThinkBlock message={message} />}
                           <div className={styles["chat-message-item"]}>
-                            <Markdown
-                              key={message.streaming ? "loading" : "done"}
-                              content={!isUser ? getMessageContentOnly(message) : getMessageTextContent(message)}
-                              loading={
-                                (message.preview || message.streaming) &&
-                                message.content.length === 0 &&
-                                !isUser
+                            {isUser ? (
+                              <>
+                                <Markdown
+                                  key={message.streaming ? "loading" : "done"}
+                                  content={getMessageTextContent(message).replace(/\[file:[^\]]+\]\s*/g, "").trim()}
+                                  loading={false}
+                                  onDoubleClickCapture={() => {
+                                    if (!isMobileScreen) return;
+                                    setUserInput(getMessageTextContent(message));
+                                  }}
+                                  fontSize={fontSize}
+                                  fontFamily={fontFamily}
+                                  parentRef={scrollRef}
+                                  defaultShow={i >= messages.length - 6}
+                                />
+                                {(() => {
+                                  const raw = getMessageTextContent(message);
+                                  const fileRefMatches = [...raw.matchAll(/\[file:([^\]]+)\]/g)];
+                                  if (fileRefMatches.length === 0) return null;
+                                  // Strip the single-quote wrapping we add on
+                                  // send so the chip/open_path sees a raw path.
+                                  const unquote = (p: string) => {
+                                    const t = p.trim();
+                                    if (t.startsWith("'") && t.endsWith("'")) {
+                                      return t.slice(1, -1).replace(/'\\''/g, "'");
+                                    }
+                                    return t;
+                                  };
+                                  return (
+                                    <div className={styles["chat-file-chips"]}>
+                                      {fileRefMatches.map(([, rawPath], idx) => {
+                                        const path = unquote(rawPath);
+                                        const name = path.split(/[/\\]/).pop()?.replace(/[/\\]$/, "") || path;
+                                        const isDir = path.endsWith("/") || path.endsWith("\\") || !name.includes(".");
+                                        return (
+                                          <span
+                                            key={idx}
+                                            className={styles["chat-file-chip"]}
+                                            title={path}
+                                            onClick={() => (window as any).__TAURI__?.invoke?.("open_path", { path })}
+                                          >
+                                            {isDir ? (
+                                              <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor" style={{ flexShrink: 0 }}>
+                                                <path d="M.54 3.87.5 3a2 2 0 0 1 2-2h3.19a2 2 0 0 1 1.345.51l.53.48A1 1 0 0 0 8.2 2h5.8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V4a2 2 0 0 1 .54-1.13z"/>
+                                              </svg>
+                                            ) : (
+                                              <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor" style={{ flexShrink: 0 }}>
+                                                <path d="M9.293 0H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V4.707L9.293 0zM9.5 3.5v-2l3 3h-2a1 1 0 0 1-1-1z"/>
+                                              </svg>
+                                            )}
+                                            {name}
+                                          </span>
+                                        );
+                                      })}
+                                    </div>
+                                  );
+                                })()}
+                              </>
+                            ) : (() => {
+                              const raw = extractRsFiles(getMessageContentOnly(message)).cleanContent;
+                              const chunks = parseAssistantChunks(raw);
+                              if (chunks.length === 0) {
+                                return (
+                                  <Markdown
+                                    key={message.streaming ? "loading" : "done"}
+                                    content=""
+                                    loading={
+                                      (message.preview || message.streaming) &&
+                                      message.content.length === 0
+                                    }
+                                    fontSize={fontSize}
+                                    fontFamily={fontFamily}
+                                    parentRef={scrollRef}
+                                    defaultShow={i >= messages.length - 6}
+                                  />
+                                );
                               }
-                              //   onContextMenu={(e) => onRightClick(e, message)} // hard to use
-                              onDoubleClickCapture={() => {
-                                if (!isMobileScreen) return;
-                                setUserInput(getMessageTextContent(message));
-                              }}
-                              fontSize={fontSize}
-                              fontFamily={fontFamily}
-                              parentRef={scrollRef}
-                              defaultShow={i >= messages.length - 6}
-                            />
+                              return groupChatChunks(chunks).map((g, gIdx) =>
+                                g.kind === "text" ? (
+                                  <Markdown
+                                    key={`t-${gIdx}-${message.streaming ? "s" : "d"}`}
+                                    content={g.content}
+                                    loading={false}
+                                    onDoubleClickCapture={() => {
+                                      if (!isMobileScreen) return;
+                                      setUserInput(getMessageTextContent(message));
+                                    }}
+                                    fontSize={fontSize}
+                                    fontFamily={fontFamily}
+                                    parentRef={scrollRef}
+                                    defaultShow={i >= messages.length - 6}
+                                  />
+                                ) : (
+                                  <ToolGroupBlock
+                                    key={`g-${gIdx}`}
+                                    items={g.items}
+                                    streaming={message.streaming}
+                                  />
+                                ),
+                              );
+                            })()}
                             {getMessageImages(message).length == 1 && (
                               <img
                                 className={styles["chat-message-item-image"]}
@@ -1914,6 +2253,30 @@ function _Chat() {
                               </div>
                             )}
                           </div>
+                          {!isUser && (() => {
+                            const raw = getMessageContentOnly(message);
+                            const { rsFiles, rsImages } = extractRsFiles(raw);
+                            return (rsFiles.length > 0 || rsImages.length > 0) ? (
+                              <>
+                                {(rsFiles.length > 0 || rsImages.length > 0) && (
+                                  <div className={styles["chat-file-chips"]}>
+                                    {rsFiles.map(([name, , path], idx) => (
+                                      <span key={idx} className={styles["chat-file-chip"]} title={path}
+                                        onClick={() => (window as any).__TAURI__?.invoke?.("open_path", { path })}>
+                                        {name || path.split("/").pop() || path}
+                                      </span>
+                                    ))}
+                                    {rsImages.map((imgPath, idx) => (
+                                      <span key={`img-${idx}`} className={styles["chat-file-chip"]} title={imgPath}
+                                        onClick={() => (window as any).__TAURI__?.invoke?.("open_path", { path: imgPath })}>
+                                        {imgPath.split("/").pop() || imgPath}
+                                      </span>
+                                    ))}
+                                  </div>
+                                )}
+                              </>
+                            ) : null;
+                          })()}
                           {message?.audio_url && (
                             <div className={styles["chat-message-audio"]}>
                               <audio src={message.audio_url} controls />
@@ -1941,24 +2304,45 @@ function _Chat() {
               <ChatActions
                 uploadImage={uploadImage}
                 attachFile={() => {
-                  // Tauri: open file dialog, insert path reference
                   if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
                     import("@tauri-apps/plugin-dialog").then(({ open }) => {
                       open({ multiple: true }).then((files) => {
                         if (files) {
                           const paths = Array.isArray(files) ? files : [files];
-                          const refs = paths.map((f: any) => `[file:${typeof f === "string" ? f : f.path}]`).join(" ");
-                          setUserInput((prev: string) => prev + (prev ? " " : "") + refs);
+                          setFileRefs((prev) => [
+                            ...prev,
+                            ...paths.map((f: any) => (typeof f === "string" ? f : f.path)),
+                          ]);
                         }
                       });
                     }).catch(() => {
-                      // Fallback: prompt for path
                       const path = prompt("Enter file path:");
-                      if (path) setUserInput((prev: string) => prev + (prev ? " " : "") + `[file:${path}]`);
+                      if (path) setFileRefs((prev) => [...prev, path]);
                     });
                   } else {
                     const path = prompt("Enter file path:");
-                    if (path) setUserInput((prev: string) => prev + (prev ? " " : "") + `[file:${path}]`);
+                    if (path) setFileRefs((prev) => [...prev, path]);
+                  }
+                }}
+                attachFolder={() => {
+                  if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+                    import("@tauri-apps/plugin-dialog").then(({ open }) => {
+                      open({ multiple: true, directory: true }).then((files) => {
+                        if (files) {
+                          const paths = Array.isArray(files) ? files : [files];
+                          setFileRefs((prev) => [
+                            ...prev,
+                            ...paths.map((f: any) => (typeof f === "string" ? f : f.path)),
+                          ]);
+                        }
+                      });
+                    }).catch(() => {
+                      const path = prompt("Enter folder path:");
+                      if (path) setFileRefs((prev) => [...prev, path]);
+                    });
+                  } else {
+                    const path = prompt("Enter folder path:");
+                    if (path) setFileRefs((prev) => [...prev, path]);
                   }
                 }}
                 setAttachImages={setAttachImages}
@@ -1982,6 +2366,36 @@ function _Chat() {
                 setUserInput={setUserInput}
                 setShowChatSidePanel={setShowChatSidePanel}
               />
+              {fileRefs.length > 0 && (
+                <div className={styles["attach-file-refs"]}>
+                  {fileRefs.map((path, i) => {
+                    const name = path.split(/[/\\]/).pop()?.replace(/[/\\]$/, "") || path;
+                    const isDir = path.endsWith("/") || path.endsWith("\\") || !name.includes(".");
+                    return (
+                      <div key={i} className={styles["attach-file-chip-input"]}>
+                        {isDir ? (
+                          <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
+                            <path d="M.54 3.87.5 3a2 2 0 0 1 2-2h3.19a2 2 0 0 1 1.345.51l.53.48A1 1 0 0 0 8.2 2h5.8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V4a2 2 0 0 1 .54-1.13z"/>
+                          </svg>
+                        ) : (
+                          <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
+                            <path d="M9.293 0H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V4.707L9.293 0zM9.5 3.5v-2l3 3h-2a1 1 0 0 1-1-1z"/>
+                          </svg>
+                        )}
+                        <span className={styles["attach-file-chip-input-name"]}>{name}</span>
+                        <button
+                          className={styles["attach-file-chip-input-remove"]}
+                          onClick={() => setFileRefs(fileRefs.filter((_, j) => j !== i))}
+                        >
+                          <svg width="9" height="9" viewBox="0 0 10 10" fill="none">
+                            <path d="M1.5 1.5L8.5 8.5M8.5 1.5L1.5 8.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+                          </svg>
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
               <label
                 className={clsx(styles["chat-input-panel-inner"], {
                   [styles["chat-input-panel-inner-attach"]]:

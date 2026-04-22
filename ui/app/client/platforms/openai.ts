@@ -188,345 +188,80 @@ export class ChatGPTApi implements LLMApi {
   }
 
   async chat(options: ChatOptions) {
-    // RsClaw: route through agent runtime via /api/v1/message with SSE streaming.
-    // This gives full agent features: context compression, memory, tools, etc.
+    // RsClaw: route through agent runtime via WebSocket chat.send.
+    // Falls back to /v1/chat/completions if WS unavailable.
     try {
-      const { getGatewayUrl, getAuthToken } = require("../../lib/rsclaw-api");
-      const gwUrl = getGatewayUrl() || "http://localhost:18888";
-      const token = getAuthToken() || "";
+      const { rsclawWs } = require("../../lib/rsclaw-ws");
       const lastMsg = options.messages[options.messages.length - 1];
-      let text = typeof lastMsg.content === "string" ? lastMsg.content : getMessageTextContent(lastMsg);
-
-      // File references: keep [file:path] markers as-is — backend extracts them.
+      const text =
+        typeof lastMsg.content === "string"
+          ? lastMsg.content
+          : getMessageTextContent(lastMsg);
 
       const session = useChatStore.getState().currentSession();
       const agentId = session.agentId || "main";
       const sessionKey = `desktop:${agentId}:${session.id}`;
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      if (token) headers["Authorization"] = `Bearer ${token}`;
 
       const controller = new AbortController();
       options.onController?.(controller);
 
-      const resp = await fetch(`${gwUrl}/api/v1/message`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          text,
-          agent_id: agentId,
-          session_key: sessionKey,
-          channel: "desktop",
-          peer_id: "desktop-user",
-          stream: true,
-        }),
-        signal: controller.signal,
+      rsclawWs.connect();
+
+      // Send via WS and get runId back
+      const result = await rsclawWs.send("chat.send", {
+        message: text,
+        sessionKey,
+        agentId,
       });
+      const runId: string = result?.runId || "";
 
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
-        options.onError?.(new Error(data.error || `HTTP ${resp.status}`));
-        return;
-      }
-
-      const contentType = resp.headers.get("content-type") || "";
-
-      if (contentType.includes("text/event-stream")) {
-        // SSE streaming mode
-        const reader = resp.body?.getReader();
-        const decoder = new TextDecoder();
-        let fullText = "";
-
-        if (reader) {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            const chunk = decoder.decode(value, { stream: true });
-            const lines = chunk.split("\n");
-
-            for (const line of lines) {
-              if (!line.startsWith("data: ")) continue;
-              const data = line.slice(6).trim();
-              if (data === "[DONE]") break;
-
-              try {
-                const parsed = JSON.parse(data);
-                const delta = parsed.choices?.[0]?.delta?.content;
-                if (delta) {
-                  fullText += delta;
-                  options.onUpdate?.(fullText, delta);
-                }
-              } catch {
-                // skip malformed chunks
-              }
-            }
-          }
-        }
-
-        options.onFinish(fullText, new Response(fullText));
-      } else {
-        // Non-streaming fallback (JSON response)
-        const data = await resp.json();
-        if (data.error) {
-          options.onError?.(new Error(data.error));
-          return;
-        }
-        const reply = data.reply || data.text || data.content || "";
-        options.onUpdate?.(reply, reply);
-        options.onFinish(reply, data);
-      }
-      return;
-    } catch (e) {
-      // Fall through to legacy path on error
-      console.warn("[RsClaw] /api/v1/message failed, falling back to /v1/chat/completions", e);
-    }
-
-    const modelConfig = {
-      ...useAppConfig.getState().modelConfig,
-      ...useChatStore.getState().currentSession().mask.modelConfig,
-      ...{
-        model: options.config.model,
-        providerName: options.config.providerName,
-      },
-    };
-
-    let requestPayload: RequestPayload | DalleRequestPayload;
-
-    const isDalle3 = _isDalle3(options.config.model);
-    const isO1OrO3 =
-      options.config.model.startsWith("o1") ||
-      options.config.model.startsWith("o3") ||
-      options.config.model.startsWith("o4-mini");
-    const isGpt5 =  options.config.model.startsWith("gpt-5");
-    if (isDalle3) {
-      const prompt = getMessageTextContent(
-        options.messages.slice(-1)?.pop() as any,
-      );
-      requestPayload = {
-        model: options.config.model,
-        prompt,
-        // URLs are only valid for 60 minutes after the image has been generated.
-        response_format: "b64_json", // using b64_json, and save image in CacheStorage
-        n: 1,
-        size: options.config?.size ?? "1024x1024",
-        quality: options.config?.quality ?? "standard",
-        style: options.config?.style ?? "vivid",
-      };
-    } else {
-      const visionModel = isVisionModel(options.config.model);
-      const messages: ChatOptions["messages"] = [];
-      for (const v of options.messages) {
-        const content = visionModel
-          ? await preProcessImageContent(v.content)
-          : getMessageTextContent(v);
-        if (!(isO1OrO3 && v.role === "system"))
-          messages.push({ role: v.role, content });
-      }
-
-      // O1 not support image, tools (plugin in ChatGPTNextWeb) and system, stream, logprobs, temperature, top_p, n, presence_penalty, frequency_penalty yet.
-      requestPayload = {
-        messages,
-        stream: options.config.stream,
-        model: modelConfig.model,
-        temperature: (!isO1OrO3 && !isGpt5) ? modelConfig.temperature : 1,
-        presence_penalty: !isO1OrO3 ? modelConfig.presence_penalty : 0,
-        frequency_penalty: !isO1OrO3 ? modelConfig.frequency_penalty : 0,
-        top_p: !isO1OrO3 ? modelConfig.top_p : 1,
-        // max_tokens: Math.max(modelConfig.max_tokens, 1024),
-        // Please do not ask me why not send max_tokens, no reason, this param is just shit, I dont want to explain anymore.
-      };
-
-      if (isGpt5) {
-  	// Remove max_tokens if present
-  	delete requestPayload.max_tokens;
-  	// Add max_completion_tokens (or max_completion_tokens if that's what you meant)
-  	requestPayload["max_completion_tokens"] = modelConfig.max_tokens;
-
-      } else if (isO1OrO3) {
-        // by default the o1/o3 models will not attempt to produce output that includes markdown formatting
-        // manually add "Formatting re-enabled" developer message to encourage markdown inclusion in model responses
-        // (https://learn.microsoft.com/en-us/azure/ai-services/openai/how-to/reasoning?tabs=python-secure#markdown-output)
-        requestPayload["messages"].unshift({
-          role: "developer",
-          content: "Formatting re-enabled",
+      // Stream deltas back via WS events
+      let fullText = "";
+      await new Promise<void>((resolve, reject) => {
+        controller.signal.addEventListener("abort", () => {
+          rsclawWs.send("chat.abort", { sessionKey }).catch(() => {});
+          reject(new Error("aborted"));
         });
 
-        // o1/o3 uses max_completion_tokens to control the number of tokens (https://platform.openai.com/docs/guides/reasoning#controlling-costs)
-        requestPayload["max_completion_tokens"] = modelConfig.max_tokens;
-      }
-
-
-      // add max_tokens to vision model
-      if (visionModel && !isO1OrO3 && ! isGpt5) {
-        requestPayload["max_tokens"] = Math.max(modelConfig.max_tokens, 4000);
-      }
-    }
-
-    console.log("[Request] openai payload: ", requestPayload);
-
-    const shouldStream = !isDalle3 && !!options.config.stream;
-    const controller = new AbortController();
-    options.onController?.(controller);
-
-    try {
-      let chatPath = "";
-      if (modelConfig.providerName === ServiceProvider.Azure) {
-        // find model, and get displayName as deployName
-        const { models: configModels, customModels: configCustomModels } =
-          useAppConfig.getState();
-        const {
-          defaultModel,
-          customModels: accessCustomModels,
-          useCustomConfig,
-        } = useAccessStore.getState();
-        const models = collectModelsWithDefaultModel(
-          configModels,
-          [configCustomModels, accessCustomModels].join(","),
-          defaultModel,
-        );
-        const model = models.find(
-          (model) =>
-            model.name === modelConfig.model &&
-            model?.provider?.providerName === ServiceProvider.Azure,
-        );
-        chatPath = this.path(
-          (isDalle3 ? Azure.ImagePath : Azure.ChatPath)(
-            (model?.displayName ?? model?.name) as string,
-            useCustomConfig ? useAccessStore.getState().azureApiVersion : "",
-          ),
-        );
-      } else {
-        chatPath = this.path(
-          isDalle3 ? OpenaiPath.ImagePath : OpenaiPath.ChatPath,
-        );
-      }
-      if (shouldStream) {
-        let index = -1;
-        const tools: any[] = [];
-        const funcs: Record<string, Function> = {};
-        streamWithThink(
-          chatPath,
-          requestPayload,
-          getHeaders(),
-          tools,
-          funcs,
-          controller,
-          // parseSSE
-          (text: string, runTools: ChatMessageTool[]) => {
-            // console.log("parseSSE", text, runTools);
-            const json = JSON.parse(text);
-            const choices = json.choices as Array<{
-              delta: {
-                content: string;
-                tool_calls: ChatMessageTool[];
-                reasoning_content: string | null;
-              };
-            }>;
-
-            if (!choices?.length) return { isThinking: false, content: "" };
-
-            const tool_calls = choices[0]?.delta?.tool_calls;
-            if (tool_calls?.length > 0) {
-              const id = tool_calls[0]?.id;
-              const args = tool_calls[0]?.function?.arguments;
-              if (id) {
-                index += 1;
-                runTools.push({
-                  id,
-                  type: tool_calls[0]?.type,
-                  function: {
-                    name: tool_calls[0]?.function?.name as string,
-                    arguments: args,
-                  },
-                });
-              } else {
-                // @ts-ignore
-                runTools[index]["function"]["arguments"] += args;
-              }
-            }
-
-            const reasoning = choices[0]?.delta?.reasoning_content;
-            const content = choices[0]?.delta?.content;
-
-            // Skip if both content and reasoning_content are empty or null
-            if (
-              (!reasoning || reasoning.length === 0) &&
-              (!content || content.length === 0)
-            ) {
-              return {
-                isThinking: false,
-                content: "",
-              };
-            }
-
-            if (reasoning && reasoning.length > 0) {
-              return {
-                isThinking: true,
-                content: reasoning,
-              };
-            } else if (content && content.length > 0) {
-              // rsclaw gateway embeds thinking in <think> tags within content
-              const isThinkContent = content.includes("<think>") || content.startsWith("</think>");
-              return {
-                isThinking: isThinkContent,
-                content: content,
-              };
-            }
-
-            return {
-              isThinking: false,
-              content: "",
-            };
+        rsclawWs.onChatEvent(runId, {
+          onDelta: (_full: string, delta: string) => {
+            fullText += delta;
+            options.onUpdate?.(fullText, delta);
           },
-          // processToolMessage, include tool_calls message and tool call results
-          (
-            requestPayload: RequestPayload,
-            toolCallMessage: any,
-            toolCallResult: any[],
+          onDone: (
+            files: [string, string, string][],
+            images: string[],
+            toolLog: [string, string, string][],
           ) => {
-            // reset index value
-            index = -1;
-            // @ts-ignore
-            requestPayload?.messages?.splice(
-              // @ts-ignore
-              requestPayload?.messages?.length,
-              0,
-              toolCallMessage,
-              ...toolCallResult,
-            );
+            if (files.length > 0 || images.length > 0) {
+              fullText += `\n\n<rsfiles>${JSON.stringify({ f: files, i: images })}</rsfiles>`;
+            }
+            if (toolLog.length > 0) {
+              fullText += `\n\n<rstools>${JSON.stringify(toolLog)}</rstools>`;
+            }
+            resolve();
           },
-          options,
-        );
-      } else {
-        const chatPayload = {
-          method: "POST",
-          body: JSON.stringify(requestPayload),
-          signal: controller.signal,
-          headers: getHeaders(),
-        };
+          onError: reject,
+        });
+      });
 
-        // make a fetch request
-        const requestTimeoutId = setTimeout(
-          () => controller.abort(),
-          getTimeoutMSByModel(options.config.model),
-        );
-
-        console.log("[RsClaw] non-stream fetch:", chatPath, chatPayload.headers);
-        const res = await fetch(chatPath, chatPayload);
-        clearTimeout(requestTimeoutId);
-        console.log("[RsClaw] response status:", res.status, res.statusText);
-
-        const resJson = await res.json();
-        console.log("[RsClaw] response json:", JSON.stringify(resJson).slice(0, 200));
-        const message = await this.extractMessage(resJson);
-        console.log("[RsClaw] extracted message:", message?.slice(0, 100));
-        options.onFinish(message, res);
-      }
-    } catch (e) {
-      console.log("[Request] failed to make a chat request", e);
-      options.onError?.(e as Error);
+      options.onFinish(fullText, new Response(fullText));
+      return;
+    } catch (e: any) {
+      // No fallback — desktop app must talk to the rsclaw gateway via WS.
+      // Silently falling back to /v1/chat/completions used to mask broken
+      // WS connections and could route messages to an unrelated OpenAI
+      // endpoint, hiding real bugs.
+      console.error("[RsClaw] chat.send WS failed:", e);
+      options.onError?.(
+        new Error(
+          `RsClaw gateway WebSocket 连接失败: ${e?.message || e}. 请确认 gateway 是否运行。`,
+        ),
+      );
+      return;
     }
   }
+
   async usage() {
     const formatDate = (d: Date) =>
       `${d.getFullYear()}-${(d.getMonth() + 1).toString().padStart(2, "0")}-${d

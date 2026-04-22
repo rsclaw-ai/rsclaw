@@ -209,7 +209,7 @@ pub(crate) fn build_tool_list(
             "properties": {
                 "command": {"type": "string", "description": "Shell command to execute. Must be valid for the current OS."},
                 "timeout": {"type": "integer", "description": "Timeout in seconds (default: 30, max: 300)"},
-                "wait": {"type": "boolean", "description": "If true, wait for the command to finish and return output. If false (default), run in background and return a task_id. Results are delivered on your next turn."},
+                "wait": {"type": "boolean", "description": "If true (default), wait for the command to finish and return stdout/stderr/exit_code. Set to false only for long-running commands (builds, servers, installs) where you want a task_id to poll later."},
                 "task_id": {"type": "string", "description": "Poll a previously started background task by its task_id."}
             },
             "required": []
@@ -223,17 +223,29 @@ pub(crate) fn build_tool_list(
             - spawn: Create a persistent agent (survives across turns).\n\
             - send: Send a message to an existing agent (async, result delivered when done).\n\
             - list: List all registered agents.\n\
+            - update: Edit a named agent's config (model, name). Pass model=\"\" to remove and fall back to defaults. Hot-reloads automatically.\n\
             - kill: Stop an agent.\n\
             Tips:\n\
             - Use task for independent, parallelizable work. You can dispatch multiple tasks at once.\n\
             - Always specify toolset matching the task (web for search, code for file ops).\n\
-            - After dispatching, tell the user what you delegated and continue with other work.".to_owned(),
+            - After dispatching, tell the user what you delegated and continue with other work.\n\
+            \n\
+            DO NOT delegate these tasks — handle them yourself directly:\n\
+            - Any GUI/desktop automation (WeChat, Finder, Safari, system apps, etc.)\n\
+            - Anything using `computer_use` (screenshot, click, key, type)\n\
+            - AppleScript/osascript workflows that control another application\n\
+            - Visual verification (\"did the window appear?\", \"is the button there?\")\n\
+            Reason: GUI tasks depend on live state (frontmost window, mouse position, display\n\
+            focus) and the current session's permission grants. Sub-agents start fresh with\n\
+            no visual context and frequently fail on first attempts, creating loops. The\n\
+            main agent that already has the screenshot/context should complete these tasks.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "action":  {"type": "string", "enum": ["spawn", "task", "send", "list", "kill"], "description": "Action to perform"},
-                "id":      {"type": "string", "description": "Agent ID (for spawn/send/kill)"},
-                "model":   {"type": "string", "description": "Model string (for spawn/task)"},
+                "action":  {"type": "string", "enum": ["spawn", "task", "send", "list", "update", "kill"], "description": "Action to perform"},
+                "id":      {"type": "string", "description": "Agent ID (for spawn/send/update/kill)"},
+                "model":   {"type": "string", "description": "Model string (for spawn/task/update). Pass \"\" to remove per-agent model override."},
+                "name":    {"type": "string", "description": "Display name (for update)"},
                 "system":  {"type": "string", "description": "Role description (for spawn/task)"},
                 "message": {"type": "string", "description": "Message to send (for task/send)"},
                 "toolset": {"type": "string", "enum": ["minimal", "standard", "web", "code", "full"], "description": "Tool access level. Default: standard."}
@@ -565,7 +577,19 @@ pub(crate) fn build_tool_list(
             Supports both recurring (cron expression) and one-shot (delay_ms) schedules.\n\
             For one-shot: set delay_ms instead of schedule. Example: delay_ms=1200000 for 20 minutes.\n\
             One-shot jobs auto-remove after execution.\n\
-            For edit/remove/enable/disable, prefer using `index` from the list output instead of `id`.".to_owned(),
+            For edit/remove/enable/disable, prefer using `index` from the list output instead of `id`.\n\
+            \n\
+            CRON FORMAT (schedule field) — EXACTLY 5 fields separated by spaces:\n\
+              minute hour day month weekday\n\
+            Common examples:\n\
+              \"*/5 * * * *\"    every 5 minutes\n\
+              \"0 * * * *\"      every hour on the hour\n\
+              \"0 17 * * *\"     5:00 PM daily  (NOT \"017 * * *\" — needs the space!)\n\
+              \"30 8 * * 1-5\"   8:30 AM on weekdays\n\
+              \"0 9 1 * *\"      9:00 AM on the 1st of each month\n\
+            Pitfall: '0 17 * * *' is FIVE fields. Writing '017 * * *' (no space after 0) is\n\
+            only FOUR fields and will be rejected. Always check your expression has exactly\n\
+            5 whitespace-separated tokens.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {

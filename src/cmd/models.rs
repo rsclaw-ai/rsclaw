@@ -14,7 +14,7 @@ use crate::{
 pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
     match sub {
         ModelsCommand::List | ModelsCommand::Status => {
-            banner(&format!("rsclaw models v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!("rsclaw models v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
             let config = config::load()?;
             if let Some(models_cfg) = &config.model.models {
                 println!(
@@ -67,7 +67,7 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
             ok(&format!("image model set to '{}'", cyan(&model)));
         }
         ModelsCommand::Scan => {
-            banner(&format!("rsclaw model scan v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!("rsclaw model scan v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()?;
@@ -88,7 +88,7 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
         }
         ModelsCommand::Aliases(sub) => match sub {
             AliasesCommand::List => {
-                banner(&format!("rsclaw model aliases v{}", env!("RSCLAW_BUILD_VERSION")));
+                banner(&format!("rsclaw model aliases v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
                 let config = config::load()?;
                 let aliases = config.agents.defaults.models.as_ref();
                 if aliases.is_none_or(|a| a.is_empty()) {
@@ -119,7 +119,7 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
         },
         ModelsCommand::Fallbacks(sub) => match sub {
             FallbacksCommand::List => {
-                banner(&format!("rsclaw model fallbacks v{}", env!("RSCLAW_BUILD_VERSION")));
+                banner(&format!("rsclaw model fallbacks v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
                 let config = config::load()?;
                 let fallbacks = config
                     .agents
@@ -177,7 +177,7 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
         },
         ModelsCommand::ImageFallbacks(sub) => match sub {
             ImageFallbacksCommand::List => {
-                banner(&format!("rsclaw image fallbacks v{}", env!("RSCLAW_BUILD_VERSION")));
+                banner(&format!("rsclaw image fallbacks v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
                 let config = config::load()?;
                 let fallbacks = config
                     .agents
@@ -235,7 +235,7 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
         },
         ModelsCommand::Auth(sub) => match sub {
             ModelsAuthCommand::Add => {
-                banner(&format!("rsclaw models auth v{}", env!("RSCLAW_BUILD_VERSION")));
+                banner(&format!("rsclaw models auth v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
                 println!("  Add a provider to rsclaw.json5:");
                 println!();
                 println!("  {}", dim(r#"models: {"#));
@@ -362,7 +362,7 @@ fn cmd_list_installed() {
     let base_dir = crate::config::loader::base_dir();
     let models_dir = base_dir.join("models");
 
-    banner(&format!("rsclaw installed models v{}", env!("RSCLAW_BUILD_VERSION")));
+    banner(&format!("rsclaw installed models v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
 
     let mut found = false;
 

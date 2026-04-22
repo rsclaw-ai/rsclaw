@@ -56,6 +56,7 @@ use crate::{
     config::runtime::RuntimeConfig,
     gateway::LiveConfig,
     store::Store,
+    ws::types::EventFrame,
 };
 
 // ---------------------------------------------------------------------------
@@ -138,6 +139,8 @@ pub struct SendMessageRequest {
     pub agent_id: Option<String>,
     pub channel: Option<String>,
     pub peer_id: Option<String>,
+    #[serde(default)]
+    pub stream: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -201,6 +204,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/config/reload", post(config_reload))
+        .route("/shutdown", post(http_shutdown))
+        .route("/restart", post(http_restart))
         .route("/config", get(get_config).put(save_config))
         .route("/cron", get(cron_list).post(cron_create))
         .route("/cron/reload", post(cron_reload))
@@ -266,7 +271,13 @@ pub async fn serve(state: AppState, bind: std::net::SocketAddr) -> Result<()> {
     let router = build_router(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!("gateway listening on {bind}");
-    axum::serve(listener, router).await?;
+    // `into_make_service_with_connect_info` exposes the peer SocketAddr to
+    // handlers via `ConnectInfo<SocketAddr>` — needed by /shutdown /restart
+    // to enforce loopback-only access.
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    ).await?;
     Ok(())
 }
 
@@ -290,6 +301,8 @@ async fn auth_middleware(
         || path == "/gateway-ws"
         || path.starts_with("/hooks/")
         || path == "/api/v1/cron/reload"
+        || path == "/api/v1/shutdown"
+        || path == "/api/v1/restart"
     {
         return next.run(request).await;
     }
@@ -334,7 +347,7 @@ async fn send_message(
     State(state): State<AppState>,
     Json(req): Json<SendMessageRequest>,
 ) -> impl IntoResponse {
-    debug!(agent_id = ?req.agent_id, session_key = ?req.session_key, text_len = req.text.len(), "HTTP send_message");
+    info!(agent_id = ?req.agent_id, session_key = ?req.session_key, text_len = req.text.len(), stream = req.stream, "HTTP /api/v1/message");
     if req.text.len() > MAX_MESSAGE_BYTES {
         return (
             StatusCode::BAD_REQUEST,
@@ -383,6 +396,9 @@ async fn send_message(
         files: file_files,
     };
 
+    // Subscribe to event_bus BEFORE sending message so we don't miss early deltas.
+    let event_rx = if req.stream { Some(state.event_bus.subscribe()) } else { None };
+
     if handle.tx.send(msg).await.is_err() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -391,7 +407,62 @@ async fn send_message(
             .into_response();
     }
 
-    // Default 600s (10 min) to match channel handlers; agent tool chains can be lengthy.
+    // Streaming: return SSE immediately in OpenAI-chunk format.
+    if let Some(rx) = event_rx {
+        let sid = session_key.clone();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let cid = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+
+        let stream = tokio_stream::wrappers::BroadcastStream::new(rx)
+            .filter_map(move |msg| {
+                let sid = sid.clone();
+                let cid = cid.clone();
+                async move {
+                    let event = msg.ok()?;
+                    if event.session_id != sid { return None; }
+                    if event.done {
+                        let mut stop = serde_json::json!({
+                            "id": cid, "object": "chat.completion.chunk",
+                            "created": now, "model": "rsclaw",
+                            "choices": [{"index":0,"delta":{},"finish_reason":"stop"}]
+                        });
+                        if !event.files.is_empty() {
+                            stop["rsclaw_files"] = serde_json::json!(event.files);
+                        }
+                        if !event.images.is_empty() {
+                            stop["rsclaw_images"] = serde_json::json!(event.images);
+                        }
+                        if !event.tool_log.is_empty() {
+                            stop["rsclaw_tool_log"] = serde_json::json!(event.tool_log);
+                        }
+                        return Some(format!("data: {stop}\n\ndata: [DONE]\n\n"));
+                    }
+                    if event.delta.is_empty() { return None; }
+                    let chunk = serde_json::json!({
+                        "id": cid, "object": "chat.completion.chunk",
+                        "created": now, "model": "rsclaw",
+                        "choices": [{"index":0,"delta":{"content":event.delta},"finish_reason":null}]
+                    });
+                    Some(format!("data: {chunk}\n\n"))
+                }
+            })
+            .scan(false, |done, line| {
+                if *done { return std::future::ready(None); }
+                if line.contains("[DONE]") { *done = true; }
+                std::future::ready(Some(Ok::<_, Infallible>(line)))
+            });
+
+        let mut hdrs = axum::http::HeaderMap::new();
+        hdrs.insert(header::CONTENT_TYPE, "text/event-stream; charset=utf-8".parse().expect("ct"));
+        hdrs.insert(header::CACHE_CONTROL, "no-cache".parse().expect("cc"));
+        hdrs.insert("x-accel-buffering".parse::<axum::http::HeaderName>().expect("hdr"), "no".parse().expect("v"));
+        return (StatusCode::OK, hdrs, axum::body::Body::from_stream(stream)).into_response();
+    }
+
+    // Non-streaming: wait for full reply.
     let timeout_secs = state.config.raw.agents.as_ref()
         .and_then(|a| a.defaults.as_ref())
         .and_then(|d| d.timeout_seconds)
@@ -671,7 +742,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let port = state.live.gateway.read().await.port;
     Json(serde_json::json!({
         "status": "ok",
-        "version": env!("RSCLAW_BUILD_VERSION"),
+        "version": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
         "port": port,
         "uptime": format!("{:02}:{:02}:{:02}", hours, mins, secs),
     }))
@@ -744,7 +815,7 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
     };
 
     Json(serde_json::json!({
-        "version": env!("RSCLAW_BUILD_VERSION"),
+        "version": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
         "agents": state.agents.len(),
         "port": port,
         "uptime": uptime,
@@ -766,6 +837,78 @@ async fn config_reload(State(_state): State<AppState>) -> impl IntoResponse {
         )
             .into_response(),
     }
+}
+
+/// Reject the request if the caller isn't a loopback peer.
+/// Shutdown / restart are only exposed to local processes — never over LAN.
+///
+/// Caveat: this checks the direct **TCP peer** address, NOT `X-Forwarded-For`.
+/// If you run rsclaw behind a reverse proxy (nginx/caddy/traefik), the proxy
+/// itself may be loopback even when the original client is on the WAN, which
+/// would incorrectly authorize remote shutdowns. In that deployment, bind the
+/// gateway to 127.0.0.1 so only the proxy can reach it, OR put `/shutdown` and
+/// `/restart` behind an explicit proxy ACL.
+fn is_loopback(addr: std::net::SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => v6.is_loopback(),
+    }
+}
+
+/// POST /api/v1/shutdown — exit the gateway process cleanly.
+/// Loopback-only; no token required (same trust model as /api/v1/cron/reload).
+async fn http_shutdown(
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if !is_loopback(peer) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "shutdown is loopback-only"})),
+        )
+            .into_response();
+    }
+    tracing::warn!("HTTP /shutdown — exiting in 300ms");
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = std::fs::remove_file(crate::config::loader::pid_file());
+        std::process::exit(0);
+    });
+    Json(serde_json::json!({ "shutting_down": true })).into_response()
+}
+
+/// POST /api/v1/restart — re-exec the gateway binary. Loopback-only.
+async fn http_restart(
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if !is_loopback(peer) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "restart is loopback-only"})),
+        )
+            .into_response();
+    }
+    tracing::warn!("HTTP /restart — re-execing");
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return Json(serde_json::json!({ "error": format!("current_exe: {e}") })).into_response(),
+    };
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(["gateway", "run"]);
+        // Windows: suppress the console flash when re-execing from a GUI app.
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let _ = cmd.spawn();
+        // Don't remove the PID file here — the new gateway process
+        // overwrites it with its own PID on startup.
+        std::process::exit(0);
+    });
+    Json(serde_json::json!({ "restarting": true })).into_response()
 }
 
 async fn cron_reload(State(state): State<AppState>) -> impl IntoResponse {
@@ -818,7 +961,12 @@ async fn cron_save_and_reload(
             .await
             .map_err(|e| format!("create cron dir: {e}"))?;
     }
-    let json = serde_json::to_string_pretty(jobs).map_err(|e| format!("serialize: {e}"))?;
+    // Write the openclaw-compatible `{version, jobs}` envelope — same format
+    // that cron::save_cron_jobs (CLI / WS) and the Tauri save_cron_jobs
+    // command produce. Writing a bare array here made the file unloadable
+    // for other readers and caused jobs to silently disappear from the UI.
+    let store = serde_json::json!({ "version": 1, "jobs": jobs });
+    let json = serde_json::to_string_pretty(&store).map_err(|e| format!("serialize: {e}"))?;
     tokio::fs::write(&path, json)
         .await
         .map_err(|e| format!("write jobs.json: {e}"))?;
@@ -863,6 +1011,14 @@ async fn cron_create(
     }
     // Normalize schedule: accept both flat string and nested object
     if let Some(sched) = body.get("schedule").and_then(|s| s.as_str()).map(|s| s.to_owned()) {
+        // Validate before normalizing — reject bad expressions with a friendly error.
+        if let Err(msg) = crate::cron::validate_cron_expr(&sched) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": msg})),
+            )
+                .into_response();
+        }
         let tz = body.get("timezone").and_then(|t| t.as_str()).map(|t| t.to_owned());
         if let Some(tz) = tz {
             body["schedule"] = serde_json::json!({"kind": "cron", "expr": sched, "tz": tz});
@@ -873,6 +1029,15 @@ async fn cron_create(
         if let Some(obj) = body.as_object_mut() {
             obj.remove("timezone");
         }
+    } else if let Some(expr) = body.get("schedule").and_then(|s| s.get("expr")).and_then(|e| e.as_str()) {
+        // Nested schedule form — validate the expr here too.
+        if let Err(msg) = crate::cron::validate_cron_expr(expr) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": msg})),
+            )
+                .into_response();
+        }
     }
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -881,6 +1046,8 @@ async fn cron_create(
     body["created_at_ms"] = serde_json::json!(now_ms);
     body["updated_at_ms"] = serde_json::json!(now_ms);
 
+    // Serialize read-modify-write so parallel cron.add calls don't clobber each other.
+    let _guard = crate::cron::CRON_FILE_LOCK.lock().await;
     let mut jobs = cron_load_jobs().await;
     // Prevent duplicate IDs
     if jobs.iter().any(|j| j["id"].as_str() == Some(&id)) {
@@ -908,6 +1075,7 @@ async fn cron_update(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    let _guard = crate::cron::CRON_FILE_LOCK.lock().await;
     let mut jobs = cron_load_jobs().await;
     let idx = match jobs.iter().position(|j| j["id"].as_str() == Some(&id)) {
         Some(i) => i,
@@ -927,6 +1095,13 @@ async fn cron_update(
                 // Normalize schedule string + timezone
                 if k == "schedule" {
                     if let Some(sched) = v.as_str() {
+                        if let Err(msg) = crate::cron::validate_cron_expr(sched) {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({"error": msg})),
+                            )
+                                .into_response();
+                        }
                         let tz = patch
                             .get("timezone")
                             .and_then(|t| t.as_str())
@@ -968,6 +1143,7 @@ async fn cron_update(
 
 /// DELETE /api/v1/cron/:id — delete a cron job.
 async fn cron_delete(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let _guard = crate::cron::CRON_FILE_LOCK.lock().await;
     let mut jobs = cron_load_jobs().await;
     let before = jobs.len();
     jobs.retain(|j| j["id"].as_str() != Some(&id));
@@ -1035,8 +1211,24 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
             let delivery_to = job["delivery"]["to"].as_str().map(|s| s.to_owned());
             let ntx = state.notification_tx.clone();
             let job_id = id.clone();
+            let ws_conns = state.ws_conns.clone();
+            let job_name = job["name"].as_str().unwrap_or(&id).to_owned();
             tokio::spawn(async move {
                 if let Ok(reply) = reply_rx.await {
+                    // Build notification text: use reply if non-empty, else fallback summary
+                    let notify_text = if !reply.text.is_empty() {
+                        reply.text.clone()
+                    } else {
+                        format!("定时任务执行完成: {}", job_name)
+                    };
+                    // Push result to desktop via WebSocket notification
+                    let frame = EventFrame::new(
+                        "notification",
+                        serde_json::json!({ "text": notify_text }),
+                        0,
+                    );
+                    ws_conns.broadcast_all(frame).await;
+
                     if !reply.text.is_empty() {
                         if let (Some(ch), Some(to)) = (delivery_channel, delivery_to) {
                             let _ = ntx.send(crate::channel::OutboundMessage {
@@ -1382,6 +1574,7 @@ async fn openai_chat_completions(
     headers: HeaderMap,
     Json(req): Json<OaiChatRequest>,
 ) -> impl IntoResponse {
+    info!(stream = req.stream, model = ?req.model, "HTTP /v1/chat/completions");
     // Extract text from the last user message.
     let text = req
         .messages
@@ -1493,11 +1686,20 @@ async fn openai_chat_completions(
                     let event = msg.ok()?;
                     if event.session_id != sid { return None; }
                     if event.done {
-                        let stop = serde_json::json!({
+                        let mut stop = serde_json::json!({
                             "id": cid, "object": "chat.completion.chunk",
                             "created": now, "model": model_str,
                             "choices": [{"index":0,"delta":{},"finish_reason":"stop"}]
                         });
+                        if !event.files.is_empty() {
+                            stop["rsclaw_files"] = serde_json::json!(event.files);
+                        }
+                        if !event.images.is_empty() {
+                            stop["rsclaw_images"] = serde_json::json!(event.images);
+                        }
+                        if !event.tool_log.is_empty() {
+                            stop["rsclaw_tool_log"] = serde_json::json!(event.tool_log);
+                        }
                         return Some(format!("data: {stop}\n\ndata: [DONE]\n\n"));
                     }
                     if event.delta.is_empty() { return None; }

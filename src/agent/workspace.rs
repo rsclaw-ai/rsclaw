@@ -17,9 +17,9 @@ use chrono::Local;
 use tracing::debug;
 
 /// Default per-file character limit.
-pub const DEFAULT_MAX_CHARS_PER_FILE: usize = 20_000;
+pub const DEFAULT_MAX_CHARS_PER_FILE: usize = 10_000;
 /// Default total character limit across all workspace files.
-pub const DEFAULT_TOTAL_MAX_CHARS: usize = 150_000;
+pub const DEFAULT_TOTAL_MAX_CHARS: usize = 50_000;
 
 // ---------------------------------------------------------------------------
 // SessionType

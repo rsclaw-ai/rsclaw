@@ -3,7 +3,7 @@ use anyhow::Result;
 use super::style::{banner, dim, green, kv, red, yellow};
 use crate::{cli::GatewayCommand, config, gateway, sys::detect_memory_tier};
 
-const VERSION: &str = env!("RSCLAW_BUILD_VERSION");
+const VERSION: &str = match option_env!("RSCLAW_BUILD_VERSION") { Some(v) => v, None => "dev" };
 
 /// Spawn `rsclaw gateway run` as a detached background process, propagating
 /// instance-isolation env vars set by `--dev` / `--profile`.

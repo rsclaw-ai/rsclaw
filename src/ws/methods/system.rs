@@ -39,8 +39,8 @@ pub async fn health(ctx: MethodCtx) -> MethodResult {
 
     Ok(serde_json::json!({
         "status": "ok",
-        "version": env!("RSCLAW_BUILD_VERSION"),
-        "runtimeVersion": env!("RSCLAW_BUILD_VERSION"),
+        "version": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
+        "runtimeVersion": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
         // Uptime / tick info used by Overview and Debug pages.
         "uptime": uptime.as_secs(),
         "uptimeFormatted": format_duration(uptime),
@@ -163,15 +163,24 @@ pub async fn cron_add(ctx: MethodCtx) -> MethodResult {
     let schedule = params["schedule"]
         .as_str()
         .ok_or_else(|| ErrorShape::bad_request("missing schedule"))?;
+    // Validate the expression BEFORE saving so the LLM gets a clear error
+    // instead of silently writing a broken cron that never fires.
+    if let Err(msg) = crate::cron::validate_cron_expr(schedule) {
+        return Err(ErrorShape::bad_request(msg));
+    }
     let message = params["message"]
         .as_str()
         .ok_or_else(|| ErrorShape::bad_request("missing message"))?;
     let agent_id = params["agentId"].as_str();
     let name = params["name"].as_str();
 
+    // Serialize RMW against concurrent cron.add/remove so writes don't clobber.
+    let _guard = crate::cron::CRON_FILE_LOCK.lock().await;
+
     let mut jobs = crate::cron::load_cron_jobs();
-    let count = jobs.len();
-    let id = format!("job-{}", count + 1);
+    // Use a UUID instead of `job-{count+1}` — the latter is unstable under
+    // concurrent adds (two callers can both see the same count).
+    let id = uuid::Uuid::new_v4().to_string();
 
     let job = crate::cron::CronJob {
         id: id.clone(),
@@ -213,6 +222,7 @@ pub async fn cron_remove(ctx: MethodCtx) -> MethodResult {
         .as_str()
         .ok_or_else(|| ErrorShape::bad_request("missing id"))?;
 
+    let _guard = crate::cron::CRON_FILE_LOCK.lock().await;
     let mut jobs = crate::cron::load_cron_jobs();
     let before = jobs.len();
     jobs.retain(|j| j.id != id);
@@ -285,9 +295,9 @@ pub async fn logs_tail(ctx: MethodCtx) -> MethodResult {
 
 pub async fn system_update_check(_ctx: MethodCtx) -> MethodResult {
     Ok(serde_json::json!({
-        "currentVersion": env!("RSCLAW_BUILD_VERSION"),
+        "currentVersion": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
         "updateAvailable": false,
-        "latestVersion": env!("RSCLAW_BUILD_VERSION"),
+        "latestVersion": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
     }))
 }
 
@@ -345,7 +355,7 @@ pub async fn system_presence(ctx: MethodCtx) -> MethodResult {
         "instances": [{
             "id": "gateway",
             "type": "gateway",
-            "version": env!("RSCLAW_BUILD_VERSION"),
+            "version": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
             "uptime": uptime.as_secs(),
             "status": "online",
         }],
@@ -441,8 +451,8 @@ pub async fn system_snapshot(ctx: MethodCtx) -> MethodResult {
     let now = chrono::Utc::now().to_rfc3339();
     Ok(serde_json::json!({
         "status": "ok",
-        "runtimeVersion": env!("RSCLAW_BUILD_VERSION"),
-        "version": env!("RSCLAW_BUILD_VERSION"),
+        "runtimeVersion": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
+        "version": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
         // Uptime — emit both field names used across openclaw versions.
         "uptime": uptime.as_secs(),
         "uptimeSeconds": uptime.as_secs(),
@@ -496,13 +506,13 @@ pub async fn status(ctx: MethodCtx) -> MethodResult {
     let uptime = ctx.state.started_at.elapsed();
     Ok(serde_json::json!({
         "status": "ok",
-        "version": env!("RSCLAW_BUILD_VERSION"),
+        "version": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
         "uptime": uptime.as_secs(),
         "cwd": std::env::current_dir()
             .map(|p| crate::config::loader::path_to_forward_slash(&p))
             .unwrap_or_default(),
         "platform": std::env::consts::OS,
-        "nodeVersion": format!("rust-{}", env!("RSCLAW_BUILD_VERSION")),
+        "nodeVersion": format!("rust-{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")),
     }))
 }
 
@@ -517,6 +527,7 @@ pub async fn cron_update(ctx: MethodCtx) -> MethodResult {
         .as_str()
         .ok_or_else(|| ErrorShape::bad_request("missing id"))?;
 
+    let _guard = crate::cron::CRON_FILE_LOCK.lock().await;
     // Load jobs from the openclaw-compatible jobs.json file
     let mut jobs = crate::cron::load_cron_jobs();
 
@@ -527,6 +538,9 @@ pub async fn cron_update(ctx: MethodCtx) -> MethodResult {
 
     // Patch allowed fields.
     if let Some(schedule) = params.get("schedule").and_then(|v| v.as_str()) {
+        if let Err(msg) = crate::cron::validate_cron_expr(schedule) {
+            return Err(ErrorShape::bad_request(msg));
+        }
         job.schedule = crate::cron::CronSchedule::Flat(schedule.to_string());
     }
     if let Some(message) = params.get("message").and_then(|v| v.as_str()) {
@@ -577,11 +591,44 @@ pub async fn update_run(_ctx: MethodCtx) -> MethodResult {
 }
 
 pub async fn system_shutdown(_ctx: MethodCtx) -> MethodResult {
-    // Initiate graceful shutdown by sending a signal to the runtime.
-    // For now, we acknowledge the request. The actual shutdown would
-    // be handled by the signal handler in main.
-    tracing::warn!("system.shutdown requested via WS");
+    // Exit the gateway process cleanly. We spawn the exit on a delay so the
+    // caller's WS frame has time to flush. Clients (tray Quit, CLI) use this
+    // instead of sending signals, so it works uniformly on every platform.
+    tracing::warn!("system.shutdown requested via WS — exiting in 300ms");
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Remove the PID file so `gateway status` reports stopped cleanly.
+        let _ = std::fs::remove_file(crate::config::loader::pid_file());
+        std::process::exit(0);
+    });
     Ok(serde_json::json!({ "shutting_down": true }))
+}
+
+/// `system.restart` — re-exec the current binary with the same `gateway run`
+/// args. The old PID exits; the new one picks up code changes on disk.
+pub async fn system_restart(_ctx: MethodCtx) -> MethodResult {
+    tracing::warn!("system.restart requested via WS");
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return Err(ErrorShape::internal(format!("current_exe: {e}"))),
+    };
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(["gateway", "run"]);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let _ = cmd.spawn();
+        // Do NOT remove the PID file on restart — the new process will
+        // overwrite it with its own PID. Removing here races and can
+        // leave us with no PID file after a successful restart.
+        std::process::exit(0);
+    });
+    Ok(serde_json::json!({ "restarting": true }))
 }
 
 pub async fn cron_run(ctx: MethodCtx) -> MethodResult {

@@ -268,12 +268,36 @@ fn inject_cache_control(body: &mut Value) {
         }
     }
 
-    // -- Message breakpoints (last 3 messages) --
+    // -- Message breakpoints: 2+1 anchor strategy --
+    //
+    // Anchor 1 (stable): first user message — the task baseline.  Once set it
+    // never changes even as the conversation grows or messages are trimmed from
+    // the middle, so the prefix before this anchor is always a cache hit.
+    //
+    // Dynamic (volatile): last message only — the freshest addition.
+    //
+    // This replaces the old "last 3" approach which caused cache churn whenever
+    // middle messages were pruned: the three-message window would shift and
+    // invalidate the previously-cached prefix.
     if let Some(Value::Array(messages)) = body.get_mut("messages") {
         let len = messages.len();
-        let start = len.saturating_sub(3);
-        for msg in &mut messages[start..] {
-            tag_last_content_block(msg, &cache_marker);
+        if len == 0 {
+            return;
+        }
+
+        // Anchor: first user message.
+        if messages[0]
+            .get("role")
+            .and_then(|r| r.as_str())
+            == Some("user")
+        {
+            tag_last_content_block(&mut messages[0], &cache_marker);
+        }
+
+        // Dynamic: latest message (only if it is different from the first).
+        if len > 1 {
+            let last_idx = len - 1;
+            tag_last_content_block(&mut messages[last_idx], &cache_marker);
         }
     }
 }
@@ -488,7 +512,8 @@ mod tests {
     }
 
     #[test]
-    fn cache_control_system_and_3() {
+    fn cache_control_system_and_anchors() {
+        // 2+1 anchor strategy: system + first user message + last message.
         let req = LlmRequest {
             system: Some("system prompt".to_owned()),
             messages: vec![
@@ -524,28 +549,41 @@ mod tests {
             "ephemeral"
         );
 
-        // Last 3 messages (m3, m4, m5) should have cache_control.
         let msgs = body["messages"].as_array().expect("messages is array");
         assert_eq!(msgs.len(), 5);
 
-        // m1, m2: no cache_control
-        assert!(msgs[0]["content"].as_str().is_some() || msgs[0]["content"][0].get("cache_control").is_none());
-        assert!(msgs[1]["content"].as_str().is_some() || msgs[1]["content"][0].get("cache_control").is_none());
+        // m1 (first user): cache_control — stable task anchor.
+        let m1_content = &msgs[0]["content"];
+        assert!(
+            m1_content.is_array(),
+            "m1 should be converted to content-block array"
+        );
+        assert_eq!(
+            m1_content[0]["cache_control"]["type"].as_str().expect("m1 cache_control type"),
+            "ephemeral"
+        );
 
-        // m3, m4, m5: have cache_control on last content block
-        for i in 2..5 {
+        // m2, m3, m4: no cache_control (middle messages are not anchored).
+        for i in 1..4 {
             let content = &msgs[i]["content"];
-            let block = if content.is_array() {
-                content.as_array().expect("content is array").last().expect("content not empty")
-            } else {
-                panic!("expected content to be converted to array for cached message");
-            };
-            assert_eq!(
-                block["cache_control"]["type"].as_str().expect("cache_control type"),
-                "ephemeral",
-                "message index {i} should have cache_control"
-            );
+            if content.is_array() {
+                assert!(
+                    content[0].get("cache_control").is_none(),
+                    "message {i} should not have cache_control"
+                );
+            }
+            // plain string content also means no cache_control — acceptable
         }
+
+        // m5 (last): cache_control — dynamic breakpoint.
+        let m5_content = &msgs[4]["content"];
+        assert!(m5_content.is_array(), "m5 should be content-block array");
+        assert_eq!(
+            m5_content[0]["cache_control"]["type"]
+                .as_str()
+                .expect("m5 cache_control type"),
+            "ephemeral"
+        );
     }
 
     #[test]

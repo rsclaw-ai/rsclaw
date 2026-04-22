@@ -68,7 +68,7 @@ pub async fn config_schema(ctx: MethodCtx) -> MethodResult {
         // Flag checked by the Control UI to decide whether to render forms.
         "available": true,
         "schema": "json5",
-        "version": env!("RSCLAW_BUILD_VERSION"),
+        "version": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
         "category": category.unwrap_or("settings"),
         "categories": [
             { "id": "settings",       "label": "Settings" },

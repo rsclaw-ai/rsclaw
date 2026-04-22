@@ -52,7 +52,7 @@ pub(crate) async fn try_preparse_locally(
 
     // /version
     if lower == "/version" {
-        return Some(txt(format!("rsclaw v{}", env!("RSCLAW_BUILD_VERSION"))));
+        return Some(txt(format!("rsclaw v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"))));
     }
     // /health
     if lower == "/health" {
@@ -127,7 +127,7 @@ pub(crate) async fn try_preparse_locally(
             "Gateway: running\nOS: {os}\nModel: {model}\nSessions: {sessions}\nContext: ~{:.1}k/{:.0}k tokens\nUptime: {uptime}\nVersion: rsclaw v{}",
             ctx_tokens as f64 / 1000.0,
             ctx_limit as f64 / 1000.0,
-            env!("RSCLAW_BUILD_VERSION")
+            option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
         )));
     }
     // /ls [path] — list workspace directory

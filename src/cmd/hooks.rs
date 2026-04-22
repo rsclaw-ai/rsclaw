@@ -8,7 +8,7 @@ pub async fn cmd_hooks(sub: HooksCommand) -> Result<()> {
     let config = config::load()?;
     match sub {
         HooksCommand::List => {
-            banner(&format!("rsclaw hooks v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!("rsclaw hooks v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
             match config.ops.hooks.as_ref() {
                 Some(h) if h.enabled => {
                     let mappings = h.mappings.as_deref().unwrap_or(&[]);
@@ -73,7 +73,7 @@ pub async fn cmd_hooks(sub: HooksCommand) -> Result<()> {
             ok(&format!("hook mapping '{}' disabled", cyan(&format!("/{id}"))));
         }
         HooksCommand::Install => {
-            banner(&format!("rsclaw hooks install v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!("rsclaw hooks install v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
             let port = config.gateway.port;
             let path = config
                 .ops

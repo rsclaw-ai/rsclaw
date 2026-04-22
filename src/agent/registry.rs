@@ -48,8 +48,15 @@ pub struct AgentHandle {
     pub started_at: Instant,
     /// Number of active sessions (updated after each turn for /status).
     pub session_count: Arc<AtomicUsize>,
-    /// Context tokens of the most recent turn (updated by runtime for /status).
+    /// Total context tokens of the most recent turn (sys + tools + msgs + scratchpad).
+    /// Updated by runtime for /status so the number matches what the LLM actually saw.
     pub last_ctx_tokens: Arc<AtomicUsize>,
+    /// System prompt tokens of the most recent LLM call.
+    pub last_sys_tokens: Arc<AtomicUsize>,
+    /// Tool-definition tokens of the most recent LLM call.
+    pub last_tools_tokens: Arc<AtomicUsize>,
+    /// Message-history tokens of the most recent LLM call.
+    pub last_msg_tokens: Arc<AtomicUsize>,
     /// Signal to clear all sessions (set by /clear bypass, consumed by runtime).
     pub clear_signal: Arc<AtomicBool>,
     /// Signal to start a new session (set by /new bypass, consumed by runtime).
@@ -274,6 +281,7 @@ impl AgentRegistry {
                 name: Some("Main Agent".to_owned()),
                 workspace,
                 model,
+                flash_model: None,
                 lane: None,
                 lane_concurrency: None,
                 group_chat: None,
@@ -318,6 +326,9 @@ impl AgentRegistry {
                     started_at: Instant::now(),
                     session_count: Arc::new(AtomicUsize::new(0)),
                     last_ctx_tokens: Arc::new(AtomicUsize::new(0)),
+                    last_sys_tokens: Arc::new(AtomicUsize::new(0)),
+                    last_tools_tokens: Arc::new(AtomicUsize::new(0)),
+                    last_msg_tokens: Arc::new(AtomicUsize::new(0)),
                     clear_signal: Arc::new(AtomicBool::new(false)),
                     new_session_signal: Arc::new(AtomicBool::new(false)),
                     reset_signal: Arc::new(AtomicBool::new(false)),
@@ -536,6 +547,7 @@ mod tests {
             default: if default { Some(true) } else { None },
             workspace: None,
             model: None,
+            flash_model: None,
             lane: None,
             lane_concurrency: None,
             group_chat: None,

@@ -182,7 +182,7 @@ impl PreParseEngine {
         add_direct(&mut commands, r"(?i)^/status$", |_| "__STATUS__".into());
         add_direct(&mut commands, r"(?i)^/health$", |_| "__HEALTH__".into());
         add_direct(&mut commands, r"(?i)^/version$", |_| {
-            format!("rsclaw v{}", env!("RSCLAW_BUILD_VERSION"))
+            format!("rsclaw v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"))
         });
         add_direct(&mut commands, r"(?i)^/uptime$", |_| "__UPTIME__".into());
         add_direct(&mut commands, r"(?i)^/models?$", |_| "__MODELS__".into());

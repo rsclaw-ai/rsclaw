@@ -7,7 +7,7 @@ use crate::{cli::AgentsCommand, config};
 pub async fn cmd_agents(sub: AgentsCommand) -> Result<()> {
     match sub {
         AgentsCommand::List => {
-            banner(&format!("rsclaw agents v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!("rsclaw agents v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
             let config = config::load()?;
             println!(
                 "  {:<16} {:<24} {:<10} {}",
@@ -74,7 +74,7 @@ pub async fn cmd_agents(sub: AgentsCommand) -> Result<()> {
             ok(&format!("deleted agent '{}'", cyan(&id)));
         }
         AgentsCommand::Bindings => {
-            banner(&format!("rsclaw agent bindings v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!("rsclaw agent bindings v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
             let config = config::load()?;
             if config.agents.bindings.is_empty() {
                 warn_msg("no bindings configured");

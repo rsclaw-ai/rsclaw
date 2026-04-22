@@ -1391,6 +1391,7 @@ function ConfigEditorPage() {
 // ══════════════════════════════════════════════════════════
 
 function AgentWorkspaceEditor({ agentId }: { agentId: string }) {
+  const zh = getLang() === "cn";
   const [files, setFiles] = useState<string[]>([]);
   const [activeFile, setActiveFile] = useState("");
   const [content, setContent] = useState("");
@@ -1401,6 +1402,10 @@ function AgentWorkspaceEditor({ agentId }: { agentId: string }) {
   const [showTemplates, setShowTemplates] = useState(false);
 
   const applyTemplate = async (tpl: AgentTemplate) => {
+    if (files.length > 0) {
+      const ok = window.confirm(zh ? `应用模板将覆盖现有 ${files.length} 个文件，确定继续吗？` : `Apply template will overwrite ${files.length} existing file(s). Continue?`);
+      if (!ok) return;
+    }
     for (const [fileName, fileContent] of Object.entries(tpl.files)) {
       await writeWorkspaceFile(fileName, fileContent, agentId);
     }
@@ -1951,7 +1956,7 @@ function AgentManagerPage() {
           onClick={openAddModal}
           style={{ padding: "8px 16px", borderRadius: 9, border: "none", background: "#f97316", color: "#fff", fontSize: 12, fontWeight: 700, boxShadow: "0 2px 8px rgba(249,115,22,.28)", cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}
         >
-          + {Locale.RsClawPanel.Agents.NewAgent}
+          {Locale.RsClawPanel.Agents.NewAgent}
         </button>
       </div>
 
@@ -3788,6 +3793,44 @@ function TauriConfigPageInner() {
             </div>
             <div style={fieldRow}>
               <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "KV Cache 模式" : "KV Cache Mode"}</div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.kv_cache_mode</div>
+              </div>
+              <select style={{ ...fSelect, minWidth: 240 }} value={getVal("agents.defaults.kv_cache_mode", 1)} onChange={(e) => updateConfig("agents.defaults.kv_cache_mode", parseInt(e.target.value))}>
+                <option value={0}>0 {zh ? "— 关闭" : "— off"}</option>
+                <option value={1}>1 {zh ? "— 追加模式（推荐）" : "— append-only (recommended)"}</option>
+                <option value={2}>2 {zh ? "— 增量模式" : "— incremental (cache_id)"}</option>
+              </select>
+            </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "快速模型" : "Flash Model"}</div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.flashModel.primary ({zh ? "留空则使用主模型" : "empty → use main model"})</div>
+              </div>
+              <input
+                style={{ ...fInput, minWidth: 240 }}
+                type="text"
+                placeholder={zh ? "例如 custom/qwen-turbo" : "e.g. custom/qwen-turbo"}
+                value={getVal("agents.defaults.flashModel.primary", "")}
+                onChange={(e) => {
+                  const v = (e.target.value || "").trim();
+                  if (!v) {
+                    updateConfig("agents.defaults.flashModel", undefined);
+                  } else {
+                    updateConfig("agents.defaults.flashModel.primary", v);
+                  }
+                }}
+              />
+            </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "旁路上下文预算" : "Bypass Context Budget"}</div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.btw_tokens ({zh ? "tokens" : "tokens"})</div>
+              </div>
+              <input style={{ ...fInput, minWidth: 100 }} type="number" min={1000} max={50000} step={1000} value={getVal("agents.defaults.btw_tokens", 10000)} onChange={(e) => updateConfig("agents.defaults.btw_tokens", parseInt(e.target.value) || 10000)} />
+            </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u8BF7\u6C42\u8D85\u65F6" : "Timeout"}</div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.timeoutSeconds ({zh ? "\u79D2" : "sec"})</div>
               </div>
@@ -4890,9 +4933,13 @@ function CronTaskPage() {
               <div style={{ marginBottom: 0 }}>
                 <div style={{ fontSize: 10, color: "#2e2c3a", letterSpacing: 0.4, marginBottom: 5, fontFamily: "'JetBrains Mono', monospace" }}>{zh ? "\u7ED3\u679C\u63A8\u9001" : "DELIVERY"} <span style={{ color: "#4a4858" }}>({zh ? "\u53EF\u9009" : "optional"})</span></div>
                 <div style={{ display: "flex", gap: 8 }}>
-                  <select value={form.deliveryChannel} onChange={(e) => setForm({ ...form, deliveryChannel: e.target.value })}
+                  <select value={form.deliveryChannel} onChange={(e) => {
+                    const ch = e.target.value;
+                    setForm({ ...form, deliveryChannel: ch, deliveryTo: ch === "desktop" ? "desktop-user" : form.deliveryTo });
+                  }}
                     style={{ flex: 1, padding: "8px 10px", borderRadius: 7, border: "1px solid rgba(255,255,255,.09)", background: "#1f2126", color: "#eceaf4", fontSize: 11, outline: "none", cursor: "pointer" }}>
                     <option value="">{zh ? "\u65E0\u63A8\u9001" : "No delivery"}</option>
+                    <option value="desktop">{zh ? "\u684C\u9762\u7AEF" : "Desktop"}</option>
                     <option value="feishu">{zh ? "\u98DE\u4E66" : "Feishu"}</option>
                     <option value="telegram">Telegram</option>
                     <option value="wechat">{zh ? "\u5FAE\u4FE1" : "WeChat"}</option>
@@ -4901,8 +4948,10 @@ function CronTaskPage() {
                     <option value="slack">Slack</option>
                     <option value="qq">QQ</option>
                   </select>
-                  <input value={form.deliveryTo} onChange={(e) => setForm({ ...form, deliveryTo: e.target.value })} placeholder={zh ? "\u76EE\u6807 ID (\u7528\u6237/\u7FA4)" : "Target ID (user/group)"}
-                    style={{ flex: 2, padding: "8px 10px", borderRadius: 7, border: "1px solid rgba(255,255,255,.09)", background: "#1f2126", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11, outline: "none" }} />
+                  {form.deliveryChannel !== "desktop" && (
+                    <input value={form.deliveryTo} onChange={(e) => setForm({ ...form, deliveryTo: e.target.value })} placeholder={zh ? "\u76EE\u6807 ID (\u7528\u6237/\u7FA4)" : "Target ID (user/group)"}
+                      style={{ flex: 2, padding: "8px 10px", borderRadius: 7, border: "1px solid rgba(255,255,255,.09)", background: "#1f2126", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11, outline: "none" }} />
+                  )}
                 </div>
               </div>
             </div>

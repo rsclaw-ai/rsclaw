@@ -24,7 +24,7 @@ pub async fn cmd_plugins(sub: PluginsCommand) -> Result<()> {
         PluginsCommand::Doctor => plugins_doctor(),
         PluginsCommand::Inspect { plugin } => plugins_inspect(&plugin),
         PluginsCommand::Marketplace => {
-            banner(&format!("rsclaw plugins marketplace v{}", env!("RSCLAW_BUILD_VERSION")));
+            banner(&format!("rsclaw plugins marketplace v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
             let url = "https://clawhub.ai/plugins";
             kv("marketplace", &bold(url));
             println!("  {}", dim("Browse and install plugins with: rsclaw plugins install <spec>"));
@@ -40,7 +40,7 @@ pub async fn cmd_plugins(sub: PluginsCommand) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn plugins_list() -> Result<()> {
-    banner(&format!("rsclaw plugins v{}", env!("RSCLAW_BUILD_VERSION")));
+    banner(&format!("rsclaw plugins v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
     let dir = plugins_dir();
     let plugins = scan_plugins(&dir)?;
 
@@ -236,7 +236,7 @@ fn plugins_set_enabled(name: &str, enabled: bool) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn plugins_doctor() -> Result<()> {
-    banner(&format!("rsclaw plugins doctor v{}", env!("RSCLAW_BUILD_VERSION")));
+    banner(&format!("rsclaw plugins doctor v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
 
     // Check runtimes
     let runtimes = [
@@ -367,7 +367,7 @@ fn plugins_uninstall(name: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn plugins_update(name: Option<&str>) -> Result<()> {
-    banner(&format!("rsclaw plugins update v{}", env!("RSCLAW_BUILD_VERSION")));
+    banner(&format!("rsclaw plugins update v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
     let dir = plugins_dir();
     let plugins = scan_plugins(&dir)?;
 

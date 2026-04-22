@@ -418,6 +418,32 @@ impl AgentRuntime {
             .to_owned()
     }
 
+    /// Resolve the "flash" (cheap/fast) model used for internal sub-tasks
+    /// like query planning and intent classification. Resolution order:
+    ///   1. `agents.<id>.flash_model`
+    ///   2. `agents.defaults.flash_model`
+    ///   3. `agents.<id>.model`         (main model for this agent)
+    ///   4. `agents.defaults.model`     (global default)
+    /// So if no flash model is configured anywhere, we fall back to whatever
+    /// the agent is already using — no regression.
+    pub(crate) fn resolve_flash_model_name(&self) -> String {
+        self.handle
+            .config
+            .flash_model
+            .as_ref()
+            .and_then(|m| m.primary.as_deref())
+            .or_else(|| {
+                self.config
+                    .agents
+                    .defaults
+                    .flash_model
+                    .as_ref()
+                    .and_then(|m| m.primary.as_deref())
+            })
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.resolve_model_name())
+    }
+
     // -----------------------------------------------------------------------
     // Plugin hook dispatch (AGENTS.md §20)
     // -----------------------------------------------------------------------
@@ -529,6 +555,108 @@ impl AgentRuntime {
             pending_analysis: None,
             was_preparse: false,
         })
+    }
+
+    /// Compress a web tool result for session storage via an ephemeral LLM call.
+    ///
+    /// Only the extracted answer is stored in session history — raw web content
+    /// (HTML, search results, screenshots) is never concatenated into the
+    /// conversation. Returns the extracted text; error means caller should fall
+    /// back to plain truncation.
+    async fn compress_tool_result_for_session(
+        &mut self,
+        session_key: &str,
+        tool_name: &str,
+        result_text: &str,
+    ) -> Result<String> {
+        use super::web_parsers::html_dehydrate_to_text;
+
+        // Step 1: extract the prose content from structured JSON results.
+        // web_fetch → {url, title, text, length}; web_browser → {action, text, ...}
+        let extracted = if let Ok(v) = serde_json::from_str::<serde_json::Value>(result_text) {
+            v.get("text")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_owned())
+                .unwrap_or_else(|| result_text.to_owned())
+        } else {
+            result_text.to_owned()
+        };
+
+        // Step 2: strip any residual HTML.
+        // web_fetch now outputs lol-html plain text, but web_browser DOM snapshots
+        // can still contain HTML-like fragments.
+        let clean = if extracted.contains('<') && extracted.contains('>') {
+            html_dehydrate_to_text(&extracted)
+        } else {
+            extracted
+        };
+
+        // Step 3: cap at ~10k tokens before sending to the compression LLM.
+        // 40k chars covers: ASCII-heavy (10k tokens × 4 chars) and CJK-heavy
+        // (10k tokens × 1.5 chars ≈ 15k chars), with margin in between.
+        const TOKEN_CAP_CHARS: usize = 40_000;
+        let capped: String = clean.chars().take(TOKEN_CAP_CHARS).collect();
+
+        // Step 4: get the user's question for context.
+        let user_question: String = self
+            .sessions
+            .get(session_key)
+            .and_then(|msgs| msgs.iter().rev().find(|m| m.role == Role::User))
+            .map(|m| match &m.content {
+                MessageContent::Text(t) => t.chars().take(500).collect(),
+                _ => String::new(),
+            })
+            .unwrap_or_default();
+
+        let prompt = if user_question.is_empty() {
+            format!("Tool: {tool_name}\n\nContent:\n{capped}")
+        } else {
+            format!("User question: {user_question}\n\nTool ({tool_name}) returned:\n{capped}")
+        };
+
+        // Step 5: single LLM call — extract the answer, no cache markers,
+        // no tools.  Like vision: raw content goes in, structured answer comes out.
+        let model = self.resolve_model_name();
+        let req = LlmRequest {
+            model,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text(prompt),
+            }],
+            tools: vec![],
+            system: Some(
+                "You are an information extractor. Given tool output and a user question, \
+                 extract the facts that directly answer the question. \
+                 Output structured plain text: a direct answer paragraph, then bullet points \
+                 for key facts. No HTML, no JSON, no code blocks. \
+                 If the content does not answer the question, summarize what was found in \
+                 1-2 sentences. Reply in the same language as the user's question."
+                    .to_owned(),
+            ),
+            max_tokens: Some(1000),
+            temperature: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            kv_cache_mode: 0,
+            session_key: None,
+        };
+
+        let providers = Arc::clone(&self.providers);
+        let mut stream = self.failover.call(req, &providers).await?;
+        let mut buf = String::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(StreamEvent::TextDelta(d)) => buf.push_str(&d),
+                Ok(StreamEvent::Done { .. }) | Ok(StreamEvent::Error(_)) => break,
+                Ok(_) => {}
+                Err(e) => return Err(anyhow!("compress stream error: {e}")),
+            }
+        }
+
+        if buf.is_empty() {
+            return Err(anyhow!("empty response from compression LLM"));
+        }
+        Ok(buf)
     }
 
     /// Drive a single conversation turn.
@@ -904,7 +1032,7 @@ impl AgentRuntime {
                             .unwrap_or("en");
                         build_help_text_filtered(allowed, lang)
                     }
-                    "__VERSION__" => format!("rsclaw {}", env!("RSCLAW_BUILD_VERSION")),
+                    "__VERSION__" => format!("rsclaw {}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")),
                     "__STATUS__" => {
                         let model = self.resolve_model_name();
                         let sessions = self.sessions.len();
@@ -916,39 +1044,56 @@ impl AgentRuntime {
                             else if cfg!(target_os = "windows") { "Windows" }
                             else if cfg!(target_os = "ios") { "iOS" }
                             else { "Unknown" };
-                        let msg_tokens: usize = self.sessions.get(session_key)
-                            .map(|msgs| msgs.iter().map(crate::agent::context_mgr::msg_tokens).sum())
-                            .unwrap_or(0);
-                        self.handle.last_ctx_tokens.store(msg_tokens, std::sync::atomic::Ordering::Relaxed);
                         let ctx_limit = self.handle.config.model.as_ref()
                             .and_then(|m| m.context_tokens)
                             .or(self.config.agents.defaults.model.as_ref()
                                 .and_then(|m| m.context_tokens))
                             .unwrap_or(64000) as usize;
 
-                        // Estimate system prompt + tools tokens.
-                        let tools = build_tool_list(
-                            &self.skills,
-                            self.agents.as_deref(),
-                            &self.handle.id,
-                            &self.config.agents.external,
-                        );
-                        let tools_json = serde_json::to_string(&tools).unwrap_or_default();
-                        let tools_tokens = tools_json.len() / 4; // JSON is mostly ASCII, ~4 chars/token
-                        // System prompt: estimate from last known size or compute a rough guess.
-                        let sys_tokens = 3500; // typical system prompt ~3.5k tokens
-                        let all_tokens = sys_tokens + tools_tokens + msg_tokens;
+// Pull the last known values from the most recent LLM
+                        // call (stored by the runtime). This matches exactly
+                        // what the model actually saw, instead of re-estimating
+                        // from scratch (which was systematically wrong).
+                        use std::sync::atomic::Ordering::Relaxed;
+                        let sys_tokens = self.handle.last_sys_tokens.load(Relaxed);
+                        let tools_tokens = self.handle.last_tools_tokens.load(Relaxed);
+                        let msg_tokens = self.handle.last_msg_tokens.load(Relaxed);
+                        let total_tokens = self.handle.last_ctx_tokens.load(Relaxed);
+
+                        // Fallback for the case where no LLM call has happened
+                        // yet in this agent's lifetime — count current session
+                        // messages so the user still sees something sensible.
+                        let (sys_tokens, tools_tokens, msg_tokens, total_tokens) =
+                            if total_tokens == 0 {
+                                let m: usize = self.sessions.get(session_key)
+                                    .map(|msgs| msgs.iter().map(crate::agent::context_mgr::msg_tokens).sum())
+                                    .unwrap_or(0);
+                                (0, 0, m, m)
+                            } else {
+                                (sys_tokens, tools_tokens, msg_tokens, total_tokens)
+                            };
+
+                        let stale_hint = if total_tokens == 0 {
+                            " (no LLM call yet)"
+                        } else {
+                            " (from last LLM call)"
+                        };
 
                         format!(
                             "Gateway: running\nOS: {os}\nModel: {model}\nSessions: {sessions}\n\
-                             Context: system ~{:.1}k + tools ~{:.1}k + messages ~{:.1}k = ~{:.1}k/{:.0}k tokens\n\
+                             Context{stale_hint}:\n\
+                             \u{A0} system  ~{:.1}k\n\
+                             \u{A0} tools   ~{:.1}k\n\
+                             \u{A0} msgs    ~{:.1}k\n\
+                             \u{A0} total   ~{:.1}k / {:.0}k ({}%)\n\
                              Uptime: {uptime}\nVersion: rsclaw {}",
                             sys_tokens as f64 / 1000.0,
                             tools_tokens as f64 / 1000.0,
                             msg_tokens as f64 / 1000.0,
-                            all_tokens as f64 / 1000.0,
+                            total_tokens as f64 / 1000.0,
                             ctx_limit as f64 / 1000.0,
-                            env!("RSCLAW_BUILD_VERSION")
+                            if ctx_limit > 0 { total_tokens * 100 / ctx_limit } else { 0 },
+                            option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
                         )
                     }
                     "__HEALTH__" => {
@@ -961,7 +1106,7 @@ impl AgentRuntime {
                             model,
                             if provider_ok { "ok" } else { "unavailable" },
                             self.handle.id,
-                            env!("RSCLAW_BUILD_VERSION"),
+                            option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
                         )
                     }
                     "__UPTIME__" => format_duration(self.started_at.elapsed()),
@@ -2724,6 +2869,16 @@ impl AgentRuntime {
 
         let mut tool_images: Vec<String> = Vec::new();
         let mut tool_files: Vec<(String, String, String)> = Vec::new();
+        let mut tool_log: Vec<(String, String, String)> = Vec::new();
+
+        // Scratch-paper buffer for this turn's tool-call/tool-result messages.
+        //
+        // Tool calls and their results are "working notes" — they are needed by
+        // the LLM during the current turn but should NOT pollute the persistent
+        // session history.  Only the final assistant text reply is stored in
+        // self.sessions / redb; everything else lives here and is discarded when
+        // the turn ends.
+        let mut turn_scratchpad: Vec<Message> = Vec::new();
 
         // Inject completed async task results into the session.
         {
@@ -2848,11 +3003,15 @@ impl AgentRuntime {
         }
 
         // Dynamic iteration limit based on task complexity.
-        // Default: 15 iterations. Complex tools (browser/opencode/exec): up to configured max.
+        // Default: 20 iterations. Complex tools (browser/opencode/exec): up to configured max.
         const BASE_ITERATIONS: usize = 20;
         let configured_complex: usize = self.config.agents.defaults.max_iterations
             .map(|v| v as usize)
-            .unwrap_or(50);
+            .unwrap_or(30);
+        // Track consecutive identical tool calls (same name + same args).
+        let mut last_tool_key = String::new();
+        let mut same_call_streak: usize = 0;
+        const MAX_SAME_CALL_STREAK: usize = 5;
         let mut max_iterations = BASE_ITERATIONS;
         let mut iteration = 0usize;
 
@@ -2911,14 +3070,34 @@ impl AgentRuntime {
             }
 
             // Apply context-budget-aware trimming: trim oldest messages so the
-            // total history fits within the model's context window minus reserves
-            // for the system prompt, tools, and reply generation.
+            // persistent session fits within the context window.  The scratchpad
+            // (current-turn working buffer) is NOT trimmed but its token cost is
+            // subtracted from the available budget so session is trimmed enough.
+            let scratchpad_tokens: usize = turn_scratchpad.iter().map(msg_tokens).sum();
             if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
-                apply_context_budget_trim(sess, context_tokens, &system_prompt, &tools);
+                apply_context_budget_trim(
+                    sess,
+                    context_tokens,
+                    &system_prompt,
+                    &tools,
+                    scratchpad_tokens,
+                );
             }
 
-            // Build API copy of messages — clone from session, then inject
-            // dynamic context and vision images. Session storage is NOT modified.
+            // Build API copy of messages for this LLM call.
+            //
+            // Final message order (stable prefix → volatile tail):
+            //   [0]   system  — main prompt           (KV-cache anchor, never changes)
+            //   [1]   system  — plugins               (inserted at front)
+            //   [2]   system  — skills                (inserted at front)
+            //   [3…n] history — session user/assistant messages
+            //   [n+1] system  — new_skills_tail        (rare, appended)
+            //   [n+2] system  — dynamic_ctx (/ctx/btw) (stable within a turn)
+            //   [tail] …      — turn_scratchpad        (grows per iteration, cleared next turn)
+            //
+            // Keeping dynamic_ctx before turn_scratchpad means the prefix
+            // [session + ctx] is identical on every LLM call within a turn,
+            // allowing the KV cache to cover it. Session storage is NOT modified.
             let mut messages = {
                 let mut raw = self
                     .sessions
@@ -2928,6 +3107,8 @@ impl AgentRuntime {
 
                 // For vision models: replace last user message with multimodal
                 // version containing original images (only for this API call).
+                // Must happen before scratchpad is appended so last() is the
+                // session user message, not a tool result.
                 if ctx.has_images {
                     if let Some(last) = raw.last_mut() {
                         if last.role == Role::User {
@@ -2937,13 +3118,8 @@ impl AgentRuntime {
                 }
 
                 // Insert plugins and skills as system messages at the front
-                // of history. After provider prepends the main system prompt [0],
-                // the final order is:
-                //   [0] system — main prompt (stable, never changes)
-                //   [1] system — plugins (highest priority, overrides skills/built-in)
-                //   [2] system — skills (overrides built-in tools)
-                //   [3+] history — user/assistant/tool messages
-                // Insert in reverse order since each insert(0, ...) pushes previous ones down.
+                // of history. Insert in reverse order since each insert(0, …)
+                // pushes previous ones down.
                 if let Some(skills) = skills_system {
                     raw.insert(0, Message {
                         role: Role::System,
@@ -2958,8 +3134,6 @@ impl AgentRuntime {
                 }
 
                 // Append newly installed skills as trailing system messages.
-                // These were added after the cached [2] was frozen — appending
-                // at the tail preserves the KV cache prefix.
                 for skill_block in &new_skills_tail {
                     raw.push(Message {
                         role: Role::System,
@@ -2969,8 +3143,8 @@ impl AgentRuntime {
                     });
                 }
 
-                // Inject remaining dynamic context (btw /ctx) as a trailing
-                // system message after all history. Session storage is unchanged.
+                // Inject dynamic context (/ctx, btw) before the scratchpad so
+                // the [session + ctx] prefix stays stable across loop iterations.
                 if !dynamic_ctx.is_empty() {
                     let ctx_block = dynamic_ctx.join("\n\n");
                     raw.push(Message {
@@ -2979,23 +3153,18 @@ impl AgentRuntime {
                     });
                 }
 
+                // Append current-turn scratch-paper (tool calls + results).
+                // Always at the tail; discarded when this turn ends.
+                raw.extend(turn_scratchpad.clone());
+
                 // Repair transcript: ensure all tool_calls have matching tool_results.
                 let repair_result = repair_tool_result_pairing(raw);
 
-                // Persist any synthetic tool results to session storage
-                // so they don't need to be added again on the next turn.
+                // Synthetic tool results (generated by repair to fix broken
+                // pairs) go into the scratch-paper buffer, not the persistent
+                // session.  They are working-turn artefacts; no need to persist.
                 if !repair_result.synthetic_messages.is_empty() {
-                    for synthetic in &repair_result.synthetic_messages {
-                        if let Err(e) = self.store.db.append_message(
-                            &ctx.session_key,
-                            &serde_json::to_value(synthetic).unwrap_or_default(),
-                        ) {
-                            tracing::warn!("failed to persist synthetic message: {e:#}");
-                        }
-                    }
-                    if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
-                        sess.extend(repair_result.synthetic_messages.clone());
-                    }
+                    turn_scratchpad.extend(repair_result.synthetic_messages.clone());
                 }
 
                 repair_result.messages
@@ -3038,8 +3207,25 @@ impl AgentRuntime {
             let tools_tokens: usize = tools.iter()
                 .map(|t| estimate_tokens(&t.name) + estimate_tokens(&t.description) + estimate_tokens(&t.parameters.to_string()))
                 .sum();
-            let approx_tokens = msg_tokens_sum + sys_tokens + tools_tokens;
-            self.handle.last_ctx_tokens.store(approx_tokens, std::sync::atomic::Ordering::Relaxed);
+            // Use the larger of: component-based estimate vs JSON body estimate.
+            // Component estimate misses JSON structure overhead, message formatting,
+            // and chat template tokens. JSON body estimate (bytes / 3) is conservative
+            // but never underestimates.
+            let component_est = msg_tokens_sum + sys_tokens + tools_tokens;
+            let body_est = {
+                let msgs_json = serde_json::to_string(&messages).unwrap_or_default();
+                let tools_json = serde_json::to_string(&tools).unwrap_or_default();
+                // Use estimate_tokens on the full JSON body — handles CJK vs ASCII correctly.
+                // Add per-message overhead for chat template tokens (~10 per message).
+                estimate_tokens(&msgs_json) + estimate_tokens(system_prompt)
+                    + estimate_tokens(&tools_json) + msg_count * 10
+            };
+            let approx_tokens = component_est.max(body_est);
+            use std::sync::atomic::Ordering::Relaxed;
+            self.handle.last_ctx_tokens.store(approx_tokens, Relaxed);
+            self.handle.last_sys_tokens.store(sys_tokens, Relaxed);
+            self.handle.last_tools_tokens.store(tools_tokens, Relaxed);
+            self.handle.last_msg_tokens.store(msg_tokens_sum, Relaxed);
             info!(session = %ctx.session_key, msg_count, approx_tokens, sys_tokens, tools_tokens, msg_tokens = msg_tokens_sum, model = %model, "LLM call: context size");
 
             // Context usage awareness: inject hint into the LAST user message
@@ -3124,6 +3310,33 @@ impl AgentRuntime {
                 Some(0.6)
             };
 
+// Pre-flight check: emergency compact if we'd exceed context.
+            let context_limit = self.config.agents.defaults.context_tokens.unwrap_or(64_000) as usize;
+            let overhead = self.estimate_fixed_overhead();
+            let session_tokens: usize = self.sessions
+                .get(&ctx.session_key)
+                .map(|msgs| msgs.iter().map(super::context_mgr::msg_tokens).sum())
+                .unwrap_or(0);
+            let total_est = overhead + session_tokens;
+            // Use 80% of context limit as threshold to account for token estimation
+            // inaccuracy (estimate is ~char/3.5, actual tokenization may differ by 10-15%).
+            if total_est > (context_limit * 80 / 100) {
+                warn!(
+                    session = %ctx.session_key,
+                    total_est,
+                    context_limit,
+                    overhead,
+                    session_tokens,
+                    "pre-flight: approaching context limit, forcing compaction"
+                );
+                self.compact_inner(&ctx.session_key, model, true).await;
+                // Re-read messages after compaction.
+                messages = self.sessions
+                    .get(&ctx.session_key)
+                    .cloned()
+                    .unwrap_or_default();
+            }
+
             let kv_cache_mode = self.config.agents.defaults.kv_cache_mode.unwrap_or(1);
             let req = LlmRequest {
                 model: model.to_owned(),
@@ -3144,7 +3357,24 @@ impl AgentRuntime {
             }
 
             let providers = Arc::clone(&self.providers);
-            let mut stream = self.failover.call(req, &providers).await?;
+            let stream_result = self.failover.call(req.clone(), &providers).await;
+
+            // If the LLM rejects for context overflow, compact and retry once.
+            let mut stream = match stream_result {
+                Err(ref e) if e.to_string().contains("exceed") || e.to_string().contains("context") => {
+                    warn!(session = %ctx.session_key, error = %e, "LLM context overflow, compacting and retrying");
+                    self.compact_inner(&ctx.session_key, &model, true).await;
+                    // Rebuild messages after compaction.
+                    let compacted = self.sessions
+                        .get(&ctx.session_key)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut retry_req = req.clone();
+                    retry_req.messages = compacted;
+                    self.failover.call(retry_req, &providers).await?
+                }
+                other => other?,
+            };
             let mut text_buf = String::new();
             let mut reasoning_buf = String::new();
             let mut tool_calls: Vec<(String, String, Value)> = Vec::new();
@@ -3198,6 +3428,9 @@ impl AgentRuntime {
                                     agent_id: ctx.agent_id.clone(),
                                     delta: std::mem::take(&mut delta_buf),
                                     done: false,
+                                    files: vec![],
+                                    images: vec![],
+                                    tool_log: vec![],
                                 });
                             }
                             last_delta_flush = now;
@@ -3328,6 +3561,9 @@ impl AgentRuntime {
                         agent_id: ctx.agent_id.clone(),
                         delta: delta_buf,
                         done: false,
+                        files: vec![],
+                        images: vec![],
+                        tool_log: vec![],
                     });
                 }
             }
@@ -3524,6 +3760,9 @@ impl AgentRuntime {
                         agent_id: ctx.agent_id.clone(),
                         delta: String::new(),
                         done: true,
+                        files: tool_files.clone(),
+                        images: tool_images.clone(),
+                        tool_log: tool_log.clone(),
                     });
                 }
 
@@ -3597,15 +3836,9 @@ impl AgentRuntime {
                 role: Role::Assistant,
                 content: MessageContent::Parts(parts),
             };
-            if let Err(e) = self.store.db.append_message(
-                &ctx.session_key,
-                &serde_json::to_value(&assistant_msg).unwrap_or_default(),
-            ) {
-                tracing::error!(error = %e, "failed to persist message");
-            }
-            if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
-                sess.push(assistant_msg);
-            }
+            // Tool-use responses are scratch-paper: the LLM needs to see them
+            // in this turn's messages, but they must not persist in session history.
+            turn_scratchpad.push(assistant_msg);
 
             // Check if any tool call targets an external (caller-provided) tool.
             // If so, return early with the OAI tool_calls payload — the caller
@@ -3678,7 +3911,7 @@ impl AgentRuntime {
                     // Record for loop detection so error doesn't count as a "different result"
                     ctx.loop_detector.record_result(&serde_json::json!({"error": err_msg}));
 
-                    // Directly return error to session without executing the tool
+                    // Directly return error to scratch-paper buffer without executing the tool.
                     let tool_msg = Message {
                         role: Role::Tool,
                         content: MessageContent::Parts(vec![
@@ -3689,19 +3922,37 @@ impl AgentRuntime {
                             },
                         ]),
                     };
-                    if let Err(e) = self.store.db.append_message(
-                        &ctx.session_key,
-                        &serde_json::to_value(&tool_msg).unwrap_or_default(),
-                    ) {
-                        tracing::error!(error = %e, "failed to persist message");
-                    }
-                    if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
-                        sess.push(tool_msg);
-                    }
+                    turn_scratchpad.push(tool_msg);
                     continue;
                 }
 
                 debug!(tool = %tool_name, "dispatching tool call");
+
+                // Detect consecutive identical tool calls (same name + same args).
+                let call_key = crate::agent::loop_detection::hash_tool_call(&tool_name, &tool_input);
+                if call_key == last_tool_key {
+                    same_call_streak += 1;
+                    if same_call_streak >= MAX_SAME_CALL_STREAK {
+                        warn!(
+                            tool = %tool_name,
+                            streak = same_call_streak,
+                            "agent_loop: identical tool call repeated {} times, breaking loop",
+                            same_call_streak
+                        );
+                        return Ok(AgentReply {
+                            text: crate::i18n::t("agent_loop_detected", crate::i18n::default_lang()).to_owned(),
+                            is_empty: false,
+                            tool_calls: None,
+                            images: vec![],
+                            files: vec![],
+                            pending_analysis: None,
+                            was_preparse: false,
+                        });
+                    }
+                } else {
+                    last_tool_key = call_key;
+                    same_call_streak = 1;
+                }
 
                 // Upgrade iteration limit when complex or multi-step tools are used.
                 if matches!(tool_name.as_str(),
@@ -3727,6 +3978,7 @@ impl AgentRuntime {
                 )
                 .await;
 
+                let tool_input_str = tool_input.to_string();
                 let result = self
                     .dispatch_tool(ctx, &tool_id, &tool_name, tool_input)
                     .await;
@@ -3815,6 +4067,34 @@ impl AgentRuntime {
                 };
 
                 tool_images.extend(result_images);
+
+                // Record tool call for frontend display (truncated to 4000 chars).
+                // Also emit immediately so the desktop chat shows results in real time.
+                {
+                    let args_str = tool_input_str;
+                    let out_str = if result_text.len() > 4000 {
+                        let truncated: String = result_text.chars().take(2000).collect();
+                        format!("{}…(truncated)", truncated)
+                    } else {
+                        result_text.clone()
+                    };
+                    tool_log.push((tool_name.clone(), args_str, out_str.clone()));
+                    if let Some(ref bus) = self.event_bus {
+                        let marker = format!(
+                            "<rstool name=\"{}\">{}</rstool>",
+                            tool_name, out_str
+                        );
+                        let _ = bus.send(AgentEvent {
+                            session_id: ctx.session_key.clone(),
+                            agent_id: ctx.agent_id.clone(),
+                            delta: marker,
+                            done: false,
+                            files: vec![],
+                            images: vec![],
+                            tool_log: vec![],
+                        });
+                    }
+                }
 
                 // Auto-send files: any tool returning __send_file=true queues the
                 // file for delivery. Images go to tool_images, others to tool_files.
@@ -3917,33 +4197,163 @@ impl AgentRuntime {
                     }
                 }
 
-                // Truncate tool result for session storage (prevent bloat).
-                // Current LLM round already has full result via tool dispatch.
-                let limits = self
-                    .config
-                    .ext
-                    .tools
-                    .as_ref()
-                    .and_then(|t| t.session_result_limits.as_ref());
-                let max_chars = match tool_name.as_str() {
-                    "web_search" => limits.and_then(|l| l.web_search).unwrap_or(2000),
-                    "web_fetch" => limits.and_then(|l| l.web_fetch).unwrap_or(5000),
-                    "execute_command" | "exec" => limits.and_then(|l| l.exec).unwrap_or(3000),
-                    _ => limits.and_then(|l| l.default).unwrap_or(3000),
-                };
-                let session_text = if result_text.len() > max_chars {
-                    let truncated = &result_text[..result_text
-                        .char_indices()
-                        .nth(max_chars)
-                        .map(|(i, _)| i)
-                        .unwrap_or(result_text.len())];
-                    format!(
-                        "{truncated}\n[...truncated, {}/{} chars]",
-                        max_chars,
-                        result_text.len()
-                    )
-                } else {
-                    result_text.clone()
+// Extract inline images and file attachments from WASM plugin results.
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result_text) {
+                    // data:image/ URIs → tool_images
+                    if let Some(imgs) = v.get("images").and_then(|i| i.as_array()) {
+                        for img in imgs {
+                            if let Some(s) = img.as_str() {
+                                if s.starts_with("data:image/") {
+                                    tool_images.push(s.to_string());
+                                    tracing::info!("extracted inline image from tool result ({} bytes)", s.len());
+                                }
+                            }
+                        }
+                        if !tool_images.is_empty() {
+                            let mut cleaned = v.clone();
+                            cleaned["images"] = serde_json::json!(format!("[{} images extracted as attachments]", tool_images.len()));
+                            result_text = cleaned.to_string();
+                        }
+                    }
+
+                    // File paths from "files" array → tool_images/tool_files (auto-send)
+                    // Jimeng plugin returns: {"files": ["{\"path\":\"/path/to/1.png\",\"size\":123}", ...]}
+                    if let Some(files) = v.get("files").and_then(|f| f.as_array()) {
+                        for file_entry in files {
+                            let path_str = if let Some(s) = file_entry.as_str() {
+                                // May be a JSON string with path field
+                                if let Ok(fv) = serde_json::from_str::<serde_json::Value>(s) {
+                                    fv.get("path").and_then(|p| p.as_str()).unwrap_or(s).to_string()
+                                } else {
+                                    s.to_string()
+                                }
+                            } else if let Some(p) = file_entry.get("path").and_then(|p| p.as_str()) {
+                                p.to_string()
+                            } else {
+                                continue;
+                            };
+
+                            let pb = std::path::PathBuf::from(&path_str);
+                            if pb.exists() {
+                                let lower = path_str.to_lowercase();
+                                let is_image = lower.ends_with(".png") || lower.ends_with(".jpg")
+                                    || lower.ends_with(".jpeg") || lower.ends_with(".webp");
+                                if is_image {
+                                    // Convert to data URI for inline sending
+                                    if let Ok(bytes) = std::fs::read(&pb) {
+                                        use base64::Engine as _;
+                                        let mime = if lower.ends_with(".png") { "image/png" }
+                                            else if lower.ends_with(".webp") { "image/webp" }
+                                            else { "image/jpeg" };
+                                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                        tool_images.push(format!("data:{mime};base64,{b64}"));
+                                        tracing::info!(path = %path_str, size = bytes.len(), "auto-sending image file as attachment");
+                                    }
+                                } else {
+                                    // Non-image file (video, etc.) → tool_files
+                                    let filename = pb.file_name()
+                                        .map(|f| f.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "file".to_string());
+                                    let mime = if lower.ends_with(".mp4") { "video/mp4" }
+                                        else if lower.ends_with(".mp3") { "audio/mpeg" }
+                                        else { "application/octet-stream" };
+                                    tool_files.push((filename, mime.to_string(), path_str.clone()));
+                                    tracing::info!(path = %path_str, "auto-sending file as attachment");
+                                }
+                            }
+                        }
+                        // Clean up result_text
+                        if !tool_images.is_empty() || !tool_files.is_empty() {
+                            let mut cleaned = v.clone();
+                            cleaned["files"] = serde_json::json!(format!(
+                                "[{} files auto-sent as attachments]",
+                                tool_images.len() + tool_files.len()
+                            ));
+                            cleaned.as_object_mut().map(|o| o.remove("_action"));
+                            result_text = cleaned.to_string();
+                        }
+                    }
+                }
+
+                // Compress or truncate tool result for session storage.
+                //
+                // Web tools (web_fetch / web_browser / web_search) with large
+                // results go through an ephemeral LLM call that extracts only
+                // the answer.  Raw HTML / search-result JSON never enters the
+                // conversation history.  Other tools are truncated as before.
+                let session_text = {
+                    const WEB_COMPRESS_THRESHOLD: usize = 1000;
+                    let is_web_tool = matches!(
+                        tool_name.as_str(),
+                        "web_fetch" | "web_browser" | "browser" | "web_search"
+                    );
+
+                    if is_web_tool && result_text.len() > WEB_COMPRESS_THRESHOLD {
+                        let sk = ctx.session_key.clone();
+                        let tn = tool_name.clone();
+                        match self.compress_tool_result_for_session(&sk, &tn, &result_text).await {
+                            Ok(summary) => {
+                                debug!(
+                                    tool = %tn,
+                                    orig = result_text.len(),
+                                    compressed = summary.len(),
+                                    "tool result compressed for session"
+                                );
+                                summary
+                            }
+                            Err(e) => {
+                                warn!(tool = %tn, error = %e, "tool result compression failed, truncating");
+                                let max = 3000usize;
+                                if result_text.len() > max {
+                                    let end = result_text
+                                        .char_indices()
+                                        .nth(max)
+                                        .map(|(i, _)| i)
+                                        .unwrap_or(result_text.len());
+                                    format!(
+                                        "{}\n[...truncated, {}/{} chars]",
+                                        &result_text[..end],
+                                        max,
+                                        result_text.len()
+                                    )
+                                } else {
+                                    result_text.clone()
+                                }
+                            }
+                        }
+                    } else {
+                        // Non-web tools: keep existing per-tool limits.
+                        let limits = self
+                            .config
+                            .ext
+                            .tools
+                            .as_ref()
+                            .and_then(|t| t.session_result_limits.as_ref());
+                        let max_chars = match tool_name.as_str() {
+                            "execute_command" | "exec" => {
+                                limits.and_then(|l| l.exec).unwrap_or(3000)
+                            }
+                            "read_file" | "read" => {
+                                limits.and_then(|l| l.default).unwrap_or(3000)
+                            }
+                            _ => limits.and_then(|l| l.default).unwrap_or(3000),
+                        };
+                        if result_text.len() > max_chars {
+                            let end = result_text
+                                .char_indices()
+                                .nth(max_chars)
+                                .map(|(i, _)| i)
+                                .unwrap_or(result_text.len());
+                            format!(
+                                "{}\n[...truncated, {}/{} chars]",
+                                &result_text[..end],
+                                max_chars,
+                                result_text.len()
+                            )
+                        } else {
+                            result_text.clone()
+                        }
+                    }
                 };
 
                 // Inject loop detection warning if present (so LLM sees it and can stop)
@@ -3979,15 +4389,10 @@ impl AgentRuntime {
                         },
                     ]),
                 };
-                if let Err(e) = self.store.db.append_message(
-                    &ctx.session_key,
-                    &serde_json::to_value(&tool_msg).unwrap_or_default(),
-                ) {
-                    tracing::error!(error = %e, "failed to persist message");
-                }
-                if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
-                    sess.push(tool_msg);
-                }
+                // Tool results are scratch-paper: keep in the working buffer for
+                // this turn's LLM iterations but never persist to session / redb.
+                // Only the final assistant text reply enters the conversation history.
+                turn_scratchpad.push(tool_msg);
             }
         }
     }
@@ -4931,6 +5336,74 @@ const MAX_FILE_CONTENT_CHARS: usize = 20_000;
 // ---------------------------------------------------------------------------
 // Persist dynamic agent to config file
 // ---------------------------------------------------------------------------
+
+/// Patch fields of an existing `AgentEntry` in `agents.list` in the config file.
+///
+/// - `model`: `Some("")` or `Some("default")` removes the field (agent falls back to defaults).
+///            `Some("provider/model")` sets `model.primary`.
+///            `None` leaves it untouched.
+/// - `name`:  `Some("")` removes the field. `Some(x)` sets it. `None` leaves it.
+///
+/// The config hot-reload watcher picks up the change automatically — no restart needed.
+pub(crate) async fn update_agent_in_config(
+    id: &str,
+    model: Option<&str>,
+    name: Option<&str>,
+) -> anyhow::Result<serde_json::Value> {
+    use serde_json::json;
+
+    let config_path = crate::config::loader::detect_config_path()
+        .ok_or_else(|| anyhow!("no config file found"))?;
+    let raw = tokio::fs::read_to_string(&config_path).await?;
+    let mut doc: serde_json::Value = json5::from_str(&raw)
+        .map_err(|e| anyhow!("parse config: {e}"))?;
+
+    let list = doc
+        .pointer_mut("/agents/list")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| anyhow!("agents.list not found in config"))?;
+
+    let entry = list
+        .iter_mut()
+        .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(id))
+        .ok_or_else(|| anyhow!("agent not found: {id}"))?;
+
+    let mut changes: Vec<String> = vec![];
+
+    if let Some(m) = model {
+        if m.is_empty() || m == "default" {
+            if entry.as_object_mut().and_then(|o| o.remove("model")).is_some() {
+                changes.push("model removed (falls back to defaults)".to_owned());
+            }
+        } else {
+            entry["model"] = json!({"primary": m});
+            changes.push(format!("model → {m}"));
+        }
+    }
+
+    if let Some(n) = name {
+        if n.is_empty() {
+            entry.as_object_mut().map(|o| o.remove("name"));
+        } else {
+            entry["name"] = json!(n);
+        }
+        changes.push("name updated".to_owned());
+    }
+
+    if changes.is_empty() {
+        return Ok(json!({"warning": "nothing to update — provide model and/or name"}));
+    }
+
+    let output = serde_json::to_string_pretty(&doc)?;
+    tokio::fs::write(&config_path, output).await?;
+    tracing::info!(agent_id = %id, ?changes, "agent config updated");
+
+    Ok(json!({
+        "updated": id,
+        "changes": changes,
+        "note": "saved — hot-reload applies within seconds"
+    }))
+}
 
 /// Append an AgentEntry to the `agents.list` array in the config file.
 /// The hot-reload watcher will pick up the change automatically.

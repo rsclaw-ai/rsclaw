@@ -247,6 +247,11 @@ pub struct AgentsConfig {
 pub struct AgentDefaults {
     pub workspace: Option<String>,
     pub model: Option<ModelConfig>,
+    /// Cheap/fast model used for internal low-stakes sub-tasks: query
+    /// planning, intent classification, summarization hints, etc. Falls back
+    /// to `model` when unset. Keep it pointed at something ~50x cheaper than
+    /// the main model (gpt-4o-mini / qwen-turbo / doubao-lite / local 1.5B).
+    pub flash_model: Option<ModelConfig>,
     pub models: Option<HashMap<String, ModelAlias>>,
     pub max_concurrent: Option<u32>,
     pub context_pruning: Option<ContextPruningConfig>,
@@ -302,6 +307,10 @@ pub struct AgentEntry {
     pub workspace: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelConfig>,
+    /// Per-agent flash model override. Falls back to defaults.flash_model,
+    /// then to this agent's `model`, then to defaults.model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flash_model: Option<ModelConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lane: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1336,6 +1345,9 @@ pub struct SessionResultLimits {
     pub web_search: Option<usize>,
     /// web_fetch result max chars in session (default: 5000)
     pub web_fetch: Option<usize>,
+    /// web_browser snapshot/action max chars in session (default: 1500)
+    /// Browser snapshots are large but mostly ephemeral (refs expire after page change).
+    pub web_browser: Option<usize>,
     /// exec result max chars in session (default: 3000)
     pub exec: Option<usize>,
     /// Default for all other tools (default: 3000)

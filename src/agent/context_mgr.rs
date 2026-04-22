@@ -163,10 +163,12 @@ pub(crate) fn msg_tokens(m: &Message) -> usize {
 /// within the model's context budget.
 ///
 /// Budget calculation:
-///   reply_reserve  = max(context_budget * 20%, 2000)
-///   system_tokens  = system_prompt.len() / 4
-///   tools_tokens   = tools JSON size / 4
-///   history_budget = context_budget - reply_reserve - system_tokens - tools_tokens
+///   reply_reserve      = max(context_budget * 20%, 2000)
+///   system_tokens      = system_prompt.len() / 4
+///   tools_tokens       = tools JSON size / 4
+///   scratchpad_tokens  = caller-supplied overhead (current-turn working buffer)
+///   history_budget     = context_budget - reply_reserve - system_tokens
+///                        - tools_tokens - scratchpad_tokens
 ///
 /// Always keeps at least the last 3 user-assistant pairs (6 messages).
 pub(crate) fn apply_context_budget_trim(
@@ -174,11 +176,8 @@ pub(crate) fn apply_context_budget_trim(
     context_tokens: usize,
     system_prompt: &str,
     tools: &[ToolDef],
+    scratchpad_tokens: usize,
 ) {
-    if messages.len() <= 6 {
-        return;
-    }
-
     let reply_reserve = (context_tokens / 5).max(2000);
     let sys_tokens = estimate_tokens(system_prompt);
     let tools_tokens = serde_json::to_string(tools)
@@ -188,14 +187,53 @@ pub(crate) fn apply_context_budget_trim(
     let history_budget = context_tokens
         .saturating_sub(reply_reserve)
         .saturating_sub(sys_tokens)
-        .saturating_sub(tools_tokens);
+        .saturating_sub(tools_tokens)
+        .saturating_sub(scratchpad_tokens);
 
-    let total_tokens: usize = messages.iter().map(msg_tokens).sum();
+    let mut total_tokens: usize = messages.iter().map(msg_tokens).sum();
     if total_tokens <= history_budget {
         return;
     }
 
-    // Trim from the front, keeping at least the last 6 messages.
+    // Zone 1 — sketch old tool results before deleting any messages.
+    //
+    // When we are over budget, first try truncating old Tool-result content
+    // to a 200-char "sketch" summary.  This preserves the full conversation
+    // structure (role alternation) while dramatically reducing token count.
+    // Only messages outside the last-4 are touched so recent context is kept.
+    let sketch_boundary = messages.len().saturating_sub(4);
+    let sketch_limit = 200usize;
+    let mut sketched = 0usize;
+    for msg in &mut messages[..sketch_boundary] {
+        if msg.role != Role::Tool {
+            continue;
+        }
+        if let MessageContent::Parts(parts) = &mut msg.content {
+            for part in parts {
+                if let crate::provider::ContentPart::ToolResult { content, .. } = part {
+                    if content.chars().count() > sketch_limit {
+                        let short: String = content.chars().take(sketch_limit).collect();
+                        *content = format!("{short}…[sketched]");
+                        sketched += 1;
+                    }
+                }
+            }
+        }
+    }
+    if sketched > 0 {
+        total_tokens = messages.iter().map(msg_tokens).sum();
+        tracing::info!(
+            history_budget,
+            sketched,
+            total_tokens,
+            "context budget: sketched {sketched} old tool results"
+        );
+        if total_tokens <= history_budget {
+            return;
+        }
+    }
+
+    // Zone 2 — still over budget: trim oldest messages from the front.
     let min_keep = 6;
     let max_removable = messages.len().saturating_sub(min_keep);
     let mut removed_tokens: usize = 0;
@@ -219,18 +257,6 @@ pub(crate) fn apply_context_budget_trim(
             "context budget trim: removed {remove_count} oldest messages"
         );
         messages.drain(..remove_count);
-
-        // Insert a system-like marker so the model knows history was truncated.
-        messages.insert(0, Message {
-            role: Role::User,
-            content: MessageContent::Text(
-                "[System: earlier conversation history was trimmed to fit context window. Continue naturally from the messages below.]".to_owned()
-            ),
-        });
-        messages.insert(1, Message {
-            role: Role::Assistant,
-            content: MessageContent::Text("Understood.".to_owned()),
-        });
     }
 }
 

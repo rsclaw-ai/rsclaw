@@ -357,6 +357,7 @@ pub struct CronRunner {
     semaphore: Arc<Semaphore>,
     default_delivery: Option<CronDelivery>,
     reload_tx: broadcast::Sender<()>,
+    ws_conns: Arc<crate::ws::ConnRegistry>,
 }
 
 impl CronRunner {
@@ -367,6 +368,7 @@ impl CronRunner {
         channels: Arc<ChannelManager>,
         data_dir: PathBuf,
         reload_tx: broadcast::Sender<()>,
+        ws_conns: Arc<crate::ws::ConnRegistry>,
     ) -> Self {
         let run_log_dir = data_dir.join("cron");
         let store_path = data_dir.join("cron_store.json");
@@ -382,6 +384,7 @@ impl CronRunner {
             semaphore: Arc::new(Semaphore::new(4)),
             default_delivery: config.default_delivery.clone(),
             reload_tx,
+            ws_conns,
         }
     }
 
@@ -517,13 +520,29 @@ impl CronRunner {
 
             let next_wake = next_wake_job.map(|(t, _, _)| t);
 
-            // DEBUG: log next_wake to diagnose early firing
-            debug!(next_wake = next_wake.unwrap_or(0), now_ms, "cron: timer tick");
-            if next_wake.map(|t| t <= now_ms).unwrap_or(false) {
-                if let Some((t, id, name)) = next_wake_job {
-                    warn!(next_wake = t, now_ms, job_id = %id, job_name = %name.as_deref().unwrap_or("unknown"), "cron: next_wake is in the past!");
+// Auto-remove expired once jobs (past due by > 5 minutes).
+            // This prevents stale once jobs from spamming "next_wake in the past" warnings.
+            let expired_threshold_ms = 5 * 60 * 1000;
+            let before_len = jobs.len();
+            jobs.retain(|j| {
+                if !j.schedule.is_once() || !j.enabled { return true; }
+                if let Some(state) = &j.state {
+                    if let Some(next_at) = state.next_run_at_ms {
+                        if now_ms > next_at + expired_threshold_ms {
+                            info!(job_id = %j.id, name = ?j.name, "cron: removing expired once job (past due by {}s)", (now_ms - next_at) / 1000);
+                            return false;
+                        }
+                    }
+                }
+                true
+            });
+            if jobs.len() < before_len {
+                if let Err(e) = self.save_store(&jobs).await {
+                    warn!(err = %e, "cron: failed to persist after expired job cleanup");
                 }
             }
+
+            debug!(next_wake = next_wake.unwrap_or(0), now_ms, "cron: timer tick");
 
             let delay_ms = match next_wake {
                 Some(next_wake) => {
@@ -748,6 +767,7 @@ impl CronRunner {
                 let channels = Arc::clone(&self.channels);
                 let run_log_dir = self.run_log_dir.clone();
                 let default_delivery = self.default_delivery.clone();
+                let ws_conns = Arc::clone(&self.ws_conns);
 
                 let handle = tokio::spawn(async move {
                     let start_time = current_timestamp_ms();
@@ -755,19 +775,27 @@ impl CronRunner {
                     let prev_consecutive_errors = job.state.as_ref().map(|s| s.consecutive_errors).unwrap_or(0);
                     info!(job_id = %job.id, "cron job triggered");
 
-                    // Run with cancellation check — polls cancel flag every second.
-                    let result = tokio::select! {
-                        r = run_cron_job(&job, &agents) => r,
-                        _ = async {
-                            loop {
-                                tokio::time::sleep(Duration::from_secs(1)).await;
-                                if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
-                                    info!(job_id = %job.id, "cron job cancelled");
-                                    break;
+                    // systemEvent: deliver payload text directly — no agent call needed.
+                    let result: Result<String> = if job.payload.as_ref().and_then(|p| match p {
+                        CronPayload::Structured { kind, .. } => kind.as_deref(),
+                        _ => None,
+                    }) == Some("systemEvent") {
+                        Ok(job.effective_message().to_owned())
+                    } else {
+                        // Run with cancellation check — polls cancel flag every second.
+                        tokio::select! {
+                            r = run_cron_job(&job, &agents) => r,
+                            _ = async {
+                                loop {
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                    if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                                        info!(job_id = %job.id, "cron job cancelled");
+                                        break;
+                                    }
                                 }
+                            } => {
+                                Err(anyhow::anyhow!("job cancelled"))
                             }
-                        } => {
-                            Err(anyhow::anyhow!("job cancelled"))
                         }
                     };
                     let duration_ms = current_timestamp_ms() - start_time;
@@ -821,6 +849,11 @@ impl CronRunner {
                             }
                         }
                     };
+
+                    // Delivery path: send_delivery → DesktopChannel (for desktop
+                    // deliveries) broadcasts via ws_conns, so we don't need a
+                    // separate direct broadcast here (would double-deliver).
+                    let _ = &ws_conns; // kept in scope for future direct use
 
                     // Spawn delivery as a detached task so it doesn't block.
                     // The result is logged but we don't wait for it.
@@ -895,7 +928,15 @@ impl CronRunner {
         info!(job_id = %job.id, "manually triggering cron job");
         let _permit = self.semaphore.acquire().await?;
         let prev_consecutive_errors = job.state.as_ref().map(|s| s.consecutive_errors).unwrap_or(0);
-        let result = run_cron_job(job, &self.agents).await;
+        // systemEvent: deliver payload text directly — no agent call needed.
+        let result: Result<String> = if job.payload.as_ref().and_then(|p| match p {
+            CronPayload::Structured { kind, .. } => kind.as_deref(),
+            _ => None,
+        }) == Some("systemEvent") {
+            Ok(job.effective_message().to_owned())
+        } else {
+            run_cron_job(job, &self.agents).await
+        };
         let success = result.is_ok();
 
         // Build delivery message with execution summary
@@ -917,6 +958,8 @@ impl CronRunner {
             }
         };
 
+        // Delivery goes through send_delivery → DesktopChannel (which broadcasts
+        // via ws_conns). A separate direct broadcast here would double-deliver.
         if let Err(e) =
             send_delivery(&self.channels, job, &self.default_delivery, &delivery_text).await
         {
@@ -992,6 +1035,7 @@ impl Clone for CronRunner {
             semaphore: Arc::clone(&self.semaphore),
             default_delivery: self.default_delivery.clone(),
             reload_tx: self.reload_tx.clone(),
+            ws_conns: Arc::clone(&self.ws_conns),
         }
     }
 }
@@ -1514,5 +1558,88 @@ pub fn save_cron_jobs(jobs: &[CronJob]) -> anyhow::Result<()> {
     }
 
     std::fs::write(&cron_file, json).context("failed to write cron jobs file")?;
+    Ok(())
+}
+
+/// Global mutex that serializes read-modify-write on the cron store file.
+/// Without this, concurrent `cron.add` calls (common when an LLM dispatches
+/// multiple tool calls in one turn) race and silently lose writes.
+pub static CRON_FILE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+mod cron_validate_tests {
+    use super::validate_cron_expr;
+
+    #[test]
+    fn accepts_common_patterns() {
+        for ok in ["*/5 * * * *", "0 17 * * *", "30 8 * * 1-5", "0 9 1 * *"] {
+            assert!(validate_cron_expr(ok).is_ok(), "should accept '{}'", ok);
+        }
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(validate_cron_expr("").is_err());
+        assert!(validate_cron_expr("   ").is_err());
+    }
+
+    #[test]
+    fn rejects_four_fields_with_hint() {
+        let err = validate_cron_expr("017 * * *").unwrap_err();
+        assert!(err.contains("5 fields"), "err = {err}");
+        assert!(err.contains("0 17"), "should hint at '0 17': {err}");
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(validate_cron_expr("not a cron").is_err());
+    }
+}
+
+/// Validate a cron expression at save time. Returns a friendly error string
+/// the LLM can act on, instead of silently accepting broken expressions and
+/// failing later at scheduling time.
+pub fn validate_cron_expr(expr: &str) -> Result<(), String> {
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return Err("cron expression is empty".to_owned());
+    }
+    let fields: Vec<&str> = trimmed.split_whitespace().collect();
+    if fields.len() != 5 {
+        // Build a hint that catches the common "forgot a space" mistake.
+        // E.g. "017 * * *" → hint that "017" might be "0 17" (4 fields → 5).
+        let hint = if fields.len() == 4 && fields[0].len() >= 2 && fields[0].chars().all(|c| c.is_ascii_digit()) {
+            let n = fields[0];
+            format!(
+                " — looks like a missing space: '{}' could be '{} {}' which makes 5 fields (e.g. '0 17 * * *' for 5pm daily)",
+                n,
+                &n[..1],
+                &n[1..]
+            )
+        } else {
+            String::new()
+        };
+        return Err(format!(
+            "cron expression must have exactly 5 fields separated by spaces \
+             (minute hour day month weekday), got {} field(s): '{}'{}",
+            fields.len(),
+            trimmed,
+            hint
+        ));
+    }
+    // Delegate range parsing to the existing scheduler. If it can compute a
+    // next run, the expression is valid; otherwise reject.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if compute_next_run_from_expr(trimmed, now, None).is_none() {
+        return Err(format!(
+            "cron expression '{}' could not be parsed. Valid examples: \
+             '*/5 * * * *' (every 5 min), '0 17 * * *' (5pm daily), \
+             '0 9 * * 1' (9am Mondays)",
+            trimmed
+        ));
+    }
     Ok(())
 }

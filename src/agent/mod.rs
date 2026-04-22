@@ -20,6 +20,7 @@ pub mod permission;
 pub mod platform;
 pub mod preparse;
 pub mod prompt_builder;
+pub mod query_planner;
 pub mod registry;
 pub mod runtime;
 pub mod security;

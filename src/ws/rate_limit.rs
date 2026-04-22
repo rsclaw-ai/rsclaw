@@ -84,6 +84,8 @@ impl RateLimiter {
                 | "exec.approval.set"
                 | "exec.approval.resolve"
                 | "system.shutdown"
+                | "system.stop"
+                | "system.restart"
                 | "system.update.run"
                 | "node.pair.request"
                 | "node.pair.approve"

@@ -111,7 +111,7 @@ async fn run() -> Result<()> {
     // Handle -v and -version before clap (clap handles --version and -V)
     let raw_args: Vec<String> = std::env::args().collect();
     if raw_args.len() == 2 && (raw_args[1] == "-v" || raw_args[1] == "-version") {
-        println!("rsclaw v{}", env!("RSCLAW_BUILD_VERSION"));
+        println!("rsclaw v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"));
         return Ok(());
     }
 
@@ -299,7 +299,7 @@ async fn cmd_acp(sub: AcpCommand) -> Result<()> {
             .await?;
 
             let init_resp = client
-                .initialize("rsclaw", env!("RSCLAW_BUILD_VERSION"))
+                .initialize("rsclaw", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"))
                 .await?;
             eprintln!(
                 "Agent initialized: {} v{}",
@@ -334,7 +334,7 @@ async fn cmd_acp(sub: AcpCommand) -> Result<()> {
             let client = GatewayClient::connect(
                 &url,
                 "rsclaw:client",
-                env!("RSCLAW_BUILD_VERSION"),
+                option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
                 token.as_deref(),
                 None,
             )
@@ -390,7 +390,7 @@ async fn cmd_acp(sub: AcpCommand) -> Result<()> {
             let client = AcpClient::spawn(&command, &["acp"]).await?;
 
             let init_resp = client
-                .initialize("rsclaw", env!("RSCLAW_BUILD_VERSION"))
+                .initialize("rsclaw", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"))
                 .await?;
             eprintln!(
                 "[rsclaw] Agent initialized: {} v{}",
@@ -438,7 +438,7 @@ async fn cmd_acp(sub: AcpCommand) -> Result<()> {
             let client = GatewayClient::connect(
                 &url,
                 "rsclaw:client",
-                env!("RSCLAW_BUILD_VERSION"),
+                option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
                 token.as_deref(),
                 None,
             )
@@ -472,7 +472,7 @@ async fn cmd_acp(sub: AcpCommand) -> Result<()> {
             let client = GatewayClient::connect(
                 &url,
                 "rsclaw:client",
-                env!("RSCLAW_BUILD_VERSION"),
+                option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
                 token.as_deref(),
                 None,
             )

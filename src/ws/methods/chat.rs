@@ -101,6 +101,9 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
                     "sessionKey": sk,
                     "type": "done",
                     "role": "assistant",
+                    "files": event.files,
+                    "images": event.images,
+                    "toolLog": event.tool_log,
                 })
             } else {
                 serde_json::json!({

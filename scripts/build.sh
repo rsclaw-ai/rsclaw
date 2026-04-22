@@ -192,6 +192,32 @@ build_target() {
     package_target "$target"
 }
 
+# Sign a macOS binary with Developer ID (no-op on other platforms / if disabled).
+# Set APPLE_SIGNING_IDENTITY="" to skip signing.
+sign_macos_binary() {
+    local bin_path="$1"
+    local target="$2"
+    [[ "$target" != *"-apple-darwin" ]] && return 0
+    [[ "$(uname -s)" != "Darwin" ]] && return 0  # can't codesign from non-macOS
+    local identity="${APPLE_SIGNING_IDENTITY-Developer ID Application: Hua Lan (K87X8CQ78Y)}"
+    if [[ -z "$identity" ]]; then
+        log "APPLE_SIGNING_IDENTITY empty — skipping signing for $target"
+        return 0
+    fi
+    # Only sign if the identity is actually installed in the keychain.
+    if ! security find-identity -v -p codesigning 2>/dev/null | grep -Fq "$identity"; then
+        warn "signing identity not found in keychain: $identity"
+        warn "leaving $target binary unsigned"
+        return 0
+    fi
+    log "Signing $target binary with: $identity"
+    if codesign --force --sign "$identity" --options runtime --timestamp "$bin_path" 2>&1; then
+        ok "Signed: $bin_path"
+    else
+        warn "codesign failed for $bin_path (leaving unsigned)"
+    fi
+}
+
 # Package built binary into dist/
 package_target() {
     local target="$1"
@@ -208,6 +234,9 @@ package_target() {
         err "Binary not found: $bin_path"
         return 1
     fi
+
+    # Sign macOS binaries before packaging so the archive contains the signed one.
+    sign_macos_binary "$bin_path" "$target"
 
     if [[ "$target" == *"-windows"* ]]; then
         archive_name="${BINARY}-${VERSION}-${target}.zip"
@@ -327,6 +356,13 @@ main() {
     if [[ $failed -gt 0 ]]; then
         err "$failed target(s) failed"
         exit 1
+    fi
+
+    # Remove debug build artifacts after a successful release build to free disk space.
+    if [[ -d "target/debug" ]]; then
+        log "Removing target/debug ..."
+        rm -rf "target/debug"
+        ok "target/debug removed"
     fi
 
     ok "All ${#unique_targets[@]} target(s) built successfully"

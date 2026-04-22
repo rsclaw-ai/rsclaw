@@ -309,6 +309,76 @@ pub(crate) fn strip_html(html: &str) -> String {
         .to_owned()
 }
 
+/// Structural HTML dehydration via lol-html (Cloudflare streaming rewriter).
+///
+/// Removes noise elements (script, style, nav, footer, etc.) as entire
+/// subtrees, strips all attributes except `href` on anchors and `src`/`alt`
+/// on images, then collapses whitespace.  Produces clean prose suitable for
+/// token-efficient LLM input.
+///
+/// Falls back to [`strip_html`] on parse errors.
+pub(crate) fn html_dehydrate(html: &str) -> String {
+    use lol_html::{element, rewrite_str, RewriteStrSettings};
+
+    let result = rewrite_str(
+        html,
+        RewriteStrSettings {
+            element_content_handlers: vec![
+                // Remove entire noise subtrees.
+                element!(
+                    "script, style, nav, footer, header, aside, \
+                     iframe, svg, canvas, noscript, form, button, \
+                     [class*=\"ad\"], [id*=\"banner\"]",
+                    |el| {
+                        el.remove();
+                        Ok(())
+                    }
+                ),
+                // Strip all attributes, keeping only semantically useful ones.
+                element!("*", |el| {
+                    let tag = el.tag_name();
+                    let attrs: Vec<String> =
+                        el.attributes().iter().map(|a| a.name()).collect();
+                    for attr in attrs {
+                        let keep = match tag.as_str() {
+                            "a" => attr == "href",
+                            "img" => attr == "src" || attr == "alt",
+                            _ => false,
+                        };
+                        if !keep {
+                            el.remove_attribute(&attr);
+                        }
+                    }
+                    Ok(())
+                }),
+            ],
+            ..RewriteStrSettings::default()
+        },
+    );
+
+    static HTML_COMMENT_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"(?s)<!--.*?-->").expect("html comment regex"));
+
+    match result {
+        // Return clean HTML — no entity decoding here so downstream callers
+        // (e.g. htmd) can parse the HTML structure correctly.
+        // Only remove comments to avoid leaking conditional blocks.
+        Ok(cleaned) => HTML_COMMENT_RE.replace_all(&cleaned, "").to_string(),
+        Err(_) => strip_html(html),
+    }
+}
+
+/// Like `html_dehydrate` but returns plain text for direct LLM consumption.
+///
+/// Applies `html_dehydrate` then strips remaining tags, decodes entities,
+/// and collapses whitespace.
+pub(crate) fn html_dehydrate_to_text(html: &str) -> String {
+    let clean_html = html_dehydrate(html);
+    let no_tags = STRIP_TAGS_RE.replace_all(&clean_html, " ");
+    let decoded = decode_html_entities(&no_tags);
+    WHITESPACE_RE.replace_all(&decoded, " ").trim().to_owned()
+}
+
 /// Decode common HTML entities.
 pub(crate) fn decode_html_entities(s: &str) -> String {
     s.replace("&amp;", "&")

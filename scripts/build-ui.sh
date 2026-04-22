@@ -89,12 +89,14 @@ fi
 # --- Step 1: Build rsclaw CLI ---
 log "Building rsclaw CLI (${PROFILE})..."
 
-VERSION="$(git -C "$ROOT_DIR" describe --tags --always 2>/dev/null || echo "dev")"
+VERSION="$(grep '^version' "$ROOT_DIR/Cargo.toml" | head -1 | sed 's/.*"\(.*\)"/\1/')"
 BUILD_DATE="$(date +%Y-%m-%d)"
+
+log "Version: ${CYAN}${VERSION}${NC}"
 
 (
     cd "$ROOT_DIR"
-    RSCLAW_BUILD_VERSION="v${VERSION}" \
+    RSCLAW_BUILD_VERSION="${VERSION}" \
     RSCLAW_BUILD_DATE="$BUILD_DATE" \
     cargo build $CARGO_FLAGS --target "$TARGET" 2>&1
 ) || {
@@ -103,7 +105,7 @@ BUILD_DATE="$(date +%Y-%m-%d)"
         log "Retrying without explicit --target..."
         (
             cd "$ROOT_DIR"
-            RSCLAW_BUILD_VERSION="v${VERSION}" \
+            RSCLAW_BUILD_VERSION="${VERSION}" \
             RSCLAW_BUILD_DATE="$BUILD_DATE" \
             cargo build $CARGO_FLAGS 2>&1
         )
@@ -151,6 +153,42 @@ log "Building Tauri app (${PROFILE})..."
 
 # --- Done ---
 echo ""
+# Tauri v2 doesn't sign debug builds from tauri.conf.json — resign explicitly
+# with the Developer ID identity so macOS TCC permissions persist across builds.
+SIGN_IDENTITY="${APPLE_SIGNING_IDENTITY:-Developer ID Application: Hua Lan (K87X8CQ78Y)}"
+APP_BUNDLE="$TAURI_DIR/target/${TARGET}/${PROFILE_DIR}/bundle/macos/RsClaw.app"
+[[ ! -d "$APP_BUNDLE" ]] && APP_BUNDLE="$TAURI_DIR/target/${PROFILE_DIR}/bundle/macos/RsClaw.app"
+if [[ -d "$APP_BUNDLE" ]] && [[ "$(uname -s)" == "Darwin" ]]; then
+    # Inject TCC usage descriptions — macOS silently denies Automation/Screen
+    # Recording without these keys (no prompt, no error). Must be done BEFORE
+    # codesign so they're covered by the signature.
+    PLIST="$APP_BUNDLE/Contents/Info.plist"
+    log "Injecting TCC usage descriptions into Info.plist..."
+    plutil -replace NSAppleEventsUsageDescription -string \
+        "RsClaw needs to automate other apps (WeChat, System Events, etc.) to perform tasks on your behalf." \
+        "$PLIST" 2>&1 || true
+    plutil -replace NSScreenCaptureUsageDescription -string \
+        "RsClaw needs to capture the screen to see UI state for agentic tasks." \
+        "$PLIST" 2>&1 || true
+
+    # Entitlements file: required for hardened runtime to allow Automation,
+    # child process launching, and library loading. Without this, macOS blocks
+    # osascript/screencapture even though TCC is granted.
+    ENTITLEMENTS="$TAURI_DIR/entitlements.plist"
+    SIGN_ARGS=(--force --deep --sign "$SIGN_IDENTITY" --options runtime --timestamp)
+    if [[ -f "$ENTITLEMENTS" ]]; then
+        SIGN_ARGS+=(--entitlements "$ENTITLEMENTS")
+        log "Using entitlements: $ENTITLEMENTS"
+    fi
+
+    log "Signing with: $SIGN_IDENTITY"
+    if codesign "${SIGN_ARGS[@]}" "$APP_BUNDLE" 2>&1; then
+        log "App signed successfully"
+    else
+        warn "Signing failed — app will use ad-hoc signature"
+    fi
+fi
+
 log "Build complete!"
 echo ""
 

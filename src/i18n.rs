@@ -2151,6 +2151,20 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "ja" => "タスクが複雑すぎるかループしています。リクエストを簡略化するか、/clear で最初からやり直してください。",
     );
 
+    msg!("agent_loop_detected",
+        "en" => "Detected repeated identical operation without progress. Trying a different approach.",
+        "zh" => "检测到重复执行相同操作但没有进展，尝试换一种方式处理。",
+        "cn" => "检测到重复执行相同操作但没有进展，尝试换一种方式处理。",
+        "ja" => "同じ操作の繰り返しを検出しました。別のアプローチを試みます。",
+        "ko" => "동일한 작업이 반복 감지되었습니다. 다른 접근 방식을 시도합니다.",
+        "de" => "Wiederholte identische Operation ohne Fortschritt erkannt. Versuche einen anderen Ansatz.",
+        "fr" => "Operation identique repetee sans progres detectee. Essai d'une autre approche.",
+        "es" => "Se detecto una operacion identica repetida sin progreso. Intentando un enfoque diferente.",
+        "ru" => "Обнаружено повторение одинаковой операции без прогресса. Пробую другой подход.",
+        "th" => "ตรวจพบการทำงานซ้ำโดยไม่มีความคืบหน้า กำลังลองวิธีอื่น",
+        "vi" => "Phat hien thao tac lap lai khong tien trien. Thu cach tiep can khac.",
+    );
+
     m
 });
 

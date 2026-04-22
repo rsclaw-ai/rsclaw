@@ -14,17 +14,40 @@ use tracing::{info, warn};
 use super::platform::{detect_chrome, has_display};
 use super::runtime::{AgentRuntime, RunContext, expand_tilde};
 use super::web_parsers::{
-    extract_html_title, is_captcha_page, lang_to_bing_mkt,
+    extract_html_title, html_dehydrate_to_text, is_captcha_page, lang_to_bing_mkt,
     parse_baidu_results, parse_bing_html_results, parse_ddg_results, parse_sogou_results,
-    search_engine_url, strip_html, truncate_chars, urlencoding,
+    search_engine_url, truncate_chars, urlencoding,
 };
 use crate::provider::{Message, MessageContent, Role, StreamEvent};
+use crate::agent::query_planner::{Intent, QueryPlan};
 
 impl AgentRuntime {
     pub(crate) async fn tool_web_search(&self, args: Value) -> Result<Value> {
         let query = args["query"]
             .as_str()
             .ok_or_else(|| anyhow!("web_search: `query` required"))?;
+
+        // ---- Query planner: split & route via the flash model ---------------
+        // For a multi-entity or structured query the planner decomposes it
+        // into sub-queries, some of which can be answered by direct APIs
+        // (wttr.in for weather, etc.) — no search engine needed.
+        // If the planner fails or returns only `general`, we fall through to
+        // the normal search logic below with the original query unchanged.
+        if !args.get("_planned").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let flash = self.resolve_flash_model_name();
+            let plan = crate::agent::query_planner::plan(query, &flash, &self.providers).await;
+
+            // Count structured (non-general) intents. If we have any, dispatch
+            // them through the planner path and return structured results.
+            let structured_count = plan.sub_queries.iter()
+                .filter(|s| !matches!(s.intent, crate::agent::query_planner::Intent::General))
+                .count();
+
+            if structured_count > 0 {
+                return self.dispatch_query_plan(plan).await;
+            }
+            // All general — fall through to normal search below.
+        }
 
         // Read config
         let ws_cfg = self
@@ -473,7 +496,7 @@ impl AgentRuntime {
                     let html = resp.text().await.ok()?;
                     let content_type = "text/html"; // assume HTML
                     let md = if content_type.contains("text/html") {
-                        htmd::convert(&html).unwrap_or_else(|_| strip_html(&html))
+                        html_dehydrate_to_text(&html)
                     } else {
                         html
                     };
@@ -673,15 +696,20 @@ impl AgentRuntime {
 
         let title = extract_html_title(&html);
 
-        // Convert HTML -> Markdown (htmd, Turndown-inspired).
+        // Convert HTML → clean plain text via lol-html structural dehydration.
+        // Removes script/style/nav/footer/aside entirely, strips all non-semantic
+        // attributes, then strips remaining tags and collapses whitespace.
+        // This reliably eliminates JS bundles and CSS noise without the
+        // htmd Markdown conversion overhead.
         let markdown = if content_type.contains("text/html") {
-            htmd::convert(&html).unwrap_or_else(|_| strip_html(&html))
+            html_dehydrate_to_text(&html)
         } else {
             html.clone()
         };
 
         // Detect SPA (large HTML but almost no text) -> fallback to browser.
-        let plain_len = strip_html(&html).trim().len();
+        // Use the already-computed dehydrated text length for the check.
+        let plain_len = markdown.trim().len();
         let is_spa = content_type.contains("text/html") && plain_len < 200 && html.len() > 10_000;
 
         let (final_title, final_md) = if is_spa {
@@ -727,7 +755,7 @@ impl AgentRuntime {
         let parsed: Value = serde_json::from_str(result_str).unwrap_or_default();
         let title = parsed["title"].as_str().unwrap_or("").to_owned();
         let html = parsed["html"].as_str().unwrap_or("");
-        let md = htmd::convert(html).unwrap_or_else(|_| strip_html(html));
+        let md = html_dehydrate_to_text(html);
         Ok((title, md))
     }
 
@@ -1033,6 +1061,63 @@ impl AgentRuntime {
         }))
     }
 
+    /// Execute a `QueryPlan` produced by the planner: dispatch each sub-query
+    /// to a direct API (weather → wttr.in, currency → exchangerate.host, …)
+    /// or recursively fall back to `tool_web_search` with `_planned=true`
+    /// marker so we don't re-plan and loop.
+    async fn dispatch_query_plan(&self, plan: QueryPlan) -> Result<Value> {
+        use futures::future::join_all;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .user_agent("rsclaw/1.0 (+https://github.com/rsclaw-ai/rsclaw)")
+            .build()?;
+
+        let futs = plan.sub_queries.into_iter().map(|sq| {
+            let client = client.clone();
+            async move {
+                let (source, answer) = match &sq.intent {
+                    Intent::Weather { location } => fetch_weather(&client, location).await,
+                    Intent::Currency { from, to } => fetch_currency(&client, from, to).await,
+                    Intent::Timezone { location } => fetch_timezone(&client, location).await,
+                    Intent::Wikipedia { topic } => fetch_wiki(&client, topic).await,
+                    Intent::GithubRepo { owner, repo } => {
+                        fetch_github(&client, owner, repo).await
+                    }
+                    Intent::General => (
+                        "web_search",
+                        // Recursive call with _planned=true skips re-planning.
+                        match self
+                            .tool_web_search(json!({
+                                "query": sq.q.clone(),
+                                "_planned": true,
+                            }))
+                            .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => json!({ "error": e.to_string() }),
+                        },
+                    ),
+                };
+                json!({
+                    "question": sq.q,
+                    "intent": match &sq.intent {
+                        Intent::Weather { .. } => "weather",
+                        Intent::Currency { .. } => "currency",
+                        Intent::Timezone { .. } => "timezone",
+                        Intent::Wikipedia { .. } => "wikipedia",
+                        Intent::GithubRepo { .. } => "github_repo",
+                        Intent::General => "general",
+                    },
+                    "source": source,
+                    "answer": answer,
+                })
+            }
+        });
+        let items: Vec<Value> = join_all(futs).await;
+        Ok(json!({ "results": items }))
+    }
+
     pub(crate) async fn tool_web_browser(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let action = args
             .get("action")
@@ -1106,26 +1191,48 @@ impl AgentRuntime {
                     }
                 };
 
+                // Architecture: at most TWO Chrome processes on the system —
+                //   1. User's own Chrome (optional, headed UI)
+                //   2. Agent's shared pool Chrome (headless, multi-tab)
+                // Everyone (main agent, sub-agents, web_fetch, web_search)
+                // uses one of these. No per-agent Chrome process.
                 let bs = if headed {
-                    // Try connecting to user's existing Chrome first.
+                    // Main agent prefers the user's visible Chrome if running.
                     let default_ports: Vec<u16> = vec![9222, 9223];
                     let ports = wb_cfg
                         .and_then(|b| b.remote_debug_ports.as_ref())
                         .unwrap_or(&default_ports);
                     if let Some(ws_url) = crate::browser::detect_existing_chrome(ports).await {
-                        info!("connecting to user Chrome (remote debugging)");
+                        info!("connecting to user Chrome (remote debugging, headed)");
                         crate::browser::BrowserSession::connect_existing(&ws_url).await?
                     } else {
-                        // No existing Chrome found, launch with visible window
-                        // using RsClaw's own profile (not user's default — that
-                        // would conflict with any running Chrome).
-                        crate::browser::can_launch_chrome()?;
-                        crate::browser::BrowserSession::start(&chrome_path, true, profile.as_deref()).await?
+                        // No user Chrome — share the agent pool instead of
+                        // launching a 3rd process.
+                        match crate::browser::pool::BrowserPool::global().chrome_ws_url().await {
+                            Ok(ws_url) => {
+                                info!("no user Chrome — connecting to shared agent pool Chrome");
+                                crate::browser::BrowserSession::connect_existing(&ws_url).await?
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "pool Chrome unavailable, last-resort launch");
+                                crate::browser::can_launch_chrome()?;
+                                crate::browser::BrowserSession::start(&chrome_path, true, profile.as_deref()).await?
+                            }
+                        }
                     }
                 } else {
-                    // Headless mode.
-                    crate::browser::can_launch_chrome()?;
-                    crate::browser::BrowserSession::start(&chrome_path, false, profile.as_deref()).await?
+                    // Sub/task agents always use the shared pool Chrome.
+                    match crate::browser::pool::BrowserPool::global().chrome_ws_url().await {
+                        Ok(ws_url) => {
+                            info!("sub-agent connecting to shared pool Chrome (headless)");
+                            crate::browser::BrowserSession::connect_existing(&ws_url).await?
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "pool Chrome unavailable, last-resort headless launch");
+                            crate::browser::can_launch_chrome()?;
+                            crate::browser::BrowserSession::start(&chrome_path, false, profile.as_deref()).await?
+                        }
+                    }
                 };
                 *guard = Some(bs);
             }
@@ -1222,5 +1329,152 @@ impl AgentRuntime {
         // Now lock again for execute -- guard is dropped, avoiding borrow issues.
         let mut browser = self.browser.lock().await;
         browser.as_mut().unwrap().execute(action, &args).await
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Direct-API helpers used by `dispatch_query_plan`. Each returns
+// `(source_name, json_value)`. All errors are captured into the value so the
+// caller can still return a complete `results[]` array.
+// -----------------------------------------------------------------------------
+
+async fn fetch_weather(client: &reqwest::Client, location: &str) -> (&'static str, Value) {
+    let url = format!("https://wttr.in/{}?format=j1", urlencoding::encode(location));
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(j) => {
+                let summary = summarize_wttr(&j);
+                ("wttr.in", json!({ "location": location, "summary": summary, "raw": j }))
+            }
+            Err(e) => ("wttr.in", json!({ "error": format!("json parse: {e}") })),
+        },
+        Ok(resp) => (
+            "wttr.in",
+            json!({ "error": format!("HTTP {}", resp.status()) }),
+        ),
+        Err(e) => ("wttr.in", json!({ "error": e.to_string() })),
+    }
+}
+
+/// Extract the 7-day summary most useful for an LLM answer. Keeps payload
+/// small — the full `raw` is also included but models can reference summary.
+fn summarize_wttr(v: &Value) -> Value {
+    let current = v.get("current_condition").and_then(|c| c.get(0));
+    let now_temp = current
+        .and_then(|c| c.get("temp_C").and_then(|t| t.as_str()))
+        .unwrap_or("?");
+    let now_desc = current
+        .and_then(|c| c.get("weatherDesc").and_then(|d| d.get(0)).and_then(|d| d.get("value")).and_then(|s| s.as_str()))
+        .unwrap_or("?");
+    let days: Vec<Value> = v.get("weather")
+        .and_then(|w| w.as_array())
+        .map(|arr| {
+            arr.iter()
+                .take(7)
+                .map(|d| {
+                    json!({
+                        "date": d.get("date").and_then(|x| x.as_str()).unwrap_or(""),
+                        "minTempC": d.get("mintempC").and_then(|x| x.as_str()).unwrap_or(""),
+                        "maxTempC": d.get("maxtempC").and_then(|x| x.as_str()).unwrap_or(""),
+                        "desc": d.get("hourly")
+                            .and_then(|h| h.as_array())
+                            .and_then(|h| h.get(4))  // noon-ish
+                            .and_then(|h| h.get("weatherDesc"))
+                            .and_then(|w| w.get(0))
+                            .and_then(|w| w.get("value"))
+                            .and_then(|x| x.as_str())
+                            .unwrap_or(""),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "nowC": now_temp,
+        "nowDesc": now_desc,
+        "forecast7d": days,
+    })
+}
+
+async fn fetch_currency(client: &reqwest::Client, from: &str, to: &str) -> (&'static str, Value) {
+    // open.er-api.com is no-auth / no-key; exchangerate.host now gates on
+    // api key and returns HTTP 200 with {success:false} on free tier.
+    let url = format!(
+        "https://open.er-api.com/v6/latest/{}",
+        urlencoding::encode(from),
+    );
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(j) => {
+                let rate = j.pointer(&format!("/rates/{}", to.to_uppercase()));
+                ("open.er-api.com", json!({
+                    "from": from,
+                    "to": to,
+                    "rate": rate,
+                    "time_last_update_utc": j.get("time_last_update_utc"),
+                }))
+            }
+            Err(e) => ("open.er-api.com", json!({ "error": e.to_string() })),
+        },
+        Ok(resp) => (
+            "open.er-api.com",
+            json!({ "error": format!("HTTP {}", resp.status()) }),
+        ),
+        Err(e) => ("open.er-api.com", json!({ "error": e.to_string() })),
+    }
+}
+
+async fn fetch_timezone(client: &reqwest::Client, location: &str) -> (&'static str, Value) {
+    let url = format!(
+        "https://worldtimeapi.org/api/timezone/{}",
+        urlencoding::encode(location),
+    );
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(j) => ("worldtimeapi.org", j),
+            Err(e) => ("worldtimeapi.org", json!({ "error": e.to_string() })),
+        },
+        Ok(resp) => (
+            "worldtimeapi.org",
+            json!({ "error": format!("HTTP {}", resp.status()) }),
+        ),
+        Err(e) => ("worldtimeapi.org", json!({ "error": e.to_string() })),
+    }
+}
+
+async fn fetch_wiki(client: &reqwest::Client, topic: &str) -> (&'static str, Value) {
+    // Pick language by heuristic: Chinese chars → zh.wikipedia, else en.
+    let has_cjk = topic.chars().any(|c| {
+        (0x4E00..=0x9FFF).contains(&(c as u32))
+            || (0x3400..=0x4DBF).contains(&(c as u32))
+    });
+    let host = if has_cjk { "zh.wikipedia.org" } else { "en.wikipedia.org" };
+    let url = format!(
+        "https://{host}/api/rest_v1/page/summary/{}",
+        urlencoding::encode(topic),
+    );
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(j) => ("wikipedia", json!({ "topic": topic, "summary": j })),
+            Err(e) => ("wikipedia", json!({ "error": e.to_string() })),
+        },
+        Ok(resp) => ("wikipedia", json!({ "error": format!("HTTP {}", resp.status()) })),
+        Err(e) => ("wikipedia", json!({ "error": e.to_string() })),
+    }
+}
+
+async fn fetch_github(client: &reqwest::Client, owner: &str, repo: &str) -> (&'static str, Value) {
+    let url = format!(
+        "https://api.github.com/repos/{}/{}",
+        urlencoding::encode(owner),
+        urlencoding::encode(repo),
+    );
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(j) => ("api.github.com", j),
+            Err(e) => ("api.github.com", json!({ "error": e.to_string() })),
+        },
+        Ok(resp) => ("api.github.com", json!({ "error": format!("HTTP {}", resp.status()) })),
+        Err(e) => ("api.github.com", json!({ "error": e.to_string() })),
     }
 }
