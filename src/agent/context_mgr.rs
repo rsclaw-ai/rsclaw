@@ -175,10 +175,6 @@ pub(crate) fn apply_context_budget_trim(
     system_prompt: &str,
     tools: &[ToolDef],
 ) {
-    if messages.len() <= 6 {
-        return;
-    }
-
     let reply_reserve = (context_tokens / 5).max(2000);
     let sys_tokens = estimate_tokens(system_prompt);
     let tools_tokens = serde_json::to_string(tools)
