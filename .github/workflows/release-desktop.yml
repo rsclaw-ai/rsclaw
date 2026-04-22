@@ -22,6 +22,8 @@ jobs:
   desktop:
     name: Desktop ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    # Resolve signing / notarization secrets from the `prod` environment.
+    environment: prod
     strategy:
       fail-fast: false
       matrix:
@@ -82,6 +84,33 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install protobuf
 
+      # Import Apple Developer ID cert into a temporary keychain so Tauri can
+      # codesign + notarize non-interactively. The keychain is deleted with
+      # the runner at job end.
+      - name: Import Apple Developer ID certificate
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          echo "$APPLE_CERTIFICATE" | base64 --decode > $RUNNER_TEMP/cert.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import $RUNNER_TEMP/cert.p12 \
+            -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          # Allow codesign to use the key without a GUI password prompt
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          rm $RUNNER_TEMP/cert.p12
+          security find-identity -v -p codesigning build.keychain
+
       - name: Install deps (Windows)
         if: runner.os == 'Windows'
         run: choco install protoc -y
@@ -113,6 +142,15 @@ jobs:
       - name: Build Tauri app
         working-directory: ui
         run: yarn tauri build --target ${{ matrix.target }}
+        env:
+          # Tauri reads these and signs the .app + .dmg during build.
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # Notarization (optional but recommended — skip by leaving APPLE_ID unset).
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
       - name: Rename artifact
         shell: bash

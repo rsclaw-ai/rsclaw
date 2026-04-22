@@ -143,6 +143,23 @@ impl BrowserPool {
         })
     }
 
+    /// Return a browser-level WebSocket URL into the pool's shared Chrome.
+    /// Launches the pool Chrome if it isn't running. This lets
+    /// `BrowserSession::connect_existing` reuse the same Chrome process —
+    /// so sub-agents get a new tab instead of launching yet another Chrome.
+    pub async fn chrome_ws_url(&self) -> Result<String> {
+        let port = self.ensure_chrome().await?;
+        let version_info: Value =
+            reqwest::get(format!("http://127.0.0.1:{port}/json/version"))
+                .await?
+                .json()
+                .await?;
+        version_info["webSocketDebuggerUrl"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| anyhow!("pool: /json/version missing webSocketDebuggerUrl"))
+    }
+
     /// Ensure the shared headless Chrome is running. Returns the debug port.
     async fn ensure_chrome(&self) -> Result<u16> {
         let mut guard = self.chrome.lock().await;

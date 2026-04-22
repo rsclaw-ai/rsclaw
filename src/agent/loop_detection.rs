@@ -137,6 +137,48 @@ pub struct ToolCallRecord {
     pub result_hash: Option<String>,
 }
 
+/// Max consecutive failures with IDENTICAL error for the same tool before blocking.
+/// Gives LLM enough room for iterative debugging (5 "fix and retry" cycles) while
+/// still catching genuine dead-ends.
+const MAX_SAME_ERROR_STREAK: usize = 5;
+
+/// Fallback: max consecutive failures of ANY kind for the same tool before blocking.
+/// Covers superficially-varying errors that still mean "stuck". A bit more lenient
+/// than same-error since errors do genuinely differ during normal debugging.
+const MAX_ANY_FAILURE_STREAK: usize = 8;
+
+/// Normalize an error message so superficial differences (line:col, timestamps,
+/// line numbers) don't produce different hashes, WITHOUT collapsing short
+/// meaningful numbers like exit codes ("exit 1" vs "exit 127" must stay distinct).
+///
+/// Rule: only digit-runs of length ≥ 3 are replaced with "N". Line/column
+/// numbers almost always hit that threshold once messages include ~3 digits
+/// somewhere; single- and two-digit numbers (exit codes, version majors) are
+/// preserved.
+fn normalize_error(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.len() >= 3 {
+            out.push('N');
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    // Collapse whitespace.
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[derive(Debug, Clone)]
 pub struct LoopDetector {
     window: usize,
@@ -145,6 +187,36 @@ pub struct LoopDetector {
     overrides: HashMap<String, (usize, usize)>, // (warning, critical) per-tool
     /// History of tool call records with args_hash and result_hash.
     history: VecDeque<ToolCallRecord>,
+    /// Per-tool streak of identical errors. Keyed by tool_name.
+    /// Value: (error_hash, count). Reset when a different error OR success appears.
+    error_streak: HashMap<String, (String, usize)>,
+    /// Per-tool streak of ANY failures (regardless of error). Catches superficially
+    /// varying errors that still mean the same thing. Reset on success.
+    any_failure_streak: HashMap<String, usize>,
+}
+
+/// Inspect a tool result value and decide if it represents a failure.
+fn is_result_failure(result: &serde_json::Value) -> bool {
+    // exec-style: exit_code != 0
+    if let Some(code) = result.get("exit_code").and_then(|v| v.as_i64()) {
+        if code != 0 {
+            return true;
+        }
+    }
+    // Error field with non-empty string
+    if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
+        if !err.is_empty() {
+            return true;
+        }
+    }
+    // Explicit success=false / ok=false
+    if result.get("success").and_then(|v| v.as_bool()) == Some(false) {
+        return true;
+    }
+    if result.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        return true;
+    }
+    false
 }
 
 impl LoopDetector {
@@ -170,6 +242,8 @@ impl LoopDetector {
             critical_threshold,
             overrides: builtin_overrides(),
             history: VecDeque::new(),
+            error_streak: HashMap::new(),
+            any_failure_streak: HashMap::new(),
         }
     }
 
@@ -187,6 +261,8 @@ impl LoopDetector {
             critical_threshold,
             overrides,
             history: VecDeque::new(),
+            error_streak: HashMap::new(),
+            any_failure_streak: HashMap::new(),
         }
     }
 
@@ -264,6 +340,36 @@ impl LoopDetector {
             same_args_records.len()
         };
 
+        // Second axis: same tool repeatedly producing the same (normalized) error.
+        // Catches "LLM retrying syntactically-different-but-equally-broken variants".
+        if let Some((err_hash, streak)) = self.error_streak.get(tool_name) {
+            if *streak >= MAX_SAME_ERROR_STREAK {
+                return LoopCheckResult::Critical {
+                    tool_name: tool_name.to_owned(),
+                    count: *streak,
+                    message: format!(
+                        "CRITICAL: tool `{tool_name}` returned the same (normalized) error {streak} times in a row \
+                         (error hash {err_hash}). Different arguments, same failure — the approach \
+                         is wrong. Stop and report the problem to the user.",
+                    ),
+                };
+            }
+        }
+        // Third axis: any-failure streak fallback — catches errors that differ
+        // in surface form but are still repeated failures on the same tool.
+        if let Some(streak) = self.any_failure_streak.get(tool_name) {
+            if *streak >= MAX_ANY_FAILURE_STREAK {
+                return LoopCheckResult::Critical {
+                    tool_name: tool_name.to_owned(),
+                    count: *streak,
+                    message: format!(
+                        "CRITICAL: tool `{tool_name}` failed {streak} times consecutively with no success. \
+                         The approach is stuck. Stop and report the problem to the user.",
+                    ),
+                };
+            }
+        }
+
         let (warning_threshold, critical_threshold) = self.thresholds_for(tool_name);
 
         // Critical threshold — blocks execution
@@ -306,16 +412,56 @@ impl LoopDetector {
 
     /// Record the result hash for the most recent tool call.
     /// Used for no-progress detection (same call, same result = stuck).
+    /// Also maintains the per-tool error_streak for the second-axis loop check.
     pub fn record_result(&mut self, result: &serde_json::Value) {
+        // Capture the tool name before the mutable borrow below.
+        let tool_name = self.history.back().map(|r| r.tool_name.clone());
+
         if let Some(last) = self.history.back_mut() {
             let result_str = stable_stringify(result);
             last.result_hash = Some(format!("{}", simple_hash(&result_str)));
+        }
+
+        let Some(name) = tool_name else { return };
+
+        let failure = is_result_failure(result);
+        if failure {
+            // Normalize the error signature — strip line:col, numeric suffixes.
+            let raw_sig = result
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or_else(|| result.get("stderr").and_then(|v| v.as_str()).map(String::from))
+                .unwrap_or_else(|| stable_stringify(result));
+            let err_sig = normalize_error(&raw_sig);
+            let err_hash = format!("{}", simple_hash(&err_sig));
+
+            self.error_streak
+                .entry(name.clone())
+                .and_modify(|(h, c)| {
+                    if *h == err_hash {
+                        *c += 1;
+                    } else {
+                        *h = err_hash.clone();
+                        *c = 1;
+                    }
+                })
+                .or_insert((err_hash, 1));
+            // Increment any-failure streak too.
+            *self.any_failure_streak.entry(name.clone()).or_insert(0) += 1;
+
+        } else {
+            // Success clears both streaks for this tool.
+            self.error_streak.remove(&name);
+            self.any_failure_streak.remove(&name);
         }
     }
 
     /// Reset the history (e.g. after a tool successfully produces new output).
     pub fn reset(&mut self) {
         self.history.clear();
+        self.error_streak.clear();
+        self.any_failure_streak.clear();
     }
 }
 

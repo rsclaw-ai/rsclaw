@@ -40,3 +40,14 @@ objc = "0.2"
 # If you use cargo directly instead of tauri's cli you can use this feature flag to switch between tauri's `dev` and `build` modes.
 # DO NOT REMOVE!!
 custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+# The Tauri UI binary is mostly webview glue — aggressive size optimization
+# `"z"` is fine here. Keeps the installer small and Windows AV scans fast.
+opt-level = "z"
+lto = "fat"
+strip = "symbols"
+codegen-units = 1
+panic = "abort"
+debug-assertions = false
+overflow-checks = false

@@ -260,6 +260,7 @@ mod tests {
                 default: if i == 0 { Some(true) } else { None },
                 workspace: None,
                 model: None,
+                flash_model: None,
                 lane: None,
                 lane_concurrency: None,
                 group_chat: None,

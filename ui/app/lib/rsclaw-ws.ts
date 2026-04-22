@@ -1,0 +1,200 @@
+/**
+ * Singleton WebSocket client for the RsClaw gateway (protocol v3).
+ *
+ * Shared between useNotificationWs (notifications) and openai.ts (chat).
+ * Handles connection lifecycle, challenge/response handshake, and event routing.
+ */
+
+import { getGatewayUrl, getAuthToken } from "./rsclaw-api";
+
+export type ChatCallbacks = {
+  onDelta: (fullText: string, delta: string) => void;
+  onDone: (
+    files: [string, string, string][],
+    images: string[],
+    toolLog: [string, string, string][],
+  ) => void;
+  onError: (err: Error) => void;
+};
+
+type PendingReq = {
+  resolve: (value: any) => void;
+  reject: (reason: any) => void;
+};
+
+class RsClawWsClient {
+  private ws: WebSocket | null = null;
+  private retryCount = 0;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private mounted = true;
+
+  private reqCounter = 2; // 1 is reserved for the connect handshake
+  private pendingReqs = new Map<string, PendingReq>();
+  private chatHandlers = new Map<string, { cb: ChatCallbacks; fullText: string }>();
+  private notificationHandlers = new Set<(text: string) => void>();
+
+  /** Ensure the WS is connected. Safe to call multiple times. */
+  connect() {
+    if (
+      this.ws &&
+      (this.ws.readyState === WebSocket.OPEN ||
+        this.ws.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
+    this._doConnect();
+  }
+
+  /** Send a method request, returns the response payload. */
+  send(method: string, params: Record<string, unknown>): Promise<any> {
+    return new Promise((resolve, reject) => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        reject(new Error("WebSocket not connected"));
+        return;
+      }
+      const id = String(this.reqCounter++);
+      this.pendingReqs.set(id, { resolve, reject });
+      this.ws.send(
+        JSON.stringify({ type: "req", id, method, params }),
+      );
+    });
+  }
+
+  /** Register chat-event callbacks for a specific runId. */
+  onChatEvent(runId: string, cb: ChatCallbacks) {
+    this.chatHandlers.set(runId, { cb, fullText: "" });
+  }
+
+  /** Register a notification handler. Returns an unsubscribe function. */
+  onNotification(handler: (text: string) => void): () => void {
+    this.notificationHandlers.add(handler);
+    return () => this.notificationHandlers.delete(handler);
+  }
+
+  private _doConnect() {
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+
+    const gwUrl = getGatewayUrl() || "http://localhost:18888";
+    const wsUrl = gwUrl.replace(/^http/, "ws") + "/ws";
+
+    try {
+      const ws = new WebSocket(wsUrl);
+      this.ws = ws;
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data as string);
+          this._handleFrame(data);
+        } catch {
+          // ignore non-JSON
+        }
+      };
+
+      ws.onclose = () => {
+        this.ws = null;
+        // Reject all pending requests
+        this.pendingReqs.forEach(({ reject }) =>
+          reject(new Error("WebSocket closed")),
+        );
+        this.pendingReqs.clear();
+        this._scheduleReconnect();
+      };
+
+      ws.onerror = () => {
+        // onclose fires after onerror
+      };
+    } catch {
+      this._scheduleReconnect();
+    }
+  }
+
+  private _scheduleReconnect() {
+    if (!this.mounted) return;
+    const delay = Math.min(1000 * Math.pow(2, this.retryCount), 30000);
+    this.retryCount++;
+    this.retryTimer = setTimeout(() => this._doConnect(), delay);
+  }
+
+  private _handleFrame(data: any) {
+    // Challenge/response handshake
+    if (data.event === "connect.challenge") {
+      const token = getAuthToken();
+      this.ws?.send(
+        JSON.stringify({
+          type: "req",
+          id: "1",
+          method: "connect",
+          params: {
+            client: "desktop-ui",
+            min_protocol: 3,
+            max_protocol: 3,
+            auth: token ? { token } : undefined,
+          },
+        }),
+      );
+      return;
+    }
+
+    // Connected confirmation
+    if (data.type === "res" && data.id === "1") {
+      this.retryCount = 0;
+      return;
+    }
+
+    // Response to a pending request
+    if (data.type === "res") {
+      const pending = this.pendingReqs.get(data.id);
+      if (pending) {
+        this.pendingReqs.delete(data.id);
+        if (data.ok) {
+          pending.resolve(data.payload);
+        } else {
+          pending.reject(new Error(data.error?.message || "request failed"));
+        }
+      }
+      return;
+    }
+
+    // Event frames
+    const event = data.event || data.type;
+
+    if (event === "notification") {
+      const text =
+        data.payload?.text || data.data?.text || data.text || "";
+      if (text) {
+        this.notificationHandlers.forEach((h) => h(text));
+      }
+      return;
+    }
+
+    if (event === "chat") {
+      const p = data.payload || {};
+      const runId: string = p.runId || "";
+      const entry = this.chatHandlers.get(runId);
+      if (!entry) return;
+
+      if (p.type === "text_delta") {
+        entry.fullText += p.delta || "";
+        entry.cb.onDelta(entry.fullText, p.delta || "");
+      } else if (p.type === "done") {
+        const files: [string, string, string][] = p.files || [];
+        const images: string[] = p.images || [];
+        const toolLog: [string, string, string][] = p.toolLog || [];
+        this.chatHandlers.delete(runId);
+        entry.cb.onDone(files, images, toolLog);
+      }
+    }
+  }
+
+  destroy() {
+    this.mounted = false;
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.ws?.close();
+    this.ws = null;
+  }
+}
+
+export const rsclawWs = new RsClawWsClient();

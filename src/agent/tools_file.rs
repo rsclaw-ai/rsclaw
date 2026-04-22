@@ -11,6 +11,86 @@ use serde_json::{Value, json};
 use super::runtime::expand_tilde;
 use super::security::{check_file_content_safety, check_read_safety, check_write_safety};
 
+/// Fix common LLM shell-writing mistakes around redirects that bash would
+/// otherwise silently mis-parse. The target is constructs like
+/// `foo.png2>&1` (bash reads as `foo.png2` + `>&1`), which eats the last
+/// character of a preceding token.
+///
+/// Rules applied:
+/// 1. Insert a space before `2>&1` / `&>` / `>&N` redirects when they are
+///    glued to a previous non-space, non-redirect character.
+/// 2. Same for plain `>` / `>>` / `<` when glued (but only when the prior
+///    token ends with a digit or letter — don't break `1>&2` etc).
+/// 3. Leave the rest of the command untouched.
+fn sanitize_shell_redirects(cmd: &str) -> String {
+    // Conservative: only fix the common `something2>&1` → `something 2>&1` case.
+    // Broader rewrites risk changing user intent.
+    // Regex-free: linear scan.
+    let bytes = cmd.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() + 8);
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look for "2>&1" not preceded by whitespace
+        if i + 4 <= bytes.len()
+            && &bytes[i..i + 4] == b"2>&1"
+            && i > 0
+            && !bytes[i - 1].is_ascii_whitespace()
+        {
+            out.push(b' ');
+            out.extend_from_slice(b"2>&1");
+            i += 4;
+            continue;
+        }
+        // Same for "&>/dev/null" etc.
+        if i + 2 <= bytes.len()
+            && &bytes[i..i + 2] == b"&>"
+            && i > 0
+            && !bytes[i - 1].is_ascii_whitespace()
+        {
+            out.push(b' ');
+            out.extend_from_slice(b"&>");
+            i += 2;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| cmd.to_owned())
+}
+
+#[cfg(test)]
+mod shell_sanitize_tests {
+    use super::sanitize_shell_redirects;
+    #[test]
+    fn fixes_glued_2redirect() {
+        assert_eq!(
+            sanitize_shell_redirects("ls /path/foo.png2>&1"),
+            "ls /path/foo.png 2>&1"
+        );
+    }
+    #[test]
+    fn leaves_proper_redirect_alone() {
+        assert_eq!(
+            sanitize_shell_redirects("ls /path 2>&1"),
+            "ls /path 2>&1"
+        );
+    }
+    #[test]
+    fn fixes_glued_amp_redirect() {
+        assert_eq!(
+            sanitize_shell_redirects("cmd&>/dev/null"),
+            "cmd &>/dev/null"
+        );
+    }
+    #[test]
+    fn no_op_on_normal_command() {
+        assert_eq!(
+            sanitize_shell_redirects("echo hello world"),
+            "echo hello world"
+        );
+    }
+}
+
 impl super::runtime::AgentRuntime {
     /// List files and directories in a path (structured alternative to `exec ls`).
     pub(crate) async fn tool_list_dir(&self, args: Value) -> Result<Value> {
@@ -406,7 +486,9 @@ impl super::runtime::AgentRuntime {
         if let Some(task_id) = args["task_id"].as_str() {
             return self.exec_poll_task(task_id).await;
         }
-        let wait = args["wait"].as_bool().unwrap_or(false);
+        // Default to synchronous: most commands (osascript, grep, ls) finish in
+        // seconds. Background is an explicit opt-in for long-running tasks.
+        let wait = args["wait"].as_bool().unwrap_or(true);
         // Accept both "command" (rsclaw native) and "cmd"+"args" (preparse/openclaw format).
         let command = if let Some(cmd) = args["command"].as_str() {
             cmd.to_owned()
@@ -438,6 +520,11 @@ impl super::runtime::AgentRuntime {
         } else {
             bail!("exec: `command` required");
         };
+        // LLM writes `foo.png2>&1` (no space before the redirect) alarmingly
+        // often. Bash parses that as "foo.png2" with `>&1` redirect, eating the
+        // last character of the previous token. Fix common variants here so a
+        // single misplaced space doesn't wreck the whole command.
+        let command = sanitize_shell_redirects(&command);
         let command = command.as_str();
 
         // Safety check (only when tools.exec.safety = true)

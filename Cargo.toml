@@ -124,9 +124,18 @@ openclaw-migrate = ["rusqlite"]
 tray = ["dep:tray-icon", "dep:muda"]
 
 [profile.release]
-lto = true
-strip = true
+# Size-optimized (`"s"` is a good balance: much smaller than default 3 with
+# minimal runtime cost. `"z"` goes further but slows CJK-heavy text / regex
+# hotpaths). The gateway is long-lived so startup is not a concern.
+opt-level = "s"
+lto = "fat"
+strip = "symbols"
 codegen-units = 1
+# Drop unwind tables — we don't rely on panic=unwind in release.
+panic = "abort"
+# Overflow/debug assertions off for smaller asserts
+debug-assertions = false
+overflow-checks = false
 
 # Reduce stack usage in debug builds
 [profile.dev]

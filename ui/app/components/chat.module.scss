@@ -420,53 +420,116 @@
 }
 
 .chat-tool-blocks {
-  margin-top: 8px;
+  margin-top: 6px;
+  margin-bottom: 4px;
   display: flex;
   flex-direction: column;
   gap: 4px;
 
   .chat-tool-block {
-    border: var(--border-in-light);
-    border-radius: 6px;
+    border-radius: 8px;
     overflow: hidden;
     font-size: 12px;
+    border: var(--border-in-light);
 
     .chat-tool-block-header {
       display: flex;
       align-items: center;
-      justify-content: space-between;
-      padding: 4px 8px;
-      background-color: var(--white);
+      gap: 8px;
+      padding: 7px 12px;
+      background: rgba(0, 0, 0, 0.05);
       cursor: pointer;
       user-select: none;
+      transition: background 0.15s;
 
       &:hover {
-        box-shadow: var(--card-shadow);
+        background: rgba(0, 0, 0, 0.09);
+      }
+
+      .chat-tool-block-icon {
+        display: none;
+      }
+
+      // title column: tool name (dim) + cmd preview (bright) stacked
+      .chat-tool-block-title {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+        overflow: hidden;
       }
 
       .chat-tool-block-name {
-        font-weight: 600;
+        font-size: 10px;
+        font-family: var(--code-font, "SFMono-Regular", Consolas, monospace);
         color: var(--black);
+        opacity: 0.38;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
       }
 
-      .chat-tool-block-toggle {
+      .chat-tool-block-cmd {
+        font-size: 12.5px;
+        font-family: var(--code-font, "SFMono-Regular", Consolas, monospace);
         color: var(--black);
-        opacity: 0.5;
-        font-size: 10px;
+        opacity: 0.82;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+
+        &::before {
+          content: "$ ";
+          opacity: 0.4;
+        }
+      }
+
+      .chat-tool-block-chevron {
+        flex-shrink: 0;
+        opacity: 0.28;
+        color: var(--black);
+        transition: transform 0.2s ease, opacity 0.15s;
+
+        &[data-open="true"] {
+          transform: rotate(180deg);
+          opacity: 0.52;
+        }
       }
     }
 
+    // Terminal-style output area
     .chat-tool-block-output {
-      margin: 0;
-      padding: 8px;
-      white-space: pre-wrap;
-      word-break: break-all;
-      font-size: 11px;
-      color: var(--black);
-      background-color: rgba(0, 0, 0, 0.03);
-      border-top: var(--border-in-light);
-      max-height: 300px;
+      padding: 10px 14px;
+      background: #16181d;
+      border-top: 1px solid rgba(255, 255, 255, 0.06);
+      max-height: 320px;
       overflow-y: auto;
+      font-family: var(--code-font, "SFMono-Regular", Consolas, monospace);
+      font-size: 11.5px;
+      line-height: 1.65;
+
+      // command lines  e.g. "$ cmd" or "> cmd"
+      .tool-line-cmd {
+        color: #93c5fd;
+      }
+
+      // stderr / error lines
+      .tool-line-err {
+        color: #fca5a5;
+      }
+
+      // exit code lines
+      .tool-line-exit {
+        color: #fdba74;
+        opacity: 0.9;
+      }
+
+      // normal output lines
+      .tool-line-out {
+        color: #c4c9d4;
+      }
     }
   }
 }
@@ -480,8 +543,8 @@
   .chat-file-chip {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
-    padding: 3px 8px;
+    gap: 5px;
+    padding: 3px 9px 3px 7px;
     border-radius: 6px;
     border: var(--border-in-light);
     background-color: var(--white);
@@ -493,8 +556,14 @@
     text-overflow: ellipsis;
     white-space: nowrap;
 
+    svg {
+      flex-shrink: 0;
+      opacity: 0.5;
+    }
+
     &:hover {
       box-shadow: var(--card-shadow);
+      svg { opacity: 0.8; }
     }
   }
 }
@@ -859,46 +928,198 @@
 }
 
 .think-icon {
-  font-size: 16px;
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  opacity: 0.75;
 }
 
 .think-title {
   flex: 1;
 }
 
-.think-expand-btn {
-  background: none;
-  border: none;
+.think-chevron {
+  flex-shrink: 0;
+  opacity: 0.45;
   color: #f97316;
-  cursor: pointer;
-  font-size: 12px;
-  padding: 2px 6px;
-  border-radius: 4px;
-  opacity: 0.7;
-  transition: opacity 0.15s;
+  transition: transform 0.2s ease, opacity 0.15s;
 
-  &:hover {
-    opacity: 1;
-    background: rgba(249, 115, 22, 0.1);
+  &[data-open="true"] {
+    transform: rotate(180deg);
+    opacity: 0.75;
   }
 }
 
 .chat-message-think-content {
-  max-height: 72px;
-  overflow-y: auto;
-  padding: 0 14px 10px;
+  padding: 0 14px 12px;
   font-size: 12px;
   color: #9996a8;
   white-space: pre-wrap;
   word-break: normal;
   overflow-wrap: break-word;
   line-height: 1.6;
+  max-height: 380px;
+  overflow-y: auto;
   scroll-behavior: smooth;
-  transition: max-height 0.3s ease;
-  width: 100%;
-  min-width: 280px;
+}
 
-  &.think-expanded {
-    max-height: 400px;
+// 多工具分组折叠
+.chat-tool-group {
+  margin-top: 6px;
+  margin-bottom: 4px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: var(--border-in-light);
+
+  .chat-tool-group-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 12px;
+    background: rgba(0, 0, 0, 0.05);
+    cursor: pointer;
+    user-select: none;
+    font-size: 12px;
+    transition: background 0.15s;
+
+    &:hover {
+      background: rgba(0, 0, 0, 0.09);
+    }
+
+    .chat-tool-group-label {
+      flex: 1;
+      font-weight: 500;
+      color: var(--black);
+      opacity: 0.65;
+    }
+
+    .chat-tool-group-chevron {
+      flex-shrink: 0;
+      opacity: 0.28;
+      color: var(--black);
+      transition: transform 0.2s ease, opacity 0.15s;
+
+      &[data-open="true"] {
+        transform: rotate(180deg);
+        opacity: 0.52;
+      }
+    }
+  }
+
+  // sub-items: remove outer margin/radius, stack cleanly
+  .chat-tool-group-items {
+    border-top: var(--border-in-light);
+
+    .chat-tool-blocks {
+      margin: 0;
+    }
+
+    .chat-tool-block {
+      border-radius: 0;
+      border-left: none;
+      border-right: none;
+      border-top: none;
+      border-bottom: var(--border-in-light);
+
+      &:last-child {
+        border-bottom: none;
+      }
+    }
+  }
+}
+
+// + 按钮下拉菜单
+.attach-btn-wrapper {
+  position: relative;
+}
+
+.attach-dropdown {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  background: var(--white);
+  border: var(--border-in-light);
+  border-radius: 8px;
+  box-shadow: var(--card-shadow);
+  overflow: hidden;
+  z-index: 20;
+  min-width: 120px;
+  animation: slide-in ease 0.15s;
+}
+
+.attach-dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 8px 13px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--black);
+  text-align: left;
+  white-space: nowrap;
+
+  svg {
+    opacity: 0.5;
+    flex-shrink: 0;
+  }
+
+  &:hover {
+    background: rgba(0, 0, 0, 0.04);
+    svg { opacity: 0.8; }
+  }
+}
+
+// 输入区文件引用 chips 行
+.attach-file-refs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 5px 10px 2px;
+  border-top: var(--border-in-light);
+  background: var(--white);
+}
+
+.attach-file-chip-input {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 6px 3px 8px;
+  border-radius: 5px;
+  background: rgba(0, 0, 0, 0.04);
+  border: var(--border-in-light);
+  font-size: 12px;
+  color: var(--black);
+  max-width: 200px;
+
+  svg {
+    flex-shrink: 0;
+    opacity: 0.5;
+  }
+
+  .attach-file-chip-input-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .attach-file-chip-input-remove {
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 1px;
+    display: flex;
+    align-items: center;
+    opacity: 0.35;
+    color: var(--black);
+    flex-shrink: 0;
+
+    &:hover {
+      opacity: 0.8;
+    }
   }
 }

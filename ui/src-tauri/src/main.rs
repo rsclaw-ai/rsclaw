@@ -557,6 +557,29 @@ fn get_gateway_port_number() -> u64 {
         .unwrap_or(18888)
 }
 
+/// Ask the running gateway to shut down via a plain HTTP POST. The endpoint
+/// is loopback-only on the gateway side (see `is_loopback` in server), so no
+/// auth token is needed from the Tauri tray handler.
+fn http_shutdown_gateway() -> Result<(), String> {
+    use std::io::{Read, Write};
+    let port = get_gateway_port_number();
+    let addr = format!("127.0.0.1:{port}").parse::<std::net::SocketAddr>()
+        .map_err(|e| format!("invalid addr: {e}"))?;
+    let mut stream = std::net::TcpStream::connect_timeout(
+        &addr, std::time::Duration::from_secs(2),
+    ).map_err(|e| format!("connect failed: {e}"))?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let req =
+        "POST /api/v1/shutdown HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Content-Length: 0\r\n\
+         Connection: close\r\n\r\n";
+    stream.write_all(req.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    let mut buf = [0u8; 256];
+    let _ = stream.read(&mut buf); // drain response (best-effort)
+    Ok(())
+}
+
 /// Read cron jobs from ~/.rsclaw/cron.json5
 #[tauri::command]
 fn get_cron_jobs() -> Result<serde_json::Value, String> {
@@ -1068,11 +1091,18 @@ fn main() {
                         "quit" => {
                             // Notify frontend to set userStopped flag
                             let _ = app.emit("tray-gateway-action", "quit");
-                            // Stop gateway before quitting.
-                            eprintln!("[tray quit] stopping gateway via rsclaw...");
-                            let result = run_rsclaw_command(&["gateway", "stop"]);
-                            eprintln!("[tray quit] result: {result:?}");
-                            std::thread::sleep(std::time::Duration::from_millis(800));
+                            APP_EXITING.store(true, Ordering::Relaxed);
+                            // Prefer HTTP shutdown — works regardless of
+                            // sidecar path or working directory.
+                            eprintln!("[tray quit] POST /api/v1/shutdown ...");
+                            match http_shutdown_gateway() {
+                                Ok(()) => eprintln!("[tray quit] shutdown OK"),
+                                Err(e) => {
+                                    eprintln!("[tray quit] HTTP shutdown failed: {e}; falling back to CLI");
+                                    let _ = run_rsclaw_command(&["gateway", "stop"]);
+                                }
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(600));
                             app.exit(0);
                         }
                         _ => {}

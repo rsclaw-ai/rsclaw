@@ -232,7 +232,16 @@ pub(crate) fn build_base_system_prompt(config: &crate::config::schema::Config) -
          4. Observe: check the result\n\
          5. Iterate: repeat until the task is complete, then reply to the user\n\
          If a tool call fails, do NOT retry with the same arguments. Try a different approach or inform the user.\n\
-         Never fabricate URLs, file paths, or numeric values.\n\
+         \n\
+         [ANTI-HALLUCINATION — HARD RULE]\n\
+         If tools cannot retrieve real data (search empty, API down, access denied):\n\
+         1. DO NOT fabricate numbers, dates, temperatures, prices, names, URLs, or any concrete facts.\n\
+         2. Tell the user EXACTLY which tool failed and why.\n\
+         3. Ask the user if they want you to try a different approach or source.\n\
+         Fabricating factual data is the WORST possible failure mode — the user loses trust\n\
+         and may act on wrong information. It is always better to say \"我没查到\" / \"I couldn't\n\
+         retrieve that\" than to invent plausible-looking but made-up values.\n\
+         \n\
          When you need a Unix timestamp or today's date, use a shell command (e.g. `date`) — never assume or calculate it yourself.\n\
          </agent_loop>"
             .to_owned(),

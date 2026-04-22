@@ -351,87 +351,6 @@ pub fn tool_prompts_for_system(base_dir: &Path, _lang: Option<&str>) -> String {
 
     let mut parts = Vec::new();
 
-    // Web browsing strategy: goal-driven philosophy + tool selection + operations.
-    parts.push(
-        "# Web Browsing Strategy\n\
-         \n\
-         ## Philosophy: Goal-Driven, Not Step-Driven\n\
-         1. Define success: what counts as done?\n\
-         2. Choose starting point: most likely direct path to goal.\n\
-         3. Verify progress: each result is evidence. Not progressing? Change direction.\n\
-         4. Complete: stop when criteria met. Don't over-operate.\n\
-         \n\
-         ## Tool Selection\n\
-         | Need | Tool |\n\
-         |------|------|\n\
-         | Structured data from websites | anycli (PREFERRED — use `list` action to check available adapters) |\n\
-         | Search/discover info from unknown sources | web_search |\n\
-         | Read known URL (static page) | web_fetch |\n\
-         | Login required, interactive, anti-crawl | web_browser |\n\
-         | Form submission, file upload, dynamic pages | web_browser |\n\
-         \n\
-         **anycli priority**: When user mentions a website, first call anycli with action=list \
-         to check if an adapter exists. If yes, use it — structured data is far better than raw HTML. \
-         If no adapter exists, try anycli search action, then fall back to web_search/web_fetch.\n\
-         \n\
-         ## web_browser Core Flow\n\
-         1. `open` URL -> 2. `snapshot` (get refs @e1...) -> 3. interact via refs -> 4. re-snapshot\n\
-         - ALWAYS snapshot BEFORE interacting. Refs expire after page changes.\n\
-         - Use `ref` for click/fill (more reliable than text selectors).\n\
-         \n\
-         ## Actions\n\
-         - click: JS el.click(). Fast, works for most buttons/links.\n\
-         - clickAt: Real mouse event via CDP. Use for: file dialogs, anti-bot sites, elements that ignore JS click.\n\
-         - fill: Type text into input fields. contenteditable: click focus -> press Meta+a -> Backspace -> fill.\n\
-         - press: Keyboard events. Enter to submit, Tab to navigate between fields.\n\
-         - upload: Set files on <input type=file>. Find [upload-zone] ref in snapshot. If hidden, click 'upload' button first.\n\
-         - evaluate: Run arbitrary JS for DOM operations, data extraction, complex interactions.\n\
-         - search: Auto-detect search box on any site, fill query, submit.\n\
-         - screenshot: Capture visible page or specific element as image.\n\
-         - network sniff: Discover all media resources (images/videos/audio) on the page. Filter by type: {\"action\":\"network\",\"value\":\"sniff\",\"text\":\"image\"}. Use 'all' for everything.\n\
-         \n\
-         ## Login Handling\n\
-         - In headed mode, user's Chrome carries existing login sessions for most sites.\n\
-         - Try to access content first. Only report login needed if content is truly inaccessible.\n\
-         - QR code login: screenshot the QR -> send_file to user -> wait for confirmation -> refresh.\n\
-         - SMS/password login: only if no QR option exists.\n\
-         \n\
-         ## Form Input & Submission\n\
-         - Regular input: fill with ref.\n\
-         - contenteditable / rich-editor: click to focus -> press Meta+a -> Backspace -> fill/type content.\n\
-         - Submit: prefer press Enter. If Enter doesn't work, click the submit button ref.\n\
-         - After submit: wait 15s+ then re-snapshot to verify.\n\
-         \n\
-         ## Upload & Publish Flows\n\
-         - Find [upload-zone] or [upload[file]] ref -> upload action with files parameter.\n\
-         - If no upload ref visible, click 'upload' button first to reveal file input.\n\
-         - Multi-step: after each click, re-snapshot to see next step (dialog, confirmation, loading).\n\
-         - Look for next/confirm/publish/submit buttons.\n\
-         - Final submit: wait 10-20s, re-snapshot to verify success.\n\
-         \n\
-         ## Extracting Results\n\
-         - Extract URLs via `evaluate` -> `web_download` -> `send_file` to user.\n\
-         - Do NOT just reply 'done' — always deliver the actual file/image.\n\
-         - Images: filter by naturalWidth > 200 to skip UI icons.\n\
-         \n\
-         ## Anti-Detection\n\
-         - Prefer GUI interaction (click/fill) over URL construction on strict platforms.\n\
-         - Links from page interaction are reliable; manually built URLs may lack required params.\n\
-         - Platform error messages ('not found') may be access issues, not real errors.\n\
-         - Short-time bulk operations (rapid tab opens) may trigger anti-crawl.\n\
-         \n\
-         ## Site Experience\n\
-         When operating on a known site, check workspace/site-rules/ for existing rules and recall memories.\n\
-         After successful operations, store the experience as memory or update site-rules for future use.\n\
-         \n\
-         ## Do NOT\n\
-         - Skip `open` and operate on about:blank.\n\
-         - Use expired refs (re-snapshot after any page change).\n\
-         - Fabricate URLs or file paths.\n\
-         - Retry the same failing approach — change direction."
-            .to_owned()
-    );
-
     // Other tools: inject directly (short prompts, always English for LLM)
     let short_tools: &[(&str, &str)] = &[
         ("exec", EN_TOOL_EXEC),
@@ -534,6 +453,19 @@ const ZH_TOOL_EXEC: &str = r#"# exec 使用指南
 - 命令失败时不要重复尝试同样的命令，换一种方式或告知用户
 - Windows 用 PowerShell，macOS/Linux 用 bash
 - 不要执行危险命令（rm -rf、格式化、关闭防火墙等）
+
+## 用户附件处理
+当用户消息包含 `[file:/绝对/路径/文件名]` 时，那就是文件本身。**直接用这个路径**，
+不要再 `ls` 找。路径里经常有**空格**（macOS 截图命名就是如此）。bash 里必须用
+单引号或双引号包起来：
+  对：`file '/Users/x/Desktop/Screenshot 2026.png'`
+  错：`file /Users/x/Desktop/Screenshot 2026.png`   （会被拆成 3 个参数）
+
+## Shell 重定向陷阱
+`2>&1` 和 `&>` 前面必须留空格。`foo.png2>&1` 会被 bash 解析成文件名 `foo.png2`
+加重定向——重定向把前一个 token 的最后一个字符吞了。
+  对：`cmd args 2>&1`
+  错：`cmd args2>&1`
 "#;
 
 // -- Tool prompts (English) --------------------------------------------------
@@ -586,6 +518,21 @@ const EN_TOOL_EXEC: &str = r#"# exec Usage Guide
 - If a command fails, do NOT retry same args — try a different approach
 - Never run dangerous commands (rm -rf /, format, disable firewall)
 
+## File Attachments from the User
+When the user's message contains `[file:/absolute/path/to/file]`, that IS the
+file. Use the path as-is — do NOT `ls` to guess it. The path can (and often
+does) contain SPACES (e.g. macOS screenshots). Quote it:
+  GOOD:  `file '/Users/x/Desktop/Screenshot 2026.png'`
+  GOOD:  `file "/Users/x/Desktop/Screenshot 2026.png"`
+  BAD:   `file /Users/x/Desktop/Screenshot 2026.png`   (word-split into 3 args)
+
+## Shell Redirect Gotcha
+Always put a SPACE before `2>&1` and `&>`. Writing `foo.png2>&1` makes bash
+parse `foo.png2` as the filename (with the `2` as a suffix) — the redirect
+eats the last character of the previous token. This is a classic trap.
+  GOOD:  `cmd args 2>&1`
+  BAD:   `cmd args2>&1`
+
 ## Python Quick Patterns
 - One-liner: `python3 -c "import json; print(json.dumps({'key':'val'}))"`
 - Script: write to /tmp/script.py, then `python3 /tmp/script.py`
@@ -608,16 +555,84 @@ const EN_TOOL_EXEC: &str = r#"# exec Usage Guide
 
 const ZH_TOOL_WEB_SEARCH: &str = r#"# web_search 使用指南
 
-- 搜索信息时优先使用 web_search，不要打开浏览器去搜索引擎
-- web_search 失败后可以重试一次换关键词，仍然失败才用 web_browser 打开搜索引擎
-- 返回空结果时换关键词，不要用相同关键词重复搜索
+## 优先走结构化 API，而不是 web_search
+以下类型的查询，用 `execute_command` + curl 打直接接口，比搜索垃圾 SEO 结果准 100 倍：
+
+| 需求 | 命令 |
+|---|---|
+| 天气（任意城市） | `curl -s 'wttr.in/Bangkok?lang=zh&format=j1'` (JSON，`.weather[].avgtempC`、`.weather[].hourly`) |
+| 天气（一句话） | `curl -s 'wttr.in/曼谷?lang=zh&format=3'` |
+| IP 归属 | `curl -s 'ipinfo.io/8.8.8.8/json'` |
+| 汇率 | `curl -s 'https://api.exchangerate.host/latest?base=USD&symbols=CNY'` |
+| 时区时间 | `curl -s 'https://worldtimeapi.org/api/timezone/Asia/Shanghai'` |
+| 维基摘要 | `curl -s 'https://zh.wikipedia.org/api/rest_v1/page/summary/主题'` |
+| GitHub 仓库信息 | `curl -s 'https://api.github.com/repos/owner/name'` |
+
+有直接 API 就用，web_search 留给开放性、非结构化问题。
+
+## 查询关键词写法
+- 关键词**短、简**（2-5 个词）。自然语言长问句命中率低。
+  差：「曼谷未来7天天气预报 2026年4月22日最新」
+  好：「bangkok weather forecast」 或直接 wttr.in（上表）
+- 国际话题用英文关键词；国内话题用中文。
+- 知道权威站点的用 `site:` 过滤：
+  `rust async fn site:doc.rust-lang.org`
+
+## 搜索结果质量差（知乎/SEO 垃圾/不相关）的处理
+按顺序尝试：
+1. 换**更短更简**的关键词重搜（删日期、删完整问句）。
+2. 看上面表格能否换成直接 API。
+3. 已知权威 URL 的用 `web_fetch` 直接抓（例如
+   `web_fetch https://weather.com/weather/tenday/l/Bangkok`）。
+4. 实在不行才 `web_browser`——慢且不稳定。
+
+## 绝对不要
+- "No results found" 后**不要**用同样关键词重试
+- 不要打开浏览器访问 google.com / baidu.com——用 web_search
+- 事实类问题**不要**把知乎/reddit 的 snippet 当权威
 "#;
 
 const EN_TOOL_WEB_SEARCH: &str = r#"# web_search Usage Guide
 
-- Always use web_search for information lookup — do NOT open a browser to visit search engines
-- If web_search fails, retry once with different keywords. Only fall back to web_browser if still empty
-- On empty results, change keywords — do NOT retry with the same query
+## Prefer direct data sources over web_search
+For these query types, use `execute_command` with curl to hit a structured API
+— results are cleaner and faster than scraping SEO-polluted search results:
+
+| Intent | Command |
+|---|---|
+| Weather (any city) | `curl -s 'wttr.in/Bangkok?format=j1'` (JSON; `.weather[].avgtempC`, `.weather[].hourly`) |
+| Weather (plain)    | `curl -s 'wttr.in/Bangkok?lang=zh&format=3'` (one line) |
+| IP geolocation     | `curl -s 'ipinfo.io/8.8.8.8/json'` |
+| Currency rate      | `curl -s 'https://api.exchangerate.host/latest?base=USD&symbols=CNY'` |
+| Time in a timezone | `curl -s 'https://worldtimeapi.org/api/timezone/Asia/Shanghai'` |
+| Wikipedia summary  | `curl -s 'https://en.wikipedia.org/api/rest_v1/page/summary/TOPIC'` |
+| GitHub repo info   | `curl -s 'https://api.github.com/repos/owner/name'` |
+
+If a direct API exists, use it FIRST. Only fall through to web_search for
+open-ended or unstructured questions.
+
+## Query writing rules
+- Keep queries SHORT (2-5 keywords). Natural-language questions return fewer hits.
+  BAD:  "曼谷未来7天天气预报 2026年4月22日最新"
+  GOOD: "bangkok weather forecast"  OR use wttr.in (above)
+- Use English keywords for international topics; Chinese for domestic topics.
+- Add `site:` filters for authoritative sources when you know them:
+  `rust async fn site:doc.rust-lang.org`
+  `oai tool calling site:platform.openai.com`
+
+## When web_search returns low-quality results
+Symptoms: results are all forum posts (zhihu/reddit), SEO spam, or unrelated.
+Actions in order:
+1. Retry with SHORTER, SIMPLER keywords (no dates, no full questions).
+2. Try a direct-API shortcut from the table above if the intent fits.
+3. If a specific authoritative URL is known, use `web_fetch` directly
+   (e.g. `web_fetch https://weather.com/weather/tenday/l/Bangkok`).
+4. Fall back to `web_browser` only as last resort — it's slow and flaky.
+
+## Never
+- Do NOT retry the same query after "No results found"
+- Do NOT open a browser to visit google.com / baidu.com — use web_search
+- Do NOT treat zhihu/reddit snippets as authoritative for factual queries
 "#;
 
 const ZH_TOOL_WEB_FETCH: &str = r#"# web_fetch 使用指南

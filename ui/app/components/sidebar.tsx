@@ -133,18 +133,39 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
         tauriInvoke("set_gateway_user_stopped", { stopped: false }).catch(() => {});
       }
       setUserStopped(false);
-      setTimeout(() => {
+      // Poll health up to ~15 seconds before declaring failure. The gateway
+      // can take several seconds to initialize (DB open, provider registry,
+      // channel handlers, etc.) — a single 1-second wait false-flags every
+      // launch.
+      const maxAttempts = 15;
+      const intervalMs = 1000;
+      let attempt = 0;
+      const poll = () => {
+        attempt += 1;
         getHealth()
-          .then(() => { setStatus("online"); setStarting(false); failCount.current = 0; setErrorMsg(""); })
-          .catch(() => {
-            failCount.current++;
+          .then(() => {
+            setStatus("online");
             setStarting(false);
-            setStatus("failed");
-            if (failCount.current >= 2) {
-              setErrorMsg(zh ? "网关启动失败，请检查端口是否被占用或配置是否正确" : "Gateway failed to start. Check port conflicts or config errors.");
+            failCount.current = 0;
+            setErrorMsg("");
+          })
+          .catch(() => {
+            if (attempt < maxAttempts) {
+              // Still starting — keep the UI on "starting".
+              setTimeout(poll, intervalMs);
+            } else {
+              failCount.current++;
+              setStarting(false);
+              setStatus("failed");
+              setErrorMsg(
+                zh
+                  ? "网关启动失败，请检查端口是否被占用或配置是否正确"
+                  : "Gateway failed to start. Check port conflicts or config errors.",
+              );
             }
           });
-      }, 1000);
+      };
+      setTimeout(poll, intervalMs);
     } catch (e: any) {
       failCount.current++;
       setStarting(false);

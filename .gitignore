@@ -38,3 +38,7 @@ docs/superpowers/
 /.claude/worktrees/
 *.sh
 ui/src-tauri/gen/
+
+# Ephemeral state files that shouldn't be committed.
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json

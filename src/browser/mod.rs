@@ -35,13 +35,21 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 /// Global counter of active Chrome instances.
 static ACTIVE_INSTANCES: AtomicU32 = AtomicU32::new(0);
 
-/// Compute max Chrome instances based on available memory.
-/// Rule: (available - 500MB reserve) / 1GB, minimum 1.
+/// Compute max Chrome instances based on TOTAL system memory.
+///
+/// Using total (not available) is more stable: available memory fluctuates as
+/// other apps open/close, and Chrome can spill into swap. With the old rule,
+/// `max` could drop to 1 when other apps were running, blocking new tabs even
+/// though the system could handle more.
+///
+/// Rule: (total - 2GB reserve for OS) / 1.5GB per Chrome, floor 2 (so the
+/// `web_browser` tool and the `BrowserPool` don't starve each other).
 fn max_instances() -> u32 {
-    let available = available_memory_bytes();
-    let reserve = 500 * 1024 * 1024; // 500MB for system
-    let usable = available.saturating_sub(reserve);
-    ((usable / (1024 * 1024 * 1024)) as u32).max(1)
+    let total = total_system_memory_bytes();
+    let reserve = 2u64 * 1024 * 1024 * 1024; // 2GB for OS + other apps
+    let usable = total.saturating_sub(reserve);
+    let per_chrome = 3u64 * 1024 * 1024 * 1024 / 2; // 1.5GB
+    ((usable / per_chrome) as u32).max(2)
 }
 
 /// Get total system physical memory in bytes.
@@ -551,6 +559,39 @@ pub struct BrowserSession {
     before_screenshot: Option<String>,
     /// Operation recording entries.
     recording: Option<Vec<Value>>,
+    /// Target ID of the tab we own — set when we created a tab via
+    /// `connect_existing` so Drop can close it, preventing tab leaks in the
+    /// shared Chrome instance.
+    owned_external_tab: Option<String>,
+}
+
+impl Drop for BrowserSession {
+    fn drop(&mut self) {
+        // If we created a tab in an external (pool/user) Chrome, close it on
+        // drop — otherwise tabs pile up in the shared Chrome forever. Fire
+        // and forget via a detached blocking request; we don't want Drop to
+        // block or panic.
+        if self.chrome.is_some() {
+            return; // owned Chrome — kill handled by ChromeProcess::Drop
+        }
+        let Some(target_id) = self.owned_external_tab.take() else {
+            return;
+        };
+        let port = self.debug_port;
+        if port == 0 {
+            // Never connected — nothing to clean up.
+            return;
+        }
+        std::thread::spawn(move || {
+            // Use a short-lived blocking HTTP client; CDP websocket would
+            // need a tokio runtime we don't want to spin up in Drop.
+            let url = format!("http://127.0.0.1:{port}/json/close/{target_id}");
+            let _ = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .and_then(|c| c.get(&url).send());
+        });
+    }
 }
 
 impl BrowserSession {
@@ -585,6 +626,7 @@ impl BrowserSession {
             last_activity: Arc::new(AtomicU64::new(now)),
             before_screenshot: None,
             recording: None,
+            owned_external_tab: None,
         })
     }
 
@@ -606,35 +648,41 @@ impl BrowserSession {
         let discovery_url = format!("http://127.0.0.1:{port}/json");
         let targets: Vec<Value> = reqwest::get(&discovery_url).await?.json().await?;
 
-        let tab_ws_url = if reuse_tab {
+        let reused = if reuse_tab {
             // Reuse the first existing page tab.
             targets.iter()
                 .find(|t| t["type"].as_str() == Some("page"))
-                .and_then(|t| t["webSocketDebuggerUrl"].as_str())
-                .map(|s| s.to_owned())
+                .and_then(|t| {
+                    Some((
+                        t["webSocketDebuggerUrl"].as_str()?.to_owned(),
+                        t["id"].as_str()?.to_owned(),
+                    ))
+                })
         } else {
             None
         };
 
-        let tab_ws_url = if let Some(url) = tab_ws_url {
-            debug!("reusing existing tab");
-            url
+        let (tab_ws_url, owned_tab_id) = if let Some((url, _id)) = reused {
+            debug!("reusing existing tab — will NOT close on drop");
+            (url, None)
         } else {
-            // Create a new tab.
+            // Create a new tab — we own it and must close it on drop.
             let browser_cdp = CdpClient::connect(browser_ws_url).await?;
             let result = browser_cdp.send("Target.createTarget", json!({"url": "about:blank"})).await?;
             let target_id = result.get("targetId")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("Target.createTarget did not return targetId"))?;
-            debug!(target_id, "created new tab in external Chrome");
+                .ok_or_else(|| anyhow!("Target.createTarget did not return targetId"))?
+                .to_owned();
+            debug!(%target_id, "created new tab in external Chrome");
 
             // Re-fetch targets to find the new tab.
             let targets: Vec<Value> = reqwest::get(&discovery_url).await?.json().await?;
-            targets.iter()
-                .find(|t| t["id"].as_str() == Some(target_id))
+            let ws_url = targets.iter()
+                .find(|t| t["id"].as_str() == Some(&target_id))
                 .and_then(|t| t["webSocketDebuggerUrl"].as_str())
                 .ok_or_else(|| anyhow!("new tab not found in target list"))?
-                .to_owned()
+                .to_owned();
+            (ws_url, Some(target_id))
         };
 
         // Connect CDP to the tab.
@@ -665,6 +713,7 @@ impl BrowserSession {
             last_activity: Arc::new(AtomicU64::new(now)),
             before_screenshot: None,
             recording: None,
+            owned_external_tab: owned_tab_id,
         })
     }
 

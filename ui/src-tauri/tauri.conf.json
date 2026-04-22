@@ -51,8 +51,8 @@
       "entitlements": null,
       "exceptionDomain": "",
       "frameworks": [],
-      "providerShortName": null,
-      "signingIdentity": null
+      "providerShortName": "K87X8CQ78Y",
+      "signingIdentity": "Developer ID Application: Hua Lan (K87X8CQ78Y)"
     },
     "resources": ["icons/icon.png", "icons/icon-tray.png", "icons/icon-tray@2x.png"],
     "shortDescription": "RsClaw AI Agent Engine",
@@ -61,6 +61,10 @@
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
       "timestampUrl": "",
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": true
+      },
       "nsis": {
         "languages": ["SimpChinese", "English", "TradChinese", "Japanese", "Korean", "French", "German", "Spanish", "Russian", "Thai"],
         "displayLanguageSelector": false

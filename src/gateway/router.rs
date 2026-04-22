@@ -245,6 +245,7 @@ mod tests {
             default: if default { Some(true) } else { None },
             workspace: None,
             model: None,
+            flash_model: None,
             lane: None,
             lane_concurrency: None,
             group_chat: None,

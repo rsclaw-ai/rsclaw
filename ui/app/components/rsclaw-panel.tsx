@@ -3804,6 +3804,26 @@ function TauriConfigPageInner() {
             </div>
             <div style={fieldRow}>
               <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "快速模型" : "Flash Model"}</div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.flashModel.primary ({zh ? "留空则使用主模型" : "empty → use main model"})</div>
+              </div>
+              <input
+                style={{ ...fInput, minWidth: 240 }}
+                type="text"
+                placeholder={zh ? "例如 custom/qwen-turbo" : "e.g. custom/qwen-turbo"}
+                value={getVal("agents.defaults.flashModel.primary", "")}
+                onChange={(e) => {
+                  const v = (e.target.value || "").trim();
+                  if (!v) {
+                    updateConfig("agents.defaults.flashModel", undefined);
+                  } else {
+                    updateConfig("agents.defaults.flashModel.primary", v);
+                  }
+                }}
+              />
+            </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "旁路上下文预算" : "Bypass Context Budget"}</div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.btw_tokens ({zh ? "tokens" : "tokens"})</div>
               </div>

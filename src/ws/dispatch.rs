@@ -20,7 +20,7 @@ pub struct MethodCtx {
 }
 
 pub async fn dispatch(ctx: MethodCtx) -> MethodResult {
-    tracing::debug!(method = %ctx.req.method, params = ?ctx.req.params, "ws dispatch");
+    tracing::info!(method = %ctx.req.method, "ws dispatch");
     match ctx.req.method.as_str() {
         // sessions
         "sessions.list" => methods::sessions::sessions_list(ctx).await,
@@ -152,7 +152,8 @@ pub async fn dispatch(ctx: MethodCtx) -> MethodResult {
         "system.snapshot" => methods::system::system_snapshot(ctx).await,
         "system.update.check" => methods::system::system_update_check(ctx).await,
         "system.update.run" => methods::system::system_update_run(ctx).await,
-        "system.shutdown" => methods::system::system_shutdown(ctx).await,
+        "system.shutdown" | "system.stop" => methods::system::system_shutdown(ctx).await,
+        "system.restart" => methods::system::system_restart(ctx).await,
 
         // --- Cron runs ---
         "cron.runs" => methods::system::cron_runs(ctx).await,
@@ -252,6 +253,8 @@ pub fn all_methods() -> Vec<String> {
         "system.update.check",
         "system.update.run",
         "system.shutdown",
+        "system.stop",
+        "system.restart",
         "update.run",
         "doctor.run",
         "doctor.memory.status",

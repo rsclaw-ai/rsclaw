@@ -416,6 +416,32 @@ impl AgentRuntime {
             .to_owned()
     }
 
+    /// Resolve the "flash" (cheap/fast) model used for internal sub-tasks
+    /// like query planning and intent classification. Resolution order:
+    ///   1. `agents.<id>.flash_model`
+    ///   2. `agents.defaults.flash_model`
+    ///   3. `agents.<id>.model`         (main model for this agent)
+    ///   4. `agents.defaults.model`     (global default)
+    /// So if no flash model is configured anywhere, we fall back to whatever
+    /// the agent is already using — no regression.
+    pub(crate) fn resolve_flash_model_name(&self) -> String {
+        self.handle
+            .config
+            .flash_model
+            .as_ref()
+            .and_then(|m| m.primary.as_deref())
+            .or_else(|| {
+                self.config
+                    .agents
+                    .defaults
+                    .flash_model
+                    .as_ref()
+                    .and_then(|m| m.primary.as_deref())
+            })
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.resolve_model_name())
+    }
+
     // -----------------------------------------------------------------------
     // Plugin hook dispatch (AGENTS.md §20)
     // -----------------------------------------------------------------------
@@ -1016,39 +1042,55 @@ impl AgentRuntime {
                             else if cfg!(target_os = "windows") { "Windows" }
                             else if cfg!(target_os = "ios") { "iOS" }
                             else { "Unknown" };
-                        let msg_tokens: usize = self.sessions.get(session_key)
-                            .map(|msgs| msgs.iter().map(crate::agent::context_mgr::msg_tokens).sum())
-                            .unwrap_or(0);
-                        self.handle.last_ctx_tokens.store(msg_tokens, std::sync::atomic::Ordering::Relaxed);
                         let ctx_limit = self.handle.config.model.as_ref()
                             .and_then(|m| m.context_tokens)
                             .or(self.config.agents.defaults.model.as_ref()
                                 .and_then(|m| m.context_tokens))
                             .unwrap_or(64000) as usize;
 
-                        // Estimate system prompt + tools tokens.
-                        let tools = build_tool_list(
-                            &self.skills,
-                            self.agents.as_deref(),
-                            &self.handle.id,
-                            &self.config.agents.external,
-                            &self.wasm_plugins,
-                        );
-                        let tools_json = serde_json::to_string(&tools).unwrap_or_default();
-                        let tools_tokens = tools_json.len() / 4; // JSON is mostly ASCII, ~4 chars/token
-                        // System prompt: estimate from last known size or compute a rough guess.
-                        let sys_tokens = 3500; // typical system prompt ~3.5k tokens
-                        let all_tokens = sys_tokens + tools_tokens + msg_tokens;
+                        // Pull the last known values from the most recent LLM
+                        // call (stored by the runtime). This matches exactly
+                        // what the model actually saw, instead of re-estimating
+                        // from scratch (which was systematically wrong).
+                        use std::sync::atomic::Ordering::Relaxed;
+                        let sys_tokens = self.handle.last_sys_tokens.load(Relaxed);
+                        let tools_tokens = self.handle.last_tools_tokens.load(Relaxed);
+                        let msg_tokens = self.handle.last_msg_tokens.load(Relaxed);
+                        let total_tokens = self.handle.last_ctx_tokens.load(Relaxed);
+
+                        // Fallback for the case where no LLM call has happened
+                        // yet in this agent's lifetime — count current session
+                        // messages so the user still sees something sensible.
+                        let (sys_tokens, tools_tokens, msg_tokens, total_tokens) =
+                            if total_tokens == 0 {
+                                let m: usize = self.sessions.get(session_key)
+                                    .map(|msgs| msgs.iter().map(crate::agent::context_mgr::msg_tokens).sum())
+                                    .unwrap_or(0);
+                                (0, 0, m, m)
+                            } else {
+                                (sys_tokens, tools_tokens, msg_tokens, total_tokens)
+                            };
+
+                        let stale_hint = if total_tokens == 0 {
+                            " (no LLM call yet)"
+                        } else {
+                            " (from last LLM call)"
+                        };
 
                         format!(
                             "Gateway: running\nOS: {os}\nModel: {model}\nSessions: {sessions}\n\
-                             Context: system ~{:.1}k + tools ~{:.1}k + messages ~{:.1}k = ~{:.1}k/{:.0}k tokens\n\
+                             Context{stale_hint}:\n\
+                             \u{A0} system  ~{:.1}k\n\
+                             \u{A0} tools   ~{:.1}k\n\
+                             \u{A0} msgs    ~{:.1}k\n\
+                             \u{A0} total   ~{:.1}k / {:.0}k ({}%)\n\
                              Uptime: {uptime}\nVersion: rsclaw {}",
                             sys_tokens as f64 / 1000.0,
                             tools_tokens as f64 / 1000.0,
                             msg_tokens as f64 / 1000.0,
-                            all_tokens as f64 / 1000.0,
+                            total_tokens as f64 / 1000.0,
                             ctx_limit as f64 / 1000.0,
+                            if ctx_limit > 0 { total_tokens * 100 / ctx_limit } else { 0 },
                             option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
                         )
                     }
@@ -3053,20 +3095,31 @@ impl AgentRuntime {
                 );
             }
 
-            // Build API copy of messages — clone from session, then append
-            // this turn's scratch-paper buffer, then inject dynamic context and
-            // vision images. Session storage is NOT modified.
+            // Build API copy of messages for this LLM call.
+            //
+            // Final message order (stable prefix → volatile tail):
+            //   [0]   system  — main prompt           (KV-cache anchor, never changes)
+            //   [1]   system  — plugins               (inserted at front)
+            //   [2]   system  — skills                (inserted at front)
+            //   [3…n] history — session user/assistant messages
+            //   [n+1] system  — new_skills_tail        (rare, appended)
+            //   [n+2] system  — dynamic_ctx (/ctx/btw) (stable within a turn)
+            //   [tail] …      — turn_scratchpad        (grows per iteration, cleared next turn)
+            //
+            // Keeping dynamic_ctx before turn_scratchpad means the prefix
+            // [session + ctx] is identical on every LLM call within a turn,
+            // allowing the KV cache to cover it. Session storage is NOT modified.
             let mut messages = {
                 let mut raw = self
                     .sessions
                     .get(&ctx.session_key)
                     .cloned()
                     .unwrap_or_default();
-                // Append current-turn working messages (tool calls + results).
-                raw.extend(turn_scratchpad.clone());
 
                 // For vision models: replace last user message with multimodal
                 // version containing original images (only for this API call).
+                // Must happen before scratchpad is appended so last() is the
+                // session user message, not a tool result.
                 if ctx.has_images {
                     if let Some(last) = raw.last_mut() {
                         if last.role == Role::User {
@@ -3076,13 +3129,8 @@ impl AgentRuntime {
                 }
 
                 // Insert plugins and skills as system messages at the front
-                // of history. After provider prepends the main system prompt [0],
-                // the final order is:
-                //   [0] system — main prompt (stable, never changes)
-                //   [1] system — plugins (highest priority, overrides skills/built-in)
-                //   [2] system — skills (overrides built-in tools)
-                //   [3+] history — user/assistant/tool messages
-                // Insert in reverse order since each insert(0, ...) pushes previous ones down.
+                // of history. Insert in reverse order since each insert(0, …)
+                // pushes previous ones down.
                 if let Some(skills) = skills_system {
                     raw.insert(0, Message {
                         role: Role::System,
@@ -3097,8 +3145,6 @@ impl AgentRuntime {
                 }
 
                 // Append newly installed skills as trailing system messages.
-                // These were added after the cached [2] was frozen — appending
-                // at the tail preserves the KV cache prefix.
                 for skill_block in &new_skills_tail {
                     raw.push(Message {
                         role: Role::System,
@@ -3108,8 +3154,8 @@ impl AgentRuntime {
                     });
                 }
 
-                // Inject remaining dynamic context (btw /ctx) as a trailing
-                // system message after all history. Session storage is unchanged.
+                // Inject dynamic context (/ctx, btw) before the scratchpad so
+                // the [session + ctx] prefix stays stable across loop iterations.
                 if !dynamic_ctx.is_empty() {
                     let ctx_block = dynamic_ctx.join("\n\n");
                     raw.push(Message {
@@ -3117,6 +3163,10 @@ impl AgentRuntime {
                         content: MessageContent::Text(ctx_block),
                     });
                 }
+
+                // Append current-turn scratch-paper (tool calls + results).
+                // Always at the tail; discarded when this turn ends.
+                raw.extend(turn_scratchpad.clone());
 
                 // Repair transcript: ensure all tool_calls have matching tool_results.
                 let repair_result = repair_tool_result_pairing(raw);
@@ -3182,7 +3232,11 @@ impl AgentRuntime {
                     + estimate_tokens(&tools_json) + msg_count * 10
             };
             let approx_tokens = component_est.max(body_est);
-            self.handle.last_ctx_tokens.store(approx_tokens, std::sync::atomic::Ordering::Relaxed);
+            use std::sync::atomic::Ordering::Relaxed;
+            self.handle.last_ctx_tokens.store(approx_tokens, Relaxed);
+            self.handle.last_sys_tokens.store(sys_tokens, Relaxed);
+            self.handle.last_tools_tokens.store(tools_tokens, Relaxed);
+            self.handle.last_msg_tokens.store(msg_tokens_sum, Relaxed);
             info!(session = %ctx.session_key, msg_count, approx_tokens, sys_tokens, tools_tokens, msg_tokens = msg_tokens_sum, model = %model, "LLM call: context size");
 
             // Context usage awareness: inject hint into the LAST user message
