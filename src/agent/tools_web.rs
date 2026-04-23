@@ -1151,6 +1151,7 @@ impl AgentRuntime {
                         Some(("ctrip_hotel", self.browser_fetch_or_error(&url).await))
                     }
                     Intent::Movie { query } => {
+                        // Douban search is SPA — always use browser pool.
                         let url = format!("https://search.douban.com/movie/subject_search?search_text={}&cat=1002", urlencoding::encode(query));
                         Some(("douban_movie", self.browser_fetch_or_error(&url).await))
                     }

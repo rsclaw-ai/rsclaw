@@ -204,6 +204,8 @@ Rules:
   known, so never include dates/years in the "q" field for live-data queries
   (weather, currency, stock, etc.).
 - PREFER English city names for "weather" intent so API lookups hit.
+- KEEP Chinese keywords for Chinese sites: movie, restaurant, concert, shopping,
+  stock, express, news, recipe, poem, idiom, sports, job, video, book, forum, law.
 - For date fields: use YYYY-MM-DD if user specifies a date, empty string if not.
 - If unsure of intent, use "general" — don't force a wrong match.
 - Max 5 sub_queries. Never output more.
