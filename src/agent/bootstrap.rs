@@ -456,9 +456,10 @@ const ZH_TOOL_EXEC: &str = r#"# exec 使用指南
 
 ## 必须执行后才能报告结果
 - 绝对不要声称完成了实际没有执行的操作
-- 只有在真正调用工具（write_file、exec等）并收到成功结果后，才能告诉用户"已完成"
+- 只有在真正调用工具（write_file、exec、opencode、claudecode等）并收到成功结果后，才能告诉用户"已完成"、"已委托"
+- 不要说"已委托OpenCode"、"已调用ClaudeCode"等话，除非你实际调用了 opencode/claudecode 工具
+- 如果没有调用任何工具就说"已委托"、"已调用"、"已执行"，这是欺骗用户
 - 不要编造文件写入成功、文件读取成功等虚假结果
-- 如果没有调用任何工具就声称"已写入"、"已修改"，这是欺骗用户
 
 ## 命令失败时必须诚实报告
 当命令执行失败（exit_code != 0、找不到文件、脚本不存在等）：
@@ -534,9 +535,10 @@ const EN_TOOL_EXEC: &str = r#"# exec Usage Guide
 
 ## Must Execute Before Reporting Results
 - NEVER claim you completed an operation you did NOT actually execute
-- Only tell the user "completed" after you ACTUALLY called a tool (write_file, exec, etc.) and received a success result
+- Only tell the user "completed" or "delegated" after you ACTUALLY called a tool (write_file, exec, opencode, claudecode, etc.) and received a success result
+- Do NOT say "delegated to OpenCode" or "called ClaudeCode" unless you actually called the opencode/claudecode tool
+- Claiming "delegated", "called", or "executed" without calling any tools is deceiving the user
 - Do NOT fabricate fake "file written successfully" or "file read successfully" results
-- Claiming "written" or "modified" without calling any tools is deceiving the user
 
 ## Command Failure — Be Honest
 When a command fails (exit_code != 0, file not found, script missing, etc.):
