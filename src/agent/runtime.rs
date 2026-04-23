@@ -425,11 +425,30 @@ impl AgentRuntime {
     /// So if no flash model is configured anywhere, we fall back to whatever
     /// the agent is already using — no regression.
     pub(crate) fn resolve_flash_model_name(&self) -> String {
+        // 1. per-agent model.flash
         self.handle
             .config
-            .flash_model
+            .model
             .as_ref()
-            .and_then(|m| m.primary.as_deref())
+            .and_then(|m| m.flash.as_deref())
+            // 2. per-agent flash_model.primary (legacy)
+            .or_else(|| {
+                self.handle
+                    .config
+                    .flash_model
+                    .as_ref()
+                    .and_then(|m| m.primary.as_deref())
+            })
+            // 3. defaults.model.flash
+            .or_else(|| {
+                self.config
+                    .agents
+                    .defaults
+                    .model
+                    .as_ref()
+                    .and_then(|m| m.flash.as_deref())
+            })
+            // 4. defaults.flash_model.primary (legacy)
             .or_else(|| {
                 self.config
                     .agents
@@ -692,6 +711,7 @@ impl AgentRuntime {
 
             self.sessions.clear();
             self.compaction_state.clear();
+            if let Ok(mut map) = self.handle.session_tokens.write() { map.clear(); }
             // Also clear persisted sessions from redb
             for key in self.store.db.list_sessions().unwrap_or_default() {
                 let _ = self.store.db.delete_session(&key);
@@ -724,6 +744,7 @@ impl AgentRuntime {
 
             self.sessions.clear();
             self.compaction_state.clear();
+            if let Ok(mut map) = self.handle.session_tokens.write() { map.clear(); }
             for key in self.store.db.list_sessions().unwrap_or_default() {
                 match self.store.db.new_generation(&key) {
                     Ok(g) => info!(session = %key, generation = g, "new generation started"),
@@ -747,6 +768,7 @@ impl AgentRuntime {
 
             self.sessions.clear();
             self.compaction_state.clear();
+            if let Ok(mut map) = self.handle.session_tokens.write() { map.clear(); }
             for key in self.store.db.list_sessions().unwrap_or_default() {
                 let _ = self.store.db.delete_session(&key);
             }
@@ -1088,6 +1110,7 @@ impl AgentRuntime {
                         };
 
                         self.sessions.remove(session_key);
+                        self.handle.remove_session_tokens(session_key);
                         if let Err(e) = self.store.db.delete_session(session_key) {
                             warn!("failed to clear persisted session: {e:#}");
                         }
@@ -1174,6 +1197,7 @@ impl AgentRuntime {
                         self.sessions.remove(&key);
                         let _ = self.store.db.delete_session(&key);
                         self.voice_mode_sessions.remove(&key);
+                        self.handle.remove_session_tokens(&key);
                         "Session reset.".to_owned()
                     }
                     "__TEXT_MODE__" => {
@@ -3170,11 +3194,12 @@ impl AgentRuntime {
                     + estimate_tokens(&tools_json) + msg_count * 10
             };
             let approx_tokens = component_est.max(body_est);
-            use std::sync::atomic::Ordering::Relaxed;
-            self.handle.last_ctx_tokens.store(approx_tokens, Relaxed);
-            self.handle.last_sys_tokens.store(sys_tokens, Relaxed);
-            self.handle.last_tools_tokens.store(tools_tokens, Relaxed);
-            self.handle.last_msg_tokens.store(msg_tokens_sum, Relaxed);
+            self.handle.update_session_tokens(&ctx.session_key, crate::agent::registry::SessionTokens {
+                sys: sys_tokens,
+                tools: tools_tokens,
+                msgs: msg_tokens_sum,
+                total: approx_tokens,
+            });
             info!(session = %ctx.session_key, msg_count, approx_tokens, sys_tokens, tools_tokens, msg_tokens = msg_tokens_sum, model = %model, "LLM call: context size");
 
             // Context usage awareness: inject hint into the LAST user message
@@ -3477,10 +3502,14 @@ impl AgentRuntime {
                         }
                     }
                     StreamEvent::Done { usage } => {
-                        // Update context token count with real usage from LLM if available.
+                        // Update context total with real usage from LLM if available.
                         if let Some(ref u) = usage {
                             let real_tokens = (u.input + u.output) as usize;
-                            self.handle.last_ctx_tokens.store(real_tokens, std::sync::atomic::Ordering::Relaxed);
+                            if let Ok(mut map) = self.handle.session_tokens.write() {
+                                if let Some(st) = map.get_mut(&ctx.session_key) {
+                                    st.total = real_tokens;
+                                }
+                            }
                             debug!(
                                 session = %ctx.session_key,
                                 input_tokens = u.input,

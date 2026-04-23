@@ -47,9 +47,16 @@ impl AgentRuntime {
             .as_str()
             .ok_or_else(|| anyhow!("agent_spawn: `id` required"))?
             .to_owned();
+        // Named agents are full independent agents → default to primary model.
+        // Sub agents (persistent=false) are temporary → resolved below after
+        // checking persistent flag.
+        let primary_model = self.resolve_model_name();
+        let flash_model = self.resolve_flash_model_name();
+        let persistent = args["persistent"].as_bool().unwrap_or(true);
+        let default_model = if persistent { &primary_model } else { &flash_model };
         let model = args["model"].as_str()
             .filter(|s| !s.is_empty() && *s != "default")
-            .unwrap_or(&self.resolve_model_name())
+            .unwrap_or(default_model)
             .to_owned();
         let system = args["system"]
             .as_str()
@@ -83,6 +90,7 @@ impl AgentRuntime {
                 tools: None,
                 context_tokens: None,
                 max_tokens: None,
+                flash: None,
             }),
             flash_model: None,
             lane: None,
@@ -98,9 +106,6 @@ impl AgentRuntime {
             claudecode: None,
         };
 
-        // Persist to config file by default (user-created agents survive restart).
-        // Pass persistent=false for sub agents (temporary, destroyed on restart).
-        let persistent = args["persistent"].as_bool().unwrap_or(true);
         let kind = if persistent {
             crate::agent::registry::AgentKind::Named
         } else {
@@ -147,10 +152,11 @@ impl AgentRuntime {
             .as_ref()
             .ok_or_else(|| anyhow!("agent_task: spawner not available"))?;
 
+        let default_task_model = self.resolve_flash_model_name();
         let model = args["model"]
             .as_str()
             .filter(|s| !s.is_empty())
-            .unwrap_or(&self.resolve_model_name())
+            .unwrap_or(&default_task_model)
             .to_owned();
 
         let system = args["system"]
@@ -193,6 +199,7 @@ impl AgentRuntime {
                 tools: None,
                 context_tokens: None,
                 max_tokens: None,
+                flash: None,
             }),
             flash_model: None,
             lane: None,
@@ -209,15 +216,6 @@ impl AgentRuntime {
         };
 
         spawner.spawn_agent_with_kind(entry, crate::agent::registry::AgentKind::Task)?;
-
-        // Write full system prompt (base + role) as SOUL.md.
-        if let Err(e) = tokio::fs::create_dir_all(&ws_path).await {
-            warn!("agent_task: failed to create workspace for {id}: {e:#}");
-        }
-        let full_prompt = self.build_subagent_system_prompt(&system);
-        if let Err(e) = tokio::fs::write(ws_path.join("SOUL.md"), format!("# Agent: {id}\n\n{full_prompt}\n")).await {
-            warn!("agent_task: failed to write SOUL.md for {id}: {e:#}");
-        }
 
         // Send message to the task agent.
         let registry = self

@@ -277,47 +277,25 @@ pub(crate) fn build_system_prompt(
         parts.push(
             "## Tool Usage Guidelines\n\
              ### File Operations (use dedicated tools, NOT execute_command)\n\
-             - List directory contents: use `list_dir` (NOT execute_command ls/dir)\n\
-             - Find files by name: use `search_file` (NOT execute_command find)\n\
-             - Search file contents: use `search_content` (NOT execute_command grep)\n\
-             - Read file: use `read_file`. Write/create file: use `write_file`.\n\
-             - For documents (xlsx/docx/pdf/pptx): use the `doc` tool, not execute_command.\n\
-             - Reserve `execute_command` for system commands and tasks that have no dedicated tool.\n\
-             ### Completion Discipline (CRITICAL)\n\
-             - When you have enough information to answer the user, STOP and reply immediately.\n\
-             - Do NOT search for additional confirmation after finding the answer.\n\
+             - List directory: `list_dir`. Find files: `search_file`. Search contents: `search_content`.\n\
+             - Read file: `read_file`. Write/create file: `write_file`.\n\
+             - Documents (xlsx/docx/pdf/pptx): use `doc` tool.\n\
+             - Reserve `execute_command` for system commands with no dedicated tool.\n\
+             ### Completion Discipline\n\
+             - Have enough info to answer? STOP and reply immediately.\n\
              - Do NOT repeat a tool call that already returned useful results.\n\
-             - One successful search/fetch is usually enough. Two is the maximum for verification.\n\
-             - If a web_browser operation produced the content the user asked for, deliver it — do not navigate further.\n\
-             ### Web Operations\n\
-             - When user asks to go to a specific site (e.g. 'go to douyin', 'open taobao'), use `web_browser` directly. Do NOT search first.\n\
-             - For general questions or info lookup, use `web_search` first.\n\
-             - To download files/images/videos: use `web_download` (supports resume, browser cookies). Do NOT use exec curl/wget.\n\
-             - `web_download` path is relative to workspace/downloads/. Just pass the filename like `video.mp4` or `subdir/file.pdf`. Do NOT include `~/`, `~/Downloads/`, or absolute paths.\n\
-             - After downloading, use `send_file` to send the file to the user.\n\
+             - One successful search/fetch is usually enough. Two is the maximum.\n\
              ### Agent & Task Delegation\n\
-             You are the architect. Delegate work to sub-agents, never block.\n\
-             - Use `agent` action=task for one-shot sub-tasks. Tasks run in the background and results appear on your next turn.\n\
-             - Always specify a `toolset` matching the task (web=search/browse, code=read/write/exec, minimal=basic).\n\
-             - Give each task a clear, specific `system` role and `message` instruction.\n\
-             #### When to delegate\n\
-             - Tasks that are independent of each other (e.g. search 3 different topics) -> dispatch ALL at once in parallel.\n\
-             - Time-consuming work (web research, file processing, code generation) -> delegate so you can continue talking to the user.\n\
-             - Do NOT delegate trivial tasks (simple answers, one read, one search) — do those yourself.\n\
-             #### Pipeline pattern (A's output feeds B)\n\
-             - Step 1: Dispatch all independent tasks in parallel.\n\
-             - Step 2: On your next turn, collect results from [async task completed] messages.\n\
-             - Step 3: If further work depends on those results, dispatch new tasks with the collected data.\n\
-             - Step 4: Synthesize final results and reply to the user.\n\
-             #### Error handling\n\
-             - If a task times out, try with a simpler scope or do it yourself.\n\
-             - If a task returns an error, explain to the user and offer alternatives.\n\
+             Delegate work to sub-agents for parallelism, never block.\n\
+             - `agent` action=task for background sub-tasks. Specify `toolset` matching the task.\n\
+             - Independent tasks -> dispatch ALL at once in parallel.\n\
+             - Trivial tasks (simple answers, one read) -> do yourself.\n\
+             - Pipeline: dispatch parallel -> collect results -> dispatch dependent tasks -> synthesize.\n\
              ### Other\n\
-             - For cron jobs: use the `cron` tool (action=list/add/remove).\n\
-             - To install tools (python, node, ffmpeg, chrome, opencode, claude-code, sherpa-onnx): use `install_tool`. Do NOT download/install manually.\n\
-             - When user asks about previous conversations, tasks, or anything you don't have context for, use `memory` to recall relevant information before answering.\n\
-             - At the start of a new session, if the user's first message references prior work, search memory first.\n\
-             - When you discover information that is more complete or accurate than what memory contains (e.g. you find a full phone number after memory only had partial digits, or you confirm a username/ID), immediately save the corrected value to memory so it survives context compaction. Do not rely on the information remaining in conversation context."
+             - Cron jobs: `cron` tool (action=list/add/remove).\n\
+             - Install tools (python, node, ffmpeg, chrome, etc.): `install_tool`. Do NOT download manually.\n\
+             - Memory: use `memory` to recall prior conversations. Search memory at session start if user references prior work.\n\
+             - Save corrected/complete info to memory immediately so it survives compaction."
                 .to_owned(),
         );
 

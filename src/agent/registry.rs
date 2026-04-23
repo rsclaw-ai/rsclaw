@@ -62,15 +62,8 @@ pub struct AgentHandle {
     pub started_at: Instant,
     /// Number of active sessions (updated after each turn for /status).
     pub session_count: Arc<AtomicUsize>,
-    /// Total context tokens of the most recent turn (sys + tools + msgs + scratchpad).
-    /// Updated by runtime for /status so the number matches what the LLM actually saw.
-    pub last_ctx_tokens: Arc<AtomicUsize>,
-    /// System prompt tokens of the most recent LLM call.
-    pub last_sys_tokens: Arc<AtomicUsize>,
-    /// Tool-definition tokens of the most recent LLM call.
-    pub last_tools_tokens: Arc<AtomicUsize>,
-    /// Message-history tokens of the most recent LLM call.
-    pub last_msg_tokens: Arc<AtomicUsize>,
+    /// Per-session context token stats, updated by normal conversation LLM calls only.
+    pub session_tokens: Arc<std::sync::RwLock<HashMap<String, SessionTokens>>>,
     /// Signal to clear all sessions (set by /clear bypass, consumed by runtime).
     pub clear_signal: Arc<AtomicBool>,
     /// Signal to start a new session (set by /new bypass, consumed by runtime).
@@ -83,16 +76,42 @@ pub struct AgentHandle {
     pub memory: Option<Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>>,
 }
 
+/// Per-session context token statistics.
+#[derive(Debug, Clone, Default)]
+pub struct SessionTokens {
+    /// System prompt tokens.
+    pub sys: usize,
+    /// Tool definition tokens.
+    pub tools: usize,
+    /// Message history tokens.
+    pub msgs: usize,
+    /// Total context tokens (sys + tools + msgs).
+    pub total: usize,
+}
+
 impl AgentHandle {
+    /// Record context token stats for a conversation session.
+    pub fn update_session_tokens(&self, session_key: &str, tokens: SessionTokens) {
+        if let Ok(mut map) = self.session_tokens.write() {
+            map.insert(session_key.to_owned(), tokens);
+        }
+    }
+
+    /// Remove token stats when a session is cleared.
+    pub fn remove_session_tokens(&self, session_key: &str) {
+        if let Ok(mut map) = self.session_tokens.write() {
+            map.remove(session_key);
+        }
+    }
+
     /// Unified status string used by all channels (desktop WS, feishu, telegram, etc.).
     pub fn format_status(&self) -> String {
-        use std::sync::atomic::Ordering::Relaxed;
         use crate::agent::prompt_builder::format_duration;
 
         let model = self.config.model.as_ref()
             .and_then(|m| m.primary.as_deref())
             .unwrap_or("default");
-        let sessions = self.session_count.load(Relaxed);
+        let sessions = self.session_count.load(std::sync::atomic::Ordering::Relaxed);
         let uptime = format_duration(self.started_at.elapsed());
         let os = if cfg!(target_os = "macos") { "macOS" }
             else if cfg!(target_os = "linux") {
@@ -105,27 +124,35 @@ impl AgentHandle {
             .and_then(|m| m.context_tokens)
             .unwrap_or(64000) as usize;
 
-        let sys_tokens = self.last_sys_tokens.load(Relaxed);
-        let tools_tokens = self.last_tools_tokens.load(Relaxed);
-        let msg_tokens = self.last_msg_tokens.load(Relaxed);
-        let total_tokens = self.last_ctx_tokens.load(Relaxed);
-
-        let stale_hint = if total_tokens == 0 { " (no LLM call yet)" } else { " (from last LLM call)" };
+        let mut ctx_lines = String::new();
+        if let Ok(map) = self.session_tokens.read() {
+            if map.is_empty() {
+                ctx_lines.push_str("Context: (no sessions)\n");
+            } else {
+                for (key, t) in map.iter() {
+                    let short_key = if key.len() > 20 { &key[..20] } else { key };
+                    let pct = if ctx_limit > 0 { t.total * 100 / ctx_limit } else { 0 };
+                    ctx_lines.push_str(&format!(
+                        "Context [{short_key}]:\n\
+                         \u{A0} system  ~{:.1}k\n\
+                         \u{A0} tools   ~{:.1}k\n\
+                         \u{A0} msgs    ~{:.1}k\n\
+                         \u{A0} total   ~{:.1}k / {:.0}k ({}%)\n",
+                        t.sys as f64 / 1000.0,
+                        t.tools as f64 / 1000.0,
+                        t.msgs as f64 / 1000.0,
+                        t.total as f64 / 1000.0,
+                        ctx_limit as f64 / 1000.0,
+                        pct,
+                    ));
+                }
+            }
+        }
 
         format!(
             "Gateway: running\nOS: {os}\nModel: {model}\nSessions: {sessions}\n\
-             Context{stale_hint}:\n\
-             \u{A0} system  ~{:.1}k\n\
-             \u{A0} tools   ~{:.1}k\n\
-             \u{A0} msgs    ~{:.1}k\n\
-             \u{A0} total   ~{:.1}k / {:.0}k ({}%)\n\
+             {ctx_lines}\
              Uptime: {uptime}\nVersion: rsclaw {}",
-            sys_tokens as f64 / 1000.0,
-            tools_tokens as f64 / 1000.0,
-            msg_tokens as f64 / 1000.0,
-            total_tokens as f64 / 1000.0,
-            ctx_limit as f64 / 1000.0,
-            if ctx_limit > 0 { total_tokens * 100 / ctx_limit } else { 0 },
             option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
         )
     }
@@ -392,10 +419,7 @@ impl AgentRegistry {
                     abort_flags: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     started_at: Instant::now(),
                     session_count: Arc::new(AtomicUsize::new(0)),
-                    last_ctx_tokens: Arc::new(AtomicUsize::new(0)),
-                    last_sys_tokens: Arc::new(AtomicUsize::new(0)),
-                    last_tools_tokens: Arc::new(AtomicUsize::new(0)),
-                    last_msg_tokens: Arc::new(AtomicUsize::new(0)),
+                    session_tokens: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     clear_signal: Arc::new(AtomicBool::new(false)),
                     new_session_signal: Arc::new(AtomicBool::new(false)),
                     reset_signal: Arc::new(AtomicBool::new(false)),
