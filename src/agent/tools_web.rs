@@ -34,8 +34,12 @@ impl AgentRuntime {
         // If the planner fails or returns only `general`, we fall through to
         // the normal search logic below with the original query unchanged.
         if !args.get("_planned").and_then(|v| v.as_bool()).unwrap_or(false) {
+            // Prefer the original user query for intent recognition — the agent
+            // often rewrites queries (adds dates, site: operators) which confuses
+            // the planner. Fall back to the tool's `query` arg if unavailable.
+            let planner_input = args["_user_query"].as_str().unwrap_or(query);
             let flash = self.resolve_flash_model_name();
-            let plan = crate::agent::query_planner::plan(query, &flash, &self.providers).await;
+            let plan = crate::agent::query_planner::plan(planner_input, &flash, &self.providers).await;
 
             // Count structured (non-general) intents. If we have any, dispatch
             // them through the planner path and return structured results.
@@ -113,7 +117,7 @@ impl AgentRuntime {
         };
 
         let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15")
             .timeout(Duration::from_secs(15))
             .build()?;
 
@@ -306,7 +310,7 @@ impl AgentRuntime {
                     .get(&url)
                     .header(
                         "User-Agent",
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
                     )
                     .send()
                     .await?
@@ -323,7 +327,7 @@ impl AgentRuntime {
                     .get(&url)
                     .header(
                         "User-Agent",
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
                     )
                     .send()
                     .await?
@@ -340,7 +344,7 @@ impl AgentRuntime {
                     .get(&url)
                     .header(
                         "User-Agent",
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
                     )
                     .send()
                     .await?
@@ -378,7 +382,7 @@ impl AgentRuntime {
                 .get(&url)
                 .header(
                     "User-Agent",
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
                 )
                 .send()
                 .await?
@@ -559,7 +563,7 @@ impl AgentRuntime {
                 );
                 let html = client
                     .get(&url)
-                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15")
                     .send().await?.text().await?;
                 let r = parse_bing_html_results(&html, limit);
                 (html, r)
@@ -573,7 +577,7 @@ impl AgentRuntime {
             "baidu-free" => {
                 let url = format!("https://www.baidu.com/s?wd={}&rn={limit}", urlencoding::encode(query));
                 let html = client.get(&url)
-                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15")
                     .send().await?.text().await?;
                 let r = parse_baidu_results(&html, limit);
                 (html, r)
@@ -581,7 +585,7 @@ impl AgentRuntime {
             "sogou-free" => {
                 let url = format!("https://www.sogou.com/web?query={}", urlencoding::encode(query));
                 let html = client.get(&url)
-                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15")
                     .send().await?.text().await?;
                 let r = parse_sogou_results(&html, limit);
                 (html, r)
@@ -1077,39 +1081,57 @@ impl AgentRuntime {
         let futs = plan.sub_queries.into_iter().map(|sq| {
             let client = client.clone();
             async move {
-                let (source, answer) = match &sq.intent {
-                    Intent::Weather { location } => fetch_weather(&client, location).await,
-                    Intent::Currency { from, to } => fetch_currency(&client, from, to).await,
-                    Intent::Timezone { location } => fetch_timezone(&client, location).await,
-                    Intent::Wikipedia { topic } => fetch_wiki(&client, topic).await,
+                // 1. Try specialized API first (non-general intents only).
+                let api_result = match &sq.intent {
+                    Intent::Weather { location } => Some(fetch_weather(&client, location).await),
+                    Intent::Currency { from, to } => Some(fetch_currency(&client, from, to).await),
+                    Intent::Timezone { location } => Some(fetch_timezone(&client, location).await),
+                    Intent::Wikipedia { topic } => Some(fetch_wiki(&client, topic).await),
                     Intent::GithubRepo { owner, repo } => {
-                        fetch_github(&client, owner, repo).await
+                        Some(fetch_github(&client, owner, repo).await)
                     }
-                    Intent::General => (
-                        "web_search",
-                        // Recursive call with _planned=true skips re-planning.
-                        match self
-                            .tool_web_search(json!({
-                                "query": sq.q.clone(),
-                                "_planned": true,
-                            }))
-                            .await
-                        {
-                            Ok(v) => v,
-                            Err(e) => json!({ "error": e.to_string() }),
-                        },
-                    ),
+                    Intent::General => None,
+                };
+
+                // 2. If API succeeded (no error field), use it. Otherwise fallback to web_search.
+                let (source, answer) = match api_result {
+                    Some((src, ref val)) if val.get("error").is_none() => (src, val.clone()),
+                    _ => {
+                        // API failed or general intent — fallback to web_search.
+                        tracing::info!(
+                            query = %sq.q,
+                            "dispatch_query_plan: falling back to web_search"
+                        );
+                        (
+                            "web_search",
+                            match self
+                                .tool_web_search(json!({
+                                    "query": sq.q.clone(),
+                                    "_planned": true,
+                                }))
+                                .await
+                            {
+                                Ok(v) => v,
+                                Err(e) => json!({ "error": e.to_string() }),
+                            },
+                        )
+                    }
+                };
+
+                let intent_str = match &sq.intent {
+                    Intent::Weather { .. } => "weather",
+                    Intent::Currency { .. } => "currency",
+                    Intent::Timezone { .. } => "timezone",
+                    Intent::Wikipedia { .. } => "wikipedia",
+                    Intent::GithubRepo { .. } => "github_repo",
+                    Intent::General => "general",
                 };
                 json!({
+                    "title": format!("[{}] {}", intent_str, sq.q),
+                    "snippet": serde_json::to_string(&answer).unwrap_or_default(),
+                    "url": source,
                     "question": sq.q,
-                    "intent": match &sq.intent {
-                        Intent::Weather { .. } => "weather",
-                        Intent::Currency { .. } => "currency",
-                        Intent::Timezone { .. } => "timezone",
-                        Intent::Wikipedia { .. } => "wikipedia",
-                        Intent::GithubRepo { .. } => "github_repo",
-                        Intent::General => "general",
-                    },
+                    "intent": intent_str,
                     "source": source,
                     "answer": answer,
                 })

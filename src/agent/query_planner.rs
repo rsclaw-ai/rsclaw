@@ -76,24 +76,33 @@ impl QueryPlan {
     }
 }
 
-const PLANNER_SYSTEM: &str = r#"You analyze a user search query and decide how to answer it.
+/// Build the planner system prompt with current time and timezone injected.
+fn planner_system() -> String {
+    let now = chrono::Local::now();
+    let tz = now.format("%Z").to_string();
+    let ts = now.format("%Y-%m-%d %H:%M %A").to_string();
+    format!(
+r#"Current time: {ts} ({tz})
+
+You analyze a user search query and decide how to answer it.
 
 Output ONLY valid JSON matching this schema (no prose, no markdown, no code fences):
-{"sub_queries":[{"q":"<cleaned keywords>","intent":{"kind":"<intent>", ...fields}}]}
+{{"sub_queries":[{{"q":"<cleaned keywords>","intent":{{"kind":"<intent>", ...fields}}}}]}}
 
 Intent kinds and required fields:
-  weather     : {"kind":"weather","location":"<city in English>"}
-  currency    : {"kind":"currency","from":"<ISO code>","to":"<ISO code>"}
-  timezone    : {"kind":"timezone","location":"<IANA zone ONLY, e.g. Asia/Shanghai — NOT a city name>"}
-  wikipedia   : {"kind":"wikipedia","topic":"<topic phrase>"}
-  github_repo : {"kind":"github_repo","owner":"<owner>","repo":"<name>"}
-  general     : {"kind":"general"}                          # fallback
+  weather     : {{"kind":"weather","location":"<city in English>"}}
+  currency    : {{"kind":"currency","from":"<ISO code>","to":"<ISO code>"}}
+  timezone    : {{"kind":"timezone","location":"<IANA zone ONLY, e.g. Asia/Shanghai — NOT a city name>"}}
+  wikipedia   : {{"kind":"wikipedia","topic":"<topic phrase>"}}
+  github_repo : {{"kind":"github_repo","owner":"<owner>","repo":"<name>"}}
+  general     : {{"kind":"general"}}
 
 Rules:
 - SPLIT multi-entity queries: if the query asks about N cities/entities,
   output N sub_queries.
-- CLEAN keywords: drop filler ("未来7天", "请", "帮我", "最新"), drop dates
-  when the question is about current/live data.
+- CLEAN keywords: drop filler words and dates. The current time is already
+  known, so never include dates/years in the "q" field for live-data queries
+  (weather, currency, stock, etc.).
 - PREFER English city names for "weather" intent so API lookups hit.
 - If unsure of intent, use "general" — don't force a wrong match.
 - Max 5 sub_queries. Never output more.
@@ -101,27 +110,27 @@ Rules:
 Examples:
 
 Input: "曼谷、广州、武汉未来7天的天气"
-Output: {"sub_queries":[
-  {"q":"Bangkok weather","intent":{"kind":"weather","location":"Bangkok"}},
-  {"q":"Guangzhou weather","intent":{"kind":"weather","location":"Guangzhou"}},
-  {"q":"Wuhan weather","intent":{"kind":"weather","location":"Wuhan"}}
-]}
+Output: {{"sub_queries":[
+  {{"q":"Bangkok weather","intent":{{"kind":"weather","location":"Bangkok"}}}},
+  {{"q":"Guangzhou weather","intent":{{"kind":"weather","location":"Guangzhou"}}}},
+  {{"q":"Wuhan weather","intent":{{"kind":"weather","location":"Wuhan"}}}}
+]}}
 
 Input: "美元兑人民币汇率"
-Output: {"sub_queries":[
-  {"q":"USD to CNY","intent":{"kind":"currency","from":"USD","to":"CNY"}}
-]}
+Output: {{"sub_queries":[
+  {{"q":"USD to CNY","intent":{{"kind":"currency","from":"USD","to":"CNY"}}}}
+]}}
 
 Input: "rust async fn 用法"
-Output: {"sub_queries":[
-  {"q":"rust async fn usage","intent":{"kind":"general"}}
-]}
+Output: {{"sub_queries":[
+  {{"q":"rust async fn usage","intent":{{"kind":"general"}}}}
+]}}
 
 Input: "tokio 仓库什么情况"
-Output: {"sub_queries":[
-  {"q":"tokio-rs/tokio","intent":{"kind":"github_repo","owner":"tokio-rs","repo":"tokio"}}
-]}
-"#;
+Output: {{"sub_queries":[
+  {{"q":"tokio-rs/tokio","intent":{{"kind":"github_repo","owner":"tokio-rs","repo":"tokio"}}}}
+]}}"#)
+}
 
 /// Plan a query using the flash model. Returns a structured `QueryPlan`.
 ///
@@ -187,7 +196,7 @@ async fn try_plan(
         model: model_id.to_owned(),
         messages,
         tools: vec![],
-        system: Some(PLANNER_SYSTEM.to_owned()),
+        system: Some(planner_system()),
         max_tokens: Some(400),
         temperature: Some(0.0),
         frequency_penalty: None,
@@ -216,6 +225,8 @@ async fn try_plan(
     let json = extract_json_object(&buf).ok_or_else(|| {
         anyhow!("planner output has no JSON object; got: {}", truncate(&buf, 200))
     })?;
+
+    tracing::debug!(raw = %truncate(json, 500), "query_planner: raw LLM output");
 
     let plan: QueryPlan = serde_json::from_str(json).map_err(|e| {
         anyhow!("planner JSON parse failed: {e}; raw: {}", truncate(json, 200))

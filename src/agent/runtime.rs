@@ -4569,7 +4569,25 @@ impl AgentRuntime {
             "list_dir" => return self.tool_list_dir(args).await,
             "search_file" => return self.tool_search_file(args).await,
             "search_content" => return self.tool_search_content(args).await,
-            "web_search" => return self.tool_web_search(args).await,
+            "web_search" => {
+                // Inject the last user message so the query planner can work
+                // with the original intent rather than the agent's rewritten query.
+                let mut args = args;
+                if args.get("_user_query").is_none() {
+                    if let Some(msgs) = self.sessions.get(&ctx.session_key) {
+                        if let Some(uq) = msgs.iter().rev()
+                            .find(|m| m.role == crate::provider::Role::User)
+                            .and_then(|m| match &m.content {
+                                crate::provider::MessageContent::Text(t) => Some(t.as_str()),
+                                _ => None,
+                            })
+                        {
+                            args["_user_query"] = serde_json::Value::String(uq.to_owned());
+                        }
+                    }
+                }
+                return self.tool_web_search(args).await;
+            }
             "web_fetch" => return self.tool_web_fetch(args).await,
             "web_download" => return self.tool_web_download(args).await,
             "web_browser" | "browser" => return self.tool_web_browser(ctx, args).await,
