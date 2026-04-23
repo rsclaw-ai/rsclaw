@@ -8,7 +8,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::info;
 
 use crate::{
-    agent::{AgentHandle, AgentMessage, AgentRegistry, AgentReply, AgentRuntime, MemoryStore},
+    agent::{AgentHandle, AgentKind, AgentMessage, AgentRegistry, AgentReply, AgentRuntime, MemoryStore},
     config::{runtime::RuntimeConfig, schema::AgentEntry},
     events::AgentEvent,
     plugin::PluginRegistry,
@@ -61,6 +61,12 @@ impl AgentSpawner {
     /// Dynamically spawn a new agent at runtime.
     /// Returns the new agent's ID on success.
     pub fn spawn_agent(&self, entry: AgentEntry) -> Result<String> {
+        self.spawn_agent_with_kind(entry, AgentKind::Named)
+    }
+
+    /// Dynamically spawn a new agent at runtime with explicit kind.
+    /// Returns the new agent's ID on success.
+    pub fn spawn_agent_with_kind(&self, entry: AgentEntry, kind: AgentKind) -> Result<String> {
         let id = entry.id.clone();
 
         if self.registry.get(&id).is_ok() {
@@ -74,6 +80,7 @@ impl AgentSpawner {
             .unwrap_or(4) as usize;
         let handle = Arc::new(AgentHandle {
             id: id.clone(),
+            kind,
             config: entry.clone(),
             tx,
             concurrency: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
@@ -85,6 +92,10 @@ impl AgentSpawner {
             started_at: std::time::Instant::now(),
             session_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_tokens: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            last_ctx_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_sys_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_tools_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_msg_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             clear_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             new_session_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reset_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),

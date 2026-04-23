@@ -46,8 +46,8 @@ pub use permission::{
     add_pending_permission, get_pending_permission, remove_pending_permission, resolve_permission,
 };
 pub use registry::{
-    AgentHandle, AgentMessage, AgentRegistry, AgentReply, FileAttachment, ImageAttachment,
-    PendingAnalysis,
+    AgentHandle, AgentKind, AgentMessage, AgentRegistry, AgentReply,
+    FileAttachment, ImageAttachment, PendingAnalysis, SessionTokens,
 };
 pub use runtime::{AgentRuntime, LiveStatus};
 pub use spawner::AgentSpawner;

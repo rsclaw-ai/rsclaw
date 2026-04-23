@@ -25,6 +25,19 @@ const DEFAULT_MAX_CONCURRENT: u32 = 4;
 // AgentHandle
 // ---------------------------------------------------------------------------
 
+/// The four kinds of agent in the system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum AgentKind {
+    /// The default entry point. Cannot be deleted. `default: true` in config.
+    Main,
+    /// User-created persistent agent. Saved to config file, survives restarts.
+    Named,
+    /// LLM-spawned temporary agent (`persistent: false`). Lives in memory, gone on restart.
+    Sub,
+    /// One-shot task agent. Automatically destroyed after completion.
+    Task,
+}
+
 /// A lightweight handle to a running agent.
 ///
 /// The actual agent loop lives in a tokio task; communication happens
@@ -32,6 +45,7 @@ const DEFAULT_MAX_CONCURRENT: u32 = 4;
 #[derive(Clone)]
 pub struct AgentHandle {
     pub id: String,
+    pub kind: AgentKind,
     pub config: AgentEntry,
     /// Sender to the agent's message queue.
     pub tx: mpsc::Sender<AgentMessage>,
@@ -50,6 +64,15 @@ pub struct AgentHandle {
     pub session_count: Arc<AtomicUsize>,
     /// Per-session context token stats, updated by normal conversation LLM calls only.
     pub session_tokens: Arc<std::sync::RwLock<HashMap<String, SessionTokens>>>,
+    /// Total context tokens of the most recent turn (sys + tools + msgs + scratchpad).
+    /// Updated by runtime for /status so the number matches what the LLM actually saw.
+    pub last_ctx_tokens: Arc<AtomicUsize>,
+    /// System prompt tokens of the most recent LLM call.
+    pub last_sys_tokens: Arc<AtomicUsize>,
+    /// Tool-definition tokens of the most recent LLM call.
+    pub last_tools_tokens: Arc<AtomicUsize>,
+    /// Message-history tokens of the most recent LLM call.
+    pub last_msg_tokens: Arc<AtomicUsize>,
     /// Signal to clear all sessions (set by /clear bypass, consumed by runtime).
     pub clear_signal: Arc<AtomicBool>,
     /// Signal to start a new session (set by /new bypass, consumed by runtime).
@@ -388,8 +411,14 @@ impl AgentRegistry {
                     .lane_concurrency
                     .map(|n| n as usize)
                     .unwrap_or(max_concurrent);
+                let kind = if entry.default == Some(true) {
+                    AgentKind::Main
+                } else {
+                    AgentKind::Named
+                };
                 let handle = Arc::new(AgentHandle {
                     id: entry.id.clone(),
+                    kind,
                     config: entry.clone(),
                     tx,
                     concurrency: Arc::new(tokio::sync::Semaphore::new(permits)),
@@ -401,6 +430,10 @@ impl AgentRegistry {
                     started_at: Instant::now(),
                     session_count: Arc::new(AtomicUsize::new(0)),
                     session_tokens: Arc::new(std::sync::RwLock::new(HashMap::new())),
+                    last_ctx_tokens: Arc::new(AtomicUsize::new(0)),
+                    last_sys_tokens: Arc::new(AtomicUsize::new(0)),
+                    last_tools_tokens: Arc::new(AtomicUsize::new(0)),
+                    last_msg_tokens: Arc::new(AtomicUsize::new(0)),
                     clear_signal: Arc::new(AtomicBool::new(false)),
                     new_session_signal: Arc::new(AtomicBool::new(false)),
                     reset_signal: Arc::new(AtomicBool::new(false)),
