@@ -26,7 +26,7 @@ use crate::{
         LiveConfig,
         hot_reload::{ConfigChange, FileWatcher},
     },
-    plugin::{MemoryStoreSlot, PluginRegistry, load_plugins},
+    plugin::{MemoryStoreSlot, PluginRegistry, load_all_plugins},
     provider::registry::ProviderRegistry,
     server::{AppState, serve},
     skill::{SkillRegistry, load_skills},
@@ -165,43 +165,36 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         }
     };
 
-    // 7. Load plugins and register built-in memory slot.
+    // 7. Load all plugins (JS + WASM) and register built-in memory slot.
     let plugins_dir = base_dir.join("plugins");
-    let mut plugin_registry = load_plugins(&plugins_dir, config.ext.plugins.as_ref(), None)
-        .await
-        .unwrap_or_else(|e| {
-            warn!("plugin load error: {e:#}");
-            PluginRegistry::new()
-        });
+    let wasm_browser: Arc<tokio::sync::Mutex<Option<crate::browser::BrowserSession>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let mut plugin_registry = load_all_plugins(
+        &plugins_dir,
+        config.ext.plugins.as_ref(),
+        Arc::clone(&wasm_browser),
+    )
+    .await
+    .unwrap_or_else(|e| {
+        warn!("plugin load error: {e:#}");
+        PluginRegistry::new()
+    });
     if let Some(ref mem_arc) = memory
         && !plugin_registry.slots.has_memory()
     {
         let slot = MemoryStoreSlot::new(Arc::clone(mem_arc));
-        // slot may already be set by a plugin; ignore if so
         let _ = plugin_registry.slots.set_memory(Arc::new(slot), "built-in");
     }
     info!(
-        "{} plugin(s) loaded, memory slot: {}",
+        "{} plugin(s) loaded (js={}, wasm={}), memory slot: {}",
         plugin_registry.len(),
+        plugin_registry.js_count(),
+        plugin_registry.wasm_count(),
         plugin_registry.slots.has_memory()
     );
 
+    let wasm_plugins = Arc::new(plugin_registry.take_wasm_plugins());
     let plugins = Arc::new(plugin_registry);
-
-    // 7.5 Load WASM plugins from the same plugins directory.
-    let wasm_browser: Arc<tokio::sync::Mutex<Option<crate::browser::BrowserSession>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
-    let wasm_plugins = crate::plugin::load_wasm_plugins(&plugins_dir, Arc::clone(&wasm_browser))
-        .await
-        .unwrap_or_else(|e| {
-            warn!("WASM plugin load error: {e:#}");
-            Vec::new()
-        });
-    if !wasm_plugins.is_empty() {
-        info!("{} WASM plugin(s) loaded: {}", wasm_plugins.len(),
-              wasm_plugins.iter().map(|p| format!("{}({}t)", p.name, p.tools.len())).collect::<Vec<_>>().join(", "));
-    }
-    let wasm_plugins = Arc::new(wasm_plugins);
 
     // Create the SSE broadcast channel once so agents and the HTTP server
     // share the same sender.

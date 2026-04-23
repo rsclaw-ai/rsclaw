@@ -9,7 +9,7 @@
 //!   - `log`, `sleep`, `read-file`
 
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -17,9 +17,9 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::debug;
 use wasmtime::{
-    Config, Engine, Store,
+    Engine, Store,
     component::{Component, Linker, bindgen},
 };
 
@@ -43,6 +43,10 @@ bindgen!({
 pub struct WasmPlugin {
     /// Plugin name (from manifest).
     pub name: String,
+    /// Semver version string (from manifest).
+    pub version: Option<String>,
+    /// Human-readable description (from manifest).
+    pub description: Option<String>,
     /// Tools this plugin exposes.
     pub tools: Vec<WasmToolDef>,
     /// Path to the `.wasm` file on disk.
@@ -72,6 +76,8 @@ pub struct WasmToolDef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WasmManifestRaw {
     name: String,
+    version: Option<String>,
+    description: Option<String>,
     #[serde(default)]
     tools: Vec<WasmToolDef>,
 }
@@ -267,86 +273,8 @@ impl HostState {
 }
 
 // ---------------------------------------------------------------------------
-// Directory scanning
-// ---------------------------------------------------------------------------
-
-/// Scan a directory for `.wasm` files and return their paths.
-///
-/// Non-`.wasm` entries and unreadable paths are silently skipped with a
-/// debug-level log.
-pub fn scan_wasm_plugins(dir: &Path) -> Vec<PathBuf> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => {
-            debug!(path = %dir.display(), error = %e, "cannot read WASM plugins directory");
-            return Vec::new();
-        }
-    };
-
-    let mut paths = Vec::new();
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                debug!(error = %e, "skipping unreadable directory entry");
-                continue;
-            }
-        };
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("wasm") {
-            debug!(path = %path.display(), "found WASM plugin");
-            paths.push(path);
-        }
-    }
-    paths
-}
-
-// ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
-
-/// Load all WASM plugins from a directory.
-///
-/// Each `.wasm` file is compiled as a component and its `get-manifest` export
-/// is called to discover the plugin name and available tools.
-///
-/// Plugins that fail to load are logged at `warn` level and skipped.
-pub async fn load_wasm_plugins(
-    dir: &Path,
-    browser: Arc<Mutex<Option<BrowserSession>>>,
-) -> Result<Vec<WasmPlugin>> {
-    let paths = scan_wasm_plugins(dir);
-    if paths.is_empty() {
-        debug!(dir = %dir.display(), "no WASM plugins found");
-        return Ok(Vec::new());
-    }
-
-    // Shared engine config — async support for async host functions.
-    let mut config = Config::new();
-    config.async_support(true);
-    let engine = Engine::new(&config).context("failed to create wasmtime engine")?;
-
-    let mut plugins = Vec::new();
-    for path in &paths {
-        match load_single_plugin(path, &engine, Arc::clone(&browser)).await {
-            Ok(plugin) => {
-                info!(
-                    plugin = %plugin.name,
-                    tools = plugin.tools.len(),
-                    path = %path.display(),
-                    "WASM plugin loaded"
-                );
-                plugins.push(plugin);
-            }
-            Err(e) => {
-                warn!(path = %path.display(), error = format!("{e:#}"), "failed to load WASM plugin");
-            }
-        }
-    }
-
-    info!(count = plugins.len(), "WASM plugins loaded");
-    Ok(plugins)
-}
 
 /// Build a `Linker<HostState>` with all host functions registered.
 fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
@@ -359,13 +287,18 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
     Ok(linker)
 }
 
-/// Load a single `.wasm` file into a `WasmPlugin`.
-async fn load_single_plugin(
-    path: &Path,
+/// Load a WASM plugin from a `PluginManifest`.
+///
+/// The manifest's `entry` field points to the `.wasm` file relative to the
+/// plugin directory. The WASM component is compiled and its `get-manifest`
+/// export is called to discover tools.
+pub async fn load_wasm_plugin(
+    manifest: &super::manifest::PluginManifest,
     engine: &Engine,
     browser: Arc<Mutex<Option<BrowserSession>>>,
 ) -> Result<WasmPlugin> {
-    let wasm_bytes = std::fs::read(path)
+    let path = manifest.entry_path();
+    let wasm_bytes = std::fs::read(&path)
         .with_context(|| format!("failed to read WASM file: {}", path.display()))?;
 
     let component = Component::new(engine, &wasm_bytes)
@@ -412,12 +345,15 @@ async fn load_single_plugin(
         .await
         .with_context(|| "get-manifest post-return failed")?;
 
-    let manifest: WasmManifestRaw = serde_json::from_str(&manifest_json)
+    let wasm_manifest: WasmManifestRaw = serde_json::from_str(&manifest_json)
         .with_context(|| format!("invalid manifest JSON from {}: {manifest_json}", path.display()))?;
 
+    // Prefer plugin.json5 metadata, fall back to wasm-internal manifest.
     Ok(WasmPlugin {
-        name: manifest.name,
-        tools: manifest.tools,
+        name: manifest.name.clone(),
+        version: manifest.version.clone().or(wasm_manifest.version),
+        description: manifest.description.clone().or(wasm_manifest.description),
+        tools: if wasm_manifest.tools.is_empty() { Vec::new() } else { wasm_manifest.tools },
         wasm_path: path.to_path_buf(),
         engine: engine.clone(),
         component,

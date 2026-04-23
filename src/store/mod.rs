@@ -1,8 +1,8 @@
-//! Storage layer: redb (hot KV) + tantivy (BM25 FTS) + LanceDB (cold vector).
+//! Storage layer: redb (hot KV) + tantivy (BM25 FTS) + hnsw_rs (vector).
 //!
 //! Hot path  — redb: session meta, messages, pairing, KV.
 //! FTS path  — tantivy: BM25 full-text search over document corpus.
-//! Cold path — LanceDB + BGE-Small: semantic vector memory (see agent::memory).
+//! Cold path — hnsw_rs + BGE-Small: semantic vector memory (see agent::memory).
 //!
 //! Architecture: AGENTS.md §8 "Storage Architecture" + §31 "Memory System"
 

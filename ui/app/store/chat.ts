@@ -787,6 +787,14 @@ export const useChatStore = createPersistStore(
         const index = sessions.findIndex((s) => s.id === targetSession.id);
         if (index < 0) return;
         updater(sessions[index]);
+        // Deduplicate messages by ID to prevent race conditions
+        // when a new message is sent while streaming is in progress.
+        const seen = new Set<string>();
+        sessions[index].messages = sessions[index].messages.filter((m) => {
+          if (seen.has(m.id)) return false;
+          seen.add(m.id);
+          return true;
+        });
         set(() => ({ sessions }));
       },
       async clearAllData() {

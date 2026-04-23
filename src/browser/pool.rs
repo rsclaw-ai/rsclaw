@@ -94,6 +94,19 @@ impl BrowserPool {
         let permit = self.tab_semaphore.clone().acquire_owned().await
             .map_err(|_| anyhow!("browser pool semaphore closed"))?;
 
+        // Whole acquire_tab has a 15s timeout — if Chrome is unresponsive,
+        // bail out instead of blocking the caller indefinitely.
+        match tokio::time::timeout(Duration::from_secs(30), self.acquire_tab_inner(permit)).await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!("pool: acquire_tab timed out (30s), Chrome may be unresponsive");
+                Err(anyhow!("browser pool: timed out connecting to Chrome"))
+            }
+        }
+    }
+
+    /// Inner logic for acquire_tab, wrapped by a timeout.
+    async fn acquire_tab_inner(&self, permit: tokio::sync::OwnedSemaphorePermit) -> Result<TabSession> {
         // Ensure Chrome is running.
         let port = self.ensure_chrome().await?;
 

@@ -1,7 +1,7 @@
 //! Plugin slot system.
 //!
 //! Slots allow plugins to replace core rsclaw subsystems:
-//!   - `memory`         — replaces the built-in LanceDB memory backend
+//!   - `memory`         — replaces the built-in hnsw_rs memory backend
 //!   - `context_engine` — replaces the context pruning / compaction logic
 //!
 //! Only one plugin may occupy each slot at a time.
@@ -118,7 +118,7 @@ impl SlotRegistry {
 // MemoryStoreSlot — built-in MemorySlot backed by agent::memory::MemoryStore
 // ---------------------------------------------------------------------------
 
-/// Wraps the built-in LanceDB `MemoryStore` so it can fill the `memory` slot
+/// Wraps the built-in `MemoryStore` so it can fill the `memory` slot
 /// and be used by external plugins that call through `SlotRegistry`.
 pub struct MemoryStoreSlot {
     inner: Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>,

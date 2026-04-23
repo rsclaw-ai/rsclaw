@@ -1132,6 +1132,12 @@ fn main() {
                 })
                 .build(app)?;
 
+            // Only open devtools in debug builds (feature enabled by `tauri dev`).
+            #[cfg(feature = "devtools")]
+            if let Some(window) = app.get_webview_window("main") {
+                window.open_devtools();
+            }
+
             // Gateway health watchdog: check every 10s, auto-restart if crashed.
             // Disabled when user manually stops gateway (GATEWAY_USER_STOPPED).
             std::thread::spawn(|| {

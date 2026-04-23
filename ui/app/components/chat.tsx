@@ -1,4 +1,5 @@
 import { useDebouncedCallback } from "use-debounce";
+import { invoke as tauriInvoke } from "../utils/tauri";
 import React, {
   Fragment,
   RefObject,
@@ -1954,8 +1955,6 @@ function _Chat() {
               }}
             >
               {messages
-                // TODO
-                // .filter((m) => !m.isMcpResponse)
                 .map((message, i) => {
                   const isUser = message.role === "user";
                   const isContext = i < context.length;
@@ -2155,7 +2154,7 @@ function _Chat() {
                                             key={idx}
                                             className={styles["chat-file-chip"]}
                                             title={path}
-                                            onClick={() => (window as any).__TAURI__?.invoke?.("open_path", { path })}
+                                            onClick={() => tauriInvoke("open_path", { path })}
                                           >
                                             {isDir ? (
                                               <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor" style={{ flexShrink: 0 }}>
@@ -2256,19 +2255,24 @@ function _Chat() {
                           {!isUser && (() => {
                             const raw = getMessageContentOnly(message);
                             const { rsFiles, rsImages } = extractRsFiles(raw);
+                            const dataImages = rsImages.filter((p) => p.startsWith("data:"));
+                            const fileImages = rsImages.filter((p) => !p.startsWith("data:"));
                             return (rsFiles.length > 0 || rsImages.length > 0) ? (
                               <>
-                                {(rsFiles.length > 0 || rsImages.length > 0) && (
+                                {dataImages.map((src, idx) => (
+                                  <img key={`di-${idx}`} className={styles["chat-message-item-image"]} src={src} alt="" />
+                                ))}
+                                {(rsFiles.length > 0 || fileImages.length > 0) && (
                                   <div className={styles["chat-file-chips"]}>
                                     {rsFiles.map(([name, , path], idx) => (
                                       <span key={idx} className={styles["chat-file-chip"]} title={path}
-                                        onClick={() => (window as any).__TAURI__?.invoke?.("open_path", { path })}>
+                                        onClick={() => tauriInvoke("open_path", { path })}>
                                         {name || path.split("/").pop() || path}
                                       </span>
                                     ))}
-                                    {rsImages.map((imgPath, idx) => (
+                                    {fileImages.map((imgPath, idx) => (
                                       <span key={`img-${idx}`} className={styles["chat-file-chip"]} title={imgPath}
-                                        onClick={() => (window as any).__TAURI__?.invoke?.("open_path", { path: imgPath })}>
+                                        onClick={() => tauriInvoke("open_path", { path: imgPath })}>
                                         {imgPath.split("/").pop() || imgPath}
                                       </span>
                                     ))}

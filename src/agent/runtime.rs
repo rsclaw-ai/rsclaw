@@ -4124,11 +4124,26 @@ impl AgentRuntime {
                     } else {
                         result_text.clone()
                     };
-                    tool_log.push((tool_name.clone(), args_str, out_str.clone()));
+                    tool_log.push((tool_name.clone(), args_str.clone(), out_str.clone()));
                     if let Some(ref bus) = self.event_bus {
+                        // Prepend `$ command` line for exec tools so the
+                        // desktop UI can show a command preview in the header.
+                        let display_out = if matches!(tool_name.as_str(), "execute_command" | "exec") {
+                            if let Ok(a) = serde_json::from_str::<serde_json::Value>(&args_str) {
+                                if let Some(cmd) = a.get("command").and_then(|c| c.as_str()) {
+                                    format!("$ {cmd}\n{out_str}")
+                                } else {
+                                    out_str.clone()
+                                }
+                            } else {
+                                out_str.clone()
+                            }
+                        } else {
+                            out_str.clone()
+                        };
                         let marker = format!(
                             "<rstool name=\"{}\">{}</rstool>",
-                            tool_name, out_str
+                            tool_name, display_out
                         );
                         let _ = bus.send(AgentEvent {
                             session_id: ctx.session_key.clone(),
