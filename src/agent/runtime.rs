@@ -1048,69 +1048,7 @@ impl AgentRuntime {
                         build_help_text_filtered(allowed, lang)
                     }
                     "__VERSION__" => format!("rsclaw {}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")),
-                    "__STATUS__" => {
-                        let model = self.resolve_model_name();
-                        let sessions = self.sessions.len();
-                        let uptime = format_duration(self.started_at.elapsed());
-                        let os = if cfg!(target_os = "macos") { "macOS" }
-                            else if cfg!(target_os = "linux") {
-                                if std::env::var("ANDROID_ROOT").is_ok() { "Android" } else { "Linux" }
-                            }
-                            else if cfg!(target_os = "windows") { "Windows" }
-                            else if cfg!(target_os = "ios") { "iOS" }
-                            else { "Unknown" };
-                        let ctx_limit = self.handle.config.model.as_ref()
-                            .and_then(|m| m.context_tokens)
-                            .or(self.config.agents.defaults.model.as_ref()
-                                .and_then(|m| m.context_tokens))
-                            .unwrap_or(64000) as usize;
-
-// Pull the last known values from the most recent LLM
-                        // call (stored by the runtime). This matches exactly
-                        // what the model actually saw, instead of re-estimating
-                        // from scratch (which was systematically wrong).
-                        use std::sync::atomic::Ordering::Relaxed;
-                        let sys_tokens = self.handle.last_sys_tokens.load(Relaxed);
-                        let tools_tokens = self.handle.last_tools_tokens.load(Relaxed);
-                        let msg_tokens = self.handle.last_msg_tokens.load(Relaxed);
-                        let total_tokens = self.handle.last_ctx_tokens.load(Relaxed);
-
-                        // Fallback for the case where no LLM call has happened
-                        // yet in this agent's lifetime — count current session
-                        // messages so the user still sees something sensible.
-                        let (sys_tokens, tools_tokens, msg_tokens, total_tokens) =
-                            if total_tokens == 0 {
-                                let m: usize = self.sessions.get(session_key)
-                                    .map(|msgs| msgs.iter().map(crate::agent::context_mgr::msg_tokens).sum())
-                                    .unwrap_or(0);
-                                (0, 0, m, m)
-                            } else {
-                                (sys_tokens, tools_tokens, msg_tokens, total_tokens)
-                            };
-
-                        let stale_hint = if total_tokens == 0 {
-                            " (no LLM call yet)"
-                        } else {
-                            " (from last LLM call)"
-                        };
-
-                        format!(
-                            "Gateway: running\nOS: {os}\nModel: {model}\nSessions: {sessions}\n\
-                             Context{stale_hint}:\n\
-                             \u{A0} system  ~{:.1}k\n\
-                             \u{A0} tools   ~{:.1}k\n\
-                             \u{A0} msgs    ~{:.1}k\n\
-                             \u{A0} total   ~{:.1}k / {:.0}k ({}%)\n\
-                             Uptime: {uptime}\nVersion: rsclaw {}",
-                            sys_tokens as f64 / 1000.0,
-                            tools_tokens as f64 / 1000.0,
-                            msg_tokens as f64 / 1000.0,
-                            total_tokens as f64 / 1000.0,
-                            ctx_limit as f64 / 1000.0,
-                            if ctx_limit > 0 { total_tokens * 100 / ctx_limit } else { 0 },
-                            option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
-                        )
-                    }
+"__STATUS__" => self.handle.format_status(),
                     "__HEALTH__" => {
                         let model = self.resolve_model_name();
                         let (prov_name, _) =
@@ -3315,12 +3253,14 @@ impl AgentRuntime {
                 );
             }
 
-            // Default temperature 0.6 for tool-calling scenarios (reduces
-            // randomness, helps small models preserve digits and paths).
-            // For pure chat (no tools), leave as None (provider default, usually 1.0).
-            // For thinking/reasoning, leave as None (let provider handle CoT temperature).
-            let temperature = if thinking_budget.is_some() || tools.is_empty() {
+            // Temperature: 0.6 when tools are available (reduces randomness,
+            // helps small models preserve digits and call tools reliably).
+            // 0.7 for pure chat (no tools) — slightly creative but not wild.
+            // None for thinking/reasoning (let provider handle CoT temperature).
+            let temperature = if thinking_budget.is_some() {
                 None
+            } else if tools.is_empty() {
+                Some(0.7)
             } else {
                 Some(0.6)
             };

@@ -293,6 +293,74 @@ fn process_alive(pid: u32) -> bool {
     crate::sys::process_alive(pid)
 }
 
+/// Scan for a running gateway process when PID file is missing.
+/// Tries: 1) lsof/netstat on the gateway port, 2) pgrep by name.
+fn find_gateway_pid() -> Option<u32> {
+    let port = detect_port();
+    let my_pid = std::process::id();
+
+    // Try finding by port first (most reliable).
+    #[cfg(unix)]
+    {
+        let output = std::process::Command::new("lsof")
+            .args(["-ti", &format!(":{port}"), "-sTCP:LISTEN"])
+            .output()
+            .ok();
+        if let Some(output) = output {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                if let Ok(pid) = line.trim().parse::<u32>() {
+                    if pid != my_pid && process_alive(pid) {
+                        return Some(pid);
+                    }
+                }
+            }
+        }
+
+        // Fallback: pgrep by process name.
+        for pattern in &["rsclaw gateway", "rsclaw"] {
+            let output = std::process::Command::new("pgrep")
+                .args(["-f", pattern])
+                .output()
+                .ok();
+            if let Some(output) = output {
+                let text = String::from_utf8_lossy(&output.stdout);
+                for line in text.lines() {
+                    if let Ok(pid) = line.trim().parse::<u32>() {
+                        if pid != my_pid && process_alive(pid) {
+                            return Some(pid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        // netstat to find PID listening on gateway port.
+        let output = std::process::Command::new("netstat")
+            .args(["-ano"])
+            .output()
+            .ok();
+        if let Some(output) = output {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let port_str = format!(":{port}");
+            for line in text.lines() {
+                if line.contains(&port_str) && line.contains("LISTENING") {
+                    if let Some(pid_str) = line.split_whitespace().last() {
+                        if let Ok(pid) = pid_str.parse::<u32>() {
+                            if pid != my_pid && process_alive(pid) {
+                                return Some(pid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn detect_port() -> u16 {
     config::load_quiet()
         .ok()
@@ -323,8 +391,10 @@ pub fn gateway_signal_stop() -> Result<()> {
     }
 
     // Fallback: direct PID kill (for manual `gateway start` without service).
+    // Try PID file first, then scan for running gateway processes.
     let pid = gateway_read_pid()
-        .ok_or_else(|| anyhow::anyhow!("gateway is not running (no PID file)"))?;
+        .or_else(|| find_gateway_pid())
+        .ok_or_else(|| anyhow::anyhow!("gateway is not running (no PID file and no matching process)"))?;
     if !process_alive(pid) {
         let _ = std::fs::remove_file(gateway_pid_file());
         anyhow::bail!("gateway process {pid} is not running");

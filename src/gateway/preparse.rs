@@ -105,30 +105,7 @@ pub(crate) async fn try_preparse_locally(
     }
     // /status
     if lower == "/status" {
-        let model = handle.config.model.as_ref()
-            .and_then(|m| m.primary.as_deref())
-            .unwrap_or("default");
-        let sessions = handle.session_count.load(Ordering::Relaxed);
-        let secs = handle.started_at.elapsed().as_secs();
-        let uptime = if secs < 60 { format!("{secs}s") }
-            else if secs < 3600 { format!("{}m {}s", secs/60, secs%60) }
-            else { format!("{}h {}m", secs/3600, (secs%3600)/60) };
-        let os = if cfg!(target_os = "macos") { "macOS" }
-            else if cfg!(target_os = "linux") {
-                if std::env::var("ANDROID_ROOT").is_ok() { "Android" } else { "Linux" }
-            }
-            else if cfg!(target_os = "windows") { "Windows" }
-            else { "Unknown" };
-        let ctx_tokens = handle.last_ctx_tokens.load(Ordering::Relaxed);
-        let ctx_limit = handle.config.model.as_ref()
-            .and_then(|m| m.context_tokens)
-            .unwrap_or(64000) as usize;
-        return Some(txt(format!(
-            "Gateway: running\nOS: {os}\nModel: {model}\nSessions: {sessions}\nContext: ~{:.1}k/{:.0}k tokens\nUptime: {uptime}\nVersion: rsclaw v{}",
-            ctx_tokens as f64 / 1000.0,
-            ctx_limit as f64 / 1000.0,
-            option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
-        )));
+        return Some(txt(handle.format_status()));
     }
     // /ls [path] — list workspace directory
     if lower == "/ls" || lower.starts_with("/ls ") {

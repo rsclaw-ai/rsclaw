@@ -6326,6 +6326,7 @@ dependencies = [
  "dialoguer",
  "dirs-next",
  "docx-rs",
+ "encoding_rs",
  "flate2",
  "fs2",
  "futures",

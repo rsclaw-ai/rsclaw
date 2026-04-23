@@ -69,6 +69,54 @@ pub struct AgentHandle {
     pub memory: Option<Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>>,
 }
 
+impl AgentHandle {
+    /// Unified status string used by all channels (desktop WS, feishu, telegram, etc.).
+    pub fn format_status(&self) -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        use crate::agent::prompt_builder::format_duration;
+
+        let model = self.config.model.as_ref()
+            .and_then(|m| m.primary.as_deref())
+            .unwrap_or("default");
+        let sessions = self.session_count.load(Relaxed);
+        let uptime = format_duration(self.started_at.elapsed());
+        let os = if cfg!(target_os = "macos") { "macOS" }
+            else if cfg!(target_os = "linux") {
+                if std::env::var("ANDROID_ROOT").is_ok() { "Android" } else { "Linux" }
+            }
+            else if cfg!(target_os = "windows") { "Windows" }
+            else if cfg!(target_os = "ios") { "iOS" }
+            else { "Unknown" };
+        let ctx_limit = self.config.model.as_ref()
+            .and_then(|m| m.context_tokens)
+            .unwrap_or(64000) as usize;
+
+        let sys_tokens = self.last_sys_tokens.load(Relaxed);
+        let tools_tokens = self.last_tools_tokens.load(Relaxed);
+        let msg_tokens = self.last_msg_tokens.load(Relaxed);
+        let total_tokens = self.last_ctx_tokens.load(Relaxed);
+
+        let stale_hint = if total_tokens == 0 { " (no LLM call yet)" } else { " (from last LLM call)" };
+
+        format!(
+            "Gateway: running\nOS: {os}\nModel: {model}\nSessions: {sessions}\n\
+             Context{stale_hint}:\n\
+             \u{A0} system  ~{:.1}k\n\
+             \u{A0} tools   ~{:.1}k\n\
+             \u{A0} msgs    ~{:.1}k\n\
+             \u{A0} total   ~{:.1}k / {:.0}k ({}%)\n\
+             Uptime: {uptime}\nVersion: rsclaw {}",
+            sys_tokens as f64 / 1000.0,
+            tools_tokens as f64 / 1000.0,
+            msg_tokens as f64 / 1000.0,
+            total_tokens as f64 / 1000.0,
+            ctx_limit as f64 / 1000.0,
+            if ctx_limit > 0 { total_tokens * 100 / ctx_limit } else { 0 },
+            option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+        )
+    }
+}
+
 /// An image attachment sent by the user.
 #[derive(Debug, Clone)]
 pub struct ImageAttachment {
