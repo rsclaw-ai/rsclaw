@@ -215,7 +215,14 @@ impl AgentRuntime {
 
             // Send prompt (runs in parallel with event collection)
             tracing::info!("tool_opencode: sending prompt");
-            let send_result = client.send_prompt(&task_str).await;
+            // Add timeout for send_prompt - opencode can take a long time but we need to know if it's stuck
+            let send_timeout = tokio::time::Duration::from_secs(600); // 10 minutes max
+            let send_result = tokio::time::timeout(send_timeout, client.send_prompt(&task_str))
+                .await
+                .map_err(|_| {
+                    tracing::error!("tool_opencode: send_prompt timed out after {}s", send_timeout.as_secs());
+                    anyhow::anyhow!("OpenCode execution timed out after {} seconds", send_timeout.as_secs())
+                });
 
             // DON'T wait for event collector - it runs forever! Just get what we have so
             // far. The events collected during execution are already in
@@ -225,7 +232,7 @@ impl AgentRuntime {
             let mut result_summary = String::new();
             let mut result_files: Vec<(String, String, String)> = vec![];
             match send_result {
-                Ok(resp) => {
+                Ok(Ok(resp)) => {
                     tracing::info!(
                         "tool_opencode: send_prompt completed, stop_reason={:?}",
                         resp.stop_reason
@@ -368,7 +375,8 @@ impl AgentRuntime {
                         tracing::warn!("tool_opencode: no notification channel available");
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
+                    // send_prompt returned an error (internal failure)
                     tracing::error!("tool_opencode: send_prompt failed: {}", e);
                     if let Some(ref tx) = notif_tx_bg {
                         tracing::info!("tool_opencode: sending error notification to {}", target_id_bg);
@@ -376,6 +384,22 @@ impl AgentRuntime {
                             target_id: target_id_bg.clone(),
                             is_group: false,
                             text: crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "OpenCode"), ("error", &e.to_string())]),
+                            reply_to: None,
+                            images: vec![],
+                            files: vec![],
+                            channel: Some(channel_bg.clone()),
+                        });
+                    }
+                }
+                Err(timeout_err) => {
+                    // Timeout case - send_prompt took too long
+                    tracing::error!("tool_opencode: {}", timeout_err);
+                    if let Some(ref tx) = notif_tx_bg {
+                        tracing::info!("tool_opencode: sending timeout notification to {}", target_id_bg);
+                        let _ = tx.send(crate::channel::OutboundMessage {
+                            target_id: target_id_bg.clone(),
+                            is_group: false,
+                            text: crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "OpenCode"), ("error", &timeout_err.to_string())]),
                             reply_to: None,
                             images: vec![],
                             files: vec![],
@@ -698,11 +722,18 @@ impl AgentRuntime {
 
             // Send prompt (runs in parallel with event collection)
             tracing::info!("tool_claudecode: sending prompt");
-            let send_result = client.send_prompt(&task_str).await;
+            // Add timeout for send_prompt - claudecode can take a long time but we need to know if it's stuck
+            let send_timeout = tokio::time::Duration::from_secs(600); // 10 minutes max
+            let send_result = tokio::time::timeout(send_timeout, client.send_prompt(&task_str))
+                .await
+                .map_err(|_| {
+                    tracing::error!("tool_claudecode: send_prompt timed out after {}s", send_timeout.as_secs());
+                    anyhow::anyhow!("ClaudeCode execution timed out after {} seconds", send_timeout.as_secs())
+                });
 
             // Process the result
             match send_result {
-                Ok(resp) => {
+                Ok(Ok(resp)) => {
                     tracing::info!(
                         "tool_claudecode: send_prompt completed, stop_reason={:?}",
                         resp.stop_reason
@@ -838,13 +869,29 @@ impl AgentRuntime {
                         tracing::warn!("tool_claudecode: no notification channel available");
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
+                    // send_prompt returned an error (internal failure)
                     tracing::error!("tool_claudecode: send_prompt failed: {}", e);
                     if let Some(ref tx) = notif_tx_bg {
                         let _ = tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
                             text: crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "Claude Code"), ("error", &e.to_string())]),
+                            reply_to: None,
+                            images: vec![],
+                            files: vec![],
+                            channel: Some(channel_bg.clone()),
+                        });
+                    }
+                }
+                Err(timeout_err) => {
+                    // Timeout case - send_prompt took too long
+                    tracing::error!("tool_claudecode: {}", timeout_err);
+                    if let Some(ref tx) = notif_tx_bg {
+                        let _ = tx.send(crate::channel::OutboundMessage {
+                            target_id: target_id_bg.clone(),
+                            is_group: false,
+                            text: crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "Claude Code"), ("error", &timeout_err.to_string())]),
                             reply_to: None,
                             images: vec![],
                             files: vec![],
