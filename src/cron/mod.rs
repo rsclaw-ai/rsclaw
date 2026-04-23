@@ -1464,6 +1464,7 @@ fn build_run_log_entry(
 
 /// Execute a command directly without agent, returning real output.
 /// Used for execCommand payload type to bypass session history pollution.
+/// Uses background execution pattern to avoid blocking the spawned task.
 /// If summarize=true, sends output to agent for summarization.
 async fn run_exec_command(
     command: &str,
@@ -1473,6 +1474,7 @@ async fn run_exec_command(
     agents: &AgentRegistry,
 ) -> Result<String> {
     let exec_timeout = Duration::from_secs(timeout_secs.unwrap_or(120));
+    let task_id = format!("cron:{}:{}", job.id, chrono::Utc::now().timestamp_millis());
 
     // Determine shell based on platform
     let (shell, shell_args) = if cfg!(target_os = "windows") {
@@ -1481,25 +1483,63 @@ async fn run_exec_command(
         ("sh", vec!["-c"])
     };
 
-    // Execute command
-    let output = tokio::time::timeout(
-        exec_timeout,
-        tokio::process::Command::new(shell)
-            .args(&shell_args)
-            .arg(command)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| anyhow!("command timed out after {}s", exec_timeout.as_secs()))?
-    .map_err(|e| anyhow!("command execution failed: {}", e))?;
+    // Build command
+    let mut cmd = tokio::process::Command::new(shell);
+    cmd.args(&shell_args)
+        .arg(command)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
 
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    // Use oneshot channel to receive result from background task
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+
+    tracing::info!(task_id = %task_id, command = %command, "cron exec: spawning background task");
+
+    let tid = task_id.clone();
+    let cmd_timeout = exec_timeout;
+    tokio::spawn(async move {
+        let started_at = std::time::Instant::now();
+        let result = tokio::time::timeout(cmd_timeout, cmd.output()).await;
+
+        let (exit_code, stdout, stderr) = match result {
+            Ok(Ok(output)) => {
+                let exit_code = output.status.code();
+                let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                (exit_code, stdout, stderr)
+            }
+            Ok(Err(e)) => {
+                tracing::error!(task_id = %tid, "cron exec background spawn failed: {}", e);
+                (None, String::new(), format!("spawn error: {}", e))
+            }
+            Err(_) => {
+                tracing::warn!(task_id = %tid, timeout_secs = cmd_timeout.as_secs(), "cron exec background timed out");
+                (None, String::new(), format!("timed out after {} seconds", cmd_timeout.as_secs()))
+            }
+        };
+
+        let completed_at = std::time::Instant::now();
+        tracing::info!(
+            task_id = %tid,
+            exit_code = ?exit_code,
+            stdout_len = stdout.len(),
+            stderr_len = stderr.len(),
+            elapsed_ms = (completed_at - started_at).as_millis(),
+            "cron exec background completed"
+        );
+
+        // Send result back via oneshot channel
+        let _ = result_tx.send((exit_code, stdout, stderr));
+    });
+
+    // Wait for background task result (non-blocking for spawned task, but waits here)
+    let (exit_code, stdout, stderr) = result_rx
+        .await
+        .map_err(|_| anyhow!("background exec channel closed"))?;
+
+    let exit_code = exit_code.unwrap_or(-1);
 
     if exit_code != 0 {
         // Return error with details
