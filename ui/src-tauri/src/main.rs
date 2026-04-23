@@ -960,7 +960,7 @@ fn main() {
             stop_gateway_sync();
             0 // allow default handler to terminate
         }
-        extern "system" { fn SetConsoleCtrlHandler(handler: unsafe extern "system" fn(u32) -> i32, add: i32) -> i32; }
+        unsafe extern "system" { fn SetConsoleCtrlHandler(handler: unsafe extern "system" fn(u32) -> i32, add: i32) -> i32; }
         unsafe { SetConsoleCtrlHandler(handler, 1); }
     }
 

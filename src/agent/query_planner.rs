@@ -54,6 +54,73 @@ pub enum Intent {
     Wikipedia { topic: String },
     /// GitHub repo info.
     GithubRepo { owner: String, repo: String },
+    /// Flight search — browser pool → ctrip/google flights.
+    /// `trip` is "oneway" or "roundtrip". Default "oneway" if user doesn't specify.
+    Flight { from: String, to: String, date: String, trip: String },
+    /// Train/rail search — browser pool → 12306/ctrip.
+    Train { from: String, to: String, date: String },
+    /// Hotel search — browser pool → ctrip/meituan.
+    Hotel { city: String, checkin: String },
+    /// Movie listings or info — browser pool → maoyan/douban.
+    Movie { query: String },
+    /// Concert/show tickets — browser pool → damai.
+    Concert { query: String },
+    /// Restaurant/food search — browser pool → dianping.
+    Restaurant { query: String, city: String },
+    /// Shopping/price comparison — browser pool → jd/smzdm.
+    Shopping { query: String },
+    /// Stock/fund quote — browser pool → eastmoney.
+    Stock { query: String },
+    /// Express/package tracking — browser pool → kuaidi100.
+    Express { number: String },
+    /// News headlines — browser pool → toutiao/baidu news.
+    News { query: String },
+    /// Map/route/navigation — browser pool → amap.
+    Map { query: String },
+    /// Translation — browser pool → fanyi.baidu.
+    Translate { text: String, to: String },
+    /// Crypto price — API → coingecko.
+    CryptoPrice { coin: String },
+    /// Calendar/date query — computed locally.
+    Calendar { query: String },
+    /// Unit conversion — computed locally.
+    UnitConvert { query: String },
+    /// Math calculation — computed locally.
+    Math { expr: String },
+    /// IP address lookup — API → ip-api.com.
+    IpLookup { ip: String },
+    /// DNS lookup.
+    DnsLookup { domain: String },
+    /// Whois domain info — browser.
+    Whois { domain: String },
+    /// Phone number region lookup — browser.
+    Phone { number: String },
+    /// Chinese idiom/dictionary — browser → hanyu.baidu.com.
+    Idiom { query: String },
+    /// Chinese poem/classical text — browser → gushiwen.cn.
+    Poem { query: String },
+    /// Law/regulation lookup — browser.
+    Law { query: String },
+    /// Medical/hospital info — browser → dxy.com.
+    Hospital { query: String },
+    /// Recipe/cooking — browser → xiachufang.com.
+    Recipe { query: String },
+    /// Sports scores/schedule — browser.
+    Sports { query: String },
+    /// Lottery results — browser → zhcw.com.
+    Lottery { query: String },
+    /// Academic paper search — browser → baidu-scholar / arxiv.
+    Academic { query: String },
+    /// Job/recruitment search — browser → boss.zhipin.com.
+    Job { query: String, city: String },
+    /// Video search — browser → bilibili.
+    Video { query: String },
+    /// Book search/recommendation — browser → douban/weread.
+    Book { query: String },
+    /// Code package search — browser → npmjs/pypi/crates.io.
+    Package { query: String, registry: String },
+    /// Forum/community discussion — browser → zhihu.
+    Forum { query: String },
     /// Everything else — caller should fall back to regular web_search.
     General,
 }
@@ -76,52 +143,135 @@ impl QueryPlan {
     }
 }
 
-const PLANNER_SYSTEM: &str = r#"You analyze a user search query and decide how to answer it.
+/// Build the planner system prompt with current time and timezone injected.
+fn planner_system() -> String {
+    let now = chrono::Local::now();
+    let tz = now.format("%Z").to_string();
+    let ts = now.format("%Y-%m-%d %H:%M %A").to_string();
+    format!(
+r#"Current time: {ts} ({tz})
+
+You analyze a user search query and decide how to answer it.
 
 Output ONLY valid JSON matching this schema (no prose, no markdown, no code fences):
-{"sub_queries":[{"q":"<cleaned keywords>","intent":{"kind":"<intent>", ...fields}}]}
+{{"sub_queries":[{{"q":"<cleaned keywords>","intent":{{"kind":"<intent>", ...fields}}}}]}}
 
 Intent kinds and required fields:
-  weather     : {"kind":"weather","location":"<city in English>"}
-  currency    : {"kind":"currency","from":"<ISO code>","to":"<ISO code>"}
-  timezone    : {"kind":"timezone","location":"<IANA zone ONLY, e.g. Asia/Shanghai — NOT a city name>"}
-  wikipedia   : {"kind":"wikipedia","topic":"<topic phrase>"}
-  github_repo : {"kind":"github_repo","owner":"<owner>","repo":"<name>"}
-  general     : {"kind":"general"}                          # fallback
+  weather      : {{"kind":"weather","location":"<city in English>"}}
+  currency     : {{"kind":"currency","from":"<ISO code>","to":"<ISO code>"}}
+  timezone     : {{"kind":"timezone","location":"<IANA zone ONLY, e.g. Asia/Shanghai>"}}
+  wikipedia    : {{"kind":"wikipedia","topic":"<topic phrase>"}}
+  github_repo  : {{"kind":"github_repo","owner":"<owner>","repo":"<name>"}}
+  flight       : {{"kind":"flight","from":"<city>","to":"<city>","date":"<YYYY-MM-DD or empty>","trip":"oneway|roundtrip"}}
+  train        : {{"kind":"train","from":"<city>","to":"<city>","date":"<YYYY-MM-DD or empty>"}}
+  hotel        : {{"kind":"hotel","city":"<city>","checkin":"<YYYY-MM-DD or empty>"}}
+  movie        : {{"kind":"movie","query":"<movie name or keyword>"}}
+  concert      : {{"kind":"concert","query":"<artist or show name>"}}
+  restaurant   : {{"kind":"restaurant","query":"<cuisine or keyword>","city":"<city>"}}
+  shopping     : {{"kind":"shopping","query":"<product name>"}}
+  stock        : {{"kind":"stock","query":"<stock name or code>"}}
+  express      : {{"kind":"express","number":"<tracking number>"}}
+  news         : {{"kind":"news","query":"<topic>"}}
+  map          : {{"kind":"map","query":"<place or route>"}}
+  translate    : {{"kind":"translate","text":"<text to translate>","to":"<target language code>"}}
+  crypto_price : {{"kind":"crypto_price","coin":"<coin id, e.g. bitcoin>"}}
+  calendar     : {{"kind":"calendar","query":"<date question>"}}
+  unit_convert : {{"kind":"unit_convert","query":"<conversion expression>"}}
+  math         : {{"kind":"math","expr":"<math expression, e.g. 123*456>"}}
+  ip_lookup    : {{"kind":"ip_lookup","ip":"<IP address or empty for self>"}}
+  dns_lookup   : {{"kind":"dns_lookup","domain":"<domain name>"}}
+  whois        : {{"kind":"whois","domain":"<domain name>"}}
+  phone        : {{"kind":"phone","number":"<phone number>"}}
+  idiom        : {{"kind":"idiom","query":"<idiom or word>"}}
+  poem         : {{"kind":"poem","query":"<poem title or keyword>"}}
+  law          : {{"kind":"law","query":"<law question>"}}
+  hospital     : {{"kind":"hospital","query":"<medical question>"}}
+  recipe       : {{"kind":"recipe","query":"<dish name>"}}
+  sports       : {{"kind":"sports","query":"<match or team>"}}
+  lottery      : {{"kind":"lottery","query":"<lottery type>"}}
+  academic     : {{"kind":"academic","query":"<paper topic or keyword>"}}
+  job          : {{"kind":"job","query":"<job title or keyword>","city":"<city or empty>"}}
+  video        : {{"kind":"video","query":"<video topic>"}}
+  book         : {{"kind":"book","query":"<book title or topic>"}}
+  package      : {{"kind":"package","query":"<package name>","registry":"npm|pypi|crates"}}
+  forum        : {{"kind":"forum","query":"<discussion topic>"}}
+  general      : {{"kind":"general"}}
 
 Rules:
 - SPLIT multi-entity queries: if the query asks about N cities/entities,
   output N sub_queries.
-- CLEAN keywords: drop filler ("未来7天", "请", "帮我", "最新"), drop dates
-  when the question is about current/live data.
+- CLEAN keywords: drop filler words and dates. The current time is already
+  known, so never include dates/years in the "q" field for live-data queries
+  (weather, currency, stock, etc.).
 - PREFER English city names for "weather" intent so API lookups hit.
+- For date fields: use YYYY-MM-DD if user specifies a date, empty string if not.
 - If unsure of intent, use "general" — don't force a wrong match.
 - Max 5 sub_queries. Never output more.
 
 Examples:
 
 Input: "曼谷、广州、武汉未来7天的天气"
-Output: {"sub_queries":[
-  {"q":"Bangkok weather","intent":{"kind":"weather","location":"Bangkok"}},
-  {"q":"Guangzhou weather","intent":{"kind":"weather","location":"Guangzhou"}},
-  {"q":"Wuhan weather","intent":{"kind":"weather","location":"Wuhan"}}
-]}
+Output: {{"sub_queries":[
+  {{"q":"Bangkok weather","intent":{{"kind":"weather","location":"Bangkok"}}}},
+  {{"q":"Guangzhou weather","intent":{{"kind":"weather","location":"Guangzhou"}}}},
+  {{"q":"Wuhan weather","intent":{{"kind":"weather","location":"Wuhan"}}}}
+]}}
 
 Input: "美元兑人民币汇率"
-Output: {"sub_queries":[
-  {"q":"USD to CNY","intent":{"kind":"currency","from":"USD","to":"CNY"}}
-]}
+Output: {{"sub_queries":[
+  {{"q":"USD to CNY","intent":{{"kind":"currency","from":"USD","to":"CNY"}}}}
+]}}
 
 Input: "rust async fn 用法"
-Output: {"sub_queries":[
-  {"q":"rust async fn usage","intent":{"kind":"general"}}
-]}
+Output: {{"sub_queries":[
+  {{"q":"rust async fn usage","intent":{{"kind":"general"}}}}
+]}}
 
 Input: "tokio 仓库什么情况"
-Output: {"sub_queries":[
-  {"q":"tokio-rs/tokio","intent":{"kind":"github_repo","owner":"tokio-rs","repo":"tokio"}}
-]}
-"#;
+Output: {{"sub_queries":[
+  {{"q":"tokio-rs/tokio","intent":{{"kind":"github_repo","owner":"tokio-rs","repo":"tokio"}}}}
+]}}
+
+Input: "下周三北京飞曼谷的机票"
+Output: {{"sub_queries":[
+  {{"q":"北京飞曼谷机票","intent":{{"kind":"flight","from":"北京","to":"曼谷","date":"","trip":"oneway"}}}}
+]}}
+
+Input: "茅台股价"
+Output: {{"sub_queries":[
+  {{"q":"茅台股票","intent":{{"kind":"stock","query":"茅台"}}}}
+]}}
+
+Input: "顺丰 SF1234567890 到哪了"
+Output: {{"sub_queries":[
+  {{"q":"SF1234567890","intent":{{"kind":"express","number":"SF1234567890"}}}}
+]}}
+
+Input: "比特币现在多少钱"
+Output: {{"sub_queries":[
+  {{"q":"bitcoin price","intent":{{"kind":"crypto_price","coin":"bitcoin"}}}}
+]}}
+
+Input: "附近好吃的火锅"
+Output: {{"sub_queries":[
+  {{"q":"火锅推荐","intent":{{"kind":"restaurant","query":"火锅","city":""}}}}
+]}}
+
+Input: "iPhone 16 多少钱"
+Output: {{"sub_queries":[
+  {{"q":"iPhone 16 价格","intent":{{"kind":"shopping","query":"iPhone 16"}}}}
+]}}
+
+Input: "周杰伦演唱会门票"
+Output: {{"sub_queries":[
+  {{"q":"周杰伦演唱会","intent":{{"kind":"concert","query":"周杰伦"}}}}
+]}}
+
+Input: "翻译 hello world 成中文"
+Output: {{"sub_queries":[
+  {{"q":"hello world","intent":{{"kind":"translate","text":"hello world","to":"zh"}}}}
+]}}"#)
+}
 
 /// Plan a query using the flash model. Returns a structured `QueryPlan`.
 ///
@@ -187,7 +337,7 @@ async fn try_plan(
         model: model_id.to_owned(),
         messages,
         tools: vec![],
-        system: Some(PLANNER_SYSTEM.to_owned()),
+        system: Some(planner_system()),
         max_tokens: Some(400),
         temperature: Some(0.0),
         frequency_penalty: None,
@@ -216,6 +366,8 @@ async fn try_plan(
     let json = extract_json_object(&buf).ok_or_else(|| {
         anyhow!("planner output has no JSON object; got: {}", truncate(&buf, 200))
     })?;
+
+    tracing::debug!(raw = %truncate(json, 500), "query_planner: raw LLM output");
 
     let plan: QueryPlan = serde_json::from_str(json).map_err(|e| {
         anyhow!("planner JSON parse failed: {e}; raw: {}", truncate(json, 200))

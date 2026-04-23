@@ -34,8 +34,12 @@ impl AgentRuntime {
         // If the planner fails or returns only `general`, we fall through to
         // the normal search logic below with the original query unchanged.
         if !args.get("_planned").and_then(|v| v.as_bool()).unwrap_or(false) {
+            // Prefer the original user query for intent recognition — the agent
+            // often rewrites queries (adds dates, site: operators) which confuses
+            // the planner. Fall back to the tool's `query` arg if unavailable.
+            let planner_input = args["_user_query"].as_str().unwrap_or(query);
             let flash = self.resolve_flash_model_name();
-            let plan = crate::agent::query_planner::plan(query, &flash, &self.providers).await;
+            let plan = crate::agent::query_planner::plan(planner_input, &flash, &self.providers).await;
 
             // Count structured (non-general) intents. If we have any, dispatch
             // them through the planner path and return structured results.
@@ -113,7 +117,7 @@ impl AgentRuntime {
         };
 
         let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15")
             .timeout(Duration::from_secs(15))
             .build()?;
 
@@ -306,7 +310,7 @@ impl AgentRuntime {
                     .get(&url)
                     .header(
                         "User-Agent",
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
                     )
                     .send()
                     .await?
@@ -323,7 +327,7 @@ impl AgentRuntime {
                     .get(&url)
                     .header(
                         "User-Agent",
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
                     )
                     .send()
                     .await?
@@ -340,7 +344,7 @@ impl AgentRuntime {
                     .get(&url)
                     .header(
                         "User-Agent",
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
                     )
                     .send()
                     .await?
@@ -378,7 +382,7 @@ impl AgentRuntime {
                 .get(&url)
                 .header(
                     "User-Agent",
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
                 )
                 .send()
                 .await?
@@ -559,7 +563,7 @@ impl AgentRuntime {
                 );
                 let html = client
                     .get(&url)
-                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15")
                     .send().await?.text().await?;
                 let r = parse_bing_html_results(&html, limit);
                 (html, r)
@@ -573,7 +577,7 @@ impl AgentRuntime {
             "baidu-free" => {
                 let url = format!("https://www.baidu.com/s?wd={}&rn={limit}", urlencoding::encode(query));
                 let html = client.get(&url)
-                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15")
                     .send().await?.text().await?;
                 let r = parse_baidu_results(&html, limit);
                 (html, r)
@@ -581,7 +585,7 @@ impl AgentRuntime {
             "sogou-free" => {
                 let url = format!("https://www.sogou.com/web?query={}", urlencoding::encode(query));
                 let html = client.get(&url)
-                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15")
                     .send().await?.text().await?;
                 let r = parse_sogou_results(&html, limit);
                 (html, r)
@@ -667,7 +671,28 @@ impl AgentRuntime {
             .redirect(redirect_policy)
             .build()?;
 
-        let response = client.get(&fetch_url).send().await?;
+        let response = match client.get(&fetch_url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // HTTP request failed — try browser fallback before giving up.
+                tracing::warn!(url = %fetch_url, error = %e, "web_fetch: HTTP failed, trying browser fallback");
+                match self.browser_get_article(&fetch_url).await {
+                    Ok((t, md)) if !md.is_empty() => {
+                        let text = truncate_chars(&md, max_length);
+                        let text = self.maybe_summarize(&text, prompt).await;
+                        FETCH_CACHE.insert(fetch_url, (t.clone(), md)).await;
+                        return Ok(json!({
+                            "url": url,
+                            "title": t,
+                            "text": text,
+                            "length": text.len(),
+                            "source": "browser_fallback",
+                        }));
+                    }
+                    _ => return Err(e.into()),
+                }
+            }
+        };
 
         // Cross-host redirect: report to agent, let it decide.
         if response.status().is_redirection() {
@@ -707,13 +732,24 @@ impl AgentRuntime {
             html.clone()
         };
 
-        // Detect SPA (large HTML but almost no text) -> fallback to browser.
-        // Use the already-computed dehydrated text length for the check.
+        // Detect SPA (large HTML but almost no text) or CAPTCHA -> fallback to browser.
         let plain_len = markdown.trim().len();
         let is_spa = content_type.contains("text/html") && plain_len < 200 && html.len() > 10_000;
+        let html_lower = html.to_lowercase();
+        let is_captcha = content_type.contains("text/html") && (
+            html_lower.contains("captcha") ||
+            html_lower.contains("challenge-form") ||
+            html_lower.contains("cf-browser-verification") ||
+            html_lower.contains("just a moment") ||
+            html_lower.contains("verify you are human") ||
+            html_lower.contains("bot detection")
+        );
+        if is_captcha {
+            tracing::warn!(url = %fetch_url, "web_fetch: CAPTCHA/bot-check detected, trying browser fallback");
+        }
 
-        let (final_title, final_md) = if is_spa {
-            // Try browser fallback for JS-rendered pages.
+        let (final_title, final_md) = if is_spa || is_captcha {
+            // Try browser fallback for JS-rendered or bot-blocked pages.
             match self.browser_get_article(&fetch_url).await {
                 Ok((t, md)) if !md.is_empty() => (t, md),
                 _ => (title.clone(), markdown.clone()),
@@ -1070,45 +1106,245 @@ impl AgentRuntime {
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
-            .user_agent("rsclaw/1.0 (+https://github.com/rsclaw-ai/rsclaw)")
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15")
             .build()?;
 
         let futs = plan.sub_queries.into_iter().map(|sq| {
             let client = client.clone();
             async move {
-                let (source, answer) = match &sq.intent {
-                    Intent::Weather { location } => fetch_weather(&client, location).await,
-                    Intent::Currency { from, to } => fetch_currency(&client, from, to).await,
-                    Intent::Timezone { location } => fetch_timezone(&client, location).await,
-                    Intent::Wikipedia { topic } => fetch_wiki(&client, topic).await,
+                // 1. Try specialized API or browser-based fetch.
+                let api_result = match &sq.intent {
+                    Intent::Weather { location } => Some(fetch_weather(&client, location).await),
+                    Intent::Currency { from, to } => Some(fetch_currency(&client, from, to).await),
+                    Intent::Timezone { location } => Some(fetch_timezone(&client, location).await),
+                    Intent::Wikipedia { topic } => Some(fetch_wiki(&client, topic).await),
                     Intent::GithubRepo { owner, repo } => {
-                        fetch_github(&client, owner, repo).await
+                        Some(fetch_github(&client, owner, repo).await)
                     }
-                    Intent::General => (
-                        "web_search",
-                        // Recursive call with _planned=true skips re-planning.
-                        match self
-                            .tool_web_search(json!({
-                                "query": sq.q.clone(),
-                                "_planned": true,
-                            }))
-                            .await
-                        {
-                            Ok(v) => v,
-                            Err(e) => json!({ "error": e.to_string() }),
-                        },
-                    ),
+                    Intent::CryptoPrice { coin } => {
+                        let result = fetch_crypto(&client, coin).await;
+                        if result.1.get("error").is_some() {
+                            // CoinGecko failed — fallback to feixiaohao via browser.
+                            let url = format!("https://www.feixiaohao.co/search/?q={}", urlencoding::encode(coin));
+                            Some(("feixiaohao", self.browser_fetch_or_error(&url).await))
+                        } else {
+                            Some(result)
+                        }
+                    }
+                    // Browser-pool intents: construct target URL, fetch via browser.
+                    Intent::Flight { from, to, date, trip } => {
+                        let trip_type = if trip == "roundtrip" { "roundtrip" } else { "oneway" };
+                        let url = format!("https://flights.ctrip.com/online/list/{trip_type}-{from}-{to}?depdate={date}");
+                        Some(("ctrip_flight", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Train { from, to, date } => {
+                        let url = format!("https://trains.ctrip.com/webapp/train/list?from={from}&to={to}&date={date}");
+                        Some(("ctrip_train", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Hotel { city, checkin } => {
+                        let url = if checkin.is_empty() {
+                            format!("https://hotels.ctrip.com/hotels/list?city={city}")
+                        } else {
+                            format!("https://hotels.ctrip.com/hotels/list?city={city}&checkin={checkin}")
+                        };
+                        Some(("ctrip_hotel", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Movie { query } => {
+                        let url = format!("https://www.maoyan.com/films?showType=3&keyword={}", urlencoding::encode(query));
+                        Some(("maoyan", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Concert { query } => {
+                        let url = format!("https://search.damai.cn/search.htm?keyword={}", urlencoding::encode(query));
+                        Some(("damai", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Restaurant { query, city } => {
+                        let q = if city.is_empty() { query.clone() } else { format!("{city} {query}") };
+                        let url = format!("https://www.dianping.com/search/keyword/0/{}", urlencoding::encode(&q));
+                        Some(("dianping", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Shopping { query } => {
+                        let url = format!("https://search.jd.com/Search?keyword={}", urlencoding::encode(query));
+                        Some(("jd", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Stock { query } => {
+                        let url = format!("https://so.eastmoney.com/web/s?keyword={}", urlencoding::encode(query));
+                        Some(("eastmoney", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Express { number } => {
+                        let url = format!("https://www.kuaidi100.com/result.jsp?nu={number}");
+                        Some(("kuaidi100", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::News { query } => {
+                        let url = format!("https://www.toutiao.com/search/?keyword={}", urlencoding::encode(query));
+                        Some(("toutiao", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Map { query } => {
+                        let url = format!("https://www.amap.com/search?query={}", urlencoding::encode(query));
+                        Some(("amap", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Translate { text, to } => {
+                        let url = format!("https://fanyi.baidu.com/#{to}/{}", urlencoding::encode(text));
+                        Some(("baidu_fanyi", self.browser_fetch_or_error(&url).await))
+                    }
+                    // Local computation intents (no network needed).
+                    Intent::Calendar { query } => {
+                        Some(("local", compute_calendar(query)))
+                    }
+                    Intent::UnitConvert { query } => {
+                        Some(("local", compute_unit_convert(query)))
+                    }
+                    Intent::Math { expr } => {
+                        Some(("local", compute_math(expr)))
+                    }
+                    // API-based intents.
+                    Intent::IpLookup { ip } => Some(fetch_ip(&client, ip).await),
+                    Intent::DnsLookup { domain } => Some(fetch_dns(&client, domain).await),
+                    // Browser-based intents.
+                    Intent::Whois { domain } => {
+                        let url = format!("https://whois.domaintools.com/{domain}");
+                        Some(("whois", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Phone { number } => {
+                        let url = format!("https://www.ip138.com/mobile.asp?mobile={number}");
+                        Some(("ip138", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Idiom { query } => {
+                        let url = format!("https://hanyu.baidu.com/s?wd={}", urlencoding::encode(query));
+                        Some(("baidu_hanyu", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Poem { query } => {
+                        let url = format!("https://so.gushiwen.cn/search.aspx?value={}", urlencoding::encode(query));
+                        Some(("gushiwen", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Law { query } => {
+                        let url = format!("https://www.pkulaw.com/search?keyword={}", urlencoding::encode(query));
+                        Some(("pkulaw", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Hospital { query } => {
+                        let url = format!("https://dxy.com/search?q={}", urlencoding::encode(query));
+                        Some(("dxy", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Recipe { query } => {
+                        let url = format!("https://www.xiachufang.com/search/?keyword={}", urlencoding::encode(query));
+                        Some(("xiachufang", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Sports { query } => {
+                        let url = format!("https://www.dongqiudi.com/search?keyword={}", urlencoding::encode(query));
+                        Some(("dongqiudi", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Lottery { query } => {
+                        let url = format!("https://www.zhcw.com/kjxx/{}/", urlencoding::encode(query));
+                        Some(("zhcw", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Academic { query } => {
+                        let has_cjk = query.chars().any(|c| (0x4E00..=0x9FFF).contains(&(c as u32)));
+                        let url = if has_cjk {
+                            format!("https://xueshu.baidu.com/s?wd={}", urlencoding::encode(query))
+                        } else {
+                            format!("https://arxiv.org/search/?query={}&searchtype=all", urlencoding::encode(query))
+                        };
+                        Some(("academic", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Job { query, city } => {
+                        let q = if city.is_empty() { query.clone() } else { format!("{query} {city}") };
+                        let url = format!("https://www.zhipin.com/web/geek/job?query={}", urlencoding::encode(&q));
+                        Some(("boss", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Video { query } => {
+                        let url = format!("https://search.bilibili.com/all?keyword={}", urlencoding::encode(query));
+                        Some(("bilibili", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Book { query } => {
+                        let url = format!("https://search.douban.com/book/subject_search?search_text={}", urlencoding::encode(query));
+                        Some(("douban_book", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Package { query, registry } => {
+                        let url = match registry.as_str() {
+                            "pypi" => format!("https://pypi.org/search/?q={}", urlencoding::encode(query)),
+                            "crates" => format!("https://crates.io/search?q={}", urlencoding::encode(query)),
+                            _ => format!("https://www.npmjs.com/search?q={}", urlencoding::encode(query)),
+                        };
+                        Some(("package", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Forum { query } => {
+                        let url = format!("https://www.zhihu.com/search?type=content&q={}", urlencoding::encode(query));
+                        Some(("zhihu", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::General => None,
+                };
+
+                // 2. If API succeeded (no error field), use it. Otherwise fallback to web_search.
+                let (source, answer) = match api_result {
+                    Some((src, ref val)) if val.get("error").is_none() => (src, val.clone()),
+                    _ => {
+                        // API failed or general intent — fallback to web_search.
+                        tracing::info!(
+                            query = %sq.q,
+                            "dispatch_query_plan: falling back to web_search"
+                        );
+                        (
+                            "web_search",
+                            match self
+                                .tool_web_search(json!({
+                                    "query": sq.q.clone(),
+                                    "_planned": true,
+                                }))
+                                .await
+                            {
+                                Ok(v) => v,
+                                Err(e) => json!({ "error": e.to_string() }),
+                            },
+                        )
+                    }
+                };
+
+                let intent_str = match &sq.intent {
+                    Intent::Weather { .. } => "weather",
+                    Intent::Currency { .. } => "currency",
+                    Intent::Timezone { .. } => "timezone",
+                    Intent::Wikipedia { .. } => "wikipedia",
+                    Intent::GithubRepo { .. } => "github_repo",
+                    Intent::Flight { .. } => "flight",
+                    Intent::Train { .. } => "train",
+                    Intent::Hotel { .. } => "hotel",
+                    Intent::Movie { .. } => "movie",
+                    Intent::Concert { .. } => "concert",
+                    Intent::Restaurant { .. } => "restaurant",
+                    Intent::Shopping { .. } => "shopping",
+                    Intent::Stock { .. } => "stock",
+                    Intent::Express { .. } => "express",
+                    Intent::News { .. } => "news",
+                    Intent::Map { .. } => "map",
+                    Intent::Translate { .. } => "translate",
+                    Intent::CryptoPrice { .. } => "crypto_price",
+                    Intent::Calendar { .. } => "calendar",
+                    Intent::UnitConvert { .. } => "unit_convert",
+                    Intent::Math { .. } => "math",
+                    Intent::IpLookup { .. } => "ip_lookup",
+                    Intent::DnsLookup { .. } => "dns_lookup",
+                    Intent::Whois { .. } => "whois",
+                    Intent::Phone { .. } => "phone",
+                    Intent::Idiom { .. } => "idiom",
+                    Intent::Poem { .. } => "poem",
+                    Intent::Law { .. } => "law",
+                    Intent::Hospital { .. } => "hospital",
+                    Intent::Recipe { .. } => "recipe",
+                    Intent::Sports { .. } => "sports",
+                    Intent::Lottery { .. } => "lottery",
+                    Intent::Academic { .. } => "academic",
+                    Intent::Job { .. } => "job",
+                    Intent::Video { .. } => "video",
+                    Intent::Book { .. } => "book",
+                    Intent::Package { .. } => "package",
+                    Intent::Forum { .. } => "forum",
+                    Intent::General => "general",
                 };
                 json!({
+                    "title": format!("[{}] {}", intent_str, sq.q),
+                    "snippet": serde_json::to_string(&answer).unwrap_or_default(),
+                    "url": source,
                     "question": sq.q,
-                    "intent": match &sq.intent {
-                        Intent::Weather { .. } => "weather",
-                        Intent::Currency { .. } => "currency",
-                        Intent::Timezone { .. } => "timezone",
-                        Intent::Wikipedia { .. } => "wikipedia",
-                        Intent::GithubRepo { .. } => "github_repo",
-                        Intent::General => "general",
-                    },
+                    "intent": intent_str,
                     "source": source,
                     "answer": answer,
                 })
@@ -1116,6 +1352,19 @@ impl AgentRuntime {
         });
         let items: Vec<Value> = join_all(futs).await;
         Ok(json!({ "results": items }))
+    }
+
+    /// Open a URL via browser pool and return extracted text, or an error JSON.
+    async fn browser_fetch_or_error(&self, url: &str) -> Value {
+        match self.browser_get_article(url).await {
+            Ok((title, text)) if !text.is_empty() => json!({
+                "title": title,
+                "text": truncate_chars(&text, 8000),
+                "url": url,
+            }),
+            Ok(_) => json!({ "error": "browser returned empty content", "url": url }),
+            Err(e) => json!({ "error": e.to_string(), "url": url }),
+        }
     }
 
     pub(crate) async fn tool_web_browser(&self, ctx: &RunContext, args: Value) -> Result<Value> {
@@ -1476,5 +1725,96 @@ async fn fetch_github(client: &reqwest::Client, owner: &str, repo: &str) -> (&'s
         },
         Ok(resp) => ("api.github.com", json!({ "error": format!("HTTP {}", resp.status()) })),
         Err(e) => ("api.github.com", json!({ "error": e.to_string() })),
+    }
+}
+
+/// Fetch cryptocurrency price from CoinGecko (free, no key).
+async fn fetch_crypto(client: &reqwest::Client, coin: &str) -> (&'static str, Value) {
+    let url = format!(
+        "https://api.coingecko.com/api/v3/simple/price?ids={}&vs_currencies=usd,cny&include_24hr_change=true",
+        urlencoding::encode(coin),
+    );
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(j) => ("coingecko", j),
+            Err(e) => ("coingecko", json!({ "error": format!("json parse: {e}") })),
+        },
+        Ok(resp) => ("coingecko", json!({ "error": format!("HTTP {}", resp.status()) })),
+        Err(e) => ("coingecko", json!({ "error": e.to_string() })),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Local computation helpers (no network)
+// ---------------------------------------------------------------------------
+
+/// Answer date/calendar questions using chrono.
+fn compute_calendar(query: &str) -> Value {
+    let now = chrono::Local::now();
+    json!({
+        "query": query,
+        "today": now.format("%Y-%m-%d %A").to_string(),
+        "timestamp": now.timestamp(),
+        "note": "Use this date info to answer the user's calendar question.",
+    })
+}
+
+/// Answer unit conversion questions. Returns the query for the LLM to compute.
+fn compute_unit_convert(query: &str) -> Value {
+    json!({
+        "query": query,
+        "note": "Compute this unit conversion and return the result.",
+    })
+}
+
+/// Evaluate a math expression. Simple expressions only.
+fn compute_math(expr: &str) -> Value {
+    // Security: only allow digits, operators, parens, decimal points, spaces.
+    let safe = expr.chars().all(|c| c.is_ascii_digit() || "+-*/.() %^".contains(c));
+    if !safe {
+        return json!({ "error": "unsafe expression", "expr": expr });
+    }
+    // Use a simple eval approach: replace ^ with ** for power, then
+    // delegate to the LLM for actual computation (we just validate safety).
+    json!({
+        "expr": expr,
+        "note": "Compute this math expression and return the exact result.",
+    })
+}
+
+// ---------------------------------------------------------------------------
+// API-based helpers
+// ---------------------------------------------------------------------------
+
+/// IP geolocation via ip-api.com (free, no key, 45 req/min).
+async fn fetch_ip(client: &reqwest::Client, ip: &str) -> (&'static str, Value) {
+    let url = if ip.is_empty() {
+        "http://ip-api.com/json/?lang=zh-CN&fields=66846719".to_owned()
+    } else {
+        format!("http://ip-api.com/json/{ip}?lang=zh-CN&fields=66846719")
+    };
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(j) => ("ip-api.com", j),
+            Err(e) => ("ip-api.com", json!({ "error": format!("json parse: {e}") })),
+        },
+        Ok(resp) => ("ip-api.com", json!({ "error": format!("HTTP {}", resp.status()) })),
+        Err(e) => ("ip-api.com", json!({ "error": e.to_string() })),
+    }
+}
+
+/// DNS lookup via DNS-over-HTTPS (Cloudflare).
+async fn fetch_dns(client: &reqwest::Client, domain: &str) -> (&'static str, Value) {
+    let url = format!(
+        "https://cloudflare-dns.com/dns-query?name={}&type=A",
+        urlencoding::encode(domain),
+    );
+    match client.get(&url).header("Accept", "application/dns-json").send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(j) => ("cloudflare-dns", j),
+            Err(e) => ("cloudflare-dns", json!({ "error": format!("json parse: {e}") })),
+        },
+        Ok(resp) => ("cloudflare-dns", json!({ "error": format!("HTTP {}", resp.status()) })),
+        Err(e) => ("cloudflare-dns", json!({ "error": e.to_string() })),
     }
 }
