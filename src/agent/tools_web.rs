@@ -1113,7 +1113,7 @@ impl AgentRuntime {
         let futs = plan.sub_queries.into_iter().map(|sq| {
             let client = client.clone();
             async move {
-                // 1. Try specialized API first (non-general intents only).
+                // 1. Try specialized API or browser-based fetch.
                 let api_result = match &sq.intent {
                     Intent::Weather { location } => Some(fetch_weather(&client, location).await),
                     Intent::Currency { from, to } => Some(fetch_currency(&client, from, to).await),
@@ -1121,6 +1121,62 @@ impl AgentRuntime {
                     Intent::Wikipedia { topic } => Some(fetch_wiki(&client, topic).await),
                     Intent::GithubRepo { owner, repo } => {
                         Some(fetch_github(&client, owner, repo).await)
+                    }
+                    Intent::CryptoPrice { coin } => Some(fetch_crypto(&client, coin).await),
+                    // Browser-pool intents: construct target URL, fetch via browser.
+                    Intent::Flight { from, to, date, trip } => {
+                        let trip_type = if trip == "roundtrip" { "roundtrip" } else { "oneway" };
+                        let url = format!("https://flights.ctrip.com/online/list/{trip_type}-{from}-{to}?depdate={date}");
+                        Some(("ctrip_flight", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Train { from, to, date } => {
+                        let url = format!("https://trains.ctrip.com/webapp/train/list?from={from}&to={to}&date={date}");
+                        Some(("ctrip_train", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Hotel { city, checkin } => {
+                        let url = if checkin.is_empty() {
+                            format!("https://hotels.ctrip.com/hotels/list?city={city}")
+                        } else {
+                            format!("https://hotels.ctrip.com/hotels/list?city={city}&checkin={checkin}")
+                        };
+                        Some(("ctrip_hotel", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Movie { query } => {
+                        let url = format!("https://www.maoyan.com/films?showType=3&keyword={}", urlencoding::encode(query));
+                        Some(("maoyan", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Concert { query } => {
+                        let url = format!("https://search.damai.cn/search.htm?keyword={}", urlencoding::encode(query));
+                        Some(("damai", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Restaurant { query, city } => {
+                        let q = if city.is_empty() { query.clone() } else { format!("{city} {query}") };
+                        let url = format!("https://www.dianping.com/search/keyword/0/{}", urlencoding::encode(&q));
+                        Some(("dianping", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Shopping { query } => {
+                        let url = format!("https://search.jd.com/Search?keyword={}", urlencoding::encode(query));
+                        Some(("jd", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Stock { query } => {
+                        let url = format!("https://so.eastmoney.com/web/s?keyword={}", urlencoding::encode(query));
+                        Some(("eastmoney", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Express { number } => {
+                        let url = format!("https://www.kuaidi100.com/result.jsp?nu={number}");
+                        Some(("kuaidi100", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::News { query } => {
+                        let url = format!("https://www.toutiao.com/search/?keyword={}", urlencoding::encode(query));
+                        Some(("toutiao", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Map { query } => {
+                        let url = format!("https://www.amap.com/search?query={}", urlencoding::encode(query));
+                        Some(("amap", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Translate { text, to } => {
+                        let url = format!("https://fanyi.baidu.com/#{to}/{}", urlencoding::encode(text));
+                        Some(("baidu_fanyi", self.browser_fetch_or_error(&url).await))
                     }
                     Intent::General => None,
                 };
@@ -1156,6 +1212,19 @@ impl AgentRuntime {
                     Intent::Timezone { .. } => "timezone",
                     Intent::Wikipedia { .. } => "wikipedia",
                     Intent::GithubRepo { .. } => "github_repo",
+                    Intent::Flight { .. } => "flight",
+                    Intent::Train { .. } => "train",
+                    Intent::Hotel { .. } => "hotel",
+                    Intent::Movie { .. } => "movie",
+                    Intent::Concert { .. } => "concert",
+                    Intent::Restaurant { .. } => "restaurant",
+                    Intent::Shopping { .. } => "shopping",
+                    Intent::Stock { .. } => "stock",
+                    Intent::Express { .. } => "express",
+                    Intent::News { .. } => "news",
+                    Intent::Map { .. } => "map",
+                    Intent::Translate { .. } => "translate",
+                    Intent::CryptoPrice { .. } => "crypto_price",
                     Intent::General => "general",
                 };
                 json!({
@@ -1171,6 +1240,19 @@ impl AgentRuntime {
         });
         let items: Vec<Value> = join_all(futs).await;
         Ok(json!({ "results": items }))
+    }
+
+    /// Open a URL via browser pool and return extracted text, or an error JSON.
+    async fn browser_fetch_or_error(&self, url: &str) -> Value {
+        match self.browser_get_article(url).await {
+            Ok((title, text)) if !text.is_empty() => json!({
+                "title": title,
+                "text": truncate_chars(&text, 8000),
+                "url": url,
+            }),
+            Ok(_) => json!({ "error": "browser returned empty content", "url": url }),
+            Err(e) => json!({ "error": e.to_string(), "url": url }),
+        }
     }
 
     pub(crate) async fn tool_web_browser(&self, ctx: &RunContext, args: Value) -> Result<Value> {
@@ -1446,5 +1528,21 @@ async fn fetch_github(client: &reqwest::Client, owner: &str, repo: &str) -> (&'s
         },
         Ok(resp) => ("api.github.com", json!({ "error": format!("HTTP {}", resp.status()) })),
         Err(e) => ("api.github.com", json!({ "error": e.to_string() })),
+    }
+}
+
+/// Fetch cryptocurrency price from CoinGecko (free, no key).
+async fn fetch_crypto(client: &reqwest::Client, coin: &str) -> (&'static str, Value) {
+    let url = format!(
+        "https://api.coingecko.com/api/v3/simple/price?ids={}&vs_currencies=usd,cny&include_24hr_change=true",
+        urlencoding::encode(coin),
+    );
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(j) => ("coingecko", j),
+            Err(e) => ("coingecko", json!({ "error": format!("json parse: {e}") })),
+        },
+        Ok(resp) => ("coingecko", json!({ "error": format!("HTTP {}", resp.status()) })),
+        Err(e) => ("coingecko", json!({ "error": e.to_string() })),
     }
 }
