@@ -109,6 +109,18 @@ pub enum Intent {
     Sports { query: String },
     /// Lottery results — browser → zhcw.com.
     Lottery { query: String },
+    /// Academic paper search — browser → baidu-scholar / arxiv.
+    Academic { query: String },
+    /// Job/recruitment search — browser → boss.zhipin.com.
+    Job { query: String, city: String },
+    /// Video search — browser → bilibili.
+    Video { query: String },
+    /// Book search/recommendation — browser → douban/weread.
+    Book { query: String },
+    /// Code package search — browser → npmjs/pypi/crates.io.
+    Package { query: String, registry: String },
+    /// Forum/community discussion — browser → zhihu.
+    Forum { query: String },
     /// Everything else — caller should fall back to regular web_search.
     General,
 }
@@ -177,6 +189,12 @@ Intent kinds and required fields:
   recipe       : {{"kind":"recipe","query":"<dish name>"}}
   sports       : {{"kind":"sports","query":"<match or team>"}}
   lottery      : {{"kind":"lottery","query":"<lottery type>"}}
+  academic     : {{"kind":"academic","query":"<paper topic or keyword>"}}
+  job          : {{"kind":"job","query":"<job title or keyword>","city":"<city or empty>"}}
+  video        : {{"kind":"video","query":"<video topic>"}}
+  book         : {{"kind":"book","query":"<book title or topic>"}}
+  package      : {{"kind":"package","query":"<package name>","registry":"npm|pypi|crates"}}
+  forum        : {{"kind":"forum","query":"<discussion topic>"}}
   general      : {{"kind":"general"}}
 
 Rules:

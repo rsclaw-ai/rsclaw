@@ -1237,6 +1237,40 @@ impl AgentRuntime {
                         let url = format!("https://www.zhcw.com/kjxx/{}/", urlencoding::encode(query));
                         Some(("zhcw", self.browser_fetch_or_error(&url).await))
                     }
+                    Intent::Academic { query } => {
+                        let has_cjk = query.chars().any(|c| (0x4E00..=0x9FFF).contains(&(c as u32)));
+                        let url = if has_cjk {
+                            format!("https://xueshu.baidu.com/s?wd={}", urlencoding::encode(query))
+                        } else {
+                            format!("https://arxiv.org/search/?query={}&searchtype=all", urlencoding::encode(query))
+                        };
+                        Some(("academic", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Job { query, city } => {
+                        let q = if city.is_empty() { query.clone() } else { format!("{query} {city}") };
+                        let url = format!("https://www.zhipin.com/web/geek/job?query={}", urlencoding::encode(&q));
+                        Some(("boss", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Video { query } => {
+                        let url = format!("https://search.bilibili.com/all?keyword={}", urlencoding::encode(query));
+                        Some(("bilibili", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Book { query } => {
+                        let url = format!("https://search.douban.com/book/subject_search?search_text={}", urlencoding::encode(query));
+                        Some(("douban_book", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Package { query, registry } => {
+                        let url = match registry.as_str() {
+                            "pypi" => format!("https://pypi.org/search/?q={}", urlencoding::encode(query)),
+                            "crates" => format!("https://crates.io/search?q={}", urlencoding::encode(query)),
+                            _ => format!("https://www.npmjs.com/search?q={}", urlencoding::encode(query)),
+                        };
+                        Some(("package", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Forum { query } => {
+                        let url = format!("https://www.zhihu.com/search?type=content&q={}", urlencoding::encode(query));
+                        Some(("zhihu", self.browser_fetch_or_error(&url).await))
+                    }
                     Intent::General => None,
                 };
 
@@ -1298,6 +1332,12 @@ impl AgentRuntime {
                     Intent::Recipe { .. } => "recipe",
                     Intent::Sports { .. } => "sports",
                     Intent::Lottery { .. } => "lottery",
+                    Intent::Academic { .. } => "academic",
+                    Intent::Job { .. } => "job",
+                    Intent::Video { .. } => "video",
+                    Intent::Book { .. } => "book",
+                    Intent::Package { .. } => "package",
+                    Intent::Forum { .. } => "forum",
                     Intent::General => "general",
                 };
                 json!({
