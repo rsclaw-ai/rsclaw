@@ -671,7 +671,28 @@ impl AgentRuntime {
             .redirect(redirect_policy)
             .build()?;
 
-        let response = client.get(&fetch_url).send().await?;
+        let response = match client.get(&fetch_url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // HTTP request failed — try browser fallback before giving up.
+                tracing::warn!(url = %fetch_url, error = %e, "web_fetch: HTTP failed, trying browser fallback");
+                match self.browser_get_article(&fetch_url).await {
+                    Ok((t, md)) if !md.is_empty() => {
+                        let text = truncate_chars(&md, max_length);
+                        let text = self.maybe_summarize(&text, prompt).await;
+                        FETCH_CACHE.insert(fetch_url, (t.clone(), md)).await;
+                        return Ok(json!({
+                            "url": url,
+                            "title": t,
+                            "text": text,
+                            "length": text.len(),
+                            "source": "browser_fallback",
+                        }));
+                    }
+                    _ => return Err(e.into()),
+                }
+            }
+        };
 
         // Cross-host redirect: report to agent, let it decide.
         if response.status().is_redirection() {
@@ -711,13 +732,24 @@ impl AgentRuntime {
             html.clone()
         };
 
-        // Detect SPA (large HTML but almost no text) -> fallback to browser.
-        // Use the already-computed dehydrated text length for the check.
+        // Detect SPA (large HTML but almost no text) or CAPTCHA -> fallback to browser.
         let plain_len = markdown.trim().len();
         let is_spa = content_type.contains("text/html") && plain_len < 200 && html.len() > 10_000;
+        let html_lower = html.to_lowercase();
+        let is_captcha = content_type.contains("text/html") && (
+            html_lower.contains("captcha") ||
+            html_lower.contains("challenge-form") ||
+            html_lower.contains("cf-browser-verification") ||
+            html_lower.contains("just a moment") ||
+            html_lower.contains("verify you are human") ||
+            html_lower.contains("bot detection")
+        );
+        if is_captcha {
+            tracing::warn!(url = %fetch_url, "web_fetch: CAPTCHA/bot-check detected, trying browser fallback");
+        }
 
-        let (final_title, final_md) = if is_spa {
-            // Try browser fallback for JS-rendered pages.
+        let (final_title, final_md) = if is_spa || is_captcha {
+            // Try browser fallback for JS-rendered or bot-blocked pages.
             match self.browser_get_article(&fetch_url).await {
                 Ok((t, md)) if !md.is_empty() => (t, md),
                 _ => (title.clone(), markdown.clone()),
@@ -1075,7 +1107,7 @@ impl AgentRuntime {
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
-            .user_agent("rsclaw/1.0 (+https://github.com/rsclaw-ai/rsclaw)")
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15")
             .build()?;
 
         let futs = plan.sub_queries.into_iter().map(|sq| {
