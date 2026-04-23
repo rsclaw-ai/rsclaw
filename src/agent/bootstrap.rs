@@ -454,6 +454,12 @@ const ZH_TOOL_EXEC: &str = r#"# exec 使用指南
 - Windows 用 PowerShell，macOS/Linux 用 bash
 - 不要执行危险命令（rm -rf、格式化、关闭防火墙等）
 
+## 必须执行后才能报告结果
+- 绝对不要声称完成了实际没有执行的操作
+- 只有在真正调用工具（write_file、exec等）并收到成功结果后，才能告诉用户"已完成"
+- 不要编造文件写入成功、文件读取成功等虚假结果
+- 如果没有调用任何工具就声称"已写入"、"已修改"，这是欺骗用户
+
 ## 命令失败时必须诚实报告
 当命令执行失败（exit_code != 0、找不到文件、脚本不存在等）：
 - 必须如实报告错误信息给用户，告诉用户具体什么失败了
@@ -525,6 +531,12 @@ const EN_TOOL_EXEC: &str = r#"# exec Usage Guide
 - Long tasks: use wait=false (background). Short tasks needing output: wait=true
 - If a command fails, do NOT retry same args — try a different approach
 - Never run dangerous commands (rm -rf /, format, disable firewall)
+
+## Must Execute Before Reporting Results
+- NEVER claim you completed an operation you did NOT actually execute
+- Only tell the user "completed" after you ACTUALLY called a tool (write_file, exec, etc.) and received a success result
+- Do NOT fabricate fake "file written successfully" or "file read successfully" results
+- Claiming "written" or "modified" without calling any tools is deceiving the user
 
 ## Command Failure — Be Honest
 When a command fails (exit_code != 0, file not found, script missing, etc.):
