@@ -230,6 +230,12 @@ pub(crate) fn build_tool_list(
             - Always specify toolset matching the task (web for search, code for file ops).\n\
             - After dispatching, tell the user what you delegated and continue with other work.\n\
             \n\
+            CRITICAL: When user EXPLICITLY asks to use a specific tool (opencode, claudecode, codex),\n\
+            you MUST call that tool directly. DO NOT create a task agent instead.\n\
+            - User says \"让opencode去...\" -> call opencode tool\n\
+            - User says \"用claudecode...\" -> call claudecode tool\n\
+            Creating a task agent when user wants opencode/claudecode is deceiving the user.\n\
+            \n\
             DO NOT delegate these tasks — handle them yourself directly:\n\
             - Any GUI/desktop automation (WeChat, Finder, Safari, system apps, etc.)\n\
             - Anything using `computer_use` (screenshot, click, key, type)\n\

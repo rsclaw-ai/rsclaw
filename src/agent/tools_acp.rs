@@ -117,6 +117,7 @@ impl AgentRuntime {
         let task_str = task.to_string();
 
         // Send initial notification
+        tracing::info!("tool_opencode: sending initial notification to {}", target_id);
         if let Some(ref tx) = notif_tx {
             let _ = tx.send(crate::channel::OutboundMessage {
                 target_id: target_id.clone(),
@@ -127,6 +128,8 @@ impl AgentRuntime {
                 files: vec![],
                 channel: Some(channel_name.clone()),
             });
+        } else {
+            tracing::warn!("tool_opencode: no notification_tx for initial notification");
         }
 
         // Spawn background task - collect events AND send prompt in parallel
@@ -322,9 +325,12 @@ impl AgentRuntime {
                     result_files = notif_files.clone();
 
                     // Send notification to user
-                    tracing::debug!(
-                        "tool_opencode: sending completion notification, summary_len={}, files={}",
-                        summary.len(), notif_files.len()
+                    tracing::info!(
+                        summary_preview = %summary.chars().take(100).collect::<String>(),
+                        files_count = notif_files.len(),
+                        target = %target_id_bg,
+                        channel = %channel_bg,
+                        "tool_opencode: sending completion notification"
                     );
                     if let Some(ref tx) = notif_tx_bg {
                         match tx.send(crate::channel::OutboundMessage {
@@ -337,10 +343,10 @@ impl AgentRuntime {
                             channel: Some(channel_bg.clone()),
                         }) {
                             Ok(_) => {
-                                tracing::debug!("tool_opencode: notification sent successfully")
+                                tracing::info!("tool_opencode: notification sent successfully to {}", target_id_bg);
                             }
                             Err(e) => {
-                                tracing::error!("tool_opencode: failed to send notification: {}", e)
+                                tracing::error!("tool_opencode: failed to send notification: {}", e);
                             }
                         }
                     } else {
@@ -350,6 +356,7 @@ impl AgentRuntime {
                 Err(e) => {
                     tracing::error!("tool_opencode: send_prompt failed: {}", e);
                     if let Some(ref tx) = notif_tx_bg {
+                        tracing::info!("tool_opencode: sending error notification to {}", target_id_bg);
                         let _ = tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
