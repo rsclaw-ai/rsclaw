@@ -193,6 +193,9 @@ pub enum CronPayload {
         text: Option<String>,
         #[serde(default, alias = "timeoutSeconds")]
         timeout_seconds: Option<u64>,
+        /// For execCommand: if true, send output to agent for summarization.
+        #[serde(default)]
+        summarize: Option<bool>,
     },
 }
 
@@ -201,6 +204,13 @@ impl CronPayload {
         match self {
             CronPayload::Text(s) => s,
             CronPayload::Structured { text, .. } => text.as_deref().unwrap_or(""),
+        }
+    }
+
+    pub fn summarize(&self) -> bool {
+        match self {
+            CronPayload::Text(_) => false,
+            CronPayload::Structured { summarize, .. } => summarize.unwrap_or(false),
         }
     }
 }
@@ -787,10 +797,16 @@ impl CronRunner {
                         _ => None,
                     }) == Some("execCommand") {
                         // Execute command directly, bypassing agent to avoid session history pollution
-                        run_exec_command(job.effective_message(), job.payload.as_ref().and_then(|p| match p {
-                            CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
-                            _ => None,
-                        })).await
+                        run_exec_command(
+                            job.effective_message(),
+                            job.payload.as_ref().and_then(|p| match p {
+                                CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
+                                _ => None,
+                            }),
+                            job.payload.as_ref().map(|p| p.summarize()).unwrap_or(false),
+                            &job,
+                            &agents,
+                        ).await
                     } else {
                         // Run with cancellation check — polls cancel flag every second.
                         tokio::select! {
@@ -949,10 +965,16 @@ impl CronRunner {
             CronPayload::Structured { kind, .. } => kind.as_deref(),
             _ => None,
         }) == Some("execCommand") {
-            run_exec_command(job.effective_message(), job.payload.as_ref().and_then(|p| match p {
-                CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
-                _ => None,
-            })).await
+            run_exec_command(
+                job.effective_message(),
+                job.payload.as_ref().and_then(|p| match p {
+                    CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
+                    _ => None,
+                }),
+                job.payload.as_ref().map(|p| p.summarize()).unwrap_or(false),
+                job,
+                &self.agents,
+            ).await
         } else {
             run_cron_job(job, &self.agents).await
         };
@@ -1442,8 +1464,15 @@ fn build_run_log_entry(
 
 /// Execute a command directly without agent, returning real output.
 /// Used for execCommand payload type to bypass session history pollution.
-async fn run_exec_command(command: &str, timeout_secs: Option<u64>) -> Result<String> {
-    let timeout = Duration::from_secs(timeout_secs.unwrap_or(120));
+/// If summarize=true, sends output to agent for summarization.
+async fn run_exec_command(
+    command: &str,
+    timeout_secs: Option<u64>,
+    summarize: bool,
+    job: &CronJob,
+    agents: &AgentRegistry,
+) -> Result<String> {
+    let exec_timeout = Duration::from_secs(timeout_secs.unwrap_or(120));
 
     // Determine shell based on platform
     let (shell, shell_args) = if cfg!(target_os = "windows") {
@@ -1454,7 +1483,7 @@ async fn run_exec_command(command: &str, timeout_secs: Option<u64>) -> Result<St
 
     // Execute command
     let output = tokio::time::timeout(
-        timeout,
+        exec_timeout,
         tokio::process::Command::new(shell)
             .args(&shell_args)
             .arg(command)
@@ -1465,7 +1494,7 @@ async fn run_exec_command(command: &str, timeout_secs: Option<u64>) -> Result<St
             .output(),
     )
     .await
-    .map_err(|_| anyhow!("command timed out after {}s", timeout.as_secs()))?
+    .map_err(|_| anyhow!("command timed out after {}s", exec_timeout.as_secs()))?
     .map_err(|e| anyhow!("command execution failed: {}", e))?;
 
     let exit_code = output.status.code().unwrap_or(-1);
@@ -1484,13 +1513,62 @@ async fn run_exec_command(command: &str, timeout_secs: Option<u64>) -> Result<St
         return Err(anyhow!("command exit_code={}, error: {}", exit_code, error_msg));
     }
 
-    // Return stdout (or stderr if stdout is empty)
-    if !stdout.is_empty() {
-        Ok(stdout)
+    // Get raw output
+    let raw_output = if !stdout.is_empty() {
+        stdout
     } else if !stderr.is_empty() {
-        Ok(stderr)
+        stderr
     } else {
-        Ok("command succeeded with no output".to_string())
+        "command succeeded with no output".to_string()
+    };
+
+    // If summarize=true, send output to agent for summarization
+    if summarize {
+        let session_key = job
+            .session_key
+            .clone()
+            .unwrap_or_else(|| format!("cron:{}", job.id));
+
+        let handle = agents
+            .get(&job.agent_id)
+            .with_context(|| format!("agent not found: {}", job.agent_id))?;
+
+        // Create summarize prompt with real output
+        let summarize_prompt = format!(
+            "以下是一个命令执行的真实输出结果，请用简洁的语言总结关键信息（不要编造数据，只总结已有内容）：\n\n```\n{}\n```",
+            raw_output
+        );
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let msg = AgentMessage {
+            session_key: format!("{}:summarize", session_key), // Use separate session to avoid pollution
+            text: summarize_prompt,
+            channel: "cron".to_string(),
+            peer_id: format!("cron:{}", job.id),
+            chat_id: String::new(),
+            reply_tx,
+            extra_tools: vec![], // No tools - only summarize
+            images: vec![],
+            files: vec![],
+        };
+
+        handle.tx.send(msg).await.context("agent inbox closed")?;
+
+        // Wait for summary with timeout
+        let summary_timeout = Duration::from_secs(60);
+        let reply = tokio::time::timeout(summary_timeout, reply_rx)
+            .await
+            .map_err(|_| anyhow!("summarization timed out after {}s", summary_timeout.as_secs()))?
+            .context("agent dropped reply channel")?;
+
+        if reply.is_empty {
+            // Agent returned nothing, use raw output
+            Ok(raw_output)
+        } else {
+            Ok(reply.text)
+        }
+    } else {
+        Ok(raw_output)
     }
 }
 
