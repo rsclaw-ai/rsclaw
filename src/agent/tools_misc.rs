@@ -1155,10 +1155,28 @@ $synth.Speak('{}')
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
+        // Post-install verification: check that the tool binary actually exists.
+        // Prevents reporting success when only an empty directory was created.
+        let verified = if output.status.success() {
+            match name {
+                "chrome" => super::platform::detect_chrome().is_some(),
+                "ffmpeg" => which::which("ffmpeg").is_ok()
+                    || crate::config::loader::base_dir().join("tools/ffmpeg/ffmpeg").exists(),
+                "node" => which::which("node").is_ok()
+                    || crate::config::loader::base_dir().join("tools/node/bin/node").exists(),
+                "python" => which::which("python3").is_ok()
+                    || crate::config::loader::base_dir().join("tools/python/bin/python3").exists(),
+                _ => true, // skip verification for unknown tools
+            }
+        } else {
+            false
+        };
+
         Ok(json!({
             "name": name,
-            "success": output.status.success(),
+            "success": verified,
             "output": if stdout.is_empty() { &stderr } else { &stdout },
+            "verified": verified,
         }))
     }
 
