@@ -776,11 +776,21 @@ impl CronRunner {
                     info!(job_id = %job.id, "cron job triggered");
 
                     // systemEvent: deliver payload text directly — no agent call needed.
+                    // execCommand: execute the command directly, bypassing agent and session history.
                     let result: Result<String> = if job.payload.as_ref().and_then(|p| match p {
                         CronPayload::Structured { kind, .. } => kind.as_deref(),
                         _ => None,
                     }) == Some("systemEvent") {
                         Ok(job.effective_message().to_owned())
+                    } else if job.payload.as_ref().and_then(|p| match p {
+                        CronPayload::Structured { kind, .. } => kind.as_deref(),
+                        _ => None,
+                    }) == Some("execCommand") {
+                        // Execute command directly, bypassing agent to avoid session history pollution
+                        run_exec_command(job.effective_message(), job.payload.as_ref().and_then(|p| match p {
+                            CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
+                            _ => None,
+                        })).await
                     } else {
                         // Run with cancellation check — polls cancel flag every second.
                         tokio::select! {
@@ -929,11 +939,20 @@ impl CronRunner {
         let _permit = self.semaphore.acquire().await?;
         let prev_consecutive_errors = job.state.as_ref().map(|s| s.consecutive_errors).unwrap_or(0);
         // systemEvent: deliver payload text directly — no agent call needed.
+        // execCommand: execute the command directly, bypassing agent and session history.
         let result: Result<String> = if job.payload.as_ref().and_then(|p| match p {
             CronPayload::Structured { kind, .. } => kind.as_deref(),
             _ => None,
         }) == Some("systemEvent") {
             Ok(job.effective_message().to_owned())
+        } else if job.payload.as_ref().and_then(|p| match p {
+            CronPayload::Structured { kind, .. } => kind.as_deref(),
+            _ => None,
+        }) == Some("execCommand") {
+            run_exec_command(job.effective_message(), job.payload.as_ref().and_then(|p| match p {
+                CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
+                _ => None,
+            })).await
         } else {
             run_cron_job(job, &self.agents).await
         };
@@ -1418,6 +1437,60 @@ fn build_run_log_entry(
         success,
         reply_preview: None,
         error: error.map(|e| e.to_string()),
+    }
+}
+
+/// Execute a command directly without agent, returning real output.
+/// Used for execCommand payload type to bypass session history pollution.
+async fn run_exec_command(command: &str, timeout_secs: Option<u64>) -> Result<String> {
+    let timeout = Duration::from_secs(timeout_secs.unwrap_or(120));
+
+    // Determine shell based on platform
+    let (shell, shell_args) = if cfg!(target_os = "windows") {
+        ("powershell", vec!["-NoProfile", "-Command"])
+    } else {
+        ("sh", vec!["-c"])
+    };
+
+    // Execute command
+    let output = tokio::time::timeout(
+        timeout,
+        tokio::process::Command::new(shell)
+            .args(&shell_args)
+            .arg(command)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow!("command timed out after {}s", timeout.as_secs()))?
+    .map_err(|e| anyhow!("command execution failed: {}", e))?;
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if exit_code != 0 {
+        // Return error with details
+        let error_msg = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "command failed with no output".to_string()
+        };
+        return Err(anyhow!("command exit_code={}, error: {}", exit_code, error_msg));
+    }
+
+    // Return stdout (or stderr if stdout is empty)
+    if !stdout.is_empty() {
+        Ok(stdout)
+    } else if !stderr.is_empty() {
+        Ok(stderr)
+    } else {
+        Ok("command succeeded with no output".to_string())
     }
 }
 

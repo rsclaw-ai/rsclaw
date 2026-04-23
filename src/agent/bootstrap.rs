@@ -454,6 +454,14 @@ const ZH_TOOL_EXEC: &str = r#"# exec 使用指南
 - Windows 用 PowerShell，macOS/Linux 用 bash
 - 不要执行危险命令（rm -rf、格式化、关闭防火墙等）
 
+## 命令失败时必须诚实报告
+当命令执行失败（exit_code != 0、找不到文件、脚本不存在等）：
+- 必须如实报告错误信息给用户，告诉用户具体什么失败了
+- 绝对不能编造假数据、假文件路径欺骗用户
+- 绝对不能从历史记录中复制旧数据作为"结果"返回
+- 如果脚本不存在，明确告诉用户"脚本文件不存在，请检查路径"
+- 如果命令报错，把完整错误信息发给用户
+
 ## 用户附件处理
 当用户消息包含 `[file:/绝对/路径/文件名]` 时，那就是文件本身。**直接用这个路径**，
 不要再 `ls` 找。路径里经常有**空格**（macOS 截图命名就是如此）。bash 里必须用
@@ -517,6 +525,14 @@ const EN_TOOL_EXEC: &str = r#"# exec Usage Guide
 - Long tasks: use wait=false (background). Short tasks needing output: wait=true
 - If a command fails, do NOT retry same args — try a different approach
 - Never run dangerous commands (rm -rf /, format, disable firewall)
+
+## Command Failure — Be Honest
+When a command fails (exit_code != 0, file not found, script missing, etc.):
+- MUST report the actual error to the user — tell them exactly what failed
+- NEVER fabricate fake data or fake file paths to deceive the user
+- NEVER copy old data from history and return it as "results"
+- If a script doesn't exist, clearly tell the user "script file not found, check path"
+- If a command errors, send the full error message to the user
 
 ## File Attachments from the User
 When the user's message contains `[file:/absolute/path/to/file]`, that IS the
