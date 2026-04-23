@@ -1151,8 +1151,8 @@ impl AgentRuntime {
                         Some(("ctrip_hotel", self.browser_fetch_or_error(&url).await))
                     }
                     Intent::Movie { query } => {
-                        let url = format!("https://www.maoyan.com/films?showType=3&keyword={}", urlencoding::encode(query));
-                        Some(("maoyan", self.browser_fetch_or_error(&url).await))
+                        let url = format!("https://search.douban.com/movie/subject_search?search_text={}&cat=1002", urlencoding::encode(query));
+                        Some(("douban_movie", self.browser_fetch_or_error(&url).await))
                     }
                     Intent::Concert { query } => {
                         let url = format!("https://search.damai.cn/search.htm?keyword={}", urlencoding::encode(query));
@@ -1168,8 +1168,7 @@ impl AgentRuntime {
                         Some(("jd", self.browser_fetch_or_error(&url).await))
                     }
                     Intent::Stock { query } => {
-                        let url = format!("https://so.eastmoney.com/web/s?keyword={}", urlencoding::encode(query));
-                        Some(("eastmoney", self.browser_fetch_or_error(&url).await))
+                        Some(fetch_stock_sina(&client, query).await)
                     }
                     Intent::Express { number } => {
                         let url = format!("https://www.kuaidi100.com/result.jsp?nu={number}");
@@ -1733,4 +1732,86 @@ async fn fetch_dns(client: &reqwest::Client, domain: &str) -> (&'static str, Val
         Ok(resp) => ("cloudflare-dns", json!({ "error": format!("HTTP {}", resp.status()) })),
         Err(e) => ("cloudflare-dns", json!({ "error": e.to_string() })),
     }
+}
+
+/// Fetch stock quote from Sina Finance API (free, no key).
+/// The query is a stock name; we first search for the code, then fetch the quote.
+async fn fetch_stock_sina(client: &reqwest::Client, query: &str) -> (&'static str, Value) {
+    // Step 1: search for stock code via Sina suggest API.
+    let suggest_url = format!(
+        "https://suggest3.sinajs.cn/suggest/type=&key={}&name=suggestdata",
+        urlencoding::encode(query),
+    );
+    let suggest_resp = match client
+        .get(&suggest_url)
+        .header("Referer", "https://finance.sina.com.cn")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return ("sina_finance", json!({ "error": e.to_string() })),
+    };
+    let suggest_text = match suggest_resp.text().await {
+        Ok(t) => t,
+        Err(e) => return ("sina_finance", json!({ "error": e.to_string() })),
+    };
+    // Parse: var suggestdata="code,name,...;code,name,...";
+    // Extract first stock code like "sh600519" or "sz000001".
+    let code = suggest_text
+        .split('"')
+        .nth(1)
+        .and_then(|s| s.split(';').next())
+        .and_then(|s| {
+            let parts: Vec<&str> = s.split(',').collect();
+            if parts.len() >= 4 {
+                // parts[3] is market+code like "11" for Shanghai
+                let market = parts[1]; // e.g. "51" -> need to map
+                let _code = parts[0]; // not useful directly
+                // Easier: use parts[3] which contains code like "sh600519"
+                Some(parts[3].to_owned())
+            } else {
+                None
+            }
+        });
+    let code = match code {
+        Some(c) if !c.is_empty() => c,
+        _ => return ("sina_finance", json!({ "error": "stock not found", "query": query })),
+    };
+
+    // Step 2: fetch real-time quote.
+    let quote_url = format!("https://hq.sinajs.cn/list={code}");
+    let quote_resp = match client
+        .get(&quote_url)
+        .header("Referer", "https://finance.sina.com.cn")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return ("sina_finance", json!({ "error": e.to_string() })),
+    };
+    let quote_bytes = match quote_resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => return ("sina_finance", json!({ "error": e.to_string() })),
+    };
+    // Sina returns GBK-encoded data. Decode via encoding_rs (transitive dep).
+    let (quote_text, _, _) = encoding_rs::GBK.decode(&quote_bytes);
+    let quote_text = quote_text.to_string();
+    let data = quote_text.split('"').nth(1).unwrap_or("");
+    let fields: Vec<&str> = data.split(',').collect();
+    if fields.len() < 32 {
+        return ("sina_finance", json!({ "error": "unexpected quote format", "raw": data }));
+    }
+    ("sina_finance", json!({
+        "code": code,
+        "name": fields[0],
+        "open": fields[1],
+        "prev_close": fields[2],
+        "price": fields[3],
+        "high": fields[4],
+        "low": fields[5],
+        "volume": fields[8],
+        "amount": fields[9],
+        "date": fields[30],
+        "time": fields[31],
+    }))
 }

@@ -294,9 +294,51 @@ pub async fn plan(
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut).await;
     match result {
         Ok(Ok(p)) => {
+            let intents: Vec<&str> = p.sub_queries.iter().map(|s| match &s.intent {
+                Intent::Weather { .. } => "weather",
+                Intent::Currency { .. } => "currency",
+                Intent::Timezone { .. } => "timezone",
+                Intent::Wikipedia { .. } => "wikipedia",
+                Intent::GithubRepo { .. } => "github_repo",
+                Intent::Flight { .. } => "flight",
+                Intent::Train { .. } => "train",
+                Intent::Hotel { .. } => "hotel",
+                Intent::Movie { .. } => "movie",
+                Intent::Concert { .. } => "concert",
+                Intent::Restaurant { .. } => "restaurant",
+                Intent::Shopping { .. } => "shopping",
+                Intent::Stock { .. } => "stock",
+                Intent::Express { .. } => "express",
+                Intent::News { .. } => "news",
+                Intent::Map { .. } => "map",
+                Intent::Translate { .. } => "translate",
+                Intent::CryptoPrice { .. } => "crypto_price",
+                Intent::Calendar { .. } => "calendar",
+                Intent::UnitConvert { .. } => "unit_convert",
+                Intent::Math { .. } => "math",
+                Intent::IpLookup { .. } => "ip_lookup",
+                Intent::DnsLookup { .. } => "dns_lookup",
+                Intent::Whois { .. } => "whois",
+                Intent::Phone { .. } => "phone",
+                Intent::Idiom { .. } => "idiom",
+                Intent::Poem { .. } => "poem",
+                Intent::Law { .. } => "law",
+                Intent::Hospital { .. } => "hospital",
+                Intent::Recipe { .. } => "recipe",
+                Intent::Sports { .. } => "sports",
+                Intent::Lottery { .. } => "lottery",
+                Intent::Academic { .. } => "academic",
+                Intent::Job { .. } => "job",
+                Intent::Video { .. } => "video",
+                Intent::Book { .. } => "book",
+                Intent::Package { .. } => "package",
+                Intent::Forum { .. } => "forum",
+                Intent::General => "general",
+            }).collect();
             tracing::info!(
                 query = %query,
                 sub_count = p.sub_queries.len(),
+                intents = ?intents,
                 "query_planner: planned"
             );
             p
