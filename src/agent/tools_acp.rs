@@ -9,9 +9,57 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use serde_json::Value;
+use futures::future::BoxFuture;
 
 use super::registry::{AgentMessage, AgentReply};
 use super::runtime::{AgentRuntime, RunContext, expand_tilde};
+use crate::acp::notification::{Notification, NotificationPriority, NotificationSink};
+use crate::channel::OutboundMessage;
+
+/// A notification sink that forwards ACP notifications to a channel.
+/// Used to send OpenCode/ClaudeCode tool progress notifications to the user.
+struct ChannelNotifier {
+    tx: tokio::sync::broadcast::Sender<OutboundMessage>,
+    target_id: String,
+    channel: String,
+}
+
+impl ChannelNotifier {
+    fn new(tx: tokio::sync::broadcast::Sender<OutboundMessage>, target_id: String, channel: String) -> Self {
+        Self { tx, target_id, channel }
+    }
+}
+
+impl NotificationSink for ChannelNotifier {
+    fn name(&self) -> &str {
+        "channel"
+    }
+
+    fn priority_filter(&self) -> NotificationPriority {
+        NotificationPriority::Medium
+    }
+
+    fn send(&self, notification: &Notification) -> BoxFuture<'_, Result<()>> {
+        let text = format!(
+            "**{}**\n\n{}",
+            notification.title,
+            notification.body
+        );
+        let msg = OutboundMessage {
+            target_id: self.target_id.clone(),
+            is_group: false,
+            text,
+            reply_to: None,
+            images: vec![],
+            files: vec![],
+            channel: Some(self.channel.clone()),
+        };
+        let tx = self.tx.clone();
+        Box::pin(async move {
+            tx.send(msg).map(|_| ()).map_err(|e| anyhow!("channel notification failed: {}", e))
+        })
+    }
+}
 
 impl AgentRuntime {
     /// Get or create the OpenCode ACP client.
@@ -111,6 +159,14 @@ impl AgentRuntime {
                 return Err(e);
             }
         };
+
+        // Add notification sink to client for real-time progress updates
+        if let Some(ref tx) = notif_tx {
+            let sink = Arc::new(ChannelNotifier::new(tx.clone(), target_id.clone(), channel_name.clone()));
+            client.add_notification_sink(sink);
+            tracing::info!("tool_opencode: added notification sink for {}", target_id);
+        }
+
         let session_id = client.session_id().await.unwrap_or_default();
         let session_id_clone = session_id.clone();
 
@@ -215,14 +271,7 @@ impl AgentRuntime {
 
             // Send prompt (runs in parallel with event collection)
             tracing::info!("tool_opencode: sending prompt");
-            // Add timeout for send_prompt - opencode can take a long time but we need to know if it's stuck
-            let send_timeout = tokio::time::Duration::from_secs(600); // 10 minutes max
-            let send_result = tokio::time::timeout(send_timeout, client.send_prompt(&task_str))
-                .await
-                .map_err(|_| {
-                    tracing::error!("tool_opencode: send_prompt timed out after {}s", send_timeout.as_secs());
-                    anyhow::anyhow!("OpenCode execution timed out after {} seconds", send_timeout.as_secs())
-                });
+            let send_result = client.send_prompt(&task_str).await;
 
             // DON'T wait for event collector - it runs forever! Just get what we have so
             // far. The events collected during execution are already in
@@ -232,7 +281,7 @@ impl AgentRuntime {
             let mut result_summary = String::new();
             let mut result_files: Vec<(String, String, String)> = vec![];
             match send_result {
-                Ok(Ok(resp)) => {
+                Ok(resp) => {
                     tracing::info!(
                         "tool_opencode: send_prompt completed, stop_reason={:?}",
                         resp.stop_reason
@@ -375,8 +424,7 @@ impl AgentRuntime {
                         tracing::warn!("tool_opencode: no notification channel available");
                     }
                 }
-                Ok(Err(e)) => {
-                    // send_prompt returned an error (internal failure)
+                Err(e) => {
                     tracing::error!("tool_opencode: send_prompt failed: {}", e);
                     if let Some(ref tx) = notif_tx_bg {
                         tracing::info!("tool_opencode: sending error notification to {}", target_id_bg);
@@ -384,22 +432,6 @@ impl AgentRuntime {
                             target_id: target_id_bg.clone(),
                             is_group: false,
                             text: crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "OpenCode"), ("error", &e.to_string())]),
-                            reply_to: None,
-                            images: vec![],
-                            files: vec![],
-                            channel: Some(channel_bg.clone()),
-                        });
-                    }
-                }
-                Err(timeout_err) => {
-                    // Timeout case - send_prompt took too long
-                    tracing::error!("tool_opencode: {}", timeout_err);
-                    if let Some(ref tx) = notif_tx_bg {
-                        tracing::info!("tool_opencode: sending timeout notification to {}", target_id_bg);
-                        let _ = tx.send(crate::channel::OutboundMessage {
-                            target_id: target_id_bg.clone(),
-                            is_group: false,
-                            text: crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "OpenCode"), ("error", &timeout_err.to_string())]),
                             reply_to: None,
                             images: vec![],
                             files: vec![],
@@ -628,6 +660,14 @@ impl AgentRuntime {
                 return Err(e);
             }
         };
+
+        // Add notification sink to client for real-time progress updates
+        if let Some(ref tx) = notif_tx {
+            let sink = Arc::new(ChannelNotifier::new(tx.clone(), target_id.clone(), channel_name.clone()));
+            client.add_notification_sink(sink);
+            tracing::info!("tool_claudecode: added notification sink for {}", target_id);
+        }
+
         let session_id = client.session_id().await.unwrap_or_default();
         let session_id_clone = session_id.clone();
 
@@ -722,18 +762,11 @@ impl AgentRuntime {
 
             // Send prompt (runs in parallel with event collection)
             tracing::info!("tool_claudecode: sending prompt");
-            // Add timeout for send_prompt - claudecode can take a long time but we need to know if it's stuck
-            let send_timeout = tokio::time::Duration::from_secs(600); // 10 minutes max
-            let send_result = tokio::time::timeout(send_timeout, client.send_prompt(&task_str))
-                .await
-                .map_err(|_| {
-                    tracing::error!("tool_claudecode: send_prompt timed out after {}s", send_timeout.as_secs());
-                    anyhow::anyhow!("ClaudeCode execution timed out after {} seconds", send_timeout.as_secs())
-                });
+            let send_result = client.send_prompt(&task_str).await;
 
             // Process the result
             match send_result {
-                Ok(Ok(resp)) => {
+                Ok(resp) => {
                     tracing::info!(
                         "tool_claudecode: send_prompt completed, stop_reason={:?}",
                         resp.stop_reason
@@ -869,29 +902,13 @@ impl AgentRuntime {
                         tracing::warn!("tool_claudecode: no notification channel available");
                     }
                 }
-                Ok(Err(e)) => {
-                    // send_prompt returned an error (internal failure)
+                Err(e) => {
                     tracing::error!("tool_claudecode: send_prompt failed: {}", e);
                     if let Some(ref tx) = notif_tx_bg {
                         let _ = tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
                             text: crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "Claude Code"), ("error", &e.to_string())]),
-                            reply_to: None,
-                            images: vec![],
-                            files: vec![],
-                            channel: Some(channel_bg.clone()),
-                        });
-                    }
-                }
-                Err(timeout_err) => {
-                    // Timeout case - send_prompt took too long
-                    tracing::error!("tool_claudecode: {}", timeout_err);
-                    if let Some(ref tx) = notif_tx_bg {
-                        let _ = tx.send(crate::channel::OutboundMessage {
-                            target_id: target_id_bg.clone(),
-                            is_group: false,
-                            text: crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "Claude Code"), ("error", &timeout_err.to_string())]),
                             reply_to: None,
                             images: vec![],
                             files: vec![],
