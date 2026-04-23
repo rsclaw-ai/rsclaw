@@ -294,38 +294,65 @@ fn process_alive(pid: u32) -> bool {
 }
 
 /// Scan for a running gateway process when PID file is missing.
+/// Tries: 1) lsof/netstat on the gateway port, 2) pgrep by name.
 fn find_gateway_pid() -> Option<u32> {
+    let port = detect_port();
+    let my_pid = std::process::id();
+
+    // Try finding by port first (most reliable).
     #[cfg(unix)]
     {
-        let output = std::process::Command::new("pgrep")
-            .args(["-f", "rsclaw gateway run"])
+        let output = std::process::Command::new("lsof")
+            .args(["-ti", &format!(":{port}"), "-sTCP:LISTEN"])
             .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        // Return the first matching PID (skip our own process).
-        let my_pid = std::process::id();
-        for line in text.lines() {
-            if let Ok(pid) = line.trim().parse::<u32>() {
-                if pid != my_pid && process_alive(pid) {
-                    return Some(pid);
+            .ok();
+        if let Some(output) = output {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                if let Ok(pid) = line.trim().parse::<u32>() {
+                    if pid != my_pid && process_alive(pid) {
+                        return Some(pid);
+                    }
+                }
+            }
+        }
+
+        // Fallback: pgrep by process name.
+        for pattern in &["rsclaw gateway", "rsclaw"] {
+            let output = std::process::Command::new("pgrep")
+                .args(["-f", pattern])
+                .output()
+                .ok();
+            if let Some(output) = output {
+                let text = String::from_utf8_lossy(&output.stdout);
+                for line in text.lines() {
+                    if let Ok(pid) = line.trim().parse::<u32>() {
+                        if pid != my_pid && process_alive(pid) {
+                            return Some(pid);
+                        }
+                    }
                 }
             }
         }
     }
     #[cfg(windows)]
     {
-        let output = std::process::Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq rsclaw.exe", "/FO", "CSV", "/NH"])
+        // netstat to find PID listening on gateway port.
+        let output = std::process::Command::new("netstat")
+            .args(["-ano"])
             .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.lines() {
-            let parts: Vec<&str> = line.split(',').collect();
-            if parts.len() >= 2 {
-                let pid_str = parts[1].trim().trim_matches('"');
-                if let Ok(pid) = pid_str.parse::<u32>() {
-                    if pid != std::process::id() && process_alive(pid) {
-                        return Some(pid);
+            .ok();
+        if let Some(output) = output {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let port_str = format!(":{port}");
+            for line in text.lines() {
+                if line.contains(&port_str) && line.contains("LISTENING") {
+                    if let Some(pid_str) = line.split_whitespace().last() {
+                        if let Ok(pid) = pid_str.parse::<u32>() {
+                            if pid != my_pid && process_alive(pid) {
+                                return Some(pid);
+                            }
+                        }
                     }
                 }
             }
