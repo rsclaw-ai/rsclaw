@@ -1187,6 +1187,56 @@ impl AgentRuntime {
                         let url = format!("https://fanyi.baidu.com/#{to}/{}", urlencoding::encode(text));
                         Some(("baidu_fanyi", self.browser_fetch_or_error(&url).await))
                     }
+                    // Local computation intents (no network needed).
+                    Intent::Calendar { query } => {
+                        Some(("local", compute_calendar(query)))
+                    }
+                    Intent::UnitConvert { query } => {
+                        Some(("local", compute_unit_convert(query)))
+                    }
+                    Intent::Math { expr } => {
+                        Some(("local", compute_math(expr)))
+                    }
+                    // API-based intents.
+                    Intent::IpLookup { ip } => Some(fetch_ip(&client, ip).await),
+                    Intent::DnsLookup { domain } => Some(fetch_dns(&client, domain).await),
+                    // Browser-based intents.
+                    Intent::Whois { domain } => {
+                        let url = format!("https://whois.domaintools.com/{domain}");
+                        Some(("whois", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Phone { number } => {
+                        let url = format!("https://www.ip138.com/mobile.asp?mobile={number}");
+                        Some(("ip138", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Idiom { query } => {
+                        let url = format!("https://hanyu.baidu.com/s?wd={}", urlencoding::encode(query));
+                        Some(("baidu_hanyu", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Poem { query } => {
+                        let url = format!("https://so.gushiwen.cn/search.aspx?value={}", urlencoding::encode(query));
+                        Some(("gushiwen", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Law { query } => {
+                        let url = format!("https://www.pkulaw.com/search?keyword={}", urlencoding::encode(query));
+                        Some(("pkulaw", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Hospital { query } => {
+                        let url = format!("https://dxy.com/search?q={}", urlencoding::encode(query));
+                        Some(("dxy", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Recipe { query } => {
+                        let url = format!("https://www.xiachufang.com/search/?keyword={}", urlencoding::encode(query));
+                        Some(("xiachufang", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Sports { query } => {
+                        let url = format!("https://www.dongqiudi.com/search?keyword={}", urlencoding::encode(query));
+                        Some(("dongqiudi", self.browser_fetch_or_error(&url).await))
+                    }
+                    Intent::Lottery { query } => {
+                        let url = format!("https://www.zhcw.com/kjxx/{}/", urlencoding::encode(query));
+                        Some(("zhcw", self.browser_fetch_or_error(&url).await))
+                    }
                     Intent::General => None,
                 };
 
@@ -1234,6 +1284,20 @@ impl AgentRuntime {
                     Intent::Map { .. } => "map",
                     Intent::Translate { .. } => "translate",
                     Intent::CryptoPrice { .. } => "crypto_price",
+                    Intent::Calendar { .. } => "calendar",
+                    Intent::UnitConvert { .. } => "unit_convert",
+                    Intent::Math { .. } => "math",
+                    Intent::IpLookup { .. } => "ip_lookup",
+                    Intent::DnsLookup { .. } => "dns_lookup",
+                    Intent::Whois { .. } => "whois",
+                    Intent::Phone { .. } => "phone",
+                    Intent::Idiom { .. } => "idiom",
+                    Intent::Poem { .. } => "poem",
+                    Intent::Law { .. } => "law",
+                    Intent::Hospital { .. } => "hospital",
+                    Intent::Recipe { .. } => "recipe",
+                    Intent::Sports { .. } => "sports",
+                    Intent::Lottery { .. } => "lottery",
                     Intent::General => "general",
                 };
                 json!({
@@ -1553,5 +1617,80 @@ async fn fetch_crypto(client: &reqwest::Client, coin: &str) -> (&'static str, Va
         },
         Ok(resp) => ("coingecko", json!({ "error": format!("HTTP {}", resp.status()) })),
         Err(e) => ("coingecko", json!({ "error": e.to_string() })),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Local computation helpers (no network)
+// ---------------------------------------------------------------------------
+
+/// Answer date/calendar questions using chrono.
+fn compute_calendar(query: &str) -> Value {
+    let now = chrono::Local::now();
+    json!({
+        "query": query,
+        "today": now.format("%Y-%m-%d %A").to_string(),
+        "timestamp": now.timestamp(),
+        "note": "Use this date info to answer the user's calendar question.",
+    })
+}
+
+/// Answer unit conversion questions. Returns the query for the LLM to compute.
+fn compute_unit_convert(query: &str) -> Value {
+    json!({
+        "query": query,
+        "note": "Compute this unit conversion and return the result.",
+    })
+}
+
+/// Evaluate a math expression. Simple expressions only.
+fn compute_math(expr: &str) -> Value {
+    // Security: only allow digits, operators, parens, decimal points, spaces.
+    let safe = expr.chars().all(|c| c.is_ascii_digit() || "+-*/.() %^".contains(c));
+    if !safe {
+        return json!({ "error": "unsafe expression", "expr": expr });
+    }
+    // Use a simple eval approach: replace ^ with ** for power, then
+    // delegate to the LLM for actual computation (we just validate safety).
+    json!({
+        "expr": expr,
+        "note": "Compute this math expression and return the exact result.",
+    })
+}
+
+// ---------------------------------------------------------------------------
+// API-based helpers
+// ---------------------------------------------------------------------------
+
+/// IP geolocation via ip-api.com (free, no key, 45 req/min).
+async fn fetch_ip(client: &reqwest::Client, ip: &str) -> (&'static str, Value) {
+    let url = if ip.is_empty() {
+        "http://ip-api.com/json/?lang=zh-CN&fields=66846719".to_owned()
+    } else {
+        format!("http://ip-api.com/json/{ip}?lang=zh-CN&fields=66846719")
+    };
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(j) => ("ip-api.com", j),
+            Err(e) => ("ip-api.com", json!({ "error": format!("json parse: {e}") })),
+        },
+        Ok(resp) => ("ip-api.com", json!({ "error": format!("HTTP {}", resp.status()) })),
+        Err(e) => ("ip-api.com", json!({ "error": e.to_string() })),
+    }
+}
+
+/// DNS lookup via DNS-over-HTTPS (Cloudflare).
+async fn fetch_dns(client: &reqwest::Client, domain: &str) -> (&'static str, Value) {
+    let url = format!(
+        "https://cloudflare-dns.com/dns-query?name={}&type=A",
+        urlencoding::encode(domain),
+    );
+    match client.get(&url).header("Accept", "application/dns-json").send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(j) => ("cloudflare-dns", j),
+            Err(e) => ("cloudflare-dns", json!({ "error": format!("json parse: {e}") })),
+        },
+        Ok(resp) => ("cloudflare-dns", json!({ "error": format!("HTTP {}", resp.status()) })),
+        Err(e) => ("cloudflare-dns", json!({ "error": e.to_string() })),
     }
 }

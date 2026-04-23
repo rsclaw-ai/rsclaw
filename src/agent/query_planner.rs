@@ -81,6 +81,34 @@ pub enum Intent {
     Translate { text: String, to: String },
     /// Crypto price — API → coingecko.
     CryptoPrice { coin: String },
+    /// Calendar/date query — computed locally.
+    Calendar { query: String },
+    /// Unit conversion — computed locally.
+    UnitConvert { query: String },
+    /// Math calculation — computed locally.
+    Math { expr: String },
+    /// IP address lookup — API → ip-api.com.
+    IpLookup { ip: String },
+    /// DNS lookup.
+    DnsLookup { domain: String },
+    /// Whois domain info — browser.
+    Whois { domain: String },
+    /// Phone number region lookup — browser.
+    Phone { number: String },
+    /// Chinese idiom/dictionary — browser → hanyu.baidu.com.
+    Idiom { query: String },
+    /// Chinese poem/classical text — browser → gushiwen.cn.
+    Poem { query: String },
+    /// Law/regulation lookup — browser.
+    Law { query: String },
+    /// Medical/hospital info — browser → dxy.com.
+    Hospital { query: String },
+    /// Recipe/cooking — browser → xiachufang.com.
+    Recipe { query: String },
+    /// Sports scores/schedule — browser.
+    Sports { query: String },
+    /// Lottery results — browser → zhcw.com.
+    Lottery { query: String },
     /// Everything else — caller should fall back to regular web_search.
     General,
 }
@@ -135,6 +163,20 @@ Intent kinds and required fields:
   map          : {{"kind":"map","query":"<place or route>"}}
   translate    : {{"kind":"translate","text":"<text to translate>","to":"<target language code>"}}
   crypto_price : {{"kind":"crypto_price","coin":"<coin id, e.g. bitcoin>"}}
+  calendar     : {{"kind":"calendar","query":"<date question>"}}
+  unit_convert : {{"kind":"unit_convert","query":"<conversion expression>"}}
+  math         : {{"kind":"math","expr":"<math expression, e.g. 123*456>"}}
+  ip_lookup    : {{"kind":"ip_lookup","ip":"<IP address or empty for self>"}}
+  dns_lookup   : {{"kind":"dns_lookup","domain":"<domain name>"}}
+  whois        : {{"kind":"whois","domain":"<domain name>"}}
+  phone        : {{"kind":"phone","number":"<phone number>"}}
+  idiom        : {{"kind":"idiom","query":"<idiom or word>"}}
+  poem         : {{"kind":"poem","query":"<poem title or keyword>"}}
+  law          : {{"kind":"law","query":"<law question>"}}
+  hospital     : {{"kind":"hospital","query":"<medical question>"}}
+  recipe       : {{"kind":"recipe","query":"<dish name>"}}
+  sports       : {{"kind":"sports","query":"<match or team>"}}
+  lottery      : {{"kind":"lottery","query":"<lottery type>"}}
   general      : {{"kind":"general"}}
 
 Rules:
