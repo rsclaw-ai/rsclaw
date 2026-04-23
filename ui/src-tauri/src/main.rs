@@ -1202,6 +1202,19 @@ fn main() {
                         set_dock_visible(false);
                     }
                 }
+                // macOS Dock quit / Cmd+Q: stop gateway before exit.
+                tauri::RunEvent::ExitRequested { .. } => {
+                    if !APP_EXITING.swap(true, Ordering::SeqCst) {
+                        eprintln!("[ExitRequested] stopping gateway...");
+                        match http_shutdown_gateway() {
+                            Ok(()) => eprintln!("[ExitRequested] shutdown OK"),
+                            Err(e) => {
+                                eprintln!("[ExitRequested] HTTP shutdown failed: {e}; falling back to CLI");
+                                let _ = run_rsclaw_command(&["gateway", "stop"]);
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         });

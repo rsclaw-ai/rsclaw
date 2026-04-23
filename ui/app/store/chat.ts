@@ -65,7 +65,7 @@ export type ChatMessage = RequestMessage & {
 export function createMessage(override: Partial<ChatMessage>): ChatMessage {
   return {
     id: nanoid(),
-    date: new Date().toLocaleString(),
+    date: new Date().toISOString(),
     role: "user",
     content: "",
     ...override,
@@ -465,7 +465,7 @@ export const useChatStore = createPersistStore(
             botMessage.streaming = false;
             if (message) {
               botMessage.content = message;
-              botMessage.date = new Date().toLocaleString();
+              botMessage.date = new Date().toISOString();
               get().onNewMessage(botMessage, session);
             }
             ChatControllerPool.remove(session.id, botMessage.id);

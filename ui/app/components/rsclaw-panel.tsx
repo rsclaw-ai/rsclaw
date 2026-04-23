@@ -3804,26 +3804,6 @@ function TauriConfigPageInner() {
             </div>
             <div style={fieldRow}>
               <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "快速模型" : "Flash Model"}</div>
-                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.flashModel.primary ({zh ? "留空则使用主模型" : "empty → use main model"})</div>
-              </div>
-              <input
-                style={{ ...fInput, minWidth: 240 }}
-                type="text"
-                placeholder={zh ? "例如 custom/qwen-turbo" : "e.g. custom/qwen-turbo"}
-                value={getVal("agents.defaults.flashModel.primary", "")}
-                onChange={(e) => {
-                  const v = (e.target.value || "").trim();
-                  if (!v) {
-                    updateConfig("agents.defaults.flashModel", undefined);
-                  } else {
-                    updateConfig("agents.defaults.flashModel.primary", v);
-                  }
-                }}
-              />
-            </div>
-            <div style={fieldRow}>
-              <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "旁路上下文预算" : "Bypass Context Budget"}</div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.btw_tokens ({zh ? "tokens" : "tokens"})</div>
               </div>
@@ -3972,7 +3952,7 @@ function TauriConfigPageInner() {
                 })()}
               </div>
             </div>
-            <div style={{ ...fieldRow, borderBottom: "none" }}>
+            <div style={fieldRow}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5DE5\u5177\u96C6" : "Toolset"}</div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.toolset</div>
@@ -3982,6 +3962,22 @@ function TauriConfigPageInner() {
                 <option value="standard">standard {zh ? "\u2014 12 \u4E2A\u5DE5\u5177" : "-- 12 tools"}</option>
                 <option value="full">full {zh ? "\u2014 \u5168\u90E8\u5DE5\u5177" : "-- all tools"}</option>
               </select>
+            </div>
+            <div style={{ ...fieldRow, borderBottom: "none" }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5FEB\u901F\u6A21\u578B" : "Flash Model"}</div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.flash ({zh ? "\u7559\u7A7A\u5219\u4F7F\u7528\u4E3B\u6A21\u578B" : "empty \u2192 use main model"})</div>
+              </div>
+              <input
+                style={{ ...fInput, minWidth: 300 }}
+                type="text"
+                placeholder={zh ? "\u4F8B\u5982 custom/qwen-turbo" : "e.g. custom/qwen-turbo"}
+                value={getVal("agents.defaults.model.flash", "")}
+                onChange={(e) => {
+                  const v = (e.target.value || "").trim();
+                  updateConfig("agents.defaults.model.flash", v || undefined);
+                }}
+              />
             </div>
           </div>
 
@@ -4590,7 +4586,7 @@ function TauriConfigPageInner() {
               <div style={{ fontSize: 10, fontWeight: 600, color: V.t2, letterSpacing: 0.4, textTransform: "uppercase" as const, flex: 1 }}>webSearch</div>
               <Toggle on={getVal("tools.webSearch.enabled", true)} onClick={() => updateConfig("tools.webSearch.enabled", !getVal("tools.webSearch.enabled", true))} />
             </div>
-            <div style={{ ...fieldRow, borderBottom: "none" }}>
+            <div style={fieldRow}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u641C\u7D22\u63D0\u4F9B\u5546" : "Search Provider"}</div>
               </div>
@@ -4603,9 +4599,53 @@ function TauriConfigPageInner() {
                 <option value="google">Google {zh ? "(\u9700 API Key)" : "(API key)"}</option>
                 <option value="bing">Bing {zh ? "(\u9700 API Key)" : "(API key)"}</option>
                 <option value="brave">Brave {zh ? "(\u9700 API Key)" : "(API key)"}</option>
-                <option value="baidu">{zh ? "\u767E\u5EA6 (\u9700 API Key)" : "Baidu (API key)"}</option>
+                <option value="serper">Serper {zh ? "(\u9700 API Key)" : "(API key)"}</option>
               </select>
             </div>
+            {/* API Key fields for providers that need them */}
+            {getVal("tools.webSearch.provider", "bing-free") === "google" && (<>
+              <div style={fieldRow}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>Google API Key</div>
+                  <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>tools.webSearch.googleApiKey</div>
+                </div>
+                <input style={{ ...fInput, minWidth: 260 }} type="password" placeholder="AIza..." value={getVal("tools.webSearch.googleApiKey", "")} onChange={(e) => updateConfig("tools.webSearch.googleApiKey", e.target.value)} />
+              </div>
+              <div style={{ ...fieldRow, borderBottom: "none" }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>Google CX</div>
+                  <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>tools.webSearch.googleCx</div>
+                </div>
+                <input style={{ ...fInput, minWidth: 260 }} type="text" placeholder="Custom Search Engine ID" value={getVal("tools.webSearch.googleCx", "")} onChange={(e) => updateConfig("tools.webSearch.googleCx", e.target.value)} />
+              </div>
+            </>)}
+            {getVal("tools.webSearch.provider", "bing-free") === "bing" && (
+              <div style={{ ...fieldRow, borderBottom: "none" }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>Bing API Key</div>
+                  <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>tools.webSearch.bingApiKey</div>
+                </div>
+                <input style={{ ...fInput, minWidth: 260 }} type="password" placeholder="Ocp-Apim-Subscription-Key" value={getVal("tools.webSearch.bingApiKey", "")} onChange={(e) => updateConfig("tools.webSearch.bingApiKey", e.target.value)} />
+              </div>
+            )}
+            {getVal("tools.webSearch.provider", "bing-free") === "brave" && (
+              <div style={{ ...fieldRow, borderBottom: "none" }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>Brave API Key</div>
+                  <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>tools.webSearch.braveApiKey</div>
+                </div>
+                <input style={{ ...fInput, minWidth: 260 }} type="password" placeholder="BSA..." value={getVal("tools.webSearch.braveApiKey", "")} onChange={(e) => updateConfig("tools.webSearch.braveApiKey", e.target.value)} />
+              </div>
+            )}
+            {getVal("tools.webSearch.provider", "bing-free") === "serper" && (
+              <div style={{ ...fieldRow, borderBottom: "none" }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>Serper API Key</div>
+                  <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>tools.webSearch.serperApiKey</div>
+                </div>
+                <input style={{ ...fInput, minWidth: 260 }} type="password" placeholder="serper.dev key" value={getVal("tools.webSearch.serperApiKey", "")} onChange={(e) => updateConfig("tools.webSearch.serperApiKey", e.target.value)} />
+              </div>
+            )}
           </div>
 
           {/* Memory */}

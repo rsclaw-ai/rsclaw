@@ -184,6 +184,44 @@ if [[ -d "$APP_BUNDLE" ]] && [[ "$(uname -s)" == "Darwin" ]]; then
     log "Signing with: $SIGN_IDENTITY"
     if codesign "${SIGN_ARGS[@]}" "$APP_BUNDLE" 2>&1; then
         log "App signed successfully"
+
+        # Notarize with Apple (requires APPLE_ID + app-specific password in keychain
+        # or env vars). Without notarization, Gatekeeper shows "cannot verify" warning.
+        APPLE_ID="${APPLE_ID:-}"
+        APPLE_TEAM_ID="${APPLE_TEAM_ID:-K87X8CQ78Y}"
+        # Try keychain profile first, then env var password
+        if xcrun notarytool history --keychain-profile "notarytool-profile" >/dev/null 2>&1; then
+            log "Notarizing with keychain profile..."
+            ZIP_PATH="/tmp/RsClaw-notarize.zip"
+            ditto -c -k --keepParent "$APP_BUNDLE" "$ZIP_PATH"
+            if xcrun notarytool submit "$ZIP_PATH" \
+                --keychain-profile "notarytool-profile" \
+                --wait 2>&1; then
+                log "Notarization succeeded"
+                xcrun stapler staple "$APP_BUNDLE" 2>&1 || true
+            else
+                warn "Notarization failed — app will trigger Gatekeeper warning"
+            fi
+            rm -f "$ZIP_PATH"
+        elif [[ -n "$APPLE_ID" && -n "${APPLE_PASSWORD:-}" ]]; then
+            log "Notarizing with APPLE_ID..."
+            ZIP_PATH="/tmp/RsClaw-notarize.zip"
+            ditto -c -k --keepParent "$APP_BUNDLE" "$ZIP_PATH"
+            if xcrun notarytool submit "$ZIP_PATH" \
+                --apple-id "$APPLE_ID" \
+                --password "$APPLE_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID" \
+                --wait 2>&1; then
+                log "Notarization succeeded"
+                xcrun stapler staple "$APP_BUNDLE" 2>&1 || true
+            else
+                warn "Notarization failed — app will trigger Gatekeeper warning"
+            fi
+            rm -f "$ZIP_PATH"
+        else
+            dim "Skipping notarization (no keychain profile or APPLE_ID set)"
+            dim "To enable: xcrun notarytool store-credentials notarytool-profile"
+        fi
     else
         warn "Signing failed — app will use ad-hoc signature"
     fi

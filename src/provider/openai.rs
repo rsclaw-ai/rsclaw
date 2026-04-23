@@ -1323,12 +1323,13 @@ fn parse_event(data: &str) -> Option<StreamEvent> {
         let name = func["name"].as_str().unwrap_or("").to_owned();
         let args_str = func["arguments"].as_str().unwrap_or("");
         // In streaming mode, arguments arrive as partial JSON fragments.
-        // Try to parse as complete JSON; if that fails, store as raw string
-        // for the runtime to accumulate across chunks.
+        // Always keep as raw string — never parse fragments, because
+        // serde_json::from_str(" 3") parses to Number(3), silently
+        // dropping the leading space and corrupting the reassembled JSON.
         let input = if args_str.is_empty() {
             Value::Object(Default::default())
         } else {
-            serde_json::from_str(args_str).unwrap_or_else(|_| Value::String(args_str.to_owned()))
+            Value::String(args_str.to_owned())
         };
         tracing::debug!(id = %id, name = %name, args_len = args_str.len(), "openai: tool call chunk");
         return Some(StreamEvent::ToolCall { id, name, input });
@@ -1759,7 +1760,7 @@ fn parse_completions_fallback(v: &Value) -> Option<StreamEvent> {
         let input = if args_str.is_empty() {
             Value::Object(Default::default())
         } else {
-            serde_json::from_str(args_str).unwrap_or_else(|_| Value::String(args_str.to_owned()))
+            Value::String(args_str.to_owned())
         };
         return Some(StreamEvent::ToolCall { id, name, input });
     }

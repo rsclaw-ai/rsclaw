@@ -449,8 +449,12 @@ impl AgentRuntime {
                     info!(count = browser_results.len(), "web_search: browser fallback succeeded");
                     results = browser_results;
                 }
-                Ok(_) => warn!("web_search: browser fallback also returned empty"),
-                Err(e) => warn!("web_search: browser fallback failed: {e:#}"),
+                Ok(_) => {
+                    bail!("web_search: all search providers and browser fallback returned empty. The IP may be rate-limited by search engines. Try again later or configure an API-key search provider.");
+                }
+                Err(e) => {
+                    bail!("web_search: all search providers failed and browser fallback error: {e:#}. Try again later or configure an API-key search provider.");
+                }
             }
         }
 

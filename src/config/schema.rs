@@ -442,6 +442,10 @@ pub struct ModelConfig {
     /// Maximum tokens for LLM response. Default: 2048.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Cheap/fast model for internal sub-tasks (query planning, intent
+    /// classification, summarization). Falls back to `primary` when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flash: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
