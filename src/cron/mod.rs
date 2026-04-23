@@ -1594,18 +1594,28 @@ async fn run_exec_command(
 
         handle.tx.send(msg).await.context("agent inbox closed")?;
 
-        // Wait for summary with timeout
+        // Wait for summary with timeout. If timeout or error, fallback to raw output.
+        // This prevents cron failure when agent is busy with other tasks.
         let summary_timeout = Duration::from_secs(60);
-        let reply = tokio::time::timeout(summary_timeout, reply_rx)
-            .await
-            .map_err(|_| anyhow!("summarization timed out after {}s", summary_timeout.as_secs()))?
-            .context("agent dropped reply channel")?;
-
-        if reply.is_empty {
-            // Agent returned nothing, use raw output
-            Ok(raw_output)
-        } else {
-            Ok(reply.text)
+        match tokio::time::timeout(summary_timeout, reply_rx).await {
+            Ok(Ok(reply)) => {
+                if reply.is_empty {
+                    // Agent returned nothing, use raw output
+                    Ok(raw_output)
+                } else {
+                    Ok(reply.text)
+                }
+            }
+            Ok(Err(_)) => {
+                // Agent dropped reply channel, fallback to raw output
+                tracing::warn!(job_id = %job.id, "summarize: agent dropped reply, using raw output");
+                Ok(raw_output)
+            }
+            Err(_) => {
+                // Timeout - agent is busy, fallback to raw output
+                tracing::warn!(job_id = %job.id, timeout_secs = summary_timeout.as_secs(), "summarize: timed out, using raw output");
+                Ok(raw_output)
+            }
         }
     } else {
         Ok(raw_output)
