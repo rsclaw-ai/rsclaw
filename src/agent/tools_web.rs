@@ -1122,7 +1122,16 @@ impl AgentRuntime {
                     Intent::GithubRepo { owner, repo } => {
                         Some(fetch_github(&client, owner, repo).await)
                     }
-                    Intent::CryptoPrice { coin } => Some(fetch_crypto(&client, coin).await),
+                    Intent::CryptoPrice { coin } => {
+                        let result = fetch_crypto(&client, coin).await;
+                        if result.1.get("error").is_some() {
+                            // CoinGecko failed — fallback to feixiaohao via browser.
+                            let url = format!("https://www.feixiaohao.co/search/?q={}", urlencoding::encode(coin));
+                            Some(("feixiaohao", self.browser_fetch_or_error(&url).await))
+                        } else {
+                            Some(result)
+                        }
+                    }
                     // Browser-pool intents: construct target URL, fetch via browser.
                     Intent::Flight { from, to, date, trip } => {
                         let trip_type = if trip == "roundtrip" { "roundtrip" } else { "oneway" };
