@@ -160,30 +160,45 @@ impl AgentRuntime {
                                 crate::acp::client::SessionEvent::ToolCallStarted {
                                     title, ..
                                 } => {
-                                    format!("🔧 {}", title.as_deref().unwrap_or("tool"))
+                                    let s = format!("🔧 {}", title.as_deref().unwrap_or("tool"));
+                                    tracing::info!("OpenCode event: {}", s);
+                                    s
                                 }
                                 crate::acp::client::SessionEvent::ToolCallCompleted {
                                     result,
                                     ..
-                                } => result
-                                    .as_ref()
-                                    .map(|r| {
-                                        if r.chars().count() > 100 {
-                                            let cutoff = r
-                                                .char_indices()
-                                                .nth(100)
-                                                .map(|(i, _)| i)
-                                                .unwrap_or(r.len());
-                                            format!("✅ {}...", &r[..cutoff])
-                                        } else {
-                                            format!("✅ {}", r)
-                                        }
-                                    })
-                                    .unwrap_or_default(),
+                                } => {
+                                    let s = result
+                                        .as_ref()
+                                        .map(|r| {
+                                            if r.chars().count() > 100 {
+                                                let cutoff = r
+                                                    .char_indices()
+                                                    .nth(100)
+                                                    .map(|(i, _)| i)
+                                                    .unwrap_or(r.len());
+                                                format!("✅ {}...", &r[..cutoff])
+                                            } else {
+                                                format!("✅ {}", r)
+                                            }
+                                        })
+                                        .unwrap_or_default();
+                                    tracing::info!("OpenCode event: {}", s);
+                                    s
+                                }
                                 crate::acp::client::SessionEvent::ToolCallFailed {
                                     error, ..
                                 } => {
-                                    format!("❌ {}", error)
+                                    let s = format!("❌ {}", error);
+                                    tracing::info!("OpenCode event: {}", s);
+                                    s
+                                }
+                                crate::acp::client::SessionEvent::AgentMessageChunk {
+                                    content,
+                                } => {
+                                    // Log message chunks for visibility
+                                    tracing::debug!("OpenCode message: {}", content);
+                                    String::new()
                                 }
                                 // Skip AgentThoughtChunk - don't send thinking messages to user
                                 _ => String::new(),
@@ -628,30 +643,45 @@ impl AgentRuntime {
                                 crate::acp::client::SessionEvent::ToolCallStarted {
                                     title, ..
                                 } => {
-                                    format!("🔧 {}", title.as_deref().unwrap_or("tool"))
+                                    let s = format!("🔧 {}", title.as_deref().unwrap_or("tool"));
+                                    tracing::info!("OpenCode event: {}", s);
+                                    s
                                 }
                                 crate::acp::client::SessionEvent::ToolCallCompleted {
                                     result,
                                     ..
-                                } => result
-                                    .as_ref()
-                                    .map(|r| {
-                                        if r.chars().count() > 100 {
-                                            let cutoff = r
-                                                .char_indices()
-                                                .nth(100)
-                                                .map(|(i, _)| i)
-                                                .unwrap_or(r.len());
-                                            format!("✅ {}...", &r[..cutoff])
-                                        } else {
-                                            format!("✅ {}", r)
-                                        }
-                                    })
-                                    .unwrap_or_default(),
+                                } => {
+                                    let s = result
+                                        .as_ref()
+                                        .map(|r| {
+                                            if r.chars().count() > 100 {
+                                                let cutoff = r
+                                                    .char_indices()
+                                                    .nth(100)
+                                                    .map(|(i, _)| i)
+                                                    .unwrap_or(r.len());
+                                                format!("✅ {}...", &r[..cutoff])
+                                            } else {
+                                                format!("✅ {}", r)
+                                            }
+                                        })
+                                        .unwrap_or_default();
+                                    tracing::info!("OpenCode event: {}", s);
+                                    s
+                                }
                                 crate::acp::client::SessionEvent::ToolCallFailed {
                                     error, ..
                                 } => {
-                                    format!("❌ {}", error)
+                                    let s = format!("❌ {}", error);
+                                    tracing::info!("OpenCode event: {}", s);
+                                    s
+                                }
+                                crate::acp::client::SessionEvent::AgentMessageChunk {
+                                    content,
+                                } => {
+                                    // Log message chunks for visibility
+                                    tracing::debug!("OpenCode message: {}", content);
+                                    String::new()
                                 }
                                 // Skip AgentThoughtChunk - don't send thinking messages to user
                                 _ => String::new(),
