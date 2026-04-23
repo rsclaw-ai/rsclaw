@@ -3249,12 +3249,14 @@ impl AgentRuntime {
                 );
             }
 
-            // Default temperature 0.6 for tool-calling scenarios (reduces
-            // randomness, helps small models preserve digits and paths).
-            // For pure chat (no tools), leave as None (provider default, usually 1.0).
-            // For thinking/reasoning, leave as None (let provider handle CoT temperature).
-            let temperature = if thinking_budget.is_some() || tools.is_empty() {
+            // Temperature: 0.6 when tools are available (reduces randomness,
+            // helps small models preserve digits and call tools reliably).
+            // 0.7 for pure chat (no tools) — slightly creative but not wild.
+            // None for thinking/reasoning (let provider handle CoT temperature).
+            let temperature = if thinking_budget.is_some() {
                 None
+            } else if tools.is_empty() {
+                Some(0.7)
             } else {
                 Some(0.6)
             };
