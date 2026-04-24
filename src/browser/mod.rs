@@ -3366,3 +3366,50 @@ const SNAPSHOT_INTERACTIVE_JS: &str = r#"(function(){
   if (document.body) walk(document.body, 0);
   return JSON.stringify({lines: lines, refCount: counter});
 })()"#;
+
+#[cfg(test)]
+mod tests {
+    use super::detect_existing_chrome;
+    use serde_json::json;
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    #[tokio::test]
+    async fn detect_existing_chrome_skips_headless() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        let body = json!({
+            "Browser": "Chrome/147.0.0.0",
+            "User-Agent": "Mozilla/5.0 ... HeadlessChrome/147.0.0.0 Safari/537.36",
+            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/browser/abc")
+        });
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let result = detect_existing_chrome(&[port]).await;
+        assert!(
+            result.is_none(),
+            "must skip HeadlessChrome instance, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_existing_chrome_accepts_headed() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        let ws = format!("ws://127.0.0.1:{port}/devtools/browser/def");
+        let body = json!({
+            "Browser": "Chrome/147.0.0.0",
+            "User-Agent": "Mozilla/5.0 ... Chrome/147.0.0.0 Safari/537.36",
+            "webSocketDebuggerUrl": ws.clone()
+        });
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let result = detect_existing_chrome(&[port]).await;
+        assert_eq!(result.as_deref(), Some(ws.as_str()));
+    }
+}
