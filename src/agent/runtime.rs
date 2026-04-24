@@ -3735,6 +3735,8 @@ impl AgentRuntime {
             if tool_calls.is_empty() {
                 // Deception detection: model claims action but no tool was called.
                 // This is a critical trust violation that must be flagged to the user.
+                // IMPORTANT: Check turn_scratchpad for tool calls from earlier iterations,
+                // not just current iteration's tool_calls (which is empty at this point).
                 let deception_keywords = [
                     "已委托", "已用opencode", "已让opencode", "委托给opencode",
                     "已检查", "已搜索", "已运行", "已执行",
@@ -3746,11 +3748,27 @@ impl AgentRuntime {
                 let claims_action = deception_keywords.iter().any(|kw| {
                     lower_text.contains(&kw.to_lowercase()) || text_buf.contains(kw)
                 });
-                if claims_action && !text_buf.trim().is_empty() {
+
+                // Check if turn_scratchpad contains tool calls (from earlier iterations)
+                let has_tool_in_turn = turn_scratchpad.iter().any(|msg| {
+                    if let crate::provider::MessageContent::Parts(parts) = &msg.content {
+                        parts.iter().any(|p| {
+                            matches!(p, crate::provider::ContentPart::ToolUse { name, .. }
+                                if name == "opencode" || name == "claudecode" || name == "codex"
+                                    || name == "web_search" || name == "execute_command")
+                        })
+                    } else {
+                        false
+                    }
+                });
+
+                // Only flag deception if model claims action AND no tool was called in entire turn
+                if claims_action && !text_buf.trim().is_empty() && !has_tool_in_turn {
                     tracing::warn!(
                         session = %ctx.session_key,
                         text_preview = %text_buf.chars().take(200).collect::<String>(),
-                        "DECEPTION DETECTED: model claims action but no tool_call"
+                        has_tool_in_turn = has_tool_in_turn,
+                        "DECEPTION DETECTED: model claims action but no tool_call in turn"
                     );
                     // Send warning via notification channel (streaming already sent original text).
                     // Append warning to text_buf so it's persisted in session history.
@@ -4431,7 +4449,14 @@ impl AgentRuntime {
                         crate::provider::ContentPart::ToolResult {
                             tool_use_id: tool_id.clone(),
                             content: session_text,
-                            is_error: Some(false),
+                            // Detect error from result content (exit_code != 0 or error field)
+                            is_error: Some(
+                                result_text.contains("\"exit_code\":")
+                                && result_text.contains("\"exit_code\": 0") == false
+                                || result_text.contains("\"error\"")
+                                || result_text.contains("[stderr]")
+                                || result_text.contains("[exit code:")
+                            ),
                         },
                     ]),
                 };
