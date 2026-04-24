@@ -95,6 +95,7 @@ import {
   Modal,
   Selector,
   showConfirm,
+  showImageModal,
   showPrompt,
   showToast,
 } from "./ui-lib";
@@ -2270,6 +2271,7 @@ function _Chat() {
                                 className={styles["chat-message-item-image"]}
                                 src={getMessageImages(message)[0]}
                                 alt=""
+                                onClick={() => showImageModal(getMessageImages(message)[0])}
                               />
                             )}
                             {getMessageImages(message).length > 1 && (
@@ -2294,6 +2296,7 @@ function _Chat() {
                                         key={index}
                                         src={image}
                                         alt=""
+                                        onClick={() => showImageModal(image)}
                                       />
                                     );
                                   },
@@ -2309,7 +2312,7 @@ function _Chat() {
                             return (rsFiles.length > 0 || rsImages.length > 0) ? (
                               <>
                                 {dataImages.map((src, idx) => (
-                                  <img key={`di-${idx}`} className={styles["chat-message-item-image"]} src={src} alt="" />
+                                  <img key={`di-${idx}`} className={styles["chat-message-item-image"]} src={src} alt="" onClick={() => showImageModal(src)} />
                                 ))}
                                 {(rsFiles.length > 0 || fileImages.length > 0) && (
                                   <div className={styles["chat-file-chips"]}>
