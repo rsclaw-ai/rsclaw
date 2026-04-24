@@ -435,16 +435,20 @@ export const useChatStore = createPersistStore(
         const sendMessages = recentMessages.concat(userMessage);
         const messageIndex = session.messages.length + 1;
 
-        // save user's and bot's message
+        // save user's and bot's message (guard against duplicate append
+        // if called while a previous bot is still streaming)
         get().updateTargetSession(session, (session) => {
           const savedUserMessage = {
             ...userMessage,
             content: mContent,
           };
-          session.messages = session.messages.concat([
-            savedUserMessage,
-            botMessage,
-          ]);
+          const ids = new Set(session.messages.map((m) => m.id));
+          const toAdd = [savedUserMessage, botMessage].filter(
+            (m) => !ids.has(m.id),
+          );
+          if (toAdd.length > 0) {
+            session.messages = session.messages.concat(toAdd);
+          }
         });
 
         const api: ClientApi = getClientApi(modelConfig.providerName);

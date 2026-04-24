@@ -1955,6 +1955,7 @@ function _Chat() {
               }}
             >
               {messages
+                .filter((m, idx, arr) => arr.findIndex((x) => x.id === m.id) === idx)
                 .map((message, i) => {
                   const isUser = message.role === "user";
                   const isContext = i < context.length;

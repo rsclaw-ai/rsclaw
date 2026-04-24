@@ -668,6 +668,24 @@ impl super::runtime::AgentRuntime {
             if !extra_paths.is_empty() {
                 let sys_path = std::env::var("PATH").unwrap_or_default();
                 let mut all: Vec<String> = extra_paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+                // Add common user bin paths that may be missing when launched
+                // from a desktop app (macOS/Windows don't inherit shell profile).
+                if let Some(home) = dirs_next::home_dir() {
+                    for rel in &[".local/bin", ".cargo/bin", "bin", "go/bin", ".bun/bin"] {
+                        let p = home.join(rel);
+                        if p.exists() {
+                            all.push(p.to_string_lossy().to_string());
+                        }
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    for p in &["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"] {
+                        if std::path::Path::new(p).exists() {
+                            all.push(p.to_string());
+                        }
+                    }
+                }
                 all.push(sys_path);
                 cmd.env("PATH", all.join(if cfg!(windows) { ";" } else { ":" }));
             }

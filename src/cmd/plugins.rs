@@ -115,7 +115,7 @@ async fn plugins_install(spec: &str) -> Result<()> {
     if spec.starts_with("http://") || spec.starts_with("https://") {
         install_from_url(spec).await
     } else if spec.ends_with(".wasm") {
-        install_wasm_file(std::path::Path::new(spec))
+        install_wasm_file(std::path::Path::new(spec)).await
     } else if spec.ends_with(".zip") {
         install_from_zip(std::path::Path::new(spec))
     } else if spec.ends_with(".tar.gz") || spec.ends_with(".tgz") {
@@ -237,26 +237,67 @@ fn find_plugin_dir(root: &std::path::Path) -> Result<std::path::PathBuf> {
     bail!("no plugin manifest found in archive")
 }
 
-/// Install a `.wasm` plugin: create a directory and generate a `plugin.json5`.
-fn install_wasm_file(src: &std::path::Path) -> Result<()> {
+/// Install a `.wasm` plugin: load it to read manifest, create directory, generate `plugin.json5`.
+async fn install_wasm_file(src: &std::path::Path) -> Result<()> {
     if !src.exists() {
         bail!("file not found: {}", src.display());
     }
-
-    let stem = src
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow::anyhow!("invalid file path: {}", src.display()))?;
 
     let filename = src
         .file_name()
         .and_then(|f| f.to_str())
         .ok_or_else(|| anyhow::anyhow!("invalid file name"))?;
 
-    let dest_dir = plugins_dir().join(stem);
+    // Load the wasm to read its embedded manifest (name, version, description, tools).
+    println!("  {} loading WASM manifest...", dim("*"));
+    let mut wasm_config = wasmtime::Config::new();
+    wasm_config.async_support(true);
+    let engine = wasmtime::Engine::new(&wasm_config)
+        .context("create wasmtime engine")?;
+
+    let stem = src
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("plugin")
+        .to_owned();
+
+    // Build a temporary manifest pointing at the source file so load_wasm_plugin can find it.
+    let tmp_manifest = crate::plugin::PluginManifest {
+        name: stem.clone(),
+        id: None,
+        version: None,
+        description: None,
+        runtime: "wasm".to_owned(),
+        entry: src.to_string_lossy().to_string(),
+        channels: vec![],
+        slots: vec![],
+        hooks: vec![],
+        tools: vec![],
+        requires_rsclaw: None,
+        extra: Default::default(),
+        dir: std::path::PathBuf::from("."),
+    };
+
+    let browser = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+    let wasm_plugin = crate::plugin::load_wasm_plugin(&tmp_manifest, &engine, browser).await;
+
+    let (name, version, description, tools_count) = match wasm_plugin {
+        Ok(ref wp) => (
+            wp.name.clone(),
+            wp.version.clone().unwrap_or_default(),
+            wp.description.clone().unwrap_or_default(),
+            wp.tools.len(),
+        ),
+        Err(ref e) => {
+            warn_msg(&format!("could not read WASM manifest: {e:#}"));
+            (stem.clone(), String::new(), String::new(), 0)
+        }
+    };
+
+    let dest_dir = plugins_dir().join(&name);
     if dest_dir.exists() {
         bail!(
-            "plugin `{stem}` already installed at {}. Remove it first.",
+            "plugin `{name}` already installed at {}. Remove it first.",
             dest_dir.display()
         );
     }
@@ -266,12 +307,17 @@ fn install_wasm_file(src: &std::path::Path) -> Result<()> {
     std::fs::copy(src, dest_dir.join(filename))
         .with_context(|| format!("copy {} -> {}", src.display(), dest_dir.display()))?;
 
-    // Generate plugin.json5 skeleton
+    // Generate plugin.json5 with data from the wasm manifest.
+    let ver = if version.is_empty() { "0.1.0" } else { &version };
+    let desc_line = if description.is_empty() {
+        String::new()
+    } else {
+        format!("\n  description: {:?},", description)
+    };
     let manifest_content = format!(
         r#"{{
-  name: "{stem}",
-  version: "0.1.0",
-  description: "",
+  name: "{name}",
+  version: "{ver}",{desc_line}
   runtime: "wasm",
   entry: "./{filename}",
 }}
@@ -280,11 +326,12 @@ fn install_wasm_file(src: &std::path::Path) -> Result<()> {
     std::fs::write(dest_dir.join(MANIFEST_FILE), &manifest_content)?;
 
     ok(&format!(
-        "installed WASM plugin '{}' to {}",
-        cyan(stem),
+        "installed WASM plugin '{}' v{} ({} tools) to {}",
+        cyan(&name),
+        dim(ver),
+        tools_count,
         dim(&dest_dir.display().to_string())
     ));
-    println!("  {}", dim(&format!("edit {} to update metadata", dest_dir.join(MANIFEST_FILE).display())));
     Ok(())
 }
 
