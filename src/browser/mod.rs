@@ -376,6 +376,15 @@ pub(crate) async fn detect_existing_chrome(ports: &[u16]) -> Option<String> {
         match client.get(&url).send().await {
             Ok(resp) => {
                 if let Ok(body) = resp.json::<Value>().await {
+                    // Skip orphaned headless Chrome (e.g. leaked by agent-browser
+                    // or other automation). The headed path is for the user's
+                    // daily browser; hijacking a zombie headless instance leads
+                    // to "CDP connect failed" when its renderer tree is stuck.
+                    let ua = body.get("User-Agent").and_then(|v| v.as_str()).unwrap_or("");
+                    if ua.contains("HeadlessChrome") {
+                        warn!(port, "skipping headless Chrome on remote-debugging port (not a user browser)");
+                        continue;
+                    }
                     if let Some(ws_url) = body.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) {
                         debug!(port, ws_url, "found existing Chrome with remote debugging");
                         return Some(ws_url.to_owned());
@@ -404,9 +413,16 @@ pub(crate) struct CdpClient {
 
 impl CdpClient {
     pub(crate) async fn connect(ws_url: &str) -> Result<Self> {
-        let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url)
-            .await
-            .map_err(|e| anyhow!("CDP WebSocket connect failed: {e}"))?;
+        // Bound the WS upgrade — a stuck Chrome (e.g. orphaned with many dead
+        // renderers) can accept the TCP connect but never complete the upgrade,
+        // which would otherwise hang the agent's serial message loop forever.
+        let (ws_stream, _) = time::timeout(
+            Duration::from_secs(5),
+            tokio_tungstenite::connect_async(ws_url),
+        )
+        .await
+        .map_err(|_| anyhow!("CDP WebSocket connect timeout after 5s: {ws_url}"))?
+        .map_err(|e| anyhow!("CDP WebSocket connect failed: {e}"))?;
 
         let (mut ws_sink, mut ws_source) = ws_stream.split();
 
@@ -640,8 +656,15 @@ impl BrowserSession {
         // Extract port from browser WS URL (ws://127.0.0.1:PORT/devtools/browser/...)
         let port = parse_port_from_ws_url(browser_ws_url)?;
 
+        // Bounded HTTP client for /json target discovery. Default reqwest has
+        // no timeout; a stuck Chrome could hang the agent loop indefinitely.
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .map_err(|e| anyhow!("failed to build HTTP client: {e}"))?;
+
         let discovery_url = format!("http://127.0.0.1:{port}/json");
-        let targets: Vec<Value> = reqwest::get(&discovery_url).await?.json().await?;
+        let targets: Vec<Value> = http.get(&discovery_url).send().await?.json().await?;
 
         let reused = if reuse_tab {
             // Reuse the first existing page tab.
@@ -671,7 +694,7 @@ impl BrowserSession {
             debug!(%target_id, "created new tab in external Chrome");
 
             // Re-fetch targets to find the new tab.
-            let targets: Vec<Value> = reqwest::get(&discovery_url).await?.json().await?;
+            let targets: Vec<Value> = http.get(&discovery_url).send().await?.json().await?;
             let ws_url = targets.iter()
                 .find(|t| t["id"].as_str() == Some(&target_id))
                 .and_then(|t| t["webSocketDebuggerUrl"].as_str())
