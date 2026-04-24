@@ -153,7 +153,7 @@ pub(crate) fn parse_ddg_results(html: &str, limit: usize) -> Vec<Value> {
         };
 
         results.push(json!({
-            "title": strip_inline_tags(title),
+            "title": strip_inline_tags_title(title),
             "url": url,
             "snippet": strip_inline_tags(snippet)
         }));
@@ -183,7 +183,7 @@ pub(crate) fn parse_bing_html_results(html: &str, limit: usize) -> Vec<Value> {
             .unwrap_or("");
         if !url.is_empty() {
             results.push(json!({
-                "title": strip_inline_tags(title),
+                "title": strip_inline_tags_title(title),
                 "url": url,
                 "snippet": strip_inline_tags(snippet)
             }));
@@ -209,7 +209,7 @@ pub(crate) fn parse_baidu_results(html: &str, limit: usize) -> Vec<Value> {
             .unwrap_or("");
         if !url.is_empty() {
             results.push(json!({
-                "title": strip_inline_tags(title),
+                "title": strip_inline_tags_title(title),
                 "url": url,
                 "snippet": strip_inline_tags(snippet)
             }));
@@ -226,7 +226,7 @@ pub(crate) fn parse_sogou_results(html: &str, limit: usize) -> Vec<Value> {
         let title = cap.get(2).map(|m| m.as_str()).unwrap_or("");
         if !url.is_empty() {
             results.push(json!({
-                "title": strip_inline_tags(title),
+                "title": strip_inline_tags_title(title),
                 "url": url,
                 "snippet": ""
             }));
@@ -272,6 +272,23 @@ pub(crate) fn percent_decode(s: &str) -> String {
 pub(crate) fn strip_inline_tags(s: &str) -> String {
     let text = STRIP_TAGS_RE.replace_all(s, "");
     decode_html_entities(&text)
+}
+
+/// Strip inline HTML tags for a search-result title, and insert a newline
+/// before an embedded URL/breadcrumb so the site name is visually separated
+/// from the URL path (common in Bing results: `<strong>domain</strong>url`).
+pub(crate) fn strip_inline_tags_title(s: &str) -> String {
+    let stripped = strip_inline_tags(s);
+    if let Some(idx) = stripped.find("http") {
+        if idx > 0 {
+            let (head, tail) = stripped.split_at(idx);
+            let head_trim = head.trim_end();
+            if !head_trim.is_empty() {
+                return format!("{head_trim}\n{tail}");
+            }
+        }
+    }
+    stripped
 }
 
 /// Truncate a string to at most `max` characters (UTF-8 safe).
