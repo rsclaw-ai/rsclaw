@@ -232,9 +232,14 @@ pub(crate) fn build_tool_list(
             \n\
             CRITICAL: When user EXPLICITLY asks to use a specific tool (opencode, claudecode, codex),\n\
             you MUST call that tool directly. DO NOT create a task agent instead.\n\
-            - User says \"让opencode去...\" -> call opencode tool\n\
+            - User says \"让opencode去...\" -> call opencode tool (action=call, NOT task agent)\n\
             - User says \"用claudecode...\" -> call claudecode tool\n\
-            Creating a task agent when user wants opencode/claudecode is deceiving the user.\n\
+            \n\
+            [HARD RULE - DECEPTION]\n\
+            Claiming \"已委托opencode\" or \"已用opencode检查\" WITHOUT a tool_call is LYING.\n\
+            If you say these words, there MUST be an actual opencode tool call in this turn.\n\
+            No tool call + claim of delegation = you are deceiving the user.\n\
+            This is worse than admitting \"I didn't call it\" - trust is destroyed.\n\
             \n\
             DO NOT delegate these tasks — handle them yourself directly:\n\
             - Any GUI/desktop automation (WeChat, Finder, Safari, system apps, etc.)\n\
@@ -643,7 +648,18 @@ pub(crate) fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "opencode".to_owned(),
-        description: "Execute coding tasks using OpenCode (a powerful coding agent). IMPORTANT: When creating new projects or files, ALWAYS create a dedicated project directory first (e.g., 'my-project/') and place all files inside it. Do NOT create files directly in the workspace root. The task will run asynchronously and results will be sent when complete.".to_owned(),
+        description: "Execute coding/debugging tasks using OpenCode (a powerful coding agent).\n\n\
+            MANDATORY USAGE RULES:\n\
+            1. When user reports a bug/error/crash -> MUST call this tool to investigate\n\
+            2. When user asks to fix/debug a script -> MUST call this tool\n\
+            3. When user says '让opencode...' or '用opencode...' -> MUST call this tool\n\
+            4. DO NOT say '已委托opencode' without actually calling this tool\n\
+            5. Saying you delegated without calling = LYING = worst failure mode\n\
+            \n\
+            If you cannot or will not call this tool, tell user honestly why.\n\
+            NEVER pretend to have called it.\n\
+            \n\
+            Technical: Create project subdirectory for new projects. Runs async, results delivered when complete.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {

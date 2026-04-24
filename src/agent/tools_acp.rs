@@ -36,7 +36,9 @@ impl NotificationSink for ChannelNotifier {
     }
 
     fn priority_filter(&self) -> NotificationPriority {
-        NotificationPriority::Medium
+        // Only forward HIGH priority notifications to user channel.
+        // Medium/Low (tool progress, thoughts) stay in logs only.
+        NotificationPriority::High
     }
 
     fn send(&self, notification: &Notification) -> BoxFuture<'_, Result<()>> {

@@ -2012,9 +2012,27 @@ impl AgentRuntime {
         // --- Dynamic context: injected into system prompt suffix ---
         // Only truly dynamic, per-turn content goes here. Static rules belong
         // in the base system prompt. Auto-recall memories are removed — LLM
-        // uses the memory tool to search when needed. Date is removed — LLM
-        // uses shell commands when it needs the current date/time.
+        // uses the memory tool to search when needed.
         let mut dynamic_ctx = Vec::<String>::new();
+
+        // Inject current date/time — essential for file naming, scheduling, etc.
+        // This is per-turn dynamic content, NOT part of the KV cache stable prefix.
+        let now = chrono::Local::now();
+        use chrono::Datelike;
+        let weekday = now.date_naive().weekday().num_days_from_monday();
+        let last_friday = if weekday >= 4 {
+            now.date_naive() - chrono::Duration::days((weekday - 4) as i64)
+        } else {
+            now.date_naive() - chrono::Duration::days((weekday + 3) as i64)
+        };
+        let yesterday = now.date_naive() - chrono::Duration::days(1);
+        dynamic_ctx.push(format!(
+            "Current date: {} ({}). Yesterday: {}. Last Friday: {}.",
+            now.format("%Y-%m-%d %H:%M"),
+            now.format("%A"),
+            yesterday.format("%Y-%m-%d"),
+            last_friday.format("%Y-%m-%d"),
+        ));
 
         // Loop A (organic evolution): collect recalled memory IDs for feedback.
         // Auto-recall is disabled — LLM uses the memory tool to search when needed.
@@ -3715,6 +3733,50 @@ impl AgentRuntime {
                 "agent_loop: stream finished"
             );
             if tool_calls.is_empty() {
+                // Deception detection: model claims action but no tool was called.
+                // This is a critical trust violation that must be flagged to the user.
+                let deception_keywords = [
+                    "已委托", "已用opencode", "已让opencode", "委托给opencode",
+                    "已检查", "已搜索", "已运行", "已执行",
+                    "已交给", "交给opencode", "opencode正在", "opencode已经",
+                    "I delegated", "I asked opencode", "opencode is", "I ran",
+                    "I checked", "I searched", "I executed",
+                ];
+                let lower_text = text_buf.to_lowercase();
+                let claims_action = deception_keywords.iter().any(|kw| {
+                    lower_text.contains(&kw.to_lowercase()) || text_buf.contains(kw)
+                });
+                if claims_action && !text_buf.trim().is_empty() {
+                    tracing::warn!(
+                        session = %ctx.session_key,
+                        text_preview = %text_buf.chars().take(200).collect::<String>(),
+                        "DECEPTION DETECTED: model claims action but no tool_call"
+                    );
+                    // Send warning via notification channel (streaming already sent original text).
+                    // Append warning to text_buf so it's persisted in session history.
+                    let warning = "\n\n⚠️ **警告**: 模型声称已执行操作但实际上没有调用任何工具。\
+                        这是欺骗行为。请回复「重试并实际调用工具」强制模型执行。";
+                    text_buf.push_str(warning);
+                    // Also send immediately via notification so user sees it.
+                    if let Some(ref ntx) = self.notification_tx {
+                        let notif_target = if !ctx.chat_id.is_empty() {
+                            ctx.chat_id.clone()
+                        } else {
+                            ctx.peer_id.clone()
+                        };
+                        let _ = ntx.send(crate::channel::OutboundMessage {
+                            target_id: notif_target,
+                            is_group: false,
+                            text: "⚠️ **欺骗警告**: 模型声称「已委托/已检查」但没有调用任何工具。\
+                                这是欺骗行为。\n\n请回复「重试」强制模型实际调用 opencode 工具。".to_owned(),
+                            reply_to: None,
+                            images: vec![],
+                            files: vec![],
+                            channel: Some(ctx.channel.clone()),
+                        });
+                    }
+                }
+
                 // Only persist non-empty assistant replies to session.
                 // Empty responses pollute history and confuse the LLM on
                 // subsequent turns (it sees its own empty reply and mimics it).

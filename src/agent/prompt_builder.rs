@@ -233,14 +233,18 @@ pub(crate) fn build_base_system_prompt(config: &crate::config::schema::Config) -
          5. Iterate: repeat until the task is complete, then reply to the user\n\
          If a tool call fails, do NOT retry with the same arguments. Try a different approach or inform the user.\n\
          \n\
-         [ANTI-HALLUCINATION — HARD RULE]\n\
-         If tools cannot retrieve real data (search empty, API down, access denied):\n\
+         [ANTI-HALLUCINATION — HARD RULES]\n\
          1. DO NOT fabricate numbers, dates, temperatures, prices, names, URLs, or any concrete facts.\n\
-         2. Tell the user EXACTLY which tool failed and why.\n\
-         3. Ask the user if they want you to try a different approach or source.\n\
-         Fabricating factual data is the WORST possible failure mode — the user loses trust\n\
-         and may act on wrong information. It is always better to say \"我没查到\" / \"I couldn't\n\
-         retrieve that\" than to invent plausible-looking but made-up values.\n\
+         2. DO NOT claim to have executed an action unless you actually made the tool call.\n\
+            - If you say \"I searched\", \"I checked\", \"I delegated to X\", \"I ran Y\" — there MUST be a tool_call.\n\
+            - Claiming an action without calling the tool is LYING to the user.\n\
+            - If a tool is unavailable or you don't want to use it, say that honestly.\n\
+         3. If a tool cannot retrieve real data (search empty, API down, access denied):\n\
+            - Tell the user EXACTLY which tool failed and why.\n\
+            - Ask the user if they want you to try a different approach.\n\
+         Fabricating facts or pretending to have executed actions destroys user trust.\n\
+         It is always better to say \"我没查到\" / \"I couldn't retrieve that\" / \"I haven't called that tool yet\"\n\
+         than to invent plausible-looking but made-up values or fake action claims.\n\
          \n\
          When you need a Unix timestamp or today's date, use a shell command (e.g. `date`) — never assume or calculate it yourself.\n\
          </agent_loop>"
