@@ -1210,6 +1210,11 @@ function _Chat() {
   const [attachImages, setAttachImages] = useState<string[]>([]);
   const [uploading, setUploading] = useState(false);
   const [fileRefs, setFileRefs] = useState<string[]>([]);
+  // Staged messages submitted while agent is still streaming. They are flushed
+  // one-by-one when isLoading transitions back to false. Mirrors the Claude CLI
+  // UX: typing while busy queues rather than blocking the backend turn.
+  type StagedItem = { text: string; images: string[]; fileRefs: string[] };
+  const [pendingQueue, setPendingQueue] = useState<StagedItem[]>([]);
 
   // prompt hints
   const promptStore = usePromptStore();
@@ -1288,6 +1293,38 @@ function _Chat() {
     }
   };
 
+  // Wrap paths that contain spaces/special chars in single quotes so the
+  // LLM naturally copies them into shell commands as a single argument.
+  // Single-quote is safest in bash; escape embedded apostrophes as
+  // `'\''` per POSIX convention.
+  const quoteIfNeeded = (p: string) => {
+    const needsQuote = /[\s"'`$\\(){}[\]&|;<>*?!]/.test(p);
+    if (!needsQuote) return p;
+    const esc = p.replace(/'/g, "'\\''");
+    return `'${esc}'`;
+  };
+
+  // Build the final input string with file refs appended as [file:...] tokens.
+  const buildFinalInput = (text: string, refs: string[]) => {
+    if (refs.length === 0) return text;
+    return (
+      (text ? text + "\n" : "") +
+      refs.map((p) => `[file:${quoteIfNeeded(p)}]`).join(" ")
+    );
+  };
+
+  // Dispatch a message directly to chatStore. Used both for immediate send and
+  // for flushing queued items. Does NOT re-check isLoading — caller is
+  // responsible for that.
+  const dispatchToStore = (text: string, images: string[], refs: string[]) => {
+    const finalInput = buildFinalInput(text, refs);
+    setIsLoading(true);
+    chatStore
+      .onUserInput(finalInput, images)
+      .finally(() => setIsLoading(false));
+    chatStore.setLastInput(text);
+  };
+
   const doSubmit = (userInput: string) => {
     const hasRefs = fileRefs.length > 0;
     if (userInput.trim() === "" && isEmpty(attachImages) && !hasRefs) return;
@@ -1298,32 +1335,43 @@ function _Chat() {
       matchCommand.invoke();
       return;
     }
-    // Wrap paths that contain spaces/special chars in single quotes so the
-    // LLM naturally copies them into shell commands as a single argument.
-    // Single-quote is safest in bash; escape embedded apostrophes as
-    // `'\''` per POSIX convention.
-    const quoteIfNeeded = (p: string) => {
-      const needsQuote = /[\s"'`$\\(){}[\]&|;<>*?!]/.test(p);
-      if (!needsQuote) return p;
-      const esc = p.replace(/'/g, "'\\''");
-      return `'${esc}'`;
-    };
-    const finalInput = hasRefs
-      ? (userInput ? userInput + "\n" : "") +
-        fileRefs.map((p) => `[file:${quoteIfNeeded(p)}]`).join(" ")
-      : userInput;
-    setIsLoading(true);
-    chatStore
-      .onUserInput(finalInput, attachImages)
-      .then(() => setIsLoading(false));
+    // Agent is busy (previous turn not finished and not interrupted) — stage
+    // this input for flush after the current turn completes or is aborted.
+    if (isLoading) {
+      setPendingQueue((q) => [
+        ...q,
+        {
+          text: userInput,
+          images: [...attachImages],
+          fileRefs: [...fileRefs],
+        },
+      ]);
+      setAttachImages([]);
+      setFileRefs([]);
+      setUserInput("");
+      setPromptHints([]);
+      if (!isMobileScreen) inputRef.current?.focus();
+      return;
+    }
+    dispatchToStore(userInput, attachImages, fileRefs);
     setAttachImages([]);
     setFileRefs([]);
-    chatStore.setLastInput(userInput);
     setUserInput("");
     setPromptHints([]);
     if (!isMobileScreen) inputRef.current?.focus();
     setAutoScroll(true);
   };
+
+  // When the current turn finishes (isLoading goes false), flush the next
+  // staged message. Use a microtask to avoid setState-during-render.
+  useEffect(() => {
+    if (isLoading || pendingQueue.length === 0) return;
+    const [next, ...rest] = pendingQueue;
+    setPendingQueue(rest);
+    dispatchToStore(next.text, next.images, next.fileRefs);
+    setAutoScroll(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLoading, pendingQueue]);
 
   const onPromptSelect = (prompt: RenderPrompt) => {
     setTimeout(() => {
@@ -2371,6 +2419,29 @@ function _Chat() {
                 setUserInput={setUserInput}
                 setShowChatSidePanel={setShowChatSidePanel}
               />
+              {pendingQueue.length > 0 && (
+                <div className={styles["pending-queue-indicator"]}>
+                  <span className={styles["pending-queue-label"]}>
+                    {getLang() === "cn"
+                      ? `等待中 (${pendingQueue.length} 条)`
+                      : `Queued (${pendingQueue.length})`}
+                  </span>
+                  <button
+                    className={styles["pending-queue-clear"]}
+                    onClick={() => setPendingQueue([])}
+                    title={getLang() === "cn" ? "清除队列" : "Clear queue"}
+                  >
+                    <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+                      <path
+                        d="M1.5 1.5L8.5 8.5M8.5 1.5L1.5 8.5"
+                        stroke="currentColor"
+                        strokeWidth="1.5"
+                        strokeLinecap="round"
+                      />
+                    </svg>
+                  </button>
+                </div>
+              )}
               {fileRefs.length > 0 && (
                 <div className={styles["attach-file-refs"]}>
                   {fileRefs.map((path, i) => {

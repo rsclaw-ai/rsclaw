@@ -425,111 +425,114 @@
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
 
-  .chat-tool-block {
-    border-radius: 8px;
-    overflow: hidden;
-    font-size: 12px;
-    border: var(--border-in-light);
+// Tool block styles live at the top level so they apply both inside
+// .chat-tool-blocks (single-tool wrapper) and inside .chat-tool-group-items
+// (expanded multi-tool group).
+.chat-tool-block {
+  border-radius: 8px;
+  overflow: hidden;
+  font-size: 12px;
+  border: var(--border-in-light);
 
-    .chat-tool-block-header {
+  .chat-tool-block-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 12px;
+    background: rgba(0, 0, 0, 0.05);
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.15s;
+
+    &:hover {
+      background: rgba(0, 0, 0, 0.09);
+    }
+
+    .chat-tool-block-icon {
+      display: none;
+    }
+
+    // title column: tool name (dim) + cmd preview (bright) stacked
+    .chat-tool-block-title {
+      flex: 1;
       display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 7px 12px;
-      background: rgba(0, 0, 0, 0.05);
-      cursor: pointer;
-      user-select: none;
-      transition: background 0.15s;
+      flex-direction: column;
+      gap: 1px;
+      overflow: hidden;
+    }
 
-      &:hover {
-        background: rgba(0, 0, 0, 0.09);
-      }
+    .chat-tool-block-name {
+      font-size: 10px;
+      font-family: var(--code-font, "SFMono-Regular", Consolas, monospace);
+      color: var(--black);
+      opacity: 0.38;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
 
-      .chat-tool-block-icon {
-        display: none;
-      }
+    .chat-tool-block-cmd {
+      font-size: 12.5px;
+      font-family: var(--code-font, "SFMono-Regular", Consolas, monospace);
+      color: var(--black);
+      opacity: 0.82;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
 
-      // title column: tool name (dim) + cmd preview (bright) stacked
-      .chat-tool-block-title {
-        flex: 1;
-        display: flex;
-        flex-direction: column;
-        gap: 1px;
-        overflow: hidden;
-      }
-
-      .chat-tool-block-name {
-        font-size: 10px;
-        font-family: var(--code-font, "SFMono-Regular", Consolas, monospace);
-        color: var(--black);
-        opacity: 0.38;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        text-transform: uppercase;
-        letter-spacing: 0.04em;
-      }
-
-      .chat-tool-block-cmd {
-        font-size: 12.5px;
-        font-family: var(--code-font, "SFMono-Regular", Consolas, monospace);
-        color: var(--black);
-        opacity: 0.82;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-
-        &::before {
-          content: "$ ";
-          opacity: 0.4;
-        }
-      }
-
-      .chat-tool-block-chevron {
-        flex-shrink: 0;
-        opacity: 0.28;
-        color: var(--black);
-        transition: transform 0.2s ease, opacity 0.15s;
-
-        &[data-open="true"] {
-          transform: rotate(180deg);
-          opacity: 0.52;
-        }
+      &::before {
+        content: "$ ";
+        opacity: 0.4;
       }
     }
 
-    // Terminal-style output area
-    .chat-tool-block-output {
-      padding: 10px 14px;
-      background: #16181d;
-      border-top: 1px solid rgba(255, 255, 255, 0.06);
-      max-height: 320px;
-      overflow-y: auto;
-      font-family: var(--code-font, "SFMono-Regular", Consolas, monospace);
-      font-size: 11.5px;
-      line-height: 1.65;
+    .chat-tool-block-chevron {
+      flex-shrink: 0;
+      opacity: 0.28;
+      color: var(--black);
+      transition: transform 0.2s ease, opacity 0.15s;
 
-      // command lines  e.g. "$ cmd" or "> cmd"
-      .tool-line-cmd {
-        color: #93c5fd;
+      &[data-open="true"] {
+        transform: rotate(180deg);
+        opacity: 0.52;
       }
+    }
+  }
 
-      // stderr / error lines
-      .tool-line-err {
-        color: #fca5a5;
-      }
+  // Terminal-style output area
+  .chat-tool-block-output {
+    padding: 10px 14px;
+    background: #16181d;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    max-height: 320px;
+    overflow-y: auto;
+    font-family: var(--code-font, "SFMono-Regular", Consolas, monospace);
+    font-size: 11.5px;
+    line-height: 1.65;
 
-      // exit code lines
-      .tool-line-exit {
-        color: #fdba74;
-        opacity: 0.9;
-      }
+    // command lines  e.g. "$ cmd" or "> cmd"
+    .tool-line-cmd {
+      color: #93c5fd;
+    }
 
-      // normal output lines
-      .tool-line-out {
-        color: #c4c9d4;
-      }
+    // stderr / error lines
+    .tool-line-err {
+      color: #fca5a5;
+    }
+
+    // exit code lines
+    .tool-line-exit {
+      color: #fdba74;
+      opacity: 0.9;
+    }
+
+    // normal output lines
+    .tool-line-out {
+      color: #c4c9d4;
     }
   }
 }
@@ -1080,6 +1083,43 @@
   padding: 5px 10px 2px;
   border-top: var(--border-in-light);
   background: var(--white);
+}
+
+// 暂存消息队列指示器：agent 正在跑 turn 时，用户再按 Enter 的消息入队
+.pending-queue-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-top: var(--border-in-light);
+  background: var(--white);
+  font-size: 12px;
+  color: var(--black);
+  opacity: 0.7;
+}
+
+.pending-queue-label {
+  flex: 1;
+}
+
+.pending-queue-clear {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--black);
+  opacity: 0.5;
+  cursor: pointer;
+
+  &:hover {
+    opacity: 1;
+    background: var(--hover-color);
+  }
 }
 
 .attach-file-chip-input {
