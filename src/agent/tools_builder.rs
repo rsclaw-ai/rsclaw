@@ -405,7 +405,7 @@ pub(crate) fn build_tool_list(
             2. `snapshot` — get page structure with interactive element refs (@e1, @e2...). Use `interactive: true` to only get actionable elements (saves tokens).\n\
             3. `click` ref=@e1 / `fill` ref=@e2 text='...' — interact using refs\n\
             4. Re-snapshot after any page change to get updated refs\n\
-            Autocomplete inputs (Ctrip, Fliggy, Google search, city pickers): use `pick` ref=@eN query='武汉' — types the query, waits for the popup, clicks the first visible candidate. Use this instead of fill when the site ignores programmatic value changes.\n\
+            Autocomplete inputs (Ctrip/Fliggy/Qunar city pickers, Google/Baidu search, flight/hotel/movie pickers, any input that pops a dropdown of suggestions): ALWAYS use `pick` ref=@eN query='武汉' in a single call — it focuses, types, waits for the popup, and clicks the first visible candidate. DO NOT build it yourself out of click+type+wait+screenshot loops; that wastes 5-7 iterations per field and the dropdown often dismisses before you re-screenshot. `pick` handles IME/React-controlled inputs that silently drop programmatic values.\n\
             Interaction: hover (triggers menus/tooltips), dblclick, drag (from=@e1 to=@e2, for sliders), focus, scrollintoview.\n\
             Quick search: `search` — auto-find search box on ANY site, fill text, submit, return results.\n\
             `clickAt` ref=@e1 or x=100 y=200 — real mouse click via CDP (for file dialogs, anti-bot sites).\n\
@@ -489,8 +489,9 @@ pub(crate) fn build_tool_list(
                     "screenshot", "mouse_move", "mouse_click", "left_click",
                     "double_click", "triple_click", "right_click", "middle_click",
                     "drag", "scroll", "type", "key", "hold_key",
-                    "cursor_position", "get_active_window", "wait"
-                ], "description": "Action to perform"},
+                    "cursor_position", "get_active_window", "ui_tree",
+                    "list_skills", "get_skill", "wait"
+                ], "description": "Action to perform. ui_tree returns the accessibility tree of the focused window (interactive elements with role/label/coordinates). list_skills/get_skill load desktop automation playbooks from ~/.rsclaw/tools/computer_use/skills/."},
                 "x":         {"type": "number", "description": "X coordinate (mouse actions, drag start)"},
                 "y":         {"type": "number", "description": "Y coordinate (mouse actions, drag start)"},
                 "to_x":      {"type": "number", "description": "Drag destination X"},
@@ -501,7 +502,8 @@ pub(crate) fn build_tool_list(
                 "then":      {"type": "string", "enum": ["click", "double_click", "right_click", "triple_click"], "description": "Sub-action for hold_key (default: click)"},
                 "direction": {"type": "string", "enum": ["up", "down", "left", "right"], "description": "Scroll direction (default: down)"},
                 "amount":    {"type": "integer", "description": "Scroll clicks (default: 3)"},
-                "ms":        {"type": "integer", "description": "Wait duration in milliseconds (max 10000)"}
+                "ms":        {"type": "integer", "description": "Wait duration in milliseconds (max 10000)"},
+                "name":      {"type": "string", "description": "Skill name (for get_skill action)"}
             },
             "required": ["action"]
         }),

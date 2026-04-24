@@ -662,6 +662,154 @@ public class WinHoldKey {{
             }
 
             // =================================================================
+            // UI tree — accessibility tree of the focused window
+            // =================================================================
+            "ui_tree" => {
+                let elements_json = if is_macos {
+                    let script = r#"
+import Cocoa
+import ApplicationServices
+struct UiEl: Codable { let role: String; let label: String; let x: Int; let y: Int; let w: Int; let h: Int }
+func ch(_ e: AXUIElement) -> [AXUIElement] { var v: CFTypeRef?; guard AXUIElementCopyAttributeValue(e, kAXChildrenAttribute as CFString, &v) == .success, let a = v as? [AXUIElement] else { return [] }; return a }
+func a(_ e: AXUIElement, _ k: String) -> String? { var v: CFTypeRef?; guard AXUIElementCopyAttributeValue(e, k as CFString, &v) == .success, let s = v else { return nil }; return "\(s)" }
+func pos(_ e: AXUIElement) -> (Int,Int)? { var v: CFTypeRef?; guard AXUIElementCopyAttributeValue(e, kAXPositionAttribute as CFString, &v) == .success, let ax = v else { return nil }; var p = CGPoint.zero; AXValueGetValue(ax as! AXValue, .cgPoint, &p); return (Int(p.x),Int(p.y)) }
+func sz(_ e: AXUIElement) -> (Int,Int)? { var v: CFTypeRef?; guard AXUIElementCopyAttributeValue(e, kAXSizeAttribute as CFString, &v) == .success, let ax = v else { return nil }; var s = CGSize.zero; AXValueGetValue(ax as! AXValue, .cgSize, &s); return (Int(s.width),Int(s.height)) }
+let roles: Set<String> = ["AXButton","AXTextField","AXTextArea","AXCheckBox","AXRadioButton","AXComboBox","AXPopUpButton","AXSlider","AXLink","AXMenuItem","AXMenuBarItem","AXTab","AXDisclosureTriangle","AXSearchField","AXSecureTextField","AXStaticText","AXCell"]
+var r: [UiEl] = []
+func walk(_ e: AXUIElement, _ d: Int) { guard d < 20, r.count < 200 else { return }; let ro = a(e, kAXRoleAttribute) ?? ""; if roles.contains(ro) { let l = a(e, kAXTitleAttribute) ?? a(e, kAXDescriptionAttribute) ?? a(e, kAXValueAttribute) ?? ""; if let (x,y) = pos(e), let (w,h) = sz(e), w > 0, h > 0 { r.append(UiEl(role: ro, label: String(l.prefix(100)), x: x, y: y, w: w, h: h)) } }; for c in ch(e) { walk(c, d+1) } }
+guard let app = NSWorkspace.shared.frontmostApplication else { print("[]"); exit(0) }
+let ax = AXUIElementCreateApplication(app.processIdentifier)
+var wv: CFTypeRef?
+if AXUIElementCopyAttributeValue(ax, kAXFocusedWindowAttribute as CFString, &wv) == .success, let w = wv { walk(w as! AXUIElement, 0) } else { walk(ax, 0) }
+if let d = try? JSONEncoder().encode(r), let j = String(data: d, encoding: .utf8) { print(j) } else { print("[]") }
+"#;
+                    let output = tokio::process::Command::new("swift")
+                        .args(["-e", script])
+                        .output()
+                        .await
+                        .map_err(|e| anyhow!("swift ui_tree: {e}"))?;
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        return Err(anyhow!("ui_tree (macos): {stderr}"));
+                    }
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                } else if is_windows {
+                    let ps_script = r#"
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$auto = [System.Windows.Automation.AutomationElement]::FocusedElement
+$root = $null
+try {
+    $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+    $cur = $auto
+    while ($cur -ne $null) {
+        $parent = $walker.GetParent($cur)
+        if ($parent -eq [System.Windows.Automation.AutomationElement]::RootElement) { $root = $cur; break }
+        $cur = $parent
+    }
+} catch { }
+if ($root -eq $null) { $root = $auto }
+$results = @()
+$count = 0
+function Walk($el, $depth) {
+    if ($depth -gt 20 -or $script:count -ge 200) { return }
+    $ct = $el.Current.ControlType.ProgrammaticName
+    $interactive = @('ControlType.Button','ControlType.Edit','ControlType.CheckBox','ControlType.RadioButton',
+        'ControlType.ComboBox','ControlType.Slider','ControlType.Hyperlink','ControlType.MenuItem',
+        'ControlType.Tab','ControlType.TabItem','ControlType.Text','ControlType.DataItem','ControlType.ListItem')
+    if ($interactive -contains $ct) {
+        $rect = $el.Current.BoundingRectangle
+        if ($rect.Width -gt 0 -and $rect.Height -gt 0) {
+            $label = $el.Current.Name
+            if ([string]::IsNullOrEmpty($label)) { $label = $el.Current.AutomationId }
+            $script:results += @{ role=$ct; label=$label; x=[int]$rect.X; y=[int]$rect.Y; w=[int]$rect.Width; h=[int]$rect.Height }
+            $script:count++
+        }
+    }
+    try {
+        $child = $walker.GetFirstChild($el)
+        while ($child -ne $null) { Walk $child ($depth+1); $child = $walker.GetNextSibling($child) }
+    } catch { }
+}
+$walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+Walk $root 0
+$results | ConvertTo-Json -Compress
+"#;
+                    let output = powershell_hidden()
+                        .args(["-Command", ps_script])
+                        .output()
+                        .await
+                        .map_err(|e| anyhow!("powershell ui_tree: {e}"))?;
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        return Err(anyhow!("ui_tree (windows): {stderr}"));
+                    }
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                } else {
+                    // Linux: AT-SPI2 via python3
+                    let py_script = r#"
+import subprocess, json, re
+out = subprocess.check_output(["gdbus", "call", "--session", "--dest=org.a11y.Bus", "--object-path=/org/a11y/bus", "--method=org.a11y.Bus.GetAddress"], text=True).strip()
+# fallback: use python3-atspi if available
+try:
+    import gi
+    gi.require_version('Atspi', '2.0')
+    from gi.repository import Atspi
+    desktop = Atspi.get_desktop(0)
+    results = []
+    interactive = {'push button','toggle button','text','password text','combo box',
+                   'check box','radio button','slider','link','menu item','tab','table cell','list item'}
+    def walk(el, depth):
+        if depth > 20 or len(results) >= 200: return
+        try:
+            role = el.get_role_name()
+            if role in interactive:
+                c = el.get_component_iface()
+                if c:
+                    rect = c.get_extents(Atspi.CoordType.SCREEN)
+                    if rect.width > 0 and rect.height > 0:
+                        name = el.get_name() or ''
+                        results.append({'role': role, 'label': name[:100], 'x': rect.x, 'y': rect.y, 'w': rect.width, 'h': rect.height})
+            for i in range(el.get_child_count()):
+                walk(el.get_child_at_index(i), depth + 1)
+        except: pass
+    # find active app
+    for i in range(desktop.get_child_count()):
+        app = desktop.get_child_at_index(i)
+        if app:
+            for j in range(app.get_child_count()):
+                win = app.get_child_at_index(j)
+                if win:
+                    try:
+                        si = win.get_state_set()
+                        if si.contains(Atspi.StateType.ACTIVE):
+                            walk(win, 0)
+                            if results: break
+                    except: pass
+            if results: break
+    print(json.dumps(results))
+except ImportError:
+    print('[]')
+"#;
+                    let output = tokio::process::Command::new("python3")
+                        .args(["-c", py_script])
+                        .output()
+                        .await
+                        .map_err(|e| anyhow!("python3 ui_tree: {e}"))?;
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        return Err(anyhow!("ui_tree (linux): {stderr}"));
+                    }
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                };
+                // Parse and return as structured JSON
+                let elements: Value = serde_json::from_str(&elements_json)
+                    .unwrap_or_else(|_| json!([]));
+                let count = elements.as_array().map(|a| a.len()).unwrap_or(0);
+                Ok(json!({"action": "ui_tree", "count": count, "elements": elements}))
+            }
+
+            // =================================================================
             // Wait — pause between actions (ms)
             // =================================================================
             "wait" => {
@@ -670,11 +818,76 @@ public class WinHoldKey {{
                 Ok(json!({"action": "wait", "ms": ms, "ok": true}))
             }
 
+            // =================================================================
+            // List available desktop skills
+            // =================================================================
+            "list_skills" => {
+                let skills_dir = crate::config::loader::base_dir()
+                    .join("tools")
+                    .join("computer_use")
+                    .join("skills");
+                let mut skills: Vec<Value> = Vec::new();
+                if skills_dir.is_dir() {
+                    if let Ok(entries) = std::fs::read_dir(&skills_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.extension().is_some_and(|e| e == "md") {
+                                if let Ok(content) = std::fs::read_to_string(&path) {
+                                    let name = path.file_stem()
+                                        .map(|s| s.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    // Extract description from frontmatter
+                                    let desc = if content.starts_with("---") {
+                                        content.splitn(3, "---").nth(1)
+                                            .and_then(|fm| {
+                                                fm.lines().find_map(|l| {
+                                                    l.strip_prefix("description:")
+                                                        .map(|d| d.trim().to_string())
+                                                })
+                                            })
+                                            .unwrap_or_default()
+                                    } else {
+                                        String::new()
+                                    };
+                                    skills.push(json!({"name": name, "description": desc}));
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(json!({"action": "list_skills", "skills_dir": skills_dir.to_string_lossy(), "count": skills.len(), "skills": skills}))
+            }
+
+            // =================================================================
+            // Get a specific desktop skill by name
+            // =================================================================
+            "get_skill" => {
+                let name = args["name"].as_str()
+                    .ok_or_else(|| anyhow!("get_skill: `name` required"))?;
+                let skills_dir = crate::config::loader::base_dir()
+                    .join("tools")
+                    .join("computer_use")
+                    .join("skills");
+                let path = skills_dir.join(format!("{name}.md"));
+                if !path.exists() {
+                    return Err(anyhow!("skill not found: {name} (looked in {})", skills_dir.display()));
+                }
+                let content = std::fs::read_to_string(&path)
+                    .map_err(|e| anyhow!("read skill {name}: {e}"))?;
+                // Strip frontmatter, return body only
+                let body = if content.starts_with("---") {
+                    content.splitn(3, "---").nth(2).unwrap_or(&content).trim()
+                } else {
+                    content.trim()
+                };
+                Ok(json!({"action": "get_skill", "name": name, "content": body}))
+            }
+
             other => Err(anyhow!(
                 "computer_use: unsupported action `{other}` \
                  (supported: screenshot, mouse_move, mouse_click, double_click, triple_click, \
                  right_click, middle_click, drag, scroll, type, key, hold_key, cursor_position, \
-                 get_active_window, wait)"
+                 get_active_window, ui_tree, list_skills, get_skill, wait)"
             )),
         }
     }
