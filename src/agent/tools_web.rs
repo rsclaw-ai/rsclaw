@@ -1581,7 +1581,24 @@ impl AgentRuntime {
 
         // Now lock again for execute -- guard is dropped, avoiding borrow issues.
         let mut browser = self.browser.lock().await;
-        browser.as_mut().unwrap().execute(action, &args).await
+        let result = browser.as_mut().unwrap().execute(action, &args).await;
+        // execute() internally restarts the CDP session on transport errors
+        // (WebSocket closed, Chrome crash, etc.). Retry once transparently so
+        // the agent doesn't see a spurious "CDP WebSocket closed" error and
+        // give up — the connection has already been re-established.
+        if let Err(ref e) = result {
+            let msg = e.to_string();
+            let is_transport = msg.contains("WebSocket")
+                || msg.contains("broken pipe")
+                || msg.contains("Connection reset")
+                || msg.contains("EOF")
+                || msg.contains("CDP response channel closed");
+            if is_transport {
+                warn!("browser: transparent retry after transport error: {e}");
+                return browser.as_mut().unwrap().execute(action, &args).await;
+            }
+        }
+        result
     }
 }
 
