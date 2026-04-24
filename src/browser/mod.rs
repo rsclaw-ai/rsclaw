@@ -941,6 +941,7 @@ impl BrowserSession {
             "click" => self.cmd_click(args).await,
             "clickAt" | "click_at" => self.cmd_click_at(args).await,
             "fill" | "type" => self.cmd_fill(args).await,
+            "pick" => self.cmd_pick(args).await,
             "select" => self.cmd_select(args).await,
             "check" => self.cmd_check(args, true).await,
             "uncheck" => self.cmd_check(args, false).await,
@@ -1333,6 +1334,153 @@ impl BrowserSession {
             }
             Ok(json!({ "action": "type", "text": format!("Typed {} characters", text.len()) }))
         }
+    }
+
+    /// Type `query` into an input and click the first matching candidate in
+    /// the dropdown/autocomplete that opens. Typical flow on sites like Ctrip,
+    /// Fliggy, Google autocomplete: click input, type, wait for popup, click
+    /// option. This one action does the whole thing atomically via JS so the
+    /// agent doesn't have to chain 4-5 snapshots.
+    ///
+    /// Args:
+    /// - `ref` (required): input element ref from snapshot (e.g. "@e92")
+    /// - `query` (required): text to insert and to match candidate text against
+    /// - `timeout_ms` (optional, default 5000): total time budget
+    /// - `index` (optional, default 0): which visible candidate to click when
+    ///   multiple match
+    async fn cmd_pick(&self, args: &Value) -> Result<Value> {
+        let eref = args
+            .get("ref")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("pick: `ref` required"))?;
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("pick: `query` required"))?;
+        let timeout_ms = args
+            .get("timeout_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5000);
+        let index = args
+            .get("index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
+        let ref_esc = escape_js_string(eref);
+        let query_esc = escape_js_string(query);
+
+        let js = format!(
+            r#"(async function(){{
+                {FIND_REF_JS}
+                var input = findRef('{ref_esc}');
+                if (!input) return {{error: 'NOT_FOUND'}};
+                {WAIT_ACTIONABLE_JS}
+                await waitActionable(input, 3000);
+                input.focus();
+                try {{
+                    var proto = Object.getPrototypeOf(input);
+                    var desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                    if (desc && desc.set) desc.set.call(input, '');
+                    else input.value = '';
+                }} catch(e) {{ input.value = ''; }}
+                input.dispatchEvent(new Event('input', {{bubbles: true}}));
+                input.dispatchEvent(new Event('change', {{bubbles: true}}));
+                input.focus();
+                document.execCommand('insertText', false, '{query_esc}');
+                var deadline = Date.now() + {timeout_ms};
+                var SELECTORS = [
+                    '[role="option"]',
+                    '[data-u_key="poi_select_item"]',
+                    '[role="listbox"] > *',
+                    '[class*="suggest"] li',
+                    '[class*="dropdown"] li',
+                    '[class*="autocomplete"] li',
+                    'li[class*="item"]',
+                    'li[class*="option"]',
+                    'li'
+                ];
+                function findVisible() {{
+                    var results = [];
+                    var seen = new Set();
+                    for (var i = 0; i < SELECTORS.length; i++) {{
+                        var els;
+                        try {{ els = document.querySelectorAll(SELECTORS[i]); }} catch(e) {{ continue; }}
+                        for (var j = 0; j < els.length; j++) {{
+                            var el = els[j];
+                            if (seen.has(el)) continue;
+                            seen.add(el);
+                            if (el === input) continue;
+                            if (!el.textContent || el.textContent.indexOf('{query_esc}') < 0) continue;
+                            var r = el.getBoundingClientRect();
+                            if (r.width <= 0 || r.height <= 0) continue;
+                            var style = getComputedStyle(el);
+                            if (style.visibility === 'hidden' || style.display === 'none') continue;
+                            results.push(el);
+                        }}
+                    }}
+                    return results;
+                }}
+                while (Date.now() < deadline) {{
+                    var hits = findVisible();
+                    if (hits.length > {index}) {{
+                        var target = hits[{index}];
+                        target.scrollIntoView({{block: 'center'}});
+                        target.click();
+                        return {{
+                            ok: true,
+                            text: (target.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80),
+                            matched: hits.length
+                        }};
+                    }}
+                    await new Promise(function(r){{ setTimeout(r, 100); }});
+                }}
+                return {{error: 'TIMEOUT'}};
+            }})()"#,
+            FIND_REF_JS = FIND_REF_JS,
+            WAIT_ACTIONABLE_JS = WAIT_ACTIONABLE_JS,
+            ref_esc = ref_esc,
+            query_esc = query_esc,
+            timeout_ms = timeout_ms,
+            index = index,
+        );
+
+        let result = self
+            .cdp
+            .send(
+                "Runtime.evaluate",
+                json!({
+                    "expression": js,
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                }),
+            )
+            .await?;
+
+        let obj = result
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        if let Some(err) = obj.get("error").and_then(|v| v.as_str()) {
+            match err {
+                "NOT_FOUND" => bail!("pick: input {eref} not found (run snapshot first)"),
+                "TIMEOUT" => bail!(
+                    "pick: no visible candidate matching '{query}' within {timeout_ms}ms"
+                ),
+                other => bail!("pick: {other}"),
+            }
+        }
+
+        let picked = obj.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let matched = obj.get("matched").and_then(|v| v.as_u64()).unwrap_or(1);
+        Ok(json!({
+            "action": "pick",
+            "ref": eref,
+            "query": query,
+            "picked": picked,
+            "candidates": matched,
+        }))
     }
 
     async fn cmd_select(&self, args: &Value) -> Result<Value> {

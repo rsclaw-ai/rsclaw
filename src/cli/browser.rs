@@ -39,6 +39,22 @@ pub enum BrowserCommand {
         /// Text to fill.
         text: String,
     },
+    /// Type into an autocomplete input and click the first matching candidate
+    /// from the popup. Handles sites (Ctrip, Fliggy, Google) where fill alone
+    /// does not trigger the dropdown.
+    Pick {
+        /// Input element reference (e.g., @e92).
+        #[arg(name = "ref")]
+        eref: String,
+        /// Text to insert and match against candidates.
+        query: String,
+        /// Timeout in ms.
+        #[arg(long, default_value = "5000")]
+        timeout: u64,
+        /// Zero-based candidate index to pick when multiple match.
+        #[arg(long, default_value = "0")]
+        index: usize,
+    },
     /// Press a key (Enter, Tab, Escape, etc.).
     Press {
         /// Key name.

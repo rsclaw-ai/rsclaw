@@ -405,6 +405,7 @@ pub(crate) fn build_tool_list(
             2. `snapshot` — get page structure with interactive element refs (@e1, @e2...). Use `interactive: true` to only get actionable elements (saves tokens).\n\
             3. `click` ref=@e1 / `fill` ref=@e2 text='...' — interact using refs\n\
             4. Re-snapshot after any page change to get updated refs\n\
+            Autocomplete inputs (Ctrip, Fliggy, Google search, city pickers): use `pick` ref=@eN query='武汉' — types the query, waits for the popup, clicks the first visible candidate. Use this instead of fill when the site ignores programmatic value changes.\n\
             Interaction: hover (triggers menus/tooltips), dblclick, drag (from=@e1 to=@e2, for sliders), focus, scrollintoview.\n\
             Quick search: `search` — auto-find search box on ANY site, fill text, submit, return results.\n\
             `clickAt` ref=@e1 or x=100 y=200 — real mouse click via CDP (for file dialogs, anti-bot sites).\n\
@@ -419,7 +420,7 @@ pub(crate) fn build_tool_list(
             "type": "object",
             "properties": {
                 "action":     {"type": "string", "enum": [
-                    "open", "navigate", "snapshot", "click", "clickAt", "fill", "type",
+                    "open", "navigate", "snapshot", "click", "clickAt", "fill", "type", "pick",
                     "select", "check", "uncheck", "scroll", "screenshot", "pdf",
                     "hover", "dblclick", "drag", "focus", "scrollintoview",
                     "back", "forward", "reload", "get_text", "get_url", "get_title",
@@ -438,6 +439,9 @@ pub(crate) fn build_tool_list(
                 "x":          {"type": "number", "description": "X pixel coordinate for clickAt"},
                 "y":          {"type": "number", "description": "Y pixel coordinate for clickAt"},
                 "text":       {"type": "string", "description": "Text for fill/type/click-by-text/clipboard/dialog"},
+                "query":      {"type": "string", "description": "Query text for pick (typed into input and used to match dropdown candidates)"},
+                "index":      {"type": "integer", "description": "For pick: zero-based candidate index when multiple match (default 0)"},
+                "timeout_ms": {"type": "integer", "description": "For pick: total time to wait for dropdown and click target in ms (default 5000)"},
                 "value":      {"type": "string", "description": "Value for select, or sub-action for cookies/state/dialog/network/clipboard/context/emulate/diff/record"},
                 "key":        {"type": "string", "description": "Key name for press (Enter, Tab, Escape, etc.)"},
                 "direction":  {"type": "string", "enum": ["up", "down", "left", "right"], "description": "Scroll direction"},
