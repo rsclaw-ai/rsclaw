@@ -99,6 +99,8 @@ fn runtime_with_agent(agent_id: &str) -> RuntimeConfig {
                 commands: None,
                 opencode: None,
                 claudecode: None,
+                codex: None,
+                flash_model: None,
             }],
             bindings: vec![],
             external: vec![],
@@ -174,6 +176,7 @@ async fn test_cron_job_runs() {
         Arc::new(ChannelManager::new(MemoryTier::Standard)),
         data_dir.path().to_owned(),
         tokio::sync::broadcast::channel(1).0,
+        Arc::new(rsclaw::ws::ConnRegistry::new()),
     );
 
     // trigger() bypasses the scheduler and fires the job synchronously.
@@ -223,6 +226,7 @@ async fn test_cron_enable_disable() {
         Arc::new(ChannelManager::new(MemoryTier::Standard)),
         data_dir.path().to_owned(),
         tokio::sync::broadcast::channel(1).0,
+        Arc::new(rsclaw::ws::ConnRegistry::new()),
     );
 
     // Verify enabled flags are stored correctly.
@@ -270,6 +274,7 @@ async fn test_cron_invalid_agent() {
         Arc::new(ChannelManager::new(MemoryTier::Standard)),
         data_dir.path().to_owned(),
         tokio::sync::broadcast::channel(1).0,
+        Arc::new(rsclaw::ws::ConnRegistry::new()),
     );
 
     let result = runner.trigger("job-bad-agent").await;
@@ -322,6 +327,7 @@ async fn test_cron_trigger_unknown_job_returns_error() {
         Arc::new(ChannelManager::new(MemoryTier::Standard)),
         data_dir.path().to_owned(),
         tokio::sync::broadcast::channel(1).0,
+        Arc::new(rsclaw::ws::ConnRegistry::new()),
     );
 
     let result = runner.trigger("no-such-job").await;
