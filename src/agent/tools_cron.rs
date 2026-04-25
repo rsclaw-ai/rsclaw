@@ -60,6 +60,12 @@ impl super::runtime::AgentRuntime {
                 // Schedule: support cron expr, delay (once), or interval.
                 let delay_ms = args["delay_ms"].as_u64().or(args["delayMs"].as_u64());
                 let schedule = args["schedule"].as_str();
+                // Fixed-interval schedule: prefer `every_seconds` (friendly), accept `every_ms` too.
+                let every_ms: Option<u64> = args["every_ms"]
+                    .as_u64()
+                    .or(args["everyMs"].as_u64())
+                    .or_else(|| args["every_seconds"].as_u64().map(|s| s.saturating_mul(1000)))
+                    .or_else(|| args["everySeconds"].as_u64().map(|s| s.saturating_mul(1000)));
 
                 if let Some(delay) = delay_ms {
                     // Short delays (<=30min): use in-memory timer, skip cron.json5.
@@ -109,6 +115,20 @@ impl super::runtime::AgentRuntime {
                     // Long delay: persist to cron.json5
                     let at_ms = now_ms + delay;
                     job["schedule"] = json!({"kind": "once", "atMs": at_ms});
+                } else if let Some(interval_ms) = every_ms {
+                    // Fixed-interval recurring schedule. Wins over `schedule` if both supplied.
+                    if interval_ms == 0 {
+                        return Err(anyhow!("cron add: `every_seconds`/`every_ms` must be > 0"));
+                    }
+                    if schedule.is_some() {
+                        tracing::warn!(
+                            interval_ms,
+                            schedule = ?schedule,
+                            "cron add: both `schedule` and `every_seconds`/`every_ms` provided; using interval and ignoring schedule"
+                        );
+                    }
+                    // Anchor at now so the first fire is `now + interval_ms` (per CronSchedule::compute_next_run).
+                    job["schedule"] = json!({"kind": "every", "everyMs": interval_ms, "anchorMs": now_ms});
                 } else if let Some(sched) = schedule {
                     // Standard cron expression or interval.
                     // Always include timezone. Use LLM-provided, config, or auto-detected.
@@ -129,7 +149,9 @@ impl super::runtime::AgentRuntime {
                         });
                     job["schedule"] = json!({"kind": "cron", "expr": sched, "tz": tz_val});
                 } else {
-                    return Err(anyhow!("cron add: `schedule` or `delay_ms` required"));
+                    return Err(anyhow!(
+                        "cron add: `schedule`, `every_seconds`/`every_ms`, or `delay_ms` required"
+                    ));
                 }
                 // Payload in OpenClaw format.
                 job["payload"] = json!({"kind": "systemEvent", "text": message});
@@ -168,7 +190,13 @@ impl super::runtime::AgentRuntime {
                     debug!(err = %e, "cron add: failed to notify gateway reload");
                 }
 
-                Ok(json!({"added": id, "schedule": schedule, "message": message}))
+                let mut resp = json!({"added": id, "message": message});
+                if let Some(interval_ms) = every_ms {
+                    resp["every_ms"] = json!(interval_ms);
+                } else if let Some(s) = schedule {
+                    resp["schedule"] = json!(s);
+                }
+                Ok(resp)
             }
             "remove" => {
                 let mut jobs = read_cron_jobs(&cron_path).await;
