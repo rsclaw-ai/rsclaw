@@ -373,6 +373,67 @@ impl super::runtime::AgentRuntime {
 // Cron helpers (file-based job storage)
 // ---------------------------------------------------------------------------
 
+/// Format a list of cron jobs into the canonical multi-line text used by
+/// `/cron list` and the agent's `__CRON_LIST__` marker.
+///
+/// Returns "No cron jobs configured." when the slice is empty so callers don't
+/// have to special-case that themselves. Both the desktop (agent runtime) and
+/// gateway preparse paths route here so feishu/wechat/etc. see the same output
+/// format as `/cron list` from the desktop console.
+pub(crate) fn format_cron_jobs(jobs: &[Value]) -> String {
+    if jobs.is_empty() {
+        return "No cron jobs configured.".to_owned();
+    }
+    let mut lines = vec!["Cron jobs:".to_owned()];
+    for (i, job) in jobs.iter().enumerate() {
+        let id = job.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        let enabled = job.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        let status = if enabled { "" } else { " (disabled)" };
+        let agent = job.get("agentId").and_then(|v| v.as_str()).unwrap_or("main");
+        let name = job.get("name").and_then(|v| v.as_str());
+        let schedule = match job.get("schedule") {
+            Some(s) if s.is_object() => {
+                if let Some(expr) = s.get("expr").and_then(|v| v.as_str()) {
+                    expr.to_owned()
+                } else if let Some(at) = s.get("atMs").and_then(|v| v.as_u64()) {
+                    format!("once@{at}")
+                } else {
+                    s.to_string()
+                }
+            }
+            Some(s) if s.is_string() => s.as_str().unwrap_or("?").to_owned(),
+            _ => "?".to_owned(),
+        };
+        let message = job
+            .get("payload")
+            .and_then(|p| p.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let msg_preview = if message.chars().count() > 50 {
+            let end = message
+                .char_indices()
+                .nth(47)
+                .map(|(idx, _)| idx)
+                .unwrap_or(message.len());
+            format!("{}...", &message[..end])
+        } else {
+            message.to_owned()
+        };
+        let label = name.map(|n| format!(" {n}")).unwrap_or_default();
+        lines.push(format!(
+            "  #{} [{}] {} -> {}{} \"{}\"{}",
+            i + 1,
+            id,
+            schedule,
+            agent,
+            label,
+            msg_preview,
+            status
+        ));
+    }
+    lines.join("\n")
+}
+
 /// Read cron jobs from cron.json5.
 /// Handles both bare array `[...]` and wrapped `{"version":1,"jobs":[...]}` formats.
 /// Parses with json5 for comment support.

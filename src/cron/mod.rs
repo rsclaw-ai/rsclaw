@@ -1092,12 +1092,26 @@ impl CronRunner {
     /// Preserves running state and error counts for existing jobs.
     /// Jobs in old_jobs but NOT in new_jobs are dropped (deleted from file).
     /// Takes `now_ms` from the caller (timer_loop) to avoid redundant calls.
+    ///
+    /// When a job's schedule changes (e.g. user edits `*/1 * * * *` to
+    /// `*/30 * * * *`), the cached `next_run_at_ms` was computed against the
+    /// OLD cadence and would still fire under that old rhythm one more time
+    /// before the new schedule kicks in.  Detect a schedule change here and
+    /// force-recompute `next_run_at_ms` so the new cadence takes effect at the
+    /// next reload tick.
     fn merge_jobs(&self, old_jobs: &[CronJob], new_jobs: Vec<CronJob>, now_ms: u64) -> Vec<CronJob> {
         let mut result = Vec::with_capacity(new_jobs.len());
 
         for mut new_job in new_jobs {
+            let mut schedule_changed = false;
             // Try to find existing job by ID and preserve its state
             if let Some(old_job) = old_jobs.iter().find(|j| j.id == new_job.id) {
+                // Detect schedule edit before we overwrite state.  Compare via
+                // serde_json::Value so we don't have to derive PartialEq on the
+                // CronSchedule enum (which would force PartialEq on every
+                // variant payload).
+                schedule_changed = serde_json::to_value(&old_job.schedule).ok()
+                    != serde_json::to_value(&new_job.schedule).ok();
                 // Preserve state from old job
                 new_job.state = old_job.state.clone();
             } else {
@@ -1110,9 +1124,20 @@ impl CronRunner {
                 }
             }
 
-            // Ensure next_run_at_ms is set
+            // Ensure next_run_at_ms is set; recompute when the schedule changed
+            // so an edit cancels the old cadence rather than firing one more
+            // time on the OLD schedule.
             if let Some(ref mut state) = new_job.state {
-                if state.next_run_at_ms.is_none() {
+                if schedule_changed {
+                    let next = new_job.schedule.compute_next_run(now_ms);
+                    debug!(
+                        job_id = %new_job.id,
+                        old_next = ?state.next_run_at_ms,
+                        new_next = ?next,
+                        "cron: schedule changed, recomputing next_run_at_ms"
+                    );
+                    state.next_run_at_ms = next;
+                } else if state.next_run_at_ms.is_none() {
                     state.next_run_at_ms = new_job.schedule.compute_next_run(now_ms);
                 }
             }
