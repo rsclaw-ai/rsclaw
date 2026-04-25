@@ -994,6 +994,15 @@ const cn = {
       Error: "错误",
     },
 
+    RestartBanner: {
+      DefaultMessage: "需要重启网关以应用更改。",
+      RestartNow: "立即重启",
+      Later: "稍后",
+      Dismiss: "忽略",
+      Restarting: "重启中...",
+      Failed: "重启失败: ",
+    },
+
     Config: {
       PageTitle: "配置管理",
       PageSub: "~/.rsclaw/rsclaw.json5 -- 实时预览",

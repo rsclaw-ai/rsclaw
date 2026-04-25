@@ -22,6 +22,16 @@ type PendingReq = {
   reject: (reason: any) => void;
 };
 
+/** Payload of a `restart.required` frame, mirrors src/events.rs RestartRequest. */
+export type RestartRequiredPayload = {
+  at_ms: number;
+  /** RestartReason — { kind: "config_changed" | "model_downloaded" | ... } */
+  reason: { kind: string; [key: string]: unknown };
+  urgency: "recommended" | "required";
+  /** Pre-translated message from the gateway. */
+  message: string;
+};
+
 class RsClawWsClient {
   private ws: WebSocket | null = null;
   private retryCount = 0;
@@ -32,6 +42,7 @@ class RsClawWsClient {
   private pendingReqs = new Map<string, PendingReq>();
   private chatHandlers = new Map<string, { cb: ChatCallbacks; fullText: string }>();
   private notificationHandlers = new Set<(text: string) => void>();
+  private restartHandlers = new Set<(payload: RestartRequiredPayload) => void>();
 
   /** Ensure the WS is connected. Safe to call multiple times. */
   connect() {
@@ -69,6 +80,19 @@ class RsClawWsClient {
   onNotification(handler: (text: string) => void): () => void {
     this.notificationHandlers.add(handler);
     return () => this.notificationHandlers.delete(handler);
+  }
+
+  /**
+   * Register a handler for `restart.required` event frames. The gateway
+   * latches the most recent pending request, so a handler registered after
+   * the frame was emitted still receives it on the next reconnect handshake.
+   * Returns an unsubscribe function.
+   */
+  onRestartRequired(
+    handler: (payload: RestartRequiredPayload) => void,
+  ): () => void {
+    this.restartHandlers.add(handler);
+    return () => this.restartHandlers.delete(handler);
   }
 
   private _doConnect() {
@@ -167,6 +191,12 @@ class RsClawWsClient {
       if (text) {
         this.notificationHandlers.forEach((h) => h(text));
       }
+      return;
+    }
+
+    if (event === "restart.required") {
+      const payload = (data.payload || data.data || {}) as RestartRequiredPayload;
+      this.restartHandlers.forEach((h) => h(payload));
       return;
     }
 

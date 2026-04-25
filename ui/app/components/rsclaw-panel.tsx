@@ -52,6 +52,7 @@ import {
   API_TYPE_NEEDS_KEY,
 } from "../lib/provider-defaults";
 import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
+import { RestartBanner } from "./restart-banner";
 
 // ── Types ──────────────────────────────────────────────
 interface ChannelInfo {
@@ -5421,6 +5422,9 @@ export function RsClawPanel() {
             </button>
           </div>
         </div>
+
+        {/* Restart-required banner (snoozable, dismissible) */}
+        <RestartBanner />
 
         {/* Body = content only (nav moved to sidebar) */}
         <div className={styles["panel-body"]}>
