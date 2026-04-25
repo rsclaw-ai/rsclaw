@@ -353,11 +353,14 @@ impl TaskQueueWorker {
         let session_key = task.session_key.clone();
 
         // Determine channel + peer + chat from the first message.
-        let (channel_name, peer_id, chat_id, is_group) = task
-            .messages
-            .first()
-            .map(|m| (m.channel.clone(), m.sender.clone(), m.chat_id.clone(), m.is_group))
-            .unwrap_or_default();
+        let Some(first_msg) = task.messages.first() else {
+            error!(task_id = %task_id, "task queue worker: task has no messages, skipping");
+            return;
+        };
+        let channel_name = first_msg.channel.clone();
+        let peer_id = first_msg.sender.clone();
+        let chat_id = first_msg.chat_id.clone();
+        let is_group = first_msg.is_group;
 
         info!(
             task_id = %task_id,
@@ -414,7 +417,7 @@ impl TaskQueueWorker {
             text,
             channel: channel_name.clone(),
             peer_id: peer_id.clone(),
-            chat_id: String::new(),
+            chat_id: chat_id.clone(),
             reply_tx,
             extra_tools: vec![],
             images,

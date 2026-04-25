@@ -33,7 +33,7 @@ use self::qq::start_qq_if_configured;
 use self::matrix::start_matrix_if_configured;
 use self::wecom::start_wecom_if_configured;
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -53,8 +53,7 @@ use crate::{
 };
 
 use super::preparse::{
-    btw_direct_call, is_fast_preparse, processing_timeout, send_processing,
-    try_preparse_locally,
+    btw_direct_call, is_fast_preparse, try_preparse_locally,
 };
 use super::startup::handle_pending_analysis;
 
@@ -375,35 +374,24 @@ pub(crate) fn start_channels(
                                 map.insert(queue_key.clone(), utx.clone());
                                 let w_reg = Arc::clone(&reg);
                                 let w_cfg = Arc::clone(&cfg);
-                                let w_tx = tx.clone();
                                 let w_uid = queue_key.clone();
+                                let w_tq = Arc::clone(&tq);
                                 tokio::spawn(async move {
-                                    while let Some((mut text, peer_id, chat_id, is_group, bound, mut images, mut file_attachments)) = urx.recv().await {
-                                        // Debounce: wait briefly then drain queued messages.
-                                        tokio::time::sleep(Duration::from_secs(2)).await;
-                                        while let Ok((extra_text, _, _, _, _, extra_images, extra_files)) = urx.try_recv() {
-                                            if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
-                                                text.push('\n');
-                                                text.push_str(&extra_text);
-                                            }
-                                            images.extend(extra_images);
-                                            file_attachments.extend(extra_files);
-                                        }
-                                        let process_result = tokio::time::timeout(
-                                            Duration::from_secs(600),
-                                            async {
+                                    while let Some((text, peer_id, chat_id, is_group, bound, images, file_attachments)) = urx.recv().await {
+                                        // No debounce — task queue merge_into_pending
+                                        // handles rapid consecutive messages automatically.
                                         let handle = if let Some(ref agent_id) = bound {
                                             match w_reg.get(agent_id) {
                                                 Ok(h) => h,
                                                 Err(_) => match w_reg.route("telegram") {
                                                     Ok(h) => h,
-                                                    Err(e) => { error!("route error: {e:#}"); return; }
+                                                    Err(e) => { error!("route error: {e:#}"); continue; }
                                                 },
                                             }
                                         } else {
                                             match w_reg.route("telegram") {
                                                 Ok(h) => h,
-                                                Err(e) => { error!("route error: {e:#}"); return; }
+                                                Err(e) => { error!("route error: {e:#}"); continue; }
                                             }
                                         };
                                         let dm_scope = default_dm_scope(&w_cfg);
@@ -421,56 +409,18 @@ pub(crate) fn start_channels(
                                             peer_id: peer_id.to_string(),
                                             dm_scope,
                                         });
-                                        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
-                                        let msg = AgentMessage {
-                                            session_key,
+                                        let qmsg = crate::gateway::task_queue::QueuedMessage {
                                             text,
+                                            sender: peer_id.to_string(),
                                             channel: "telegram".to_string(),
-                                            peer_id: peer_id.to_string(),
-                                            chat_id: String::new(),
-                                            reply_tx,
-                                            extra_tools: vec![],
-                                            images,
-                                            files: file_attachments,
+                                            chat_id: chat_id.to_string(),
+                                            is_group,
+                                            timestamp: chrono::Utc::now().timestamp(),
+                                            images: images.iter().map(|i| i.data.clone()).collect(),
+                                            files: file_attachments.iter().map(|f| f.filename.clone()).collect(),
                                         };
-                                        if handle.tx.send(msg).await.is_err() {
-                                            return;
-                                        }
-                                        let reply = tokio::select! {
-                                            result = &mut reply_rx => result,
-                                            _ = tokio::time::sleep(processing_timeout(&w_cfg)) => {
-                                                send_processing(&w_tx, chat_id.to_string(), is_group, &w_cfg).await;
-                                                reply_rx.await
-                                            }
-                                        };
-                                        if let Ok(r) = reply {
-                                            let pending = r.pending_analysis;
-                                            if !r.is_empty {
-                                                if let Err(e) = w_tx
-                                                    .send(OutboundMessage {
-                                                        target_id: chat_id.to_string(),
-                                                        is_group,
-                                                        text: r.text,
-                                                        reply_to: None,
-                                                        images: r.images,
-                                                        files: r.files,
-                                                        channel: None,                                                    })
-                                                    .await
-                                                {
-                                                    tracing::warn!("failed to send message: {e}");
-                                                }
-                                            }
-                                            if let Some(analysis) = pending {
-                                                handle_pending_analysis(
-                                                    analysis, Arc::clone(&handle), &w_tx,
-                                                    chat_id.to_string(), is_group, &w_cfg,
-                                                ).await;
-                                            }
-                                        }
-                                            }
-                                        ).await;
-                                        if process_result.is_err() {
-                                            warn!(user = %w_uid, "telegram: message processing timed out (600s), skipping to next");
+                                        if let Err(e) = w_tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
+                                            error!(user = %w_uid, "telegram: queue submit failed: {e:#}");
                                         }
                                     }
                                     debug!(user = %w_uid, "telegram: per-user worker stopped");
