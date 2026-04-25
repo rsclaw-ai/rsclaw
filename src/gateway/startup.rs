@@ -98,6 +98,15 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let (notification_tx, notification_rx) =
         broadcast::channel::<crate::channel::OutboundMessage>(64);
 
+    // Restart-required event channel + latch. Published into by the file
+    // watcher bridge and the BGE auto-downloader; subscribed to by WS dispatch
+    // so UI clients see banners. Allocated early so the BGE downloader (next
+    // step) and the file-watcher bridge (later) can both publish.
+    let (restart_request_tx, _restart_request_rx) =
+        tokio::sync::broadcast::channel::<crate::events::RestartRequest>(16);
+    let pending_restart: Arc<std::sync::RwLock<Option<crate::events::RestartRequest>>> =
+        Arc::new(std::sync::RwLock::new(None));
+
     // 6. Open shared memory store.
     // Auto-detect embedding model: prefer higher-quality models first.
     // Priority: bge-base-zh > bge-small-zh > bge-small-en > auto-download small-zh.
@@ -119,35 +128,46 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             let i18n_lang = crate::i18n::resolve_lang(cfg_lang.as_deref().unwrap_or("en")).to_owned();
             let search_cfg_clone = search_cfg.cloned();
             let dl_dir = target_dir.clone();
-            let ntx = notification_tx.clone();
+            let bge_restart_tx = restart_request_tx.clone();
+            let bge_pending = Arc::clone(&pending_restart);
             tokio::spawn(async move {
                 info!("BGE embedding model not found, downloading in background...");
                 match download_bge_model(&dl_dir, search_cfg_clone.as_ref(), cfg_lang.as_deref()).await {
                     Ok(()) => {
-                        info!("BGE model downloaded. Notifying user to restart.");
-                        // receiver may have been dropped
-                        let _ = ntx.send(crate::channel::OutboundMessage {
-                            target_id: String::new(),
-                            is_group: false,
-                            text: crate::i18n::t("bge_model_downloaded", &i18n_lang),
-                            reply_to: None,
-                            images: vec![],
-                            files: vec![],
-                            channel: None,
-                        });
+                        info!("BGE model downloaded. Notifying UI to restart.");
+                        publish_restart(
+                            &bge_restart_tx,
+                            &bge_pending,
+                            crate::events::RestartRequest::new(
+                                crate::events::RestartReason::ModelDownloaded {
+                                    name: "bge-small-zh".into(),
+                                },
+                                crate::events::RestartUrgency::Recommended,
+                                crate::i18n::t("restart_required_model_downloaded", &i18n_lang),
+                            ),
+                        );
                     }
                     Err(e) => {
                         warn!("BGE model auto-download failed: {e:#}");
-                        // receiver may have been dropped
-                        let _ = ntx.send(crate::channel::OutboundMessage {
-                            target_id: String::new(),
-                            is_group: false,
-                            text: crate::i18n::t_fmt("bge_model_download_failed", &i18n_lang, &[("error", &format!("{e:#}"))]),
-                            reply_to: None,
-                            images: vec![],
-                            files: vec![],
-                            channel: None,
-                        });
+                        // Failure is reported via the same banner channel so the
+                        // user sees it in the UI; urgency is Recommended (the
+                        // gateway works without semantic search).
+                        publish_restart(
+                            &bge_restart_tx,
+                            &bge_pending,
+                            crate::events::RestartRequest::new(
+                                crate::events::RestartReason::ModelDownloadFailed {
+                                    name: "bge-small-zh".into(),
+                                    error: format!("{e:#}"),
+                                },
+                                crate::events::RestartUrgency::Recommended,
+                                crate::i18n::t_fmt(
+                                    "restart_model_download_failed",
+                                    &i18n_lang,
+                                    &[("error", &format!("{e:#}"))],
+                                ),
+                            ),
+                        );
                     }
                 }
             });
@@ -286,6 +306,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Arc::clone(&channel_senders),
     );
 
+    // Graceful-shutdown coordinator — wired to task queue worker, axum graceful
+    // shutdown, and the /api/v1/restart drain handler.
+    let shutdown = crate::gateway::ShutdownCoordinator::new();
+
     // Spawn task queue worker — processes queued tasks in priority order.
     {
         let task_queue_mgr = Arc::new(
@@ -295,6 +319,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             Arc::clone(&task_queue_mgr),
             Arc::clone(&registry),
             Arc::clone(&channel_senders),
+            shutdown.clone(),
         );
         tokio::spawn(async move { worker.run().await });
         info!("task queue worker started");
@@ -381,9 +406,17 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         let (mut watcher, mut reload_rx) = FileWatcher::new(config_path);
         tokio::spawn(async move { watcher.run().await });
         let live_reload = Arc::clone(&live);
-        let pid_file_restart = pid_file.clone();
         let (restart_tx, _) = broadcast::channel::<Vec<String>>(8);
+        let bridge_tx = restart_request_tx.clone();
+        let bridge_pending = Arc::clone(&pending_restart);
+        let cfg_lang = config
+            .raw
+            .gateway
+            .as_ref()
+            .and_then(|g| g.language.as_deref())
+            .map(str::to_owned);
         tokio::spawn(async move {
+            let lang = crate::i18n::resolve_lang(cfg_lang.as_deref().unwrap_or("en")).to_owned();
             loop {
                 match reload_rx.recv().await {
                     Ok(ConfigChange::FullReload(new_cfg)) => {
@@ -394,25 +427,35 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                         } else {
                             warn!(?needs_restart, "config change requires gateway restart");
                         }
+                        // Even FullReload doesn't fully propagate to running
+                        // agents (their providers/prompts are snapshotted at
+                        // spawn). Surface a Recommended restart banner so the
+                        // user can choose to apply changes cleanly.
+                        publish_restart(
+                            &bridge_tx,
+                            &bridge_pending,
+                            crate::events::RestartRequest::new(
+                                crate::events::RestartReason::ConfigChanged {
+                                    sections: needs_restart,
+                                },
+                                crate::events::RestartUrgency::Recommended,
+                                crate::i18n::t("restart_required_config_changed", &lang),
+                            ),
+                        );
                     }
                     Ok(ConfigChange::RequiresRestart(fields)) => {
-                        warn!(
-                            ?fields,
-                            "config change requires restart — restarting gateway"
+                        warn!(?fields, "config change requires restart — surfacing banner");
+                        publish_restart(
+                            &bridge_tx,
+                            &bridge_pending,
+                            crate::events::RestartRequest::new(
+                                crate::events::RestartReason::ConfigChanged {
+                                    sections: fields,
+                                },
+                                crate::events::RestartUrgency::Required,
+                                crate::i18n::t("restart_required_config_changed", &lang),
+                            ),
                         );
-                        if let Err(e) = std::fs::remove_file(&pid_file_restart) {
-                            warn!("could not remove PID file on restart: {e}");
-                        }
-                        match std::env::current_exe() {
-                            Ok(exe) => {
-                                let args: Vec<String> = std::env::args().skip(1).collect();
-                                match std::process::Command::new(&exe).args(&args).spawn() {
-                                    Ok(_) => std::process::exit(0),
-                                    Err(e) => error!("failed to re-exec gateway: {e:#}"),
-                                }
-                            }
-                            Err(e) => error!("cannot resolve current exe for restart: {e:#}"),
-                        }
                     }
                     Ok(_) => {}
                     Err(_) => break,
@@ -539,6 +582,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         cron_reload: cron_reload_tx,
         notification_tx: notification_tx.clone(),
         wasm_plugins: Arc::clone(&wasm_plugins),
+        restart_request_tx: restart_request_tx.clone(),
+        pending_restart: Arc::clone(&pending_restart),
+        shutdown: shutdown.clone(),
     };
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
 
@@ -1087,4 +1133,22 @@ async fn download_bge_model(
 
     info!("BGE model downloaded to {}", target_dir.display());
     Ok(())
+}
+
+/// Publish a `RestartRequest` into the broadcast channel and store it in the
+/// `pending_restart` latch so late-connecting UI clients see it on handshake.
+///
+/// `send` failure (no live subscribers) is normal and ignored — the latch
+/// guarantees the next subscriber will pick it up.
+pub(crate) fn publish_restart(
+    tx: &tokio::sync::broadcast::Sender<crate::events::RestartRequest>,
+    latch: &Arc<std::sync::RwLock<Option<crate::events::RestartRequest>>>,
+    req: crate::events::RestartRequest,
+) {
+    if let Ok(mut guard) = latch.write() {
+        *guard = Some(req.clone());
+    } else {
+        warn!("pending_restart lock poisoned; restart event still broadcast");
+    }
+    let _ = tx.send(req);
 }

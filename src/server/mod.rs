@@ -123,6 +123,16 @@ pub struct AppState {
     pub notification_tx: broadcast::Sender<crate::channel::OutboundMessage>,
     /// WASM plugins for direct tool execution via API.
     pub wasm_plugins: Arc<Vec<crate::plugin::WasmPlugin>>,
+    /// Broadcast channel for restart-required events
+    /// (config changed, model downloaded, etc.). Multi-source, single sink.
+    pub restart_request_tx: broadcast::Sender<crate::events::RestartRequest>,
+    /// Latch holding the current pending restart request, if any.
+    /// Read on WS handshake so late-connecting UIs see prior events.
+    pub pending_restart: Arc<std::sync::RwLock<Option<crate::events::RestartRequest>>>,
+    /// Graceful shutdown coordinator — used by /api/v1/restart to drain
+    /// in-flight HTTP requests, task queue tasks, and channel handlers
+    /// before re-exec.
+    pub shutdown: crate::gateway::ShutdownCoordinator,
 }
 
 // AgentEvent is defined in crate::events to avoid circular deps with agent.
@@ -206,6 +216,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/config/reload", post(config_reload))
         .route("/shutdown", post(http_shutdown))
         .route("/restart", post(http_restart))
+        .route("/restart-dismiss", post(http_restart_dismiss))
         .route("/config", get(get_config).put(save_config))
         .route("/cron", get(cron_list).post(cron_create))
         .route("/cron/reload", post(cron_reload))
@@ -267,7 +278,14 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 /// Start the HTTP server. Blocks until shutdown.
+///
+/// On `state.shutdown.begin_drain()` (called by `POST /api/v1/restart`), axum
+/// stops accepting new connections, lets in-flight requests complete, and then
+/// returns. The caller (`serve`'s caller in `startup.rs`) is responsible for
+/// the post-drain steps (waiting for non-HTTP inflight, spawning the
+/// replacement process, exiting).
 pub async fn serve(state: AppState, bind: std::net::SocketAddr) -> Result<()> {
+    let shutdown = state.shutdown.clone();
     let router = build_router(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!("gateway listening on {bind}");
@@ -277,7 +295,9 @@ pub async fn serve(state: AppState, bind: std::net::SocketAddr) -> Result<()> {
     axum::serve(
         listener,
         router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    ).await?;
+    )
+    .with_graceful_shutdown(async move { shutdown.notified().await })
+    .await?;
     Ok(())
 }
 
@@ -303,6 +323,7 @@ async fn auth_middleware(
         || path == "/api/v1/cron/reload"
         || path == "/api/v1/shutdown"
         || path == "/api/v1/restart"
+        || path == "/api/v1/restart-dismiss"
     {
         return next.run(request).await;
     }
@@ -876,8 +897,25 @@ async fn http_shutdown(
     Json(serde_json::json!({ "shutting_down": true })).into_response()
 }
 
-/// POST /api/v1/restart — re-exec the gateway binary. Loopback-only.
+/// POST /api/v1/restart — re-exec the gateway binary with graceful drain.
+/// Loopback-only.
+///
+/// Sequence:
+///   1. Set `shutdown.draining = true` and notify subscribers.
+///      - axum's `with_graceful_shutdown` stops accepting new connections.
+///      - `TaskQueueWorker` stops dequeueing.
+///   2. Send the "restarting" response so the client knows the request landed.
+///   3. In the spawned drainer:
+///      a. Wait for `inflight == 0` or 10s timeout (so currently-running
+///         agent turns / task queue tasks finish cleanly).
+///      b. `Command::spawn(current_exe, ["gateway", "run"])` — replacement
+///         process binds the listener and starts handling requests.
+///      c. `process::exit(0)` — current process exits.
+///
+/// Persistent task queue items left behind are picked up by the new process
+/// on startup, so the user-visible behavior is "brief unavailability".
 async fn http_restart(
+    State(state): State<AppState>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
     if !is_loopback(peer) {
@@ -887,13 +925,40 @@ async fn http_restart(
         )
             .into_response();
     }
-    tracing::warn!("HTTP /restart — re-execing");
     let exe = match std::env::current_exe() {
         Ok(p) => p,
-        Err(e) => return Json(serde_json::json!({ "error": format!("current_exe: {e}") })).into_response(),
+        Err(e) => {
+            return Json(serde_json::json!({ "error": format!("current_exe: {e}") }))
+                .into_response();
+        }
     };
+    tracing::warn!("HTTP /restart — beginning graceful drain");
+    state.shutdown.begin_drain();
+
+    let coord = state.shutdown.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Give the response 100ms to flush before draining begins in earnest.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Wait up to 10s for in-flight work to settle. Polling rather than a
+        // single sleep so we exit early once everything's done.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let n = coord.inflight();
+            if n == 0 {
+                tracing::info!("graceful drain: inflight cleared");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    inflight = n,
+                    "graceful drain: timeout reached, restarting anyway"
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
         let mut cmd = std::process::Command::new(&exe);
         cmd.args(["gateway", "run"]);
         // Windows: suppress the console flash when re-execing from a GUI app.
@@ -903,12 +968,35 @@ async fn http_restart(
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
-        let _ = cmd.spawn();
+        match cmd.spawn() {
+            Ok(_) => tracing::info!("replacement gateway spawned"),
+            Err(e) => tracing::error!("failed to spawn replacement gateway: {e:#}"),
+        }
         // Don't remove the PID file here — the new gateway process
         // overwrites it with its own PID on startup.
         std::process::exit(0);
     });
     Json(serde_json::json!({ "restarting": true })).into_response()
+}
+
+/// POST /api/v1/restart-dismiss — clear the pending-restart latch so the UI
+/// banner stops re-appearing on reconnect. New restart-required events
+/// re-populate the latch and re-show the banner. Loopback-only.
+async fn http_restart_dismiss(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if !is_loopback(peer) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "restart-dismiss is loopback-only"})),
+        )
+            .into_response();
+    }
+    if let Ok(mut guard) = state.pending_restart.write() {
+        *guard = None;
+    }
+    Json(serde_json::json!({ "dismissed": true })).into_response()
 }
 
 async fn cron_reload(State(state): State<AppState>) -> impl IntoResponse {

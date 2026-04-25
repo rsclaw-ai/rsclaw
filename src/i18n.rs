@@ -2139,6 +2139,23 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "zh" => "[系统] BGE 模型下载失败: {error}\n请运行 `rsclaw models download` 或从 https://gitfast.io 下载",
         "ja" => "[システム] BGEモデルのダウンロードに失敗: {error}\n`rsclaw models download` を実行するか https://gitfast.io からダウンロードしてください",
     );
+
+    // -- Restart-required banner messages (shown to UI as RestartRequest) --
+    msg!("restart_required_config_changed",
+        "en" => "Configuration changed. Restart gateway to apply.",
+        "zh" => "配置已更改，请重启 gateway 以生效。",
+        "ja" => "設定が変更されました。ゲートウェイを再起動して適用してください。",
+    );
+    msg!("restart_required_model_downloaded",
+        "en" => "Embedding model downloaded. Restart gateway to enable semantic memory search.",
+        "zh" => "向量模型下载完成，请重启 gateway 以启用语义搜索。",
+        "ja" => "埋め込みモデルのダウンロードが完了しました。セマンティック検索を有効にするにはゲートウェイを再起動してください。",
+    );
+    msg!("restart_model_download_failed",
+        "en" => "Embedding model download failed: {error}",
+        "zh" => "向量模型下载失败: {error}",
+        "ja" => "埋め込みモデルのダウンロードに失敗: {error}",
+    );
     msg!("tool_missing",
         "en" => "[system] {tool} not found. Run `rsclaw tools install {tool}`, or download from https://gitfast.io",
         "zh" => "[系统] 未找到 {tool}，请运行 `rsclaw tools install {tool}` 或从 https://gitfast.io 下载安装",

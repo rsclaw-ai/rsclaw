@@ -261,6 +261,7 @@ pub struct TaskQueueWorker {
     manager: Arc<TaskQueueManager>,
     registry: Arc<AgentRegistry>,
     channel_senders: Arc<std::sync::RwLock<HashMap<String, mpsc::Sender<OutboundMessage>>>>,
+    shutdown: super::shutdown::ShutdownCoordinator,
 }
 
 impl TaskQueueWorker {
@@ -269,21 +270,32 @@ impl TaskQueueWorker {
         manager: Arc<TaskQueueManager>,
         registry: Arc<AgentRegistry>,
         channel_senders: Arc<std::sync::RwLock<HashMap<String, mpsc::Sender<OutboundMessage>>>>,
+        shutdown: super::shutdown::ShutdownCoordinator,
     ) -> Self {
         Self {
             manager,
             registry,
             channel_senders,
+            shutdown,
         }
     }
 
-    /// Main loop: poll for pending tasks and dispatch them.
+    /// Main loop: poll for pending tasks and dispatch them. Exits when the
+    /// shutdown coordinator signals drain — already-running tasks complete,
+    /// but no new ones are pulled. Persistent tasks left in the queue are
+    /// picked up by the next gateway process on startup.
     pub async fn run(&self) {
         info!("task queue worker started");
         loop {
+            if self.shutdown.is_draining() {
+                info!("task queue worker: drain signaled, stopping dequeue");
+                break;
+            }
             match self.manager.next() {
                 Ok(Some(task)) => {
+                    let _guard = self.shutdown.begin_work();
                     self.process_task(task).await;
+                    // _guard drops here, decrementing inflight.
                 }
                 Ok(None) => {
                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -294,6 +306,7 @@ impl TaskQueueWorker {
                 }
             }
         }
+        info!("task queue worker exited");
     }
 
     /// Process a single queued task: send to agent, wait for reply, route back.
