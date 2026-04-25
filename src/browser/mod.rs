@@ -229,57 +229,7 @@ pub(crate) struct ChromeProcess {
 /// We do NOT reuse existing Chrome DevTools ports because launching a new Chrome
 /// on a port that's already in use will cause immediate exit.
 fn find_available_port(start: u16, count: u16) -> Result<u16> {
-    // First, proactively kill any existing Chrome DevTools instances in our port range.
-    // This prevents zombie Chrome from blocking ports.
-    for port in start..start + count {
-        if is_chrome_devtools_port(port) {
-            warn!(port, "found existing Chrome DevTools, killing it before launch");
-            // Use kill_zombie_chrome logic specifically for this port
-            #[cfg(target_os = "windows")]
-            {
-                use std::process::Command;
-                let output = Command::new("netstat")
-                    .args(["-ano", "-p", "TCP"])
-                    .output()
-                    .ok();
-                if let Some(output) = output {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    for line in stdout.lines() {
-                        if line.contains(&format!("127.0.0.1:{port}")) || line.contains(&format!("[::1]:{port}")) {
-                            let pid = line.split_whitespace().last()
-                                .and_then(|s| s.parse::<u32>().ok());
-                            if let Some(pid) = pid {
-                                let proc_output = Command::new("tasklist")
-                                    .args(["/FI", &format!("PID eq {pid}"), "/FI", "IMAGENAME eq chrome.exe"])
-                                    .output();
-                                if let Ok(proc_out) = proc_output {
-                                    let proc_str = String::from_utf8_lossy(&proc_out.stdout);
-                                    if proc_str.contains("chrome.exe") {
-                                        info!(pid, port, "killing existing Chrome DevTools process");
-                                        let _ = Command::new("taskkill")
-                                            .args(["/F", "/T", "/PID", &pid.to_string()])
-                                            .output();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                use std::process::Command;
-                // Kill Chrome processes with this specific port
-                let _ = Command::new("pkill")
-                    .args(["-9", "-f", &format!("remote-debugging-port={port}")])
-                    .output();
-            }
-            // Brief pause for process to exit
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-    }
-
-    // Now try to find a truly available port
+    // First pass: find a truly empty port (don't kill existing Chrome)
     for port in start..start + count {
         // Try IPv4 bind
         if std::net::TcpListener::bind(format!("127.0.0.1:{port}")).is_ok() {
@@ -289,14 +239,15 @@ fn find_available_port(start: u16, count: u16) -> Result<u16> {
         if std::net::TcpListener::bind(format!("[::1]:{port}")).is_ok() {
             return Ok(port);
         }
-        // Port is in use - skip it, don't try to reuse existing Chrome
+        // Port is in use - skip it
     }
 
-    // All ports blocked - try to kill zombie Chrome processes and retry
+    // All ports blocked - kill zombie Chrome processes and wait longer
     let end = start + count - 1;
-    warn!("all ports in range {start}-{end} are blocked, attempting to kill zombie Chrome");
+    warn!("all ports in range {start}-{end} are blocked, killing zombie Chrome");
     kill_zombie_chrome()?;
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    // Wait longer for OS to release ports (Windows can take 2-3 seconds)
+    std::thread::sleep(std::time::Duration::from_secs(3));
 
     // Second pass after cleanup
     for port in start..start + count {
@@ -308,7 +259,6 @@ fn find_available_port(start: u16, count: u16) -> Result<u16> {
         }
     }
 
-    let end = start + count - 1;
     Err(anyhow!("no available port in range {start}-{end} after cleanup"))
 }
 

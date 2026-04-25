@@ -3918,8 +3918,10 @@ impl AgentRuntime {
                     "已委托", "已用opencode", "已让opencode", "委托给opencode",
                     "已检查", "已搜索", "已运行", "已执行",
                     "已交给", "交给opencode", "opencode正在", "opencode已经",
+                    "已访问", "访问了", "用浏览器", "用cdp", "用CDP",
                     "I delegated", "I asked opencode", "opencode is", "I ran",
-                    "I checked", "I searched", "I executed",
+                    "I checked", "I searched", "I executed", "I visited",
+                    "using browser", "used browser", "using cdp", "used cdp",
                 ];
                 let lower_text = text_buf.to_lowercase();
                 let claims_action = deception_keywords.iter().any(|kw| {
@@ -3932,7 +3934,8 @@ impl AgentRuntime {
                         parts.iter().any(|p| {
                             matches!(p, crate::provider::ContentPart::ToolUse { name, .. }
                                 if name == "opencode" || name == "claudecode" || name == "codex"
-                                    || name == "web_search" || name == "execute_command")
+                                    || name == "web_search" || name == "execute_command"
+                                    || name == "web_browser" || name == "web_fetch")
                         })
                     } else {
                         false

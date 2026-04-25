@@ -1448,11 +1448,21 @@ impl AgentRuntime {
                 // Everyone (main agent, sub-agents, web_fetch, web_search)
                 // uses one of these. No per-agent Chrome process.
                 let bs = if headed {
-                    // Headed mode: always launch a new visible Chrome window.
-                    // Don't try to connect to existing Chrome (could be headless pool).
-                    info!("launching new headed Chrome for user interaction");
-                    crate::browser::can_launch_chrome()?;
-                    crate::browser::BrowserSession::start(&chrome_path, true, profile.as_deref()).await?
+                    // Headed mode: try to connect to existing headed Chrome first.
+                    // If user already has Chrome open (with their login sessions),
+                    // we should reuse it instead of launching a new instance.
+                    let ports: &[u16] = &[9222, 9223, 9224];
+                    match crate::browser::detect_existing_chrome(ports).await {
+                        Some(ws_url) => {
+                            info!(ws_url, "connecting to existing headed Chrome for user interaction");
+                            crate::browser::BrowserSession::connect_existing(&ws_url).await?
+                        }
+                        None => {
+                            info!("no existing headed Chrome found, launching new one");
+                            crate::browser::can_launch_chrome()?;
+                            crate::browser::BrowserSession::start(&chrome_path, true, profile.as_deref()).await?
+                        }
+                    }
                 } else {
                     // Sub/task agents always use the shared pool Chrome.
                     match crate::browser::pool::BrowserPool::global().chrome_ws_url().await {
