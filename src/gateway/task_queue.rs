@@ -4,13 +4,19 @@
 //! here and processed in priority order (System > Cron > User, FIFO within
 //! the same priority level).
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tracing::{error, info};
 
-use crate::store::redb_store::RedbStore;
+use crate::{
+    agent::{AgentMessage, AgentRegistry, FileAttachment, ImageAttachment},
+    channel::OutboundMessage,
+    store::redb_store::RedbStore,
+};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -216,5 +222,214 @@ impl TaskQueueManager {
             failed: all.iter().filter(|t| t.status == TaskStatus::Failed).count(),
             dead: all.iter().filter(|t| t.status == TaskStatus::Dead).count(),
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Submit helper
+// ---------------------------------------------------------------------------
+
+/// Submit a message to the task queue instead of directly to the agent.
+///
+/// This is the recommended way for channels to send messages when the queue
+/// is enabled. Returns `(task_id, was_merged)`.
+pub fn submit_to_queue(
+    manager: &TaskQueueManager,
+    session_key: &str,
+    text: &str,
+    channel: &str,
+    peer_id: &str,
+    priority: Priority,
+) -> Result<(String, bool)> {
+    let message = QueuedMessage {
+        text: text.to_string(),
+        sender: peer_id.to_string(),
+        channel: channel.to_string(),
+        timestamp: chrono::Utc::now().timestamp(),
+        images: vec![],
+        files: vec![],
+    };
+    manager.submit(session_key, message, priority)
+}
+
+// ---------------------------------------------------------------------------
+// TaskQueueWorker
+// ---------------------------------------------------------------------------
+
+/// Background worker that polls the task queue and dispatches tasks to agents.
+pub struct TaskQueueWorker {
+    manager: Arc<TaskQueueManager>,
+    registry: Arc<AgentRegistry>,
+    channel_senders: Arc<std::sync::RwLock<HashMap<String, mpsc::Sender<OutboundMessage>>>>,
+}
+
+impl TaskQueueWorker {
+    /// Create a new worker.
+    pub fn new(
+        manager: Arc<TaskQueueManager>,
+        registry: Arc<AgentRegistry>,
+        channel_senders: Arc<std::sync::RwLock<HashMap<String, mpsc::Sender<OutboundMessage>>>>,
+    ) -> Self {
+        Self {
+            manager,
+            registry,
+            channel_senders,
+        }
+    }
+
+    /// Main loop: poll for pending tasks and dispatch them.
+    pub async fn run(&self) {
+        info!("task queue worker started");
+        loop {
+            match self.manager.next() {
+                Ok(Some(task)) => {
+                    self.process_task(task).await;
+                }
+                Ok(None) => {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Err(e) => {
+                    error!("task queue worker: dequeue error: {e:#}");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    /// Process a single queued task: send to agent, wait for reply, route back.
+    async fn process_task(&self, task: QueuedTask) {
+        let task_id = task.id.clone();
+        let session_key = task.session_key.clone();
+
+        // Determine channel + peer from the first message.
+        let (channel_name, peer_id) = task
+            .messages
+            .first()
+            .map(|m| (m.channel.clone(), m.sender.clone()))
+            .unwrap_or_default();
+
+        info!(
+            task_id = %task_id,
+            session_key = %session_key,
+            channel = %channel_name,
+            messages = task.messages.len(),
+            "task queue worker: processing task"
+        );
+
+        // Resolve agent handle — use default agent.
+        let handle = match self.registry.default_agent() {
+            Ok(h) => h,
+            Err(e) => {
+                error!(task_id = %task_id, "task queue worker: no default agent: {e:#}");
+                if let Err(fe) = self.manager.fail(&task_id, &format!("{e:#}"), task.max_retries) {
+                    error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}");
+                }
+                return;
+            }
+        };
+
+        // Build AgentMessage from merged text.
+        let text = task.merged_text();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+
+        // Collect images and files from all queued messages.
+        let images: Vec<ImageAttachment> = task
+            .messages
+            .iter()
+            .flat_map(|m| {
+                m.images.iter().map(|data| ImageAttachment {
+                    data: data.clone(),
+                    mime_type: "image/png".to_string(),
+                })
+            })
+            .collect();
+        let files: Vec<FileAttachment> = task
+            .messages
+            .iter()
+            .flat_map(|m| {
+                m.files.iter().map(|path| FileAttachment {
+                    filename: path.clone(),
+                    data: vec![],
+                    mime_type: "application/octet-stream".to_string(),
+                })
+            })
+            .collect();
+
+        let msg = AgentMessage {
+            session_key: session_key.clone(),
+            text,
+            channel: channel_name.clone(),
+            peer_id: peer_id.clone(),
+            chat_id: String::new(),
+            reply_tx,
+            extra_tools: vec![],
+            images,
+            files,
+        };
+
+        if handle.tx.send(msg).await.is_err() {
+            error!(task_id = %task_id, "task queue worker: agent channel closed");
+            if let Err(fe) = self.manager.fail(&task_id, "agent channel closed", task.max_retries) {
+                error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}");
+            }
+            return;
+        }
+
+        // Wait for reply with timeout (10 minutes, matching handle_pending_analysis).
+        match tokio::time::timeout(Duration::from_secs(600), reply_rx).await {
+            Ok(Ok(reply)) => {
+                info!(task_id = %task_id, "task queue worker: task completed");
+                if let Err(e) = self.manager.complete(&task_id) {
+                    error!(task_id = %task_id, "task queue worker: complete() error: {e:#}");
+                }
+
+                // Route reply back to the originating channel.
+                if !reply.text.is_empty() || !reply.images.is_empty() || !reply.files.is_empty() {
+                    let out = OutboundMessage {
+                        target_id: peer_id,
+                        is_group: false,
+                        text: reply.text,
+                        reply_to: None,
+                        images: reply.images,
+                        files: reply.files,
+                        channel: Some(channel_name.clone()),
+                    };
+                    let tx = {
+                        let guard = self
+                            .channel_senders
+                            .read()
+                            .expect("channel_senders lock poisoned");
+                        guard.get(&channel_name).cloned()
+                    };
+                    if let Some(tx) = tx {
+                        if let Err(e) = tx.send(out).await {
+                            error!(
+                                task_id = %task_id,
+                                channel = %channel_name,
+                                "task queue worker: send reply failed: {e}"
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            channel = %channel_name,
+                            "task queue worker: no channel sender registered"
+                        );
+                    }
+                }
+            }
+            Ok(Err(_)) => {
+                error!(task_id = %task_id, "task queue worker: reply channel dropped");
+                if let Err(fe) = self.manager.fail(&task_id, "reply channel dropped", task.max_retries) {
+                    error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}");
+                }
+            }
+            Err(_) => {
+                error!(task_id = %task_id, "task queue worker: reply timeout (600s)");
+                if let Err(fe) = self.manager.fail(&task_id, "reply timeout", task.max_retries) {
+                    error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}");
+                }
+            }
+        }
     }
 }

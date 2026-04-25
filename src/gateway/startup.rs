@@ -286,6 +286,20 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Arc::clone(&channel_senders),
     );
 
+    // Spawn task queue worker — processes queued tasks in priority order.
+    {
+        let task_queue_mgr = Arc::new(
+            super::task_queue::TaskQueueManager::new(Arc::clone(&store.db)),
+        );
+        let worker = super::task_queue::TaskQueueWorker::new(
+            Arc::clone(&task_queue_mgr),
+            Arc::clone(&registry),
+            Arc::clone(&channel_senders),
+        );
+        tokio::spawn(async move { worker.run().await });
+        info!("task queue worker started");
+    }
+
     // Spawn notification router task — routes OutboundMessages from ACP tools
     // (OpenCode, ClaudeCode) to the correct channel based on msg.channel.
     {
