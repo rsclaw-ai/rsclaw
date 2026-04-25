@@ -46,12 +46,27 @@ pub fn load_quiet() -> Result<RuntimeConfig> {
 }
 
 fn load_from_path(path: &std::path::Path) -> Result<RuntimeConfig> {
+    tracing::info!(path = %path.display(), "CDP: loading config file");
 
-    let runtime = load_json5(&path)
-        .with_context(|| format!("failed to load config: {}", path.display()))?
-        .into_runtime()?;
+    let raw_config = load_json5(&path)
+        .with_context(|| format!("failed to load config: {}", path.display()))?;
 
+    tracing::info!(
+        tools_present = raw_config.tools.is_some(),
+        web_browser_present = raw_config.tools.as_ref().and_then(|t| t.web_browser.as_ref()).is_some(),
+        web_browser_config = ?raw_config.tools.as_ref().and_then(|t| t.web_browser.as_ref()),
+        "CDP: raw config parsed"
+    );
+
+    let runtime = raw_config.into_runtime()?;
     validator::validate(&runtime)?;
+
+    tracing::info!(
+        tools_present = runtime.ext.tools.is_some(),
+        web_browser_present = runtime.ext.tools.as_ref().and_then(|t| t.web_browser.as_ref()).is_some(),
+        web_browser_config = ?runtime.ext.tools.as_ref().and_then(|t| t.web_browser.as_ref()),
+        "CDP: runtime config built"
+    );
 
     // Apply instance-isolation overrides set by --dev / --profile (AGENTS.md §26).
     let runtime = apply_env_overrides(runtime);

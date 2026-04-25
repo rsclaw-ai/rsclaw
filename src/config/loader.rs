@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use regex::Regex;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use super::schema::Config;
 
@@ -55,6 +55,8 @@ pub fn load_json5(path: &Path) -> Result<Config> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config: {}", path.display()))?;
 
+    info!(path = %path.display(), raw_len = raw.len(), "CDP: config file raw content read");
+
     // 1. Expand env vars before any parsing.
     let expanded = expand_env_vars(&raw);
 
@@ -62,12 +64,27 @@ pub fn load_json5(path: &Path) -> Result<Config> {
     let mut value: serde_json::Value = json5::from_str(&expanded)
         .with_context(|| format!("JSON5 parse error in {}", path.display()))?;
 
+    info!(
+        tools_present = value.get("tools").is_some(),
+        tools_web_browser = value.get("tools").and_then(|t| t.get("webBrowser")).is_some(),
+        tools_web_browser_snake = value.get("tools").and_then(|t| t.get("web_browser")).is_some(),
+        root_keys = ?value.as_object().map(|m| m.keys().collect::<Vec<_>>()),
+        "CDP: JSON5 parsed to generic Value"
+    );
+
     // 3. Resolve $include directives recursively.
     resolve_includes(&mut value, base_dir, 0)?;
 
     // 4. Deserialize into the typed schema.
     let config: Config = serde_json::from_value(value)
         .with_context(|| format!("schema error in {}", path.display()))?;
+
+    info!(
+        tools_present = config.tools.is_some(),
+        web_browser_present = config.tools.as_ref().and_then(|t| t.web_browser.as_ref()).is_some(),
+        web_browser_config = ?config.tools.as_ref().and_then(|t| t.web_browser.as_ref()),
+        "CDP: deserialized to Config struct"
+    );
 
     Ok(config)
 }

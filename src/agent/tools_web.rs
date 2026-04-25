@@ -1395,18 +1395,16 @@ impl AgentRuntime {
             // Task agents (non-main) always use headless to save resources.
             let wb_cfg = self.config.ext.tools.as_ref()
                 .and_then(|t| t.web_browser.as_ref());
+            info!(
+                tools_present = self.config.ext.tools.is_some(),
+                web_browser_present = wb_cfg.is_some(),
+                web_browser_config = ?wb_cfg,
+                "CDP: web_browser config check"
+            );
             let is_main = self.handle.id == "main";
-            let config_headed = if is_main {
-                wb_cfg.and_then(|b| b.headed).unwrap_or_else(has_display)
-            } else {
-                false // task agents always headless
-            };
+            let config_headed = wb_cfg.and_then(|b| b.headed).unwrap_or_else(has_display);
             let request_headed = args.get("headed").and_then(|v| v.as_bool());
-            let headed = if is_main {
-                request_headed.unwrap_or(config_headed)
-            } else {
-                false // task agents cannot override to headed
-            };
+            let headed = request_headed.unwrap_or(config_headed);
             let profile = wb_cfg.and_then(|b| b.profile.clone());
 
             // If headed mode changed, restart the session.
@@ -1450,29 +1448,11 @@ impl AgentRuntime {
                 // Everyone (main agent, sub-agents, web_fetch, web_search)
                 // uses one of these. No per-agent Chrome process.
                 let bs = if headed {
-                    // Main agent prefers the user's visible Chrome if running.
-                    let default_ports: Vec<u16> = vec![9222, 9223];
-                    let ports = wb_cfg
-                        .and_then(|b| b.remote_debug_ports.as_ref())
-                        .unwrap_or(&default_ports);
-                    if let Some(ws_url) = crate::browser::detect_existing_chrome(ports).await {
-                        info!("connecting to user Chrome (remote debugging, headed)");
-                        crate::browser::BrowserSession::connect_existing(&ws_url).await?
-                    } else {
-                        // No user Chrome — share the agent pool instead of
-                        // launching a 3rd process.
-                        match crate::browser::pool::BrowserPool::global().chrome_ws_url().await {
-                            Ok(ws_url) => {
-                                info!("no user Chrome — connecting to shared agent pool Chrome");
-                                crate::browser::BrowserSession::connect_existing(&ws_url).await?
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "pool Chrome unavailable, last-resort launch");
-                                crate::browser::can_launch_chrome()?;
-                                crate::browser::BrowserSession::start(&chrome_path, true, profile.as_deref()).await?
-                            }
-                        }
-                    }
+                    // Headed mode: always launch a new visible Chrome window.
+                    // Don't try to connect to existing Chrome (could be headless pool).
+                    info!("launching new headed Chrome for user interaction");
+                    crate::browser::can_launch_chrome()?;
+                    crate::browser::BrowserSession::start(&chrome_path, true, profile.as_deref()).await?
                 } else {
                     // Sub/task agents always use the shared pool Chrome.
                     match crate::browser::pool::BrowserPool::global().chrome_ws_url().await {

@@ -20,11 +20,10 @@ use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
     sync::{Mutex, mpsc, oneshot},
     time,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, error};
 
 /// Minimum available memory (bytes) required to launch a new Chrome instance.
 const MIN_AVAILABLE_MEMORY: u64 = 200 * 1024 * 1024; // 200 MB
@@ -162,14 +161,231 @@ pub fn can_launch_chrome() -> Result<()> {
     Ok(())
 }
 
+/// Kill zombie Chrome processes that are blocking ports 9222-9251.
+/// On Windows, uses netstat + taskkill to find and kill processes.
+/// Call this if Chrome fails to start due to port conflicts.
+#[cfg(target_os = "windows")]
+pub fn kill_zombie_chrome() -> Result<()> {
+    use std::process::Command;
+
+    // Find processes using our Chrome ports
+    for port in 9222..9252u16 {
+        // Use netstat to find PID using the port
+        let output = Command::new("netstat")
+            .args(["-ano", "-p", "TCP"])
+            .output()
+            .map_err(|e| anyhow!("netstat failed: {e}"))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            // Look for lines like: "TCP    127.0.0.1:9222    ...    PID"
+            if line.contains(&format!("127.0.0.1:{port}")) || line.contains(&format!("[::1]:{port}")) {
+                // Extract PID (last column)
+                let pid = line.split_whitespace().last()
+                    .and_then(|s| s.parse::<u32>().ok());
+                if let Some(pid) = pid {
+                    // Check if it's Chrome
+                    let proc_output = Command::new("tasklist")
+                        .args(["/FI", &format!("PID eq {pid}"), "/FI", "IMAGENAME eq chrome.exe"])
+                        .output();
+                    if let Ok(proc_out) = proc_output {
+                        let proc_str = String::from_utf8_lossy(&proc_out.stdout);
+                        if proc_str.contains("chrome.exe") {
+                            info!(pid, port, "killing zombie Chrome process");
+                            let _ = Command::new("taskkill")
+                                .args(["/F", "/T", "/PID", &pid.to_string()])
+                                .output();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn kill_zombie_chrome() -> Result<()> {
+    // On Unix, use pkill
+    let _ = Command::new("pkill")
+        .args(["-9", "-f", "remote-debugging-port=9[2-5][2-9][0-9]"])
+        .output();
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // ChromeProcess -- launch and manage a headless Chrome instance
 // ---------------------------------------------------------------------------
 
 pub(crate) struct ChromeProcess {
     child: tokio::process::Child,
+    port: u16,
     ws_url: String,
     _tmp_dir: Option<tempfile::TempDir>,
+}
+
+/// Find an available port in the given range.
+/// A port is "available" only if we can bind to it (meaning it's truly free).
+/// We do NOT reuse existing Chrome DevTools ports because launching a new Chrome
+/// on a port that's already in use will cause immediate exit.
+fn find_available_port(start: u16, count: u16) -> Result<u16> {
+    // First, proactively kill any existing Chrome DevTools instances in our port range.
+    // This prevents zombie Chrome from blocking ports.
+    for port in start..start + count {
+        if is_chrome_devtools_port(port) {
+            warn!(port, "found existing Chrome DevTools, killing it before launch");
+            // Use kill_zombie_chrome logic specifically for this port
+            #[cfg(target_os = "windows")]
+            {
+                use std::process::Command;
+                let output = Command::new("netstat")
+                    .args(["-ano", "-p", "TCP"])
+                    .output()
+                    .ok();
+                if let Some(output) = output {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    for line in stdout.lines() {
+                        if line.contains(&format!("127.0.0.1:{port}")) || line.contains(&format!("[::1]:{port}")) {
+                            let pid = line.split_whitespace().last()
+                                .and_then(|s| s.parse::<u32>().ok());
+                            if let Some(pid) = pid {
+                                let proc_output = Command::new("tasklist")
+                                    .args(["/FI", &format!("PID eq {pid}"), "/FI", "IMAGENAME eq chrome.exe"])
+                                    .output();
+                                if let Ok(proc_out) = proc_output {
+                                    let proc_str = String::from_utf8_lossy(&proc_out.stdout);
+                                    if proc_str.contains("chrome.exe") {
+                                        info!(pid, port, "killing existing Chrome DevTools process");
+                                        let _ = Command::new("taskkill")
+                                            .args(["/F", "/T", "/PID", &pid.to_string()])
+                                            .output();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                use std::process::Command;
+                // Kill Chrome processes with this specific port
+                let _ = Command::new("pkill")
+                    .args(["-9", "-f", &format!("remote-debugging-port={port}")])
+                    .output();
+            }
+            // Brief pause for process to exit
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+
+    // Now try to find a truly available port
+    for port in start..start + count {
+        // Try IPv4 bind
+        if std::net::TcpListener::bind(format!("127.0.0.1:{port}")).is_ok() {
+            return Ok(port);
+        }
+        // Try IPv6 bind
+        if std::net::TcpListener::bind(format!("[::1]:{port}")).is_ok() {
+            return Ok(port);
+        }
+        // Port is in use - skip it, don't try to reuse existing Chrome
+    }
+
+    // All ports blocked - try to kill zombie Chrome processes and retry
+    let end = start + count - 1;
+    warn!("all ports in range {start}-{end} are blocked, attempting to kill zombie Chrome");
+    kill_zombie_chrome()?;
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Second pass after cleanup
+    for port in start..start + count {
+        if std::net::TcpListener::bind(format!("127.0.0.1:{port}")).is_ok() {
+            return Ok(port);
+        }
+        if std::net::TcpListener::bind(format!("[::1]:{port}")).is_ok() {
+            return Ok(port);
+        }
+    }
+
+    let end = start + count - 1;
+    Err(anyhow!("no available port in range {start}-{end} after cleanup"))
+}
+
+/// Check if a port is serving Chrome DevTools Protocol.
+fn is_chrome_devtools_port(port: u16) -> bool {
+    // Quick HTTP check to see if Chrome DevTools is listening
+    let url = format!("http://127.0.0.1:{port}/json/version");
+    if let Ok(resp) = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+        .and_then(|c| c.get(&url).send())
+    {
+        if resp.status().is_success() {
+            return true;
+        }
+    }
+    // Also try IPv6
+    let url_v6 = format!("http://[::1]:{port}/json/version");
+    if let Ok(resp) = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+        .and_then(|c| c.get(&url_v6).send())
+    {
+        resp.status().is_success()
+    } else {
+        false
+    }
+}
+
+/// Parse the port number from a WebSocket URL.
+/// Supports formats: ws://127.0.0.1:PORT/... or ws://[::1]:PORT/...
+fn parse_port_from_ws_url(url: &str) -> Result<u16> {
+    // IPv4: ws://127.0.0.1:PORT/
+    if let Some(pos) = url.find("127.0.0.1:") {
+        let start = pos + "127.0.0.1:".len();
+        let end = url[start..].find('/').unwrap_or(url.len() - start);
+        return url[start..start + end].parse::<u16>()
+            .map_err(|e| anyhow!("invalid port: {e}"));
+    }
+    // IPv6: ws://[::1]:PORT/
+    if let Some(pos) = url.find("[::1]:") {
+        let start = pos + "[::1]:".len();
+        let end = url[start..].find('/').unwrap_or(url.len() - start);
+        return url[start..start + end].parse::<u16>()
+            .map_err(|e| anyhow!("invalid port: {e}"));
+    }
+    Err(anyhow!("cannot parse port from ws URL: {url}"))
+}
+
+/// Fetch the DevTools WebSocket URL via HTTP after Chrome starts.
+async fn fetch_ws_url_via_http(port: u16, timeout_secs: u64) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+
+    // Try both IPv4 and IPv6
+    let hosts = ["127.0.0.1", "[::1]"];
+
+    for attempt in 0..timeout_secs {
+        for &host in &hosts {
+            let url = format!("http://{host}:{port}/json/version");
+            match client.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(body) = resp.json::<Value>().await {
+                        if let Some(ws_url) = body.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) {
+                            return Ok(ws_url.to_owned());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if attempt < timeout_secs - 1 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    Err(anyhow!("timeout waiting for Chrome DevTools at port {port}"))
 }
 
 impl ChromeProcess {
@@ -226,63 +442,74 @@ impl ChromeProcess {
             (dir, Some(tmp))
         };
 
-        let mut args = vec![
-            "--remote-debugging-port=0",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-background-networking",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-component-update",
-            "--disable-default-apps",
-            "--disable-hang-monitor",
-            "--disable-popup-blocking",
-            "--disable-prompt-on-repost",
-            "--disable-sync",
-            "--disable-features=Translate",
-            "--enable-features=NetworkService,NetworkServiceInProcess",
-            "--metrics-recording-only",
-            "--password-store=basic",
-            "--use-mock-keychain",
-            "--window-size=1280,720",
-            "about:blank",
+        // Try a range of ports.
+        // Headed Chrome uses 9222-9231 (standard user ports, wider range).
+        // Headless Chrome pool uses 9242-9251 (separate range, avoids conflict).
+        let (port_start, port_count) = if headed {
+            (9222, 10)
+        } else {
+            (9242, 10)
+        };
+        // find_available_port uses blocking operations (socket bind, HTTP client),
+        // so we must run it in a blocking thread pool.
+        let port = tokio::task::spawn_blocking(move || {
+            find_available_port(port_start, port_count)
+        }).await
+            .map_err(|e| anyhow!("spawn_blocking failed: {e}"))??;
+
+        let mut args: Vec<String> = vec![
+            format!("--remote-debugging-port={}", port),
+            "--no-first-run".to_string(),
+            "--no-default-browser-check".to_string(),
+            "--disable-background-networking".to_string(),
+            "--disable-backgrounding-occluded-windows".to_string(),
+            "--disable-component-update".to_string(),
+            "--disable-default-apps".to_string(),
+            "--disable-hang-monitor".to_string(),
+            "--disable-popup-blocking".to_string(),
+            "--disable-prompt-on-repost".to_string(),
+            "--disable-sync".to_string(),
+            "--disable-features=Translate".to_string(),
+            "--enable-features=NetworkService,NetworkServiceInProcess".to_string(),
+            "--metrics-recording-only".to_string(),
+            "--password-store=basic".to_string(),
+            "--use-mock-keychain".to_string(),
+            "--window-size=1280,720".to_string(),
+            // Keep Chrome running with a blank page - headless Chrome exits after loading about:blank
+            "--no-exit-on-main-process-crash".to_string(),
+            "data:,".to_string(),  // Use minimal page instead of about:blank
         ];
         if !headed {
-            args.push("--headless=new");
+            // Headless mode requires --no-sandbox for Chrome for Testing on Windows
+            args.push("--headless=new".to_string());
+            args.push("--no-sandbox".to_string());
         }
+
+        info!(
+            chrome_path,
+            user_data_dir = %user_data_dir.display(),
+            headed,
+            profile = ?profile,
+            port,
+            args = ?args,
+            "CDP: launching Chrome"
+        );
 
         let mut child = tokio::process::Command::new(chrome_path)
             .args(&args)
             .arg(format!("--user-data-dir={}", user_data_dir.display()))
-            .stderr(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())  // Ignore stderr to avoid encoding issues
+            .stdout(std::process::Stdio::null())  // Ignore stdout
             .stdin(std::process::Stdio::null())
             .spawn()
             .map_err(|e| anyhow!("failed to launch Chrome at {chrome_path}: {e}"))?;
 
-        // Read stderr until we find the DevTools WebSocket URL.
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow!("no stderr from Chrome process"))?;
-        let mut reader = BufReader::new(stderr).lines();
+        info!(pid = ?child.id(), port, "CDP: Chrome process spawned, waiting for DevTools...");
 
-        let ws_url = time::timeout(Duration::from_secs(30), async {
-            while let Some(line) = reader.next_line().await? {
-                debug!(line = %line, "chrome stderr");
-                if let Some(pos) = line.find("ws://") {
-                    return Ok::<String, anyhow::Error>(line[pos..].trim().to_owned());
-                }
-            }
-            Err(anyhow!("Chrome exited without printing DevTools URL"))
-        })
-        .await
-        .map_err(|e| {
-            // Chrome launched but didn't give us a WebSocket URL — kill it.
-            let _ = child.start_kill();
-            anyhow!("timed out waiting for Chrome DevTools URL: {}", e)
-        })??;
+        // Wait for Chrome to start and fetch ws_url via HTTP (more reliable than stderr parsing)
+        let ws_url = fetch_ws_url_via_http(port, 10).await?;
 
-        debug!(ws_url = %ws_url, "Chrome DevTools URL discovered");
+        info!(ws_url = %ws_url, port, "CDP: Chrome DevTools URL discovered");
         ACTIVE_INSTANCES.fetch_add(1, Ordering::Relaxed);
         let active = ACTIVE_INSTANCES.load(Ordering::Relaxed);
         let max = max_instances();
@@ -290,14 +517,15 @@ impl ChromeProcess {
 
         Ok(Self {
             child,
+            port,
             ws_url,
             _tmp_dir: tmp_dir,
         })
     }
 
-    /// Extract the debugging port from the ws URL.
-    pub(crate) fn port(&self) -> Result<u16> {
-        parse_port_from_ws_url(&self.ws_url)
+    /// Get the debugging port.
+    pub(crate) fn port(&self) -> u16 {
+        self.port
     }
 }
 
@@ -346,44 +574,34 @@ impl Drop for ChromeProcess {
     }
 }
 
-/// Parse the port number from a Chrome DevTools WebSocket URL.
-/// Expects format: `ws://127.0.0.1:PORT/devtools/...`
-fn parse_port_from_ws_url(url: &str) -> Result<u16> {
-    let after_host = url
-        .find("127.0.0.1:")
-        .map(|i| i + "127.0.0.1:".len())
-        .ok_or_else(|| anyhow!("cannot parse port from ws URL: {url}"))?;
-    let end = url[after_host..]
-        .find('/')
-        .unwrap_or(url.len() - after_host);
-    let port_str = &url[after_host..after_host + end];
-    port_str
-        .parse::<u16>()
-        .map_err(|e| anyhow!("invalid port in ws URL: {e}"))
-}
-
 /// Try to connect to an already-running Chrome with remote debugging.
-/// Probes the given ports and returns the browser WebSocket URL if found.
+/// Probes the given ports on both IPv4 (127.0.0.1) and IPv6 ([::1]) localhost.
+/// Returns the browser WebSocket URL if found.
 pub(crate) async fn detect_existing_chrome(ports: &[u16]) -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
         .build()
         .ok()?;
 
+    // Try IPv4 first (more common), then IPv6 (Windows default for Chrome)
+    let hosts = ["127.0.0.1", "[::1]"];
+
     for &port in ports {
-        let url = format!("http://127.0.0.1:{port}/json/version");
-        debug!(port, "probing for existing Chrome remote debugging");
-        match client.get(&url).send().await {
-            Ok(resp) => {
-                if let Ok(body) = resp.json::<Value>().await {
-                    if let Some(ws_url) = body.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) {
-                        debug!(port, ws_url, "found existing Chrome with remote debugging");
-                        return Some(ws_url.to_owned());
+        for &host in &hosts {
+            let url = format!("http://{host}:{port}/json/version");
+            debug!(port, host, "probing for existing Chrome remote debugging");
+            match client.get(&url).send().await {
+                Ok(resp) => {
+                    if let Ok(body) = resp.json::<Value>().await {
+                        if let Some(ws_url) = body.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) {
+                            debug!(port, host, ws_url, "found existing Chrome with remote debugging");
+                            return Some(ws_url.to_owned());
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                debug!(port, error = %e, "no Chrome remote debugging on this port");
+                Err(e) => {
+                    debug!(port, host, error = %e, "no Chrome remote debugging on this address");
+                }
             }
         }
     }
@@ -598,7 +816,7 @@ impl BrowserSession {
     /// Launch Chrome, discover the default page target, and connect CDP.
     pub async fn start(chrome_path: &str, headed: bool, profile: Option<&str>) -> Result<Self> {
         let chrome = ChromeProcess::launch(chrome_path, headed, profile).await?;
-        let port = chrome.port()?;
+        let port = chrome.port();
         let cdp = Self::connect_cdp_by_port(port).await?;
 
         let now = std::time::SystemTime::now()
@@ -782,7 +1000,7 @@ impl BrowserSession {
         if self.chrome.is_some() {
             // Drop old chrome (kills process via Drop) and launch new one.
             let new_chrome = ChromeProcess::launch(&self.chrome_path, self.headed, self.profile.as_deref()).await?;
-            let port = new_chrome.port()?;
+            let port = new_chrome.port();
             let new_cdp = Self::connect_cdp_by_port(port).await?;
             self.debug_port = port;
             self.chrome = Some(new_chrome);

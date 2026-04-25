@@ -204,7 +204,7 @@ impl BrowserPool {
 
         // Launch headless Chrome with shared profile (for cookies/session).
         let process = ChromeProcess::launch(&chrome_path, false, profile.as_deref()).await?;
-        let port = process.port()?;
+        let port = process.port();
         info!(port, profile = ?profile, "pool: shared headless Chrome launched");
 
         *guard = Some(PooledChrome { process, port });
