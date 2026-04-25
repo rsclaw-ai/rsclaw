@@ -2623,6 +2623,14 @@ impl AgentRuntime {
 
             if !candidates.is_empty() {
                 let mem_clone = Arc::clone(mem);
+                let providers = Arc::clone(&self.providers);
+                let model_for_distill = self
+                    .handle
+                    .config
+                    .model
+                    .as_ref()
+                    .and_then(|m| m.primary.clone())
+                    .unwrap_or_default();
                 let ws_dir = self
                     .handle
                     .config
@@ -2635,46 +2643,96 @@ impl AgentRuntime {
                 let scope = format!("agent:{}", self.handle.id);
                 tokio::spawn(async move {
                     for doc_id in candidates {
-                        let mut store = mem_clone.lock().await;
-                        match crate::skill::crystallizer::find_cluster(&store, &doc_id, &scope) {
-                            Ok(Some(cluster)) => {
-                                let prompt =
-                                    crate::skill::crystallizer::build_distill_prompt(&cluster);
-                                // Tag all cluster docs as crystallized (even without
-                                // LLM distillation) to prevent repeated attempts.
-                                let ids: Vec<String> =
-                                    cluster.iter().map(|d| d.id.clone()).collect();
-                                for id in &ids {
-                                    if let Err(e) = store.tag_doc(id, "crystallized").await {
-                                        tracing::debug!(id, "tag_doc failed: {e:#}");
-                                    }
-                                }
-                                drop(store);
-                                // Write a draft skill with the prompt as content.
-                                // A future version can use an LLM to distill it.
-                                let slug = crate::skill::crystallizer::slugify(
-                                    &prompt.lines().next().unwrap_or("auto-skill"),
-                                );
-                                match crate::skill::crystallizer::write_skill(
-                                    &skills_dir,
-                                    &slug,
-                                    &prompt,
-                                ) {
-                                    Ok(path) => {
-                                        tracing::info!(
-                                            ?path,
-                                            "crystallized {} memories into skill",
-                                            ids.len()
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("skill crystallization write failed: {e:#}");
-                                    }
-                                }
-                            }
-                            Ok(None) => {} // not enough related memories yet
+                        // 1. Find cluster (brief read lock).
+                        let cluster_result = {
+                            let store = mem_clone.lock().await;
+                            crate::skill::crystallizer::find_cluster(&store, &doc_id, &scope)
+                        };
+                        let cluster = match cluster_result {
+                            Ok(Some(c)) => c,
+                            Ok(None) => continue, // not enough related memories yet
                             Err(e) => {
                                 tracing::debug!(doc_id, "crystallization check failed: {e:#}");
+                                continue;
+                            }
+                        };
+                        let ids: Vec<String> = cluster.iter().map(|d| d.id.clone()).collect();
+
+                        // 2. Build the distillation prompt.
+                        let prompt =
+                            crate::skill::crystallizer::build_distill_prompt(&cluster);
+
+                        // 3. Distill via LLM. On any failure, skip this cluster
+                        //    without tagging so a future reply can retry.
+                        if model_for_distill.is_empty() {
+                            tracing::debug!("crystallization: no agent model configured, skipping");
+                            continue;
+                        }
+                        let (provider_name, model_id) =
+                            providers.resolve_model(&model_for_distill);
+                        let provider_arc = match providers.get(provider_name) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::warn!(
+                                    provider = provider_name,
+                                    "crystallization: provider not registered: {e:#}"
+                                );
+                                continue;
+                            }
+                        };
+                        let model_owned = model_id.to_owned();
+                        let skill_md = match crate::skill::crystallizer::distill_with_llm(
+                            &prompt,
+                            provider_arc,
+                            model_owned,
+                        )
+                        .await
+                        {
+                            Ok(md) => md,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "crystallization: LLM distillation failed, skipping: {e:#}"
+                                );
+                                continue;
+                            }
+                        };
+
+                        // 4. Derive slug from the SKILL.md frontmatter (or fall back
+                        //    to a per-cluster id so different clusters don't collide).
+                        let fallback = format!(
+                            "auto-skill-{}",
+                            &doc_id[..8.min(doc_id.len())]
+                        );
+                        let slug = crate::skill::crystallizer::extract_skill_slug(
+                            &skill_md, &fallback,
+                        );
+
+                        // 5. Write the SKILL.md file.
+                        match crate::skill::crystallizer::write_skill(
+                            &skills_dir,
+                            &slug,
+                            &skill_md,
+                        ) {
+                            Ok(path) => {
+                                tracing::info!(
+                                    ?path,
+                                    slug = %slug,
+                                    n = ids.len(),
+                                    "crystallized memories into skill"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("skill crystallization write failed: {e:#}");
+                                continue;
+                            }
+                        }
+
+                        // 6. Tag cluster docs as crystallized only after a
+                        //    successful write so transient failures stay retryable.
+                        let mut store = mem_clone.lock().await;
+                        for id in &ids {
+                            if let Err(e) = store.tag_doc(id, "crystallized").await {
+                                tracing::debug!(id, "tag_doc failed: {e:#}");
                             }
                         }
                     }
