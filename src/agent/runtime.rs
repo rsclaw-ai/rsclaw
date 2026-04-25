@@ -4303,14 +4303,21 @@ impl AgentRuntime {
                         }
                     }
                     Err(e) => {
-                        warn!(tool = %tool_name, "tool error: {e:#}");
+                        // Use {:#} (anyhow alternate Display) to include the
+                        // full error chain — without this the LLM only sees
+                        // the outermost with_context() wrapper and root cause
+                        // (wasm trap, http status, panic msg) is hidden.
+                        let err_chain = format!("{e:#}");
+                        warn!(tool = %tool_name, "tool error: {}", err_chain);
                         // Record error result for loop detection (errors count as results too).
                         ctx.loop_detector
-                            .record_result(&serde_json::json!({"error": e.to_string()}));
-                        (format!(
-                            "{{\"error\":\"{}\",\"_do_not_retry\":true,\"hint\":\"This tool call failed. Do NOT retry the same tool with the same arguments. Try a different approach or inform the user.\"}}",
-                            e
-                        ), vec![])
+                            .record_result(&serde_json::json!({"error": err_chain.clone()}));
+                        let payload = serde_json::json!({
+                            "error": err_chain,
+                            "_do_not_retry": true,
+                            "hint": "This tool call failed. Do NOT retry the same tool with the same arguments. Try a different approach or inform the user.",
+                        });
+                        (payload.to_string(), vec![])
                     }
                 };
 
