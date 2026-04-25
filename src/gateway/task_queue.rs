@@ -9,7 +9,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use anyhow::Result;
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::{error, info};
 
 use crate::{
@@ -51,6 +51,10 @@ pub struct QueuedMessage {
     pub text: String,
     pub sender: String,
     pub channel: String,
+    /// Platform-specific chat/conversation ID (e.g. Telegram chat_id).
+    pub chat_id: String,
+    /// Whether this message originated from a group conversation.
+    pub is_group: bool,
     pub timestamp: i64,
     /// Base64-encoded images or file-system paths.
     pub images: Vec<String>,
@@ -148,12 +152,24 @@ pub struct QueueStats {
 /// High-level task queue API used by the gateway.
 pub struct TaskQueueManager {
     store: Arc<RedbStore>,
+    notify: Notify,
 }
 
 impl TaskQueueManager {
     /// Create a new manager backed by the given store.
     pub fn new(store: Arc<RedbStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            notify: Notify::new(),
+        }
+    }
+
+    /// Wait until a new task is submitted.
+    ///
+    /// Use inside `tokio::select!` with a fallback timeout so that the worker
+    /// also picks up tasks that were persisted before the current process started.
+    pub async fn notified(&self) {
+        self.notify.notified().await;
     }
 
     /// Submit a new task. Handles dedup and merge automatically.
@@ -179,6 +195,7 @@ impl TaskQueueManager {
         // Merge: if there is already a pending task for this session, append.
         if self.store.merge_into_pending(session_key, &message)? {
             tracing::info!(session_key, "task_queue: message merged into pending task");
+            self.notify.notify_one();
             return Ok(("merged".to_string(), true));
         }
 
@@ -187,6 +204,7 @@ impl TaskQueueManager {
         let id = task.id.clone();
         self.store.enqueue_task(&task)?;
         tracing::info!(session_key, task_id = %id, "task_queue: new task enqueued");
+        self.notify.notify_one();
         Ok((id, false))
     }
 
@@ -239,12 +257,16 @@ pub fn submit_to_queue(
     text: &str,
     channel: &str,
     peer_id: &str,
+    chat_id: &str,
+    is_group: bool,
     priority: Priority,
 ) -> Result<(String, bool)> {
     let message = QueuedMessage {
         text: text.to_string(),
         sender: peer_id.to_string(),
         channel: channel.to_string(),
+        chat_id: chat_id.to_string(),
+        is_group,
         timestamp: chrono::Utc::now().timestamp(),
         images: vec![],
         files: vec![],
@@ -257,6 +279,9 @@ pub fn submit_to_queue(
 // ---------------------------------------------------------------------------
 
 /// Background worker that polls the task queue and dispatches tasks to agents.
+///
+/// Each dequeued task is spawned as a separate tokio task so multiple
+/// channel messages can be processed concurrently.
 pub struct TaskQueueWorker {
     manager: Arc<TaskQueueManager>,
     registry: Arc<AgentRegistry>,
@@ -280,11 +305,15 @@ impl TaskQueueWorker {
         }
     }
 
-    /// Main loop: poll for pending tasks and dispatch them. Exits when the
-    /// shutdown coordinator signals drain — already-running tasks complete,
+    /// Main loop: wait for task notifications and dispatch them. Exits when
+    /// the shutdown coordinator signals drain — already-running tasks complete,
     /// but no new ones are pulled. Persistent tasks left in the queue are
     /// picked up by the next gateway process on startup.
-    pub async fn run(&self) {
+    ///
+    /// Uses `tokio::select!` between the manager's `Notify` (instant wake on
+    /// submit) and a 5-second fallback (picks up pre-existing or
+    /// crash-recovered tasks).
+    pub async fn run(self: Arc<Self>) {
         info!("task queue worker started");
         loop {
             if self.shutdown.is_draining() {
@@ -293,12 +322,21 @@ impl TaskQueueWorker {
             }
             match self.manager.next() {
                 Ok(Some(task)) => {
-                    let _guard = self.shutdown.begin_work();
-                    self.process_task(task).await;
-                    // _guard drops here, decrementing inflight.
+                    let guard = self.shutdown.begin_work();
+                    let worker = Arc::clone(&self);
+                    tokio::spawn(async move {
+                        worker.process_task(task).await;
+                        drop(guard);
+                    });
+                    // Immediately loop back to check for more tasks.
+                    continue;
                 }
                 Ok(None) => {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    // No pending tasks — wait for a notification or fallback.
+                    tokio::select! {
+                        () = self.manager.notified() => {}
+                        () = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    }
                 }
                 Err(e) => {
                     error!("task queue worker: dequeue error: {e:#}");
@@ -314,11 +352,11 @@ impl TaskQueueWorker {
         let task_id = task.id.clone();
         let session_key = task.session_key.clone();
 
-        // Determine channel + peer from the first message.
-        let (channel_name, peer_id) = task
+        // Determine channel + peer + chat from the first message.
+        let (channel_name, peer_id, chat_id, is_group) = task
             .messages
             .first()
-            .map(|m| (m.channel.clone(), m.sender.clone()))
+            .map(|m| (m.channel.clone(), m.sender.clone(), m.chat_id.clone(), m.is_group))
             .unwrap_or_default();
 
         info!(
@@ -329,16 +367,19 @@ impl TaskQueueWorker {
             "task queue worker: processing task"
         );
 
-        // Resolve agent handle — use default agent.
-        let handle = match self.registry.default_agent() {
+        // Resolve agent handle — route by channel, fall back to default.
+        let handle = match self.registry.route(&channel_name) {
             Ok(h) => h,
-            Err(e) => {
-                error!(task_id = %task_id, "task queue worker: no default agent: {e:#}");
-                if let Err(fe) = self.manager.fail(&task_id, &format!("{e:#}"), task.max_retries) {
-                    error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}");
+            Err(_) => match self.registry.default_agent() {
+                Ok(h) => h,
+                Err(e) => {
+                    error!(task_id = %task_id, "task queue worker: no agent for channel {channel_name}: {e:#}");
+                    if let Err(fe) = self.manager.fail(&task_id, &format!("{e:#}"), task.max_retries) {
+                        error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}");
+                    }
+                    return;
                 }
-                return;
-            }
+            },
         };
 
         // Build AgentMessage from merged text.
@@ -398,9 +439,12 @@ impl TaskQueueWorker {
 
                 // Route reply back to the originating channel.
                 if !reply.text.is_empty() || !reply.images.is_empty() || !reply.files.is_empty() {
+                    // Use chat_id as target when available (e.g. Telegram group),
+                    // fall back to peer_id for DM-style channels.
+                    let target = if chat_id.is_empty() { peer_id.clone() } else { chat_id };
                     let out = OutboundMessage {
-                        target_id: peer_id,
-                        is_group: false,
+                        target_id: target,
+                        is_group,
                         text: reply.text,
                         reply_to: None,
                         images: reply.images,

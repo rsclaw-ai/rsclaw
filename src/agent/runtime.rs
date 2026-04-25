@@ -3502,17 +3502,15 @@ impl AgentRuntime {
                     .and_then(|m| m.max_tokens)
                     .map(|v| v as u32);
 
-                from_agent.or(from_defaults).or(from_provider)
+                from_agent.or(from_defaults).or(from_provider).or(Some(30_000))
             };
 
-            // Only pass max_tokens when explicitly configured.
-            // When None, the model/provider decides its own output limit.
             if let Some(configured) = configured_max_tokens {
                 info!(
                     session = %ctx.session_key,
                     model = %model,
                     max_tokens = configured,
-                    "LLM request max_tokens (from config)"
+                    "LLM request max_tokens"
                 );
             }
 

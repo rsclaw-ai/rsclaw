@@ -292,6 +292,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
 
+    // Create task queue manager before channels so channels can submit to it.
+    let task_queue_mgr = Arc::new(
+        super::task_queue::TaskQueueManager::new(Arc::clone(&store.db)),
+    );
+
     start_channels(
         &config,
         Arc::clone(&registry),
@@ -304,6 +309,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Arc::clone(&dm_enforcers),
         Arc::clone(&store.db),
         Arc::clone(&channel_senders),
+        Arc::clone(&task_queue_mgr),
     );
 
     // Graceful-shutdown coordinator — wired to task queue worker, axum graceful
@@ -312,15 +318,12 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     // Spawn task queue worker — processes queued tasks in priority order.
     {
-        let task_queue_mgr = Arc::new(
-            super::task_queue::TaskQueueManager::new(Arc::clone(&store.db)),
-        );
-        let worker = super::task_queue::TaskQueueWorker::new(
+        let worker = Arc::new(super::task_queue::TaskQueueWorker::new(
             Arc::clone(&task_queue_mgr),
             Arc::clone(&registry),
             Arc::clone(&channel_senders),
             shutdown.clone(),
-        );
+        ));
         tokio::spawn(async move { worker.run().await });
         info!("task queue worker started");
     }

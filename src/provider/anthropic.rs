@@ -122,7 +122,7 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
     inject_cache_control(&mut body);
 
     if let Some(t) = req.temperature {
-        body["temperature"] = json!(t);
+        body["temperature"] = super::json_f32(t);
     }
 
     if !req.tools.is_empty() {

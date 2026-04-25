@@ -421,7 +421,7 @@ impl OpenAiProvider {
         // Ollama uses "options" for parameters, not top-level fields.
         let mut options = serde_json::Map::new();
         if let Some(t) = req.temperature {
-            options.insert("temperature".into(), json!(t));
+            options.insert("temperature".into(), super::json_f32(t));
         }
         if let Some(max) = req.max_tokens {
             if max > 0 {
@@ -843,12 +843,12 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
     }
 
     if let Some(t) = req.temperature {
-        body["temperature"] = json!(t);
+        body["temperature"] = super::json_f32(t);
     }
 
     if let Some(fp) = req.frequency_penalty {
         if fp > 0.0 {
-            body["frequency_penalty"] = json!(fp);
+            body["frequency_penalty"] = super::json_f32(fp);
         }
     }
 
@@ -1409,7 +1409,7 @@ fn build_responses_body(req: &LlmRequest, file_id_map: &HashMap<String, String>)
     }
 
     if let Some(t) = req.temperature {
-        body["temperature"] = json!(t);
+        body["temperature"] = super::json_f32(t);
     }
 
     if !req.tools.is_empty() {

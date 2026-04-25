@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -11,10 +11,9 @@ use crate::{
 };
 
 use super::super::preparse::{
-    btw_direct_call, is_fast_preparse, processing_timeout, send_processing,
+    btw_direct_call, is_fast_preparse,
     try_preparse_locally,
 };
-use super::super::startup::handle_pending_analysis;
 use super::default_dm_scope;
 
 pub(crate) fn start_whatsapp_if_configured(
@@ -29,6 +28,7 @@ pub(crate) fn start_whatsapp_if_configured(
     channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
+    task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
 ) {
     use crate::channel::whatsapp::WhatsAppChannel;
 
@@ -95,6 +95,7 @@ pub(crate) fn start_whatsapp_if_configured(
         let enforcer = Arc::clone(&enforcer);
         let reg = Arc::clone(&registry);
         let cfg_arc = Arc::new(config.clone());
+        let tq = Arc::clone(&task_queue);
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
         // Register WhatsApp channel sender for notification routing.
@@ -118,6 +119,7 @@ pub(crate) fn start_whatsapp_if_configured(
                 let tx = out_tx.clone();
                 let enforcer = Arc::clone(&enforcer);
                 let queues = Arc::clone(&wa_user_queues);
+                let tq = Arc::clone(&tq);
                 tokio::spawn(async move {
                     // DM policy check (WhatsApp is DM-only).
                     {
@@ -188,84 +190,36 @@ pub(crate) fn start_whatsapp_if_configured(
                             map.insert(from.clone(), utx.clone());
                             let w_reg = Arc::clone(&reg);
                             let w_cfg = Arc::clone(&cfg);
-                            let w_tx = tx.clone();
+                            let w_tq = Arc::clone(&tq);
                             let w_uid = from.clone();
                             tokio::spawn(async move {
-                                while let Some((mut text, from, mut images)) = urx.recv().await {
-                                    // Debounce: wait briefly then drain queued messages.
-                                    tokio::time::sleep(Duration::from_secs(2)).await;
-                                    while let Ok((extra_text, _, extra_images)) = urx.try_recv() {
-                                        if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
-                                            text.push('\n');
-                                            text.push_str(&extra_text);
-                                        }
-                                        images.extend(extra_images);
-                                    }
-                                    let process_result = tokio::time::timeout(
-                                Duration::from_secs(600),
-                                async {
-                            let handle = match w_reg.route("whatsapp") {
-                                Ok(h) => h,
-                                Err(e) => { error!("whatsapp route: {e:#}"); return; }
-                            };
-                            let dm_scope = default_dm_scope(&w_cfg);
-                            let session_key = derive_session_key(&SessionKeyParams {
-                                agent_id: handle.id.clone(),
-                                kind: MessageKind::DirectMessage { account_id: None },
-                                channel: "whatsapp".to_string(),
-                                peer_id: from.clone(),
-                                dm_scope,
-                            });
-                            let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
-                            let msg = AgentMessage {
-                                session_key,
-                                text,
-                                channel: "whatsapp".to_string(),
-                                peer_id: from.clone(),
-                                chat_id: String::new(),
-                                reply_tx,
-                                extra_tools: vec![],
-                                images,
-                                files: vec![],
-                            };
-                            if handle.tx.send(msg).await.is_err() {
-                                return;
-                            }
-                            let reply = tokio::select! {
-                                result = &mut reply_rx => result,
-                                _ = tokio::time::sleep(processing_timeout(&w_cfg)) => {
-                                    send_processing(&w_tx, from.clone(), false, &w_cfg).await;
-                                    reply_rx.await
-                                }
-                            };
-                            if let Ok(r) = reply {
-                                let pending = r.pending_analysis;
-                                if !r.is_empty {
-                                    if let Err(e) = w_tx
-                                        .send(OutboundMessage {
-                                            target_id: from.clone(),
-                                            is_group: false,
-                                            text: r.text,
-                                            reply_to: None,
-                                            images: r.images,
-                                            files: r.files,
-                                            channel: None,                                        })
-                                        .await
-                                    {
-                                        tracing::warn!("failed to send message: {e}");
-                                    }
-                                }
-                                if let Some(analysis) = pending {
-                                    handle_pending_analysis(
-                                        analysis, Arc::clone(&handle), &w_tx,
-                                        from, false, &w_cfg,
-                                    ).await;
-                                }
-                            }
-                                }
-                            ).await;
-                                    if process_result.is_err() {
-                                        warn!(user = %w_uid, "whatsapp: message processing timed out (600s), skipping to next");
+                                while let Some((text, from, images)) = urx.recv().await {
+                                    // No debounce -- task queue merge_into_pending
+                                    // handles rapid consecutive messages automatically.
+                                    let handle = match w_reg.route("whatsapp") {
+                                        Ok(h) => h,
+                                        Err(e) => { error!("whatsapp route: {e:#}"); continue; }
+                                    };
+                                    let dm_scope = default_dm_scope(&w_cfg);
+                                    let session_key = derive_session_key(&SessionKeyParams {
+                                        agent_id: handle.id.clone(),
+                                        kind: MessageKind::DirectMessage { account_id: None },
+                                        channel: "whatsapp".to_string(),
+                                        peer_id: from.clone(),
+                                        dm_scope,
+                                    });
+                                    let qmsg = crate::gateway::task_queue::QueuedMessage {
+                                        text,
+                                        sender: from.to_string(),
+                                        channel: "whatsapp".to_string(),
+                                        chat_id: from.to_string(),
+                                        is_group: false,
+                                        timestamp: chrono::Utc::now().timestamp(),
+                                        images: images.iter().map(|i| i.data.clone()).collect(),
+                                        files: vec![],
+                                    };
+                                    if let Err(e) = w_tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
+                                        error!(user = %w_uid, "whatsapp: queue submit failed: {e:#}");
                                     }
                                 }
                                 debug!(user = %w_uid, "whatsapp: per-user worker stopped");

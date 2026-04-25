@@ -83,6 +83,7 @@ pub(crate) fn start_channels(
     channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
+    task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
 ) {
     // CLI channel — always started in local mode.
     {
@@ -643,6 +644,7 @@ pub(crate) fn start_channels(
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
+        Arc::clone(&task_queue),
     );
     start_slack_if_configured(
         config,
@@ -651,6 +653,7 @@ pub(crate) fn start_channels(
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
+        Arc::clone(&task_queue),
     );
     start_whatsapp_if_configured(
         config,
@@ -660,6 +663,7 @@ pub(crate) fn start_channels(
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
+        Arc::clone(&task_queue),
     );
     start_line_if_configured(
         config,
@@ -669,6 +673,7 @@ pub(crate) fn start_channels(
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
+        Arc::clone(&task_queue),
     );
     start_zalo_if_configured(
         config,
@@ -678,6 +683,7 @@ pub(crate) fn start_channels(
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
+        Arc::clone(&task_queue),
     );
     start_signal_if_configured(
         config,
@@ -686,6 +692,7 @@ pub(crate) fn start_channels(
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
+        Arc::clone(&task_queue),
     );
     start_wechat_personal_if_configured(
         config,
@@ -694,6 +701,7 @@ pub(crate) fn start_channels(
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
+        Arc::clone(&task_queue),
     );
     start_feishu_if_configured(
         config,
@@ -703,6 +711,7 @@ pub(crate) fn start_channels(
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
+        Arc::clone(&task_queue),
     );
     start_dingtalk_if_configured(
         config,
@@ -711,6 +720,7 @@ pub(crate) fn start_channels(
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
+        Arc::clone(&task_queue),
     );
     start_qq_if_configured(
         config,
@@ -719,6 +729,7 @@ pub(crate) fn start_channels(
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
+        Arc::clone(&task_queue),
     );
     start_matrix_if_configured(
         config,
@@ -727,6 +738,7 @@ pub(crate) fn start_channels(
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
+        Arc::clone(&task_queue),
     );
     start_wecom_if_configured(
         config,
@@ -736,5 +748,6 @@ pub(crate) fn start_channels(
         Arc::clone(&dm_enforcers),
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
+        Arc::clone(&task_queue),
     );
 }

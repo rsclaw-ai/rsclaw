@@ -110,6 +110,15 @@ pub struct LlmRequest {
     pub session_key: Option<String>,
 }
 
+/// Serialize an `f32` to a JSON number with 2 decimal places.
+///
+/// Avoids IEEE 754 precision artefacts when `f32` 0.6 becomes
+/// `f64` 0.6000000238418579 during JSON round-trips.
+pub fn json_f32(v: f32) -> serde_json::Value {
+    let rounded = (f64::from(v) * 100.0).round() / 100.0;
+    serde_json::json!(rounded)
+}
+
 /// A single streaming delta event from the LLM.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {

@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -11,10 +11,8 @@ use crate::{
 };
 
 use super::super::preparse::{
-    btw_direct_call, is_fast_preparse, processing_timeout, send_processing,
-    try_preparse_locally,
+    btw_direct_call, is_fast_preparse, try_preparse_locally,
 };
-use super::super::startup::handle_pending_analysis;
 use super::default_dm_scope;
 
 // ---------------------------------------------------------------------------
@@ -33,6 +31,7 @@ pub(crate) fn start_feishu_if_configured(
     _channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
+    task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
 ) {
     let fs_cfg = config.channel.channels.feishu.as_ref();
     if let Some(cfg) = fs_cfg {
@@ -141,6 +140,7 @@ pub(crate) fn start_feishu_if_configured(
         let enforcer = Arc::clone(&enforcer);
         let gp = Arc::new(group_policy.clone());
         let ga = Arc::new(group_allow_from.clone());
+        let tq = Arc::clone(&task_queue);
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
         // Register channel sender for notification routing (ACP tools like OpenCode, ClaudeCode)
@@ -193,6 +193,7 @@ pub(crate) fn start_feishu_if_configured(
                 let group_policy = Arc::clone(&gp);
                 let group_allow = Arc::clone(&ga);
                 let queues = Arc::clone(&fs_user_queues);
+                let tq = Arc::clone(&tq);
                 tokio::spawn(async move {
                     // Group policy check.
                     if is_group {
@@ -310,45 +311,35 @@ pub(crate) fn start_feishu_if_configured(
                             map.insert(sender_id.clone(), utx.clone());
                             let w_reg = Arc::clone(&reg);
                             let w_cfg = cfg.clone();
-                            let w_tx = tx.clone();
                             let w_uid = sender_id.clone();
+                            let w_tq = Arc::clone(&tq);
                             tokio::spawn(async move {
                                 while let Some((
-                                    mut text,
+                                    text,
                                     sender_id,
                                     chat_id,
                                     is_group,
                                     bound,
-                                    mut images,
-                                    mut file_attachments,
+                                    images,
+                                    file_attachments,
                                 )) = urx.recv().await
                                 {
-                                    // Debounce: wait briefly then drain queued messages.
-                                    tokio::time::sleep(Duration::from_secs(2)).await;
-                                    while let Ok((extra_text, _, _, _, _, extra_images, extra_files)) = urx.try_recv() {
-                                        if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
-                                            text.push('\n');
-                                            text.push_str(&extra_text);
-                                        }
-                                        images.extend(extra_images);
-                                        file_attachments.extend(extra_files);
-                                    }
-                                    info!(user = %w_uid, text_start = %text.chars().take(20).collect::<String>(), "feishu: worker dispatching");
-                                    let process_result = tokio::time::timeout(
-                                        Duration::from_secs(172800), // 48 hours, matching OpenClaw default
-                                        async {
+                                    // No debounce — task queue merge_into_pending
+                                    // handles rapid consecutive messages automatically.
+                                    info!(user = %w_uid, text_start = %text.chars().take(20).collect::<String>(), "feishu: worker dispatching via task queue");
+                                    // Resolve agent for session_key derivation.
                                     let handle = if let Some(ref agent_id) = bound {
                                         match w_reg.get(agent_id) {
                                             Ok(h) => h,
                                             Err(_) => match w_reg.route_account("feishu", None) {
                                                 Ok(h) => h,
-                                                Err(e) => { error!("feishu route error: {e:#}"); return; }
+                                                Err(e) => { error!("feishu route error: {e:#}"); continue; }
                                             },
                                         }
                                     } else {
                                         match w_reg.route_account("feishu", None) {
                                             Ok(h) => h,
-                                            Err(e) => { error!("feishu route error: {e:#}"); return; }
+                                            Err(e) => { error!("feishu route error: {e:#}"); continue; }
                                         }
                                     };
                                     let dm_scope = default_dm_scope(&w_cfg);
@@ -366,62 +357,19 @@ pub(crate) fn start_feishu_if_configured(
                                         peer_id: sender_id.clone(),
                                         dm_scope,
                                     });
-                                    let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
-                                    let fs_target = if is_group { chat_id.clone() } else { chat_id.clone() };
-                                    let msg = AgentMessage {
-                                        session_key,
+                                    // Submit to persistent task queue (worker handles dispatch + reply).
+                                    let qmsg = crate::gateway::task_queue::QueuedMessage {
                                         text,
+                                        sender: sender_id.clone(),
                                         channel: "feishu".to_string(),
-                                        peer_id: sender_id.clone(),
-                                        chat_id: fs_target.clone(),
-                                        reply_tx,
-                                        extra_tools: vec![],
-                                        images,
-                                        files: file_attachments,
+                                        chat_id: chat_id.clone(),
+                                        is_group,
+                                        timestamp: chrono::Utc::now().timestamp(),
+                                        images: images.iter().map(|i| i.data.clone()).collect(),
+                                        files: file_attachments.iter().map(|f| f.filename.clone()).collect(),
                                     };
-                                    if handle.tx.send(msg).await.is_err() {
-                                        error!(user = %sender_id, "feishu: agent channel closed, message dropped");
-                                        return;
-                                    }
-                                    info!(user = %sender_id, "feishu: message sent to agent, waiting for reply");
-                                    let reply = tokio::select! {
-                                        result = &mut reply_rx => result,
-                                        _ = tokio::time::sleep(processing_timeout(&w_cfg)) => {
-                                            send_processing(&w_tx, fs_target.clone(), is_group, &w_cfg).await;
-                                            reply_rx.await
-                                        }
-                                    };
-                                    match reply {
-                                        Ok(r) => {
-                                            let pending = r.pending_analysis;
-                                            if !r.text.is_empty() || !r.images.is_empty() || !r.files.is_empty() {
-                                                if let Err(e) = w_tx
-                                                    .send(OutboundMessage {
-                                                        target_id: fs_target.clone(),
-                                                        is_group,
-                                                        text: r.text,
-                                                        reply_to: None,
-                                                        images: r.images,
-                                                        files: r.files,
-                                                        channel: None,                                                    })
-                                                    .await
-                                                {
-                                                    tracing::warn!("failed to send message: {e}");
-                                                }
-                                            }
-                                            if let Some(analysis) = pending {
-                                                handle_pending_analysis(
-                                                    analysis, Arc::clone(&handle), &w_tx,
-                                                    fs_target, is_group, &w_cfg,
-                                                ).await;
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                        }
-                                    ).await;
-                                    if process_result.is_err() {
-                                        warn!(user = %w_uid, "feishu: message processing timed out (600s), skipping to next");
+                                    if let Err(e) = w_tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
+                                        error!(user = %w_uid, "feishu: queue submit failed: {e:#}");
                                     }
                                 }
                                 debug!(user = %w_uid, "feishu: per-user worker stopped");
