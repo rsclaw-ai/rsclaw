@@ -4,6 +4,7 @@
 //! tokio-cron-scheduler, for reliable cross-platform behavior.
 //!
 //! Schedule format: standard 5-field cron "min hr dom mon dow".
+//! Timezone: stored in schedule but currently executes in UTC.
 //!
 //! Each job runs in an isolated session (`cron:<jobId>`) or a persistent
 //! session (`session:<key>`). Concurrent runs are capped by
@@ -784,6 +785,19 @@ impl CronRunner {
                     // Max concurrency reached — remaining jobs will fire next tick.
                     break;
                 }
+                // Re-check drain after the await — `acquire_owned` can park
+                // arbitrarily long on a saturated semaphore, and a restart can
+                // arrive while parked. Without this re-check, a job slot
+                // claimed during drain would spawn after `is_draining()`
+                // returned true on the previous iteration, hiding from the
+                // 60s drain window.
+                if let Some(s) = &self.shutdown {
+                    if s.is_draining() {
+                        info!("cron scheduler: drain signaled during permit await, dropping job {}", job_id);
+                        drop(permit);
+                        break;
+                    }
+                }
 
                 let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) else {
                     continue;
@@ -995,6 +1009,10 @@ impl CronRunner {
 
         info!(job_id = %job.id, "manually triggering cron job");
         let _permit = self.semaphore.acquire().await?;
+        // Track in the gateway inflight count so a graceful restart waits for
+        // a manual /api/v1/cron/run invocation to finish (until drain timeout)
+        // before re-execing.
+        let _inflight_guard = self.shutdown.as_ref().map(|s| s.begin_work());
         let prev_consecutive_errors = job.state.as_ref().map(|s| s.consecutive_errors).unwrap_or(0);
         // systemEvent: deliver payload text directly — no agent call needed.
         // execCommand: execute the command directly, bypassing agent and session history.

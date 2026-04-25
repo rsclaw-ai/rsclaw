@@ -120,6 +120,22 @@ impl super::runtime::AgentRuntime {
                     if interval_ms == 0 {
                         return Err(anyhow!("cron add: `every_seconds`/`every_ms` must be > 0"));
                     }
+                    // Floor: 2s. Below this the scheduler busy-loops (matches
+                    // crate::cron::MIN_REFIRE_GAP_MS).
+                    const MIN_INTERVAL_MS: u64 = 2_000;
+                    // Ceiling: 10 years. Beyond this `anchor_ms + n * every_ms`
+                    // can overflow u64 inside compute_next_run.
+                    const MAX_INTERVAL_MS: u64 = 10 * 365 * 24 * 3600 * 1000;
+                    if interval_ms < MIN_INTERVAL_MS {
+                        return Err(anyhow!(
+                            "cron add: `every_seconds`/`every_ms` must be >= 2s ({MIN_INTERVAL_MS}ms) — shorter intervals will busy-loop the scheduler"
+                        ));
+                    }
+                    if interval_ms > MAX_INTERVAL_MS {
+                        return Err(anyhow!(
+                            "cron add: `every_seconds`/`every_ms` must be <= 10 years ({MAX_INTERVAL_MS}ms)"
+                        ));
+                    }
                     if schedule.is_some() {
                         tracing::warn!(
                             interval_ms,
