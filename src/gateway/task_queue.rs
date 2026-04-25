@@ -45,6 +45,17 @@ pub enum TaskStatus {
     Dead,
 }
 
+/// A file attachment staged on disk for queue persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedFile {
+    /// Original filename from the channel.
+    pub filename: String,
+    /// Path to the staged file on disk (under `var/data/queue/staging/`).
+    pub path: String,
+    /// MIME type.
+    pub mime_type: String,
+}
+
 /// A message captured for later processing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedMessage {
@@ -58,8 +69,8 @@ pub struct QueuedMessage {
     pub timestamp: i64,
     /// Base64-encoded images or file-system paths.
     pub images: Vec<String>,
-    /// Attached file paths.
-    pub files: Vec<String>,
+    /// File attachments staged on disk.
+    pub files: Vec<QueuedFile>,
 }
 
 /// A task sitting in the persistent queue.
@@ -244,6 +255,55 @@ impl TaskQueueManager {
 }
 
 // ---------------------------------------------------------------------------
+// File staging
+// ---------------------------------------------------------------------------
+
+/// Return the staging directory for queue file attachments.
+fn staging_dir() -> std::path::PathBuf {
+    crate::config::loader::base_dir()
+        .join("var/data/queue/staging")
+}
+
+/// Write file bytes to the staging directory and return a [`QueuedFile`].
+///
+/// The staged file is named `{uuid}_{original_filename}` to avoid collisions.
+pub fn stage_file(filename: &str, data: &[u8], mime_type: &str) -> Result<QueuedFile> {
+    let dir = staging_dir();
+    std::fs::create_dir_all(&dir)?;
+    let safe_name = filename.replace(['/', '\\'], "_");
+    let staged = format!("{}_{}", uuid::Uuid::new_v4(), safe_name);
+    let path = dir.join(&staged);
+    std::fs::write(&path, data)?;
+    Ok(QueuedFile {
+        filename: filename.to_string(),
+        path: path.to_string_lossy().to_string(),
+        mime_type: mime_type.to_string(),
+    })
+}
+
+/// Read a staged file back into a [`FileAttachment`].
+fn unstage_file(qf: &QueuedFile) -> FileAttachment {
+    let data = std::fs::read(&qf.path).unwrap_or_default();
+    FileAttachment {
+        filename: qf.filename.clone(),
+        data,
+        mime_type: qf.mime_type.clone(),
+    }
+}
+
+/// Remove staged files for a completed/dead task.
+fn cleanup_staged_files(task: &QueuedTask) {
+    for msg in &task.messages {
+        for qf in &msg.files {
+            if let Err(e) = std::fs::remove_file(&qf.path) {
+                // File may already be cleaned up or missing — not critical.
+                tracing::debug!(path = %qf.path, "staging cleanup: {e}");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Submit helper
 // ---------------------------------------------------------------------------
 
@@ -403,13 +463,7 @@ impl TaskQueueWorker {
         let files: Vec<FileAttachment> = task
             .messages
             .iter()
-            .flat_map(|m| {
-                m.files.iter().map(|path| FileAttachment {
-                    filename: path.clone(),
-                    data: vec![],
-                    mime_type: "application/octet-stream".to_string(),
-                })
-            })
+            .flat_map(|m| m.files.iter().map(unstage_file))
             .collect();
 
         let msg = AgentMessage {
@@ -439,6 +493,7 @@ impl TaskQueueWorker {
                 if let Err(e) = self.manager.complete(&task_id) {
                     error!(task_id = %task_id, "task queue worker: complete() error: {e:#}");
                 }
+                cleanup_staged_files(&task);
 
                 // Route reply back to the originating channel.
                 if !reply.text.is_empty() || !reply.images.is_empty() || !reply.files.is_empty() {
@@ -480,14 +535,18 @@ impl TaskQueueWorker {
             }
             Ok(Err(_)) => {
                 error!(task_id = %task_id, "task queue worker: reply channel dropped");
-                if let Err(fe) = self.manager.fail(&task_id, "reply channel dropped", task.max_retries) {
-                    error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}");
+                match self.manager.fail(&task_id, "reply channel dropped", task.max_retries) {
+                    Ok(TaskStatus::Dead) => cleanup_staged_files(&task),
+                    Err(fe) => error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}"),
+                    _ => {}
                 }
             }
             Err(_) => {
                 error!(task_id = %task_id, "task queue worker: reply timeout (600s)");
-                if let Err(fe) = self.manager.fail(&task_id, "reply timeout", task.max_retries) {
-                    error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}");
+                match self.manager.fail(&task_id, "reply timeout", task.max_retries) {
+                    Ok(TaskStatus::Dead) => cleanup_staged_files(&task),
+                    Err(fe) => error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}"),
+                    _ => {}
                 }
             }
         }

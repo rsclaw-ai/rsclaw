@@ -223,7 +223,9 @@ pub(crate) fn start_wecom_if_configured(
                                         is_group,
                                         timestamp: chrono::Utc::now().timestamp(),
                                         images: images.iter().map(|i| i.data.clone()).collect(),
-                                        files: files.iter().map(|f| f.filename.clone()).collect(),
+                                        files: files.iter().filter_map(|f| {
+                                            crate::gateway::task_queue::stage_file(&f.filename, &f.data, &f.mime_type).ok()
+                                        }).collect(),
                                     };
                                     if let Err(e) = w_tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
                                         error!(user = %w_uid, "wecom: queue submit failed: {e:#}");

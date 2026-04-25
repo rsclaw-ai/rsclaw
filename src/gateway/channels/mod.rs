@@ -419,7 +419,9 @@ pub(crate) fn start_channels(
                                             is_group,
                                             timestamp: chrono::Utc::now().timestamp(),
                                             images: images.iter().map(|i| i.data.clone()).collect(),
-                                            files: file_attachments.iter().map(|f| f.filename.clone()).collect(),
+                                            files: file_attachments.iter().filter_map(|f| {
+                                                crate::gateway::task_queue::stage_file(&f.filename, &f.data, &f.mime_type).ok()
+                                            }).collect(),
                                         };
                                         if let Err(e) = w_tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
                                             error!(user = %w_uid, "telegram: queue submit failed: {e:#}");
