@@ -1,14 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="-35 -35 582 582">
   <defs>
-    <!-- clip path stays in local (0-512) coords; the outer transform handles placement -->
     <clipPath id="rounded">
       <rect width="512" height="512" rx="116"/>
     </clipPath>
   </defs>
-
-  <!-- 6% transparent padding on every side: scale 0.88, translate 30.72 -->
-  <g transform="translate(30.72 30.72) scale(0.88)">
 
   <!-- Background -->
   <rect width="512" height="512" rx="116" fill="#f97316"/>
@@ -93,6 +89,4 @@
     <circle cx="224" cy="224" r="6"  fill="#c05a0a"/>
     <circle cx="288" cy="224" r="6"  fill="#c05a0a"/>
   </g>
-
-  </g><!-- end scale/translate wrapper -->
 </svg>
