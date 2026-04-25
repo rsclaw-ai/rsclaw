@@ -3902,6 +3902,22 @@ function TauriConfigPageInner() {
             </div>
             <div style={fieldRow}>
               <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5FEB\u901F\u6A21\u578B" : "Flash Model"}</div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.flash ({zh ? "\u7559\u7A7A\u5219\u4F7F\u7528\u4E3B\u6A21\u578B" : "empty \u2192 use main model"})</div>
+              </div>
+              <input
+                style={{ ...fInput, minWidth: 300 }}
+                type="text"
+                placeholder={zh ? "\u4F8B\u5982 custom/qwen-turbo" : "e.g. custom/qwen-turbo"}
+                value={getVal("agents.defaults.model.flash", "")}
+                onChange={(e) => {
+                  const v = (e.target.value || "").trim();
+                  updateConfig("agents.defaults.model.flash", v || undefined);
+                }}
+              />
+            </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5907\u7528\u6A21\u578B" : "Fallback Models"} <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u9017\u53F7\u5206\u9694)" : "(comma separated)"}</span></div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.fallbacks</div>
               </div>
@@ -3956,7 +3972,7 @@ function TauriConfigPageInner() {
                 })()}
               </div>
             </div>
-            <div style={fieldRow}>
+            <div style={{ ...fieldRow, borderBottom: "none" }}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5DE5\u5177\u96C6" : "Toolset"}</div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.toolset</div>
@@ -3966,22 +3982,6 @@ function TauriConfigPageInner() {
                 <option value="standard">standard {zh ? "\u2014 12 \u4E2A\u5DE5\u5177" : "-- 12 tools"}</option>
                 <option value="full">full {zh ? "\u2014 \u5168\u90E8\u5DE5\u5177" : "-- all tools"}</option>
               </select>
-            </div>
-            <div style={{ ...fieldRow, borderBottom: "none" }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5FEB\u901F\u6A21\u578B" : "Flash Model"}</div>
-                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.flash ({zh ? "\u7559\u7A7A\u5219\u4F7F\u7528\u4E3B\u6A21\u578B" : "empty \u2192 use main model"})</div>
-              </div>
-              <input
-                style={{ ...fInput, minWidth: 300 }}
-                type="text"
-                placeholder={zh ? "\u4F8B\u5982 custom/qwen-turbo" : "e.g. custom/qwen-turbo"}
-                value={getVal("agents.defaults.model.flash", "")}
-                onChange={(e) => {
-                  const v = (e.target.value || "").trim();
-                  updateConfig("agents.defaults.model.flash", v || undefined);
-                }}
-              />
             </div>
           </div>
 
