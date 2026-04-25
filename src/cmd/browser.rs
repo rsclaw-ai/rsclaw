@@ -29,6 +29,9 @@ pub async fn cmd_browser(sub: BrowserCommand) -> Result<()> {
             ("clickAt", a)
         }
         BrowserCommand::Fill { eref, text } => ("fill", json!({"ref": eref, "text": text})),
+        BrowserCommand::Pick { eref, query, timeout, index } => ("pick", json!({
+            "ref": eref, "query": query, "timeout_ms": timeout, "index": index
+        })),
         BrowserCommand::Press { key } => ("press", json!({"key": key})),
         BrowserCommand::Scroll { direction, amount } => ("scroll", json!({"direction": direction, "amount": amount})),
         BrowserCommand::Screenshot { path } => ("screenshot", json!({"path": path})),

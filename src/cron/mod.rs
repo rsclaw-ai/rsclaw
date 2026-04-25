@@ -1410,10 +1410,19 @@ async fn send_delivery(
         return Ok(());
     }
 
-    let channel = match channels.get(channel_name) {
+    // Back-compat: historical cron.json5 entries created from the WS chat
+    // transport carry channel="ws" (copied from ctx.channel). That is not a
+    // registered ChannelManager entry — the desktop broadcaster is registered
+    // under "desktop". Remap here so pre-existing jobs still deliver.
+    let resolved_channel: &str = if channel_name == "ws" {
+        "desktop"
+    } else {
+        channel_name.as_str()
+    };
+    let channel = match channels.get(resolved_channel) {
         Some(ch) => ch,
         None => {
-            warn!(job_id = %job.id, channel = %channel_name, "cron: channel not found in ChannelManager");
+            warn!(job_id = %job.id, channel = %channel_name, resolved = %resolved_channel, "cron: channel not found in ChannelManager");
             return Ok(());
         }
     };
@@ -1427,7 +1436,7 @@ async fn send_delivery(
         reply_to: delivery.thread_id.clone(),
         images: vec![],
         files: vec![],
-        channel: Some(channel_name.to_owned()),
+        channel: Some(resolved_channel.to_owned()),
     };
 
     match channel.send(msg).await {

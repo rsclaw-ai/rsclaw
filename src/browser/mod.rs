@@ -593,6 +593,15 @@ pub(crate) async fn detect_existing_chrome(ports: &[u16]) -> Option<String> {
             match client.get(&url).send().await {
                 Ok(resp) => {
                     if let Ok(body) = resp.json::<Value>().await {
+                        // Skip orphaned headless Chrome (e.g. leaked by agent-browser
+                        // or other automation). The headed path is for the user's
+                        // daily browser; hijacking a zombie headless instance leads
+                        // to "CDP connect failed" when its renderer tree is stuck.
+                        let ua = body.get("User-Agent").and_then(|v| v.as_str()).unwrap_or("");
+                        if ua.contains("HeadlessChrome") {
+                            warn!(port, host, "skipping headless Chrome on remote-debugging port (not a user browser)");
+                            continue;
+                        }
                         if let Some(ws_url) = body.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) {
                             debug!(port, host, ws_url, "found existing Chrome with remote debugging");
                             return Some(ws_url.to_owned());
@@ -622,9 +631,16 @@ pub(crate) struct CdpClient {
 
 impl CdpClient {
     pub(crate) async fn connect(ws_url: &str) -> Result<Self> {
-        let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url)
-            .await
-            .map_err(|e| anyhow!("CDP WebSocket connect failed: {e}"))?;
+        // Bound the WS upgrade — a stuck Chrome (e.g. orphaned with many dead
+        // renderers) can accept the TCP connect but never complete the upgrade,
+        // which would otherwise hang the agent's serial message loop forever.
+        let (ws_stream, _) = time::timeout(
+            Duration::from_secs(5),
+            tokio_tungstenite::connect_async(ws_url),
+        )
+        .await
+        .map_err(|_| anyhow!("CDP WebSocket connect timeout after 5s: {ws_url}"))?
+        .map_err(|e| anyhow!("CDP WebSocket connect failed: {e}"))?;
 
         let (mut ws_sink, mut ws_source) = ws_stream.split();
 
@@ -858,8 +874,15 @@ impl BrowserSession {
         // Extract port from browser WS URL (ws://127.0.0.1:PORT/devtools/browser/...)
         let port = parse_port_from_ws_url(browser_ws_url)?;
 
+        // Bounded HTTP client for /json target discovery. Default reqwest has
+        // no timeout; a stuck Chrome could hang the agent loop indefinitely.
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .map_err(|e| anyhow!("failed to build HTTP client: {e}"))?;
+
         let discovery_url = format!("http://127.0.0.1:{port}/json");
-        let targets: Vec<Value> = reqwest::get(&discovery_url).await?.json().await?;
+        let targets: Vec<Value> = http.get(&discovery_url).send().await?.json().await?;
 
         let reused = if reuse_tab {
             // Reuse the first existing page tab.
@@ -889,7 +912,7 @@ impl BrowserSession {
             debug!(%target_id, "created new tab in external Chrome");
 
             // Re-fetch targets to find the new tab.
-            let targets: Vec<Value> = reqwest::get(&discovery_url).await?.json().await?;
+            let targets: Vec<Value> = http.get(&discovery_url).send().await?.json().await?;
             let ws_url = targets.iter()
                 .find(|t| t["id"].as_str() == Some(&target_id))
                 .and_then(|t| t["webSocketDebuggerUrl"].as_str())
@@ -1136,6 +1159,7 @@ impl BrowserSession {
             "click" => self.cmd_click(args).await,
             "clickAt" | "click_at" => self.cmd_click_at(args).await,
             "fill" | "type" => self.cmd_fill(args).await,
+            "pick" => self.cmd_pick(args).await,
             "select" => self.cmd_select(args).await,
             "check" => self.cmd_check(args, true).await,
             "uncheck" => self.cmd_check(args, false).await,
@@ -1530,6 +1554,153 @@ impl BrowserSession {
         }
     }
 
+    /// Type `query` into an input and click the first matching candidate in
+    /// the dropdown/autocomplete that opens. Typical flow on sites like Ctrip,
+    /// Fliggy, Google autocomplete: click input, type, wait for popup, click
+    /// option. This one action does the whole thing atomically via JS so the
+    /// agent doesn't have to chain 4-5 snapshots.
+    ///
+    /// Args:
+    /// - `ref` (required): input element ref from snapshot (e.g. "@e92")
+    /// - `query` (required): text to insert and to match candidate text against
+    /// - `timeout_ms` (optional, default 5000): total time budget
+    /// - `index` (optional, default 0): which visible candidate to click when
+    ///   multiple match
+    async fn cmd_pick(&self, args: &Value) -> Result<Value> {
+        let eref = args
+            .get("ref")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("pick: `ref` required"))?;
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("pick: `query` required"))?;
+        let timeout_ms = args
+            .get("timeout_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5000);
+        let index = args
+            .get("index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
+        let ref_esc = escape_js_string(eref);
+        let query_esc = escape_js_string(query);
+
+        let js = format!(
+            r#"(async function(){{
+                {FIND_REF_JS}
+                var input = findRef('{ref_esc}');
+                if (!input) return {{error: 'NOT_FOUND'}};
+                {WAIT_ACTIONABLE_JS}
+                await waitActionable(input, 3000);
+                input.focus();
+                try {{
+                    var proto = Object.getPrototypeOf(input);
+                    var desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                    if (desc && desc.set) desc.set.call(input, '');
+                    else input.value = '';
+                }} catch(e) {{ input.value = ''; }}
+                input.dispatchEvent(new Event('input', {{bubbles: true}}));
+                input.dispatchEvent(new Event('change', {{bubbles: true}}));
+                input.focus();
+                document.execCommand('insertText', false, '{query_esc}');
+                var deadline = Date.now() + {timeout_ms};
+                var SELECTORS = [
+                    '[role="option"]',
+                    '[data-u_key="poi_select_item"]',
+                    '[role="listbox"] > *',
+                    '[class*="suggest"] li',
+                    '[class*="dropdown"] li',
+                    '[class*="autocomplete"] li',
+                    'li[class*="item"]',
+                    'li[class*="option"]',
+                    'li'
+                ];
+                function findVisible() {{
+                    var results = [];
+                    var seen = new Set();
+                    for (var i = 0; i < SELECTORS.length; i++) {{
+                        var els;
+                        try {{ els = document.querySelectorAll(SELECTORS[i]); }} catch(e) {{ continue; }}
+                        for (var j = 0; j < els.length; j++) {{
+                            var el = els[j];
+                            if (seen.has(el)) continue;
+                            seen.add(el);
+                            if (el === input) continue;
+                            if (!el.textContent || el.textContent.indexOf('{query_esc}') < 0) continue;
+                            var r = el.getBoundingClientRect();
+                            if (r.width <= 0 || r.height <= 0) continue;
+                            var style = getComputedStyle(el);
+                            if (style.visibility === 'hidden' || style.display === 'none') continue;
+                            results.push(el);
+                        }}
+                    }}
+                    return results;
+                }}
+                while (Date.now() < deadline) {{
+                    var hits = findVisible();
+                    if (hits.length > {index}) {{
+                        var target = hits[{index}];
+                        target.scrollIntoView({{block: 'center'}});
+                        target.click();
+                        return {{
+                            ok: true,
+                            text: (target.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80),
+                            matched: hits.length
+                        }};
+                    }}
+                    await new Promise(function(r){{ setTimeout(r, 100); }});
+                }}
+                return {{error: 'TIMEOUT'}};
+            }})()"#,
+            FIND_REF_JS = FIND_REF_JS,
+            WAIT_ACTIONABLE_JS = WAIT_ACTIONABLE_JS,
+            ref_esc = ref_esc,
+            query_esc = query_esc,
+            timeout_ms = timeout_ms,
+            index = index,
+        );
+
+        let result = self
+            .cdp
+            .send(
+                "Runtime.evaluate",
+                json!({
+                    "expression": js,
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                }),
+            )
+            .await?;
+
+        let obj = result
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        if let Some(err) = obj.get("error").and_then(|v| v.as_str()) {
+            match err {
+                "NOT_FOUND" => bail!("pick: input {eref} not found (run snapshot first)"),
+                "TIMEOUT" => bail!(
+                    "pick: no visible candidate matching '{query}' within {timeout_ms}ms"
+                ),
+                other => bail!("pick: {other}"),
+            }
+        }
+
+        let picked = obj.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let matched = obj.get("matched").and_then(|v| v.as_u64()).unwrap_or(1);
+        Ok(json!({
+            "action": "pick",
+            "ref": eref,
+            "query": query,
+            "picked": picked,
+            "candidates": matched,
+        }))
+    }
+
     async fn cmd_select(&self, args: &Value) -> Result<Value> {
         let eref = args
             .get("ref")
@@ -1922,19 +2093,23 @@ impl BrowserSession {
             let _ = self.eval_js("document.querySelectorAll('.__rsclaw_annotation').forEach(e=>e.remove())").await;
 
             let legend: Value = serde_json::from_str(&legend_raw).unwrap_or(json!([]));
+            let save_path = save_screenshot_bytes(data, format).await?;
             return Ok(json!({
                 "action": "screenshot",
-                "image": format!("data:{mime};base64,{data}"),
+                "image_path": save_path,
+                "mime": mime,
                 "legend": legend,
             }));
         }
 
         let result = self.cdp.send("Page.captureScreenshot", params).await?;
         let data = result.get("data").and_then(|v| v.as_str()).unwrap_or("");
+        let save_path = save_screenshot_bytes(data, format).await?;
 
         Ok(json!({
             "action": "screenshot",
-            "image": format!("data:{mime};base64,{data}")
+            "image_path": save_path,
+            "mime": mime,
         }))
     }
 
@@ -3199,6 +3374,39 @@ fn escape_js_string(s: &str) -> String {
         .replace(']', "\\]")
 }
 
+/// Decode a base64-encoded screenshot from CDP and save it to
+/// `<Downloads>/rsclaw/screenshots/br_<nanos>.<ext>`, returning the path as
+/// a string.  Used by browser screenshot/snapshot to avoid shipping ~MB of
+/// base64 over the WebSocket — the desktop UI loads the file via Tauri's
+/// asset protocol, and non-WS channels rehydrate it back to a data URL at
+/// the AgentReply boundary (`image_ref_to_data_url`).
+async fn save_screenshot_bytes(b64_data: &str, format: &str) -> Result<String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64_data)
+        .map_err(|e| anyhow!("browser screenshot: invalid base64: {e}"))?;
+    let ext = if format == "jpeg" { "jpg" } else { "png" };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let save_dir = dirs_next::download_dir()
+        .unwrap_or_else(|| {
+            dirs_next::home_dir()
+                .unwrap_or_else(crate::config::loader::base_dir)
+                .join("Downloads")
+        })
+        .join("rsclaw")
+        .join("screenshots");
+    tokio::fs::create_dir_all(&save_dir)
+        .await
+        .map_err(|e| anyhow!("browser screenshot: create_dir: {e}"))?;
+    let save_path = save_dir.join(format!("br_{nanos:x}.{ext}"));
+    tokio::fs::write(&save_path, &bytes)
+        .await
+        .map_err(|e| anyhow!("browser screenshot: write: {e}"))?;
+    Ok(save_path.to_string_lossy().into_owned())
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot JS -- injected into the page to build an accessibility-like tree
 // ---------------------------------------------------------------------------
@@ -3413,3 +3621,50 @@ const SNAPSHOT_INTERACTIVE_JS: &str = r#"(function(){
   if (document.body) walk(document.body, 0);
   return JSON.stringify({lines: lines, refCount: counter});
 })()"#;
+
+#[cfg(test)]
+mod tests {
+    use super::detect_existing_chrome;
+    use serde_json::json;
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    #[tokio::test]
+    async fn detect_existing_chrome_skips_headless() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        let body = json!({
+            "Browser": "Chrome/147.0.0.0",
+            "User-Agent": "Mozilla/5.0 ... HeadlessChrome/147.0.0.0 Safari/537.36",
+            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/browser/abc")
+        });
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let result = detect_existing_chrome(&[port]).await;
+        assert!(
+            result.is_none(),
+            "must skip HeadlessChrome instance, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_existing_chrome_accepts_headed() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        let ws = format!("ws://127.0.0.1:{port}/devtools/browser/def");
+        let body = json!({
+            "Browser": "Chrome/147.0.0.0",
+            "User-Agent": "Mozilla/5.0 ... Chrome/147.0.0.0 Safari/537.36",
+            "webSocketDebuggerUrl": ws.clone()
+        });
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let result = detect_existing_chrome(&[port]).await;
+        assert_eq!(result.as_deref(), Some(ws.as_str()));
+    }
+}

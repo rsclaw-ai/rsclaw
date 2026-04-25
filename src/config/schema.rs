@@ -1642,7 +1642,7 @@ pub struct MemoryConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MemoryBackend {
-    LanceDb,
+    Hnsw,
     None,
 }
 

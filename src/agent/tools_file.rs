@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use super::runtime::expand_tilde;
+use super::runtime::{canonicalize_external_path, expand_tilde};
 use super::security::{check_file_content_safety, check_read_safety, check_write_safety};
 
 /// Fix common LLM shell-writing mistakes around redirects that bash would
@@ -293,14 +293,7 @@ impl super::runtime::AgentRuntime {
             .map(expand_tilde)
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
 
-        // Normalize path separators for Windows
-        let path_normalized = path.replace('/', std::path::MAIN_SEPARATOR.to_string().as_str());
-        let path_buf = std::path::PathBuf::from(&path_normalized);
-        let full = if path_buf.is_absolute() {
-            path_buf
-        } else {
-            workspace.join(&path_normalized)
-        };
+        let full = canonicalize_external_path(path, &workspace);
 
         // Safety: block reading sensitive files
         let safety_enabled = self
@@ -414,14 +407,7 @@ impl super::runtime::AgentRuntime {
             .map(expand_tilde)
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
 
-        // Normalize path separators for Windows
-        let path_normalized = path.replace('/', std::path::MAIN_SEPARATOR.to_string().as_str());
-        let path_buf = std::path::PathBuf::from(&path_normalized);
-        let full = if path_buf.is_absolute() {
-            path_buf
-        } else {
-            workspace.join(&path_normalized)
-        };
+        let full = canonicalize_external_path(&path, &workspace);
 
         // Safety: block sensitive paths (only when tools.exec.safety = true)
         let safety_enabled = self
@@ -668,6 +654,24 @@ impl super::runtime::AgentRuntime {
             if !extra_paths.is_empty() {
                 let sys_path = std::env::var("PATH").unwrap_or_default();
                 let mut all: Vec<String> = extra_paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+                // Add common user bin paths that may be missing when launched
+                // from a desktop app (macOS/Windows don't inherit shell profile).
+                if let Some(home) = dirs_next::home_dir() {
+                    for rel in &[".local/bin", ".cargo/bin", "bin", "go/bin", ".bun/bin"] {
+                        let p = home.join(rel);
+                        if p.exists() {
+                            all.push(p.to_string_lossy().to_string());
+                        }
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    for p in &["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"] {
+                        if std::path::Path::new(p).exists() {
+                            all.push(p.to_string());
+                        }
+                    }
+                }
                 all.push(sys_path);
                 cmd.env("PATH", all.join(if cfg!(windows) { ";" } else { ":" }));
             }

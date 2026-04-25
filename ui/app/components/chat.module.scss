@@ -425,112 +425,145 @@
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
 
-  .chat-tool-block {
-    border-radius: 8px;
-    overflow: hidden;
-    font-size: 12px;
-    border: var(--border-in-light);
+// Tool block styles live at the top level so they apply both inside
+// .chat-tool-blocks (single-tool wrapper) and inside .chat-tool-group-items
+// (expanded multi-tool group).
+.chat-tool-block {
+  border-radius: 8px;
+  overflow: hidden;
+  font-size: 12px;
+  border: var(--border-in-light);
 
-    .chat-tool-block-header {
+  .chat-tool-block-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 12px;
+    background: rgba(0, 0, 0, 0.05);
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.15s;
+
+    &:hover {
+      background: rgba(0, 0, 0, 0.09);
+    }
+
+    .chat-tool-block-icon {
+      display: none;
+    }
+
+    // title column: tool name (dim) + cmd preview (bright) stacked
+    .chat-tool-block-title {
+      flex: 1;
       display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 7px 12px;
-      background: rgba(0, 0, 0, 0.05);
-      cursor: pointer;
-      user-select: none;
-      transition: background 0.15s;
-
-      &:hover {
-        background: rgba(0, 0, 0, 0.09);
-      }
-
-      .chat-tool-block-icon {
-        display: none;
-      }
-
-      // title column: tool name (dim) + cmd preview (bright) stacked
-      .chat-tool-block-title {
-        flex: 1;
-        display: flex;
-        flex-direction: column;
-        gap: 1px;
-        overflow: hidden;
-      }
-
-      .chat-tool-block-name {
-        font-size: 10px;
-        font-family: var(--code-font, "SFMono-Regular", Consolas, monospace);
-        color: var(--black);
-        opacity: 0.38;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        text-transform: uppercase;
-        letter-spacing: 0.04em;
-      }
-
-      .chat-tool-block-cmd {
-        font-size: 12.5px;
-        font-family: var(--code-font, "SFMono-Regular", Consolas, monospace);
-        color: var(--black);
-        opacity: 0.82;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-
-        &::before {
-          content: "$ ";
-          opacity: 0.4;
-        }
-      }
-
-      .chat-tool-block-chevron {
-        flex-shrink: 0;
-        opacity: 0.28;
-        color: var(--black);
-        transition: transform 0.2s ease, opacity 0.15s;
-
-        &[data-open="true"] {
-          transform: rotate(180deg);
-          opacity: 0.52;
-        }
-      }
+      flex-direction: column;
+      gap: 1px;
+      overflow: hidden;
     }
 
-    // Terminal-style output area
-    .chat-tool-block-output {
-      padding: 10px 14px;
-      background: #16181d;
-      border-top: 1px solid rgba(255, 255, 255, 0.06);
-      max-height: 320px;
-      overflow-y: auto;
+    .chat-tool-block-name {
+      font-size: 10px;
       font-family: var(--code-font, "SFMono-Regular", Consolas, monospace);
-      font-size: 11.5px;
-      line-height: 1.65;
+      color: var(--black);
+      opacity: 0.38;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
 
-      // command lines  e.g. "$ cmd" or "> cmd"
-      .tool-line-cmd {
-        color: #93c5fd;
-      }
+    .chat-tool-block-cmd {
+      font-size: 12.5px;
+      font-family: var(--code-font, "SFMono-Regular", Consolas, monospace);
+      color: var(--black);
+      opacity: 0.82;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
 
-      // stderr / error lines
-      .tool-line-err {
-        color: #fca5a5;
-      }
-
-      // exit code lines
-      .tool-line-exit {
-        color: #fdba74;
-        opacity: 0.9;
-      }
-
-      // normal output lines
-      .tool-line-out {
-        color: #c4c9d4;
+      &::before {
+        content: "$ ";
+        opacity: 0.4;
       }
     }
+
+    .chat-tool-block-chevron {
+      flex-shrink: 0;
+      opacity: 0.28;
+      color: var(--black);
+      transition: transform 0.2s ease, opacity 0.15s;
+
+      &[data-open="true"] {
+        transform: rotate(180deg);
+        opacity: 0.52;
+      }
+    }
+  }
+
+  // Terminal-style output area
+  .chat-tool-block-output {
+    padding: 10px 14px;
+    background: #16181d;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    max-height: 320px;
+    overflow-y: auto;
+    font-family: var(--code-font, "SFMono-Regular", Consolas, monospace);
+    font-size: 11.5px;
+    line-height: 1.65;
+
+    // command lines  e.g. "$ cmd" or "> cmd"
+    .tool-line-cmd {
+      color: #93c5fd;
+    }
+
+    // stderr / error lines
+    .tool-line-err {
+      color: #fca5a5;
+    }
+
+    // exit code lines
+    .tool-line-exit {
+      color: #fdba74;
+      opacity: 0.9;
+    }
+
+    // normal output lines
+    .tool-line-out {
+      color: #c4c9d4;
+    }
+  }
+}
+
+.chat-video {
+  display: block;
+  max-width: 480px;
+  max-height: 360px;
+  margin-top: 8px;
+  border-radius: 10px;
+  background-color: #000;
+  outline: none;
+}
+
+.chat-video-error {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: var(--border-in-light);
+  background-color: rgba(255, 80, 80, 0.08);
+  color: var(--black);
+  font-size: 12px;
+  line-height: 1.5;
+  max-width: 480px;
+  word-break: break-all;
+
+  .chat-video-error-path {
+    margin-top: 4px;
+    opacity: 0.6;
+    font-family: var(--font-family-code);
+    font-size: 11px;
   }
 }
 
@@ -643,6 +676,7 @@
   box-sizing: border-box;
   border-radius: 10px;
   border: rgba($color: #888, $alpha: 0.2) 1px solid;
+  cursor: zoom-in;
 }
 
 @media only screen and (max-width: 600px) {
@@ -903,15 +937,17 @@
 
 
 
+// Muted neutral palette shared between think blocks and intermediate-text
+// bubbles so reasoning / progress chatter recedes vs. real assistant replies.
 .chat-message-think {
   margin-bottom: 10px;
   border-radius: 10px;
-  background: rgba(249, 115, 22, 0.08);
-  border: 1px solid rgba(249, 115, 22, 0.15);
+  background: rgba(128, 128, 140, 0.04);
+  border: 1px solid rgba(128, 128, 140, 0.10);
   overflow: hidden;
 
   &.thinking-active {
-    border-color: rgba(249, 115, 22, 0.3);
+    border-color: rgba(128, 128, 140, 0.18);
   }
 }
 
@@ -924,14 +960,15 @@
   user-select: none;
   font-size: 13px;
   font-weight: 500;
-  color: #f97316;
+  color: #9996a8;
+  opacity: 0.7;
 }
 
 .think-icon {
   width: 14px;
   height: 14px;
   flex-shrink: 0;
-  opacity: 0.75;
+  opacity: 0.5;
 }
 
 .think-title {
@@ -940,20 +977,20 @@
 
 .think-chevron {
   flex-shrink: 0;
-  opacity: 0.45;
-  color: #f97316;
+  opacity: 0.35;
+  color: #9996a8;
   transition: transform 0.2s ease, opacity 0.15s;
 
   &[data-open="true"] {
     transform: rotate(180deg);
-    opacity: 0.75;
+    opacity: 0.6;
   }
 }
 
 .chat-message-think-content {
   padding: 0 14px 12px;
   font-size: 12px;
-  color: #9996a8;
+  color: #b3b0c0;
   white-space: pre-wrap;
   word-break: normal;
   overflow-wrap: break-word;
@@ -961,6 +998,17 @@
   max-height: 380px;
   overflow-y: auto;
   scroll-behavior: smooth;
+}
+
+// Intermediate-text bubbles ("好的，我来帮你搜索…" / WS notification injected
+// messages).  Match the think-block muted palette so they recede next to
+// real assistant replies.
+.chat-message-item-intermediate {
+  background-color: rgba(128, 128, 140, 0.04) !important;
+  border: 1px solid rgba(128, 128, 140, 0.10) !important;
+  color: #b3b0c0 !important;
+  opacity: 0.85;
+  font-size: 13px;
 }
 
 // 多工具分组折叠
@@ -1080,6 +1128,43 @@
   padding: 5px 10px 2px;
   border-top: var(--border-in-light);
   background: var(--white);
+}
+
+// 暂存消息队列指示器：agent 正在跑 turn 时，用户再按 Enter 的消息入队
+.pending-queue-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-top: var(--border-in-light);
+  background: var(--white);
+  font-size: 12px;
+  color: var(--black);
+  opacity: 0.7;
+}
+
+.pending-queue-label {
+  flex: 1;
+}
+
+.pending-queue-clear {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--black);
+  opacity: 0.5;
+  cursor: pointer;
+
+  &:hover {
+    opacity: 1;
+    background: var(--hover-color);
+  }
 }
 
 .attach-file-chip-input {

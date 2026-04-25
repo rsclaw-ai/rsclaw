@@ -175,14 +175,49 @@ if [[ -d "$APP_BUNDLE" ]] && [[ "$(uname -s)" == "Darwin" ]]; then
     # child process launching, and library loading. Without this, macOS blocks
     # osascript/screencapture even though TCC is granted.
     ENTITLEMENTS="$TAURI_DIR/entitlements.plist"
-    SIGN_ARGS=(--force --deep --sign "$SIGN_IDENTITY" --options runtime --timestamp)
     if [[ -f "$ENTITLEMENTS" ]]; then
-        SIGN_ARGS+=(--entitlements "$ENTITLEMENTS")
         log "Using entitlements: $ENTITLEMENTS"
     fi
 
-    log "Signing with: $SIGN_IDENTITY"
+    # Sign inside-out: all nested executables first, then the app bundle.
+    # Each binary must be signed individually with entitlements because
+    # --deep does not propagate entitlements, and signing the bundle
+    # after --deep strips entitlements from nested binaries.
+    SIGN_BASE=(--force --sign "$SIGN_IDENTITY" --options runtime --timestamp)
+    if [[ -f "$ENTITLEMENTS" ]]; then
+        SIGN_BASE+=(--entitlements "$ENTITLEMENTS")
+    fi
+
+    # Sign all Mach-O binaries inside the bundle individually.
+    log "Signing all binaries inside app bundle..."
+    while IFS= read -r -d '' bin; do
+        if file "$bin" | grep -q "Mach-O"; then
+            log "  signing: $(basename "$bin")"
+            codesign "${SIGN_BASE[@]}" "$bin" 2>&1 || true
+        fi
+    done < <(find "$APP_BUNDLE/Contents/MacOS" -type f -print0)
+
+    # Sign any frameworks/dylibs
+    while IFS= read -r -d '' fw; do
+        codesign "${SIGN_BASE[@]}" "$fw" 2>&1 || true
+    done < <(find "$APP_BUNDLE/Contents/Frameworks" -type f -name "*.dylib" -print0 2>/dev/null)
+
+    SIGN_ARGS=(--force --sign "$SIGN_IDENTITY" --options runtime --timestamp)
+    if [[ -f "$ENTITLEMENTS" ]]; then
+        SIGN_ARGS+=(--entitlements "$ENTITLEMENTS")
+    fi
+
+    log "Signing app bundle..."
     if codesign "${SIGN_ARGS[@]}" "$APP_BUNDLE" 2>&1; then
+        # Re-sign sidecar AFTER bundle — codesign on an app bundle strips
+        # entitlements from nested binaries. The sidecar needs allow-jit for
+        # wasmtime JIT; without it macOS kills the process (SIGKILL Invalid Page).
+        SIDECAR_BIN="$APP_BUNDLE/Contents/MacOS/rsclaw"
+        if [[ -f "$SIDECAR_BIN" ]] && [[ -f "$ENTITLEMENTS" ]]; then
+            log "Re-signing sidecar with entitlements (post-bundle)..."
+            codesign --force --sign "$SIGN_IDENTITY" --options runtime --timestamp \
+                --entitlements "$ENTITLEMENTS" "$SIDECAR_BIN" 2>&1 || true
+        fi
         log "App signed successfully"
 
         # Notarize with Apple (requires APPLE_ID + app-specific password in keychain
@@ -224,6 +259,23 @@ if [[ -d "$APP_BUNDLE" ]] && [[ "$(uname -s)" == "Darwin" ]]; then
         fi
     else
         warn "Signing failed — app will use ad-hoc signature"
+    fi
+fi
+
+# Rebuild DMG after re-signing so it contains the correctly entitled binaries.
+# Tauri generates the DMG before our post-build signing steps.
+if $RELEASE && [[ "$(uname -s)" == "Darwin" ]] && [[ -d "$APP_BUNDLE" ]]; then
+    BUNDLE_DIR="$TAURI_DIR/target/${TARGET}/${PROFILE_DIR}/bundle"
+    [[ ! -d "$BUNDLE_DIR" ]] && BUNDLE_DIR="$TAURI_DIR/target/${PROFILE_DIR}/bundle"
+    DMG_DIR="$BUNDLE_DIR/dmg"
+    if [[ -d "$DMG_DIR" ]]; then
+        DMG_NAME=$(ls "$DMG_DIR"/*.dmg 2>/dev/null | head -1)
+        if [[ -n "$DMG_NAME" ]]; then
+            log "Rebuilding DMG with re-signed app..."
+            rm -f "$DMG_NAME"
+            hdiutil create -volname "RsClaw" -srcfolder "$APP_BUNDLE" \
+                -ov -format UDZO "$DMG_NAME" 2>&1 || warn "DMG rebuild failed"
+        fi
     fi
 fi
 

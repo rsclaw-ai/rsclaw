@@ -62,7 +62,7 @@ use super::context_mgr::{
     compress_image_for_llm, msg_tokens,
 };
 use super::prompt_builder::{
-    build_help_text_filtered, build_system_prompt, format_duration,
+    build_help_text_filtered, build_minimal_system_prompt, build_system_prompt, format_duration,
     memory_age_label, READONLY_COMMANDS,
 };
 use super::security::check_read_safety;
@@ -148,6 +148,62 @@ struct PendingFile {
     /// Pre-encoded image data, if the file is an image.
     images: Vec<super::registry::ImageAttachment>,
     stage: PendingStage,
+}
+
+/// Internal sessions run on a scheduled/automated basis (not initiated by a
+/// human user) and only have the `memory` tool available. Their transcripts
+/// are not useful history — each tick should start fresh, without the
+/// previous tick's "HEARTBEAT_OK" reply polluting context.
+fn is_internal_session(session_key: &str) -> bool {
+    session_key.starts_with("heartbeat:")
+        || session_key.starts_with("cron:")
+        || session_key.starts_with("system:")
+}
+
+/// Convert an image reference (file path or data URL) into a `data:` URL
+/// suitable for non-WS channels.
+///
+/// `tool_images` in the agent loop may hold either:
+///   - a `data:image/...;base64,...` URL (image-gen tools, inline uploads),
+///   - an `http(s)://...` URL (remote images already usable by channels), or
+///   - a local file path (computer_use screenshots, saved to disk to avoid
+///     shipping base64 through the WS event bus).
+///
+/// Returns `None` if the file cannot be read — the image is simply dropped
+/// rather than breaking the whole reply.
+fn image_ref_to_data_url(image_ref: String) -> Option<String> {
+    if image_ref.starts_with("data:")
+        || image_ref.starts_with("http://")
+        || image_ref.starts_with("https://")
+    {
+        return Some(image_ref);
+    }
+    match std::fs::read(&image_ref) {
+        Ok(bytes) => {
+            use base64::Engine as _;
+            let ext = std::path::Path::new(&image_ref)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase());
+            let mime = match ext.as_deref() {
+                Some("jpg") | Some("jpeg") => "image/jpeg",
+                Some("webp") => "image/webp",
+                Some("gif") => "image/gif",
+                Some("bmp") => "image/bmp",
+                _ => "image/png",
+            };
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            Some(format!("data:{mime};base64,{b64}"))
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %image_ref,
+                error = %e,
+                "image_ref_to_data_url: read failed, dropping image"
+            );
+            None
+        }
+    }
 }
 
 /// Check if the current model supports vision (image input).
@@ -267,6 +323,9 @@ pub struct AgentRuntime {
     /// Cached system prompt — built once per gateway lifetime, never
     /// invalidated (only rebuilt on gateway restart).
     pub(crate) cached_system_prompt: Option<String>,
+    /// Cached minimal system prompt for internal sessions (heartbeat/cron/system).
+    /// Built on first internal session use.
+    pub(crate) cached_minimal_prompt: Option<String>,
     /// Cached plugins system message — frozen at session start, rebuilt
     /// on compact or `/new`. Sorted by name for byte-stable output.
     pub(crate) cached_plugins_system: Option<String>,
@@ -358,6 +417,7 @@ impl AgentRuntime {
             started_at: std::time::Instant::now(),
             workspace_cache: None,
             cached_system_prompt: None,
+            cached_minimal_prompt: None,
             cached_plugins_system: None,
             cached_skills_system: None,
             cached_skills_snapshot: Vec::new(),
@@ -372,6 +432,20 @@ impl AgentRuntime {
             session_aliases,
             exec_pool,
         };
+
+        // Purge any internal-session history left over in redb from older
+        // gateway builds (heartbeat/cron/system used to persist every
+        // "HEARTBEAT_OK" reply).  These sessions are no longer persisted,
+        // so drop whatever is still there.
+        if let Ok(keys) = rt.store.db.list_sessions() {
+            for key in keys {
+                if is_internal_session(&key) {
+                    if let Err(e) = rt.store.db.delete_session(&key) {
+                        tracing::warn!(session = %key, error = %e, "failed to purge stale internal session");
+                    }
+                }
+            }
+        }
 
         // Spawn a background task that periodically checks for idle browser
         // sessions and drops them to release Chrome memory.  Runs every 60s.
@@ -1295,34 +1369,52 @@ impl AgentRuntime {
                         }
                     }
                     "__CRON_LIST__" => {
-                        if let Some(ref cron_cfg) = self.config.ops.cron {
-                            if let Some(ref jobs) = cron_cfg.jobs {
-                                if jobs.is_empty() {
-                                    "No cron jobs configured.".to_owned()
-                                } else {
-                                    let mut lines = vec!["Cron jobs:".to_owned()];
-                                    for job in jobs {
-                                        let enabled = job.enabled.unwrap_or(true);
-                                        let status = if enabled { "" } else { " (disabled)" };
-                                        let agent = job.agent_id.as_deref().unwrap_or("main");
-                                        let msg_preview = if job.message.len() > 50 {
-                                            let end = job.message.char_indices().nth(47).map(|(i, _)| i).unwrap_or(job.message.len());
-                                            format!("{}...", &job.message[..end])
-                                        } else {
-                                            job.message.clone()
-                                        };
-                                        lines.push(format!(
-                                            "  [{}] {} -> {} \"{}\"{}",
-                                            job.id, job.schedule, agent, msg_preview, status
-                                        ));
-                                    }
-                                    lines.join("\n")
-                                }
-                            } else {
-                                "No cron jobs configured.".to_owned()
-                            }
-                        } else {
+                        // Read the live job store at ~/.rsclaw/cron.json5 — this is the
+                        // same source the cron runner and the `cron` tool use.  The
+                        // previous implementation read self.config.ops.cron.jobs (static
+                        // startup config) which is ALWAYS empty for tool-created jobs.
+                        let cron_path = crate::config::loader::base_dir().join("cron.json5");
+                        let jobs = crate::agent::tools_cron::read_cron_jobs(&cron_path).await;
+                        if jobs.is_empty() {
                             "No cron jobs configured.".to_owned()
+                        } else {
+                            let mut lines = vec!["Cron jobs:".to_owned()];
+                            for (i, job) in jobs.iter().enumerate() {
+                                let id = job.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                                let enabled = job.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+                                let status = if enabled { "" } else { " (disabled)" };
+                                let agent = job.get("agentId").and_then(|v| v.as_str()).unwrap_or("main");
+                                let name = job.get("name").and_then(|v| v.as_str());
+                                let schedule = match job.get("schedule") {
+                                    Some(s) if s.is_object() => {
+                                        if let Some(expr) = s.get("expr").and_then(|v| v.as_str()) {
+                                            expr.to_owned()
+                                        } else if let Some(at) = s.get("atMs").and_then(|v| v.as_u64()) {
+                                            format!("once@{}", at)
+                                        } else {
+                                            s.to_string()
+                                        }
+                                    }
+                                    _ => "?".to_owned(),
+                                };
+                                let message = job
+                                    .get("payload")
+                                    .and_then(|p| p.get("text"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let msg_preview = if message.chars().count() > 50 {
+                                    let end = message.char_indices().nth(47).map(|(idx, _)| idx).unwrap_or(message.len());
+                                    format!("{}...", &message[..end])
+                                } else {
+                                    message.to_owned()
+                                };
+                                let label = name.map(|n| format!(" {n}")).unwrap_or_default();
+                                lines.push(format!(
+                                    "  #{} [{}] {} -> {}{} \"{}\"{}",
+                                    i + 1, id, schedule, agent, label, msg_preview, status
+                                ));
+                            }
+                            lines.join("\n")
                         }
                     }
                     "__GET_UPLOAD_SIZE__" => {
@@ -1995,19 +2087,31 @@ impl AgentRuntime {
 
         // Build system prompt — cached for entire gateway lifetime.
         // Only rebuilt on gateway restart.
-        if self.cached_system_prompt.is_none() {
-            let prompt = build_system_prompt(&ws_ctx, &self.skills, &self.config.raw);
-            // DEBUG: dump full system prompt to file for inspection
-            if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
-                let dump_path = crate::config::loader::base_dir().join("debug_system_prompt.txt");
-                if let Err(e) = std::fs::write(&dump_path, &prompt) {
-                    tracing::warn!("failed to dump system prompt: {e}");
-                }
-                tracing::info!(path = %dump_path.display(), len = prompt.len(), "dumped system prompt");
+        //
+        // Internal sessions (heartbeat/cron/system) get a minimal prompt
+        // since they only have the `memory` tool and don't need workspace
+        // files, skills, or tool guidelines. Saves ~3k tokens per tick.
+        let is_internal = is_internal_session(session_key);
+        let system_prompt = if is_internal {
+            if self.cached_minimal_prompt.is_none() {
+                self.cached_minimal_prompt = Some(build_minimal_system_prompt());
             }
-            self.cached_system_prompt = Some(prompt);
-        }
-        let system_prompt = self.cached_system_prompt.clone().expect("just set");
+            self.cached_minimal_prompt.clone().expect("just set")
+        } else {
+            if self.cached_system_prompt.is_none() {
+                let prompt = build_system_prompt(&ws_ctx, &self.skills, &self.config.raw);
+                // DEBUG: dump full system prompt to file for inspection
+                if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
+                    let dump_path = crate::config::loader::base_dir().join("debug_system_prompt.txt");
+                    if let Err(e) = std::fs::write(&dump_path, &prompt) {
+                        tracing::warn!("failed to dump system prompt: {e}");
+                    }
+                    tracing::info!(path = %dump_path.display(), len = prompt.len(), "dumped system prompt");
+                }
+                self.cached_system_prompt = Some(prompt);
+            }
+            self.cached_system_prompt.clone().expect("just set")
+        };
 
         // --- Dynamic context: injected into system prompt suffix ---
         // Only truly dynamic, per-turn content goes here. Static rules belong
@@ -2256,6 +2360,13 @@ impl AgentRuntime {
         };
 
         // NOW load session (after media processing is done, no more self borrows).
+        // Internal sessions (heartbeat/cron/system) should start each tick
+        // with fresh state — drop any in-memory history from the previous
+        // tick before loading (DB is never written for these sessions, so
+        // load_session will return an empty Vec).
+        if is_internal {
+            self.sessions.remove(session_key);
+        }
         let session_messages = self.load_session(session_key);
 
         // First user message in session: prepend session metadata (date, timezone,
@@ -2283,11 +2394,16 @@ impl AgentRuntime {
             content: MessageContent::Text(persist_text),
         };
         session_messages.push(persist_msg.clone());
-        if let Err(e) = self.store.db.append_message(
-            session_key,
-            &serde_json::to_value(&persist_msg).unwrap_or_default(),
-        ) {
-            tracing::warn!("failed to persist user message: {e:#}");
+        // Internal sessions (heartbeat/cron/system): skip DB persist —
+        // each tick is independent and we don't want history accumulating
+        // "HEARTBEAT_OK" replies in redb.
+        if !is_internal {
+            if let Err(e) = self.store.db.append_message(
+                session_key,
+                &serde_json::to_value(&persist_msg).unwrap_or_default(),
+            ) {
+                tracing::warn!("failed to persist user message: {e:#}");
+            }
         }
 
         // Timeout wrapper.
@@ -2632,16 +2748,12 @@ impl AgentRuntime {
             // compaction time with zero extra LLM calls.
         }
 
-        // Deterministic entity extraction from assistant reply.
-        if let Some(ref mem) = self.memory {
-            let reply_entities = crate::agent::context_mgr::extract_key_entities(&reply.text);
-            if !reply_entities.is_empty() {
-                let scope = format!("agent:{}", self.handle.id);
-                crate::agent::context_mgr::write_entity_memories(
-                    mem, &scope, reply_entities,
-                ).await;
-            }
-        }
+        // NOTE: We intentionally do NOT extract entities from reply.text.
+        // Harvesting "facts" from the agent's own output causes hallucinations
+        // (e.g. a fabricated third-person success narrative) to be crystallized
+        // into entity memory and then fed back on the next turn, reinforcing
+        // the false belief. Entities are extracted only from user messages and
+        // tool outputs (both trusted sources).
 
         // Compaction check (AGENTS.md §15).
         self.compact_if_needed(session_key, &model).await;
@@ -2808,16 +2920,23 @@ impl AgentRuntime {
     /// Load session history from in-memory cache, falling back to redb.
     /// Session key should already be resolved through `resolve_session_key`
     /// (done in `run_turn`) so aliases are transparent.
+    ///
+    /// Internal sessions (heartbeat/cron/system) are never persisted to redb
+    /// (see `is_internal_session`) — always start with an empty history so
+    /// stale entries from a previous version don't leak in.
     fn load_session(&mut self, session_key: &str) -> &mut Vec<Message> {
         if !self.sessions.contains_key(session_key) {
-            let history = self
-                .store
-                .db
-                .load_messages(session_key)
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|v| serde_json::from_value::<Message>(v).ok())
-                .collect::<Vec<_>>();
+            let history = if is_internal_session(session_key) {
+                Vec::new()
+            } else {
+                self.store
+                    .db
+                    .load_messages(session_key)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|v| serde_json::from_value::<Message>(v).ok())
+                    .collect::<Vec<_>>()
+            };
             self.sessions.insert(session_key.to_owned(), history);
         }
         self.sessions.get_mut(session_key).expect("just inserted")
@@ -3018,8 +3137,20 @@ impl AgentRuntime {
                 info!(session = %ctx.session_key, "agent_loop: clear_signal, clearing sessions");
                 self.sessions.clear();
                 self.compaction_state.clear();
+                let terminal_text = "[session cleared]".to_string();
+                if let Some(ref bus) = self.event_bus {
+                    let _ = bus.send(AgentEvent {
+                        session_id: ctx.session_key.clone(),
+                        agent_id: ctx.agent_id.clone(),
+                        delta: terminal_text.clone(),
+                        done: true,
+                        files: vec![],
+                        images: vec![],
+                        tool_log: vec![],
+                    });
+                }
                 return Ok(AgentReply {
-                    text: "[session cleared]".to_string(),
+                    text: terminal_text,
                     is_empty: false,
                     tool_calls: None,
                     images: vec![],
@@ -3033,8 +3164,20 @@ impl AgentRuntime {
             if abort_flag.load(Ordering::SeqCst) {
                 abort_flag.store(false, Ordering::SeqCst);
                 info!(session = %ctx.session_key, iteration, "agent_loop: aborted by user");
+                let terminal_text = "[aborted]".to_string();
+                if let Some(ref bus) = self.event_bus {
+                    let _ = bus.send(AgentEvent {
+                        session_id: ctx.session_key.clone(),
+                        agent_id: ctx.agent_id.clone(),
+                        delta: terminal_text.clone(),
+                        done: true,
+                        files: tool_files.clone(),
+                        images: tool_images.clone(),
+                        tool_log: tool_log.clone(),
+                    });
+                }
                 return Ok(AgentReply {
-                    text: "[aborted]".to_string(),
+                    text: terminal_text,
                     is_empty: false,
                     tool_calls: None,
                     images: vec![],
@@ -3049,8 +3192,27 @@ impl AgentRuntime {
                     iterations = iteration,
                     "agent_loop: hit max iteration limit, breaking out"
                 );
+                let terminal_text = crate::i18n::t(
+                    "agent_max_iterations",
+                    crate::i18n::default_lang(),
+                )
+                .to_owned();
+                // Emit a done=true event so WS subscribers get both the
+                // terminal text and the terminator frame. Without this, the
+                // UI hangs waiting for done and never shows this message.
+                if let Some(ref bus) = self.event_bus {
+                    let _ = bus.send(AgentEvent {
+                        session_id: ctx.session_key.clone(),
+                        agent_id: ctx.agent_id.clone(),
+                        delta: terminal_text.clone(),
+                        done: true,
+                        files: tool_files.clone(),
+                        images: tool_images.clone(),
+                        tool_log: tool_log.clone(),
+                    });
+                }
                 return Ok(AgentReply {
-                    text: crate::i18n::t("agent_max_iterations", crate::i18n::default_lang()).to_owned(),
+                    text: terminal_text,
                     is_empty: false,
                     tool_calls: None,
                     images: vec![],
@@ -3593,8 +3755,23 @@ impl AgentRuntime {
             // Reasoning models (e.g. kimi-for-coding) may return only reasoning_content
             // with empty content. Use reasoning as the reply text to avoid saving an
             // empty assistant message (which some APIs reject on the next turn).
-            tracing::info!(text_len = text_buf.len(), reasoning_len = reasoning_buf.len(), "agent_loop: post-stream buffers");
-            if text_buf.trim().is_empty() && !reasoning_buf.trim().is_empty() {
+            //
+            // IMPORTANT: only fall back when there are NO tool calls. When the model
+            // emits `reasoning + tool_calls` (qwen-thinking, claude-extended-thinking,
+            // etc. doing silent tool use), promoting reasoning_buf into text_buf leaks
+            // the chain-of-thought through the intermediate-output path
+            // (`notification_tx` below) and the user sees CoT text bubbles like
+            // "用户现在需要..." / "对，先执行第一步...".
+            tracing::info!(
+                text_len = text_buf.len(),
+                reasoning_len = reasoning_buf.len(),
+                tool_call_count = tool_calls.len(),
+                "agent_loop: post-stream buffers"
+            );
+            if text_buf.trim().is_empty()
+                && !reasoning_buf.trim().is_empty()
+                && tool_calls.is_empty()
+            {
                 tracing::info!(reasoning_len = reasoning_buf.len(), "agent_loop: using reasoning as reply text");
                 text_buf = reasoning_buf.clone();
             }
@@ -3803,14 +3980,19 @@ impl AgentRuntime {
                         role: Role::Assistant,
                         content: MessageContent::Text(text_buf.clone()),
                     };
-                    if let Err(e) = self.store.db.append_message(
-                        &ctx.session_key,
-                        &serde_json::to_value(&assistant_msg).unwrap_or_default(),
-                    ) {
-                        tracing::error!(error = %e, "failed to persist message");
-                    }
-                    if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
-                        sess.push(assistant_msg);
+                    // Internal sessions (heartbeat/cron/system): skip DB
+                    // persist so replies like "HEARTBEAT_OK" don't
+                    // accumulate in session history.
+                    if !is_internal_session(&ctx.session_key) {
+                        if let Err(e) = self.store.db.append_message(
+                            &ctx.session_key,
+                            &serde_json::to_value(&assistant_msg).unwrap_or_default(),
+                        ) {
+                            tracing::error!(error = %e, "failed to persist message");
+                        }
+                        if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
+                            sess.push(assistant_msg);
+                        }
                     }
                 } else {
                     tracing::debug!(session = %ctx.session_key, "skipping empty assistant reply (not persisted)");
@@ -3846,11 +4028,26 @@ impl AgentRuntime {
                     text_buf
                 };
 
+                if !tool_images.is_empty() {
+                    info!("AgentReply returning with {} image(s), first {} bytes", tool_images.len(), tool_images.first().map(|s| s.len()).unwrap_or(0));
+                }
+                // tool_images may contain file paths (from computer_use
+                // screenshots saved to disk) OR data URLs (from image-gen
+                // tools).  The event_bus already emitted the unchanged values
+                // for the WS/desktop client, which loads file paths via
+                // Tauri's asset protocol.  Non-WS channels (telegram, feishu,
+                // wechat, ...) only look at AgentReply.images and expect the
+                // `data:image/...;base64,...` format, so rehydrate any file
+                // paths here before returning.
+                let reply_images = tool_images
+                    .into_iter()
+                    .filter_map(|i| image_ref_to_data_url(i))
+                    .collect::<Vec<_>>();
                 return Ok(AgentReply {
                     text: final_text,
-                    is_empty: no_reply && tool_images.is_empty(),
+                    is_empty: no_reply && reply_images.is_empty(),
                     tool_calls: None,
-                    images: tool_images,
+                    images: reply_images,
                     files: tool_files,
                     pending_analysis: None,
                     was_preparse: false,
@@ -4093,13 +4290,18 @@ impl AgentRuntime {
                             }
                         }
                         // Extract images from tool result to avoid passing large
-                        // base64 back to LLM. Check "image" (screenshot) and "url" (image gen).
+                        // base64 back to LLM. Check "image" (data-URL screenshots
+                        // and image-gen), "image_path" (new screenshot path), and
+                        // "url" (image gen). File paths get forwarded as-is so
+                        // the UI can load them via Tauri's asset protocol —
+                        // much lighter than shipping base64 over WS.
                         let img_data = v.get("image").and_then(|i| i.as_str()).or_else(|| {
                             v.get("url")
                                 .and_then(|u| u.as_str())
                                 .filter(|u| u.starts_with("data:image/"))
                         });
-                        if let Some(img) = img_data {
+                        let img_path = v.get("image_path").and_then(|p| p.as_str());
+                        if let Some(img) = img_data.or(img_path) {
                             let desc = v
                                 .get("revised_prompt")
                                 .and_then(|p| p.as_str())
@@ -4142,11 +4344,26 @@ impl AgentRuntime {
                     } else {
                         result_text.clone()
                     };
-                    tool_log.push((tool_name.clone(), args_str, out_str.clone()));
+                    tool_log.push((tool_name.clone(), args_str.clone(), out_str.clone()));
                     if let Some(ref bus) = self.event_bus {
+                        // Prepend `$ command` line for exec tools so the
+                        // desktop UI can show a command preview in the header.
+                        let display_out = if matches!(tool_name.as_str(), "execute_command" | "exec") {
+                            if let Ok(a) = serde_json::from_str::<serde_json::Value>(&args_str) {
+                                if let Some(cmd) = a.get("command").and_then(|c| c.as_str()) {
+                                    format!("$ {cmd}\n{out_str}")
+                                } else {
+                                    out_str.clone()
+                                }
+                            } else {
+                                out_str.clone()
+                            }
+                        } else {
+                            out_str.clone()
+                        };
                         let marker = format!(
                             "<rstool name=\"{}\">{}</rstool>",
-                            tool_name, out_str
+                            tool_name, display_out
                         );
                         let _ = bus.send(AgentEvent {
                             session_id: ctx.session_key.clone(),
@@ -4166,23 +4383,26 @@ impl AgentRuntime {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result_text) {
                         if v.get("__send_file").and_then(|b| b.as_bool()).unwrap_or(false) {
                             if let Some(path_str) = v.get("path").and_then(|p| p.as_str()) {
-                                let full = std::path::PathBuf::from(path_str);
+                                let send_workspace = self.handle.config.workspace.as_deref()
+                                    .or(self.config.agents.defaults.workspace.as_deref())
+                                    .map(expand_tilde)
+                                    .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+                                let full = canonicalize_external_path(path_str, &send_workspace);
                                 let filename = v.get("filename").and_then(|f| f.as_str()).unwrap_or("file").to_owned();
                                 let lower = filename.to_lowercase();
                                 let is_image = lower.ends_with(".jpg") || lower.ends_with(".jpeg")
                                     || lower.ends_with(".png") || lower.ends_with(".webp")
                                     || lower.ends_with(".gif");
                                 if is_image {
-                                    // Send as inline image, not file attachment.
-                                    if let Ok(bytes) = std::fs::read(&full) {
-                                        use base64::Engine as _;
-                                        let mime = if lower.ends_with(".png") { "image/png" }
-                                            else if lower.ends_with(".webp") { "image/webp" }
-                                            else if lower.ends_with(".gif") { "image/gif" }
-                                            else { "image/jpeg" };
-                                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                        tool_images.push(format!("data:{mime};base64,{b64}"));
-                                        tracing::info!(path = %full.display(), "agent: send_file queued as image");
+                                    // Send the path inline. Desktop UI loads via Tauri's
+                                    // asset protocol; `image_ref_to_data_url` converts to
+                                    // a base64 data URL only for non-WS channels at the
+                                    // AgentReply boundary.
+                                    if full.exists() {
+                                        tool_images.push(full.to_string_lossy().into_owned());
+                                        tracing::info!(path = %full.display(), "agent: send_file queued as image (path)");
+                                    } else {
+                                        tracing::warn!(path = %full.display(), "agent: send_file image path missing, dropping");
                                     }
                                 } else {
                                     let mime = if lower.ends_with(".xlsx") { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }
@@ -4221,8 +4441,7 @@ impl AgentRuntime {
                             ".pdf", ".csv", ".mp4", ".mp3", ".zip", ".tar.gz", ".txt", ".json",
                             ".html", ".py", ".md"];
                         if !sendable_exts.iter().any(|ext| lower.ends_with(ext)) { return; }
-                        let pb = std::path::PathBuf::from(path_str);
-                        let full = if pb.is_absolute() { pb } else { workspace.join(path_str) };
+                        let full = canonicalize_external_path(path_str, &workspace);
                         if !full.exists() { return; }
                         // Skip very large files (>50MB)
                         if let Ok(meta) = full.metadata() {
@@ -4297,22 +4516,24 @@ impl AgentRuntime {
                                 continue;
                             };
 
-                            let pb = std::path::PathBuf::from(&path_str);
+                            let files_workspace = self.handle.config.workspace.as_deref()
+                                .or(self.config.agents.defaults.workspace.as_deref())
+                                .map(expand_tilde)
+                                .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+                            let pb = canonicalize_external_path(&path_str, &files_workspace);
+                            let pb_str = pb.to_string_lossy().to_string();
                             if pb.exists() {
                                 let lower = path_str.to_lowercase();
                                 let is_image = lower.ends_with(".png") || lower.ends_with(".jpg")
                                     || lower.ends_with(".jpeg") || lower.ends_with(".webp");
                                 if is_image {
-                                    // Convert to data URI for inline sending
-                                    if let Ok(bytes) = std::fs::read(&pb) {
-                                        use base64::Engine as _;
-                                        let mime = if lower.ends_with(".png") { "image/png" }
-                                            else if lower.ends_with(".webp") { "image/webp" }
-                                            else { "image/jpeg" };
-                                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                        tool_images.push(format!("data:{mime};base64,{b64}"));
-                                        tracing::info!(path = %path_str, size = bytes.len(), "auto-sending image file as attachment");
-                                    }
+                                    // Push the file path (not base64). The desktop UI loads
+                                    // it via Tauri's asset protocol; non-WS channels rehydrate
+                                    // to a data URL at the AgentReply boundary
+                                    // (`image_ref_to_data_url`), avoiding a multi-MB base64
+                                    // blast over the WebSocket.
+                                    tool_images.push(pb_str.clone());
+                                    tracing::info!(path = %pb_str, "auto-sending image file as attachment (path)");
                                 } else {
                                     // Non-image file (video, etc.) → tool_files
                                     let filename = pb.file_name()
@@ -4321,8 +4542,8 @@ impl AgentRuntime {
                                     let mime = if lower.ends_with(".mp4") { "video/mp4" }
                                         else if lower.ends_with(".mp3") { "audio/mpeg" }
                                         else { "application/octet-stream" };
-                                    tool_files.push((filename, mime.to_string(), path_str.clone()));
-                                    tracing::info!(path = %path_str, "auto-sending file as attachment");
+                                    tool_files.push((filename, mime.to_string(), pb_str.clone()));
+                                    tracing::info!(path = %pb_str, "auto-sending file as attachment");
                                 }
                             }
                         }
@@ -5089,6 +5310,40 @@ pub(crate) fn expand_tilde(p: &str) -> std::path::PathBuf {
     } else {
         std::path::PathBuf::from(p)
     }
+}
+
+/// Canonicalize a path received from an external source (tool output, plugin
+/// result, LLM-generated argument). Performs:
+///   1. `~/...` expansion via [`expand_tilde`]
+///   2. If still relative, joins with `workspace`
+///   3. Collapses `.` and `..` components without requiring filesystem access
+///      (does NOT follow symlinks — this is a pure lexical normalization).
+///
+/// This is the single entry point for turning untrusted path strings into
+/// filesystem paths the host will actually read/write. Call this instead of
+/// `PathBuf::from(s)` at module boundaries.
+pub(crate) fn canonicalize_external_path(
+    input: &str,
+    workspace: &std::path::Path,
+) -> std::path::PathBuf {
+    use std::path::Component;
+    let expanded = expand_tilde(input);
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        workspace.join(expanded)
+    };
+    let mut out = std::path::PathBuf::new();
+    for c in absolute.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

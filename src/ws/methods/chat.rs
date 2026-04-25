@@ -74,11 +74,29 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
         files: vec![],
     };
 
-    agent
-        .tx
-        .send(msg)
-        .await
-        .map_err(|e| ErrorShape::internal(e.to_string()))?;
+    tracing::info!(
+        agent_id = %agent.id,
+        session_key = %session_key,
+        run_id = %run_id,
+        tx_capacity = agent.tx.capacity(),
+        tx_max_capacity = agent.tx.max_capacity(),
+        "chat.send: dispatching to agent runtime"
+    );
+    if let Err(e) = agent.tx.send(msg).await {
+        tracing::error!(
+            agent_id = %agent.id,
+            session_key = %session_key,
+            error = %e,
+            "chat.send: agent.tx.send failed"
+        );
+        return Err(ErrorShape::internal(e.to_string()));
+    }
+    tracing::info!(
+        agent_id = %agent.id,
+        session_key = %session_key,
+        run_id = %run_id,
+        "chat.send: dispatched ok, waiting for runtime"
+    );
 
     // Spawn relay task: emit OpenClaw-format "chat" events back to the WS
     // client that initiated the request.  The payload uses the `event:chat`

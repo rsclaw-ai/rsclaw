@@ -66,36 +66,41 @@ impl super::runtime::AgentRuntime {
                     // Longer delays: persist to cron.json5 (survives restart).
                     let short_threshold_ms = 30 * 60 * 1000; // 30 minutes
                     if delay <= short_threshold_ms {
+                        // Unified delivery path: route through notification_tx so the
+                        // notification router forwards to the "desktop" channel bridge
+                        // (same sink used by persisted cron jobs). Previously this
+                        // path emitted AgentEvents on the event_bus which relied on a
+                        // live WS subscriber at fire-time and session_id match — any
+                        // reconnect or filter mismatch dropped the reminder.
                         let msg_text = message.to_owned();
-                        let event_bus = self.event_bus.clone();
-                        let session_key = ctx.session_key.clone();
+                        let notif_tx = self.notification_tx.clone();
+                        let peer_id = ctx.peer_id.clone();
+                        let origin_channel = ctx.channel.clone();
+                        let delivery_channel: String = if origin_channel == "ws" {
+                            "desktop".to_owned()
+                        } else {
+                            origin_channel
+                        };
                         let delay_dur = Duration::from_millis(delay);
                         let timer_name = name.unwrap_or("reminder").to_owned();
-                        debug!(delay_ms = delay, name = %timer_name, "cron: using in-memory timer (short delay)");
+                        debug!(delay_ms = delay, name = %timer_name, channel = %delivery_channel, "cron: using in-memory timer (short delay)");
                         tokio::spawn(async move {
                             tokio::time::sleep(delay_dur).await;
-                            // Emit via event_bus so WS auto-relay delivers to connected UI.
-                            if let Some(bus) = event_bus {
-                                // Send text delta with reminder content
-                                let _ = bus.send(crate::events::AgentEvent {
-                                    session_id: session_key.clone(),
-                                    agent_id: "cron".to_owned(),
-                                    delta: msg_text,
-                                    done: false,
-                                    files: vec![],
+                            if let Some(tx) = notif_tx {
+                                let msg = crate::channel::OutboundMessage {
+                                    target_id: peer_id,
+                                    is_group: false,
+                                    text: msg_text,
+                                    reply_to: None,
                                     images: vec![],
-                                    tool_log: vec![],
-                                });
-                                // Send done signal
-                                let _ = bus.send(crate::events::AgentEvent {
-                                    session_id: session_key,
-                                    agent_id: "cron".to_owned(),
-                                    delta: String::new(),
-                                    done: true,
                                     files: vec![],
-                                    images: vec![],
-                                    tool_log: vec![],
-                                });
+                                    channel: Some(delivery_channel),
+                                };
+                                if let Err(e) = tx.send(msg) {
+                                    tracing::warn!(error = %e, "cron in-memory timer: notification_tx send failed");
+                                }
+                            } else {
+                                tracing::warn!("cron in-memory timer: no notification_tx wired up, reminder dropped");
                             }
                         });
                         return Ok(json!({"added": id, "type": "in-memory timer", "delay_ms": delay, "message": message}));
@@ -133,15 +138,19 @@ impl super::runtime::AgentRuntime {
                 }
 
                 // Auto-set delivery to the originating channel+peer when not explicitly specified.
+                // Special case: WS chat transport uses ctx.channel="ws", but the delivery
+                // sink registered in ChannelManager is "desktop" (DesktopChannel broadcasts
+                // to all connected WS clients). Remap so send_delivery can route.
                 let channel = &ctx.channel;
                 let peer_id = &ctx.peer_id;
                 if !channel.is_empty() && channel != "system" && channel != "cron" && !peer_id.is_empty() {
+                    let delivery_channel: &str = if channel == "ws" { "desktop" } else { channel.as_str() };
                     job["delivery"] = json!({
-                        "channel": channel,
+                        "channel": delivery_channel,
                         "to": peer_id,
                         "mode": "always"
                     });
-                    debug!(channel, peer_id, "cron add: auto-set delivery to originating channel");
+                    debug!(channel = delivery_channel, peer_id, "cron add: auto-set delivery to originating channel");
                 }
 
                 jobs.push(job);

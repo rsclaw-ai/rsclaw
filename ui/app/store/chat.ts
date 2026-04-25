@@ -60,6 +60,13 @@ export type ChatMessage = RequestMessage & {
   tools?: ChatMessageTool[];
   audio_url?: string;
   isMcpResponse?: boolean;
+  /**
+   * Marks messages that are NOT a real assistant reply — agent
+   * intermediate text ("好的，我来帮你搜索…"), cron / system notifications
+   * pushed via the desktop channel, etc.  Rendered with the muted
+   * palette shared with `ThinkBlock` so they recede.
+   */
+  isIntermediate?: boolean;
 };
 
 export function createMessage(override: Partial<ChatMessage>): ChatMessage {
@@ -435,16 +442,20 @@ export const useChatStore = createPersistStore(
         const sendMessages = recentMessages.concat(userMessage);
         const messageIndex = session.messages.length + 1;
 
-        // save user's and bot's message
+        // save user's and bot's message (guard against duplicate append
+        // if called while a previous bot is still streaming)
         get().updateTargetSession(session, (session) => {
           const savedUserMessage = {
             ...userMessage,
             content: mContent,
           };
-          session.messages = session.messages.concat([
-            savedUserMessage,
-            botMessage,
-          ]);
+          const ids = new Set(session.messages.map((m) => m.id));
+          const toAdd = [savedUserMessage, botMessage].filter(
+            (m) => !ids.has(m.id),
+          );
+          if (toAdd.length > 0) {
+            session.messages = session.messages.concat(toAdd);
+          }
         });
 
         const api: ClientApi = getClientApi(modelConfig.providerName);
@@ -787,6 +798,14 @@ export const useChatStore = createPersistStore(
         const index = sessions.findIndex((s) => s.id === targetSession.id);
         if (index < 0) return;
         updater(sessions[index]);
+        // Deduplicate messages by ID to prevent race conditions
+        // when a new message is sent while streaming is in progress.
+        const seen = new Set<string>();
+        sessions[index].messages = sessions[index].messages.filter((m) => {
+          if (seen.has(m.id)) return false;
+          seen.add(m.id);
+          return true;
+        });
         set(() => ({ sessions }));
       },
       async clearAllData() {

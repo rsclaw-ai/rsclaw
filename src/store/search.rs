@@ -197,7 +197,7 @@ impl SearchIndex {
     /// Index a memory document in tantivy for BM25 search, then commit.
     ///
     /// Convenience method used by MemoryStore::add() to keep the BM25 index
-    /// in sync with the LanceDB vector store.
+    /// in sync with the hnsw_rs vector store.
     pub fn index_memory_doc(&self, id: &str, scope: &str, kind: &str, text: &str) -> Result<()> {
         self.index_document(&IndexDoc {
             id: id.to_owned(),
