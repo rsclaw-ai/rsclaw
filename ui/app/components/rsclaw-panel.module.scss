@@ -169,7 +169,7 @@ $r: 10px;
   border-left: 2px solid $amber;
   border-radius: $r;
   padding: 10px 14px;
-  margin: 12px 18px 0;
+  margin: -8px 0 16px;
   font-size: 12px;
   color: $t0;
 }
@@ -192,6 +192,12 @@ $r: 10px;
   flex: 1;
   line-height: 1.5;
   word-break: break-word;
+}
+
+.restart-banner-countdown {
+  margin-top: 4px;
+  font-size: 11px;
+  color: $t1;
 }
 
 .restart-banner-actions {

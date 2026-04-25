@@ -996,6 +996,9 @@ const cn = {
 
     RestartBanner: {
       DefaultMessage: "需要重启网关以应用更改。",
+      AutoRestartCountdown: (seconds: number) =>
+        `系统将在 ${seconds} 秒后自动重启。如未自动重启，请点击「立即重启」。`,
+      AutoRestarting: "正在自动重启...",
       RestartNow: "立即重启",
       Later: "稍后",
       Dismiss: "忽略",

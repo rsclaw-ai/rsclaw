@@ -265,6 +265,9 @@ function StatusPage() {
         </>
       </div>
 
+      {/* Restart-required banner — appears under the gateway status when a restart event is pending */}
+      <RestartBanner />
+
       {/* Stats Row */}
       <div className={styles["stat-row"]}>
         <div className={styles["stat-c"]}>
@@ -5422,9 +5425,6 @@ export function RsClawPanel() {
             </button>
           </div>
         </div>
-
-        {/* Restart-required banner (snoozable, dismissible) */}
-        <RestartBanner />
 
         {/* Body = content only (nav moved to sidebar) */}
         <div className={styles["panel-body"]}>

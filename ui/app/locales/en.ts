@@ -1005,6 +1005,9 @@ const en: LocaleType = {
 
     RestartBanner: {
       DefaultMessage: "A gateway restart is required to apply changes.",
+      AutoRestartCountdown: (seconds: number) =>
+        `Auto-restarting in ${seconds}s. If it does not happen automatically, click "Restart Now".`,
+      AutoRestarting: "Auto-restarting...",
       RestartNow: "Restart Now",
       Later: "Later",
       Dismiss: "Dismiss",
