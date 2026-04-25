@@ -59,6 +59,7 @@ fn spawn_wechat_user_worker(
                 channel: "wechat".to_string(),
                 chat_id: String::new(),
                 is_group: false,
+                reply_to: None,
                 timestamp: chrono::Utc::now().timestamp(),
                 images: images.iter().map(|i| i.data.clone()).collect(),
                 files: file_attachments.iter().filter_map(|f| {

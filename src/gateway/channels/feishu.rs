@@ -364,6 +364,7 @@ pub(crate) fn start_feishu_if_configured(
                                         channel: "feishu".to_string(),
                                         chat_id: chat_id.clone(),
                                         is_group,
+                                        reply_to: None,
                                         timestamp: chrono::Utc::now().timestamp(),
                                         images: images.iter().map(|i| i.data.clone()).collect(),
                                         files: file_attachments.iter().filter_map(|f| {

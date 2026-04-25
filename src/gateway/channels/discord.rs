@@ -260,6 +260,7 @@ pub(crate) fn start_discord_if_configured(
                                         channel: "discord".to_string(),
                                         chat_id: channel_id.to_string(),
                                         is_group: is_guild,
+                                        reply_to: None,
                                         timestamp: chrono::Utc::now().timestamp(),
                                         images: vec![],
                                         files: vec![],

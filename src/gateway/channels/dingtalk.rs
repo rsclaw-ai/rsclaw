@@ -297,6 +297,7 @@ pub(crate) fn start_dingtalk_if_configured(
                                         channel: "dingtalk".to_string(),
                                         chat_id: dt_target.clone(),
                                         is_group,
+                                        reply_to: None,
                                         timestamp: chrono::Utc::now().timestamp(),
                                         images: images.iter().map(|i| i.data.clone()).collect(),
                                         files: vec![],

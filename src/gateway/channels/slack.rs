@@ -281,6 +281,7 @@ pub(crate) fn start_slack_if_configured(
                                         channel: "slack".to_string(),
                                         chat_id: channel_id.to_string(),
                                         is_group: is_channel,
+                                        reply_to: None,
                                         timestamp: chrono::Utc::now().timestamp(),
                                         images: vec![],
                                         files: vec![],

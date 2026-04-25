@@ -221,6 +221,7 @@ pub(crate) fn start_wecom_if_configured(
                                         channel: "wecom".to_string(),
                                         chat_id: chat_id.clone(),
                                         is_group,
+                                        reply_to: None,
                                         timestamp: chrono::Utc::now().timestamp(),
                                         images: images.iter().map(|i| i.data.clone()).collect(),
                                         files: files.iter().filter_map(|f| {

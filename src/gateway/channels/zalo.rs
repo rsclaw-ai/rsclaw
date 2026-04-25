@@ -202,6 +202,7 @@ pub(crate) fn start_zalo_if_configured(
                                         channel: "zalo".to_string(),
                                         chat_id: String::new(),
                                         is_group: false,
+                                        reply_to: None,
                                         timestamp: chrono::Utc::now().timestamp(),
                                         images: images.iter().map(|i| i.data.clone()).collect(),
                                         files: vec![],

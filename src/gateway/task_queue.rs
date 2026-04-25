@@ -66,6 +66,9 @@ pub struct QueuedMessage {
     pub chat_id: String,
     /// Whether this message originated from a group conversation.
     pub is_group: bool,
+    /// Platform message ID for reply quoting (e.g. QQ msg_id).
+    #[serde(default)]
+    pub reply_to: Option<String>,
     pub timestamp: i64,
     /// Base64-encoded images or file-system paths.
     pub images: Vec<String>,
@@ -327,6 +330,7 @@ pub fn submit_to_queue(
         channel: channel.to_string(),
         chat_id: chat_id.to_string(),
         is_group,
+        reply_to: None,
         timestamp: chrono::Utc::now().timestamp(),
         images: vec![],
         files: vec![],
@@ -347,6 +351,7 @@ pub struct TaskQueueWorker {
     registry: Arc<AgentRegistry>,
     channel_senders: Arc<std::sync::RwLock<HashMap<String, mpsc::Sender<OutboundMessage>>>>,
     shutdown: super::shutdown::ShutdownCoordinator,
+    config: crate::config::runtime::RuntimeConfig,
 }
 
 impl TaskQueueWorker {
@@ -356,13 +361,24 @@ impl TaskQueueWorker {
         registry: Arc<AgentRegistry>,
         channel_senders: Arc<std::sync::RwLock<HashMap<String, mpsc::Sender<OutboundMessage>>>>,
         shutdown: super::shutdown::ShutdownCoordinator,
+        config: crate::config::runtime::RuntimeConfig,
     ) -> Self {
         Self {
             manager,
             registry,
             channel_senders,
             shutdown,
+            config,
         }
+    }
+
+    /// Look up the outbound sender for a channel by name.
+    fn channel_tx(&self, name: &str) -> Option<mpsc::Sender<OutboundMessage>> {
+        self.channel_senders
+            .read()
+            .expect("channel_senders lock poisoned")
+            .get(name)
+            .cloned()
     }
 
     /// Main loop: wait for task notifications and dispatch them. Exits when
@@ -421,6 +437,7 @@ impl TaskQueueWorker {
         let peer_id = first_msg.sender.clone();
         let chat_id = first_msg.chat_id.clone();
         let is_group = first_msg.is_group;
+        let reply_to = first_msg.reply_to.clone();
 
         info!(
             task_id = %task_id,
@@ -495,28 +512,21 @@ impl TaskQueueWorker {
                 }
                 cleanup_staged_files(&task);
 
+                let pending = reply.pending_analysis;
+
                 // Route reply back to the originating channel.
                 if !reply.text.is_empty() || !reply.images.is_empty() || !reply.files.is_empty() {
-                    // Use chat_id as target when available (e.g. Telegram group),
-                    // fall back to peer_id for DM-style channels.
-                    let target = if chat_id.is_empty() { peer_id.clone() } else { chat_id };
+                    let target = if chat_id.is_empty() { peer_id.clone() } else { chat_id.clone() };
                     let out = OutboundMessage {
                         target_id: target,
                         is_group,
                         text: reply.text,
-                        reply_to: None,
+                        reply_to: reply_to.clone(),
                         images: reply.images,
                         files: reply.files,
                         channel: Some(channel_name.clone()),
                     };
-                    let tx = {
-                        let guard = self
-                            .channel_senders
-                            .read()
-                            .expect("channel_senders lock poisoned");
-                        guard.get(&channel_name).cloned()
-                    };
-                    if let Some(tx) = tx {
+                    if let Some(tx) = self.channel_tx(&channel_name) {
                         if let Err(e) = tx.send(out).await {
                             error!(
                                 task_id = %task_id,
@@ -530,6 +540,22 @@ impl TaskQueueWorker {
                             channel = %channel_name,
                             "task queue worker: no channel sender registered"
                         );
+                    }
+                }
+
+                // Handle pending analysis (e.g. background image/file analysis).
+                if let Some(analysis) = pending {
+                    let target = if chat_id.is_empty() { peer_id } else { chat_id };
+                    if let Some(tx) = self.channel_tx(&channel_name) {
+                        crate::gateway::startup::handle_pending_analysis(
+                            analysis,
+                            Arc::clone(&handle),
+                            &tx,
+                            target,
+                            is_group,
+                            &self.config,
+                        )
+                        .await;
                     }
                 }
             }

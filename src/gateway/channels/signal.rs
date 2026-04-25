@@ -228,6 +228,7 @@ pub(crate) fn start_signal_if_configured(
                                     channel: "signal".to_string(),
                                     chat_id: String::new(),
                                     is_group,
+                                    reply_to: None,
                                     timestamp: chrono::Utc::now().timestamp(),
                                     images: vec![],
                                     files: vec![],

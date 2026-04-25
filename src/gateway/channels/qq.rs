@@ -232,7 +232,7 @@ pub(crate) fn start_qq_if_configured(
                                     sender_id,
                                     target_id,
                                     is_group,
-                                    _msg_id,
+                                    msg_id,
                                     images,
                                     file_attachments,
                                 )) = urx.recv().await
@@ -247,6 +247,7 @@ pub(crate) fn start_qq_if_configured(
                                         channel: "qq".to_string(),
                                         chat_id: target_id.clone(),
                                         is_group,
+                                        reply_to: Some(msg_id),
                                         timestamp: chrono::Utc::now().timestamp(),
                                         images: images.iter().map(|i| i.data.clone()).collect(),
                                         files: file_attachments.iter().filter_map(|f| {

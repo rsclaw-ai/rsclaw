@@ -323,6 +323,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             Arc::clone(&registry),
             Arc::clone(&channel_senders),
             shutdown.clone(),
+            (*config).clone(),
         ));
         tokio::spawn(async move { worker.run().await });
         info!("task queue worker started");

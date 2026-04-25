@@ -214,6 +214,7 @@ pub(crate) fn start_whatsapp_if_configured(
                                         channel: "whatsapp".to_string(),
                                         chat_id: from.to_string(),
                                         is_group: false,
+                                        reply_to: None,
                                         timestamp: chrono::Utc::now().timestamp(),
                                         images: images.iter().map(|i| i.data.clone()).collect(),
                                         files: vec![],

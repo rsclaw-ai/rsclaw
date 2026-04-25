@@ -417,6 +417,7 @@ pub(crate) fn start_channels(
                                             channel: "telegram".to_string(),
                                             chat_id: chat_id.to_string(),
                                             is_group,
+                                            reply_to: None,
                                             timestamp: chrono::Utc::now().timestamp(),
                                             images: images.iter().map(|i| i.data.clone()).collect(),
                                             files: file_attachments.iter().filter_map(|f| {

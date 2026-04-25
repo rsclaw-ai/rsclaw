@@ -240,6 +240,7 @@ pub(crate) fn start_line_if_configured(
                                         channel: "line".to_string(),
                                         chat_id: String::new(),
                                         is_group,
+                                        reply_to: None,
                                         timestamp: chrono::Utc::now().timestamp(),
                                         images: images.iter().map(|i| i.data.clone()).collect(),
                                         files: vec![],
