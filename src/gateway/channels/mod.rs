@@ -257,6 +257,7 @@ pub(crate) fn start_channels(
             let enforcer = Arc::clone(&enforcer);
             let gp = Arc::new(group_policy.clone());
             let ga = Arc::new(group_allow_from.clone());
+            let tq = Arc::clone(&task_queue);
             let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
             // Register Telegram channel sender for notification routing.
@@ -296,6 +297,7 @@ pub(crate) fn start_channels(
                     let group_policy = Arc::clone(&gp);
                     let group_allow = Arc::clone(&ga);
                     let queues = Arc::clone(&tg_user_queues);
+                    let tq = Arc::clone(&tq);
                     tokio::spawn(async move {
                         // Group policy check.
                         if is_group {
