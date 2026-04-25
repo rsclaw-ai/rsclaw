@@ -23,11 +23,21 @@ use rsclaw::{
         },
         schema::{BindMode, GatewayMode, ReloadMode, SessionConfig},
     },
-    gateway::LiveConfig,
+    events::RestartRequest,
+    gateway::{LiveConfig, ShutdownCoordinator},
     server::{AppState, serve},
     store::Store,
 };
 use tokio::sync::broadcast;
+
+/// Handles into the running server's AppState. Returned by
+/// [`start_server_with_handles`] so tests can publish events directly into the
+/// gateway's broadcast channels and inspect latched state.
+pub struct ServerHandles {
+    pub restart_request_tx: broadcast::Sender<RestartRequest>,
+    pub pending_restart: Arc<std::sync::RwLock<Option<RestartRequest>>>,
+    pub shutdown: ShutdownCoordinator,
+}
 
 /// Allocate a free TCP port by binding :0 and returning the address.
 /// The listener is dropped immediately; there is a small TOCTOU window
@@ -95,6 +105,13 @@ pub fn minimal_config(port: u16) -> RuntimeConfig {
 /// Spawn a minimal Axum server on `addr` and wait until it is ready.
 /// The caller must ensure `addr` is not reused before this future resolves.
 pub async fn start_server(addr: SocketAddr) {
+    let _ = start_server_with_handles(addr).await;
+}
+
+/// Like [`start_server`], but returns handles into the running AppState so a
+/// test can publish events into broadcast channels or inspect latched state.
+pub async fn start_server_with_handles(addr: SocketAddr) -> ServerHandles {
+    init_tls();
     let config = Arc::new(minimal_config(addr.port()));
     let live = Arc::new(LiveConfig::new((*config).clone()));
 
@@ -103,15 +120,28 @@ pub async fn start_server(addr: SocketAddr) {
     let agents = Arc::new(AgentRegistry::from_config(&config));
     let (event_tx, _) = broadcast::channel(16);
 
+    let restart_request_tx: broadcast::Sender<RestartRequest> = broadcast::channel(16).0;
+    let pending_restart: Arc<std::sync::RwLock<Option<RestartRequest>>> =
+        Arc::new(std::sync::RwLock::new(None));
+    let shutdown = ShutdownCoordinator::new();
+
+    // Per-test device-store path so tests don't share token state on disk.
+    let device_path = tempfile::Builder::new()
+        .prefix("rsclaw-test-devices-")
+        .suffix(".json")
+        .tempfile()
+        .expect("device tempfile")
+        .into_temp_path()
+        .keep()
+        .expect("keep device path");
+
     let state = AppState {
         config,
         live,
         agents,
         store,
         event_bus: event_tx,
-        devices: Arc::new(rsclaw::ws::DeviceStore::new(std::path::PathBuf::from(
-            "/tmp/test-devices.json",
-        ))),
+        devices: Arc::new(rsclaw::ws::DeviceStore::new(device_path)),
         ws_conns: Arc::new(rsclaw::ws::ConnRegistry::new()),
         feishu: Arc::new(tokio::sync::OnceCell::new()),
         wecom: Arc::new(tokio::sync::OnceCell::new()),
@@ -124,9 +154,9 @@ pub async fn start_server(addr: SocketAddr) {
         cron_reload: broadcast::channel(1).0,
         notification_tx: broadcast::channel(16).0,
         wasm_plugins: Arc::new(Vec::new()),
-        restart_request_tx: broadcast::channel(16).0,
-        pending_restart: Arc::new(std::sync::RwLock::new(None)),
-        shutdown: rsclaw::gateway::ShutdownCoordinator::new(),
+        restart_request_tx: restart_request_tx.clone(),
+        pending_restart: Arc::clone(&pending_restart),
+        shutdown: shutdown.clone(),
     };
 
     // Leak tempdir — store must stay live for the lifetime of the server task.
@@ -137,14 +167,22 @@ pub async fn start_server(addr: SocketAddr) {
     });
 
     // Poll until the health endpoint responds (up to 1 s).
+    let mut ready = false;
     for _ in 0..50 {
         if reqwest::get(format!("http://{addr}/api/v1/health"))
             .await
             .is_ok()
         {
-            return;
+            ready = true;
+            break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    panic!("server did not start within 1 s");
+    assert!(ready, "server did not start within 1 s");
+
+    ServerHandles {
+        restart_request_tx,
+        pending_restart,
+        shutdown,
+    }
 }
