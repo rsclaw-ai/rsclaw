@@ -1875,19 +1875,23 @@ impl BrowserSession {
             let _ = self.eval_js("document.querySelectorAll('.__rsclaw_annotation').forEach(e=>e.remove())").await;
 
             let legend: Value = serde_json::from_str(&legend_raw).unwrap_or(json!([]));
+            let save_path = save_screenshot_bytes(data, format).await?;
             return Ok(json!({
                 "action": "screenshot",
-                "image": format!("data:{mime};base64,{data}"),
+                "image_path": save_path,
+                "mime": mime,
                 "legend": legend,
             }));
         }
 
         let result = self.cdp.send("Page.captureScreenshot", params).await?;
         let data = result.get("data").and_then(|v| v.as_str()).unwrap_or("");
+        let save_path = save_screenshot_bytes(data, format).await?;
 
         Ok(json!({
             "action": "screenshot",
-            "image": format!("data:{mime};base64,{data}")
+            "image_path": save_path,
+            "mime": mime,
         }))
     }
 
@@ -3150,6 +3154,39 @@ fn escape_js_string(s: &str) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace(']', "\\]")
+}
+
+/// Decode a base64-encoded screenshot from CDP and save it to
+/// `<Downloads>/rsclaw/screenshots/br_<nanos>.<ext>`, returning the path as
+/// a string.  Used by browser screenshot/snapshot to avoid shipping ~MB of
+/// base64 over the WebSocket — the desktop UI loads the file via Tauri's
+/// asset protocol, and non-WS channels rehydrate it back to a data URL at
+/// the AgentReply boundary (`image_ref_to_data_url`).
+async fn save_screenshot_bytes(b64_data: &str, format: &str) -> Result<String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64_data)
+        .map_err(|e| anyhow!("browser screenshot: invalid base64: {e}"))?;
+    let ext = if format == "jpeg" { "jpg" } else { "png" };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let save_dir = dirs_next::download_dir()
+        .unwrap_or_else(|| {
+            dirs_next::home_dir()
+                .unwrap_or_else(crate::config::loader::base_dir)
+                .join("Downloads")
+        })
+        .join("rsclaw")
+        .join("screenshots");
+    tokio::fs::create_dir_all(&save_dir)
+        .await
+        .map_err(|e| anyhow!("browser screenshot: create_dir: {e}"))?;
+    let save_path = save_dir.join(format!("br_{nanos:x}.{ext}"));
+    tokio::fs::write(&save_path, &bytes)
+        .await
+        .map_err(|e| anyhow!("browser screenshot: write: {e}"))?;
+    Ok(save_path.to_string_lossy().into_owned())
 }
 
 // ---------------------------------------------------------------------------

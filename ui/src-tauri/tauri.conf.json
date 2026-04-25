@@ -12,7 +12,11 @@
   "app": {
     "withGlobalTauri": true,
     "security": {
-      "csp": null
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$DOWNLOAD/rsclaw/**", "$DOWNLOAD/rsclaw/**/*"]
+      }
     },
     "windows": [
       {

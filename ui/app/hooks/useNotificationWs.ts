@@ -33,13 +33,18 @@ export function useNotificationWs() {
         new Notification("RsClaw", { body: text });
       }
 
-      // Also add to current chat session so it's visible inline
+      // Also add to current chat session so it's visible inline.
+      // Tag as intermediate so the chat renderer applies the muted
+      // think-block palette (see chat-message-item-intermediate in
+      // chat.module.scss) — these are notifications/progress chatter,
+      // not a real assistant reply.
       const session = useChatStore.getState().currentSession();
       useChatStore.getState().updateTargetSession(session, (s) => {
         s.messages.push(
           createMessage({
             role: "assistant",
             content: text,
+            isIntermediate: true,
           }),
         );
       });

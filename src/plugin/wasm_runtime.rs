@@ -102,6 +102,14 @@ impl wasmtime_wasi::WasiView for HostState {
 // Host trait implementations
 // ---------------------------------------------------------------------------
 
+/// Canonicalize a filesystem path coming from a WASM plugin. Plugins have no
+/// notion of agent workspace, so relative paths are resolved against the
+/// default `base_dir()/workspace`. `~` is expanded, `.`/`..` collapsed.
+fn canonicalize_plugin_path(input: &str) -> PathBuf {
+    let workspace = crate::config::loader::base_dir().join("workspace");
+    crate::agent::runtime::canonicalize_external_path(input, &workspace)
+}
+
 impl rsclaw::jimeng::host_browser::Host for HostState {
     async fn browser_open(&mut self, url: String) -> Result<Result<String, String>> {
         Ok(self.browser_action("open", json!({"url": url})).await)
@@ -202,8 +210,12 @@ impl rsclaw::jimeng::host_browser::Host for HostState {
         ref_str: String,
         filepath: String,
     ) -> Result<Result<String, String>> {
+        let canonical = canonicalize_plugin_path(&filepath);
         Ok(self
-            .browser_action("upload", json!({"ref": ref_str, "filepath": filepath}))
+            .browser_action(
+                "upload",
+                json!({"ref": ref_str, "filepath": canonical.to_string_lossy()}),
+            )
             .await)
     }
 
@@ -230,10 +242,59 @@ impl rsclaw::jimeng::host_runtime::Host for HostState {
     }
 
     async fn read_file(&mut self, path: String) -> Result<Result<String, String>> {
-        match tokio::fs::read_to_string(&path).await {
+        let canonical = canonicalize_plugin_path(&path);
+        match tokio::fs::read_to_string(&canonical).await {
             Ok(contents) => Ok(Ok(contents)),
-            Err(e) => Ok(Err(format!("failed to read {path}: {e}"))),
+            Err(e) => Ok(Err(format!("failed to read {}: {e}", canonical.display()))),
         }
+    }
+}
+
+impl rsclaw::jimeng::host_storage::Host for HostState {
+    async fn allocate_artifact(
+        &mut self,
+        filename: String,
+    ) -> Result<Result<String, String>> {
+        // Reject path separators — plugins must supply a bare filename.
+        if filename.contains('/') || filename.contains('\\') {
+            return Ok(Err(format!(
+                "allocate_artifact: filename must not contain path separators: {filename}"
+            )));
+        }
+        // Layout: <Downloads>/rsclaw/<videos|images|files>/<nanos_hex>/<filename>
+        // Use the OS Downloads dir (visible, cross-platform: macOS/Windows/Linux
+        // all expose one) so Tauri v2's asset protocol scope can match without
+        // fighting `require_literal_leading_dot`. nanos_hex makes each
+        // allocation unique so repeated filenames don't collide.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let category = match std::path::Path::new(&filename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("mp4" | "mov" | "webm" | "mkv" | "avi" | "m4v") => "videos",
+            Some("jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg") => "images",
+            _ => "files",
+        };
+        let base = dirs_next::download_dir()
+            .unwrap_or_else(|| {
+                dirs_next::home_dir()
+                    .unwrap_or_else(crate::config::loader::base_dir)
+                    .join("Downloads")
+            })
+            .join("rsclaw")
+            .join(category);
+        let subdir = base.join(format!("{nanos:x}"));
+        if let Err(e) = std::fs::create_dir_all(&subdir) {
+            return Ok(Err(format!("allocate_artifact: create_dir: {e}")));
+        }
+        let full = subdir.join(&filename);
+        tracing::debug!(target: "wasm_plugin", "allocated artifact: {}", full.display());
+        Ok(Ok(full.to_string_lossy().to_string()))
     }
 }
 
@@ -284,6 +345,7 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
     // Add our custom host interfaces.
     rsclaw::jimeng::host_browser::add_to_linker(&mut linker, |state: &mut HostState| state)?;
     rsclaw::jimeng::host_runtime::add_to_linker(&mut linker, |state: &mut HostState| state)?;
+    rsclaw::jimeng::host_storage::add_to_linker(&mut linker, |state: &mut HostState| state)?;
     Ok(linker)
 }
 

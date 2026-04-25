@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use super::runtime::expand_tilde;
+use super::runtime::{canonicalize_external_path, expand_tilde};
 use super::security::{check_file_content_safety, check_read_safety, check_write_safety};
 
 /// Fix common LLM shell-writing mistakes around redirects that bash would
@@ -293,14 +293,7 @@ impl super::runtime::AgentRuntime {
             .map(expand_tilde)
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
 
-        // Normalize path separators for Windows
-        let path_normalized = path.replace('/', std::path::MAIN_SEPARATOR.to_string().as_str());
-        let path_buf = std::path::PathBuf::from(&path_normalized);
-        let full = if path_buf.is_absolute() {
-            path_buf
-        } else {
-            workspace.join(&path_normalized)
-        };
+        let full = canonicalize_external_path(path, &workspace);
 
         // Safety: block reading sensitive files
         let safety_enabled = self
@@ -414,14 +407,7 @@ impl super::runtime::AgentRuntime {
             .map(expand_tilde)
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
 
-        // Normalize path separators for Windows
-        let path_normalized = path.replace('/', std::path::MAIN_SEPARATOR.to_string().as_str());
-        let path_buf = std::path::PathBuf::from(&path_normalized);
-        let full = if path_buf.is_absolute() {
-            path_buf
-        } else {
-            workspace.join(&path_normalized)
-        };
+        let full = canonicalize_external_path(&path, &workspace);
 
         // Safety: block sensitive paths (only when tools.exec.safety = true)
         let safety_enabled = self

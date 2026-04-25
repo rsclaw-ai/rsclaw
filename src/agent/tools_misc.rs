@@ -10,6 +10,39 @@ use serde_json::{Value, json};
 use super::platform::powershell_hidden;
 use super::runtime::{AgentRuntime, RunContext};
 
+/// Persist generated image bytes to `~/Downloads/rsclaw/images/` and return
+/// the absolute path. Avoids shipping multi-MB base64 over the WebSocket —
+/// the desktop UI loads via Tauri's asset protocol; non-WS channels rehydrate
+/// to a data URL at the AgentReply boundary (`image_ref_to_data_url`).
+async fn save_generated_image_bytes(bytes: &[u8], mime: &str) -> Result<String> {
+    let ext = match mime {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "png",
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let save_dir = dirs_next::download_dir()
+        .unwrap_or_else(|| {
+            dirs_next::home_dir()
+                .unwrap_or_else(crate::config::loader::base_dir)
+                .join("Downloads")
+        })
+        .join("rsclaw")
+        .join("images");
+    tokio::fs::create_dir_all(&save_dir)
+        .await
+        .map_err(|e| anyhow!("image: create_dir: {e}"))?;
+    let save_path = save_dir.join(format!("img_{nanos:x}.{ext}"));
+    tokio::fs::write(&save_path, bytes)
+        .await
+        .map_err(|e| anyhow!("image: write: {e}"))?;
+    Ok(save_path.to_string_lossy().into_owned())
+}
+
 impl AgentRuntime {
     // -----------------------------------------------------------------------
     // Image generation
@@ -261,9 +294,13 @@ impl AgentRuntime {
                     if let Some(inline) = part.get("inlineData") {
                         let mime = inline.get("mimeType").and_then(|v| v.as_str()).unwrap_or("image/png");
                         if let Some(b64_data) = inline.get("data").and_then(|v| v.as_str()) {
-                            let data_uri = format!("data:{mime};base64,{b64_data}");
+                            let bytes = base64::engine::general_purpose::STANDARD
+                                .decode(b64_data)
+                                .map_err(|e| anyhow!("image: gemini base64 decode: {e}"))?;
+                            let path = save_generated_image_bytes(&bytes, mime).await?;
                             return Ok(json!({
-                                "url": data_uri,
+                                "image_path": path,
+                                "mime": mime,
                                 "revised_prompt": prompt
                             }));
                         }
@@ -273,40 +310,79 @@ impl AgentRuntime {
             return Err(anyhow!("image: no image data in Gemini response"));
         }
 
-        let img_url_str = if is_qwen {
+        // Each provider may return either a fetchable URL or inline base64.
+        // We normalise both into raw bytes + mime, then save to disk.
+        let img_ref = if is_qwen {
             resp_body
                 .pointer("/output/choices/0/message/content/0/image")
                 .and_then(|v| v.as_str())
         } else if is_minimax {
-            // minimax: data.image_base64[0] (base64) or data.image_urls[0] (url)
+            // minimax: data.image_urls[0] (url) or data.image_base64[0] (base64)
             resp_body.pointer("/data/image_urls/0").and_then(|v| v.as_str())
                 .or_else(|| resp_body.pointer("/data/image_base64/0").and_then(|v| v.as_str()))
         } else {
+            // OpenAI/Doubao/etc: prefer url, fall back to b64_json (b64_json is what
+            // OpenAI's response_format=b64_json returns, and some compatible
+            // providers return it even when url is requested).
             resp_body.pointer("/data/0/url").and_then(|v| v.as_str())
+                .or_else(|| resp_body.pointer("/data/0/b64_json").and_then(|v| v.as_str()))
         };
 
-        let Some(img_url_str) = img_url_str else {
-            return Err(anyhow!("image: no image URL in response"));
+        let Some(img_ref) = img_ref else {
+            return Err(anyhow!("image: no image data in response"));
         };
 
-        // Download image and convert to data URI
-        use base64::Engine;
-        let image_result = match reqwest::Client::new()
-            .get(img_url_str)
-            .timeout(std::time::Duration::from_secs(60))
-            .send()
-            .await
-        {
-            Ok(r) if r.status().is_success() => match r.bytes().await {
-                Ok(bytes) => {
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                    format!("data:image/png;base64,{b64}")
-                }
-                Err(e) => return Err(anyhow!("image: download failed: {e}")),
-            },
-            Ok(r) => return Err(anyhow!("image: download returned {}", r.status())),
-            Err(e) => return Err(anyhow!("image: download error: {e}")),
+        // Resolve `img_ref` → bytes + mime.  Three shapes are accepted:
+        //   * `data:image/...;base64,<b64>`   inline data URL (Gemini-style)
+        //   * `http(s)://...`                  download via reqwest
+        //   * `<raw base64>`                   minimax `image_base64`, OpenAI `b64_json`
+        use base64::Engine as _;
+        let (bytes, mime): (Vec<u8>, &str) = if let Some(rest) = img_ref.strip_prefix("data:") {
+            // data:<mime>;base64,<b64>
+            let (header, b64) = rest.split_once(',').unwrap_or(("image/png;base64", rest));
+            let mime = header.split(';').next().unwrap_or("image/png");
+            let mime_static: &str = match mime {
+                "image/jpeg" | "image/jpg" => "image/jpeg",
+                "image/webp" => "image/webp",
+                "image/gif" => "image/gif",
+                _ => "image/png",
+            };
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64.trim())
+                .map_err(|e| anyhow!("image: base64 decode: {e}"))?;
+            (bytes, mime_static)
+        } else if img_ref.starts_with("http://") || img_ref.starts_with("https://") {
+            let resp = reqwest::Client::new()
+                .get(img_ref)
+                .timeout(std::time::Duration::from_secs(60))
+                .send()
+                .await
+                .map_err(|e| anyhow!("image: download error: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(anyhow!("image: download returned {}", resp.status()));
+            }
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| anyhow!("image: download failed: {e}"))?
+                .to_vec();
+            let mime: &str = if img_ref.ends_with(".jpg") || img_ref.ends_with(".jpeg") {
+                "image/jpeg"
+            } else if img_ref.ends_with(".webp") {
+                "image/webp"
+            } else {
+                "image/png"
+            };
+            (bytes, mime)
+        } else {
+            // Treat as raw base64 (no `data:` prefix) — minimax image_base64 /
+            // OpenAI b64_json fall through here.
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(img_ref.trim())
+                .map_err(|e| anyhow!("image: raw base64 decode: {e}"))?;
+            (bytes, "image/png")
         };
+        let image_path = save_generated_image_bytes(&bytes, mime).await?;
 
         let revised = resp_body
             .pointer("/data/0/revised_prompt")
@@ -315,7 +391,8 @@ impl AgentRuntime {
             .to_owned();
 
         Ok(json!({
-            "url": image_result,
+            "image_path": image_path,
+            "mime": mime,
             "revised_prompt": revised,
             "size": size,
             "model": image_model

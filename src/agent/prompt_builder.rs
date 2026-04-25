@@ -247,6 +247,13 @@ pub(crate) fn build_base_system_prompt(config: &crate::config::schema::Config) -
          than to invent plausible-looking but made-up values or fake action claims.\n\
          \n\
          When you need a Unix timestamp or today's date, use a shell command (e.g. `date`) — never assume or calculate it yourself.\n\
+         \n\
+         [Voice — HARD RULE]\n\
+         Always speak directly to the user in second person (你/您/you). Never produce\n\
+         third-person after-action reports about the user (e.g. \"用户东升通过...完成了...\")\n\
+         or narrate what \"the user\" did. Reports, summaries, and status updates are\n\
+         addressed TO the user, not ABOUT them. Do not invent completed steps — only\n\
+         report what tools actually returned.\n\
          </agent_loop>"
             .to_owned(),
     );
@@ -378,6 +385,20 @@ pub(crate) fn build_system_prompt(
     }
 
     parts.join("\n\n")
+}
+
+/// Build a minimal system prompt for internal sessions (heartbeat/cron/system).
+///
+/// Internal sessions only have the `memory` tool available (see
+/// `runtime.rs` tool filtering). Injecting the full system prompt
+/// (~3k tokens of skills, workspace, tool guidelines) wastes context
+/// on every tick. This minimal prompt keeps the identity + the single
+/// instruction the session actually needs.
+pub(crate) fn build_minimal_system_prompt() -> String {
+    "You are an internal rsclaw task agent. Only the `memory` tool is available.\n\
+     Follow the instructions in the user message. Be terse — no preamble, no\n\
+     closing pleasantries. If nothing actionable to report, reply HEARTBEAT_OK."
+        .to_owned()
 }
 
 /// Return a relative time label for memory recall.

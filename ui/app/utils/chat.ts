@@ -11,6 +11,7 @@ import {
 } from "@fortaine/fetch-event-source";
 import { prettyObject } from "./format";
 import { fetch as tauriFetch } from "./stream";
+import { invoke, convertFileSrc } from "@/app/utils/tauri";
 
 export function compressImage(file: Blob, maxSize: number): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -111,10 +112,43 @@ export async function preProcessImageContentForAlibabaDashScope(
 }
 
 const imageCaches: Record<string, string> = {};
+
+/** Extract the absolute filesystem path from an `asset://localhost/...`
+ *  URL produced by Tauri's `convertFileSrc`. Returns null for non-asset
+ *  URLs. On macOS/Linux the path is URL-encoded and starts with `/`. */
+function assetUrlToPath(url: string): string | null {
+  const macLinux = /^asset:\/\/localhost\/(.+)$/.exec(url);
+  if (macLinux) {
+    try {
+      return decodeURIComponent(macLinux[1]);
+    } catch {
+      return null;
+    }
+  }
+  // Windows variant: https://asset.localhost/<path>
+  const win = /^https?:\/\/asset\.localhost\/(.+)$/.exec(url);
+  if (win) {
+    try {
+      return decodeURIComponent(win[1]);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 export function cacheImageToBase64Image(imageUrl: string) {
+  // asset://... → rehydrate from disk via Tauri so LLM request carries
+  // the real base64 payload. Cached so repeated sends don't re-read.
+  const localPath = assetUrlToPath(imageUrl);
+  if (localPath) {
+    if (imageCaches[imageUrl]) return Promise.resolve(imageCaches[imageUrl]);
+    return invoke("read_file_as_data_url", { path: localPath }).then(
+      (dataUrl: string) => (imageCaches[imageUrl] = dataUrl),
+    );
+  }
   if (imageUrl.includes(CACHE_URL_PREFIX)) {
     if (!imageCaches[imageUrl]) {
-      const reader = new FileReader();
       return fetch(imageUrl, {
         method: "GET",
         mode: "cors",
@@ -141,27 +175,75 @@ export function base64Image2Blob(base64Data: string, contentType: string) {
   return new Blob([byteArray], { type: contentType });
 }
 
+/** True when running inside Tauri v2 webview (runtime check — `isTauri`
+ *  from the tauri util can be frozen to false during SSR). */
+function inTauri(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+/** Decode a `data:image/...;base64,XXX` URL to raw bytes + file extension. */
+function dataUrlToBytes(dataUrl: string): { bytes: Uint8Array; ext: string } {
+  const m = /^data:image\/([a-zA-Z0-9+.-]+);base64,(.*)$/.exec(dataUrl);
+  if (!m) throw new Error("not a base64 image data URL");
+  const mime = m[1].toLowerCase();
+  const ext =
+    mime === "jpeg" || mime === "jpg"
+      ? "jpg"
+      : mime === "svg+xml"
+        ? "svg"
+        : mime;
+  const bin = atob(m[2]);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return { bytes, ext };
+}
+
+/** Save an attachment to `<Downloads>/rsclaw/images/...` via Tauri and
+ *  return an `asset://localhost/...` URL suitable for `<img src>`.
+ *  Keeps base64 out of chat history so typing is not laggy. */
+async function saveAttachToDisk(dataUrl: string): Promise<string> {
+  const { bytes, ext } = dataUrlToBytes(dataUrl);
+  const path = (await invoke("save_attach_image", {
+    bytes: Array.from(bytes),
+    extension: ext,
+  })) as string;
+  return convertFileSrc(path);
+}
+
 export function uploadImage(file: Blob): Promise<string> {
-  if (!window._SW_ENABLED) {
-    // if serviceWorker register error, using compressImage
-    return compressImage(file, 256 * 1024);
-  }
-  const body = new FormData();
-  body.append("file", file);
-  return fetch(UPLOAD_URL, {
-    method: "post",
-    body,
-    mode: "cors",
-    credentials: "include",
-  })
-    .then((res) => res.json())
-    .then((res) => {
-      // console.log("res", res);
-      if (res?.code == 0 && res?.data) {
-        return res?.data;
-      }
-      throw Error(`upload Error: ${res?.msg}`);
-    });
+  const compressed = (async () => {
+    if (!window._SW_ENABLED) {
+      // if serviceWorker register error, using compressImage
+      return compressImage(file, 256 * 1024);
+    }
+    const body = new FormData();
+    body.append("file", file);
+    return fetch(UPLOAD_URL, {
+      method: "post",
+      body,
+      mode: "cors",
+      credentials: "include",
+    })
+      .then((res) => res.json())
+      .then((res) => {
+        if (res?.code == 0 && res?.data) {
+          return res?.data as string;
+        }
+        throw Error(`upload Error: ${res?.msg}`);
+      });
+  })();
+  // In Tauri: persist base64 payload to disk and return an asset:// URL
+  // so the stored chat message holds a short reference string, not an
+  // MB-sized data URL. Fall back silently if anything goes wrong.
+  return compressed.then(async (dataUrl) => {
+    if (!inTauri() || !dataUrl.startsWith("data:image/")) return dataUrl;
+    try {
+      return await saveAttachToDisk(dataUrl);
+    } catch (e) {
+      console.warn("[uploadImage] save to disk failed, keeping base64:", e);
+      return dataUrl;
+    }
+  });
 }
 
 export function removeImage(imageUrl: string) {

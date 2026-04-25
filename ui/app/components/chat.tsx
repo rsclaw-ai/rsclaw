@@ -1,5 +1,5 @@
 import { useDebouncedCallback } from "use-debounce";
-import { invoke as tauriInvoke } from "../utils/tauri";
+import { invoke as tauriInvoke, convertFileSrc } from "../utils/tauri";
 import React, {
   Fragment,
   RefObject,
@@ -317,6 +317,47 @@ function ToolGroupBlock({ items, streaming }: { items: ToolItem[]; streaming?: b
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * Inline video renderer that surfaces load failures instead of showing a
+ * silent black box. When the browser can't open the file (wrong path, asset
+ * protocol blocked, codec unsupported) we swap in a readable error line.
+ */
+function ChatVideo({ path }: { path: string }) {
+  const [failed, setFailed] = useState<string | null>(null);
+  const src = convertFileSrc(path);
+  if (failed) {
+    return (
+      <div className={styles["chat-video-error"]} title={path}>
+        视频加载失败：{failed}
+        <div className={styles["chat-video-error-path"]}>{path}</div>
+      </div>
+    );
+  }
+  return (
+    <video
+      className={styles["chat-video"]}
+      src={src}
+      controls
+      preload="metadata"
+      onError={(e) => {
+        const err = (e.currentTarget as HTMLVideoElement).error;
+        const code = err?.code ?? 0;
+        const codeName =
+          code === 1
+            ? "MEDIA_ERR_ABORTED"
+            : code === 2
+              ? "MEDIA_ERR_NETWORK"
+              : code === 3
+                ? "MEDIA_ERR_DECODE"
+                : code === 4
+                  ? "MEDIA_ERR_SRC_NOT_SUPPORTED"
+                  : "UNKNOWN";
+        setFailed(`${codeName}${err?.message ? " — " + err.message : ""}`);
+      }}
+    />
   );
 }
 
@@ -693,9 +734,32 @@ export function ChatActions(props: {
     config.update((config) => (config.theme = nextTheme));
   }
 
-  // stop all responses
-  const couldStop = ChatControllerPool.hasPending();
-  const stopAll = () => ChatControllerPool.stopAll();
+  // Stop all responses. The button must also show when messages are stuck
+  // with `streaming: true` but the pool is already empty (a WS subscription
+  // that never fired `done` or `error` — the "zombie stream" case). In that
+  // state users had no way to unstick the queue.
+  const hasStreamingMsg = session.messages.some((m) => m.streaming);
+  const couldStop = ChatControllerPool.hasPending() || hasStreamingMsg;
+  const stopAll = () => {
+    ChatControllerPool.stopAll();
+    // Best-effort: tell the backend to abort this session's active run.
+    try {
+      const { rsclawWs } = require("../lib/rsclaw-ws");
+      const agentId = (session as any).agentId || "main";
+      const sessionKey = `desktop:${agentId}:${session.id}`;
+      rsclawWs.send("chat.abort", { sessionKey }).catch(() => {});
+    } catch {
+      /* WS module unavailable — fall through to local cleanup */
+    }
+    // Local cleanup: forcibly flip any streaming flags so the queue
+    // flush effect can run and the input unfreezes, even if no abort ack
+    // comes back from the backend.
+    chatStore.updateTargetSession(session, (s) => {
+      s.messages.forEach((m) => {
+        if (m.streaming) m.streaming = false;
+      });
+    });
+  };
 
   // switch model
   const currentModel = session.mask.modelConfig.model;
@@ -1177,6 +1241,12 @@ function _Chat() {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [userInput, setUserInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  // True busy signal: any bot message in the current session is still
+  // streaming. `isLoading` is unreliable here because chatStore.onUserInput
+  // is fire-and-forget — the promise resolves before the stream completes,
+  // so .finally() would clear isLoading immediately and let queued items
+  // spawn parallel streams.
+  const isStreaming = session.messages.some((m) => m.streaming);
   const { submitKey, shouldSubmit } = useSubmitHandler();
   const scrollRef = useRef<HTMLDivElement>(null);
   const isScrolledToBottom = scrollRef?.current
@@ -1212,7 +1282,7 @@ function _Chat() {
   const [uploading, setUploading] = useState(false);
   const [fileRefs, setFileRefs] = useState<string[]>([]);
   // Staged messages submitted while agent is still streaming. They are flushed
-  // one-by-one when isLoading transitions back to false. Mirrors the Claude CLI
+  // one-by-one when isStreaming transitions back to false. Mirrors the Claude CLI
   // UX: typing while busy queues rather than blocking the backend turn.
   type StagedItem = { text: string; images: string[]; fileRefs: string[] };
   const [pendingQueue, setPendingQueue] = useState<StagedItem[]>([]);
@@ -1315,8 +1385,10 @@ function _Chat() {
   };
 
   // Dispatch a message directly to chatStore. Used both for immediate send and
-  // for flushing queued items. Does NOT re-check isLoading — caller is
-  // responsible for that.
+  // for flushing queued items. Does NOT re-check isStreaming — caller is
+  // responsible for that. setIsLoading is retained only for the "……" preview
+  // bubble; it flips false almost immediately since onUserInput is
+  // fire-and-forget, but the bot's streaming message takes over the UI.
   const dispatchToStore = (text: string, images: string[], refs: string[]) => {
     const finalInput = buildFinalInput(text, refs);
     setIsLoading(true);
@@ -1338,7 +1410,7 @@ function _Chat() {
     }
     // Agent is busy (previous turn not finished and not interrupted) — stage
     // this input for flush after the current turn completes or is aborted.
-    if (isLoading) {
+    if (isStreaming) {
       setPendingQueue((q) => [
         ...q,
         {
@@ -1363,16 +1435,16 @@ function _Chat() {
     setAutoScroll(true);
   };
 
-  // When the current turn finishes (isLoading goes false), flush the next
+  // When the current turn finishes (no message is streaming), flush the next
   // staged message. Use a microtask to avoid setState-during-render.
   useEffect(() => {
-    if (isLoading || pendingQueue.length === 0) return;
+    if (isStreaming || pendingQueue.length === 0) return;
     const [next, ...rest] = pendingQueue;
     setPendingQueue(rest);
     dispatchToStore(next.text, next.images, next.fileRefs);
     setAutoScroll(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isLoading, pendingQueue]);
+  }, [isStreaming, pendingQueue]);
 
   const onPromptSelect = (prompt: RenderPrompt) => {
     setTimeout(() => {
@@ -1578,43 +1650,23 @@ function _Chat() {
     context.push(copiedHello);
   }
 
-  // preview messages
+  // preview messages — typing preview removed: re-rendering the full
+  // message list on every keystroke was expensive and visually noisy.
   const renderMessages = useMemo(() => {
-    return context
-      .concat(session.messages as RenderMessage[])
-      .concat(
-        isLoading
-          ? [
-              {
-                ...createMessage({
-                  role: "assistant",
-                  content: "……",
-                }),
-                preview: true,
-              },
-            ]
-          : [],
-      )
-      .concat(
-        userInput.length > 0 && config.sendPreviewBubble
-          ? [
-              {
-                ...createMessage({
-                  role: "user",
-                  content: userInput,
-                }),
-                preview: true,
-              },
-            ]
-          : [],
-      );
-  }, [
-    config.sendPreviewBubble,
-    context,
-    isLoading,
-    session.messages,
-    userInput,
-  ]);
+    return context.concat(session.messages as RenderMessage[]).concat(
+      isLoading
+        ? [
+            {
+              ...createMessage({
+                role: "assistant",
+                content: "……",
+              }),
+              preview: true,
+            },
+          ]
+        : [],
+    );
+  }, [context, isLoading, session.messages]);
 
   const [msgRenderIndex, _setMsgRenderIndex] = useState(
     Math.max(0, renderMessages.length - CHAT_PAGE_SIZE),
@@ -1739,6 +1791,21 @@ function _Chat() {
     return () => {
       localStorage.setItem(key, dom?.value ?? "");
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Zombie-stream cleanup on mount: chat sessions are persisted to
+  // localStorage, so a message left with `streaming: true` (gateway
+  // crash, WS drop, previous window force-quit) survives reload and
+  // blocks the pending-queue flush. Reset any stale flags once on load.
+  useEffect(() => {
+    const hasZombie = session.messages.some((m) => m.streaming);
+    if (!hasZombie) return;
+    chatStore.updateTargetSession(session, (s) => {
+      s.messages.forEach((m) => {
+        if (m.streaming) m.streaming = false;
+      });
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -2003,8 +2070,18 @@ function _Chat() {
                 setAutoScroll(false);
               }}
             >
-              {messages
-                .filter((m, idx, arr) => arr.findIndex((x) => x.id === m.id) === idx)
+              {(() => {
+                // Dedupe visible messages by id (O(N) via Set, not O(N^2) via findIndex).
+                // The same message list rendered here gets used for reply chains
+                // and streaming preview; duplicates can appear transiently.
+                const seen = new Set<string>();
+                const uniqueMessages = messages.filter((m) => {
+                  if (seen.has(m.id)) return false;
+                  seen.add(m.id);
+                  return true;
+                });
+                return uniqueMessages;
+              })()
                 .map((message, i) => {
                   const isUser = message.role === "user";
                   const isContext = i < context.length;
@@ -2016,6 +2093,20 @@ function _Chat() {
 
                   const shouldShowClearContextDivider =
                     i === clearContextIndex - 1;
+
+                  // Hoist expensive per-message helpers: each of these was being
+                  // re-called 3–6x per render, and some (getMessageImages) return
+                  // base64 payloads that bloat prop diffing on every keystroke.
+                  const msgText = getMessageTextContent(message);
+                  const msgImages = getMessageImages(message);
+                  const msgContentOnly = isUser ? "" : getMessageContentOnly(message);
+                  const rsExtract = isUser
+                    ? {
+                        cleanContent: "",
+                        rsFiles: [] as [string, string, string][],
+                        rsImages: [] as string[],
+                      }
+                    : extractRsFiles(msgContentOnly);
 
                   return (
                     <Fragment key={message.id}>
@@ -2164,16 +2255,22 @@ function _Chat() {
                             </div>
                           )}
                           {!isUser && <ThinkBlock message={message} />}
-                          <div className={styles["chat-message-item"]}>
+                          <div
+                            className={`${styles["chat-message-item"]}${
+                              (message as any).isIntermediate
+                                ? " " + styles["chat-message-item-intermediate"]
+                                : ""
+                            }`}
+                          >
                             {isUser ? (
                               <>
                                 <Markdown
                                   key={message.streaming ? "loading" : "done"}
-                                  content={getMessageTextContent(message).replace(/\[file:[^\]]+\]\s*/g, "").trim()}
+                                  content={msgText.replace(/\[file:[^\]]+\]\s*/g, "").trim()}
                                   loading={false}
                                   onDoubleClickCapture={() => {
                                     if (!isMobileScreen) return;
-                                    setUserInput(getMessageTextContent(message));
+                                    setUserInput(msgText);
                                   }}
                                   fontSize={fontSize}
                                   fontFamily={fontFamily}
@@ -2181,8 +2278,7 @@ function _Chat() {
                                   defaultShow={i >= messages.length - 6}
                                 />
                                 {(() => {
-                                  const raw = getMessageTextContent(message);
-                                  const fileRefMatches = [...raw.matchAll(/\[file:([^\]]+)\]/g)];
+                                  const fileRefMatches = [...msgText.matchAll(/\[file:([^\]]+)\]/g)];
                                   if (fileRefMatches.length === 0) return null;
                                   // Strip the single-quote wrapping we add on
                                   // send so the chip/open_path sees a raw path.
@@ -2224,8 +2320,7 @@ function _Chat() {
                                 })()}
                               </>
                             ) : (() => {
-                              const raw = extractRsFiles(getMessageContentOnly(message)).cleanContent;
-                              const chunks = parseAssistantChunks(raw);
+                              const chunks = parseAssistantChunks(rsExtract.cleanContent);
                               if (chunks.length === 0) {
                                 return (
                                   <Markdown
@@ -2250,7 +2345,7 @@ function _Chat() {
                                     loading={false}
                                     onDoubleClickCapture={() => {
                                       if (!isMobileScreen) return;
-                                      setUserInput(getMessageTextContent(message));
+                                      setUserInput(msgText);
                                     }}
                                     fontSize={fontSize}
                                     fontFamily={fontFamily}
@@ -2266,57 +2361,83 @@ function _Chat() {
                                 ),
                               );
                             })()}
-                            {getMessageImages(message).length == 1 && (
+                            {msgImages.length == 1 && (
                               <img
                                 className={styles["chat-message-item-image"]}
-                                src={getMessageImages(message)[0]}
+                                src={msgImages[0]}
                                 alt=""
-                                onClick={() => showImageModal(getMessageImages(message)[0])}
+                                onClick={() => showImageModal(msgImages[0])}
                               />
                             )}
-                            {getMessageImages(message).length > 1 && (
+                            {msgImages.length > 1 && (
                               <div
                                 className={styles["chat-message-item-images"]}
                                 style={
                                   {
-                                    "--image-count":
-                                      getMessageImages(message).length,
+                                    "--image-count": msgImages.length,
                                   } as React.CSSProperties
                                 }
                               >
-                                {getMessageImages(message).map(
-                                  (image, index) => {
-                                    return (
-                                      <img
-                                        className={
-                                          styles[
-                                            "chat-message-item-image-multi"
-                                          ]
-                                        }
-                                        key={index}
-                                        src={image}
-                                        alt=""
-                                        onClick={() => showImageModal(image)}
-                                      />
-                                    );
-                                  },
-                                )}
+                                {msgImages.map((image, index) => {
+                                  return (
+                                    <img
+                                      className={
+                                        styles["chat-message-item-image-multi"]
+                                      }
+                                      key={index}
+                                      src={image}
+                                      alt=""
+                                      onClick={() => showImageModal(image)}
+                                    />
+                                  );
+                                })}
                               </div>
                             )}
                           </div>
                           {!isUser && (() => {
-                            const raw = getMessageContentOnly(message);
-                            const { rsFiles, rsImages } = extractRsFiles(raw);
+                            const { rsFiles, rsImages } = rsExtract;
                             const dataImages = rsImages.filter((p) => p.startsWith("data:"));
-                            const fileImages = rsImages.filter((p) => !p.startsWith("data:"));
+                            const isImagePath = (p: string) =>
+                              /\.(jpg|jpeg|png|webp|gif|bmp)$/i.test(p);
+                            // File-path images (e.g. computer_use screenshots saved
+                            // under ~/Downloads/rsclaw/screenshots/) are loaded
+                            // inline via Tauri's asset protocol so the UI avoids
+                            // the multi-hundred-KB base64 blast over WebSocket.
+                            const pathImages = rsImages.filter(
+                              (p) => !p.startsWith("data:") && isImagePath(p),
+                            );
+                            const fileImages = rsImages.filter(
+                              (p) => !p.startsWith("data:") && !isImagePath(p),
+                            );
+                            const isVideo = (mime: string, path: string) =>
+                              (mime || "").startsWith("video/") ||
+                              /\.(mp4|webm|mov|m4v|mkv)$/i.test(path);
+                            const videoFiles = rsFiles.filter(([, mime, path]) => isVideo(mime, path));
+                            const otherFiles = rsFiles.filter(([, mime, path]) => !isVideo(mime, path));
                             return (rsFiles.length > 0 || rsImages.length > 0) ? (
                               <>
                                 {dataImages.map((src, idx) => (
                                   <img key={`di-${idx}`} className={styles["chat-message-item-image"]} src={src} alt="" onClick={() => showImageModal(src)} />
                                 ))}
-                                {(rsFiles.length > 0 || fileImages.length > 0) && (
+                                {pathImages.map((path, idx) => {
+                                  const src = convertFileSrc(path);
+                                  return (
+                                    <img
+                                      key={`pi-${idx}`}
+                                      className={styles["chat-message-item-image"]}
+                                      src={src}
+                                      alt=""
+                                      loading="lazy"
+                                      onClick={() => showImageModal(src)}
+                                    />
+                                  );
+                                })}
+                                {videoFiles.map(([, , path], idx) => (
+                                  <ChatVideo key={`v-${idx}`} path={path} />
+                                ))}
+                                {(otherFiles.length > 0 || fileImages.length > 0) && (
                                   <div className={styles["chat-file-chips"]}>
-                                    {rsFiles.map(([name, , path], idx) => (
+                                    {otherFiles.map(([name, , path], idx) => (
                                       <span key={idx} className={styles["chat-file-chip"]} title={path}
                                         onClick={() => tauriInvoke("open_path", { path })}>
                                         {name || path.split("/").pop() || path}
@@ -2372,7 +2493,7 @@ function _Chat() {
                         }
                       });
                     }).catch(() => {
-                      const path = prompt("Enter file path:");
+                      const path = prompt(getLang() === "cn" ? "\u8F93\u5165\u6587\u4EF6\u8DEF\u5F84\uFF1A" : "Enter file path:");
                       if (path) setFileRefs((prev) => [...prev, path]);
                     });
                   } else {
@@ -2393,7 +2514,7 @@ function _Chat() {
                         }
                       });
                     }).catch(() => {
-                      const path = prompt("Enter folder path:");
+                      const path = prompt(getLang() === "cn" ? "\u8F93\u5165\u6587\u4EF6\u5939\u8DEF\u5F84\uFF1A" : "Enter folder path:");
                       if (path) setFileRefs((prev) => [...prev, path]);
                     });
                   } else {

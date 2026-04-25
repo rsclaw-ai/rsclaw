@@ -60,6 +60,13 @@ export type ChatMessage = RequestMessage & {
   tools?: ChatMessageTool[];
   audio_url?: string;
   isMcpResponse?: boolean;
+  /**
+   * Marks messages that are NOT a real assistant reply — agent
+   * intermediate text ("好的，我来帮你搜索…"), cron / system notifications
+   * pushed via the desktop channel, etc.  Rendered with the muted
+   * palette shared with `ThinkBlock` so they recede.
+   */
+  isIntermediate?: boolean;
 };
 
 export function createMessage(override: Partial<ChatMessage>): ChatMessage {

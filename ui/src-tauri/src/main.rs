@@ -913,6 +913,82 @@ fn set_gateway_user_stopped(stopped: bool) {
     GATEWAY_USER_STOPPED.store(stopped, Ordering::Relaxed);
 }
 
+/// Save a user-attached image (paste or upload) to
+/// `<Downloads>/rsclaw/images/<nanos_hex>/attach.<ext>` and return the
+/// absolute path. Keeps base64 blobs out of chat history so typing does
+/// not force React to re-diff MB of string per keystroke.
+#[tauri::command]
+fn save_attach_image(bytes: Vec<u8>, extension: String) -> Result<String, String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let ext = {
+        let e = extension.trim_start_matches('.').to_ascii_lowercase();
+        if e.is_empty() || !e.chars().all(|c| c.is_ascii_alphanumeric()) {
+            "jpg".to_string()
+        } else {
+            e
+        }
+    };
+    let base = dirs::download_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join("Downloads"))
+        .join("rsclaw")
+        .join("images")
+        .join(format!("{nanos:x}"));
+    std::fs::create_dir_all(&base).map_err(|e| format!("create_dir: {e}"))?;
+    let full = base.join(format!("attach.{ext}"));
+    std::fs::write(&full, &bytes).map_err(|e| format!("write: {e}"))?;
+    Ok(full.to_string_lossy().to_string())
+}
+
+/// Read a local image file and return it as a `data:image/...;base64,...`
+/// URL. Used at LLM-send time to rehydrate disk-backed attachments into
+/// the format upstream APIs expect.
+#[tauri::command]
+fn read_file_as_data_url(path: String) -> Result<String, String> {
+    let p = std::path::Path::new(&path);
+    let data = std::fs::read(p).map_err(|e| format!("read: {e}"))?;
+    let mime = match p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("svg") => "image/svg+xml",
+        Some("heic") => "image/heic",
+        Some("heif") => "image/heif",
+        _ => "image/jpeg",
+    };
+    const B64: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut b64 = String::with_capacity(data.len() * 4 / 3 + 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        b64.push(B64[((n >> 18) & 0x3F) as usize] as char);
+        b64.push(B64[((n >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            b64.push(B64[((n >> 6) & 0x3F) as usize] as char);
+        } else {
+            b64.push('=');
+        }
+        if chunk.len() > 2 {
+            b64.push(B64[(n & 0x3F) as usize] as char);
+        } else {
+            b64.push('=');
+        }
+    }
+    Ok(format!("data:{mime};base64,{b64}"))
+}
+
 /// macOS: hide app from dock (agent mode). App only visible via tray icon.
 #[cfg(target_os = "macos")]
 fn set_dock_visible(visible: bool) {
@@ -1008,6 +1084,8 @@ fn main() {
             get_auto_start,
             set_gateway_user_stopped,
             open_path,
+            save_attach_image,
+            read_file_as_data_url,
         ])
         .setup(|app| {
             // Build system tray

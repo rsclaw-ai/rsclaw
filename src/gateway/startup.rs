@@ -428,6 +428,32 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // Register desktop channel — routes cron delivery to connected WS clients.
     {
         let desktop_ch = Arc::new(crate::channel::desktop::DesktopChannel::new(Arc::clone(&ws_conns)));
+        // Bridge the notification_tx → DesktopChannel path so AgentRuntime
+        // (which only has notification_tx, not ChannelManager) can route
+        // short-delay reminders through the same broadcast path cron uses.
+        let (desktop_out_tx, mut desktop_out_rx) = mpsc::channel::<OutboundMessage>(64);
+        {
+            let mut senders = channel_senders
+                .write()
+                .expect("channel_senders lock poisoned");
+            senders.insert("desktop".to_string(), desktop_out_tx.clone());
+            // "ws" is the channel name used by WS-originated agent runs (see
+            // ws/methods/chat.rs where AgentMessage.channel = "ws"). Without
+            // this alias, OutboundMessages tagged channel="ws" — e.g. WASM
+            // plugin progress notify(), async task completion messages — hit
+            // the notification router's "no channel sender registered" warn
+            // and get dropped, leaving the desktop UI without progress pings.
+            senders.insert("ws".to_string(), desktop_out_tx);
+        }
+        let desktop_for_bridge = Arc::clone(&desktop_ch);
+        tokio::spawn(async move {
+            use crate::channel::Channel;
+            while let Some(msg) = desktop_out_rx.recv().await {
+                if let Err(e) = desktop_for_bridge.send(msg).await {
+                    warn!(error = %e, "desktop notification bridge: send failed");
+                }
+            }
+        });
         if let Err(e) = channel_manager.register(desktop_ch as Arc<dyn crate::channel::Channel>) {
             warn!("failed to register desktop channel: {e}");
         }
@@ -653,6 +679,12 @@ fn spawn_agent_tasks(
         tokio::spawn(async move {
             info!(agent_id = %handle.id, "agent runtime task started");
             while let Some(msg) = rx.recv().await {
+                info!(
+                    agent_id = %handle.id,
+                    session_key = %msg.session_key,
+                    channel = %msg.channel,
+                    "agent runtime: received msg from queue"
+                );
                 let AgentMessage {
                     session_key,
                     text,
@@ -675,6 +707,7 @@ fn spawn_agent_tasks(
                         files,
                     )
                     .await;
+                let turn_errored = result.is_err();
                 let reply = result.unwrap_or_else(|e| {
                     error!(agent = %handle.id, "turn error: {e:#}");
                     AgentReply {
@@ -687,10 +720,13 @@ fn spawn_agent_tasks(
                         was_preparse: false,
                     }
                 });
-                // Emit to event_bus only for preparse turns (agent_loop already emits
-                // streaming deltas + done for LLM turns; a second emit would send a
-                // duplicate done frame to WS clients).
-                if reply.was_preparse {
+                // Emit to event_bus for preparse turns (agent_loop already
+                // emits streaming deltas + done for LLM turns, so a second
+                // emit would duplicate the done frame) *and* for turns that
+                // failed with Err (agent_loop returns early via `?` on LLM
+                // errors and never gets to emit done — WS clients would hang
+                // waiting for the terminator forever).
+                if reply.was_preparse || turn_errored {
                     if !reply.text.is_empty() {
                         // receiver may have been dropped
                         let _ = event_tx_task.send(crate::events::AgentEvent {

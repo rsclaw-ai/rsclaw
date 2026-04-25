@@ -183,15 +183,41 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                     (0, 0)
                 };
 
-                use base64::Engine;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                // Save screenshot to <Downloads>/rsclaw/screenshots/<nanos>.<ext>
+                // so the UI can reference it by file path via Tauri's asset
+                // protocol (scope: $DOWNLOAD/rsclaw/**) instead of shipping
+                // ~100KB of base64 per shot over the WebSocket.  The LLM no
+                // longer consumes the raw image (screenshots are described as
+                // text via the vision model), so there is no reason to embed
+                // the bytes in the tool result either.
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let ext = if mime == "image/jpeg" { "jpg" } else { "png" };
+                let save_dir = dirs_next::download_dir()
+                    .unwrap_or_else(|| {
+                        dirs_next::home_dir()
+                            .unwrap_or_else(crate::config::loader::base_dir)
+                            .join("Downloads")
+                    })
+                    .join("rsclaw")
+                    .join("screenshots");
+                tokio::fs::create_dir_all(&save_dir)
+                    .await
+                    .map_err(|e| anyhow!("computer_use screenshot: create_dir: {e}"))?;
+                let save_path = save_dir.join(format!("{nanos:x}.{ext}"));
+                tokio::fs::write(&save_path, &bytes)
+                    .await
+                    .map_err(|e| anyhow!("computer_use screenshot: write: {e}"))?;
 
                 // Return scale factor so LLM can map coordinates back.
                 let scale = if width > 0 && orig_w > width { orig_w as f64 / width as f64 } else { 1.0 };
 
                 Ok(json!({
                     "action": "screenshot",
-                    "image": format!("data:{mime};base64,{b64}"),
+                    "image_path": save_path.to_string_lossy(),
+                    "mime": mime,
                     "width": width,
                     "height": height,
                     "original_width": orig_w,
