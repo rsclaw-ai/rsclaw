@@ -901,16 +901,15 @@ async fn http_shutdown(
 /// Loopback-only.
 ///
 /// Sequence:
-///   1. Set `shutdown.draining = true` and notify subscribers.
-///      - axum's `with_graceful_shutdown` stops accepting new connections.
-///      - `TaskQueueWorker` stops dequeueing.
+///   1. Set `shutdown.draining = true` and notify subscribers — axum's
+///      `with_graceful_shutdown` stops accepting new connections and the
+///      `TaskQueueWorker` stops dequeueing.
 ///   2. Send the "restarting" response so the client knows the request landed.
-///   3. In the spawned drainer:
-///      a. Wait for `inflight == 0` or 10s timeout (so currently-running
-///         agent turns / task queue tasks finish cleanly).
-///      b. `Command::spawn(current_exe, ["gateway", "run"])` — replacement
-///         process binds the listener and starts handling requests.
-///      c. `process::exit(0)` — current process exits.
+///   3. In the spawned drainer, wait for `inflight == 0` or 60s timeout (so
+///      currently-running agent turns / task queue tasks finish cleanly), then
+///      `Command::spawn(current_exe, ["gateway", "run"])` — the replacement
+///      process binds the listener and starts handling requests, then the
+///      current process calls `process::exit(0)`.
 ///
 /// Persistent task queue items left behind are picked up by the new process
 /// on startup, so the user-visible behavior is "brief unavailability".
@@ -940,9 +939,9 @@ async fn http_restart(
         // Give the response 100ms to flush before draining begins in earnest.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // Wait up to 10s for in-flight work to settle. Polling rather than a
+        // Wait up to 60s for in-flight work to settle. Polling rather than a
         // single sleep so we exit early once everything's done.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             let n = coord.inflight();
             if n == 0 {

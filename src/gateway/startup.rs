@@ -376,10 +376,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         .and_then(|h| h.enabled)
         .unwrap_or(true);
     if hb_enabled {
-        let runner = std::sync::Arc::new(crate::heartbeat::HeartbeatRunner::new(
+        let runner = std::sync::Arc::new(crate::heartbeat::HeartbeatRunner::new_with_shutdown(
             Arc::clone(&registry),
             &data_dir,
             heartbeat_memory,
+            Some(shutdown.clone()),
         ));
         runner.run();
         info!("heartbeat runner started");
@@ -545,7 +546,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
         if cron_enabled {
             let cron_data_dir = base_dir.join("var").join("data");
-            let runner = CronRunner::new(
+            let runner = CronRunner::new_with_shutdown(
                 &cron_cfg,
                 jobs,
                 Arc::clone(&registry),
@@ -553,6 +554,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 cron_data_dir,
                 cron_reload_tx.clone(),
                 Arc::clone(&ws_conns),
+                Some(shutdown.clone()),
             );
             tokio::spawn(async move {
                 if let Err(e) = runner.run().await {

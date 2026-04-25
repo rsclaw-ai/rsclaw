@@ -2182,6 +2182,36 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "vi" => "Phat hien thao tac lap lai khong tien trien. Thu cach tiep can khac.",
     );
 
+    msg!("cron_run_success",
+        "en" => "[ok] Scheduled task completed\n\n**Task**: {name}\n**Duration**: {seconds}s",
+        "zh" => "[ok] 定时任务执行完成\n\n**任务**: {name}\n**耗时**: {seconds}秒",
+        "ja" => "[ok] スケジュールタスク完了\n\n**タスク**: {name}\n**所要時間**: {seconds}秒",
+    );
+
+    msg!("cron_run_success_no_duration",
+        "en" => "[ok] Scheduled task completed\n\n**Task**: {name}",
+        "zh" => "[ok] 定时任务执行完成\n\n**任务**: {name}",
+        "ja" => "[ok] スケジュールタスク完了\n\n**タスク**: {name}",
+    );
+
+    msg!("cron_run_failed_disabled",
+        "en" => "[fail] Scheduled task failed\n\n**Task**: {name}\n**Consecutive failures**: {consecutive}\n**Error**: {error}\n\n[warn] Task auto-disabled. Please check the configuration and re-enable manually.",
+        "zh" => "[fail] 定时任务执行失败\n\n**任务**: {name}\n**连续失败**: {consecutive} 次\n**错误**: {error}\n\n[warn] 任务已被自动禁用，请检查配置后手动启用。",
+        "ja" => "[fail] スケジュールタスク失敗\n\n**タスク**: {name}\n**連続失敗**: {consecutive} 回\n**エラー**: {error}\n\n[warn] タスクは自動的に無効化されました。設定を確認してから手動で有効化してください。",
+    );
+
+    msg!("cron_run_failed_retry",
+        "en" => "[fail] Scheduled task failed\n\n**Task**: {name}\n**Consecutive failures**: {consecutive}\n**Next retry**: in {backoff}\n**Error**: {error}",
+        "zh" => "[fail] 定时任务执行失败\n\n**任务**: {name}\n**连续失败**: {consecutive} 次\n**下次重试**: {backoff}后\n**错误**: {error}",
+        "ja" => "[fail] スケジュールタスク失敗\n\n**タスク**: {name}\n**連続失敗**: {consecutive} 回\n**次回再試行**: {backoff}後\n**エラー**: {error}",
+    );
+
+    msg!("cron_run_failed_manual",
+        "en" => "[fail] Scheduled task failed\n\n**Task**: {name}\n**Consecutive failures**: {consecutive}\n**Error**: {error}",
+        "zh" => "[fail] 定时任务执行失败\n\n**任务**: {name}\n**连续失败**: {consecutive} 次\n**错误**: {error}",
+        "ja" => "[fail] スケジュールタスク失敗\n\n**タスク**: {name}\n**連続失敗**: {consecutive} 回\n**エラー**: {error}",
+    );
+
     m
 });
 
