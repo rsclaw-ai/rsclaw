@@ -40,6 +40,12 @@ struct ShutdownInner {
     /// task queue entries) currently being processed. Restart waits for
     /// this to drop to zero (with a timeout) before terminating the process.
     inflight: AtomicUsize,
+    /// Set by `request_restart()`. After `axum::serve()` returns (i.e., the
+    /// listener has been released), `start_gateway` reads this flag to decide
+    /// whether to spawn a replacement gateway process. Decoupling the spawn
+    /// from the restart handler avoids the race where the child tries to
+    /// `bind()` while the parent's listener is still held by axum.
+    restart_requested: AtomicBool,
 }
 
 impl ShutdownCoordinator {
@@ -93,6 +99,21 @@ impl ShutdownCoordinator {
     pub fn inflight(&self) -> usize {
         self.inner.inflight.load(Ordering::Acquire)
     }
+
+    /// Mark this drain as a restart, then begin draining. After
+    /// `axum::serve()` returns, `start_gateway` will spawn a replacement
+    /// gateway process instead of exiting cleanly.
+    ///
+    /// Idempotent — safe to call concurrently with `begin_drain` or itself.
+    pub fn request_restart(&self) {
+        self.inner.restart_requested.store(true, Ordering::Release);
+        self.begin_drain();
+    }
+
+    /// Whether `request_restart` has been called this session.
+    pub fn is_restart_requested(&self) -> bool {
+        self.inner.restart_requested.load(Ordering::Acquire)
+    }
 }
 
 /// RAII guard returned from `begin_work`. Decrements the in-flight counter on
@@ -134,6 +155,38 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(100), coord.notified())
             .await
             .expect("notified returned");
+    }
+
+    #[tokio::test]
+    async fn request_restart_sets_flag_and_begins_drain() {
+        let coord = ShutdownCoordinator::new();
+        assert!(!coord.is_draining());
+        assert!(!coord.is_restart_requested());
+
+        coord.request_restart();
+
+        assert!(coord.is_draining(), "request_restart should also drain");
+        assert!(coord.is_restart_requested());
+
+        // Idempotent.
+        coord.request_restart();
+        assert!(coord.is_restart_requested());
+
+        // `notified` returns immediately (drain already in progress).
+        tokio::time::timeout(std::time::Duration::from_millis(100), coord.notified())
+            .await
+            .expect("notified after request_restart");
+    }
+
+    #[test]
+    fn begin_drain_alone_does_not_set_restart_flag() {
+        let coord = ShutdownCoordinator::new();
+        coord.begin_drain();
+        assert!(coord.is_draining());
+        assert!(
+            !coord.is_restart_requested(),
+            "drain without restart must not set the restart flag"
+        );
     }
 
     #[test]

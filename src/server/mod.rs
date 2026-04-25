@@ -900,16 +900,15 @@ async fn http_shutdown(
 /// POST /api/v1/restart — re-exec the gateway binary with graceful drain.
 /// Loopback-only.
 ///
-/// Sequence:
-///   1. Set `shutdown.draining = true` and notify subscribers — axum's
-///      `with_graceful_shutdown` stops accepting new connections and the
-///      `TaskQueueWorker` stops dequeueing.
+/// Flag-and-flush design:
+///   1. Set `shutdown.restart_requested = true` and `draining = true` — axum's
+///      `with_graceful_shutdown` future resolves, the listener accept loop
+///      stops, in-flight HTTP connections (including this response) finish.
 ///   2. Send the "restarting" response so the client knows the request landed.
-///   3. In the spawned drainer, wait for `inflight == 0` or 60s timeout (so
-///      currently-running agent turns / task queue tasks finish cleanly), then
-///      `Command::spawn(current_exe, ["gateway", "run"])` — the replacement
-///      process binds the listener and starts handling requests, then the
-///      current process calls `process::exit(0)`.
+///   3. `axum::serve` returns; `start_gateway` notices `is_restart_requested`
+///      and spawns the replacement process AFTER the listener has been
+///      released — closing the race where the child's `bind()` would fail
+///      because the parent still owns the port.
 ///
 /// Persistent task queue items left behind are picked up by the new process
 /// on startup, so the user-visible behavior is "brief unavailability".
@@ -924,57 +923,8 @@ async fn http_restart(
         )
             .into_response();
     }
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            return Json(serde_json::json!({ "error": format!("current_exe: {e}") }))
-                .into_response();
-        }
-    };
-    tracing::warn!("HTTP /restart — beginning graceful drain");
-    state.shutdown.begin_drain();
-
-    let coord = state.shutdown.clone();
-    tokio::spawn(async move {
-        // Give the response 100ms to flush before draining begins in earnest.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Wait up to 60s for in-flight work to settle. Polling rather than a
-        // single sleep so we exit early once everything's done.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        loop {
-            let n = coord.inflight();
-            if n == 0 {
-                tracing::info!("graceful drain: inflight cleared");
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                tracing::warn!(
-                    inflight = n,
-                    "graceful drain: timeout reached, restarting anyway"
-                );
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.args(["gateway", "run"]);
-        // Windows: suppress the console flash when re-execing from a GUI app.
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        match cmd.spawn() {
-            Ok(_) => tracing::info!("replacement gateway spawned"),
-            Err(e) => tracing::error!("failed to spawn replacement gateway: {e:#}"),
-        }
-        // Don't remove the PID file here — the new gateway process
-        // overwrites it with its own PID on startup.
-        std::process::exit(0);
-    });
+    tracing::warn!("HTTP /restart — flagging for post-drain respawn");
+    state.shutdown.request_restart();
     Json(serde_json::json!({ "restarting": true })).into_response()
 }
 

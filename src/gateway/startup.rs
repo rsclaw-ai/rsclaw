@@ -665,7 +665,64 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     let result = serve(state, bind_addr).await;
 
-    // Clean up PID file on exit.
+    // At this point `axum::serve` has returned, which means the listener has
+    // been dropped — so the port is free for whatever runs next. Two paths:
+    //   - clean shutdown (Ctrl-C, SIGTERM, /api/v1/shutdown): just clean up
+    //     the PID file and return.
+    //   - restart requested (/api/v1/restart, system.restart): wait for
+    //     non-HTTP inflight to drain, spawn the replacement, then exit.
+    //     We spawn HERE rather than in the restart handler to avoid the
+    //     race where the child's `bind()` runs before the parent's listener
+    //     drops; that race could cause `cmd_gateway` to see "port in use"
+    //     and exit cleanly, leaving the gateway dead.
+    if shutdown.is_restart_requested() {
+        info!("restart requested - waiting for inflight drain (max 60s)");
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let n = shutdown.inflight();
+            if n == 0 {
+                info!("graceful drain: inflight cleared");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                warn!(
+                    inflight = n,
+                    "graceful drain: 60s timeout reached, restarting anyway"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                error!("current_exe failed; cannot respawn replacement: {e:#}");
+                // Don't remove the PID file - we'd rather leave a stale PID
+                // than wipe it and bail with no replacement running.
+                return result;
+            }
+        };
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(["gateway", "run"]);
+        // Windows: suppress the console flash when re-execing from a GUI app.
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        match cmd.spawn() {
+            Ok(_) => info!("replacement gateway spawned"),
+            Err(e) => error!("failed to spawn replacement gateway: {e:#}"),
+        }
+        // Do NOT remove the PID file - the new gateway process overwrites it
+        // with its own PID on startup. Removing here races and can leave us
+        // with no PID file after a successful restart.
+        std::process::exit(0);
+    }
+
+    // Clean shutdown path - remove the PID file before returning.
     if let Err(e) = std::fs::remove_file(&pid_file) {
         warn!("could not remove PID file on exit: {e}");
     }
