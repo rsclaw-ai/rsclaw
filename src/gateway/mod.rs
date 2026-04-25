@@ -14,6 +14,7 @@ pub mod providers;
 pub mod router;
 pub mod session;
 pub mod startup;
+pub mod task_queue;
 
 pub use hot_reload::{ConfigChange, FileWatcher};
 pub use live_config::LiveConfig;
