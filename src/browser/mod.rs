@@ -709,6 +709,20 @@ impl BrowserSession {
         cdp.send("DOM.enable", json!({})).await?;
         cdp.send("Runtime.enable", json!({})).await?;
         cdp.send("Network.enable", json!({})).await?;
+        // Pretend to be Safari on macOS for the whole browser session.
+        // Some jimeng/dreamina endpoints special-case Chrome (block, throttle,
+        // or vary response shape); Safari is what the user's normal browser
+        // would send and matches the UA our server-side reqwest uses for
+        // CDN downloads, so cookies + UA stay consistent end-to-end.
+        let _ = cdp
+            .send(
+                "Network.setUserAgentOverride",
+                json!({
+                    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
+                    "platform": "MacIntel",
+                }),
+            )
+            .await;
         cdp.send("Target.setDiscoverTargets", json!({"discover": true})).await?;
 
         let now = std::time::SystemTime::now()
@@ -774,6 +788,20 @@ impl BrowserSession {
         cdp.send("DOM.enable", json!({})).await?;
         cdp.send("Runtime.enable", json!({})).await?;
         cdp.send("Network.enable", json!({})).await?;
+        // Pretend to be Safari on macOS for the whole browser session.
+        // Some jimeng/dreamina endpoints special-case Chrome (block, throttle,
+        // or vary response shape); Safari is what the user's normal browser
+        // would send and matches the UA our server-side reqwest uses for
+        // CDN downloads, so cookies + UA stay consistent end-to-end.
+        let _ = cdp
+            .send(
+                "Network.setUserAgentOverride",
+                json!({
+                    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
+                    "platform": "MacIntel",
+                }),
+            )
+            .await;
         cdp.send("Target.setDiscoverTargets", json!({"discover": true})).await?;
 
         Ok(cdp)
@@ -985,6 +1013,7 @@ impl BrowserSession {
             "mouse" => self.cmd_mouse(args).await,
             "storage" => self.cmd_storage(args).await,
             "download_wait" => self.cmd_download_wait(args).await,
+            "download" => self.cmd_download(args).await,
             "is" => self.cmd_is(args).await,
             "get" => self.cmd_get(args).await,
             "search" => self.cmd_search(args).await,
@@ -1788,6 +1817,245 @@ impl BrowserSession {
         })).await?;
         tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
         Ok(json!({"action": "download_wait", "timeout": timeout_secs, "status": "completed"}))
+    }
+
+    /// Helper for `cmd_download`'s URL mode. Fetches host-side via reqwest
+    /// — vlabvod / dreamina CDNs don't return CORS headers so in-page
+    /// `fetch(..., {mode: 'cors'})` always fails. We pull cookies from the
+    /// browser session via CDP first so the request looks identical to
+    /// what jimeng's own UI would send (some signed URLs gate on the
+    /// session cookies in addition to the URL signature).
+    async fn cmd_download_url(
+        &self,
+        url: &str,
+        dest_path: &str,
+        timeout_secs: u64,
+    ) -> Result<Value> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| anyhow!("download(url): build client: {e}"))?;
+
+        // Pull session cookies for this URL from the browser via CDP and
+        // build a Cookie header. This lets jimeng/dreamina CDN auth pass.
+        let cookie_header = match self
+            .cdp
+            .send("Network.getCookies", json!({"urls": [url]}))
+            .await
+        {
+            Ok(resp) => resp
+                .get("cookies")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|c| {
+                            let n = c.get("name").and_then(|v| v.as_str())?;
+                            let v = c.get("value").and_then(|v| v.as_str())?;
+                            Some(format!("{}={}", n, v))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+
+        let referer = if url.contains("vlabvod") || url.contains("dreamina") {
+            "https://jimeng.jianying.com/"
+        } else {
+            ""
+        };
+        let mut req = client.get(url);
+        if !referer.is_empty() {
+            req = req.header("Referer", referer);
+        }
+        if !cookie_header.is_empty() {
+            req = req.header("Cookie", cookie_header);
+        }
+        // Mimic Safari rather than Chrome — some jimeng CDNs treat
+        // Chrome UA strings differently (or block them). Safari is what
+        // the user's normal browser session would send.
+        req = req.header(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
+        );
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| anyhow!("download(url): send: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            bail!("download(url): HTTP {status}");
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| anyhow!("download(url): read body: {e}"))?;
+
+        let dest = std::path::PathBuf::from(dest_path);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow!("download(url): create parent dir: {e}"))?;
+        }
+        std::fs::write(&dest, &bytes)
+            .map_err(|e| anyhow!("download(url): write: {e}"))?;
+
+        // NOTE: do not include a top-level "url" field here — wasm_runtime's
+        // browser_action extractor checks fields in order ["text", "image",
+        // "data", "url", "result"] and picks the first string match. A "url"
+        // field would shadow "result" and the plugin would receive the
+        // *source* URL rather than the local file path.
+        Ok(json!({
+            "action": "download",
+            "source": url,
+            "path": dest_path,
+            "bytes": bytes.len(),
+            "result": dest_path,
+        }))
+    }
+
+    /// Download to a caller-supplied path. Two modes:
+    /// - `ref` mode: click the referenced element, watch a temp dir for the
+    ///   resulting file, then move it to `path`.
+    /// - `url` mode: fetch the URL via the browser session (so cookies and
+    ///   referer match what jimeng/dreamina expect for their CDN signed
+    ///   URLs), convert to a blob, and write to `path`. Triggered when
+    ///   `ref` starts with `http://` / `https://` (no separate arg name —
+    ///   keeps the existing wasm-side `browser_download(ref, path)` shape).
+    async fn cmd_download(&self, args: &Value) -> Result<Value> {
+        let eref = args
+            .get("ref")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("download: `ref` required"))?;
+        let dest_path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("download: `path` required"))?;
+        let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(45);
+
+        // URL mode: same-origin fetch + base64 → write to dest. Lets plugins
+        // download CDN-signed jimeng/dreamina URLs without driving the UI.
+        if eref.starts_with("http://") || eref.starts_with("https://") {
+            return self.cmd_download_url(eref, dest_path, timeout_secs).await;
+        }
+
+        // Use a per-call temp dir so we only see this download's output.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let stage_dir = std::path::PathBuf::from(format!("/tmp/rsclaw-dl-{nanos:x}"));
+        std::fs::create_dir_all(&stage_dir)
+            .map_err(|e| anyhow!("download: create stage dir: {e}"))?;
+
+        self.cdp
+            .send(
+                "Page.setDownloadBehavior",
+                json!({
+                    "behavior": "allow",
+                    "downloadPath": stage_dir.to_string_lossy(),
+                }),
+            )
+            .await?;
+
+        // Click the ref via the same JS path as cmd_click.
+        let js = format!(
+            r#"(async function(){{
+                {FIND_REF_JS}
+                var el=findRef('{eref_esc}');
+                if(!el) return 'NOT_FOUND';
+                {WAIT_ACTIONABLE_JS}
+                var status = await waitActionable(el, 5000);
+                if (status === 'TIMEOUT') return 'TIMEOUT';
+                el.scrollIntoView({{block:'center'}});
+                el.click();
+                return 'OK';
+            }})()"#,
+            eref_esc = escape_js_string(eref),
+            FIND_REF_JS = FIND_REF_JS,
+            WAIT_ACTIONABLE_JS = WAIT_ACTIONABLE_JS,
+        );
+        let click_res = self
+            .cdp
+            .send(
+                "Runtime.evaluate",
+                json!({"expression": js, "returnByValue": true, "awaitPromise": true}),
+            )
+            .await?;
+        let click_status = click_res
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if click_status == "NOT_FOUND" {
+            bail!("download: element ref `{eref}` not found");
+        }
+        if click_status == "TIMEOUT" {
+            bail!("download: element ref `{eref}` not actionable within 5s");
+        }
+
+        // Poll the stage dir for a new finished file. Chrome writes a `.crdownload`
+        // suffix while in-flight; we wait for any non-suffix file with stable size.
+        let deadline = time::Instant::now() + Duration::from_secs(timeout_secs);
+        let mut last_size: u64 = 0;
+        let mut stable_ticks: u32 = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let mut candidate: Option<(std::path::PathBuf, u64)> = None;
+            if let Ok(rd) = std::fs::read_dir(&stage_dir) {
+                for entry in rd.flatten() {
+                    let path = entry.path();
+                    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    if name.ends_with(".crdownload") || name.starts_with('.') {
+                        continue;
+                    }
+                    if let Ok(meta) = entry.metadata() {
+                        if meta.is_file() {
+                            candidate = Some((path, meta.len()));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some((path, size)) = candidate {
+                if size > 0 && size == last_size {
+                    stable_ticks += 1;
+                    if stable_ticks >= 2 {
+                        // 1s of stable size — treat as complete. Move the file.
+                        let dest = std::path::PathBuf::from(dest_path);
+                        if let Some(parent) = dest.parent() {
+                            std::fs::create_dir_all(parent)
+                                .map_err(|e| anyhow!("download: create dest parent: {e}"))?;
+                        }
+                        std::fs::rename(&path, &dest).or_else(|_| {
+                            // Cross-device rename can fail; fall back to copy + remove.
+                            std::fs::copy(&path, &dest).map(|_| ()).and_then(|_| {
+                                std::fs::remove_file(&path).or(Ok::<(), std::io::Error>(()))
+                            })
+                        }).map_err(|e| anyhow!("download: move file: {e}"))?;
+                        let _ = std::fs::remove_dir_all(&stage_dir);
+                        return Ok(json!({
+                            "action": "download",
+                            "ref": eref,
+                            "path": dest_path,
+                            "result": dest_path,
+                        }));
+                    }
+                } else {
+                    stable_ticks = 0;
+                    last_size = size;
+                }
+            } else {
+                stable_ticks = 0;
+            }
+
+            if time::Instant::now() >= deadline {
+                let _ = std::fs::remove_dir_all(&stage_dir);
+                bail!("download: no completed file in {timeout_secs}s");
+            }
+        }
     }
 
     /// Query element state: visible, hidden, checked, enabled, disabled.
