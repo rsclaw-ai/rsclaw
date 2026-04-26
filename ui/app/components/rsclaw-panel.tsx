@@ -52,6 +52,7 @@ import {
   API_TYPE_NEEDS_KEY,
 } from "../lib/provider-defaults";
 import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
+import { RestartBanner } from "./restart-banner";
 
 // ── Types ──────────────────────────────────────────────
 interface ChannelInfo {
@@ -263,6 +264,9 @@ function StatusPage() {
           </button>
         </>
       </div>
+
+      {/* Restart-required banner — appears under the gateway status when a restart event is pending */}
+      <RestartBanner />
 
       {/* Stats Row */}
       <div className={styles["stat-row"]}>
@@ -3898,6 +3902,22 @@ function TauriConfigPageInner() {
             </div>
             <div style={fieldRow}>
               <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5FEB\u901F\u6A21\u578B" : "Flash Model"}</div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.flash ({zh ? "\u7559\u7A7A\u5219\u4F7F\u7528\u4E3B\u6A21\u578B" : "empty \u2192 use main model"})</div>
+              </div>
+              <input
+                style={{ ...fInput, minWidth: 300 }}
+                type="text"
+                placeholder={zh ? "\u4F8B\u5982 custom/qwen-turbo" : "e.g. custom/qwen-turbo"}
+                value={getVal("agents.defaults.model.flash", "")}
+                onChange={(e) => {
+                  const v = (e.target.value || "").trim();
+                  updateConfig("agents.defaults.model.flash", v || undefined);
+                }}
+              />
+            </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5907\u7528\u6A21\u578B" : "Fallback Models"} <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u9017\u53F7\u5206\u9694)" : "(comma separated)"}</span></div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.fallbacks</div>
               </div>
@@ -3952,7 +3972,7 @@ function TauriConfigPageInner() {
                 })()}
               </div>
             </div>
-            <div style={fieldRow}>
+            <div style={{ ...fieldRow, borderBottom: "none" }}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5DE5\u5177\u96C6" : "Toolset"}</div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.toolset</div>
@@ -3962,22 +3982,6 @@ function TauriConfigPageInner() {
                 <option value="standard">standard {zh ? "\u2014 12 \u4E2A\u5DE5\u5177" : "-- 12 tools"}</option>
                 <option value="full">full {zh ? "\u2014 \u5168\u90E8\u5DE5\u5177" : "-- all tools"}</option>
               </select>
-            </div>
-            <div style={{ ...fieldRow, borderBottom: "none" }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5FEB\u901F\u6A21\u578B" : "Flash Model"}</div>
-                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.flash ({zh ? "\u7559\u7A7A\u5219\u4F7F\u7528\u4E3B\u6A21\u578B" : "empty \u2192 use main model"})</div>
-              </div>
-              <input
-                style={{ ...fInput, minWidth: 300 }}
-                type="text"
-                placeholder={zh ? "\u4F8B\u5982 custom/qwen-turbo" : "e.g. custom/qwen-turbo"}
-                value={getVal("agents.defaults.model.flash", "")}
-                onChange={(e) => {
-                  const v = (e.target.value || "").trim();
-                  updateConfig("agents.defaults.model.flash", v || undefined);
-                }}
-              />
             </div>
           </div>
 
@@ -4646,6 +4650,36 @@ function TauriConfigPageInner() {
                 <input style={{ ...fInput, minWidth: 260 }} type="password" placeholder="serper.dev key" value={getVal("tools.webSearch.serperApiKey", "")} onChange={(e) => updateConfig("tools.webSearch.serperApiKey", e.target.value)} />
               </div>
             )}
+          </div>
+
+          {/* Web browser */}
+          {secHead(zh ? "\u7F51\u9875\u6D4F\u89C8\u5668" : "WEB BROWSER")}
+          <div style={fcard}>
+            <div style={{ ...fieldRow, borderBottom: "none" }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u8FD0\u884C\u6A21\u5F0F" : "Run Mode"}</div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>tools.webBrowser.headed</div>
+              </div>
+              <select
+                style={{ ...fSelect, minWidth: 260 }}
+                value={(() => {
+                  const v = getVal("tools.webBrowser.headed", null);
+                  if (v === true) return "headed";
+                  if (v === false) return "headless";
+                  return "auto";
+                })()}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "headed") updateConfig("tools.webBrowser.headed", true);
+                  else if (v === "headless") updateConfig("tools.webBrowser.headed", false);
+                  else deleteConfig("tools.webBrowser.headed");
+                }}
+              >
+                <option value="auto">{zh ? "\u81EA\u52A8 \u2014 \u6839\u636E\u662F\u5426\u6709\u663E\u793A\u5668\u51B3\u5B9A" : "auto \u2014 based on display"}</option>
+                <option value="headed">{zh ? "\u524D\u53F0 \u2014 \u663E\u793A\u6D4F\u89C8\u5668\u7A97\u53E3" : "foreground \u2014 show window"}</option>
+                <option value="headless">{zh ? "\u540E\u53F0 \u2014 \u9759\u9ED8\u8FD0\u884C" : "background \u2014 headless"}</option>
+              </select>
+            </div>
           </div>
 
           {/* Memory */}

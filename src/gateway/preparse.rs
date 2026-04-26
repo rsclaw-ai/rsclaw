@@ -227,45 +227,13 @@ $g.Dispose();$b.Dispose()"#
         }
         return Some(txt(lines.join("\n")));
     }
-    // /cron — list cron jobs (reads from disk)
+    // /cron — list cron jobs (reads from disk).  Routes through the same
+    // formatter the agent runtime uses for `__CRON_LIST__` so feishu/wechat/etc.
+    // see the same output format as the desktop console.
     if lower == "/cron" || lower == "/cron list" {
         let jobs_path = crate::config::loader::base_dir().join("cron.json5");
-        let reply = match tokio::fs::read_to_string(&jobs_path).await {
-            Ok(content) => {
-                let parsed: Option<Vec<serde_json::Value>> = json5::from_str::<serde_json::Value>(&content)
-                    .or_else(|_| serde_json::from_str(&content))
-                    .ok()
-                    .and_then(|v| {
-                        v.get("jobs").and_then(|j| j.as_array().cloned())
-                            .or_else(|| v.as_array().cloned())
-                    });
-                match parsed {
-                    Some(jobs) if jobs.is_empty() => "No cron jobs configured.".to_owned(),
-                    Some(jobs) => {
-                        let mut lines = vec!["Cron jobs:".to_owned()];
-                        for job in &jobs {
-                            let id = job.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                            let schedule = job.get("schedule").and_then(|v| v.as_str()).unwrap_or("?");
-                            let agent = job.get("agentId").and_then(|v| v.as_str()).unwrap_or("main");
-                            let msg = job.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                            let enabled = job.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
-                            let status = if enabled { "" } else { " (disabled)" };
-                            let msg_preview = if msg.len() > 50 {
-                                let end = msg.char_indices().nth(47).map(|(i, _)| i).unwrap_or(msg.len());
-                                format!("{}...", &msg[..end])
-                            } else {
-                                msg.to_owned()
-                            };
-                            lines.push(format!("  [{}] {} -> {} \"{}\"{}",
-                                id, schedule, agent, msg_preview, status));
-                        }
-                        lines.join("\n")
-                    }
-                    None => "No cron jobs configured.".to_owned(),
-                }
-            }
-            Err(_) => "No cron jobs configured.".to_owned(),
-        };
+        let jobs = crate::agent::tools_cron::read_cron_jobs(&jobs_path).await;
+        let reply = crate::agent::tools_cron::format_cron_jobs(&jobs);
         return Some(txt(reply));
     }
     // /model — show current model; /models — list providers; /model <name> — switch

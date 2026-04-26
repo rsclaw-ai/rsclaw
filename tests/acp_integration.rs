@@ -1,6 +1,6 @@
 //! ACP integration tests
 
-use async_trait::async_trait;
+use futures::future::BoxFuture;
 use rsclaw::acp::{AcpCallbackHandler, SessionEvent, types::*};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -22,91 +22,102 @@ impl MockHandler {
     }
 }
 
-#[async_trait]
 impl AcpCallbackHandler for MockHandler {
-    async fn handle_request_permission(
+    fn handle_request_permission(
         &self,
         _session_id: &SessionId,
         tool_call_id: &str,
         options: Vec<PermissionOption>,
-    ) -> RequestPermissionOutcome {
-        self.permissions.lock().await.push(tool_call_id.to_string());
+    ) -> BoxFuture<'_, RequestPermissionOutcome> {
+        let permissions = self.permissions.clone();
+        let tool_call_id = tool_call_id.to_string();
+        Box::pin(async move {
+            permissions.lock().await.push(tool_call_id);
 
-        for opt in &options {
-            if matches!(opt.kind, PermissionOptionKind::AllowOnce) {
-                return RequestPermissionOutcome::Selected {
-                    option_id: opt.option_id.clone(),
-                };
+            for opt in &options {
+                if matches!(opt.kind, PermissionOptionKind::AllowOnce) {
+                    return RequestPermissionOutcome::Selected {
+                        option_id: opt.option_id.clone(),
+                    };
+                }
             }
-        }
-        RequestPermissionOutcome::Cancelled
+            RequestPermissionOutcome::Cancelled
+        })
     }
 
-    async fn handle_read_text_file(
+    fn handle_read_text_file(
         &self,
         _session_id: &SessionId,
         path: &str,
-    ) -> anyhow::Result<String> {
-        self.files_read.lock().await.push(path.to_string());
-        Ok(format!("mock content for {}", path))
+    ) -> BoxFuture<'_, anyhow::Result<String>> {
+        let files_read = self.files_read.clone();
+        let path = path.to_string();
+        Box::pin(async move {
+            files_read.lock().await.push(path.clone());
+            Ok(format!("mock content for {}", path))
+        })
     }
 
-    async fn handle_write_text_file(
+    fn handle_write_text_file(
         &self,
         _session_id: &SessionId,
         path: &str,
         contents: &str,
-    ) -> anyhow::Result<()> {
-        self.files_written
-            .lock()
-            .await
-            .push((path.to_string(), contents.to_string()));
-        Ok(())
+    ) -> BoxFuture<'_, anyhow::Result<()>> {
+        let files_written = self.files_written.clone();
+        let path = path.to_string();
+        let contents = contents.to_string();
+        Box::pin(async move {
+            files_written.lock().await.push((path, contents));
+            Ok(())
+        })
     }
 
-    async fn handle_terminal_create(
+    fn handle_terminal_create(
         &self,
         _session_id: &SessionId,
         _command: Option<&str>,
         _args: Option<Vec<String>>,
-    ) -> anyhow::Result<String> {
-        Ok("mock-terminal-1".to_string())
+    ) -> BoxFuture<'_, anyhow::Result<String>> {
+        Box::pin(async move { Ok("mock-terminal-1".to_string()) })
     }
 
-    async fn handle_terminal_output(
+    fn handle_terminal_output(
         &self,
         _session_id: &SessionId,
         _terminal_id: &str,
-    ) -> anyhow::Result<TerminalOutputResponse> {
-        Ok(TerminalOutputResponse {
-            exit: Some(0),
-            stdout: "mock output".to_string(),
-            stderr: String::new(),
+    ) -> BoxFuture<'_, anyhow::Result<TerminalOutputResponse>> {
+        Box::pin(async move {
+            Ok(TerminalOutputResponse {
+                exit: Some(0),
+                stdout: "mock output".to_string(),
+                stderr: String::new(),
+            })
         })
     }
 
-    async fn handle_terminal_kill(
+    fn handle_terminal_kill(
         &self,
         _session_id: &SessionId,
         _terminal_id: &str,
-    ) -> anyhow::Result<()> {
-        Ok(())
+    ) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move { Ok(()) })
     }
 
-    async fn handle_terminal_release(
+    fn handle_terminal_release(
         &self,
         _session_id: &SessionId,
         _terminal_id: &str,
-    ) -> anyhow::Result<()> {
-        Ok(())
+    ) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move { Ok(()) })
     }
 
-    async fn handle_terminal_wait_for_exit(
+    fn handle_terminal_wait_for_exit(
         &self,
         _session_id: &SessionId,
         _terminal_id: &str,
-    ) -> anyhow::Result<Option<i32>> {
-        Ok(Some(0))
+    ) -> BoxFuture<'_, anyhow::Result<Option<i32>>> {
+        Box::pin(async move { Ok(Some(0)) })
     }
 }
 

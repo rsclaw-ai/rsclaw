@@ -60,6 +60,12 @@ impl super::runtime::AgentRuntime {
                 // Schedule: support cron expr, delay (once), or interval.
                 let delay_ms = args["delay_ms"].as_u64().or(args["delayMs"].as_u64());
                 let schedule = args["schedule"].as_str();
+                // Fixed-interval schedule: prefer `every_seconds` (friendly), accept `every_ms` too.
+                let every_ms: Option<u64> = args["every_ms"]
+                    .as_u64()
+                    .or(args["everyMs"].as_u64())
+                    .or_else(|| args["every_seconds"].as_u64().map(|s| s.saturating_mul(1000)))
+                    .or_else(|| args["everySeconds"].as_u64().map(|s| s.saturating_mul(1000)));
 
                 if let Some(delay) = delay_ms {
                     // Short delays (<=30min): use in-memory timer, skip cron.json5.
@@ -109,6 +115,36 @@ impl super::runtime::AgentRuntime {
                     // Long delay: persist to cron.json5
                     let at_ms = now_ms + delay;
                     job["schedule"] = json!({"kind": "once", "atMs": at_ms});
+                } else if let Some(interval_ms) = every_ms {
+                    // Fixed-interval recurring schedule. Wins over `schedule` if both supplied.
+                    if interval_ms == 0 {
+                        return Err(anyhow!("cron add: `every_seconds`/`every_ms` must be > 0"));
+                    }
+                    // Floor: 2s. Below this the scheduler busy-loops (matches
+                    // crate::cron::MIN_REFIRE_GAP_MS).
+                    const MIN_INTERVAL_MS: u64 = 2_000;
+                    // Ceiling: 10 years. Beyond this `anchor_ms + n * every_ms`
+                    // can overflow u64 inside compute_next_run.
+                    const MAX_INTERVAL_MS: u64 = 10 * 365 * 24 * 3600 * 1000;
+                    if interval_ms < MIN_INTERVAL_MS {
+                        return Err(anyhow!(
+                            "cron add: `every_seconds`/`every_ms` must be >= 2s ({MIN_INTERVAL_MS}ms) — shorter intervals will busy-loop the scheduler"
+                        ));
+                    }
+                    if interval_ms > MAX_INTERVAL_MS {
+                        return Err(anyhow!(
+                            "cron add: `every_seconds`/`every_ms` must be <= 10 years ({MAX_INTERVAL_MS}ms)"
+                        ));
+                    }
+                    if schedule.is_some() {
+                        tracing::warn!(
+                            interval_ms,
+                            schedule = ?schedule,
+                            "cron add: both `schedule` and `every_seconds`/`every_ms` provided; using interval and ignoring schedule"
+                        );
+                    }
+                    // Anchor at now so the first fire is `now + interval_ms` (per CronSchedule::compute_next_run).
+                    job["schedule"] = json!({"kind": "every", "everyMs": interval_ms, "anchorMs": now_ms});
                 } else if let Some(sched) = schedule {
                     // Standard cron expression or interval.
                     // Always include timezone. Use LLM-provided, config, or auto-detected.
@@ -129,7 +165,9 @@ impl super::runtime::AgentRuntime {
                         });
                     job["schedule"] = json!({"kind": "cron", "expr": sched, "tz": tz_val});
                 } else {
-                    return Err(anyhow!("cron add: `schedule` or `delay_ms` required"));
+                    return Err(anyhow!(
+                        "cron add: `schedule`, `every_seconds`/`every_ms`, or `delay_ms` required"
+                    ));
                 }
                 // Payload in OpenClaw format.
                 job["payload"] = json!({"kind": "systemEvent", "text": message});
@@ -168,7 +206,13 @@ impl super::runtime::AgentRuntime {
                     debug!(err = %e, "cron add: failed to notify gateway reload");
                 }
 
-                Ok(json!({"added": id, "schedule": schedule, "message": message}))
+                let mut resp = json!({"added": id, "message": message});
+                if let Some(interval_ms) = every_ms {
+                    resp["every_ms"] = json!(interval_ms);
+                } else if let Some(s) = schedule {
+                    resp["schedule"] = json!(s);
+                }
+                Ok(resp)
             }
             "remove" => {
                 let mut jobs = read_cron_jobs(&cron_path).await;
@@ -328,6 +372,67 @@ impl super::runtime::AgentRuntime {
 // ---------------------------------------------------------------------------
 // Cron helpers (file-based job storage)
 // ---------------------------------------------------------------------------
+
+/// Format a list of cron jobs into the canonical multi-line text used by
+/// `/cron list` and the agent's `__CRON_LIST__` marker.
+///
+/// Returns "No cron jobs configured." when the slice is empty so callers don't
+/// have to special-case that themselves. Both the desktop (agent runtime) and
+/// gateway preparse paths route here so feishu/wechat/etc. see the same output
+/// format as `/cron list` from the desktop console.
+pub(crate) fn format_cron_jobs(jobs: &[Value]) -> String {
+    if jobs.is_empty() {
+        return "No cron jobs configured.".to_owned();
+    }
+    let mut lines = vec!["Cron jobs:".to_owned()];
+    for (i, job) in jobs.iter().enumerate() {
+        let id = job.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        let enabled = job.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        let status = if enabled { "" } else { " (disabled)" };
+        let agent = job.get("agentId").and_then(|v| v.as_str()).unwrap_or("main");
+        let name = job.get("name").and_then(|v| v.as_str());
+        let schedule = match job.get("schedule") {
+            Some(s) if s.is_object() => {
+                if let Some(expr) = s.get("expr").and_then(|v| v.as_str()) {
+                    expr.to_owned()
+                } else if let Some(at) = s.get("atMs").and_then(|v| v.as_u64()) {
+                    format!("once@{at}")
+                } else {
+                    s.to_string()
+                }
+            }
+            Some(s) if s.is_string() => s.as_str().unwrap_or("?").to_owned(),
+            _ => "?".to_owned(),
+        };
+        let message = job
+            .get("payload")
+            .and_then(|p| p.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let msg_preview = if message.chars().count() > 50 {
+            let end = message
+                .char_indices()
+                .nth(47)
+                .map(|(idx, _)| idx)
+                .unwrap_or(message.len());
+            format!("{}...", &message[..end])
+        } else {
+            message.to_owned()
+        };
+        let label = name.map(|n| format!(" {n}")).unwrap_or_default();
+        lines.push(format!(
+            "  #{} [{}] {} -> {}{} \"{}\"{}",
+            i + 1,
+            id,
+            schedule,
+            agent,
+            label,
+            msg_preview,
+            status
+        ));
+    }
+    lines.join("\n")
+}
 
 /// Read cron jobs from cron.json5.
 /// Handles both bare array `[...]` and wrapped `{"version":1,"jobs":[...]}` formats.

@@ -1375,47 +1375,7 @@ impl AgentRuntime {
                         // startup config) which is ALWAYS empty for tool-created jobs.
                         let cron_path = crate::config::loader::base_dir().join("cron.json5");
                         let jobs = crate::agent::tools_cron::read_cron_jobs(&cron_path).await;
-                        if jobs.is_empty() {
-                            "No cron jobs configured.".to_owned()
-                        } else {
-                            let mut lines = vec!["Cron jobs:".to_owned()];
-                            for (i, job) in jobs.iter().enumerate() {
-                                let id = job.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                                let enabled = job.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
-                                let status = if enabled { "" } else { " (disabled)" };
-                                let agent = job.get("agentId").and_then(|v| v.as_str()).unwrap_or("main");
-                                let name = job.get("name").and_then(|v| v.as_str());
-                                let schedule = match job.get("schedule") {
-                                    Some(s) if s.is_object() => {
-                                        if let Some(expr) = s.get("expr").and_then(|v| v.as_str()) {
-                                            expr.to_owned()
-                                        } else if let Some(at) = s.get("atMs").and_then(|v| v.as_u64()) {
-                                            format!("once@{}", at)
-                                        } else {
-                                            s.to_string()
-                                        }
-                                    }
-                                    _ => "?".to_owned(),
-                                };
-                                let message = job
-                                    .get("payload")
-                                    .and_then(|p| p.get("text"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                let msg_preview = if message.chars().count() > 50 {
-                                    let end = message.char_indices().nth(47).map(|(idx, _)| idx).unwrap_or(message.len());
-                                    format!("{}...", &message[..end])
-                                } else {
-                                    message.to_owned()
-                                };
-                                let label = name.map(|n| format!(" {n}")).unwrap_or_default();
-                                lines.push(format!(
-                                    "  #{} [{}] {} -> {}{} \"{}\"{}",
-                                    i + 1, id, schedule, agent, label, msg_preview, status
-                                ));
-                            }
-                            lines.join("\n")
-                        }
+                        crate::agent::tools_cron::format_cron_jobs(&jobs)
                     }
                     "__GET_UPLOAD_SIZE__" => {
                         let max = self
@@ -2624,6 +2584,14 @@ impl AgentRuntime {
 
             if !candidates.is_empty() {
                 let mem_clone = Arc::clone(mem);
+                let providers = Arc::clone(&self.providers);
+                let model_for_distill = self
+                    .handle
+                    .config
+                    .model
+                    .as_ref()
+                    .and_then(|m| m.primary.clone())
+                    .unwrap_or_default();
                 let ws_dir = self
                     .handle
                     .config
@@ -2636,46 +2604,96 @@ impl AgentRuntime {
                 let scope = format!("agent:{}", self.handle.id);
                 tokio::spawn(async move {
                     for doc_id in candidates {
-                        let mut store = mem_clone.lock().await;
-                        match crate::skill::crystallizer::find_cluster(&store, &doc_id, &scope) {
-                            Ok(Some(cluster)) => {
-                                let prompt =
-                                    crate::skill::crystallizer::build_distill_prompt(&cluster);
-                                // Tag all cluster docs as crystallized (even without
-                                // LLM distillation) to prevent repeated attempts.
-                                let ids: Vec<String> =
-                                    cluster.iter().map(|d| d.id.clone()).collect();
-                                for id in &ids {
-                                    if let Err(e) = store.tag_doc(id, "crystallized").await {
-                                        tracing::debug!(id, "tag_doc failed: {e:#}");
-                                    }
-                                }
-                                drop(store);
-                                // Write a draft skill with the prompt as content.
-                                // A future version can use an LLM to distill it.
-                                let slug = crate::skill::crystallizer::slugify(
-                                    &prompt.lines().next().unwrap_or("auto-skill"),
-                                );
-                                match crate::skill::crystallizer::write_skill(
-                                    &skills_dir,
-                                    &slug,
-                                    &prompt,
-                                ) {
-                                    Ok(path) => {
-                                        tracing::info!(
-                                            ?path,
-                                            "crystallized {} memories into skill",
-                                            ids.len()
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("skill crystallization write failed: {e:#}");
-                                    }
-                                }
-                            }
-                            Ok(None) => {} // not enough related memories yet
+                        // 1. Find cluster (brief read lock).
+                        let cluster_result = {
+                            let store = mem_clone.lock().await;
+                            crate::skill::crystallizer::find_cluster(&store, &doc_id, &scope)
+                        };
+                        let cluster = match cluster_result {
+                            Ok(Some(c)) => c,
+                            Ok(None) => continue, // not enough related memories yet
                             Err(e) => {
                                 tracing::debug!(doc_id, "crystallization check failed: {e:#}");
+                                continue;
+                            }
+                        };
+                        let ids: Vec<String> = cluster.iter().map(|d| d.id.clone()).collect();
+
+                        // 2. Build the distillation prompt.
+                        let prompt =
+                            crate::skill::crystallizer::build_distill_prompt(&cluster);
+
+                        // 3. Distill via LLM. On any failure, skip this cluster
+                        //    without tagging so a future reply can retry.
+                        if model_for_distill.is_empty() {
+                            tracing::debug!("crystallization: no agent model configured, skipping");
+                            continue;
+                        }
+                        let (provider_name, model_id) =
+                            providers.resolve_model(&model_for_distill);
+                        let provider_arc = match providers.get(provider_name) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::warn!(
+                                    provider = provider_name,
+                                    "crystallization: provider not registered: {e:#}"
+                                );
+                                continue;
+                            }
+                        };
+                        let model_owned = model_id.to_owned();
+                        let skill_md = match crate::skill::crystallizer::distill_with_llm(
+                            &prompt,
+                            provider_arc,
+                            model_owned,
+                        )
+                        .await
+                        {
+                            Ok(md) => md,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "crystallization: LLM distillation failed, skipping: {e:#}"
+                                );
+                                continue;
+                            }
+                        };
+
+                        // 4. Derive slug from the SKILL.md frontmatter (or fall back
+                        //    to a per-cluster id so different clusters don't collide).
+                        let fallback = format!(
+                            "auto-skill-{}",
+                            &doc_id[..8.min(doc_id.len())]
+                        );
+                        let slug = crate::skill::crystallizer::extract_skill_slug(
+                            &skill_md, &fallback,
+                        );
+
+                        // 5. Write the SKILL.md file.
+                        match crate::skill::crystallizer::write_skill(
+                            &skills_dir,
+                            &slug,
+                            &skill_md,
+                        ) {
+                            Ok(path) => {
+                                tracing::info!(
+                                    ?path,
+                                    slug = %slug,
+                                    n = ids.len(),
+                                    "crystallized memories into skill"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("skill crystallization write failed: {e:#}");
+                                continue;
+                            }
+                        }
+
+                        // 6. Tag cluster docs as crystallized only after a
+                        //    successful write so transient failures stay retryable.
+                        let mut store = mem_clone.lock().await;
+                        for id in &ids {
+                            if let Err(e) = store.tag_doc(id, "crystallized").await {
+                                tracing::debug!(id, "tag_doc failed: {e:#}");
                             }
                         }
                     }
@@ -3445,17 +3463,15 @@ impl AgentRuntime {
                     .and_then(|m| m.max_tokens)
                     .map(|v| v as u32);
 
-                from_agent.or(from_defaults).or(from_provider)
+                from_agent.or(from_defaults).or(from_provider).or(Some(30_000))
             };
 
-            // Only pass max_tokens when explicitly configured.
-            // When None, the model/provider decides its own output limit.
             if let Some(configured) = configured_max_tokens {
                 info!(
                     session = %ctx.session_key,
                     model = %model,
                     max_tokens = configured,
-                    "LLM request max_tokens (from config)"
+                    "LLM request max_tokens"
                 );
             }
 

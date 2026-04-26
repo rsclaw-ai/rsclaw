@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -11,10 +11,8 @@ use crate::{
 };
 
 use super::super::preparse::{
-    btw_direct_call, is_fast_preparse, processing_timeout, send_processing,
-    try_preparse_locally,
+    btw_direct_call, is_fast_preparse, try_preparse_locally,
 };
-use super::super::startup::handle_pending_analysis;
 use super::default_dm_scope;
 
 // ---------------------------------------------------------------------------
@@ -32,6 +30,7 @@ pub(crate) fn start_qq_if_configured(
     _channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
+    task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
 ) {
     let Some(qq_cfg) = &config.channel.channels.qq else {
         return;
@@ -105,6 +104,7 @@ pub(crate) fn start_qq_if_configured(
         let enforcer = Arc::clone(&enforcer);
         let reg = Arc::clone(&registry);
         let qq_cfg_arc = Arc::new(config.clone());
+        let tq = Arc::clone(&task_queue);
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
         let gp = Arc::new(group_policy.clone());
@@ -139,6 +139,7 @@ pub(crate) fn start_qq_if_configured(
                 let group_allow = Arc::clone(&ga);
                 let queues = Arc::clone(&qq_user_queues);
                 let qq_cfg = Arc::clone(&qq_cfg_arc);
+                let tq = Arc::clone(&tq);
                 tokio::spawn(async move {
                     // Group policy check.
                     if is_group {
@@ -223,92 +224,38 @@ pub(crate) fn start_qq_if_configured(
                         if needs_create {
                             let (utx, mut urx) = mpsc::channel::<QqItem>(32);
                             map.insert(sender_id.clone(), utx.clone());
-                            let w_reg = Arc::clone(&reg);
-                            let w_tx = tx.clone();
                             let w_uid = sender_id.clone();
-                            let w_cfg = Arc::clone(&qq_cfg);
+                            let w_tq = Arc::clone(&tq);
                             tokio::spawn(async move {
                                 while let Some((
-                                    mut text,
+                                    text,
                                     sender_id,
                                     target_id,
                                     is_group,
                                     msg_id,
-                                    mut images,
-                                    mut file_attachments,
+                                    images,
+                                    file_attachments,
                                 )) = urx.recv().await
                                 {
-                                    // Debounce: wait briefly then drain queued messages.
-                                    tokio::time::sleep(Duration::from_secs(2)).await;
-                                    while let Ok((extra_text, _, _, _, _, extra_images, extra_files)) = urx.try_recv() {
-                                        if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
-                                            text.push('\n');
-                                            text.push_str(&extra_text);
-                                        }
-                                        images.extend(extra_images);
-                                        file_attachments.extend(extra_files);
-                                    }
-                                    let process_result = tokio::time::timeout(
-                                    Duration::from_secs(600),
-                                    async {
-                                let handle = match w_reg.route("qq").or_else(|_| w_reg.default_agent()) {
-                                    Ok(h) => h,
-                                    Err(e) => { error!("qq route error: {e:#}"); return; }
-                                };
-                                let session_key =
-                                    format!("qq:{}:{}", if is_group { "group" } else { "dm" }, target_id);
-                                let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
-                                let msg = crate::agent::AgentMessage {
-                                    session_key,
-                                    text,
-                                    channel: "qq".to_owned(),
-                                    peer_id: sender_id,
-                                    chat_id: target_id.clone(),
-                                    reply_tx,
-                                    extra_tools: vec![],
-                                    images,
-                                    files: file_attachments,
-                                };
-                                if handle.tx.send(msg).await.is_err() {
-                                    error!("qq: agent inbox closed");
-                                    return;
-                                }
-                                let reply = tokio::select! {
-                                    result = &mut reply_rx => result,
-                                    _ = tokio::time::sleep(processing_timeout(&w_cfg)) => {
-                                        send_processing(&w_tx, target_id.clone(), is_group, &w_cfg).await;
-                                        reply_rx.await
-                                    }
-                                };
-                                match reply {
-                                    Ok(r) => {
-                                        let pending = r.pending_analysis;
-                                        if let Err(e) = w_tx
-                                            .send(OutboundMessage {
-                                                target_id: target_id.clone(),
-                                                is_group,
-                                                text: r.text,
-                                                reply_to: Some(msg_id),
-                                                images: r.images,
-                                                files: r.files,
-                                                channel: None,                                            })
-                                            .await
-                                        {
-                                            tracing::warn!("failed to send message: {e}");
-                                        }
-                                        if let Some(analysis) = pending {
-                                            handle_pending_analysis(
-                                                analysis, Arc::clone(&handle), &w_tx,
-                                                target_id, is_group, &w_cfg,
-                                            ).await;
-                                        }
-                                    }
-                                    Err(_) => error!("qq: agent dropped reply"),
-                                }
-                                    }
-                                ).await;
-                                    if process_result.is_err() {
-                                        warn!(user = %w_uid, "qq: message processing timed out (600s), skipping to next");
+                                    // No debounce — task queue merge_into_pending
+                                    // handles rapid consecutive messages automatically.
+                                    let session_key =
+                                        format!("qq:{}:{}", if is_group { "group" } else { "dm" }, target_id);
+                                    let qmsg = crate::gateway::task_queue::QueuedMessage {
+                                        text,
+                                        sender: sender_id.clone(),
+                                        channel: "qq".to_string(),
+                                        chat_id: target_id.clone(),
+                                        is_group,
+                                        reply_to: Some(msg_id),
+                                        timestamp: chrono::Utc::now().timestamp(),
+                                        images: images.iter().map(|i| i.data.clone()).collect(),
+                                        files: file_attachments.iter().filter_map(|f| {
+                                            crate::gateway::task_queue::stage_file(&f.filename, &f.data, &f.mime_type).ok()
+                                        }).collect(),
+                                    };
+                                    if let Err(e) = w_tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
+                                        error!(user = %w_uid, "qq: queue submit failed: {e:#}");
                                     }
                                 }
                                 debug!(user = %w_uid, "qq: per-user worker stopped");

@@ -604,30 +604,13 @@ pub async fn system_shutdown(_ctx: MethodCtx) -> MethodResult {
     Ok(serde_json::json!({ "shutting_down": true }))
 }
 
-/// `system.restart` — re-exec the current binary with the same `gateway run`
-/// args. The old PID exits; the new one picks up code changes on disk.
-pub async fn system_restart(_ctx: MethodCtx) -> MethodResult {
+/// `system.restart` — flag the gateway for restart and let the post-drain
+/// path in `start_gateway` spawn the replacement process. Doing the spawn
+/// after `axum::serve()` returns guarantees the parent has already released
+/// the listener, so the child cannot lose the bind() race against itself.
+pub async fn system_restart(ctx: MethodCtx) -> MethodResult {
     tracing::warn!("system.restart requested via WS");
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => return Err(ErrorShape::internal(format!("current_exe: {e}"))),
-    };
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.args(["gateway", "run"]);
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        let _ = cmd.spawn();
-        // Do NOT remove the PID file on restart — the new process will
-        // overwrite it with its own PID. Removing here races and can
-        // leave us with no PID file after a successful restart.
-        std::process::exit(0);
-    });
+    ctx.state.shutdown.request_restart();
     Ok(serde_json::json!({ "restarting": true }))
 }
 

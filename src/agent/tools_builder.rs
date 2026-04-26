@@ -151,7 +151,7 @@ pub(crate) fn build_tool_list(
                 "id":     {"type": "string", "description": "Memory document ID (for get)"},
                 "text":   {"type": "string", "description": "Content to store (for put). Be specific and include context."},
                 "scope":  {"type": "string", "description": "Scope filter (optional)"},
-                "kind":   {"type": "string", "description": "Document kind: note (general), fact (verified info), summary (session summary), remember (user explicitly asked to remember)"},
+                "kind":   {"type": "string", "description": "Document kind: note (general), fact (verified info), remember (user explicitly asked to remember). Do NOT use kind=summary; session summaries are written automatically by /compact, /new, /reset."},
                 "top_k":  {"type": "integer", "description": "Max results (for search, default 5)"}
             },
             "required": ["action"]
@@ -645,8 +645,12 @@ pub(crate) fn build_tool_list(
     tools.push(ToolDef {
         name: "cron".to_owned(),
         description: "List, add, edit, remove, enable or disable cron jobs.\n\
-            Supports both recurring (cron expression) and one-shot (delay_ms) schedules.\n\
+            Supports recurring (cron expression OR fixed interval) and one-shot (delay_ms) schedules.\n\
             For one-shot: set delay_ms instead of schedule. Example: delay_ms=1200000 for 20 minutes.\n\
+            For fixed-interval recurring (every N seconds): set every_seconds instead of schedule.\n\
+            Example: every_seconds=2700 fires every 45 minutes (use this for non-standard intervals\n\
+            like 45 min that cannot be expressed as a 5-field cron). If both schedule and\n\
+            every_seconds are given, every_seconds wins.\n\
             One-shot jobs auto-remove after execution.\n\
             For edit/remove/enable/disable, prefer using `index` from the list output instead of `id`.\n\
             \n\
@@ -664,15 +668,16 @@ pub(crate) fn build_tool_list(
         parameters: json!({
             "type": "object",
             "properties": {
-                "action":   {"type": "string", "enum": ["list", "add", "edit", "remove", "enable", "disable"], "description": "Action to perform"},
-                "schedule": {"type": "string", "description": "Cron schedule expression (for add/edit recurring jobs)"},
-                "delay_ms": {"type": "number", "description": "Delay in milliseconds for one-shot timer (e.g., 1200000 = 20 min). Use instead of schedule for reminders/timers."},
-                "message":  {"type": "string", "description": "Message or task to run (for add, edit)"},
-                "index":    {"type": "number", "description": "Job index from list (1-based, for edit/remove/enable/disable - preferred)"},
-                "id":       {"type": "string", "description": "Job ID (for edit/remove/enable/disable - use index instead if possible)"},
-                "name":     {"type": "string", "description": "Job name (for add, edit)"},
-                "tz":       {"type": "string", "description": "Timezone IANA name. Auto-detected if omitted. Only set if user explicitly requests a different timezone."},
-                "agentId":  {"type": "string", "description": "Agent ID to run the job (for add, edit, default: main)"}
+                "action":        {"type": "string", "enum": ["list", "add", "edit", "remove", "enable", "disable"], "description": "Action to perform"},
+                "schedule":      {"type": "string", "description": "Cron schedule expression (for add/edit recurring jobs). Must be 5 whitespace-separated fields."},
+                "every_seconds": {"type": "number", "description": "Fire every N seconds (for add). Use for fixed intervals like 45 minutes (every_seconds=2700) that cannot be expressed as a 5-field cron expression."},
+                "delay_ms":      {"type": "number", "description": "Delay in milliseconds for one-shot timer (e.g., 1200000 = 20 min). Use instead of schedule for reminders/timers."},
+                "message":       {"type": "string", "description": "Message or task to run (for add, edit)"},
+                "index":         {"type": "number", "description": "Job index from list (1-based, for edit/remove/enable/disable - preferred)"},
+                "id":            {"type": "string", "description": "Job ID (for edit/remove/enable/disable - use index instead if possible)"},
+                "name":          {"type": "string", "description": "Job name (for add, edit)"},
+                "tz":            {"type": "string", "description": "Timezone IANA name. Auto-detected if omitted. Only set if user explicitly requests a different timezone."},
+                "agentId":       {"type": "string", "description": "Agent ID to run the job (for add, edit, default: main)"}
             },
             "required": ["action"]
         }),

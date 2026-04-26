@@ -2139,6 +2139,23 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "zh" => "[系统] BGE 模型下载失败: {error}\n请运行 `rsclaw models download` 或从 https://gitfast.io 下载",
         "ja" => "[システム] BGEモデルのダウンロードに失敗: {error}\n`rsclaw models download` を実行するか https://gitfast.io からダウンロードしてください",
     );
+
+    // -- Restart-required banner messages (shown to UI as RestartRequest) --
+    msg!("restart_required_config_changed",
+        "en" => "Configuration changed. Restart gateway to apply.",
+        "zh" => "配置已更改，请重启 gateway 以生效。",
+        "ja" => "設定が変更されました。ゲートウェイを再起動して適用してください。",
+    );
+    msg!("restart_required_model_downloaded",
+        "en" => "Embedding model downloaded. Restart gateway to enable semantic memory search.",
+        "zh" => "向量模型下载完成，请重启 gateway 以启用语义搜索。",
+        "ja" => "埋め込みモデルのダウンロードが完了しました。セマンティック検索を有効にするにはゲートウェイを再起動してください。",
+    );
+    msg!("restart_model_download_failed",
+        "en" => "Embedding model download failed: {error}",
+        "zh" => "向量模型下载失败: {error}",
+        "ja" => "埋め込みモデルのダウンロードに失敗: {error}",
+    );
     msg!("tool_missing",
         "en" => "[system] {tool} not found. Run `rsclaw tools install {tool}`, or download from https://gitfast.io",
         "zh" => "[系统] 未找到 {tool}，请运行 `rsclaw tools install {tool}` 或从 https://gitfast.io 下载安装",
@@ -2163,6 +2180,41 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "ru" => "Обнаружено повторение одинаковой операции без прогресса. Пробую другой подход.",
         "th" => "ตรวจพบการทำงานซ้ำโดยไม่มีความคืบหน้า กำลังลองวิธีอื่น",
         "vi" => "Phat hien thao tac lap lai khong tien trien. Thu cach tiep can khac.",
+    );
+
+    msg!("cron_run_success",
+        "en" => "[ok] Scheduled task completed\n\n**Task**: {name}\n**Duration**: {seconds}s",
+        "zh" => "[ok] 定时任务执行完成\n\n**任务**: {name}\n**耗时**: {seconds}秒",
+        "ja" => "[ok] スケジュールタスク完了\n\n**タスク**: {name}\n**所要時間**: {seconds}秒",
+        "vi" => "[ok] Tac vu da chay xong\n\n**Tac vu**: {name}\n**Thoi gian**: {seconds}s",
+    );
+
+    msg!("cron_run_success_no_duration",
+        "en" => "[ok] Scheduled task completed\n\n**Task**: {name}",
+        "zh" => "[ok] 定时任务执行完成\n\n**任务**: {name}",
+        "ja" => "[ok] スケジュールタスク完了\n\n**タスク**: {name}",
+        "vi" => "[ok] Tac vu da chay xong\n\n**Tac vu**: {name}",
+    );
+
+    msg!("cron_run_failed_disabled",
+        "en" => "[fail] Scheduled task failed\n\n**Task**: {name}\n**Consecutive failures**: {consecutive}\n**Error**: {error}\n\n[warn] Task auto-disabled. Please check the configuration and re-enable manually.",
+        "zh" => "[fail] 定时任务执行失败\n\n**任务**: {name}\n**连续失败**: {consecutive} 次\n**错误**: {error}\n\n[warn] 任务已被自动禁用，请检查配置后手动启用。",
+        "ja" => "[fail] スケジュールタスク失敗\n\n**タスク**: {name}\n**連続失敗**: {consecutive} 回\n**エラー**: {error}\n\n[warn] タスクは自動的に無効化されました。設定を確認してから手動で有効化してください。",
+        "vi" => "[fail] Tac vu loi\n\n**Tac vu**: {name}\n**That bai lien tiep**: {consecutive} lan\n**Loi**: {error}\n\n[warn] Tac vu da bi tu dong tat. Vui long kiem tra cau hinh va bat lai thu cong.",
+    );
+
+    msg!("cron_run_failed_retry",
+        "en" => "[fail] Scheduled task failed\n\n**Task**: {name}\n**Consecutive failures**: {consecutive}\n**Next retry**: in {backoff}\n**Error**: {error}",
+        "zh" => "[fail] 定时任务执行失败\n\n**任务**: {name}\n**连续失败**: {consecutive} 次\n**下次重试**: {backoff}后\n**错误**: {error}",
+        "ja" => "[fail] スケジュールタスク失敗\n\n**タスク**: {name}\n**連続失敗**: {consecutive} 回\n**次回再試行**: {backoff}後\n**エラー**: {error}",
+        "vi" => "[fail] Tac vu loi\n\n**Tac vu**: {name}\n**That bai lien tiep**: {consecutive} lan\n**Thu lai sau**: {backoff}\n**Loi**: {error}",
+    );
+
+    msg!("cron_run_failed_manual",
+        "en" => "[fail] Scheduled task failed\n\n**Task**: {name}\n**Consecutive failures**: {consecutive}\n**Error**: {error}",
+        "zh" => "[fail] 定时任务执行失败\n\n**任务**: {name}\n**连续失败**: {consecutive} 次\n**错误**: {error}",
+        "ja" => "[fail] スケジュールタスク失敗\n\n**タスク**: {name}\n**連続失敗**: {consecutive} 回\n**エラー**: {error}",
+        "vi" => "[fail] Tac vu loi\n\n**Tac vu**: {name}\n**That bai lien tiep**: {consecutive} lan\n**Loi**: {error}",
     );
 
     m

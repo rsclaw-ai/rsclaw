@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -11,10 +11,9 @@ use crate::{
 };
 
 use super::super::preparse::{
-    btw_direct_call, is_fast_preparse, processing_timeout, send_processing,
+    btw_direct_call, is_fast_preparse,
     try_preparse_locally,
 };
-use super::super::startup::handle_pending_analysis;
 use super::default_dm_scope;
 
 pub(crate) fn start_discord_if_configured(
@@ -28,6 +27,7 @@ pub(crate) fn start_discord_if_configured(
     channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
+    task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
 ) {
     use crate::channel::discord::DiscordChannel;
 
@@ -89,6 +89,7 @@ pub(crate) fn start_discord_if_configured(
     for (acct_name, token) in dc_accounts {
         let reg = Arc::clone(&registry);
         let cfg_arc = Arc::new(config.clone());
+        let tq = Arc::clone(&task_queue);
         let acct_for_log = acct_name.clone();
         let enforcer = Arc::clone(&enforcer);
         let gp = Arc::new(group_policy.clone());
@@ -129,6 +130,7 @@ pub(crate) fn start_discord_if_configured(
                 let group_policy = Arc::clone(&gp);
                 let group_allow = Arc::clone(&ga);
                 let queues = Arc::clone(&dc_user_queues);
+                let tq = Arc::clone(&tq);
                 tokio::spawn(async move {
                     // Group policy check.
                     if is_guild {
@@ -215,35 +217,26 @@ pub(crate) fn start_discord_if_configured(
                             map.insert(peer_id.clone(), utx.clone());
                             let w_reg = Arc::clone(&reg);
                             let w_cfg = Arc::clone(&cfg);
-                            let w_tx = tx.clone();
+                            let w_tq = Arc::clone(&tq);
                             let w_uid = peer_id.clone();
                             tokio::spawn(async move {
-                                while let Some((mut text, peer_id, channel_id, is_guild, bound)) =
+                                while let Some((text, peer_id, channel_id, is_guild, bound)) =
                                     urx.recv().await
                                 {
-                                    // Debounce: wait briefly then drain queued messages.
-                                    tokio::time::sleep(Duration::from_secs(2)).await;
-                                    while let Ok((extra_text, _, _, _, _)) = urx.try_recv() {
-                                        if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
-                                            text.push('\n');
-                                            text.push_str(&extra_text);
-                                        }
-                                    }
-                                    let process_result = tokio::time::timeout(
-                                        Duration::from_secs(172800), // 48 hours, matching OpenClaw default
-                                        async {
+                                    // No debounce -- task queue merge_into_pending
+                                    // handles rapid consecutive messages automatically.
                                     let handle = if let Some(ref agent_id) = bound {
                                         match w_reg.get(agent_id) {
                                             Ok(h) => h,
                                             Err(_) => match w_reg.route("discord") {
                                                 Ok(h) => h,
-                                                Err(e) => { error!("discord route: {e:#}"); return; }
+                                                Err(e) => { error!("discord route: {e:#}"); continue; }
                                             },
                                         }
                                     } else {
                                         match w_reg.route("discord") {
                                             Ok(h) => h,
-                                            Err(e) => { error!("discord route: {e:#}"); return; }
+                                            Err(e) => { error!("discord route: {e:#}"); continue; }
                                         }
                                     };
                                     let dm_scope = default_dm_scope(&w_cfg);
@@ -261,56 +254,19 @@ pub(crate) fn start_discord_if_configured(
                                         peer_id: peer_id.clone(),
                                         dm_scope,
                                     });
-                                    let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
-                                    let msg = AgentMessage {
-                                        session_key,
+                                    let qmsg = crate::gateway::task_queue::QueuedMessage {
                                         text,
+                                        sender: peer_id.to_string(),
                                         channel: "discord".to_string(),
-                                        peer_id,
-                                        chat_id: String::new(),
-                                        reply_tx,
-                                        extra_tools: vec![],
+                                        chat_id: channel_id.to_string(),
+                                        is_group: is_guild,
+                                        reply_to: None,
+                                        timestamp: chrono::Utc::now().timestamp(),
                                         images: vec![],
                                         files: vec![],
                                     };
-                                    if handle.tx.send(msg).await.is_err() {
-                                        return;
-                                    }
-                                    let reply = tokio::select! {
-                                        result = &mut reply_rx => result,
-                                        _ = tokio::time::sleep(processing_timeout(&w_cfg)) => {
-                                            send_processing(&w_tx, channel_id.clone(), is_guild, &w_cfg).await;
-                                            reply_rx.await
-                                        }
-                                    };
-                                    if let Ok(r) = reply {
-                                        let pending = r.pending_analysis;
-                                        if !r.is_empty {
-                                            if let Err(e) = w_tx
-                                                .send(OutboundMessage {
-                                                    target_id: channel_id.clone(),
-                                                    is_group: is_guild,
-                                                    text: r.text,
-                                                    reply_to: None,
-                                                    images: r.images,
-                                                    files: r.files,
-                                                    channel: None,                                                })
-                                                .await
-                                            {
-                                                tracing::warn!("failed to send message: {e}");
-                                            }
-                                        }
-                                        if let Some(analysis) = pending {
-                                            handle_pending_analysis(
-                                                analysis, Arc::clone(&handle), &w_tx,
-                                                channel_id, is_guild, &w_cfg,
-                                            ).await;
-                                        }
-                                    }
-                                        }
-                                    ).await;
-                                    if process_result.is_err() {
-                                        warn!(user = %w_uid, "discord: message processing timed out (600s), skipping to next");
+                                    if let Err(e) = w_tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
+                                        error!(user = %w_uid, "discord: queue submit failed: {e:#}");
                                     }
                                 }
                                 debug!(user = %w_uid, "discord: per-user worker stopped");

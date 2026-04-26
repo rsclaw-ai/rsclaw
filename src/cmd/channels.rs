@@ -85,9 +85,13 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                 "wechat" | "weixin" | "openclaw-weixin" => {
                     if !quiet { kv("channel", &cyan("WeChat Personal")); }
                     let client = reqwest::Client::new();
-                    let (_url, qrcode) =
+                    let (_url, qrcode) = if quiet {
+                        crate::channel::wechat::WeChatPersonalChannel::start_qr_login_silent(&client)
+                            .await?
+                    } else {
                         crate::channel::wechat::WeChatPersonalChannel::start_qr_login(&client)
-                            .await?;
+                            .await?
+                    };
                     // In quiet mode, just print the QR image path for UI consumption.
                     if quiet {
                         let qr_path = std::env::temp_dir().join("rsclaw_qr.png");
@@ -137,8 +141,15 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                 "feishu" | "lark" | "openclaw-lark" => {
                     let client = reqwest::Client::new();
                     let brand = if channel == "lark" { "lark" } else { "feishu" };
-                    let (app_id, app_secret, actual_brand) =
-                        crate::channel::auth::feishu_auth::onboard(&client, brand).await?;
+                    // Note: onboard_silent writes the QR PNG early then blocks
+                    // on polling. Tauri detects the file via filesystem watch,
+                    // so no path print is needed (subprocess returns only after
+                    // the user has already scanned).
+                    let (app_id, app_secret, actual_brand) = if quiet {
+                        crate::channel::auth::feishu_auth::onboard_silent(&client, brand).await?
+                    } else {
+                        crate::channel::auth::feishu_auth::onboard(&client, brand).await?
+                    };
 
                     // Update config with feishu credentials (multi-account compatible)
                     let (path, mut val) = load_config_json()?;

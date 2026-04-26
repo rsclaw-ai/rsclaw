@@ -131,7 +131,14 @@ impl FileWatcher {
         }
     }
 
-    async fn process_change(&mut self) {
+    /// Re-parse the config file, diff it against the previously loaded
+    /// config, and emit the appropriate `ConfigChange` on the broadcast
+    /// channel.
+    ///
+    /// Public so integration tests can drive a single change deterministically
+    /// without waiting for the polling tick. Inside `run()` this is invoked
+    /// automatically each time the file hash changes.
+    pub async fn process_change(&mut self) {
         match config::load_from(self.path.clone()) {
             Ok(new_cfg) => {
                 // Diff gateway fields against the previous config.

@@ -42,6 +42,9 @@ const KV: TableDefinition<&str, &str> = TableDefinition::new("kv");
 /// Used for migration compatibility (OpenClaw keys, format upgrades).
 const SESSION_ALIASES: TableDefinition<&str, &str> = TableDefinition::new("session_aliases");
 
+/// Task queue: task_id → JSON-serialized QueuedTask.
+const TASK_QUEUE: TableDefinition<&str, &str> = TableDefinition::new("task_queue");
+
 // ---------------------------------------------------------------------------
 // RedbStore
 // ---------------------------------------------------------------------------
@@ -82,6 +85,9 @@ impl RedbStore {
             write
                 .open_table(SESSION_ALIASES)
                 .context("init SESSION_ALIASES")?;
+            write
+                .open_table(TASK_QUEUE)
+                .context("init TASK_QUEUE")?;
         }
         write.commit().context("commit init")?;
 
@@ -445,6 +451,250 @@ impl RedbStore {
             map.insert(k.value().to_owned(), v.value().to_owned());
         }
         Ok(map)
+    }
+
+    // -----------------------------------------------------------------------
+    // Task queue
+    // -----------------------------------------------------------------------
+
+    /// Enqueue a task. Returns `Ok(())` on success.
+    pub fn enqueue_task(&self, task: &crate::gateway::task_queue::QueuedTask) -> Result<()> {
+        let json = serde_json::to_string(task)?;
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(TASK_QUEUE)?;
+            table.insert(task.id.as_str(), json.as_str())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Dequeue the highest-priority pending task (lowest priority number,
+    /// oldest first). Atomically changes status from Pending to Running.
+    pub fn dequeue_task(&self) -> Result<Option<crate::gateway::task_queue::QueuedTask>> {
+        use crate::gateway::task_queue::TaskStatus;
+
+        let write = self.db.begin_write()?;
+        let result = {
+            let mut table = write.open_table(TASK_QUEUE)?;
+            let mut best: Option<crate::gateway::task_queue::QueuedTask> = None;
+
+            // Scan all tasks to find the best candidate.
+            for entry in table.iter()? {
+                let (_k, v) = entry?;
+                let task: crate::gateway::task_queue::QueuedTask =
+                    serde_json::from_str(v.value())?;
+                if task.status != TaskStatus::Pending {
+                    continue;
+                }
+                let dominated = match &best {
+                    None => true,
+                    Some(b) => {
+                        (task.priority, task.created_at) < (b.priority, b.created_at)
+                    }
+                };
+                if dominated {
+                    best = Some(task);
+                }
+            }
+
+            if let Some(mut task) = best {
+                task.status = TaskStatus::Running;
+                task.updated_at = chrono::Utc::now().timestamp();
+                let json = serde_json::to_string(&task)?;
+                table.insert(task.id.as_str(), json.as_str())?;
+                Some(task)
+            } else {
+                None
+            }
+        };
+        write.commit()?;
+        Ok(result)
+    }
+
+    /// Update task status.
+    pub fn update_task_status(
+        &self,
+        task_id: &str,
+        status: crate::gateway::task_queue::TaskStatus,
+    ) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(TASK_QUEUE)?;
+            let guard = table
+                .get(task_id)?
+                .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+            let mut task: crate::gateway::task_queue::QueuedTask =
+                serde_json::from_str(guard.value())?;
+            drop(guard);
+            task.status = status;
+            task.updated_at = chrono::Utc::now().timestamp();
+            let json = serde_json::to_string(&task)?;
+            table.insert(task_id, json.as_str())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Mark a task as failed, increment retry count. If retries >= max,
+    /// mark as Dead. Returns the resulting status.
+    pub fn fail_task(
+        &self,
+        task_id: &str,
+        max_retries: u32,
+    ) -> Result<crate::gateway::task_queue::TaskStatus> {
+        use crate::gateway::task_queue::TaskStatus;
+
+        let write = self.db.begin_write()?;
+        let status = {
+            let mut table = write.open_table(TASK_QUEUE)?;
+            let guard = table
+                .get(task_id)?
+                .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+            let mut task: crate::gateway::task_queue::QueuedTask =
+                serde_json::from_str(guard.value())?;
+            drop(guard);
+            task.retries += 1;
+            task.updated_at = chrono::Utc::now().timestamp();
+            if task.retries >= max_retries {
+                task.status = TaskStatus::Dead;
+            } else {
+                task.status = TaskStatus::Failed;
+            }
+            let new_status = task.status;
+            let json = serde_json::to_string(&task)?;
+            table.insert(task_id, json.as_str())?;
+            new_status
+        };
+        write.commit()?;
+        Ok(status)
+    }
+
+    /// Get a task by ID.
+    pub fn get_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<crate::gateway::task_queue::QueuedTask>> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(TASK_QUEUE)?;
+        match table.get(task_id)? {
+            Some(guard) => {
+                let task = serde_json::from_str(guard.value())?;
+                Ok(Some(task))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// List tasks, optionally filtered by status.
+    pub fn list_tasks(
+        &self,
+        status: Option<crate::gateway::task_queue::TaskStatus>,
+    ) -> Result<Vec<crate::gateway::task_queue::QueuedTask>> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(TASK_QUEUE)?;
+        let mut tasks = Vec::new();
+        for entry in table.iter()? {
+            let (_k, v) = entry?;
+            let task: crate::gateway::task_queue::QueuedTask =
+                serde_json::from_str(v.value())?;
+            if let Some(ref s) = status {
+                if task.status != *s {
+                    continue;
+                }
+            }
+            tasks.push(task);
+        }
+        Ok(tasks)
+    }
+
+    /// Remove expired tasks (past TTL). Returns count removed.
+    pub fn cleanup_expired_tasks(&self) -> Result<usize> {
+        let write = self.db.begin_write()?;
+        let count = {
+            let mut table = write.open_table(TASK_QUEUE)?;
+            let mut expired_ids = Vec::new();
+            for entry in table.iter()? {
+                let (_k, v) = entry?;
+                let task: crate::gateway::task_queue::QueuedTask =
+                    serde_json::from_str(v.value())?;
+                if task.is_expired() {
+                    expired_ids.push(task.id);
+                }
+            }
+            let count = expired_ids.len();
+            for id in &expired_ids {
+                table.remove(id.as_str())?;
+            }
+            count
+        };
+        write.commit()?;
+        Ok(count)
+    }
+
+    /// Check if there is a pending task for the same session_key with the
+    /// same content hash (dedup guard).
+    pub fn has_duplicate(&self, session_key: &str, content_hash: &str) -> Result<bool> {
+        use crate::gateway::task_queue::TaskStatus;
+
+        let read = self.db.begin_read()?;
+        let table = read.open_table(TASK_QUEUE)?;
+        for entry in table.iter()? {
+            let (_k, v) = entry?;
+            let task: crate::gateway::task_queue::QueuedTask =
+                serde_json::from_str(v.value())?;
+            if task.session_key == session_key
+                && task.content_hash == content_hash
+                && task.status == TaskStatus::Pending
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Merge a message into an existing pending task for the same
+    /// session_key. Returns `true` if a merge happened.
+    pub fn merge_into_pending(
+        &self,
+        session_key: &str,
+        message: &crate::gateway::task_queue::QueuedMessage,
+    ) -> Result<bool> {
+        use crate::gateway::task_queue::TaskStatus;
+
+        let write = self.db.begin_write()?;
+        let merged = {
+            let mut table = write.open_table(TASK_QUEUE)?;
+            let mut target_id: Option<String> = None;
+
+            for entry in table.iter()? {
+                let (_k, v) = entry?;
+                let task: crate::gateway::task_queue::QueuedTask =
+                    serde_json::from_str(v.value())?;
+                if task.session_key == session_key && task.status == TaskStatus::Pending {
+                    target_id = Some(task.id);
+                    break;
+                }
+            }
+
+            if let Some(id) = target_id {
+                let guard = table
+                    .get(id.as_str())?
+                    .ok_or_else(|| anyhow::anyhow!("task disappeared: {id}"))?;
+                let mut task: crate::gateway::task_queue::QueuedTask =
+                    serde_json::from_str(guard.value())?;
+                drop(guard);
+                task.messages.push(message.clone());
+                task.updated_at = chrono::Utc::now().timestamp();
+                let json = serde_json::to_string(&task)?;
+                table.insert(id.as_str(), json.as_str())?;
+                true
+            } else {
+                false
+            }
+        };
+        write.commit()?;
+        Ok(merged)
     }
 }
 

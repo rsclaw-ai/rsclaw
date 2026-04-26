@@ -334,6 +334,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let presence = EventFrame::new("presence", json!({ "agents": agents_list }), 0);
     let _ = send_frame(&outbound_tx, &presence).await; // receiver may have disconnected
 
+    // 6b. Replay any latched pending restart so late-connecting UIs see the
+    //     current pending event without having to wait for the next publish.
+    if let Some(req) = state
+        .pending_restart
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+    {
+        let payload = serde_json::to_value(&req).unwrap_or(json!({}));
+        let frame = EventFrame::new("restart.required", payload, 0);
+        let _ = send_frame(&outbound_tx, &frame).await; // receiver may have disconnected
+    }
+
     // 7. Register this connection in the ConnRegistry.
     let conn_id: ConnId = uuid::Uuid::new_v4().to_string();
     let conn = Arc::new(RwLock::new(ConnHandle::new(
@@ -397,6 +410,39 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 }
             }
             info!(conn = %relay_id, "ws auto-relay exited");
+        });
+    }
+
+    // 8b. Restart-event relay: forward every RestartRequest published into the
+    //     gateway-wide broadcast channel as a `restart.required` EventFrame so
+    //     the UI can render its banner ([Restart Now] / [Later] / [Dismiss]).
+    {
+        let rx = state.restart_request_tx.subscribe();
+        let relay_tx = outbound_tx.clone();
+        let relay_conn = Arc::clone(&conn);
+        let relay_id = conn_id.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt as _;
+            info!(conn = %relay_id, "ws restart-relay started");
+            let mut stream = tokio_stream::wrappers::BroadcastStream::new(rx);
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(req) => {
+                        let seq = relay_conn.write().await.next_seq();
+                        let payload = serde_json::to_value(&req).unwrap_or(json!({}));
+                        let frame = EventFrame::new("restart.required", payload, seq);
+                        let json = serde_json::to_string(&frame).unwrap_or_default();
+                        if relay_tx.send(json).await.is_err() {
+                            info!(conn = %relay_id, "ws restart-relay: outbound closed");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(conn = %relay_id, error = %e, "ws restart-relay: recv error");
+                    }
+                }
+            }
+            info!(conn = %relay_id, "ws restart-relay exited");
         });
     }
 

@@ -171,14 +171,28 @@ pub struct HeartbeatRunner {
     active: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Shared memory store (used by meditation heartbeat type).
     memory: Option<Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>>,
+    /// Optional graceful-shutdown coordinator. Per-agent loops exit at the
+    /// next tick when draining; the rescan loop also stops scheduling new
+    /// agent loops.
+    shutdown: Option<crate::gateway::ShutdownCoordinator>,
 }
 
 impl HeartbeatRunner {
-    /// Create a new heartbeat runner.
+    /// Create a new heartbeat runner without a shutdown coordinator.
     pub fn new(
         registry: Arc<AgentRegistry>,
         data_dir: &Path,
         memory: Option<Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>>,
+    ) -> Self {
+        Self::new_with_shutdown(registry, data_dir, memory, None)
+    }
+
+    /// Create a new heartbeat runner with an explicit shutdown coordinator.
+    pub fn new_with_shutdown(
+        registry: Arc<AgentRegistry>,
+        data_dir: &Path,
+        memory: Option<Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>>,
+        shutdown: Option<crate::gateway::ShutdownCoordinator>,
     ) -> Self {
         let state_path = data_dir.join("heartbeat").join("state.json");
         Self {
@@ -186,6 +200,7 @@ impl HeartbeatRunner {
             store: Arc::new(HeartbeatStore::new(state_path)),
             active: std::sync::Mutex::new(std::collections::HashSet::new()),
             memory,
+            shutdown,
         }
     }
 
@@ -199,6 +214,12 @@ impl HeartbeatRunner {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
+                if let Some(s) = &runner.shutdown {
+                    if s.is_draining() {
+                        info!("heartbeat rescan: drain signaled, stopping");
+                        break;
+                    }
+                }
                 runner.scan_and_spawn();
             }
         });
@@ -287,6 +308,13 @@ impl HeartbeatRunner {
         tokio::time::sleep(delay).await;
 
         loop {
+            if let Some(s) = &self.shutdown {
+                if s.is_draining() {
+                    info!(agent_id, "heartbeat: drain signaled, stopping");
+                    return;
+                }
+            }
+
             // Re-read HEARTBEAT.md each tick (auto hot-reload).
             let spec = match self.read_spec(&heartbeat_path) {
                 Some(s) => s,
@@ -302,6 +330,10 @@ impl HeartbeatRunner {
                 tokio::time::sleep(sleep_dur).await;
                 continue;
             }
+
+            // Track this tick in the gateway's inflight count so a graceful
+            // restart waits for it before exiting.
+            let _inflight_guard = self.shutdown.as_ref().map(|s| s.begin_work());
 
             // Execute heartbeat action based on type.
             let result = match spec.spec_type {

@@ -368,9 +368,15 @@ pub struct CronRunner {
     default_delivery: Option<CronDelivery>,
     reload_tx: broadcast::Sender<()>,
     ws_conns: Arc<crate::ws::ConnRegistry>,
+    /// Optional graceful-shutdown coordinator. When draining, the scheduler
+    /// loop exits at the next iteration without firing further jobs. Tests
+    /// that don't care about graceful shutdown can pass `None`.
+    shutdown: Option<crate::gateway::ShutdownCoordinator>,
 }
 
 impl CronRunner {
+    /// Construct a new cron runner without a shutdown coordinator. Suitable
+    /// for tests that don't exercise graceful shutdown.
     pub fn new(
         config: &CronConfig,
         jobs: Vec<CronJob>,
@@ -379,6 +385,23 @@ impl CronRunner {
         data_dir: PathBuf,
         reload_tx: broadcast::Sender<()>,
         ws_conns: Arc<crate::ws::ConnRegistry>,
+    ) -> Self {
+        Self::new_with_shutdown(
+            config, jobs, agents, channels, data_dir, reload_tx, ws_conns, None,
+        )
+    }
+
+    /// Construct a new cron runner with an explicit shutdown coordinator.
+    /// The runtime uses this constructor; tests typically use [`new`].
+    pub fn new_with_shutdown(
+        config: &CronConfig,
+        jobs: Vec<CronJob>,
+        agents: Arc<AgentRegistry>,
+        channels: Arc<ChannelManager>,
+        data_dir: PathBuf,
+        reload_tx: broadcast::Sender<()>,
+        ws_conns: Arc<crate::ws::ConnRegistry>,
+        shutdown: Option<crate::gateway::ShutdownCoordinator>,
     ) -> Self {
         let run_log_dir = data_dir.join("cron");
         let store_path = data_dir.join("cron_store.json");
@@ -395,6 +418,7 @@ impl CronRunner {
             default_delivery: config.default_delivery.clone(),
             reload_tx,
             ws_conns,
+            shutdown,
         }
     }
 
@@ -515,6 +539,12 @@ impl CronRunner {
         loop {
             if !running.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
+            }
+            if let Some(s) = &self.shutdown {
+                if s.is_draining() {
+                    info!("cron scheduler: drain signaled, stopping job dispatch");
+                    break;
+                }
             }
 
             let now_ms = current_timestamp_ms();
@@ -755,6 +785,19 @@ impl CronRunner {
                     // Max concurrency reached — remaining jobs will fire next tick.
                     break;
                 }
+                // Re-check drain after the await — `acquire_owned` can park
+                // arbitrarily long on a saturated semaphore, and a restart can
+                // arrive while parked. Without this re-check, a job slot
+                // claimed during drain would spawn after `is_draining()`
+                // returned true on the previous iteration, hiding from the
+                // 60s drain window.
+                if let Some(s) = &self.shutdown {
+                    if s.is_draining() {
+                        info!("cron scheduler: drain signaled during permit await, dropping job {}", job_id);
+                        drop(permit);
+                        break;
+                    }
+                }
 
                 let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) else {
                     continue;
@@ -778,8 +821,12 @@ impl CronRunner {
                 let run_log_dir = self.run_log_dir.clone();
                 let default_delivery = self.default_delivery.clone();
                 let ws_conns = Arc::clone(&self.ws_conns);
+                // Track this job in the gateway's inflight count so a graceful
+                // restart waits for it (until drain timeout) before exiting.
+                let inflight_guard = self.shutdown.as_ref().map(|s| s.begin_work());
 
                 let handle = tokio::spawn(async move {
+                    let _inflight_guard = inflight_guard;
                     let start_time = current_timestamp_ms();
                     let job_started_at = started_at;
                     let prev_consecutive_errors = job.state.as_ref().map(|s| s.consecutive_errors).unwrap_or(0);
@@ -836,10 +883,11 @@ impl CronRunner {
                         Ok(_) => {
                             // Success but no output - send summary
                             let job_name = job.name.as_deref().unwrap_or(&job.id);
-                            format!(
-                                "✅ 定时任务执行完成\n\n**任务**: {}\n**耗时**: {}秒",
-                                job_name,
-                                duration_ms / 1000
+                            let seconds = (duration_ms / 1000).to_string();
+                            crate::i18n::t_fmt(
+                                "cron_run_success",
+                                crate::i18n::default_lang(),
+                                &[("name", job_name), ("seconds", &seconds)],
                             )
                         }
                         Err(e) => {
@@ -857,20 +905,28 @@ impl CronRunner {
                                 format!("{}小时", backoff / 3_600_000)
                             };
 
+                            let consecutive_str = consecutive.to_string();
+                            let error_str = e.to_string();
                             if will_disable {
-                                format!(
-                                    "❌ 定时任务执行失败\n\n**任务**: {}\n**连续失败**: {} 次\n**错误**: {}\n\n⚠️ 任务已被自动禁用，请检查配置后手动启用。",
-                                    job_name,
-                                    consecutive,
-                                    e
+                                crate::i18n::t_fmt(
+                                    "cron_run_failed_disabled",
+                                    crate::i18n::default_lang(),
+                                    &[
+                                        ("name", job_name),
+                                        ("consecutive", &consecutive_str),
+                                        ("error", &error_str),
+                                    ],
                                 )
                             } else {
-                                format!(
-                                    "❌ 定时任务执行失败\n\n**任务**: {}\n**连续失败**: {} 次\n**下次重试**: {}后\n**错误**: {}",
-                                    job_name,
-                                    consecutive,
-                                    backoff_text,
-                                    e
+                                crate::i18n::t_fmt(
+                                    "cron_run_failed_retry",
+                                    crate::i18n::default_lang(),
+                                    &[
+                                        ("name", job_name),
+                                        ("consecutive", &consecutive_str),
+                                        ("backoff", &backoff_text),
+                                        ("error", &error_str),
+                                    ],
                                 )
                             }
                         }
@@ -953,6 +1009,10 @@ impl CronRunner {
 
         info!(job_id = %job.id, "manually triggering cron job");
         let _permit = self.semaphore.acquire().await?;
+        // Track in the gateway inflight count so a graceful restart waits for
+        // a manual /api/v1/cron/run invocation to finish (until drain timeout)
+        // before re-execing.
+        let _inflight_guard = self.shutdown.as_ref().map(|s| s.begin_work());
         let prev_consecutive_errors = job.state.as_ref().map(|s| s.consecutive_errors).unwrap_or(0);
         // systemEvent: deliver payload text directly — no agent call needed.
         // execCommand: execute the command directly, bypassing agent and session history.
@@ -985,16 +1045,27 @@ impl CronRunner {
             Ok(output) if !output.trim().is_empty() => output.clone(),
             Ok(_) => {
                 let job_name = job.name.as_deref().unwrap_or(&job.id);
-                format!("✅ 定时任务执行完成\n\n**任务**: {}", job_name)
+                crate::i18n::t_fmt(
+                    "cron_run_success_no_duration",
+                    crate::i18n::default_lang(),
+                    &[("name", job_name)],
+                )
             }
             Err(e) => {
                 let job_name = job.name.as_deref().unwrap_or(&job.id);
                 let consecutive = prev_consecutive_errors + 1;
                 // Manual trigger: show error but don't mention auto-disable
                 // (manual triggers don't count toward auto-disable threshold)
-                format!(
-                    "❌ 定时任务执行失败\n\n**任务**: {}\n**连续失败**: {} 次\n**错误**: {}",
-                    job_name, consecutive, e
+                let consecutive_str = consecutive.to_string();
+                let error_str = e.to_string();
+                crate::i18n::t_fmt(
+                    "cron_run_failed_manual",
+                    crate::i18n::default_lang(),
+                    &[
+                        ("name", job_name),
+                        ("consecutive", &consecutive_str),
+                        ("error", &error_str),
+                    ],
                 )
             }
         };
@@ -1021,12 +1092,26 @@ impl CronRunner {
     /// Preserves running state and error counts for existing jobs.
     /// Jobs in old_jobs but NOT in new_jobs are dropped (deleted from file).
     /// Takes `now_ms` from the caller (timer_loop) to avoid redundant calls.
+    ///
+    /// When a job's schedule changes (e.g. user edits `*/1 * * * *` to
+    /// `*/30 * * * *`), the cached `next_run_at_ms` was computed against the
+    /// OLD cadence and would still fire under that old rhythm one more time
+    /// before the new schedule kicks in.  Detect a schedule change here and
+    /// force-recompute `next_run_at_ms` so the new cadence takes effect at the
+    /// next reload tick.
     fn merge_jobs(&self, old_jobs: &[CronJob], new_jobs: Vec<CronJob>, now_ms: u64) -> Vec<CronJob> {
         let mut result = Vec::with_capacity(new_jobs.len());
 
         for mut new_job in new_jobs {
+            let mut schedule_changed = false;
             // Try to find existing job by ID and preserve its state
             if let Some(old_job) = old_jobs.iter().find(|j| j.id == new_job.id) {
+                // Detect schedule edit before we overwrite state.  Compare via
+                // serde_json::Value so we don't have to derive PartialEq on the
+                // CronSchedule enum (which would force PartialEq on every
+                // variant payload).
+                schedule_changed = serde_json::to_value(&old_job.schedule).ok()
+                    != serde_json::to_value(&new_job.schedule).ok();
                 // Preserve state from old job
                 new_job.state = old_job.state.clone();
             } else {
@@ -1039,9 +1124,20 @@ impl CronRunner {
                 }
             }
 
-            // Ensure next_run_at_ms is set
+            // Ensure next_run_at_ms is set; recompute when the schedule changed
+            // so an edit cancels the old cadence rather than firing one more
+            // time on the OLD schedule.
             if let Some(ref mut state) = new_job.state {
-                if state.next_run_at_ms.is_none() {
+                if schedule_changed {
+                    let next = new_job.schedule.compute_next_run(now_ms);
+                    debug!(
+                        job_id = %new_job.id,
+                        old_next = ?state.next_run_at_ms,
+                        new_next = ?next,
+                        "cron: schedule changed, recomputing next_run_at_ms"
+                    );
+                    state.next_run_at_ms = next;
+                } else if state.next_run_at_ms.is_none() {
                     state.next_run_at_ms = new_job.schedule.compute_next_run(now_ms);
                 }
             }
@@ -1077,6 +1173,7 @@ impl Clone for CronRunner {
             default_delivery: self.default_delivery.clone(),
             reload_tx: self.reload_tx.clone(),
             ws_conns: Arc::clone(&self.ws_conns),
+            shutdown: self.shutdown.clone(),
         }
     }
 }

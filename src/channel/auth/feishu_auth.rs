@@ -52,9 +52,20 @@ struct PollUserInfo {
     tenant_brand: Option<String>,
 }
 
-/// Run the full Feishu device authorization onboarding.
+/// Run the full Feishu device authorization onboarding with terminal output.
 /// Returns (app_id, app_secret, brand) on success.
 pub async fn onboard(client: &Client, brand: &str) -> Result<(String, String, String)> {
+    onboard_inner(client, brand, false).await
+}
+
+/// Same as [`onboard`] but suppresses all stdout (no banners, no prompts) and
+/// writes the QR code to a temp PNG file instead of rendering it in the
+/// terminal. Used by Tauri-spawned `rsclaw channels login --quiet feishu`.
+pub async fn onboard_silent(client: &Client, brand: &str) -> Result<(String, String, String)> {
+    onboard_inner(client, brand, true).await
+}
+
+async fn onboard_inner(client: &Client, brand: &str, silent: bool) -> Result<(String, String, String)> {
     let base = accounts_url(brand);
 
     // 1. Init
@@ -101,9 +112,13 @@ pub async fn onboard(client: &Client, brand: &str) -> Result<(String, String, St
         "?"
     };
     let qr_url = format!("{}{sep}from=onboard", begin_resp.verification_uri_complete);
-    println!("=== Feishu Bot Setup ===");
-    println!("Scan with Feishu app to create and configure your bot:");
-    super::display_qr_terminal(&qr_url)?;
+    if silent {
+        super::save_qr_to_path(&qr_url)?;
+    } else {
+        println!("=== Feishu Bot Setup ===");
+        println!("Scan with Feishu app to create and configure your bot:");
+        super::display_qr_terminal(&qr_url)?;
+    }
 
     // 4. Poll
     let interval = begin_resp.interval.unwrap_or(5);
@@ -111,7 +126,9 @@ pub async fn onboard(client: &Client, brand: &str) -> Result<(String, String, St
     let device_code = begin_resp.device_code;
     let mut actual_brand = brand.to_owned();
 
-    println!("Waiting for scan...");
+    if !silent {
+        println!("Waiting for scan...");
+    }
 
     let start = std::time::Instant::now();
     loop {
@@ -151,8 +168,10 @@ pub async fn onboard(client: &Client, brand: &str) -> Result<(String, String, St
         if let (Some(app_id), Some(app_secret)) = (app_id, app_secret) {
             let open_id = poll.user_info.and_then(|u| u.open_id).unwrap_or_default();
 
-            println!("Bot configured successfully!");
-            println!("  App ID: {app_id}");
+            if !silent {
+                println!("Bot configured successfully!");
+                println!("  App ID: {app_id}");
+            }
 
             // Save to auth store
             super::save_token(
