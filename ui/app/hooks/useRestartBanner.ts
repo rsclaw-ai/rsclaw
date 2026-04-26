@@ -40,7 +40,7 @@ export function useRestartBanner(): RestartBannerControls {
   useEffect(() => {
     rsclawWs.connect();
 
-    const unsub = rsclawWs.onRestartRequired((payload) => {
+    const unsubEvent = rsclawWs.onRestartRequired((payload) => {
       const now = Date.now();
       const snoozedUntil = readSnoozedUntil();
       if (snoozedUntil > now) {
@@ -50,7 +50,20 @@ export function useRestartBanner(): RestartBannerControls {
       setState({ visible: true, payload });
     });
 
-    return unsub;
+    // Each fresh handshake clears the banner. If the new gateway has a
+    // latched restart.required it arrives in the very next frame and
+    // re-arms the banner above. Without this, banner state leaks across
+    // sidecar swaps (gateway dies → React state preserved → reconnect to
+    // empty-latch gateway → banner stays visible forever, eventually
+    // triggering the auto-restart timer in a loop).
+    const unsubConnect = rsclawWs.onConnect(() => {
+      setState({ visible: false, payload: null });
+    });
+
+    return () => {
+      unsubEvent();
+      unsubConnect();
+    };
   }, []);
 
   const snooze = useCallback(() => {
