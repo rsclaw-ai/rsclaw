@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  RsClaw menu-bar (status-bar) icon.
+
+  Designed to be legible at 22x22.  Uses solid fills instead of strokes
+  because stroke widths under ~2px get muddied by anti-aliasing at this
+  size.  Spoke lines / leg-tip dots / inner eyes from the full logo are
+  dropped because they vanish below ~5px of real pixels.  Pure white at
+  full opacity so it reads against a dark menu bar.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <g fill="#ffffff" stroke="none">
+    <!-- Hex body (solid filled) with a small inner cutout for "face" feel -->
+    <path d="
+      M32,15
+      L48,23
+      L48,40
+      L32,48
+      L16,40
+      L16,23
+      Z
+      M32,28
+      L26,32
+      L32,36
+      L38,32
+      Z
+    " fill-rule="evenodd"/>
+
+    <!-- Left claw arm -->
+    <path d="
+      M16,23
+      Q9,16  6,8
+      L9,7
+      Q12,15 19,21
+      Z
+    "/>
+    <!-- Left pincer top -->
+    <path d="
+      M6,8
+      Q3,3 4,1
+      L7,1
+      Q6,4 8,7
+      Z
+    "/>
+    <!-- Left pincer bottom -->
+    <path d="
+      M6,8
+      Q1,9 0,5
+      L1,2
+      Q3,6 7,6
+      Z
+    "/>
+
+    <!-- Right claw arm -->
+    <path d="
+      M48,23
+      Q55,16 58,8
+      L55,7
+      Q52,15 45,21
+      Z
+    "/>
+    <!-- Right pincer top -->
+    <path d="
+      M58,8
+      Q61,3 60,1
+      L57,1
+      Q58,4 56,7
+      Z
+    "/>
+    <!-- Right pincer bottom -->
+    <path d="
+      M58,8
+      Q63,9 64,5
+      L63,2
+      Q61,6 57,6
+      Z
+    "/>
+
+    <!-- Three legs as solid trapezoids -->
+    <path d="M24,46 L28,46 L23,58 L20,58 Z"/>
+    <path d="M30,48 L34,48 L34,60 L30,60 Z"/>
+    <path d="M36,46 L40,46 L44,58 L41,58 Z"/>
+  </g>
+</svg>
