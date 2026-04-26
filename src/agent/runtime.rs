@@ -4918,7 +4918,18 @@ impl AgentRuntime {
         //    because plugins win the priority ladder).
         if let Some((plugin_name, tool_name)) = name.split_once('.') {
             if let Some(wp) = self.wasm_plugins.iter().find(|p| p.name == plugin_name) {
-                return wp.call_tool(tool_name, args).await;
+                let notify_ctx = self.notification_tx.as_ref().map(|tx| {
+                    crate::plugin::wasm_runtime::WasmNotifyCtx {
+                        tx: tx.clone(),
+                        target_id: if !ctx.chat_id.is_empty() {
+                            ctx.chat_id.clone()
+                        } else {
+                            ctx.peer_id.clone()
+                        },
+                        channel: ctx.channel.clone(),
+                    }
+                });
+                return wp.call_tool_with_ctx(tool_name, args, notify_ctx).await;
             }
         }
 

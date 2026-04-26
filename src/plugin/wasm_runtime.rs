@@ -90,15 +90,30 @@ pub struct WasmToolDef {
     pub parameters: serde_json::Value,
 }
 
+/// Routing context for `host::notify` — when supplied by the agent
+/// runtime, plugin notifications get forwarded as a real OutboundMessage
+/// to the user's current channel; without it, notifications are
+/// trace-logged only.
+#[derive(Clone)]
+pub struct WasmNotifyCtx {
+    pub tx: tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>,
+    pub target_id: String,
+    pub channel: String,
+}
+
 /// State passed into the wasmtime `Store`, available to host functions.
 struct HostState {
     browser: Arc<Mutex<Option<BrowserSession>>>,
     wasi: wasmtime_wasi::WasiCtx,
     wasi_table: wasmtime::component::ResourceTable,
     limits: StoreLimits,
+    notify_ctx: Option<WasmNotifyCtx>,
 }
 
-fn new_host_state(browser: Arc<Mutex<Option<BrowserSession>>>) -> HostState {
+fn new_host_state(
+    browser: Arc<Mutex<Option<BrowserSession>>>,
+    notify_ctx: Option<WasmNotifyCtx>,
+) -> HostState {
     HostState {
         browser,
         wasi: wasmtime_wasi::WasiCtxBuilder::new().build(),
@@ -106,6 +121,7 @@ fn new_host_state(browser: Arc<Mutex<Option<BrowserSession>>>) -> HostState {
         limits: StoreLimitsBuilder::new()
             .memory_size(MEMORY_CAP_BYTES)
             .build(),
+        notify_ctx,
     }
 }
 
@@ -114,8 +130,9 @@ fn new_host_state(browser: Arc<Mutex<Option<BrowserSession>>>) -> HostState {
 fn new_sandboxed_store(
     engine: &Engine,
     browser: Arc<Mutex<Option<BrowserSession>>>,
+    notify_ctx: Option<WasmNotifyCtx>,
 ) -> Store<HostState> {
-    let mut store = Store::new(engine, new_host_state(browser));
+    let mut store = Store::new(engine, new_host_state(browser, notify_ctx));
     store.limiter(|s| &mut s.limits);
     store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
     store
@@ -301,14 +318,22 @@ impl rsclaw::jimeng::host_browser::Host for HostState {
         ref_str: String,
         filepath: String,
     ) -> Result<Result<String, String>> {
-        let canonical = match canonicalize_plugin_path(&filepath) {
-            Ok(p) => p,
-            Err(e) => return Ok(Err(e)),
-        };
+        // Uploads send a file *out* of the host to a remote site. Unlike
+        // read_file (which enforces workspace containment to prevent reading
+        // /etc/passwd etc.), upload paths are typically user-supplied via
+        // the LLM ("upload ~/Downloads/cat.png") so we tolerate any path
+        // the user has access to. Just expand `~` and normalize.
+        let workspace = crate::config::loader::base_dir().join("workspace");
+        let canonical = crate::agent::runtime::canonicalize_external_path(&filepath, &workspace);
+        // Note: cmd_upload expects `files: [path]` (array), not `filepath: path`.
         Ok(self
             .browser_action(
                 "upload",
-                json!({"ref": ref_str, "filepath": canonical.to_string_lossy()}),
+                json!({
+                    "ref": ref_str,
+                    "files": [canonical.to_string_lossy()],
+                    "filepath": canonical.to_string_lossy(),
+                }),
             )
             .await)
     }
@@ -338,11 +363,21 @@ impl rsclaw::jimeng::host_runtime::Host for HostState {
     }
 
     async fn notify(&mut self, message: String) -> Result<Result<String, String>> {
-        // For now, plugin progress notifications are surfaced via tracing.
-        // When we wire wasm plugins into the agent runtime's notification_tx
-        // (see runtime.rs), this becomes the dispatch point.
         tracing::info!(target: "wasm_plugin_notify", "{message}");
-        Ok(Ok("ok".to_string()))
+        if let Some(ctx) = &self.notify_ctx {
+            let _ = ctx.tx.send(crate::channel::OutboundMessage {
+                target_id: ctx.target_id.clone(),
+                is_group: false,
+                text: message,
+                reply_to: None,
+                images: vec![],
+                files: vec![],
+                channel: Some(ctx.channel.clone()),
+            });
+            Ok(Ok("dispatched".to_string()))
+        } else {
+            Ok(Ok("logged_only".to_string()))
+        }
     }
 
     async fn read_file(&mut self, path: String) -> Result<Result<String, String>> {
@@ -511,10 +546,22 @@ impl WasmPlugin {
     /// The tool name must match one of the plugin's declared tools.
     /// Arguments are passed as a JSON value and the result is returned
     /// as a JSON value.
+    /// Convenience: dispatch without a notify routing context (e.g. when
+    /// invoked via /api/v1/tools/execute for debugging). `host::notify`
+    /// calls fall back to trace logging only.
     pub async fn call_tool(
         &self,
         tool_name: &str,
         args: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.call_tool_with_ctx(tool_name, args, None).await
+    }
+
+    pub async fn call_tool_with_ctx(
+        &self,
+        tool_name: &str,
+        args: serde_json::Value,
+        notify_ctx: Option<WasmNotifyCtx>,
     ) -> Result<serde_json::Value> {
         // Verify the tool exists in this plugin's manifest.
         let _tool_def = self
@@ -545,7 +592,8 @@ impl WasmPlugin {
         }
 
         // Fresh store per call for isolation, with memory cap and epoch deadline.
-        let mut store = new_sandboxed_store(&self.engine, Arc::clone(&self.browser));
+        let mut store =
+            new_sandboxed_store(&self.engine, Arc::clone(&self.browser), notify_ctx);
 
         let instance = self
             .linker
