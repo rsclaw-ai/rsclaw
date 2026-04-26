@@ -257,29 +257,13 @@ fn get_gateway_port() -> Result<serde_json::Value, String> {
     };
     // Read auth token: gateway.auth.token > env var
     // If missing, auto-generate one and write it to config.
-    let mut token = val.pointer("/gateway/auth/token")
+    // Read-only: use token from config or env, never auto-generate.
+    // If user wants auth they configure gateway.auth.token themselves.
+    let token = val.pointer("/gateway/auth/token")
         .and_then(|v| v.as_str())
         .map(|s| s.to_owned())
         .or_else(|| std::env::var("RSCLAW_AUTH_TOKEN").ok())
         .unwrap_or_default();
-
-    if token.is_empty() {
-        // Generate a random token and write to config
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-        let pid = std::process::id();
-        let generated = format!("{:016x}{:08x}", ts, pid);
-        let mut cfg: serde_json::Value = json5::from_str(&raw).unwrap_or(serde_json::json!({}));
-        if cfg.get("gateway").is_none() {
-            cfg["gateway"] = serde_json::json!({});
-        }
-        if cfg["gateway"].get("auth").is_none() {
-            cfg["gateway"]["auth"] = serde_json::json!({});
-        }
-        cfg["gateway"]["auth"]["token"] = serde_json::json!(generated);
-        let _ = std::fs::write(&config_path, serde_json::to_string_pretty(&cfg).unwrap_or_default());
-        token = generated;
-    }
 
     Ok(serde_json::json!({
         "url": format!("http://{}:{}", host, port),
