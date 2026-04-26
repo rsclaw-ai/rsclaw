@@ -2347,12 +2347,11 @@ function AgentManagerPage() {
 
             {/* Temperature */}
             <div className={styles["cfg-f"]}>
-              <div className={styles["cfg-lbl"]}>{getLang() === "cn" ? "采样温度" : "Temperature"} <span style={{ color: "#666", fontWeight: 400 }}>({getLang() === "cn" ? "auto = 沿用全局" : "auto = inherit defaults"})</span></div>
+              <div className={styles["cfg-lbl"]}>{getLang() === "cn" ? "采样温度" : "Temperature"} <span className={styles["cfg-hint"]}>({getLang() === "cn" ? "auto = 沿用全局" : "auto = inherit defaults"})</span></div>
               <select
-                className={styles["cfg-select"]}
+                className={styles["cfg-select-narrow"]}
                 value={newTemperature}
                 onChange={(e) => setNewTemperature(e.target.value)}
-                style={{ maxWidth: 200 }}
               >
                 <option value="auto">{getLang() === "cn" ? "自动 (auto)" : "Auto"}</option>
                 <option value="0">0.0</option>
