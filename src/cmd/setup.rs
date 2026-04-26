@@ -209,11 +209,7 @@ fn default_config(lang: &str) -> String {
 }}
 "#,
         lang_name = lang_name,
-        model_download_url = if lang == "zh" {
-            r#"modelDownloadUrl: "https://hf-mirror.com/BAAI/bge-small-zh-v1.5/resolve/main","#
-        } else {
-            r#"modelDownloadUrl: "https://huggingface.co/BAAI/bge-small-zh-v1.5/resolve/main","#
-        },
+        model_download_url = r#"// modelDownloadUrl: "https://gitfast.org/tools/models/bge-small-zh-v1.5.zip","#,
     )
 }
 

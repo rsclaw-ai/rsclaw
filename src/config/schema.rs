@@ -1754,8 +1754,8 @@ pub struct MemorySearchConfig {
 pub struct LocalEmbeddingConfig {
     /// Path to a GGUF model file for local embedding
     pub model_path: Option<String>,
-    /// Override HuggingFace download URL for the embedding model.
-    /// Default: auto-detect based on locale (hf-mirror.com for zh, huggingface.co otherwise).
+    /// Override download URL for the embedding model.
+    /// Default: https://gitfast.org/tools/models/bge-small-zh-v1.5.zip
     pub model_download_url: Option<String>,
     /// Model repo name on HuggingFace (default: "BAAI/bge-small-zh-v1.5")
     pub model_repo: Option<String>,

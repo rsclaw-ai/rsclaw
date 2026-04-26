@@ -1074,7 +1074,7 @@ pub(crate) async fn handle_pending_analysis(
 // ---------------------------------------------------------------------------
 
 /// Download BGE-Small embedding model files from HuggingFace.
-/// Uses hf-mirror.com for Chinese locale, huggingface.co otherwise.
+/// Downloads BGE model from gitfast.org (ZIP archive).
 async fn download_bge_model(
     target_dir: &std::path::Path,
     search_cfg: Option<&crate::config::schema::MemorySearchConfig>,
