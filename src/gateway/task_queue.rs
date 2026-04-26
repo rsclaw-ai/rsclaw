@@ -859,6 +859,12 @@ impl TaskQueueWorker {
                     if let Err(e) = tx.send(out).await {
                         error!(task_id = %task_id, "send reply failed: {e}");
                     }
+                } else {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        channel = %channel_name,
+                        "no channel sender registered, reply dropped"
+                    );
                 }
             }
 
