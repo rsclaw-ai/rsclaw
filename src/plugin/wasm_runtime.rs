@@ -330,6 +330,14 @@ impl rsclaw::jimeng::host_runtime::Host for HostState {
         Ok(())
     }
 
+    async fn notify(&mut self, message: String) -> Result<Result<String, String>> {
+        // For now, plugin progress notifications are surfaced via tracing.
+        // When we wire wasm plugins into the agent runtime's notification_tx
+        // (see runtime.rs), this becomes the dispatch point.
+        tracing::info!(target: "wasm_plugin_notify", "{message}");
+        Ok(Ok("ok".to_string()))
+    }
+
     async fn read_file(&mut self, path: String) -> Result<Result<String, String>> {
         let canonical = match canonicalize_plugin_path(&path) {
             Ok(p) => p,
