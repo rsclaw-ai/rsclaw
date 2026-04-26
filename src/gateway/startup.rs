@@ -716,7 +716,36 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             }
         };
         let mut cmd = std::process::Command::new(&exe);
-        cmd.args(["gateway", "run"]);
+        // Forward --dev, --profile, --base-dir flags so the replacement
+        // process uses the same isolation mode as the original.
+        let original_args: Vec<String> = std::env::args().collect();
+        let mut extra_args: Vec<String> = Vec::new();
+        let mut i = 1; // skip argv[0]
+        while i < original_args.len() {
+            match original_args[i].as_str() {
+                "--dev" => { extra_args.push("--dev".to_owned()); }
+                "--profile" => {
+                    extra_args.push("--profile".to_owned());
+                    if let Some(val) = original_args.get(i + 1) {
+                        extra_args.push(val.clone());
+                        i += 1;
+                    }
+                }
+                "--base-dir" => {
+                    extra_args.push("--base-dir".to_owned());
+                    if let Some(val) = original_args.get(i + 1) {
+                        extra_args.push(val.clone());
+                        i += 1;
+                    }
+                }
+                s if s.starts_with("--profile=") => { extra_args.push(s.to_owned()); }
+                s if s.starts_with("--base-dir=") => { extra_args.push(s.to_owned()); }
+                _ => {}
+            }
+            i += 1;
+        }
+        extra_args.extend(["gateway".to_owned(), "run".to_owned()]);
+        cmd.args(&extra_args);
         // Windows: suppress the console flash when re-execing from a GUI app.
         #[cfg(target_os = "windows")]
         {
