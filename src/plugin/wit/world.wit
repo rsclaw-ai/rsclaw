@@ -4,6 +4,10 @@ interface host-browser {
     browser-open: func(url: string) -> result<string, string>;
     browser-snapshot: func() -> result<string, string>;
     browser-click: func(ref-str: string) -> result<string, string>;
+    /// Native (CDP-level) mouse click at viewport coordinates. Use this
+    /// when synthetic JS click events are ignored by the page (typical for
+    /// React PointerEvent handlers on popups / paywalls).
+    browser-click-at: func(x: u32, y: u32) -> result<string, string>;
     browser-fill: func(ref-str: string, text: string) -> result<string, string>;
     browser-press: func(key: string) -> result<string, string>;
     browser-eval: func(code: string) -> result<string, string>;

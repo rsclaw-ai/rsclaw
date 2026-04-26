@@ -26,11 +26,12 @@ use wasmtime::{
     component::{Component, Linker, bindgen},
 };
 
-/// Per-call wasm-CPU deadline in epoch ticks. Engine ticks every 100ms in
-/// `mod.rs::load_all_plugins`, so 600 ticks ≈ 60s of wasm-CPU. Host-async
-/// awaits (browser ops, sleep) do not advance epoch, so this only bounds
-/// plugin code that loops without yielding.
-const EPOCH_DEADLINE_TICKS: u64 = 600;
+/// Per-call wall-clock deadline in epoch ticks, relative to `set_epoch_deadline`
+/// being called. The engine ticks every 100ms (see `mod.rs::load_all_plugins`),
+/// so 18000 ticks ≈ 30 minutes. Browser-automation plugins (image / video
+/// generation, scrape pagination) routinely run for several minutes; the
+/// deadline only needs to be tight enough to kill a true runaway.
+const EPOCH_DEADLINE_TICKS: u64 = 18000;
 
 /// Per-store memory cap for wasm linear memory.
 const MEMORY_CAP_BYTES: usize = 256 * 1024 * 1024;
@@ -161,6 +162,10 @@ impl rsclaw::jimeng::host_browser::Host for HostState {
 
     async fn browser_click(&mut self, ref_str: String) -> Result<Result<String, String>> {
         Ok(self.browser_action("click", json!({"ref": ref_str})).await)
+    }
+
+    async fn browser_click_at(&mut self, x: u32, y: u32) -> Result<Result<String, String>> {
+        Ok(self.browser_action("click_at", json!({"x": x, "y": y})).await)
     }
 
     async fn browser_fill(
@@ -315,12 +320,14 @@ impl rsclaw::jimeng::host_browser::Host for HostState {
 
 impl rsclaw::jimeng::host_runtime::Host for HostState {
     async fn log(&mut self, level: String, msg: String) -> Result<()> {
+        // Use the module path as target (instead of "wasm_plugin") so plugin
+        // logs inherit the default tracing filter level for this crate.
         match level.as_str() {
-            "error" => tracing::error!(target: "wasm_plugin", "{msg}"),
-            "warn" => tracing::warn!(target: "wasm_plugin", "{msg}"),
-            "info" => tracing::info!(target: "wasm_plugin", "{msg}"),
-            "debug" => tracing::debug!(target: "wasm_plugin", "{msg}"),
-            _ => tracing::trace!(target: "wasm_plugin", "{msg}"),
+            "error" => tracing::error!(plugin_log = true, "{msg}"),
+            "warn" => tracing::warn!(plugin_log = true, "{msg}"),
+            "info" => tracing::info!(plugin_log = true, "{msg}"),
+            "debug" => tracing::debug!(plugin_log = true, "{msg}"),
+            _ => tracing::trace!(plugin_log = true, "{msg}"),
         }
         Ok(())
     }

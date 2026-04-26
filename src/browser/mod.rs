@@ -985,6 +985,7 @@ impl BrowserSession {
             "mouse" => self.cmd_mouse(args).await,
             "storage" => self.cmd_storage(args).await,
             "download_wait" => self.cmd_download_wait(args).await,
+            "download" => self.cmd_download(args).await,
             "is" => self.cmd_is(args).await,
             "get" => self.cmd_get(args).await,
             "search" => self.cmd_search(args).await,
@@ -1788,6 +1789,140 @@ impl BrowserSession {
         })).await?;
         tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
         Ok(json!({"action": "download_wait", "timeout": timeout_secs, "status": "completed"}))
+    }
+
+    /// Click a download trigger element and move the resulting file to a
+    /// caller-supplied path. Args: `ref` (element ref to click) + `path`
+    /// (absolute destination). Watches a temp dir for the new file, polls
+    /// until size stabilises, then moves it.
+    async fn cmd_download(&self, args: &Value) -> Result<Value> {
+        let eref = args
+            .get("ref")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("download: `ref` required"))?;
+        let dest_path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("download: `path` required"))?;
+        let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(45);
+
+        // Use a per-call temp dir so we only see this download's output.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let stage_dir = std::path::PathBuf::from(format!("/tmp/rsclaw-dl-{nanos:x}"));
+        std::fs::create_dir_all(&stage_dir)
+            .map_err(|e| anyhow!("download: create stage dir: {e}"))?;
+
+        self.cdp
+            .send(
+                "Page.setDownloadBehavior",
+                json!({
+                    "behavior": "allow",
+                    "downloadPath": stage_dir.to_string_lossy(),
+                }),
+            )
+            .await?;
+
+        // Click the ref via the same JS path as cmd_click.
+        let js = format!(
+            r#"(async function(){{
+                {FIND_REF_JS}
+                var el=findRef('{eref_esc}');
+                if(!el) return 'NOT_FOUND';
+                {WAIT_ACTIONABLE_JS}
+                var status = await waitActionable(el, 5000);
+                if (status === 'TIMEOUT') return 'TIMEOUT';
+                el.scrollIntoView({{block:'center'}});
+                el.click();
+                return 'OK';
+            }})()"#,
+            eref_esc = escape_js_string(eref),
+            FIND_REF_JS = FIND_REF_JS,
+            WAIT_ACTIONABLE_JS = WAIT_ACTIONABLE_JS,
+        );
+        let click_res = self
+            .cdp
+            .send(
+                "Runtime.evaluate",
+                json!({"expression": js, "returnByValue": true, "awaitPromise": true}),
+            )
+            .await?;
+        let click_status = click_res
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if click_status == "NOT_FOUND" {
+            bail!("download: element ref `{eref}` not found");
+        }
+        if click_status == "TIMEOUT" {
+            bail!("download: element ref `{eref}` not actionable within 5s");
+        }
+
+        // Poll the stage dir for a new finished file. Chrome writes a `.crdownload`
+        // suffix while in-flight; we wait for any non-suffix file with stable size.
+        let deadline = time::Instant::now() + Duration::from_secs(timeout_secs);
+        let mut last_size: u64 = 0;
+        let mut stable_ticks: u32 = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let mut candidate: Option<(std::path::PathBuf, u64)> = None;
+            if let Ok(rd) = std::fs::read_dir(&stage_dir) {
+                for entry in rd.flatten() {
+                    let path = entry.path();
+                    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    if name.ends_with(".crdownload") || name.starts_with('.') {
+                        continue;
+                    }
+                    if let Ok(meta) = entry.metadata() {
+                        if meta.is_file() {
+                            candidate = Some((path, meta.len()));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some((path, size)) = candidate {
+                if size > 0 && size == last_size {
+                    stable_ticks += 1;
+                    if stable_ticks >= 2 {
+                        // 1s of stable size — treat as complete. Move the file.
+                        let dest = std::path::PathBuf::from(dest_path);
+                        if let Some(parent) = dest.parent() {
+                            std::fs::create_dir_all(parent)
+                                .map_err(|e| anyhow!("download: create dest parent: {e}"))?;
+                        }
+                        std::fs::rename(&path, &dest).or_else(|_| {
+                            // Cross-device rename can fail; fall back to copy + remove.
+                            std::fs::copy(&path, &dest).map(|_| ()).and_then(|_| {
+                                std::fs::remove_file(&path).or(Ok::<(), std::io::Error>(()))
+                            })
+                        }).map_err(|e| anyhow!("download: move file: {e}"))?;
+                        let _ = std::fs::remove_dir_all(&stage_dir);
+                        return Ok(json!({
+                            "action": "download",
+                            "ref": eref,
+                            "path": dest_path,
+                            "result": dest_path,
+                        }));
+                    }
+                } else {
+                    stable_ticks = 0;
+                    last_size = size;
+                }
+            } else {
+                stable_ticks = 0;
+            }
+
+            if time::Instant::now() >= deadline {
+                let _ = std::fs::remove_dir_all(&stage_dir);
+                bail!("download: no completed file in {timeout_secs}s");
+            }
+        }
     }
 
     /// Query element state: visible, hidden, checked, enabled, disabled.
