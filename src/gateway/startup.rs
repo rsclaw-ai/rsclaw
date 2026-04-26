@@ -1078,131 +1078,22 @@ pub(crate) async fn handle_pending_analysis(
 async fn download_bge_model(
     target_dir: &std::path::Path,
     search_cfg: Option<&crate::config::schema::MemorySearchConfig>,
-    config_language: Option<&str>,
+    _config_language: Option<&str>,
 ) -> anyhow::Result<()> {
-    use tokio::io::AsyncWriteExt;
-
     let local_cfg = search_cfg.and_then(|c| c.local.as_ref());
 
-    // Determine model repo.
-    let repo = local_cfg
-        .and_then(|c| c.model_repo.as_deref())
-        .unwrap_or("BAAI/bge-small-zh-v1.5");
-
-    // Determine base URL: config override > locale auto-detect.
-    let base_url = if let Some(url) = local_cfg.and_then(|c| c.model_download_url.as_deref()) {
-        // User provided full URL — use as-is.
-        url.trim_end_matches('/').to_owned()
+    // Config override for custom download URL.
+    let url = if let Some(url) = local_cfg.and_then(|c| c.model_download_url.as_deref()) {
+        url.to_owned()
     } else {
-        // Auto-detect: config language > LANG/LC_ALL env var.
-        let is_zh = config_language
-            .map(|l| l.to_lowercase().contains("chinese") || l.to_lowercase().contains("zh"))
-            .unwrap_or_else(|| {
-                std::env::var("LANG")
-                    .or_else(|_| std::env::var("LC_ALL"))
-                    .unwrap_or_default()
-                    .to_lowercase()
-                    .contains("zh")
-            });
-        let host = if is_zh { "https://hf-mirror.com" } else { "https://huggingface.co" };
-        format!("{host}/{repo}/resolve/main")
+        "https://gitfast.org/tools/models/bge-small-zh-v1.5.zip".to_owned()
     };
 
-    let files = ["config.json", "model.safetensors", "tokenizer.json"];
-
-    info!("downloading BGE embedding model from {base_url} ...");
+    info!("downloading BGE embedding model from {url} ...");
     std::fs::create_dir_all(target_dir)?;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
-        .build()?;
-
-    for filename in &files {
-        let url = format!("{base_url}/{filename}");
-        let dest = target_dir.join(filename);
-        let partial = target_dir.join(format!("{filename}.partial"));
-
-        if dest.exists() {
-            debug!("{filename} already exists, skipping");
-            continue;
-        }
-
-        // Retry up to 3 times with resume support.
-        let mut success = false;
-        for attempt in 0..3 {
-            if attempt > 0 {
-                info!("  retrying {filename} (attempt {})...", attempt + 1);
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-
-            // Check if partial file exists for resume.
-            let existing_len = tokio::fs::metadata(&partial).await.map(|m| m.len()).unwrap_or(0);
-
-            let mut req = client.get(&url);
-            if existing_len > 0 {
-                info!("  resuming {filename} from byte {existing_len}...");
-                req = req.header("Range", format!("bytes={existing_len}-"));
-            } else {
-                info!("  downloading {filename} ...");
-            }
-
-            let response = match req.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("  download request failed: {e}");
-                    continue;
-                }
-            };
-
-            let status = response.status();
-            if !status.is_success() && status.as_u16() != 206 {
-                warn!("  download failed: HTTP {status}");
-                continue;
-            }
-
-            // Stream to partial file (append if resuming).
-            let mut file = if existing_len > 0 && status.as_u16() == 206 {
-                tokio::fs::OpenOptions::new().append(true).open(&partial).await?
-            } else {
-                tokio::fs::File::create(&partial).await?
-            };
-
-            let mut stream = response.bytes_stream();
-            use futures::StreamExt;
-            let mut downloaded = existing_len;
-            let mut stream_ok = true;
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(bytes) => {
-                        file.write_all(&bytes).await?;
-                        downloaded += bytes.len() as u64;
-                    }
-                    Err(e) => {
-                        warn!("  stream error at byte {downloaded}: {e}");
-                        stream_ok = false;
-                        break;
-                    }
-                }
-            }
-            file.flush().await?;
-
-            if stream_ok {
-                // Rename partial to final.
-                tokio::fs::rename(&partial, &dest).await?;
-                info!("  {filename} downloaded ({downloaded} bytes)");
-                success = true;
-                break;
-            }
-        }
-
-        if !success {
-            // Clean up partial file on final failure (best-effort, about to bail anyway).
-            if let Err(e) = tokio::fs::remove_file(&partial).await {
-                warn!("could not remove partial download file: {e}");
-            }
-            anyhow::bail!("failed to download {filename} after 3 attempts");
-        }
-    }
+    let client = reqwest::Client::new();
+    crate::cmd::tools::download_and_extract_public(&client, &url, target_dir).await?;
 
     info!("BGE model downloaded to {}", target_dir.display());
     Ok(())

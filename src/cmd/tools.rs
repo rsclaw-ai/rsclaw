@@ -455,6 +455,15 @@ fn resolve_download_url(
 // Download and extract archive
 // ---------------------------------------------------------------------------
 
+/// Download an archive and extract to dest. Public so `cmd/models.rs` can reuse.
+pub async fn download_and_extract_public(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &std::path::Path,
+) -> Result<()> {
+    download_and_extract(client, url, dest).await
+}
+
 async fn download_and_extract(
     client: &reqwest::Client,
     url: &str,

@@ -20,9 +20,9 @@ pub enum ModelsCommand {
     Scan,
     #[command(subcommand)]
     Auth(ModelsAuthCommand),
-    /// Download embedding models from HuggingFace.
+    /// Download ML models from gitfast.org.
     Download {
-        /// Model to download (default: bge). Available: bge
+        /// Model to download (default: bge). Available: bge, bge-base-zh, bge-small-en, whisper, whisper-turbo, vits
         model: Option<String>,
     },
     /// List installed embedding models.
