@@ -425,12 +425,15 @@ fn channel_login_start(channel: String) -> Result<String, String> {
     let spawned = exe_dir.as_ref().and_then(|dir| {
         let sidecar = dir.join(if cfg!(target_os = "windows") { "rsclaw.exe" } else { "rsclaw" });
         if sidecar.exists() {
-            std::process::Command::new(&sidecar)
-                .args(["channels", "login", "--quiet", &channel])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .ok()
+            // hide_window prevents a flashing cmd console on Windows.
+            hide_window(
+                std::process::Command::new(&sidecar)
+                    .args(["channels", "login", "--quiet", &channel])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null()),
+            )
+            .spawn()
+            .ok()
         } else {
             None
         }
@@ -438,12 +441,14 @@ fn channel_login_start(channel: String) -> Result<String, String> {
 
     if spawned.is_none() {
         // Fallback: spawn via PATH
-        std::process::Command::new("rsclaw")
-            .args(["channels", "login", "--quiet", &channel])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Failed to start login: {e}"))?;
+        hide_window(
+            std::process::Command::new("rsclaw")
+                .args(["channels", "login", "--quiet", &channel])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        )
+        .spawn()
+        .map_err(|e| format!("Failed to start login: {e}"))?;
     }
 
     Ok(qr_path.to_string_lossy().to_string())
