@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -11,10 +11,8 @@ use crate::{
 };
 
 use super::super::preparse::{
-    btw_direct_call, is_fast_preparse, processing_timeout, send_processing,
-    try_preparse_locally,
+    btw_direct_call, is_fast_preparse, try_preparse_locally,
 };
-use super::super::startup::handle_pending_analysis;
 use super::default_dm_scope;
 
 pub(crate) fn start_line_if_configured(
@@ -29,6 +27,7 @@ pub(crate) fn start_line_if_configured(
     _channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
+    task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
 ) {
     use crate::channel::line::LineChannel;
 
@@ -100,6 +99,7 @@ pub(crate) fn start_line_if_configured(
 
         let gp = Arc::new(group_policy.clone());
         let ga = Arc::new(group_allow_from.clone());
+        let tq = Arc::clone(&task_queue);
 
         // Per-user inbound queue for LINE.
         type LineItem = (
@@ -124,6 +124,7 @@ pub(crate) fn start_line_if_configured(
                 let group_policy = Arc::clone(&gp);
                 let group_allow = Arc::clone(&ga);
                 let queues = Arc::clone(&line_user_queues);
+                let tq = Arc::clone(&tq);
                 tokio::spawn(async move {
                     // Group policy check.
                     if is_group {
@@ -210,89 +211,42 @@ pub(crate) fn start_line_if_configured(
                             map.insert(user_id.clone(), utx.clone());
                             let w_reg = Arc::clone(&reg);
                             let w_cfg = Arc::clone(&cfg);
-                            let w_tx = tx.clone();
                             let w_uid = user_id.clone();
+                            let w_tq = Arc::clone(&tq);
                             tokio::spawn(async move {
-                                while let Some((mut text, user_id, is_group, mut images)) = urx.recv().await
+                                while let Some((text, user_id, is_group, images)) = urx.recv().await
                                 {
-                                    // Debounce: wait briefly then drain queued messages.
-                                    tokio::time::sleep(Duration::from_secs(2)).await;
-                                    while let Ok((extra_text, _, _, extra_images)) = urx.try_recv() {
-                                        if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
-                                            text.push('\n');
-                                            text.push_str(&extra_text);
-                                        }
-                                        images.extend(extra_images);
-                                    }
-                                    let process_result = tokio::time::timeout(
-                                    Duration::from_secs(600),
-                                    async {
-                                let handle = match w_reg.route("line") {
-                                    Ok(h) => h,
-                                    Err(e) => { error!("line route: {e:#}"); return; }
-                                };
-                                let dm_scope = default_dm_scope(&w_cfg);
-                                let session_key = derive_session_key(&SessionKeyParams {
-                                    agent_id: handle.id.clone(),
-                                    kind: if is_group {
-                                        MessageKind::DirectMessage { account_id: None }
-                                    } else {
-                                        MessageKind::DirectMessage { account_id: None }
-                                    },
-                                    channel: "line".to_string(),
-                                    peer_id: user_id.clone(),
-                                    dm_scope,
-                                });
-                                let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
-                                let msg = AgentMessage {
-                                    session_key,
-                                    text,
-                                    channel: "line".to_string(),
-                                    peer_id: user_id.clone(),
-                                    chat_id: String::new(),
-                                    reply_tx,
-                                    extra_tools: vec![],
-                                    images,
-                                    files: vec![],
-                                };
-                                if handle.tx.send(msg).await.is_err() {
-                                    return;
-                                }
-                                let reply = tokio::select! {
-                                    result = &mut reply_rx => result,
-                                    _ = tokio::time::sleep(processing_timeout(&w_cfg)) => {
-                                        send_processing(&w_tx, user_id.clone(), is_group, &w_cfg).await;
-                                        reply_rx.await
-                                    }
-                                };
-                                if let Ok(r) = reply {
-                                    let pending = r.pending_analysis;
-                                    if !r.is_empty {
-                                        if let Err(e) = w_tx
-                                            .send(OutboundMessage {
-                                                target_id: user_id.clone(),
-                                                is_group,
-                                                text: r.text,
-                                                reply_to: None,
-                                                images: r.images,
-                                                files: r.files,
-                                                channel: None,                                            })
-                                            .await
-                                        {
-                                            tracing::warn!("failed to send message: {e}");
-                                        }
-                                    }
-                                    if let Some(analysis) = pending {
-                                        handle_pending_analysis(
-                                            analysis, Arc::clone(&handle), &w_tx,
-                                            user_id, is_group, &w_cfg,
-                                        ).await;
-                                    }
-                                }
-                                    }
-                                ).await;
-                                    if process_result.is_err() {
-                                        warn!(user = %w_uid, "line: message processing timed out (600s), skipping to next");
+                                    // No debounce — task queue merge_into_pending
+                                    // handles rapid consecutive messages automatically.
+                                    let handle = match w_reg.route("line") {
+                                        Ok(h) => h,
+                                        Err(e) => { error!("line route: {e:#}"); continue; }
+                                    };
+                                    let dm_scope = default_dm_scope(&w_cfg);
+                                    let session_key = derive_session_key(&SessionKeyParams {
+                                        agent_id: handle.id.clone(),
+                                        kind: if is_group {
+                                            MessageKind::DirectMessage { account_id: None }
+                                        } else {
+                                            MessageKind::DirectMessage { account_id: None }
+                                        },
+                                        channel: "line".to_string(),
+                                        peer_id: user_id.clone(),
+                                        dm_scope,
+                                    });
+                                    let qmsg = crate::gateway::task_queue::QueuedMessage {
+                                        text,
+                                        sender: user_id.clone(),
+                                        channel: "line".to_string(),
+                                        chat_id: String::new(),
+                                        is_group,
+                                        reply_to: None,
+                                        timestamp: chrono::Utc::now().timestamp(),
+                                        images: images.iter().map(|i| i.data.clone()).collect(),
+                                        files: vec![],
+                                    };
+                                    if let Err(e) = w_tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
+                                        error!(user = %w_uid, "line: queue submit failed: {e:#}");
                                     }
                                 }
                                 debug!(user = %w_uid, "line: per-user worker stopped");

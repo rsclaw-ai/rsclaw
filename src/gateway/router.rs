@@ -255,6 +255,7 @@ mod tests {
             name: None,
             opencode: None,
             claudecode: None,
+            codex: None,
             agent_dir: None,
             system: None,
         }

@@ -256,8 +256,11 @@ impl WeChatPersonalChannel {
     // QR code login (static — used before creating the channel)
     // -----------------------------------------------------------------------
 
-    /// Start QR code login. Returns (qrcode_url, session_qrcode) for polling.
-    pub async fn start_qr_login(client: &Client) -> Result<(String, String)> {
+    /// Fetch a fresh login QR code from ilink. Returns (qrcode_url, qrcode_token).
+    ///
+    /// The url is what the user must scan; the token is what callers poll
+    /// `get_qrcode_status` with.
+    async fn fetch_qr_login(client: &Client) -> Result<(String, String)> {
         let url = format!(
             "{}/ilink/bot/get_bot_qrcode?bot_type={}",
             ILINK_BASE_URL, DEFAULT_BOT_TYPE
@@ -279,9 +282,26 @@ impl WeChatPersonalChannel {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| format!("https://login.weixin.qq.com/qrcode/{}", qrcode));
 
-        // Display QR code in terminal
-        crate::channel::auth::display_qr_terminal(&qrcode_url)?;
+        Ok((qrcode_url, qrcode))
+    }
 
+    /// Start QR code login and render it in the terminal (iTerm2 inline image
+    /// or Unicode fallback). Returns (qrcode_url, session_qrcode) for polling.
+    pub async fn start_qr_login(client: &Client) -> Result<(String, String)> {
+        let (qrcode_url, qrcode) = Self::fetch_qr_login(client).await?;
+        crate::channel::auth::display_qr_terminal(&qrcode_url)?;
+        Ok((qrcode_url, qrcode))
+    }
+
+    /// Start QR code login silently — write the QR PNG to a temp path without
+    /// any terminal output or image-viewer popup. Returns (qrcode_url, qrcode).
+    ///
+    /// Used by Tauri-spawned `rsclaw channels login --quiet` and the
+    /// `/api/v1/channels/wechat/qr-login` HTTP endpoint, where stdout is null
+    /// and the desktop UI displays the PNG itself.
+    pub async fn start_qr_login_silent(client: &Client) -> Result<(String, String)> {
+        let (qrcode_url, qrcode) = Self::fetch_qr_login(client).await?;
+        crate::channel::auth::save_qr_to_path(&qrcode_url)?;
         Ok((qrcode_url, qrcode))
     }
 

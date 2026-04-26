@@ -160,6 +160,69 @@ $r: 10px;
 
 // ── Status Page ──────────────────────────────────────
 
+.restart-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: $alo2;
+  border: 1px solid rgba(245, 166, 35, 0.25);
+  border-left: 2px solid $amber;
+  border-radius: $r;
+  padding: 10px 14px;
+  margin: -8px 0 16px;
+  font-size: 12px;
+  color: $t0;
+}
+
+.restart-banner-icon {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: $amber;
+  color: $bg0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.restart-banner-msg {
+  flex: 1;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.restart-banner-countdown {
+  margin-top: 4px;
+  font-size: 11px;
+  color: $t1;
+}
+
+.restart-banner-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.restart-banner-primary {
+  background: $accent;
+  border-color: $accent;
+  color: $bg0;
+
+  &:hover:not(:disabled) {
+    background: $accent2;
+    border-color: $accent2;
+    color: $bg0;
+  }
+
+  &:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+}
+
 .status-banner {
   display: flex;
   align-items: center;

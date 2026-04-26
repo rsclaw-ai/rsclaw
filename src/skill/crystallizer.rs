@@ -9,10 +9,15 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
+use futures::StreamExt as _;
 
 use crate::agent::memory::{MemDocTier, MemoryDoc, MemoryStore};
+use crate::provider::{
+    LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
+};
 
 /// Minimum number of related Core memories to trigger crystallization.
 const MIN_CLUSTER_SIZE: usize = 3;
@@ -198,6 +203,88 @@ pub fn slugify(name: &str) -> String {
     }
 }
 
+/// Distill a cluster prompt into SKILL.md content via a one-shot LLM call.
+///
+/// Sends `prompt` as a single user message to the given provider and returns
+/// the assistant text accumulated from the stream. Tool-call events are
+/// ignored (the request carries no tools). Returns an error on stream
+/// failure or empty output so the caller can decide whether to fall back.
+pub async fn distill_with_llm(
+    prompt: &str,
+    provider: Arc<dyn LlmProvider>,
+    model: String,
+) -> Result<String> {
+    let req = LlmRequest {
+        model,
+        messages: vec![Message {
+            role: Role::User,
+            content: MessageContent::Text(prompt.to_owned()),
+        }],
+        tools: Vec::new(),
+        system: None,
+        max_tokens: Some(4096),
+        temperature: Some(0.3),
+        frequency_penalty: None,
+        thinking_budget: None,
+        kv_cache_mode: 0,
+        session_key: None,
+    };
+
+    let mut stream = provider
+        .stream(req)
+        .await
+        .context("distill: provider stream failed")?;
+
+    let mut output = String::new();
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(StreamEvent::TextDelta(d)) => output.push_str(&d),
+            Ok(StreamEvent::ReasoningDelta(_)) => {}
+            Ok(StreamEvent::Done { .. }) => break,
+            Ok(StreamEvent::Error(msg)) => bail!("distill: provider error: {msg}"),
+            Ok(StreamEvent::ToolCall { .. }) => {} // no tools requested; ignore
+            Err(e) => return Err(anyhow!("distill stream error: {e:#}")),
+        }
+    }
+
+    if output.trim().is_empty() {
+        bail!("distill: empty output from LLM");
+    }
+    Ok(output)
+}
+
+/// Extract a slug from the `name:` field of a SKILL.md YAML frontmatter.
+///
+/// Walks the leading frontmatter (between `---` delimiters) looking for a
+/// `name:` line. Quoted and unquoted values are accepted. Falls back to
+/// slugifying `fallback` if no usable name is found.
+pub fn extract_skill_slug(skill_md: &str, fallback: &str) -> String {
+    let mut delimiters_seen = 0u8;
+    let mut in_frontmatter = false;
+    for line in skill_md.lines() {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            delimiters_seen += 1;
+            if delimiters_seen == 1 {
+                in_frontmatter = true;
+                continue;
+            }
+            // Closing delimiter — stop scanning.
+            break;
+        }
+        if !in_frontmatter {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("name:") {
+            let raw = rest.trim().trim_matches('"').trim_matches('\'').trim();
+            if !raw.is_empty() {
+                return slugify(raw);
+            }
+        }
+    }
+    slugify(fallback)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +307,35 @@ mod tests {
     #[test]
     fn slugify_empty() {
         assert_eq!(slugify(""), "unnamed-skill");
+    }
+
+    #[test]
+    fn extract_slug_from_frontmatter_unquoted() {
+        let md = "---\nname: web-search-helper\ndescription: foo\n---\nbody";
+        assert_eq!(extract_skill_slug(md, "fallback"), "web-search-helper");
+    }
+
+    #[test]
+    fn extract_slug_from_frontmatter_quoted() {
+        let md = "---\nname: \"Order Extractor\"\n---\nbody";
+        assert_eq!(extract_skill_slug(md, "fallback"), "order-extractor");
+    }
+
+    #[test]
+    fn extract_slug_falls_back_when_no_name() {
+        let md = "---\ndescription: foo\n---\nbody";
+        assert_eq!(extract_skill_slug(md, "Auto Skill"), "auto-skill");
+    }
+
+    #[test]
+    fn extract_slug_falls_back_when_no_frontmatter() {
+        let md = "just body, no frontmatter";
+        assert_eq!(extract_skill_slug(md, "Fallback Name"), "fallback-name");
+    }
+
+    #[test]
+    fn extract_slug_ignores_name_after_closing_delimiter() {
+        let md = "---\ndescription: foo\n---\nname: not-a-real-name\n";
+        assert_eq!(extract_skill_slug(md, "real"), "real");
     }
 }

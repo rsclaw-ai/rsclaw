@@ -1003,6 +1003,18 @@ const en: LocaleType = {
       Error: "error",
     },
 
+    RestartBanner: {
+      DefaultMessage: "A gateway restart is required to apply changes.",
+      AutoRestartCountdown: (seconds: number) =>
+        `Auto-restarting in ${seconds}s. If it does not happen automatically, click "Restart Now".`,
+      AutoRestarting: "Auto-restarting...",
+      RestartNow: "Restart Now",
+      Later: "Later",
+      Dismiss: "Dismiss",
+      Restarting: "Restarting...",
+      Failed: "Restart failed: ",
+    },
+
     Config: {
       PageTitle: "Config Editor",
       PageSub: "~/.rsclaw/rsclaw.json5 -- live preview",

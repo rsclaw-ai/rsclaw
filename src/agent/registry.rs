@@ -662,6 +662,7 @@ mod tests {
             allowed_commands: None,
             opencode: None,
             claudecode: None,
+            codex: None,
             agent_dir: None,
             system: None,
         }

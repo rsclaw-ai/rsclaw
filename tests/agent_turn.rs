@@ -68,6 +68,8 @@ fn config_with_echo_agent(port: u16) -> RuntimeConfig {
                 allowed_commands: None,
                 opencode: None,
                 claudecode: None,
+                codex: None,
+                flash_model: None,
                 agent_dir: None,
                 system: None,
             }],
@@ -156,6 +158,9 @@ async fn start_echo_server(addr: SocketAddr) {
         cron_reload: broadcast::channel(1).0,
         notification_tx: broadcast::channel(16).0,
         wasm_plugins: Arc::new(Vec::new()),
+        restart_request_tx: broadcast::channel(16).0,
+        pending_restart: Arc::new(std::sync::RwLock::new(None)),
+        shutdown: rsclaw::gateway::ShutdownCoordinator::new(),
     };
 
     // Leak the tempdir so the store stays valid for the server's lifetime.

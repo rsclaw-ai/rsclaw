@@ -99,6 +99,8 @@ fn runtime_with_agent(agent_id: &str) -> RuntimeConfig {
                 commands: None,
                 opencode: None,
                 claudecode: None,
+                codex: None,
+                flash_model: None,
             }],
             bindings: vec![],
             external: vec![],
@@ -174,6 +176,7 @@ async fn test_cron_job_runs() {
         Arc::new(ChannelManager::new(MemoryTier::Standard)),
         data_dir.path().to_owned(),
         tokio::sync::broadcast::channel(1).0,
+        Arc::new(rsclaw::ws::ConnRegistry::new()),
     );
 
     // trigger() bypasses the scheduler and fires the job synchronously.
@@ -223,6 +226,7 @@ async fn test_cron_enable_disable() {
         Arc::new(ChannelManager::new(MemoryTier::Standard)),
         data_dir.path().to_owned(),
         tokio::sync::broadcast::channel(1).0,
+        Arc::new(rsclaw::ws::ConnRegistry::new()),
     );
 
     // Verify enabled flags are stored correctly.
@@ -270,6 +274,7 @@ async fn test_cron_invalid_agent() {
         Arc::new(ChannelManager::new(MemoryTier::Standard)),
         data_dir.path().to_owned(),
         tokio::sync::broadcast::channel(1).0,
+        Arc::new(rsclaw::ws::ConnRegistry::new()),
     );
 
     let result = runner.trigger("job-bad-agent").await;
@@ -322,6 +327,7 @@ async fn test_cron_trigger_unknown_job_returns_error() {
         Arc::new(ChannelManager::new(MemoryTier::Standard)),
         data_dir.path().to_owned(),
         tokio::sync::broadcast::channel(1).0,
+        Arc::new(rsclaw::ws::ConnRegistry::new()),
     );
 
     let result = runner.trigger("no-such-job").await;
@@ -411,4 +417,66 @@ fn test_rsclaw_flat_format() {
     assert_eq!(job.cron_expr(), "*/5 * * * *");
     assert_eq!(job.effective_message(), "ping");
     assert!(job.timezone().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// test_every_schedule_fires_at_interval
+//
+// Regression: the LLM cron tool exposes `every_seconds` / `every_ms` so it can
+// schedule fixed-interval jobs (e.g. every 45 minutes) that cannot be expressed
+// as a 5-field cron string. The persisted form is `{"kind":"every","everyMs":N,
+// "anchorMs":M}` (existing `CronScheduleTagged::Every`). This test asserts that
+// such a job deserialises and that `compute_next_run` produces at least two
+// fires within a 2.5-second window when `every_ms = 1000`.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_every_schedule_fires_at_interval() {
+    use rsclaw::cron::CronJob;
+
+    let anchor_ms: u64 = 1_700_000_000_000; // arbitrary fixed epoch ms
+    let every_ms: u64 = 1_000; // 1 second
+
+    let job_json = serde_json::json!({
+        "id": "job-every-1s",
+        "agentId": "main",
+        "enabled": true,
+        "schedule": {"kind": "every", "everyMs": every_ms, "anchorMs": anchor_ms},
+        "message": "tick"
+    });
+
+    let job: CronJob =
+        serde_json::from_value(job_json).expect("every schedule should deserialise");
+    assert_eq!(job.cron_expr(), "every");
+
+    // Walk the schedule like the runner does: each fire is the input to the
+    // next compute_next_run call. Within a 2.5s window starting at anchor_ms
+    // we must see at least two fires.
+    let window_end = anchor_ms + 2_500;
+    let mut from = anchor_ms;
+    let mut fires: Vec<u64> = Vec::new();
+    while let Some(next) = job.schedule.compute_next_run(from) {
+        if next > window_end {
+            break;
+        }
+        fires.push(next);
+        from = next;
+        if fires.len() > 10 {
+            break; // safety cap
+        }
+    }
+
+    assert!(
+        fires.len() >= 2,
+        "every_ms=1000 should fire at least twice in 2.5s, got {} fires: {:?}",
+        fires.len(),
+        fires
+    );
+    // Spacing must equal every_ms.
+    for pair in fires.windows(2) {
+        assert_eq!(
+            pair[1] - pair[0],
+            every_ms,
+            "fires should be spaced by every_ms"
+        );
+    }
 }

@@ -215,6 +215,18 @@ fn save_qr_png(code: &QrCode) -> Option<std::path::PathBuf> {
     Some(path)
 }
 
+/// Save a URL as a QR-code PNG file silently (no terminal output, no image
+/// viewer popup). Returns the path on success.
+///
+/// Used by headless callers (Tauri-spawned `rsclaw channels login --quiet`,
+/// HTTP `/api/v1/channels/*/qr-login` endpoints) where the terminal-rendering
+/// path of [`display_qr_terminal`] would write to a closed stdout or open an
+/// unwanted preview window.
+pub fn save_qr_to_path(url: &str) -> Result<std::path::PathBuf> {
+    let code = QrCode::new(url.as_bytes()).context("failed to generate QR code")?;
+    save_qr_png(&code).ok_or_else(|| anyhow::anyhow!("failed to write QR PNG to temp dir"))
+}
+
 /// Fallback: render QR code with Unicode half-block characters.
 fn render_unicode(code: &QrCode) {
     let width = code.width();

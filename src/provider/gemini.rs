@@ -151,7 +151,7 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
         gen_cfg.insert("maxOutputTokens".to_owned(), json!(max));
     }
     if let Some(t) = req.temperature {
-        gen_cfg.insert("temperature".to_owned(), json!(t));
+        gen_cfg.insert("temperature".to_owned(), super::json_f32(t));
     }
 
     // Tools.

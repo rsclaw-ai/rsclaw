@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -11,10 +11,8 @@ use crate::{
 };
 
 use super::super::preparse::{
-    btw_direct_call, is_fast_preparse, processing_timeout, send_processing,
-    try_preparse_locally,
+    btw_direct_call, is_fast_preparse, try_preparse_locally,
 };
-use super::super::startup::handle_pending_analysis;
 use super::default_dm_scope;
 
 
@@ -23,8 +21,7 @@ use super::default_dm_scope;
 // ---------------------------------------------------------------------------
 
 /// Per-user sequential message processor for WeChat.
-/// Drains the user's inbound queue one message at a time, sends to agent,
-/// waits for reply, then sends reply back via the outbound channel.
+/// Receives inbound messages and submits them to the task queue.
 fn spawn_wechat_user_worker(
     user_id: String,
     mut rx: mpsc::Receiver<(
@@ -34,105 +31,43 @@ fn spawn_wechat_user_worker(
     )>,
     reg: Arc<AgentRegistry>,
     cfg: RuntimeConfig,
-    out_tx: mpsc::Sender<OutboundMessage>,
+    tq: Arc<crate::gateway::task_queue::TaskQueueManager>,
 ) {
     tokio::spawn(async move {
         debug!(user = %user_id, "wechat: per-user worker started");
-        while let Some((mut text, mut images, mut file_attachments)) = rx.recv().await {
-            // Debounce: wait briefly then drain queued messages.
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            while let Ok((extra_text, extra_images, extra_files)) = rx.try_recv() {
-                if !extra_text.is_empty() && !is_fast_preparse(&extra_text) {
-                    text.push('\n');
-                    text.push_str(&extra_text);
+        while let Some((text, images, file_attachments)) = rx.recv().await {
+            // No debounce — task queue merge_into_pending
+            // handles rapid consecutive messages automatically.
+            let handle = match reg.route_account("wechat", Some("default")).or_else(|_| reg.default_agent()) {
+                Ok(h) => h,
+                Err(e) => {
+                    error!("wechat route error: {e:#}");
+                    continue;
                 }
-                images.extend(extra_images);
-                file_attachments.extend(extra_files);
-            }
-            debug!(user = %user_id, text_start = %text.chars().take(30).collect::<String>(), "wechat: worker processing");
-            let process_result = tokio::time::timeout(Duration::from_secs(600), async {
-                let handle = match reg.route_account("wechat", Some("default")).or_else(|_| reg.default_agent()) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        error!("wechat route error: {e:#}");
-                        return;
-                    }
-                };
-                let dm_scope = default_dm_scope(&cfg);
-                let session_key = derive_session_key(&SessionKeyParams {
-                    agent_id: handle.id.clone(),
-                    kind: MessageKind::DirectMessage { account_id: None },
-                    channel: "wechat".to_string(),
-                    peer_id: user_id.clone(),
-                    dm_scope,
-                });
-                let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
-                let msg = AgentMessage {
-                    session_key,
-                    text,
-                    channel: "wechat".to_string(),
-                    peer_id: user_id.clone(),
-                    chat_id: String::new(),
-                    reply_tx,
-                    extra_tools: vec![],
-                    images,
-                    files: file_attachments,
-                };
-                if handle.tx.send(msg).await.is_err() {
-                    return;
-                }
-                let reply = tokio::select! {
-                    result = &mut reply_rx => result,
-                    _ = tokio::time::sleep(processing_timeout(&cfg)) => {
-                        send_processing(&out_tx, user_id.clone(), false, &cfg).await;
-                        reply_rx.await
-                    }
-                };
-                match reply {
-                    Ok(r) => {
-                        info!(
-                            user = %user_id,
-                            text_len = r.text.len(),
-                            images = r.images.len(),
-                            files = r.files.len(),
-                            "wechat: got agent reply"
-                        );
-                        let pending = r.pending_analysis;
-                        if !r.text.is_empty() || !r.images.is_empty() || !r.files.is_empty() {
-                            if let Err(e) = out_tx
-                                .send(OutboundMessage {
-                                    target_id: user_id.clone(),
-                                    is_group: false,
-                                    text: r.text,
-                                    reply_to: None,
-                                    images: r.images,
-                                    files: r.files,
-                                    channel: None,                                })
-                                .await
-                            {
-                                error!("wechat: failed to queue reply: {e:#}");
-                            }
-                        }
-                        if let Some(analysis) = pending {
-                            handle_pending_analysis(
-                                analysis,
-                                Arc::clone(&handle),
-                                &out_tx,
-                                user_id.clone(),
-                                false,
-                                &cfg,
-                            )
-                            .await;
-                        }
-                    }
-                    Err(_) => {
-                        warn!(user = %user_id, "wechat: agent dropped reply channel");
-                    }
-                }
-            })
-            .await;
-            if process_result.is_err() {
-                warn!(user = %user_id, "wechat: message processing timed out (600s), skipping to next");
+            };
+            let dm_scope = default_dm_scope(&cfg);
+            let session_key = derive_session_key(&SessionKeyParams {
+                agent_id: handle.id.clone(),
+                kind: MessageKind::DirectMessage { account_id: None },
+                channel: "wechat".to_string(),
+                peer_id: user_id.clone(),
+                dm_scope,
+            });
+            let qmsg = crate::gateway::task_queue::QueuedMessage {
+                text,
+                sender: user_id.to_string(),
+                channel: "wechat".to_string(),
+                chat_id: String::new(),
+                is_group: false,
+                reply_to: None,
+                timestamp: chrono::Utc::now().timestamp(),
+                images: images.iter().map(|i| i.data.clone()).collect(),
+                files: file_attachments.iter().filter_map(|f| {
+                    crate::gateway::task_queue::stage_file(&f.filename, &f.data, &f.mime_type).ok()
+                }).collect(),
+            };
+            if let Err(e) = tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
+                error!(user = %user_id, "wechat: queue submit failed: {e:#}");
             }
         }
         debug!(user = %user_id, "wechat: per-user worker stopped");
@@ -150,6 +85,7 @@ pub(crate) fn start_wechat_personal_if_configured(
     _channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
+    task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
 ) {
     // Check if wechat channel is enabled in config
     let enabled = config
@@ -254,6 +190,7 @@ pub(crate) fn start_wechat_personal_if_configured(
         let wechat_base_url = wechat_base_url.clone();
         let reg = Arc::clone(&registry);
         let cfg = config.clone();
+        let tq = Arc::clone(&task_queue);
 
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
@@ -277,6 +214,7 @@ pub(crate) fn start_wechat_personal_if_configured(
                 let reg = Arc::clone(&reg);
                 let tx = out_tx.clone();
                 let cfg = cfg.clone();
+                let tq = Arc::clone(&tq);
                 let queues = Arc::clone(&user_queues);
                 let enforcer = Arc::clone(&enforcer);
                 tokio::spawn(async move {
@@ -350,7 +288,7 @@ pub(crate) fn start_wechat_personal_if_configured(
                                     urx,
                                     Arc::clone(&reg),
                                     cfg.clone(),
-                                    tx.clone(),
+                                    Arc::clone(&tq),
                                 );
                                 utx
                             }
@@ -362,7 +300,7 @@ pub(crate) fn start_wechat_personal_if_configured(
                                 urx,
                                 Arc::clone(&reg),
                                 cfg.clone(),
-                                tx.clone(),
+                                Arc::clone(&tq),
                             );
                             utx
                         }

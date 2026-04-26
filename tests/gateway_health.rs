@@ -117,6 +117,9 @@ async fn start_server(addr: SocketAddr) {
         cron_reload: broadcast::channel(1).0,
         notification_tx: broadcast::channel(16).0,
         wasm_plugins: Arc::new(Vec::new()),
+        restart_request_tx: broadcast::channel(16).0,
+        pending_restart: Arc::new(std::sync::RwLock::new(None)),
+        shutdown: rsclaw::gateway::ShutdownCoordinator::new(),
     };
 
     // Leak the tempdir so the store stays valid for the lifetime of the server.
@@ -207,6 +210,9 @@ async fn auth_token_gates_non_health_endpoints() {
         cron_reload: broadcast::channel(1).0,
         notification_tx: broadcast::channel(16).0,
         wasm_plugins: Arc::new(Vec::new()),
+        restart_request_tx: broadcast::channel(16).0,
+        pending_restart: Arc::new(std::sync::RwLock::new(None)),
+        shutdown: rsclaw::gateway::ShutdownCoordinator::new(),
     };
     std::mem::forget(data_dir);
     tokio::spawn(async move { serve(state, addr).await.expect("serve") });
