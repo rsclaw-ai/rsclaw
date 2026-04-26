@@ -36,6 +36,12 @@ const EPOCH_DEADLINE_TICKS: u64 = 18000;
 /// Per-store memory cap for wasm linear memory.
 const MEMORY_CAP_BYTES: usize = 256 * 1024 * 1024;
 
+/// On-disk Chrome profile dir name used by all wasm plugins. Kept as the
+/// legacy slug to preserve existing login sessions; do NOT interpret as
+/// "the jimeng plugin's profile" — every plugin (jimeng/douyin/xianyu)
+/// shares this single profile so a Bytedance login spans all of them.
+const SHARED_BROWSER_PROFILE: &str = "jimeng";
+
 use crate::browser::BrowserSession;
 
 // ---------------------------------------------------------------------------
@@ -72,6 +78,10 @@ pub struct WasmPlugin {
     linker: Linker<HostState>,
     /// Reference to the browser session for host function callbacks.
     browser: Arc<Mutex<Option<BrowserSession>>>,
+    /// CDN routing rules declared by this plugin — applied when the plugin
+    /// invokes `host::browser_download(url, ...)` so the host doesn't need
+    /// to hardcode per-platform auth quirks.
+    browser_cdn_rules: Vec<crate::plugin::manifest::CdnDownloadRule>,
     /// Minimum gap between successive `call_tool` invocations on this plugin
     /// (host-enforced rate limit). 0 disables throttling.
     min_call_interval: Duration,
@@ -108,11 +118,15 @@ struct HostState {
     wasi_table: wasmtime::component::ResourceTable,
     limits: StoreLimits,
     notify_ctx: Option<WasmNotifyCtx>,
+    /// CDN download rules from the calling plugin's manifest. Consulted by
+    /// `browser_download` to attach a Referer when the URL matches.
+    cdn_rules: Vec<crate::plugin::manifest::CdnDownloadRule>,
 }
 
 fn new_host_state(
     browser: Arc<Mutex<Option<BrowserSession>>>,
     notify_ctx: Option<WasmNotifyCtx>,
+    cdn_rules: Vec<crate::plugin::manifest::CdnDownloadRule>,
 ) -> HostState {
     HostState {
         browser,
@@ -122,6 +136,7 @@ fn new_host_state(
             .memory_size(MEMORY_CAP_BYTES)
             .build(),
         notify_ctx,
+        cdn_rules,
     }
 }
 
@@ -131,8 +146,9 @@ fn new_sandboxed_store(
     engine: &Engine,
     browser: Arc<Mutex<Option<BrowserSession>>>,
     notify_ctx: Option<WasmNotifyCtx>,
+    cdn_rules: Vec<crate::plugin::manifest::CdnDownloadRule>,
 ) -> Store<HostState> {
-    let mut store = Store::new(engine, new_host_state(browser, notify_ctx));
+    let mut store = Store::new(engine, new_host_state(browser, notify_ctx, cdn_rules));
     store.limiter(|s| &mut s.limits);
     store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
     store
@@ -308,9 +324,21 @@ impl rsclaw::jimeng::host_browser::Host for HostState {
         ref_str: String,
         filename: String,
     ) -> Result<Result<String, String>> {
-        Ok(self
-            .browser_action("download", json!({"ref": ref_str, "path": filename}))
-            .await)
+        let mut args = json!({"ref": ref_str, "path": filename});
+        // If the ref looks like a URL, consult the calling plugin's CDN
+        // rules and attach a Referer when one matches. The host itself has
+        // no domain knowledge — Bytedance / Douyin / future-platform quirks
+        // live in each plugin's plugin.json5 under `browserCdn.downloadRules`.
+        if ref_str.starts_with("http") {
+            if let Some(rule) = self
+                .cdn_rules
+                .iter()
+                .find(|r| r.match_hosts.iter().any(|m| ref_str.contains(m.as_str())))
+            {
+                args["referer"] = json!(rule.referer);
+            }
+        }
+        Ok(self.browser_action("download", args).await)
     }
 
     async fn browser_upload(
@@ -451,7 +479,14 @@ impl HostState {
             tracing::info!("WASM plugin: auto-starting browser session");
             let chrome_path = crate::agent::platform::detect_chrome()
                 .ok_or_else(|| "Chrome not found on this system".to_string())?;
-            let session = BrowserSession::start(&chrome_path, true, Some("jimeng"))
+            // All wasm plugins share one Chrome profile so that auth state
+            // (cookies, localStorage) is reused across the session — e.g.
+            // a single login to Bytedance covers jimeng + douyin + xianyu.
+            // The legacy slug "jimeng" was the first plugin's name and is
+            // still used as the on-disk profile dir to avoid invalidating
+            // existing login sessions; callers should treat this as an
+            // opaque shared identifier, not as a per-plugin profile.
+            let session = BrowserSession::start(&chrome_path, true, Some(SHARED_BROWSER_PROFILE))
                 .await
                 .map_err(|e| format!("failed to start Chrome: {e:#}"))?;
             *guard = Some(session);
@@ -531,6 +566,7 @@ pub async fn load_wasm_plugin(
         component,
         linker,
         browser,
+        browser_cdn_rules: manifest.browser_cdn.download_rules.clone(),
         min_call_interval: Duration::from_millis(u64::from(manifest.min_call_interval_ms)),
         last_call: Mutex::new(None),
     })
@@ -592,8 +628,12 @@ impl WasmPlugin {
         }
 
         // Fresh store per call for isolation, with memory cap and epoch deadline.
-        let mut store =
-            new_sandboxed_store(&self.engine, Arc::clone(&self.browser), notify_ctx);
+        let mut store = new_sandboxed_store(
+            &self.engine,
+            Arc::clone(&self.browser),
+            notify_ctx,
+            self.browser_cdn_rules.clone(),
+        );
 
         let instance = self
             .linker

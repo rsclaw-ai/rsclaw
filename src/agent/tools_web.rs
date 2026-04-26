@@ -1042,18 +1042,17 @@ impl AgentRuntime {
         if !cookie_header.is_empty() {
             req = req.header("Cookie", &cookie_header);
         }
-        // Set Referer — use custom referer if provided, otherwise derive from URL.
-        // Jimeng CDN (byteimg.com) requires Referer from jimeng.jianying.com.
+        // Set Referer — use the caller-supplied value if present, else
+        // default to the URL's own origin. Domain-specific Referer rules
+        // (e.g. Bytedance CDNs requiring a different origin) are owned by
+        // plugins via `browserCdn.downloadRules` in their manifest, not
+        // by this generic skill — if you're hitting one of those CDNs,
+        // route through the relevant plugin instead of this tool.
         if let Some(referer) = args["referer"].as_str() {
             req = req.header("Referer", referer);
         } else if let Ok(parsed) = reqwest::Url::parse(url) {
             if let Some(host) = parsed.host_str() {
-                let referer = if host.contains("byteimg.com") || host.contains("dreamina") {
-                    "https://jimeng.jianying.com/".to_string()
-                } else {
-                    format!("{}://{}/", parsed.scheme(), host)
-                };
-                req = req.header("Referer", referer);
+                req = req.header("Referer", format!("{}://{}/", parsed.scheme(), host));
             }
         }
         if existing_size > 0 {

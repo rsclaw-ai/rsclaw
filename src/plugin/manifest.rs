@@ -8,15 +8,15 @@
 //! Example `plugin.json5`:
 //! ```json5
 //! {
-//!   name: "jimeng",
+//!   name: "myplugin",
 //!   version: "1.0.0",
-//!   description: "Jimeng image generation",
-//!   runtime: "wasm",           // "wasm" | "node" | "bun" | "deno"
-//!   entry: "./jimeng.wasm",    // or "./dist/index.js"
+//!   description: "What the plugin does (shown to the LLM)",
+//!   runtime: "wasm",            // "wasm" | "node" | "bun" | "deno"
+//!   entry: "./myplugin.wasm",   // or "./dist/index.js"
 //!   tools: [
 //!     {
-//!       name: "txt2img",
-//!       description: "Generate an image from text",
+//!       name: "do_thing",
+//!       description: "Do the thing",
 //!       inputSchema: { type: "object", properties: {} }
 //!     }
 //!   ]
@@ -60,7 +60,7 @@ pub struct PluginManifest {
     #[serde(default = "default_runtime")]
     pub runtime: String,
     /// Entry point relative to the plugin directory.
-    /// e.g. `"./jimeng.wasm"` or `"./dist/index.js"`.
+    /// e.g. `"./myplugin.wasm"` or `"./dist/index.js"`.
     /// Optional for OpenClaw extensions (defaults to `"./dist/index.js"`).
     #[serde(default = "default_entry")]
     pub entry: String,
@@ -83,6 +83,12 @@ pub struct PluginManifest {
     pub min_call_interval_ms: u32,
     /// Minimum rsclaw version required.
     pub requires_rsclaw: Option<String>,
+    /// Plugin-declared CDN routing rules. The host applies them when this
+    /// plugin invokes `host::browser_download(url, ...)` so the host stays
+    /// agnostic to per-platform auth quirks (Bytedance referers, etc.).
+    /// Default is empty — most plugins don't need this.
+    #[serde(default)]
+    pub browser_cdn: BrowserCdnConfig,
     /// Arbitrary extra fields for future compatibility.
     #[serde(default, flatten)]
     pub extra: HashMap<String, Value>,
@@ -95,6 +101,33 @@ pub struct PluginManifest {
 
 fn default_entry() -> String {
     "./dist/index.js".to_owned()
+}
+
+/// Plugin-declared rules for the host's CDN-aware downloader.
+///
+/// Each plugin owns the knowledge of *its* platform's CDN auth quirks —
+/// not the host. Bytedance's vlabvod gates signed URLs on a Referer of
+/// `jimeng.jianying.com`; Douyin's douyinpic/douyinvod gate on
+/// `www.douyin.com`. The host has no business knowing either fact —
+/// it just looks up the rule the calling plugin declared.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserCdnConfig {
+    /// Per-host download rules. When the URL's host substring-matches any
+    /// entry in `match_hosts`, the rule applies and `referer` is forwarded
+    /// to the host's downloader.
+    #[serde(default)]
+    pub download_rules: Vec<CdnDownloadRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CdnDownloadRule {
+    /// URL host substrings; ANY match triggers the rule. First matching
+    /// rule wins (so order rules from most-specific to most-general).
+    pub match_hosts: Vec<String>,
+    /// Referer header to forward when downloading from a matching URL.
+    pub referer: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
