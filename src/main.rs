@@ -195,7 +195,6 @@ async fn run() -> Result<()> {
         Command::Update(sub) | Command::Upgrade(sub) => cmd_update(sub).await,
         Command::Pairing(sub) => cmd_pairing(sub).await,
         Command::Acp(sub) => cmd_acp(sub).await,
-        Command::Agent(sub) => cmd_agent(sub).await,
         Command::Approvals(sub) => cmd_approvals(sub).await,
         Command::Devices(sub) => cmd_devices(sub).await,
         Command::Directory(sub) => cmd_directory(sub).await,
@@ -559,32 +558,6 @@ async fn interactive_gateway_loop(client: &rsclaw::acp::GatewayClient) -> Result
     Ok(())
 }
 
-async fn cmd_agent(sub: cli::AgentCommand) -> Result<()> {
-    match sub {
-        cli::AgentCommand::Spawn {
-            agent_type,
-            cwd,
-            args: _,
-        } => {
-            let cwd = cwd.unwrap_or_else(|| {
-                std::env::current_dir()
-                    .expect("current_dir")
-                    .to_string_lossy()
-                    .to_string()
-            });
-            eprintln!("Spawning agent type: {} in {}", agent_type, cwd);
-            Ok(())
-        }
-        cli::AgentCommand::List => {
-            eprintln!("Listing agents...");
-            Ok(())
-        }
-        cli::AgentCommand::Kill { id } => {
-            eprintln!("Killing agent: {}", id);
-            Ok(())
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tracing initialisation

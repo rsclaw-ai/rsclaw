@@ -84,28 +84,3 @@ pub enum AcpCommand {
         agent_id: String,
     },
 }
-
-#[derive(Subcommand, Debug)]
-pub enum AgentCommand {
-    #[command(name = "spawn", about = "Spawn a new agent")]
-    Spawn {
-        /// Agent type: "opencode" or "claudecode"
-        #[arg(long, default_value = "opencode")]
-        agent_type: String,
-
-        #[arg(long)]
-        cwd: Option<String>,
-
-        #[arg(trailing_var_arg = true)]
-        args: Vec<String>,
-    },
-
-    #[command(name = "list", about = "List running agents")]
-    List,
-
-    #[command(name = "kill", about = "Kill an agent")]
-    Kill {
-        #[arg(long)]
-        id: String,
-    },
-}
