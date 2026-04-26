@@ -333,14 +333,6 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// Processing indicator — send with 3s timeout to avoid blocking
-// ---------------------------------------------------------------------------
-
-/// Returns the configured processing timeout duration (default 120s).
-/// When set to 0, returns a very large duration (effectively disabled).
-/// When intermediateOutput is enabled, also disabled (intermediate text replaces this).
-// ---------------------------------------------------------------------------
 // /btw direct LLM call — bypasses agent inbox entirely
 // ---------------------------------------------------------------------------
 

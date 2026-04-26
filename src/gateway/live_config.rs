@@ -84,7 +84,9 @@ impl LiveConfig {
                 ?restart_fields,
                 "hot-reload skipped: fields require gateway restart"
             );
-            let _ = restart_tx.send(restart_fields.clone());
+            if restart_tx.send(restart_fields.clone()).is_err() {
+                tracing::debug!("restart broadcast: no receivers");
+            }
             return restart_fields;
         }
 

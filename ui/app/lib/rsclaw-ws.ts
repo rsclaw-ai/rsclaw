@@ -43,6 +43,7 @@ class RsClawWsClient {
   private chatHandlers = new Map<string, { cb: ChatCallbacks; fullText: string }>();
   private notificationHandlers = new Set<(text: string) => void>();
   private restartHandlers = new Set<(payload: RestartRequiredPayload) => void>();
+  private tokenRefresh: Promise<void> | null = null;
 
   /** Ensure the WS is connected. Safe to call multiple times. */
   connect() {
@@ -95,10 +96,15 @@ class RsClawWsClient {
     return () => this.restartHandlers.delete(handler);
   }
 
-  private _doConnect() {
+  private async _doConnect() {
     if (this.retryTimer) {
       clearTimeout(this.retryTimer);
       this.retryTimer = null;
+    }
+
+    // Wait for any pending token refresh before reconnecting.
+    if (this.tokenRefresh) {
+      await this.tokenRefresh;
     }
 
     const gwUrl = getGatewayUrl() || "http://localhost:18888";
@@ -146,7 +152,7 @@ class RsClawWsClient {
   private _refreshTokenFromTauri() {
     const tauriInvoke = (window as any).__TAURI__?.invoke;
     if (!tauriInvoke) return;
-    tauriInvoke("get_gateway_port")
+    this.tokenRefresh = tauriInvoke("get_gateway_port")
       .then((gw: any) => {
         if (gw?.token) {
           setAuthToken(gw.token);
@@ -156,7 +162,12 @@ class RsClawWsClient {
           console.info("[rsclaw-ws] auth token refreshed from config");
         }
       })
-      .catch(() => {});
+      .catch((e: unknown) => {
+        console.warn("[rsclaw-ws] token refresh failed:", e);
+      })
+      .finally(() => {
+        this.tokenRefresh = null;
+      });
   }
 
   private _handleFrame(data: any) {
