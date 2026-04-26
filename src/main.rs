@@ -440,6 +440,11 @@ async fn cmd_acp(sub: AcpCommand) -> Result<()> {
                 req = req.header("Authorization", format!("Bearer {auth}"));
             }
             let resp = req.send().await.context("failed to reach gateway")?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("gateway returned {}: {}", status, if body.is_empty() { "endpoint not available (restart gateway?)" } else { &body });
+            }
             let conns: Vec<serde_json::Value> = resp.json().await.context("invalid JSON response")?;
             if conns.is_empty() {
                 println!("No active ACP connections");
