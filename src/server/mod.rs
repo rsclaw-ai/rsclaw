@@ -211,6 +211,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/agents", get(list_agents).post(create_agent))
         .route("/agents/{id}", patch(patch_agent).delete(delete_agent))
         .route("/agents/{id}/status", get(agent_status))
+        .route("/acp/connections", get(list_acp_connections))
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/config/reload", post(config_reload))
@@ -566,6 +567,12 @@ async fn list_agents(State(state): State<AppState>) -> impl IntoResponse {
         })
         .collect();
     Json(agents)
+}
+
+/// List active ACP/WS connections with client metadata.
+async fn list_acp_connections(State(state): State<AppState>) -> impl IntoResponse {
+    let conns = state.ws_conns.list_connections().await;
+    Json(conns)
 }
 
 async fn agent_status(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {

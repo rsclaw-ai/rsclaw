@@ -162,6 +162,17 @@ pub struct ConnectParams {
     pub auth: Option<AuthCredentials>,
     pub device_id: Option<String>,
     pub role: Option<String>,
+    pub client: Option<ClientInfo>,
+}
+
+/// Metadata about the connecting client (sent in the connect handshake).
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientInfo {
+    pub id: Option<String>,
+    pub version: Option<String>,
+    pub platform: Option<String>,
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]

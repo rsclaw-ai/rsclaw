@@ -349,10 +349,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // 7. Register this connection in the ConnRegistry.
     let conn_id: ConnId = uuid::Uuid::new_v4().to_string();
-    let conn = Arc::new(RwLock::new(ConnHandle::new(
-        conn_id.clone(),
-        outbound_tx.clone(),
-    )));
+    let mut handle = ConnHandle::new(conn_id.clone(), outbound_tx.clone());
+    handle.client_info = connect_params.client.clone();
+    let conn = Arc::new(RwLock::new(handle));
     state.ws_conns.register(Arc::clone(&conn)).await;
     info!("ws: connection {conn_id} registered");
 

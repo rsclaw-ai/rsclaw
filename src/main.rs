@@ -435,25 +435,27 @@ async fn cmd_acp(sub: AcpCommand) -> Result<()> {
         AcpCommand::List { url, token } => {
             let auth = resolve_gateway_token(token);
             let client = reqwest::Client::new();
-            let mut req = client.get(format!("{}/api/v1/agents", url.trim_end_matches('/')));
+            let mut req = client.get(format!("{}/api/v1/acp/connections", url.trim_end_matches('/')));
             if !auth.is_empty() {
                 req = req.header("Authorization", format!("Bearer {auth}"));
             }
             let resp = req.send().await.context("failed to reach gateway")?;
-            let body: serde_json::Value = resp.json().await.context("invalid JSON response")?;
-            if let Some(agents) = body.as_array() {
-                if agents.is_empty() {
-                    println!("No agents configured");
-                } else {
-                    for a in agents {
-                        let id = a["id"].as_str().unwrap_or("-");
-                        let model = a["model"].as_str().unwrap_or("(default)");
-                        let default = if a["default"].as_bool().unwrap_or(false) { "yes" } else { "no" };
-                        println!("{:<20} model={:<20} default={}", id, model, default);
-                    }
-                }
+            let conns: Vec<serde_json::Value> = resp.json().await.context("invalid JSON response")?;
+            if conns.is_empty() {
+                println!("No active ACP connections");
             } else {
-                println!("{}", serde_json::to_string_pretty(&body).unwrap_or_default());
+                for c in &conns {
+                    let client_id = c["client_id"].as_str().unwrap_or("unknown");
+                    let version = c["version"].as_str().unwrap_or("-");
+                    let platform = c["platform"].as_str().unwrap_or("-");
+                    let mode = c["mode"].as_str().unwrap_or("-");
+                    let sessions = c["sessions"].as_u64().unwrap_or(0);
+                    let uptime = c["uptime_secs"].as_u64().unwrap_or(0);
+                    println!(
+                        "{:<30} v{:<10} {:<8} mode={:<6} sessions={} uptime={}s",
+                        client_id, version, platform, mode, sessions, uptime,
+                    );
+                }
             }
             Ok(())
         }
