@@ -1791,10 +1791,104 @@ impl BrowserSession {
         Ok(json!({"action": "download_wait", "timeout": timeout_secs, "status": "completed"}))
     }
 
-    /// Click a download trigger element and move the resulting file to a
-    /// caller-supplied path. Args: `ref` (element ref to click) + `path`
-    /// (absolute destination). Watches a temp dir for the new file, polls
-    /// until size stabilises, then moves it.
+    /// Helper for `cmd_download`'s URL mode. Fetches host-side via reqwest
+    /// — vlabvod / dreamina CDNs don't return CORS headers so in-page
+    /// `fetch(..., {mode: 'cors'})` always fails. We pull cookies from the
+    /// browser session via CDP first so the request looks identical to
+    /// what jimeng's own UI would send (some signed URLs gate on the
+    /// session cookies in addition to the URL signature).
+    async fn cmd_download_url(
+        &self,
+        url: &str,
+        dest_path: &str,
+        timeout_secs: u64,
+    ) -> Result<Value> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| anyhow!("download(url): build client: {e}"))?;
+
+        // Pull session cookies for this URL from the browser via CDP and
+        // build a Cookie header. This lets jimeng/dreamina CDN auth pass.
+        let cookie_header = match self
+            .cdp
+            .send("Network.getCookies", json!({"urls": [url]}))
+            .await
+        {
+            Ok(resp) => resp
+                .get("cookies")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|c| {
+                            let n = c.get("name").and_then(|v| v.as_str())?;
+                            let v = c.get("value").and_then(|v| v.as_str())?;
+                            Some(format!("{}={}", n, v))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+
+        let referer = if url.contains("vlabvod") || url.contains("dreamina") {
+            "https://jimeng.jianying.com/"
+        } else {
+            ""
+        };
+        let mut req = client.get(url);
+        if !referer.is_empty() {
+            req = req.header("Referer", referer);
+        }
+        if !cookie_header.is_empty() {
+            req = req.header("Cookie", cookie_header);
+        }
+        // Mimic Safari rather than Chrome — some jimeng CDNs treat
+        // Chrome UA strings differently (or block them). Safari is what
+        // the user's normal browser session would send.
+        req = req.header(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
+        );
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| anyhow!("download(url): send: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            bail!("download(url): HTTP {status}");
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| anyhow!("download(url): read body: {e}"))?;
+
+        let dest = std::path::PathBuf::from(dest_path);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow!("download(url): create parent dir: {e}"))?;
+        }
+        std::fs::write(&dest, &bytes)
+            .map_err(|e| anyhow!("download(url): write: {e}"))?;
+
+        Ok(json!({
+            "action": "download",
+            "url": url,
+            "path": dest_path,
+            "bytes": bytes.len(),
+            "result": dest_path,
+        }))
+    }
+
+    /// Download to a caller-supplied path. Two modes:
+    /// - `ref` mode: click the referenced element, watch a temp dir for the
+    ///   resulting file, then move it to `path`.
+    /// - `url` mode: fetch the URL via the browser session (so cookies and
+    ///   referer match what jimeng/dreamina expect for their CDN signed
+    ///   URLs), convert to a blob, and write to `path`. Triggered when
+    ///   `ref` starts with `http://` / `https://` (no separate arg name —
+    ///   keeps the existing wasm-side `browser_download(ref, path)` shape).
     async fn cmd_download(&self, args: &Value) -> Result<Value> {
         let eref = args
             .get("ref")
@@ -1805,6 +1899,12 @@ impl BrowserSession {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("download: `path` required"))?;
         let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(45);
+
+        // URL mode: same-origin fetch + base64 → write to dest. Lets plugins
+        // download CDN-signed jimeng/dreamina URLs without driving the UI.
+        if eref.starts_with("http://") || eref.starts_with("https://") {
+            return self.cmd_download_url(eref, dest_path, timeout_secs).await;
+        }
 
         // Use a per-call temp dir so we only see this download's output.
         let nanos = std::time::SystemTime::now()
