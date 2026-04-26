@@ -65,18 +65,20 @@ pub enum AcpCommand {
 
     #[command(name = "list", about = "List agents on Gateway")]
     List {
-        #[arg(long, default_value = "ws://localhost:18888")]
+        #[arg(long, default_value = "http://localhost:18888")]
         url: String,
 
+        /// Auth token (auto-detected from config if omitted).
         #[arg(long)]
         token: Option<String>,
     },
 
     #[command(name = "kill", about = "Kill an agent on Gateway")]
     Kill {
-        #[arg(long, default_value = "ws://localhost:18888")]
+        #[arg(long, default_value = "http://localhost:18888")]
         url: String,
 
+        /// Auth token (auto-detected from config if omitted).
         #[arg(long)]
         token: Option<String>,
 

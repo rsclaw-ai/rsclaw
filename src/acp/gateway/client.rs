@@ -9,11 +9,11 @@ use tokio::{
 
 use crate::acp::gateway::{
     EventFrame, Features, GatewayFrame, HelloOk, Policy, RequestFrame, RequestFrameType,
-    ServerInfo, Snapshot, client_mode,
+    ResponseFrame, ServerInfo, Snapshot, client_mode,
 };
 
 pub const GATEWAY_TIMEOUT: Duration = Duration::from_secs(30);
-pub const DEFAULT_PROTOCOL_VERSION: u32 = 1;
+pub const DEFAULT_PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Clone)]
 pub struct GatewayClient {
@@ -177,7 +177,48 @@ impl GatewayClient {
             });
         }
 
-        let response = self.call("connect", Some(params)).await?;
+        // Send the connect request directly (receive_loop is not yet running,
+        // so we read the response inline like wait_challenge does).
+        let frame = RequestFrame {
+            frame_type: RequestFrameType::Req,
+            id: "connect-1".to_string(),
+            method: "connect".to_string(),
+            params: Some(params),
+        };
+        let json = serde_json::to_string(&frame)?;
+        eprintln!("[GWClient] -> {}", json);
+        {
+            let inner = self.inner.read().await;
+            inner.write_tx.send(json).await?;
+        }
+
+        // Read the response directly from the WS read channel.
+        let response = timeout(Duration::from_secs(10), async {
+            loop {
+                let msg = {
+                    let mut inner = self.inner.write().await;
+                    inner.read_rx.recv().await
+                };
+                match msg {
+                    Some(text) => {
+                        eprintln!("[GWClient] <- {}", text);
+                        if let Ok(res) = serde_json::from_str::<ResponseFrame>(&text) {
+                            if res.id == "connect-1" {
+                                if res.ok {
+                                    return Ok(res.payload.unwrap_or(serde_json::Value::Null));
+                                } else {
+                                    let msg = res.error.map(|e| e.message).unwrap_or_default();
+                                    return Err(anyhow::anyhow!("connect failed: {}", msg));
+                                }
+                            }
+                        }
+                    }
+                    None => return Err(anyhow::anyhow!("Connection closed during handshake")),
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("connect response timeout"))??;
 
         let hello: HelloOk =
             serde_json::from_value(response).context("Failed to parse hello response")?;
