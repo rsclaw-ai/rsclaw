@@ -428,30 +428,21 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             loop {
                 match reload_rx.recv().await {
                     Ok(ConfigChange::FullReload(new_cfg)) => {
-                        // Snapshot BEFORE apply so we can diff against the
-                        // incoming config and decide whether the change is
-                        // hot-safe (e.g. just a temperature tweak).
-                        let old_snapshot = live_reload.snapshot().await;
+                        // `apply` now uses `diff_restart_sections` as the
+                        // single source of truth: empty = hot-safe (already
+                        // written into live locks); non-empty = a restart is
+                        // recommended for the listed sections.
                         let new_owned = (*new_cfg).clone();
                         let needs_restart =
-                            live_reload.apply(new_owned.clone(), &restart_tx).await;
+                            live_reload.apply(new_owned, &restart_tx).await;
                         if needs_restart.is_empty() {
-                            info!("config hot-reload applied");
+                            info!("config hot-reload applied (hot-safe fields only)");
                         } else {
                             warn!(?needs_restart, "config change requires gateway restart");
-                        }
-                        if crate::gateway::live_config::is_hot_safe_only(
-                            &old_snapshot,
-                            &new_owned,
-                        ) {
-                            info!(
-                                "config hot-reload: only live-safe fields changed, suppressing restart banner"
-                            );
-                        } else {
                             // FullReload doesn't fully propagate to running
-                            // agents (their providers/prompts are snapshotted
-                            // at spawn). Surface a Recommended restart banner
-                            // so the user can choose to apply changes cleanly.
+                            // agents/channels (providers/prompts/credentials
+                            // are snapshotted at spawn). Surface a Recommended
+                            // banner so the user can apply changes cleanly.
                             publish_restart(
                                 &bridge_tx,
                                 &bridge_pending,

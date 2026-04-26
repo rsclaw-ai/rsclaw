@@ -74,15 +74,15 @@ impl AgentRuntime {
         use crate::config::schema::CompactionMode;
 
         // Use configured compaction settings, or sensible defaults.
-        let cfg = self.config.agents.defaults.compaction.clone()
+        let cfg = self.live.agents.read().await.defaults.compaction.clone()
             .unwrap_or_default();
 
         // Compaction trigger: token threshold ONLY.
         // Turn count and time-based triggers were removed because they
         // unnecessarily discard context and break KV cache in the new
         // append-only architecture.
-        let context_tokens = self.config.agents.defaults.context_tokens.unwrap_or(64_000) as usize;
-        let kv_cache_mode = self.config.agents.defaults.kv_cache_mode.unwrap_or(1);
+        let context_tokens = self.live.agents.read().await.defaults.context_tokens.unwrap_or(64_000) as usize;
+        let kv_cache_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
         // kvCacheMode >= 1: append-only mode, compact at 80% to leave headroom
         // for token estimation inaccuracy (10-15%). Mode 0: legacy 50% threshold.
         let default_threshold = if kv_cache_mode >= 1 {

@@ -587,7 +587,7 @@ impl AgentRuntime {
     async fn handle_side_query(&mut self, session_key: &str, question: &str) -> Result<AgentReply> {
         // Read current session history — only User/Assistant text messages,
         // skip Tool/ToolCall messages (btw has no tools, they'd confuse the model).
-        let btw_budget = self.config.agents.defaults.btw_tokens.unwrap_or(10_000) as usize;
+        let btw_budget = self.live.agents.read().await.defaults.btw_tokens.unwrap_or(10_000) as usize;
         let history: Vec<Message> = self.sessions.get(session_key).cloned().unwrap_or_default();
         let mut messages = Vec::new();
         let mut token_count = 0usize;
@@ -833,7 +833,7 @@ impl AgentRuntime {
             // Save session summary to memory before clearing — no summary
             // will be injected into the new session, so memory is the only
             // way the LLM can find prior context.
-            let compaction_model = self.config.agents.defaults.compaction
+            let compaction_model = self.live.agents.read().await.defaults.compaction
                 .as_ref().and_then(|c| c.model.clone())
                 .or_else(|| self.handle.config.model.as_ref()?.primary.clone())
                 .unwrap_or_else(|| "default".to_owned());
@@ -857,7 +857,7 @@ impl AgentRuntime {
             info!("reset_signal received, resetting sessions");
 
             // Save session summary to memory before clearing.
-            let compaction_model2 = self.config.agents.defaults.compaction
+            let compaction_model2 = self.live.agents.read().await.defaults.compaction
                 .as_ref().and_then(|c| c.model.clone())
                 .or_else(|| self.handle.config.model.as_ref()?.primary.clone())
                 .unwrap_or_else(|| "default".to_owned());
@@ -930,7 +930,7 @@ impl AgentRuntime {
                 .config
                 .workspace
                 .as_deref()
-                .or(self.config.agents.defaults.workspace.as_deref())
+                .or(self.live.agents.read().await.defaults.workspace.as_deref())
                 .map(expand_tilde)
                 .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
             let uploads = workspace.join("uploads");
@@ -1193,8 +1193,8 @@ impl AgentRuntime {
                                 None
                             } else {
                                 let model = self.resolve_model_name();
-                                let context_tokens = self.config.agents.defaults.context_tokens.unwrap_or(64_000) as usize;
-                                let cfg = self.config.agents.defaults.compaction.clone().unwrap_or_default();
+                                let context_tokens = self.live.agents.read().await.defaults.context_tokens.unwrap_or(64_000) as usize;
+                                let cfg = self.live.agents.read().await.defaults.compaction.clone().unwrap_or_default();
                                 let default_transcript = (context_tokens * 7 / 10).max(16_000);
                                 let max_transcript = cfg.max_transcript_tokens.map(|t| t as usize).unwrap_or(default_transcript);
                                 // Render transcript (reuse the same logic as compaction).
@@ -1873,7 +1873,7 @@ impl AgentRuntime {
             let ws = agent_cfg
                 .workspace
                 .as_deref()
-                .or(self.config.agents.defaults.workspace.as_deref())
+                .or(self.live.agents.read().await.defaults.workspace.as_deref())
                 .map(expand_tilde)
                 .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
             let uploads = ws.join("uploads");
@@ -2034,7 +2034,7 @@ impl AgentRuntime {
         let workspace = agent_cfg
             .workspace
             .as_deref()
-            .or(self.config.agents.defaults.workspace.as_deref())
+            .or(self.live.agents.read().await.defaults.workspace.as_deref())
             .map(expand_tilde)
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
 
@@ -2233,7 +2233,7 @@ impl AgentRuntime {
         self.cached_tools = tools.clone();
 
         // Check vision support before loading session (avoids borrow conflict).
-        let kv_mode = self.config.agents.defaults.kv_cache_mode.unwrap_or(1);
+        let kv_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
         // Always detect vision capability — used to decide which model describes images.
         // kvCacheMode >= 1: images are described then stored as text (never base64 in session).
         // kvCacheMode = 0: images kept as base64 in session for vision models.
@@ -2274,12 +2274,22 @@ impl AgentRuntime {
                 let vision_model = if model_has_vision {
                     model.clone()
                 } else {
+                    // Snapshot the live default-model image before the chain so the
+                    // `.or_else()` closure stays synchronous.
+                    let default_image_model = self
+                        .live
+                        .agents
+                        .read()
+                        .await
+                        .defaults
+                        .model
+                        .as_ref()
+                        .and_then(|m| m.image.clone());
                     // Try image model config, then fallback to known vision providers.
                     self.handle.config.model.as_ref()
                         .and_then(|m| m.image.as_deref())
-                        .or_else(|| self.config.agents.defaults.model.as_ref()
-                            .and_then(|m| m.image.as_deref()))
                         .map(|s| s.to_owned())
+                        .or(default_image_model)
                         .unwrap_or_else(|| {
                             // Auto-detect a vision-capable provider from config.
                             let vision_providers = ["doubao", "gemini", "openai", "qwen"];
@@ -2417,12 +2427,15 @@ impl AgentRuntime {
             chat_id: String::new(),
             exec_pool: Arc::clone(&self.exec_pool),
             loop_detector: {
-                let ld_cfg = self
-                    .config
+                let ld_cfg_owned = self
+                    .live
                     .ext
+                    .read()
+                    .await
                     .tools
                     .as_ref()
-                    .and_then(|t| t.loop_detection.as_ref());
+                    .and_then(|t| t.loop_detection.clone());
+                let ld_cfg = ld_cfg_owned.as_ref();
                 if ld_cfg.map(|c| c.enabled.unwrap_or(true)).unwrap_or(true) {
                     let window = ld_cfg.and_then(|c| c.window).unwrap_or(20);
                     let warning_threshold = ld_cfg.and_then(|c| c.threshold).unwrap_or(20);
@@ -2602,7 +2615,7 @@ impl AgentRuntime {
                     .config
                     .workspace
                     .as_deref()
-                    .or(self.config.agents.defaults.workspace.as_deref())
+                    .or(self.live.agents.read().await.defaults.workspace.as_deref())
                     .map(crate::agent::runtime::expand_tilde)
                     .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
                 let skills_dir = ws_dir.join("skills");
@@ -2850,7 +2863,7 @@ impl AgentRuntime {
     async fn save_session_summaries_to_memory(&mut self, model: &str) {
         if self.memory.is_none() { return; }
 
-        let kv_cache_mode = self.config.agents.defaults.kv_cache_mode.unwrap_or(1);
+        let kv_cache_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
 
         // Collect session data upfront to avoid borrow conflicts.
         let session_data: Vec<(String, String)> = self.sessions.iter()
@@ -2983,7 +2996,7 @@ impl AgentRuntime {
         dynamic_ctx: Vec<String>,
         new_skills_tail: Vec<String>,
     ) -> Result<AgentReply> {
-        let pruning_cfg = self.config.agents.defaults.context_pruning.clone();
+        let pruning_cfg = self.live.agents.read().await.defaults.context_pruning.clone();
 
         // Resolve context budget (tokens) for history trimming.
         // Priority: agent model config > defaults.contextTokens >
@@ -2994,7 +3007,7 @@ impl AgentRuntime {
             .model
             .as_ref()
             .and_then(|m| m.context_tokens)
-            .or(self.config.agents.defaults.context_tokens)
+            .or(self.live.agents.read().await.defaults.context_tokens)
             .or_else(|| {
                 self.config
                     .agents
@@ -3143,7 +3156,7 @@ impl AgentRuntime {
         // Dynamic iteration limit based on task complexity.
         // Default: 20 iterations. Complex tools (browser/opencode/exec): up to configured max.
         const BASE_ITERATIONS: usize = 20;
-        let configured_complex: usize = self.config.agents.defaults.max_iterations
+        let configured_complex: usize = self.live.agents.read().await.defaults.max_iterations
             .map(|v| v as usize)
             .unwrap_or(30);
         // Track consecutive identical tool calls (same name + same args).
@@ -3358,8 +3371,11 @@ impl AgentRuntime {
                     .config
                     .model
                     .as_ref()
-                    .and_then(|m| m.thinking.as_ref());
-                let default_thinking = self.config.agents.defaults.thinking.as_ref();
+                    .and_then(|m| m.thinking.as_ref())
+                    .cloned();
+                // Clone the live default so we don't hold the lock across the
+                // closure / `.and_then` chain below.
+                let default_thinking = self.live.agents.read().await.defaults.thinking.clone();
                 let tc = agent_thinking.or(default_thinking);
                 tc.and_then(|t| {
                     // Explicit budget_tokens takes precedence.
@@ -3507,7 +3523,7 @@ impl AgentRuntime {
             };
 
 // Pre-flight check: emergency compact if we'd exceed context.
-            let context_limit = self.config.agents.defaults.context_tokens.unwrap_or(64_000) as usize;
+            let context_limit = self.live.agents.read().await.defaults.context_tokens.unwrap_or(64_000) as usize;
             let overhead = self.estimate_fixed_overhead();
             let session_tokens: usize = self.sessions
                 .get(&ctx.session_key)
@@ -3533,7 +3549,7 @@ impl AgentRuntime {
                     .unwrap_or_default();
             }
 
-            let kv_cache_mode = self.config.agents.defaults.kv_cache_mode.unwrap_or(1);
+            let kv_cache_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
             let req = LlmRequest {
                 model: model.to_owned(),
                 messages,
@@ -3541,7 +3557,7 @@ impl AgentRuntime {
                 system: Some(effective_system.clone()),
                 max_tokens: configured_max_tokens,
                 temperature,
-                frequency_penalty: self.config.agents.defaults.frequency_penalty,
+                frequency_penalty: self.live.agents.read().await.defaults.frequency_penalty,
                 thinking_budget,
                 kv_cache_mode,
                 session_key: if kv_cache_mode >= 2 { Some(ctx.session_key.clone()) } else { None },
@@ -3774,7 +3790,7 @@ impl AgentRuntime {
             // Can be overridden via agents.defaults.stripThinkTags.
             let pre_strip_len = text_buf.trim().len();
             let thinking_active = thinking_budget.unwrap_or(0) > 0;
-            let strip_enabled = self.config.agents.defaults.strip_think_tags.unwrap_or(!thinking_active);
+            let strip_enabled = self.live.agents.read().await.defaults.strip_think_tags.unwrap_or(!thinking_active);
             if strip_enabled {
                 let before = text_buf.clone();
                 text_buf = crate::provider::openai::strip_think_tags_pub(&text_buf);
@@ -4075,7 +4091,7 @@ impl AgentRuntime {
             // Send intermediate text to user immediately (progress feedback).
             // Model often says "好的，我来帮你搜索" before calling tools — send it now
             // instead of waiting for the entire turn to complete.
-            let intermediate_enabled = self.config.agents.defaults.intermediate_output.unwrap_or(true);
+            let intermediate_enabled = self.live.agents.read().await.defaults.intermediate_output.unwrap_or(true);
             if intermediate_enabled && !text_buf.is_empty() && !tool_calls.is_empty() {
                 if let Some(ref ntx) = self.notification_tx {
                     let notif_target = if !ctx.chat_id.is_empty() {
@@ -4409,7 +4425,7 @@ impl AgentRuntime {
                         if v.get("__send_file").and_then(|b| b.as_bool()).unwrap_or(false) {
                             if let Some(path_str) = v.get("path").and_then(|p| p.as_str()) {
                                 let send_workspace = self.handle.config.workspace.as_deref()
-                                    .or(self.config.agents.defaults.workspace.as_deref())
+                                    .or(self.live.agents.read().await.defaults.workspace.as_deref())
                                     .map(expand_tilde)
                                     .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
                                 let full = canonicalize_external_path(path_str, &send_workspace);
@@ -4455,7 +4471,7 @@ impl AgentRuntime {
                 // Collect sendable file attachments from write/exec tool results.
                 if matches!(tool_name.as_str(), "write_file" | "write" | "execute_command" | "exec") {
                     let workspace = self.handle.config.workspace.as_deref()
-                        .or(self.config.agents.defaults.workspace.as_deref())
+                        .or(self.live.agents.read().await.defaults.workspace.as_deref())
                         .map(expand_tilde)
                         .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
 
@@ -4542,7 +4558,7 @@ impl AgentRuntime {
                             };
 
                             let files_workspace = self.handle.config.workspace.as_deref()
-                                .or(self.config.agents.defaults.workspace.as_deref())
+                                .or(self.live.agents.read().await.defaults.workspace.as_deref())
                                 .map(expand_tilde)
                                 .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
                             let pb = canonicalize_external_path(&path_str, &files_workspace);
@@ -4633,12 +4649,15 @@ impl AgentRuntime {
                         }
                     } else {
                         // Non-web tools: keep existing per-tool limits.
-                        let limits = self
-                            .config
+                        let limits_owned = self
+                            .live
                             .ext
+                            .read()
+                            .await
                             .tools
                             .as_ref()
-                            .and_then(|t| t.session_result_limits.as_ref());
+                            .and_then(|t| t.session_result_limits.clone());
+                        let limits = limits_owned.as_ref();
                         let max_chars = match tool_name.as_str() {
                             "execute_command" | "exec" => {
                                 limits.and_then(|l| l.exec).unwrap_or(3000)
@@ -4824,7 +4843,7 @@ impl AgentRuntime {
                 // Returns a marker that the agent loop picks up to add to tool_files.
                 let path = args["path"].as_str().unwrap_or("").to_owned();
                 let workspace = self.handle.config.workspace.as_deref()
-                    .or(self.config.agents.defaults.workspace.as_deref())
+                    .or(self.live.agents.read().await.defaults.workspace.as_deref())
                     .map(expand_tilde)
                     .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
                 let pb = std::path::PathBuf::from(&path);
@@ -5177,12 +5196,15 @@ impl AgentRuntime {
         if kind != "remember" {
             return Ok(json!({"stored": true, "id": id}));
         }
+        // Snapshot defaults.workspace before the chain — `.or_else` takes a
+        // sync closure so we can't await inside it.
+        let default_workspace = self.live.agents.read().await.defaults.workspace.clone();
         let ws_str = self
             .handle
             .config
             .workspace
             .clone()
-            .or_else(|| self.config.agents.defaults.workspace.clone())
+            .or(default_workspace)
             .unwrap_or_else(|| "~/.rsclaw/workspace".to_owned());
         let ws = if ws_str.starts_with('~') {
             dirs_next::home_dir().unwrap_or_default().join(&ws_str[2..])
