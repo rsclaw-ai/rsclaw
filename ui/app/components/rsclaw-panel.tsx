@@ -52,7 +52,6 @@ import {
   API_TYPE_NEEDS_KEY,
 } from "../lib/provider-defaults";
 import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
-import { RestartBanner } from "./restart-banner";
 
 // ── Types ──────────────────────────────────────────────
 interface ChannelInfo {
@@ -266,9 +265,6 @@ function StatusPage() {
           </button>
         </>
       </div>
-
-      {/* Restart-required banner — appears under the gateway status when a restart event is pending */}
-      <RestartBanner />
 
       {/* Stats Row */}
       <div className={styles["stat-row"]}>
@@ -495,7 +491,6 @@ function ConfigEditorPage() {
   const [port, setPort] = useState(18889);
   const [bind, setBind] = useState("127.0.0.1");
   const [language, setLanguage] = useState("zh-CN");
-  const [processingTimeout, setProcessingTimeout] = useState(120);
   const [authToken, setAuthToken] = useState("");
   const [agentModel, setAgentModel] = useState("");
   const [agentMaxTokens, setAgentMaxTokens] = useState(0);
@@ -551,8 +546,6 @@ function ConfigEditorPage() {
     if (b) setBind(b);
     const l = extractVal(raw, "language");
     if (l) setLanguage(l);
-    const pt = extractVal(raw, "processingTimeout");
-    if (pt) setProcessingTimeout(parseInt(pt, 10) || 120);
     const at = extractVal(raw, "authToken");
     if (at) { setAuthToken(at); setApiAuthToken(at); }
 
@@ -694,7 +687,6 @@ function ConfigEditorPage() {
     cfg.gateway.port = port;
     cfg.gateway.bind = bind;
     cfg.gateway.language = language;
-    cfg.gateway.processingTimeout = processingTimeout;
     if (authToken) {
       if (!cfg.gateway.auth) cfg.gateway.auth = {};
       cfg.gateway.auth.token = authToken;
@@ -722,7 +714,7 @@ function ConfigEditorPage() {
     }
 
     return JSON.stringify(cfg, null, 2);
-  }, [rawConfig, port, bind, language, processingTimeout, authToken, providers]);
+  }, [rawConfig, port, bind, language, authToken, providers]);
 
   const handleSave = async () => {
     setSaving(true);
@@ -858,14 +850,6 @@ function ConfigEditorPage() {
             <option value="en">en</option>
             <option value="ja">ja</option>
           </select>
-        </div>
-        <div style={fieldRow}>
-          <div>
-            <div style={fieldLabel}>{Locale.RsClawPanel.Config.ProcessingTimeout}</div>
-            <div style={fieldSub}>seconds</div>
-          </div>
-          <input style={fieldInput} type="number" value={processingTimeout}
-            onChange={(e) => { setProcessingTimeout(parseInt(e.target.value, 10) || 120); markDirty(); }} />
         </div>
         <div style={{ ...fieldRow, borderBottom: "none" }}>
           <div>
@@ -1308,7 +1292,6 @@ function ConfigEditorPage() {
       Locale.RsClawPanel.Config.BindLoopback,
       Locale.RsClawPanel.Config.BindAll,
       Locale.RsClawPanel.Config.Language,
-      Locale.RsClawPanel.Config.ProcessingTimeout,
       Locale.RsClawPanel.Config.SaveAndReload,
       Locale.RsClawPanel.Config.Saving,
       Locale.RsClawPanel.Config.ReloadNote,
@@ -3787,7 +3770,7 @@ function TauriConfigPageInner() {
               <input style={{ ...fInput, minWidth: 100 }} type="number" value={getVal("gateway.port", 18888)} onChange={(e) => updateConfig("gateway.port", parseInt(e.target.value) || 18888)} />
             </div>
             {/* Language */}
-            <div style={fieldRow}>
+            <div style={{ ...fieldRow, borderBottom: "none" }}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u7F51\u5173\u8BED\u8A00" : "Gateway Language"}</div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>gateway.language</div>
@@ -3795,14 +3778,6 @@ function TauriConfigPageInner() {
               <select style={{ ...fSelect, minWidth: 180 }} value={getVal("gateway.language", "Chinese")} onChange={(e) => updateConfig("gateway.language", e.target.value)}>
                 {LANGUAGES.map((l) => <option key={l.value} value={l.value}>{l.label}</option>)}
               </select>
-            </div>
-            {/* Processing timeout */}
-            <div style={{ ...fieldRow, borderBottom: "none" }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5904\u7406\u4E2D\u63D0\u793A\u5EF6\u8FDF" : "Processing Timeout"}</div>
-                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>gateway.processingTimeout ({zh ? "\u79D2\uFF0C0=\u7981\u7528" : "sec, 0=disabled"})</div>
-              </div>
-              <input style={{ ...fInput, minWidth: 100 }} type="number" value={getVal("gateway.processingTimeout", 60)} onChange={(e) => updateConfig("gateway.processingTimeout", parseInt(e.target.value) || 0)} />
             </div>
           </div>
 

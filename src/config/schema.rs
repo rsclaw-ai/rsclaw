@@ -99,8 +99,6 @@ pub struct GatewayConfig {
     pub hot_reload: Option<Value>,
     /// Default response language (e.g. "Chinese", "English", "Japanese").
     pub language: Option<String>,
-    /// Seconds before sending "Processing..." indicator. 0 = disabled. Default: 10.
-    pub processing_timeout: Option<u64>,
     /// Global default User-Agent for all LLM provider HTTP requests.
     /// Provider-level user_agent overrides this. Default: "Mozilla/5.0 (compatible; rsclaw/1.0)".
     #[serde(default, skip_serializing_if = "Option::is_none")]

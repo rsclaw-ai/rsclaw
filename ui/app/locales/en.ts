@@ -1003,15 +1003,11 @@ const en: LocaleType = {
       Error: "error",
     },
 
-    RestartBanner: {
-      DefaultMessage: "A gateway restart is required to apply changes.",
-      AutoRestartCountdown: (seconds: number) =>
-        `Auto-restarting in ${seconds}s. If it does not happen automatically, click "Restart Now".`,
-      AutoRestarting: "Auto-restarting...",
-      RestartNow: "Restart Now",
-      Later: "Later",
-      Dismiss: "Dismiss",
-      Restarting: "Restarting...",
+    RestartPending: {
+      // Inline label shown next to the gateway running indicator when a
+      // restart is required. Kept short so it fits in the sidebar row.
+      Label: (seconds: number) => `Config changed, restart in ${seconds}s`,
+      RestartNow: "Restart now",
       Failed: "Restart failed: ",
     },
 
@@ -1031,7 +1027,6 @@ const en: LocaleType = {
       BindAll: "all (all interfaces)",
       BindCustom: "custom",
       Language: "Gateway Language",
-      ProcessingTimeout: "processingTimeout (s)",
       Models: "Models",
       Channels: "Channels",
       Tools: "Tools",

@@ -29,6 +29,10 @@ import { showConfirm } from "./ui-lib";
 import clsx from "clsx";
 import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
 import { getAgents, getHealth } from "../lib/rsclaw-api";
+import { useRestartBanner } from "../hooks/useRestartBanner";
+
+/** Seconds before an auto-restart fires once a `restart.required` event arrives. */
+const RESTART_PENDING_SECONDS = 60;
 
 const ChatList = dynamic(async () => (await import("./chat-list")).ChatList, {
   loading: () => null,
@@ -122,6 +126,15 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
   const navigate = useNavigate();
   const zh = getLang() === "cn";
 
+  // Inline restart-required indicator. The hook subscribes to the gateway's
+  // `restart.required` WS frame and survives navigation since this sidebar is
+  // mounted on every non-onboarding/non-auth route.
+  const restartReq = useRestartBanner();
+  const [restartSecondsLeft, setRestartSecondsLeft] = React.useState(RESTART_PENDING_SECONDS);
+  // Hold a stable ref to doRestart so the countdown effect can call it without
+  // re-subscribing on every render.
+  const doRestartRef = React.useRef<() => Promise<void>>(async () => {});
+
   const doStart = async () => {
     setStarting(true);
     setStatus("starting");
@@ -185,6 +198,10 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
       setStatus("offline");
       setErrorMsg("");
       failCount.current = 0;
+      // Stopping is an explicit user action — clear any pending restart so
+      // the next manual start doesn't immediately re-arm the auto-restart
+      // countdown from a stale latch.
+      restartReq.dismiss();
     } catch {}
   };
 
@@ -192,6 +209,9 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
     setStarting(true);
     setStatus("starting");
     setErrorMsg("");
+    // Clear the pending-restart banner state so the inline countdown stops
+    // regardless of whether this restart was user-clicked or auto-fired.
+    restartReq.dismiss();
     try {
       const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       if (tauriInvoke) {
@@ -213,6 +233,7 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
       setStatus("failed");
     }
   };
+  doRestartRef.current = doRestart;
 
   const doDiagnose = async () => {
     navigate(Path.RsClawPanel + "?tab=doctor");
@@ -264,12 +285,42 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
     return () => clearInterval(timer);
   }, []);
 
+  // Auto-restart countdown: when a `restart.required` event arrives and the
+  // gateway is running, count down RESTART_PENDING_SECONDS then trigger
+  // doRestart automatically. Manual click on the Restart button cancels via
+  // restartReq.dismiss() (which flips banner.visible to false → effect cleans
+  // up). Web/non-Tauri builds skip auto-restart since the desktop shell owns
+  // the gateway sidecar.
+  React.useEffect(() => {
+    if (!restartReq.visible || status !== "online" || !isTauri) return;
+    setRestartSecondsLeft(RESTART_PENDING_SECONDS);
+    const timer = setInterval(() => {
+      setRestartSecondsLeft((s) => {
+        if (s <= 1) {
+          clearInterval(timer);
+          void doRestartRef.current();
+          return 0;
+        }
+        return s - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [restartReq.visible, status]);
+
   const isOnline = status === "online";
   const isFailed = status === "failed";
   const isChecking = status === "checking";
   const isStarting = status === "starting" || starting;
-  const color = isOnline ? "#2dd4a0" : (isStarting || isChecking) ? "#f5a623" : isFailed ? "#d95f5f" : "#d95f5f";
-  const label = isOnline ? Locale.RsClawPanel.Running
+  // While a restart is pending, override the running indicator with an amber
+  // dot + countdown label. The button row stays visible so the user can click
+  // Restart to fire it immediately (bypassing the usual confirm modal).
+  const restartPending = restartReq.visible && isOnline && !isStarting;
+  const color = restartPending ? "#f5a623"
+    : isOnline ? "#2dd4a0"
+    : (isStarting || isChecking) ? "#f5a623"
+    : isFailed ? "#d95f5f" : "#d95f5f";
+  const label = restartPending ? Locale.RsClawPanel.RestartPending.Label(restartSecondsLeft)
+    : isOnline ? Locale.RsClawPanel.Running
     : isStarting ? (zh ? "\u542F\u52A8\u4E2D..." : "Starting...")
     : isChecking ? (zh ? "\u68C0\u67E5\u4E2D..." : "Checking...")
     : isFailed ? (zh ? "\u542F\u52A8\u5931\u8D25" : "Start Failed")
@@ -317,16 +368,32 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
               ) : (
                 <>
                   <button
-                    onClick={() => setConfirmAction("restart")}
+                    onClick={() => {
+                      // When the gateway has signalled a restart is required,
+                      // skip the confirm modal — the user has already been
+                      // told what's about to happen via the inline countdown.
+                      if (restartPending) doRestart();
+                      else setConfirmAction("restart");
+                    }}
                     style={{
                       padding: "2px 8px", borderRadius: 5, fontSize: 11, fontFamily: "inherit",
-                      border: "1px solid rgba(255,255,255,.12)", background: "transparent",
-                      color: "rgba(255,255,255,.4)", cursor: "pointer", transition: "color .12s",
+                      border: restartPending
+                        ? "1px solid rgba(245,166,35,.45)"
+                        : "1px solid rgba(255,255,255,.12)",
+                      background: "transparent",
+                      color: restartPending ? "rgba(245,166,35,.95)" : "rgba(255,255,255,.4)",
+                      cursor: "pointer", transition: "color .12s",
                     }}
-                    onMouseEnter={(e) => (e.currentTarget.style.color = "rgba(255,255,255,.65)")}
-                    onMouseLeave={(e) => (e.currentTarget.style.color = "rgba(255,255,255,.4)")}
+                    onMouseEnter={(e) => (e.currentTarget.style.color = restartPending
+                      ? "rgba(245,166,35,1)"
+                      : "rgba(255,255,255,.65)")}
+                    onMouseLeave={(e) => (e.currentTarget.style.color = restartPending
+                      ? "rgba(245,166,35,.95)"
+                      : "rgba(255,255,255,.4)")}
                   >
-                    {zh ? "\u91CD\u542F" : "Restart"}
+                    {restartPending
+                      ? Locale.RsClawPanel.RestartPending.RestartNow
+                      : (zh ? "\u91CD\u542F" : "Restart")}
                   </button>
                   {isOnline ? (
                     <button
