@@ -636,36 +636,38 @@ async fn message_read(
         );
     }
 
-    // Search sessions by channel + peer_id pattern.
+    // Find session: exact match first, then substring search.
     let sessions = state.store.db.list_sessions().unwrap_or_default();
-    let needle = if channel.is_empty() {
+
+    let session_key = if sessions.iter().any(|s| s == target) {
+        // Target is a full session key.
         target.to_string()
     } else {
-        format!("{channel}:{target}")
+        // Substring search: channel:target or just target.
+        let needle = if channel.is_empty() {
+            target.to_string()
+        } else {
+            format!("{channel}:{target}")
+        };
+        match sessions.iter().filter(|s| s.contains(&needle)).last() {
+            Some(s) => s.clone(),
+            None => return (StatusCode::OK, Json(serde_json::json!([]))),
+        }
     };
-    let matched: Vec<_> = sessions
-        .iter()
-        .filter(|s| s.contains(&needle))
-        .collect();
 
-    if matched.is_empty() {
-        return (StatusCode::OK, Json(serde_json::json!([])));
-    }
-
-    // Load messages from the most recent matching session.
-    let session_key = matched.last().expect("matched is non-empty");
     let messages = state
         .store
         .db
-        .load_messages(session_key)
+        .load_messages(&session_key)
         .unwrap_or_default();
     let recent: Vec<_> = messages
-        .iter()
+        .into_iter()
         .rev()
         .take(limit)
+        .collect::<Vec<serde_json::Value>>()
+        .into_iter()
         .rev()
-        .cloned()
-        .collect::<Vec<serde_json::Value>>();
+        .collect();
     (StatusCode::OK, Json(serde_json::json!(recent)))
 }
 
