@@ -160,8 +160,146 @@ impl QueuedTask {
     }
 }
 
+/// Default max turns for regular messages (no auto-continue).
 fn default_max_turns() -> u32 {
-    10
+    0
+}
+
+/// Default max turns for /task mode.
+pub const TASK_DEFAULT_MAX_TURNS: u32 = 10;
+/// Default TTL for /task mode (1 hour).
+pub const TASK_DEFAULT_TTL_SECS: u64 = 3600;
+
+/// Parse `/task` prefix and extract `--turns N` / `--timeout Xh` flags.
+///
+/// Returns `(max_turns, ttl_secs)`. If the text does not start with `/task`,
+/// returns `(0, 3600)` (regular chat mode). Modifies `text` in-place to
+/// strip the `/task` prefix and flags, leaving only the actual message.
+///
+/// Examples:
+/// - `/task fix the login bug` → turns=10, ttl=3600, text="fix the login bug"
+/// - `/task --turns 20 refactor` → turns=20, ttl=3600, text="refactor"
+/// - `/task --timeout 4h big job` → turns=10, ttl=14400, text="big job"
+/// - `/task --turns 50 --timeout 8h x` → turns=50, ttl=28800, text="x"
+/// - `hello` → turns=0, ttl=3600, text unchanged
+fn parse_task_prefix(text: &mut String) -> (u32, u64) {
+    let trimmed = text.trim();
+    if !trimmed.starts_with("/task ") && trimmed != "/task" {
+        // Natural language detection: if it looks like a task, auto-enable.
+        if looks_like_task(trimmed) {
+            return (TASK_DEFAULT_MAX_TURNS, TASK_DEFAULT_TTL_SECS);
+        }
+        return (0, TASK_DEFAULT_TTL_SECS);
+    }
+
+    // Strip "/task " prefix.
+    let rest = trimmed.strip_prefix("/task").unwrap_or(trimmed).trim();
+    let mut max_turns = TASK_DEFAULT_MAX_TURNS;
+    let mut ttl_secs = TASK_DEFAULT_TTL_SECS;
+    let mut remaining = rest.to_string();
+
+    // Parse --turns N
+    if let Some(pos) = remaining.find("--turns") {
+        let after = &remaining[pos + 7..].trim_start();
+        if let Some(end) = after.find(|c: char| c.is_whitespace()).or(Some(after.len())) {
+            if let Ok(n) = after[..end].parse::<u32>() {
+                max_turns = n;
+            }
+            remaining = format!(
+                "{}{}",
+                &remaining[..pos],
+                after.get(end..).unwrap_or("")
+            )
+            .trim()
+            .to_string();
+        }
+    }
+
+    // Parse --timeout Xh / Xm / Xs
+    if let Some(pos) = remaining.find("--timeout") {
+        let after = &remaining[pos + 9..].trim_start();
+        if let Some(end) = after.find(|c: char| c.is_whitespace()).or(Some(after.len())) {
+            let val_str = &after[..end];
+            if let Some(parsed) = parse_duration_str(val_str) {
+                ttl_secs = parsed;
+            }
+            remaining = format!(
+                "{}{}",
+                &remaining[..pos],
+                after.get(end..).unwrap_or("")
+            )
+            .trim()
+            .to_string();
+        }
+    }
+
+    *text = remaining;
+    (max_turns, ttl_secs)
+}
+
+/// Parse a human-readable duration like "4h", "30m", "3600s", "2h30m".
+fn parse_duration_str(s: &str) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut num_buf = String::new();
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            num_buf.push(c);
+        } else {
+            let n: u64 = num_buf.parse().ok()?;
+            num_buf.clear();
+            match c {
+                'h' | 'H' => total += n * 3600,
+                'm' | 'M' => total += n * 60,
+                's' | 'S' => total += n,
+                _ => return None,
+            }
+        }
+    }
+    // Bare number without unit → seconds.
+    if !num_buf.is_empty() {
+        total += num_buf.parse::<u64>().ok()?;
+    }
+    if total > 0 { Some(total) } else { None }
+}
+
+/// Heuristic check: does this message look like a task (vs. casual chat)?
+///
+/// Returns true when the text contains action-oriented patterns that
+/// suggest the user wants sustained work, not a quick Q&A.
+fn looks_like_task(text: &str) -> bool {
+    // Too short — likely a greeting or quick question.
+    if text.len() < 15 {
+        return false;
+    }
+
+    let lower = text.to_lowercase();
+
+    // Chinese task indicators.
+    for pat in [
+        "帮我", "帮忙", "请你", "麻烦", "实现", "开发", "编写", "修复",
+        "重构", "优化", "部署", "测试", "写一个", "搞一个", "做一个",
+        "创建", "生成", "分析", "调研", "设计", "搭建", "迁移",
+    ] {
+        if lower.contains(pat) {
+            return true;
+        }
+    }
+
+    // English task indicators.
+    for pat in [
+        "implement", "develop", "build", "create", "write a",
+        "fix the", "fix this", "refactor", "optimize", "deploy",
+        "set up", "migrate", "design", "analyze", "generate",
+        "please write", "please create", "please fix", "please implement",
+        "can you write", "can you create", "can you fix",
+        "i need you to", "i want you to",
+    ] {
+        if lower.contains(pat) {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Compute an MD5 hex digest of `text` (for content dedup, not security).
@@ -211,18 +349,22 @@ impl TaskQueueManager {
         self.notify.notified().await;
     }
 
-    /// Submit a new task. Handles dedup and merge automatically.
+    /// Submit a new message. Handles dedup, merge, and `/task` parsing.
     ///
-    /// Returns `(task_id, was_merged)`. If the message is a duplicate of an
-    /// existing pending task the id `"dedup"` is returned. If the message was
-    /// merged into an existing pending task for the same session the id
-    /// `"merged"` is returned.
+    /// If the message text starts with `/task`, it is parsed as a task-mode
+    /// message with optional `--turns N` and `--timeout Nh/Nm/Ns` flags.
+    /// Otherwise, it is a regular chat message (max_turns=0, no auto-continue).
+    ///
+    /// Returns `(task_id, was_merged)`.
     pub fn submit(
         &self,
         session_key: &str,
-        message: QueuedMessage,
+        mut message: QueuedMessage,
         priority: Priority,
     ) -> Result<(String, bool)> {
+        // Parse /task prefix to extract mode + overrides.
+        let (max_turns, ttl_secs) = parse_task_prefix(&mut message.text);
+
         let hash = compute_hash(&message.text);
 
         // Dedup: same content within short window.
@@ -239,10 +381,48 @@ impl TaskQueueManager {
         }
 
         // New task.
-        let task = QueuedTask::new(session_key.to_string(), message, priority);
+        let mut task = QueuedTask::new(session_key.to_string(), message, priority);
+        task.max_turns = max_turns;
+        task.ttl_secs = ttl_secs;
         let id = task.id.clone();
         self.store.enqueue_task(&task)?;
-        tracing::info!(session_key, task_id = %id, "task_queue: new task enqueued");
+        if max_turns > 0 {
+            tracing::info!(session_key, task_id = %id, max_turns, ttl_secs, "task_queue: task enqueued (task mode)");
+        } else {
+            tracing::info!(session_key, task_id = %id, "task_queue: message enqueued");
+        }
+        self.notify.notify_one();
+        Ok((id, false))
+    }
+
+    /// Submit a task-mode message with custom turns and timeout.
+    ///
+    /// Unlike `submit()` which creates chat-mode tasks (max_turns=0),
+    /// this creates a task that auto-continues until done.
+    pub fn submit_task(
+        &self,
+        session_key: &str,
+        message: QueuedMessage,
+        priority: Priority,
+        max_turns: u32,
+        ttl_secs: u64,
+    ) -> Result<(String, bool)> {
+        let hash = compute_hash(&message.text);
+        if self.store.has_duplicate(session_key, &hash)? {
+            tracing::info!(session_key, "task_queue: duplicate task dropped");
+            return Ok(("dedup".to_string(), false));
+        }
+        if self.store.merge_into_pending(session_key, &message)? {
+            tracing::info!(session_key, "task_queue: message merged into pending task");
+            self.notify.notify_one();
+            return Ok(("merged".to_string(), true));
+        }
+        let mut task = QueuedTask::new(session_key.to_string(), message, priority);
+        task.max_turns = max_turns;
+        task.ttl_secs = ttl_secs;
+        let id = task.id.clone();
+        self.store.enqueue_task(&task)?;
+        tracing::info!(session_key, task_id = %id, max_turns, ttl_secs, "task_queue: task enqueued");
         self.notify.notify_one();
         Ok((id, false))
     }
