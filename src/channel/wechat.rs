@@ -1171,6 +1171,10 @@ impl WeChatPersonalChannel {
     /// Convert audio bytes (mp3/wav/ogg) to SILK v3 format for WeChat voice messages.
     /// Uses ffmpeg to decode to raw PCM (s16le, mono, 24kHz), then silk-rs to encode.
     /// Returns (silk_bytes, duration_ms).
+    ///
+    /// Currently unused — WeChat voice delivery is staged but not wired into
+    /// the channel send path yet. See project_wechat_voice.md.
+    #[allow(dead_code)]
     fn convert_to_silk(audio_bytes: &[u8], ext: &str) -> Result<(Vec<u8>, u64)> {
         let tmp_src = std::env::temp_dir().join(format!(
             "wechat_src_{}.{}",
@@ -1220,6 +1224,8 @@ impl WeChatPersonalChannel {
     }
 
     /// Send a voice message referencing a previously uploaded voice file.
+    /// Companion to `convert_to_silk` — wired in when WeChat voice delivery ships.
+    #[allow(dead_code)]
     async fn send_voice_message(
         &self,
         to_user_id: &str,

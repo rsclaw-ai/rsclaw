@@ -162,7 +162,9 @@ impl AgentRuntime {
             .unwrap_or(&default_task_model)
             .to_owned();
 
-        let system = args["system"]
+        // `system` is required by the schema but task agents currently inherit
+        // the parent's prompt; keep the validation so callers can't omit it.
+        let _system = args["system"]
             .as_str()
             .ok_or_else(|| anyhow!("agent_task: `system` required"))?
             .to_owned();

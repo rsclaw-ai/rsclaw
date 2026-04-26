@@ -48,7 +48,7 @@ use futures::{Stream, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::{
     agent::{AgentMessage, AgentRegistry},

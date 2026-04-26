@@ -325,9 +325,6 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
 // Embedding model download / list
 // ---------------------------------------------------------------------------
 
-/// All downloadable models, hosted on gitfast.org.
-const MODELS_BASE: &str = "https://gitfast.org/models";
-
 struct ModelDef {
     /// CLI name(s) and aliases.
     names: &'static [&'static str],
@@ -337,8 +334,6 @@ struct ModelDef {
     dir: &'static str,
     /// Download URL (ZIP or tar.bz2).
     url: &'static str,
-    /// Whether it is an archive (zip/tar.bz2) instead of individual files.
-    archive: bool,
 }
 
 const AVAILABLE_MODELS: &[ModelDef] = &[
@@ -347,42 +342,36 @@ const AVAILABLE_MODELS: &[ModelDef] = &[
         label: "BGE-Small-ZH (Chinese embeddings, ~91MB)",
         dir: "bge-small-zh",
         url: "https://gitfast.org/tools/models/bge-small-zh-v1.5.zip",
-        archive: true,
     },
     ModelDef {
         names: &["bge-base-zh"],
         label: "BGE-Base-ZH (Chinese embeddings, higher quality, ~400MB)",
         dir: "bge-base-zh",
         url: "https://gitfast.org/tools/models/bge-base-zh-v1.5.zip",
-        archive: true,
     },
     ModelDef {
         names: &["bge-small-en"],
         label: "BGE-Small-EN (English embeddings, ~127MB)",
         dir: "bge-small-en",
         url: "https://gitfast.org/tools/models/bge-small-en-v1.5.zip",
-        archive: true,
     },
     ModelDef {
         names: &["whisper", "whisper-tiny"],
         label: "Whisper-Tiny (STT lightweight, ~110MB)",
         dir: "whisper-tiny",
         url: "https://gitfast.org/tools/models/sherpa-onnx-whisper-tiny.tar.bz2",
-        archive: true,
     },
     ModelDef {
         names: &["whisper-turbo"],
         label: "Whisper-Turbo (STT Chinese recommended, ~537MB)",
         dir: "whisper-turbo",
         url: "https://gitfast.org/tools/models/sherpa-onnx-whisper-turbo.tar.bz2",
-        archive: true,
     },
     ModelDef {
         names: &["vits", "vits-theresa"],
         label: "VITS-Theresa (Chinese TTS female voice, ~115MB)",
         dir: "vits-theresa",
         url: "https://gitfast.org/tools/models/vits-zh-hf-theresa.tar.bz2",
-        archive: true,
     },
 ];
 

@@ -1882,9 +1882,8 @@ async fn fetch_stock_sina(client: &reqwest::Client, query: &str) -> (&'static st
             let parts: Vec<&str> = s.split(',').collect();
             if parts.len() >= 4 {
                 // parts[3] is market+code like "11" for Shanghai
-                let market = parts[1]; // e.g. "51" -> need to map
-                let _code = parts[0]; // not useful directly
-                // Easier: use parts[3] which contains code like "sh600519"
+                // parts[3] already contains a usable code like "sh600519",
+                // so we skip parts[0] (raw code) and parts[1] (market id).
                 Some(parts[3].to_owned())
             } else {
                 None

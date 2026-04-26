@@ -2,7 +2,7 @@
 
 All notable changes to RsClaw will be documented in this file.
 
-## [2026.4.25] - 2026-04-26
+## [2026.4.26] - 2026-04-26
 
 ### Unified Task Queue (all 13 channels)
 
@@ -99,7 +99,8 @@ All notable changes to RsClaw will be documented in this file.
 - Status-bar tray icon redesigned as solid filled silhouette (legible at 22×22)
 - Window centers on launch
 - `build.sh` ROOT_DIR resolves correctly from any directory
-- Version unified to 2026.4.25
+- Version unified to 2026.4.26
+- `anycli` upgraded to 0.2
 - Merged remote `dev`: WASM plugin + browser improvements
 
 ## [2026.4.20] - 2026-04-20

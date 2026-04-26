@@ -181,13 +181,15 @@ dependencies = [
 
 [[package]]
 name = "anycli"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57737bc541e4855745722554ed2f9095cd1d167d470e05816420b2bf906be7b9"
+checksum = "b25ac07c1e15f358046fc50f1ce11b64b4b3e3cd306ddc4b74520099323a9f44"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap 4.6.0",
  "dirs-next",
+ "futures",
  "indexmap",
  "regex",
  "reqwest",
@@ -6303,7 +6305,7 @@ dependencies = [
 
 [[package]]
 name = "rsclaw"
-version = "2026.4.25"
+version = "2026.4.26"
 dependencies = [
  "aes",
  "anycli",

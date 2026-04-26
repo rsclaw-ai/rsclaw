@@ -1,6 +1,6 @@
 [package]
 name = "rsclaw"
-version = "2026.4.25"
+version = "2026.4.26"
 edition = "2024"
 rust-version = "1.91"
 description = "AI Agent Engine Compatible with OpenClaw"
@@ -62,7 +62,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 rand          = "0.9"
 which         = "7"
 serde_yaml_ng = "0.10"
-anycli = "0.1"
+anycli = "0.2"
 sys-info      = "0.9"
 flate2        = "1"
 tar           = "0.4"
