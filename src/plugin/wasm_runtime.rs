@@ -1,8 +1,10 @@
 //! WASM plugin runtime — loads `.wasm` component-model plugins via wasmtime.
 //!
 //! Each WASM plugin exports (via WIT `plugin-api` interface):
-//!   - `get-manifest() -> string` — returns a JSON-encoded manifest
 //!   - `handle-tool(tool-name, args-json) -> result<string, string>` — executes a tool
+//!
+//! Tool metadata (name, description, JSON schema) lives in `plugin.json5` —
+//! the host does not call back into the wasm to discover tools.
 //!
 //! Host functions provided to plugins (via WIT `host-browser` and `host-runtime`):
 //!   - 13 browser automation functions (open, snapshot, click, fill, etc.)
@@ -11,6 +13,7 @@
 use std::{
     path::PathBuf,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -19,9 +22,19 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::debug;
 use wasmtime::{
-    Engine, Store,
+    Engine, Store, StoreLimits, StoreLimitsBuilder,
     component::{Component, Linker, bindgen},
 };
+
+/// Per-call wall-clock deadline in epoch ticks, relative to `set_epoch_deadline`
+/// being called. The engine ticks every 100ms (see `mod.rs::load_all_plugins`),
+/// so 18000 ticks ≈ 30 minutes. Browser-automation plugins (image / video
+/// generation, scrape pagination) routinely run for several minutes; the
+/// deadline only needs to be tight enough to kill a true runaway.
+const EPOCH_DEADLINE_TICKS: u64 = 18000;
+
+/// Per-store memory cap for wasm linear memory.
+const MEMORY_CAP_BYTES: usize = 256 * 1024 * 1024;
 
 use crate::browser::BrowserSession;
 
@@ -59,6 +72,11 @@ pub struct WasmPlugin {
     linker: Linker<HostState>,
     /// Reference to the browser session for host function callbacks.
     browser: Arc<Mutex<Option<BrowserSession>>>,
+    /// Minimum gap between successive `call_tool` invocations on this plugin
+    /// (host-enforced rate limit). 0 disables throttling.
+    min_call_interval: Duration,
+    /// Last `call_tool` start time, used to compute the throttle delay.
+    last_call: Mutex<Option<Instant>>,
 }
 
 /// A tool definition extracted from a WASM plugin's manifest.
@@ -72,14 +90,15 @@ pub struct WasmToolDef {
     pub parameters: serde_json::Value,
 }
 
-/// Raw manifest returned by `get_manifest()` from the WASM module.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WasmManifestRaw {
-    name: String,
-    version: Option<String>,
-    description: Option<String>,
-    #[serde(default)]
-    tools: Vec<WasmToolDef>,
+/// Routing context for `host::notify` — when supplied by the agent
+/// runtime, plugin notifications get forwarded as a real OutboundMessage
+/// to the user's current channel; without it, notifications are
+/// trace-logged only.
+#[derive(Clone)]
+pub struct WasmNotifyCtx {
+    pub tx: tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>,
+    pub target_id: String,
+    pub channel: String,
 }
 
 /// State passed into the wasmtime `Store`, available to host functions.
@@ -87,6 +106,36 @@ struct HostState {
     browser: Arc<Mutex<Option<BrowserSession>>>,
     wasi: wasmtime_wasi::WasiCtx,
     wasi_table: wasmtime::component::ResourceTable,
+    limits: StoreLimits,
+    notify_ctx: Option<WasmNotifyCtx>,
+}
+
+fn new_host_state(
+    browser: Arc<Mutex<Option<BrowserSession>>>,
+    notify_ctx: Option<WasmNotifyCtx>,
+) -> HostState {
+    HostState {
+        browser,
+        wasi: wasmtime_wasi::WasiCtxBuilder::new().build(),
+        wasi_table: wasmtime::component::ResourceTable::new(),
+        limits: StoreLimitsBuilder::new()
+            .memory_size(MEMORY_CAP_BYTES)
+            .build(),
+        notify_ctx,
+    }
+}
+
+/// Build a sandboxed `Store` for one plugin invocation: memory cap + epoch
+/// deadline so a buggy plugin can't OOM or hang the gateway.
+fn new_sandboxed_store(
+    engine: &Engine,
+    browser: Arc<Mutex<Option<BrowserSession>>>,
+    notify_ctx: Option<WasmNotifyCtx>,
+) -> Store<HostState> {
+    let mut store = Store::new(engine, new_host_state(browser, notify_ctx));
+    store.limiter(|s| &mut s.limits);
+    store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
+    store
 }
 
 impl wasmtime_wasi::WasiView for HostState {
@@ -102,12 +151,21 @@ impl wasmtime_wasi::WasiView for HostState {
 // Host trait implementations
 // ---------------------------------------------------------------------------
 
-/// Canonicalize a filesystem path coming from a WASM plugin. Plugins have no
-/// notion of agent workspace, so relative paths are resolved against the
-/// default `base_dir()/workspace`. `~` is expanded, `.`/`..` collapsed.
-fn canonicalize_plugin_path(input: &str) -> PathBuf {
+/// Canonicalize a filesystem path from a WASM plugin and reject anything that
+/// resolves outside the plugin workspace. `~` expansion and absolute paths
+/// in the input are tolerated *only* if the canonical result still lives
+/// under the workspace dir — otherwise the call is rejected.
+fn canonicalize_plugin_path(input: &str) -> Result<PathBuf, String> {
     let workspace = crate::config::loader::base_dir().join("workspace");
-    crate::agent::runtime::canonicalize_external_path(input, &workspace)
+    let canonical = crate::agent::runtime::canonicalize_external_path(input, &workspace);
+    if !canonical.starts_with(&workspace) {
+        return Err(format!(
+            "plugin path '{}' resolves outside workspace ({})",
+            input,
+            workspace.display()
+        ));
+    }
+    Ok(canonical)
 }
 
 impl rsclaw::jimeng::host_browser::Host for HostState {
@@ -139,45 +197,7 @@ impl rsclaw::jimeng::host_browser::Host for HostState {
         Ok(self.browser_action("press", json!({"key": key})).await)
     }
 
-    async fn browser_scroll(
-        &mut self,
-        direction: String,
-        amount: u32,
-    ) -> Result<Result<String, String>> {
-        Ok(self
-            .browser_action("scroll", json!({"direction": direction, "amount": amount}))
-            .await)
-    }
-
     async fn browser_eval(&mut self, code: String) -> Result<Result<String, String>> {
-        // Special command: switch to the newest/last tab
-        if code == "__switch_latest_tab" {
-            let mut guard = self.browser.lock().await;
-            if guard.is_none() {
-                return Ok(Err("browser not initialized".to_string()));
-            }
-            let session = guard.as_mut().unwrap();
-            // list_tabs returns {"action":"list_tabs","tabs":[{"id":"...","url":"..."},...]}
-            match session.execute("list_tabs", &json!({})).await {
-                Ok(val) => {
-                    if let Some(tabs) = val.get("tabs").and_then(|t| t.as_array()) {
-                        tracing::info!("list_tabs: {} tab(s)", tabs.len());
-                        if let Some(last_tab) = tabs.last() {
-                            if let Some(tid) = last_tab.get("id").and_then(|t| t.as_str()) {
-                                let url = last_tab.get("url").and_then(|u| u.as_str()).unwrap_or("?");
-                                tracing::info!("switching to tab: {} url={}", tid, &url[..url.len().min(80)]);
-                                match session.execute("switch_tab", &json!({"target_id": tid})).await {
-                                    Ok(_) => return Ok(Ok(format!("switched to tab: {}", url))),
-                                    Err(e) => return Ok(Err(format!("switch_tab failed: {e:#}"))),
-                                }
-                            }
-                        }
-                    }
-                    return Ok(Err("no tabs found in list".to_string()));
-                }
-                Err(e) => return Ok(Err(format!("list_tabs failed: {e:#}"))),
-            }
-        }
         Ok(self.browser_action("evaluate", json!({"js": code})).await)
     }
 
@@ -186,9 +206,97 @@ impl rsclaw::jimeng::host_browser::Host for HostState {
         text: String,
         timeout_ms: u32,
     ) -> Result<Result<String, String>> {
+        let timeout_secs = u64::from(timeout_ms / 1000).max(1);
         Ok(self
-            .browser_action("wait", json!({"text": text, "timeout_ms": timeout_ms}))
+            .browser_action(
+                "wait",
+                json!({"target": "text", "value": text, "timeout": timeout_secs}),
+            )
+            .await
+            .map(|_| "ok".to_string()))
+    }
+
+    async fn wait_for_selector(
+        &mut self,
+        css_selector: String,
+        timeout_ms: u32,
+    ) -> Result<Result<String, String>> {
+        let timeout_secs = u64::from(timeout_ms / 1000).max(1);
+        Ok(self
+            .browser_action(
+                "wait",
+                json!({"target": "element", "value": css_selector, "timeout": timeout_secs}),
+            )
+            .await
+            .map(|_| "ok".to_string()))
+    }
+
+    async fn wait_for_network_idle(
+        &mut self,
+        timeout_ms: u32,
+    ) -> Result<Result<String, String>> {
+        let timeout_secs = u64::from(timeout_ms / 1000).max(1);
+        Ok(self
+            .browser_action(
+                "wait",
+                json!({"target": "networkidle", "timeout": timeout_secs}),
+            )
+            .await
+            .map(|_| "ok".to_string()))
+    }
+
+    async fn eval_with_args(
+        &mut self,
+        code: String,
+        args_json: String,
+    ) -> Result<Result<String, String>> {
+        // JSON is valid JS expression syntax, so we can embed args_json
+        // directly as an object literal — no escaping dance required.
+        let args_literal = if args_json.trim().is_empty() {
+            "null".to_string()
+        } else {
+            args_json
+        };
+        let wrapped = format!(
+            r#"(async function() {{
+                const __args = ({args_literal});
+                const __fn = ({code});
+                const __out = await __fn(__args);
+                return typeof __out === "string" ? __out : JSON.stringify(__out);
+            }})()"#
+        );
+        Ok(self
+            .browser_action("evaluate", json!({"js": wrapped}))
             .await)
+    }
+
+    async fn switch_latest_tab(&mut self) -> Result<Result<String, String>> {
+        let mut guard = self.browser.lock().await;
+        if guard.is_none() {
+            return Ok(Err("browser not initialized".to_string()));
+        }
+        let session = guard.as_mut().expect("browser presence checked above");
+        let tabs_val = match session.execute("list_tabs", &json!({})).await {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(format!("list_tabs failed: {e:#}"))),
+        };
+        let tabs = match tabs_val.get("tabs").and_then(|t| t.as_array()) {
+            Some(t) => t,
+            None => return Ok(Err("list_tabs returned no tabs array".to_string())),
+        };
+        let last = match tabs.last() {
+            Some(t) => t,
+            None => return Ok(Err("no tabs to switch to".to_string())),
+        };
+        let tid = match last.get("id").and_then(|t| t.as_str()) {
+            Some(s) => s,
+            None => return Ok(Err("last tab has no id".to_string())),
+        };
+        let url = last.get("url").and_then(|u| u.as_str()).unwrap_or("?");
+        match session.execute("switch_tab", &json!({"target_id": tid})).await {
+            Ok(_) => Ok(Ok(format!("switched to tab: {url}"))),
+            Err(e) => Ok(Err(format!("switch_tab failed: {e:#}"))),
+        }
     }
 
     async fn browser_screenshot(&mut self) -> Result<Result<String, String>> {
@@ -210,11 +318,22 @@ impl rsclaw::jimeng::host_browser::Host for HostState {
         ref_str: String,
         filepath: String,
     ) -> Result<Result<String, String>> {
-        let canonical = canonicalize_plugin_path(&filepath);
+        // Uploads send a file *out* of the host to a remote site. Unlike
+        // read_file (which enforces workspace containment to prevent reading
+        // /etc/passwd etc.), upload paths are typically user-supplied via
+        // the LLM ("upload ~/Downloads/cat.png") so we tolerate any path
+        // the user has access to. Just expand `~` and normalize.
+        let workspace = crate::config::loader::base_dir().join("workspace");
+        let canonical = crate::agent::runtime::canonicalize_external_path(&filepath, &workspace);
+        // Note: cmd_upload expects `files: [path]` (array), not `filepath: path`.
         Ok(self
             .browser_action(
                 "upload",
-                json!({"ref": ref_str, "filepath": canonical.to_string_lossy()}),
+                json!({
+                    "ref": ref_str,
+                    "files": [canonical.to_string_lossy()],
+                    "filepath": canonical.to_string_lossy(),
+                }),
             )
             .await)
     }
@@ -226,12 +345,14 @@ impl rsclaw::jimeng::host_browser::Host for HostState {
 
 impl rsclaw::jimeng::host_runtime::Host for HostState {
     async fn log(&mut self, level: String, msg: String) -> Result<()> {
+        // Use the module path as target (instead of "wasm_plugin") so plugin
+        // logs inherit the default tracing filter level for this crate.
         match level.as_str() {
-            "error" => tracing::error!(target: "wasm_plugin", "{msg}"),
-            "warn" => tracing::warn!(target: "wasm_plugin", "{msg}"),
-            "info" => tracing::info!(target: "wasm_plugin", "{msg}"),
-            "debug" => tracing::debug!(target: "wasm_plugin", "{msg}"),
-            _ => tracing::trace!(target: "wasm_plugin", "{msg}"),
+            "error" => tracing::error!(plugin_log = true, "{msg}"),
+            "warn" => tracing::warn!(plugin_log = true, "{msg}"),
+            "info" => tracing::info!(plugin_log = true, "{msg}"),
+            "debug" => tracing::debug!(plugin_log = true, "{msg}"),
+            _ => tracing::trace!(plugin_log = true, "{msg}"),
         }
         Ok(())
     }
@@ -241,8 +362,29 @@ impl rsclaw::jimeng::host_runtime::Host for HostState {
         Ok(())
     }
 
+    async fn notify(&mut self, message: String) -> Result<Result<String, String>> {
+        tracing::info!(target: "wasm_plugin_notify", "{message}");
+        if let Some(ctx) = &self.notify_ctx {
+            let _ = ctx.tx.send(crate::channel::OutboundMessage {
+                target_id: ctx.target_id.clone(),
+                is_group: false,
+                text: message,
+                reply_to: None,
+                images: vec![],
+                files: vec![],
+                channel: Some(ctx.channel.clone()),
+            });
+            Ok(Ok("dispatched".to_string()))
+        } else {
+            Ok(Ok("logged_only".to_string()))
+        }
+    }
+
     async fn read_file(&mut self, path: String) -> Result<Result<String, String>> {
-        let canonical = canonicalize_plugin_path(&path);
+        let canonical = match canonicalize_plugin_path(&path) {
+            Ok(p) => p,
+            Err(e) => return Ok(Err(e)),
+        };
         match tokio::fs::read_to_string(&canonical).await {
             Ok(contents) => Ok(Ok(contents)),
             Err(e) => Ok(Err(format!("failed to read {}: {e}", canonical.display()))),
@@ -352,8 +494,9 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
 /// Load a WASM plugin from a `PluginManifest`.
 ///
 /// The manifest's `entry` field points to the `.wasm` file relative to the
-/// plugin directory. The WASM component is compiled and its `get-manifest`
-/// export is called to discover tools.
+/// plugin directory. We compile the component and pre-build the linker, but
+/// do *not* instantiate — tools come from `plugin.json5`, which is the single
+/// source of truth.
 pub async fn load_wasm_plugin(
     manifest: &super::manifest::PluginManifest,
     engine: &Engine,
@@ -368,59 +511,28 @@ pub async fn load_wasm_plugin(
 
     let linker = build_linker(engine)?;
 
-    // Create a temporary store to call get-manifest and discover tools.
-    let wasi = wasmtime_wasi::WasiCtxBuilder::new().build();
-    let mut store = Store::new(
-        engine,
-        HostState {
-            browser: Arc::clone(&browser),
-            wasi,
-            wasi_table: wasmtime::component::ResourceTable::new(),
-        },
-    );
+    let tools = manifest
+        .tools
+        .iter()
+        .map(|t| WasmToolDef {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            parameters: t.input_schema.clone().unwrap_or(json!({"type": "object"})),
+        })
+        .collect();
 
-    let instance = linker
-        .instantiate_async(&mut store, &component)
-        .await
-        .with_context(|| format!("failed to instantiate component: {}", path.display()))?;
-
-    // Look up the plugin-api interface and call get-manifest.
-    let iface_idx = instance
-        .get_export(&mut store, None, "rsclaw:jimeng/plugin-api")
-        .with_context(|| "plugin-api interface not found in component exports")?;
-
-    let get_manifest_idx = instance
-        .get_export(&mut store, Some(&iface_idx), "get-manifest")
-        .with_context(|| "get-manifest export not found in plugin-api interface")?;
-
-    let get_manifest_fn = instance
-        .get_typed_func::<(), (String,)>(&mut store, &get_manifest_idx)
-        .with_context(|| "get-manifest has unexpected type")?;
-
-    let (manifest_json,) = get_manifest_fn
-        .call_async(&mut store, ())
-        .await
-        .with_context(|| "get-manifest call failed")?;
-
-    get_manifest_fn
-        .post_return_async(&mut store)
-        .await
-        .with_context(|| "get-manifest post-return failed")?;
-
-    let wasm_manifest: WasmManifestRaw = serde_json::from_str(&manifest_json)
-        .with_context(|| format!("invalid manifest JSON from {}: {manifest_json}", path.display()))?;
-
-    // Prefer plugin.json5 metadata, fall back to wasm-internal manifest.
     Ok(WasmPlugin {
         name: manifest.name.clone(),
-        version: manifest.version.clone().or(wasm_manifest.version),
-        description: manifest.description.clone().or(wasm_manifest.description),
-        tools: if wasm_manifest.tools.is_empty() { Vec::new() } else { wasm_manifest.tools },
+        version: manifest.version.clone(),
+        description: manifest.description.clone(),
+        tools,
         wasm_path: path.to_path_buf(),
         engine: engine.clone(),
         component,
         linker,
         browser,
+        min_call_interval: Duration::from_millis(u64::from(manifest.min_call_interval_ms)),
+        last_call: Mutex::new(None),
     })
 }
 
@@ -434,10 +546,22 @@ impl WasmPlugin {
     /// The tool name must match one of the plugin's declared tools.
     /// Arguments are passed as a JSON value and the result is returned
     /// as a JSON value.
+    /// Convenience: dispatch without a notify routing context (e.g. when
+    /// invoked via /api/v1/tools/execute for debugging). `host::notify`
+    /// calls fall back to trace logging only.
     pub async fn call_tool(
         &self,
         tool_name: &str,
         args: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.call_tool_with_ctx(tool_name, args, None).await
+    }
+
+    pub async fn call_tool_with_ctx(
+        &self,
+        tool_name: &str,
+        args: serde_json::Value,
+        notify_ctx: Option<WasmNotifyCtx>,
     ) -> Result<serde_json::Value> {
         // Verify the tool exists in this plugin's manifest.
         let _tool_def = self
@@ -453,16 +577,23 @@ impl WasmPlugin {
 
         debug!(plugin = %self.name, tool = tool_name, "dispatching WASM tool call");
 
-        // Fresh store per call for isolation.
-        let wasi = wasmtime_wasi::WasiCtxBuilder::new().build();
-        let mut store = Store::new(
-            &self.engine,
-            HostState {
-                browser: Arc::clone(&self.browser),
-                wasi,
-                wasi_table: wasmtime::component::ResourceTable::new(),
-            },
-        );
+        // Host-side rate limit: hold off until the configured interval has
+        // elapsed since the previous call. Replaces per-plugin sleeps in
+        // dispatch code.
+        if !self.min_call_interval.is_zero() {
+            let mut last = self.last_call.lock().await;
+            if let Some(t) = *last {
+                let elapsed = t.elapsed();
+                if elapsed < self.min_call_interval {
+                    tokio::time::sleep(self.min_call_interval - elapsed).await;
+                }
+            }
+            *last = Some(Instant::now());
+        }
+
+        // Fresh store per call for isolation, with memory cap and epoch deadline.
+        let mut store =
+            new_sandboxed_store(&self.engine, Arc::clone(&self.browser), notify_ctx);
 
         let instance = self
             .linker

@@ -7,10 +7,64 @@ use serde_json::{Value, json};
 
 use crate::{
     config::schema::ExternalAgentConfig,
+    plugin::WasmPlugin,
     provider::ToolDef,
     skill::SkillRegistry,
 };
 use super::registry::AgentRegistry;
+
+/// Build a `Vec<ToolDef>` advertising every tool exported by every loaded
+/// WASM plugin. Tool names are namespaced as `<plugin>.<tool>` so the
+/// dispatcher can route them back to the right plugin instance.
+pub(crate) fn build_wasm_tool_defs(plugins: &[WasmPlugin]) -> Vec<ToolDef> {
+    plugins
+        .iter()
+        .flat_map(|p| {
+            let plugin_name = p.name.clone();
+            p.tools.iter().map(move |t| ToolDef {
+                name: format!("{}.{}", plugin_name, t.name),
+                description: t.description.clone(),
+                parameters: t.parameters.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Build a system-prompt section that lists installed WASM plugins. Helps
+/// the model decide *to use* the plugin instead of falling back to a
+/// generic browser-automation flow.
+pub(crate) fn build_plugins_system(plugins: &[WasmPlugin]) -> Option<String> {
+    if plugins.is_empty() {
+        return None;
+    }
+    let blocks: Vec<String> = plugins
+        .iter()
+        .map(|p| {
+            let tools_lines: Vec<String> = p
+                .tools
+                .iter()
+                .map(|t| format!("  - {}.{}: {}", p.name, t.name, t.description))
+                .collect();
+            format!(
+                "<plugin name=\"{}\" version=\"{}\">\n{}\n\nTools:\n{}\n</plugin>",
+                p.name,
+                p.version.as_deref().unwrap_or(""),
+                p.description.as_deref().unwrap_or(""),
+                tools_lines.join("\n"),
+            )
+        })
+        .collect();
+
+    Some(format!(
+        "## Installed Plugins\n\
+         Plugins automate external services (e.g. image/video generation, \
+         marketplace ops). When the user's task matches a plugin tool, prefer \
+         it over a generic browser-automation flow.\n\
+         Priority: plugins > skills > built-in tools.\n\n\
+         {}",
+        blocks.join("\n\n"),
+    ))
+}
 
 /// Compute the set of allowed tool names based on toolset level + custom tools.
 /// Returns None for "full" (no filtering), Some(set) for others.

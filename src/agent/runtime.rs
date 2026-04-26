@@ -2161,6 +2161,7 @@ impl AgentRuntime {
                 &self.config.agents.external,
             );
             all.extend(extra_tools.iter().cloned());
+            all.extend(super::tools_builder::build_wasm_tool_defs(&self.wasm_plugins));
             if let Some(ref mcp) = self.mcp {
                 all.extend(mcp.all_tool_defs().await);
             }
@@ -2470,8 +2471,8 @@ impl AgentRuntime {
         // Build/cache plugins system message.
         // TODO: populate from self.plugins when plugin system is merged.
         if self.cached_plugins_system.is_none() {
-            // Placeholder — will be populated after jimeng-automation merge.
-            // self.cached_plugins_system = Some(build_plugins_system(&self.plugins));
+            self.cached_plugins_system =
+                super::tools_builder::build_plugins_system(&self.wasm_plugins);
         }
 
         // Build/cache skills system message.
@@ -4957,7 +4958,26 @@ impl AgentRuntime {
             return Err(anyhow!("MCP tool `{name}` not found"));
         }
 
-        // 4. Skill tool.
+        // 4. WASM plugin tool: `<plugin>.<tool>` (must precede skill match
+        //    because plugins win the priority ladder).
+        if let Some((plugin_name, tool_name)) = name.split_once('.') {
+            if let Some(wp) = self.wasm_plugins.iter().find(|p| p.name == plugin_name) {
+                let notify_ctx = self.notification_tx.as_ref().map(|tx| {
+                    crate::plugin::wasm_runtime::WasmNotifyCtx {
+                        tx: tx.clone(),
+                        target_id: if !ctx.chat_id.is_empty() {
+                            ctx.chat_id.clone()
+                        } else {
+                            ctx.peer_id.clone()
+                        },
+                        channel: ctx.channel.clone(),
+                    }
+                });
+                return wp.call_tool_with_ctx(tool_name, args, notify_ctx).await;
+            }
+        }
+
+        // 5. Skill tool.
         let (skill_name, tool_name) = name.split_once('.').unwrap_or((name, name));
         let Some(skill) = self.skills.get(skill_name) else {
             return Err(anyhow!("unknown tool: `{name}`"));
