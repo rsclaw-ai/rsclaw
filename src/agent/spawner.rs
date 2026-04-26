@@ -11,6 +11,7 @@ use crate::{
     agent::{AgentHandle, AgentKind, AgentMessage, AgentRegistry, AgentReply, AgentRuntime, MemoryStore},
     config::{runtime::RuntimeConfig, schema::AgentEntry},
     events::AgentEvent,
+    gateway::live_config::LiveConfig,
     plugin::PluginRegistry,
     provider::registry::ProviderRegistry,
     skill::SkillRegistry,
@@ -20,6 +21,9 @@ use crate::{
 pub struct AgentSpawner {
     pub registry: Arc<AgentRegistry>,
     pub config: Arc<RuntimeConfig>,
+    /// Live, hot-mutable config slices (temperature, etc.) shared across all
+    /// runtimes spawned by this spawner.
+    pub live: Arc<LiveConfig>,
     pub providers: Arc<ProviderRegistry>,
     pub skills: Arc<SkillRegistry>,
     pub store: Arc<Store>,
@@ -36,6 +40,7 @@ impl AgentSpawner {
     pub fn new_arc(
         registry: Arc<AgentRegistry>,
         config: Arc<RuntimeConfig>,
+        live: Arc<LiveConfig>,
         providers: Arc<ProviderRegistry>,
         skills: Arc<SkillRegistry>,
         store: Arc<Store>,
@@ -46,6 +51,7 @@ impl AgentSpawner {
         let s = Arc::new(Self {
             registry,
             config,
+            live,
             providers,
             skills,
             store,
@@ -117,6 +123,7 @@ impl AgentSpawner {
         let mut runtime = AgentRuntime::new(
             Arc::clone(&handle),
             Arc::clone(&self.config),
+            Arc::clone(&self.live),
             Arc::clone(&self.providers),
             fallback_models,
             Arc::clone(&self.skills),

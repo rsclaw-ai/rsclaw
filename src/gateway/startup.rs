@@ -220,10 +220,15 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // share the same sender.
     let (event_tx, _) = broadcast::channel::<crate::events::AgentEvent>(1024);
 
+    // Build LiveConfig BEFORE the spawner: hot-reloadable per-domain locks
+    // that AgentRuntime reads for live-mutable fields (temperature, etc.).
+    let live = Arc::new(LiveConfig::new((*config).clone()));
+
     // Create AgentSpawner — enables agent-to-agent dynamic spawning.
     let spawner = AgentSpawner::new_arc(
         Arc::clone(&registry),
         Arc::clone(&config),
+        Arc::clone(&live),
         Arc::clone(&providers),
         Arc::clone(&skills),
         Arc::clone(&store),
@@ -244,6 +249,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         receivers,
         Arc::clone(&registry),
         Arc::clone(&config),
+        Arc::clone(&live),
         Arc::clone(&store),
         Arc::clone(&skills),
         Arc::clone(&providers),
@@ -390,9 +396,6 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         info!("heartbeat runner started");
     }
 
-    // 11. Build LiveConfig for hot-reloadable per-domain access.
-    let live = Arc::new(LiveConfig::new((*config).clone()));
-
     // 11. Write PID file early so the hot-reload task can clean it on restart.
     let pid_file = crate::config::loader::pid_file();
     if let Some(parent) = pid_file.parent() {
@@ -425,28 +428,42 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             loop {
                 match reload_rx.recv().await {
                     Ok(ConfigChange::FullReload(new_cfg)) => {
+                        // Snapshot BEFORE apply so we can diff against the
+                        // incoming config and decide whether the change is
+                        // hot-safe (e.g. just a temperature tweak).
+                        let old_snapshot = live_reload.snapshot().await;
+                        let new_owned = (*new_cfg).clone();
                         let needs_restart =
-                            live_reload.apply((*new_cfg).clone(), &restart_tx).await;
+                            live_reload.apply(new_owned.clone(), &restart_tx).await;
                         if needs_restart.is_empty() {
                             info!("config hot-reload applied");
                         } else {
                             warn!(?needs_restart, "config change requires gateway restart");
                         }
-                        // Even FullReload doesn't fully propagate to running
-                        // agents (their providers/prompts are snapshotted at
-                        // spawn). Surface a Recommended restart banner so the
-                        // user can choose to apply changes cleanly.
-                        publish_restart(
-                            &bridge_tx,
-                            &bridge_pending,
-                            crate::events::RestartRequest::new(
-                                crate::events::RestartReason::ConfigChanged {
-                                    sections: needs_restart,
-                                },
-                                crate::events::RestartUrgency::Recommended,
-                                crate::i18n::t("restart_required_config_changed", &lang),
-                            ),
-                        );
+                        if crate::gateway::live_config::is_hot_safe_only(
+                            &old_snapshot,
+                            &new_owned,
+                        ) {
+                            info!(
+                                "config hot-reload: only live-safe fields changed, suppressing restart banner"
+                            );
+                        } else {
+                            // FullReload doesn't fully propagate to running
+                            // agents (their providers/prompts are snapshotted
+                            // at spawn). Surface a Recommended restart banner
+                            // so the user can choose to apply changes cleanly.
+                            publish_restart(
+                                &bridge_tx,
+                                &bridge_pending,
+                                crate::events::RestartRequest::new(
+                                    crate::events::RestartReason::ConfigChanged {
+                                        sections: needs_restart,
+                                    },
+                                    crate::events::RestartUrgency::Recommended,
+                                    crate::i18n::t("restart_required_config_changed", &lang),
+                                ),
+                            );
+                        }
                     }
                     Ok(ConfigChange::RequiresRestart(fields)) => {
                         warn!(?fields, "config change requires restart — surfacing banner");
@@ -743,6 +760,7 @@ fn spawn_agent_tasks(
     receivers: HashMap<String, mpsc::Receiver<AgentMessage>>,
     registry: Arc<AgentRegistry>,
     config: Arc<RuntimeConfig>,
+    live: Arc<LiveConfig>,
     store: Arc<Store>,
     skills: Arc<SkillRegistry>,
     providers: Arc<ProviderRegistry>,
@@ -782,6 +800,7 @@ fn spawn_agent_tasks(
         let mut runtime = AgentRuntime::new(
             Arc::clone(&handle),
             Arc::clone(&config),
+            Arc::clone(&live),
             Arc::clone(&providers),
             fallback_models,
             Arc::clone(&skills),

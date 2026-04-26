@@ -70,6 +70,7 @@ use super::tools_builder::{build_tool_list, toolset_allowed_names};
 use crate::{
     config::runtime::RuntimeConfig,
     events::AgentEvent,
+    gateway::live_config::LiveConfig,
     plugin::PluginRegistry,
     provider::{
         ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent, ToolDef,
@@ -281,6 +282,9 @@ pub struct RunContext {
 pub struct AgentRuntime {
     pub handle: Arc<AgentHandle>,
     pub config: Arc<RuntimeConfig>,
+    /// Live, hot-mutable config slices (temperature, etc.). Read at request
+    /// time so users can tune values without restarting the gateway.
+    pub live: Arc<LiveConfig>,
     /// All registered providers — used by the failover manager.
     pub providers: Arc<ProviderRegistry>,
     /// Per-runtime failover manager tracking per-profile cooldowns.
@@ -359,6 +363,7 @@ impl AgentRuntime {
     pub fn new(
         #[allow(clippy::too_many_arguments)] handle: Arc<AgentHandle>,
         config: Arc<RuntimeConfig>,
+        live: Arc<LiveConfig>,
         providers: Arc<ProviderRegistry>,
         fallback_models: Vec<String>,
         skills: Arc<SkillRegistry>,
@@ -396,6 +401,7 @@ impl AgentRuntime {
         let rt = Self {
             handle,
             config,
+            live,
             providers,
             failover,
             skills,
@@ -3474,25 +3480,31 @@ impl AgentRuntime {
                 );
             }
 
-            // Temperature resolution order:
-            //   1. Per-agent override (self.handle.config.temperature)
-            //   2. Global defaults (self.config.agents.defaults.temperature)
+            // Temperature resolution order (read live so hot-reload takes
+            // effect on the next turn without a restart):
+            //   1. Per-agent override (live.agents.list[id].temperature)
+            //   2. Global defaults (live.agents.defaults.temperature)
             //   3. "Auto" heuristic — 0.6 with tools, 0.7 chat, None for thinking
-            let temperature = self
-                .handle
-                .config
-                .temperature
-                .or(self.config.agents.defaults.temperature)
-                .map(Some)
-                .unwrap_or_else(|| {
-                    if thinking_budget.is_some() {
-                        None
-                    } else if tools.is_empty() {
-                        Some(0.7)
-                    } else {
-                        Some(0.6)
-                    }
-                });
+            let temperature = {
+                let agents_live = self.live.agents.read().await;
+                let per_agent = agents_live
+                    .list
+                    .iter()
+                    .find(|a| a.id == self.handle.id)
+                    .and_then(|a| a.temperature);
+                per_agent
+                    .or(agents_live.defaults.temperature)
+                    .map(Some)
+                    .unwrap_or_else(|| {
+                        if thinking_budget.is_some() {
+                            None
+                        } else if tools.is_empty() {
+                            Some(0.7)
+                        } else {
+                            Some(0.6)
+                        }
+                    })
+            };
 
 // Pre-flight check: emergency compact if we'd exceed context.
             let context_limit = self.config.agents.defaults.context_tokens.unwrap_or(64_000) as usize;

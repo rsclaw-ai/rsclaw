@@ -145,6 +145,54 @@ pub(crate) fn detect_restart_fields(old: &GatewayRuntime, new: &GatewayRuntime) 
     fields
 }
 
+/// True when the only differences between `old` and `new` are fields that
+/// `AgentRuntime` reads live (currently `agents.defaults.temperature` and
+/// `agents.list[i].temperature`).
+///
+/// When this returns true the hot-reload watcher can skip the restart banner —
+/// the change has already taken effect via `LiveConfig::apply`. Anything else
+/// (model changes, prompt edits, channel adds/removes, …) still snapshots into
+/// AgentRuntime fields at startup, so a restart banner is required.
+///
+/// Implementation note: `RuntimeConfig` doesn't derive `PartialEq`, but its
+/// `raw: Config` schema does derive `Serialize`. We serialize both, blank out
+/// the live-mutable temperature fields, and compare the JSON values.
+pub fn is_hot_safe_only(old: &RuntimeConfig, new: &RuntimeConfig) -> bool {
+    let mut old_v = match serde_json::to_value(&old.raw) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let mut new_v = match serde_json::to_value(&new.raw) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    strip_live_fields(&mut old_v);
+    strip_live_fields(&mut new_v);
+    old_v == new_v
+}
+
+/// Remove `agents.defaults.temperature` and every `agents.list[i].temperature`
+/// from a serialized `Config` so two snapshots can be compared on the fields
+/// that actually require restart.
+fn strip_live_fields(v: &mut serde_json::Value) {
+    let agents = match v.get_mut("agents") {
+        Some(a) => a,
+        None => return,
+    };
+    if let Some(defaults) = agents.get_mut("defaults") {
+        if let Some(obj) = defaults.as_object_mut() {
+            obj.remove("temperature");
+        }
+    }
+    if let Some(list) = agents.get_mut("list").and_then(|l| l.as_array_mut()) {
+        for entry in list {
+            if let Some(obj) = entry.as_object_mut() {
+                obj.remove("temperature");
+            }
+        }
+    }
+}
+
 /// Detect if any channel was added or removed (requires restart).
 fn channels_changed(
     old: &crate::config::schema::ChannelsConfig,
@@ -275,5 +323,80 @@ mod tests {
             live.gateway.read().await.auth_token.as_deref(),
             Some("rotated")
         );
+    }
+
+    fn empty_runtime_config() -> RuntimeConfig {
+        use crate::config::{
+            runtime::{AgentsRuntime, ChannelRuntime, ExtRuntime, ModelRuntime, OpsRuntime},
+            schema::SessionConfig,
+        };
+        RuntimeConfig {
+            gateway: base_gw(),
+            agents: AgentsRuntime {
+                defaults: Default::default(),
+                list: vec![],
+                bindings: vec![],
+                external: vec![],
+            },
+            channel: ChannelRuntime {
+                channels: Default::default(),
+                session: SessionConfig {
+                    dm_scope: None,
+                    thread_bindings: None,
+                    reset: None,
+                    identity_links: None,
+                    maintenance: None,
+                },
+            },
+            model: ModelRuntime {
+                models: None,
+                auth: None,
+            },
+            ext: ExtRuntime {
+                tools: None,
+                skills: None,
+                plugins: None,
+            },
+            ops: OpsRuntime {
+                cron: None,
+                hooks: None,
+                sandbox: None,
+                logging: None,
+                secrets: None,
+            },
+            raw: Default::default(),
+        }
+    }
+
+    #[test]
+    fn hot_safe_when_only_default_temperature_changes() {
+        let mut old = empty_runtime_config();
+        let mut new = empty_runtime_config();
+        old.raw.agents = Some(crate::config::schema::AgentsConfig {
+            defaults: Some(crate::config::schema::AgentDefaults {
+                temperature: Some(0.5),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        new.raw.agents = Some(crate::config::schema::AgentsConfig {
+            defaults: Some(crate::config::schema::AgentDefaults {
+                temperature: Some(0.3),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(is_hot_safe_only(&old, &new));
+    }
+
+    #[test]
+    fn not_hot_safe_when_port_changes() {
+        let old = empty_runtime_config();
+        let mut new = empty_runtime_config();
+        new.raw.gateway = Some(crate::config::schema::GatewayConfig {
+            port: Some(19000),
+            ..Default::default()
+        });
+        assert!(!is_hot_safe_only(&old, &new));
     }
 }
