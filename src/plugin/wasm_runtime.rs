@@ -184,7 +184,7 @@ fn canonicalize_plugin_path(input: &str) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
-impl rsclaw::jimeng::host_browser::Host for HostState {
+impl rsclaw::plugin::host_browser::Host for HostState {
     async fn browser_open(&mut self, url: String) -> Result<Result<String, String>> {
         Ok(self.browser_action("open", json!({"url": url})).await)
     }
@@ -371,7 +371,7 @@ impl rsclaw::jimeng::host_browser::Host for HostState {
     }
 }
 
-impl rsclaw::jimeng::host_runtime::Host for HostState {
+impl rsclaw::plugin::host_runtime::Host for HostState {
     async fn log(&mut self, level: String, msg: String) -> Result<()> {
         // Use the module path as target (instead of "wasm_plugin") so plugin
         // logs inherit the default tracing filter level for this crate.
@@ -420,7 +420,7 @@ impl rsclaw::jimeng::host_runtime::Host for HostState {
     }
 }
 
-impl rsclaw::jimeng::host_storage::Host for HostState {
+impl rsclaw::plugin::host_storage::Host for HostState {
     async fn allocate_artifact(
         &mut self,
         filename: String,
@@ -520,9 +520,9 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
     // Add WASI interfaces (io, filesystem, etc.) required by wasm32-wasip2 components.
     wasmtime_wasi::add_to_linker_async(&mut linker)?;
     // Add our custom host interfaces.
-    rsclaw::jimeng::host_browser::add_to_linker(&mut linker, |state: &mut HostState| state)?;
-    rsclaw::jimeng::host_runtime::add_to_linker(&mut linker, |state: &mut HostState| state)?;
-    rsclaw::jimeng::host_storage::add_to_linker(&mut linker, |state: &mut HostState| state)?;
+    rsclaw::plugin::host_browser::add_to_linker(&mut linker, |state: &mut HostState| state)?;
+    rsclaw::plugin::host_runtime::add_to_linker(&mut linker, |state: &mut HostState| state)?;
+    rsclaw::plugin::host_storage::add_to_linker(&mut linker, |state: &mut HostState| state)?;
     Ok(linker)
 }
 
@@ -643,7 +643,7 @@ impl WasmPlugin {
 
         // Drill into the plugin-api interface to find handle-tool.
         let iface_idx = instance
-            .get_export(&mut store, None, "rsclaw:jimeng/plugin-api")
+            .get_export(&mut store, None, "rsclaw:plugin/plugin-api")
             .with_context(|| "plugin-api interface not found")?;
 
         let handle_tool_idx = instance
