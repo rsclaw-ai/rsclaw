@@ -212,6 +212,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/agents/{id}", patch(patch_agent).delete(delete_agent))
         .route("/agents/{id}/status", get(agent_status))
         .route("/acp/connections", get(list_acp_connections))
+        .route("/message/send", post(message_send))
+        .route("/message/read", get(message_read))
+        .route("/message/broadcast", post(message_broadcast))
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/config/reload", post(config_reload))
@@ -573,6 +576,143 @@ async fn list_agents(State(state): State<AppState>) -> impl IntoResponse {
 async fn list_acp_connections(State(state): State<AppState>) -> impl IntoResponse {
     let conns = state.ws_conns.list_connections().await;
     Json(conns)
+}
+
+// ---------------------------------------------------------------------------
+// Message routing — send/read/broadcast via channel_senders
+// ---------------------------------------------------------------------------
+
+/// POST /api/v1/message/send — send a message to a channel target.
+async fn message_send(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let target = body["target"].as_str().unwrap_or("");
+    let text = body["message"].as_str().unwrap_or("");
+    let channel = body["channel"].as_str().unwrap_or("");
+
+    if target.is_empty() || text.is_empty() || channel.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "missing required fields: target, message, channel"})),
+        );
+    }
+
+    let out = crate::channel::OutboundMessage {
+        target_id: target.to_string(),
+        is_group: false,
+        text: text.to_string(),
+        reply_to: body["replyTo"].as_str().map(str::to_owned),
+        images: vec![],
+        files: vec![],
+        channel: Some(channel.to_string()),
+    };
+
+    match state.notification_tx.send(out) {
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("send failed: {e}")})),
+        ),
+    }
+}
+
+/// GET /api/v1/message/read — read recent messages from a session.
+async fn message_read(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let target = params.get("target").map(String::as_str).unwrap_or("");
+    let channel = params.get("channel").map(String::as_str).unwrap_or("");
+    let limit: usize = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+
+    if target.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "missing required field: target"})),
+        );
+    }
+
+    // Search sessions by channel + peer_id pattern.
+    let sessions = state.store.db.list_sessions().unwrap_or_default();
+    let needle = if channel.is_empty() {
+        target.to_string()
+    } else {
+        format!("{channel}:{target}")
+    };
+    let matched: Vec<_> = sessions
+        .iter()
+        .filter(|s| s.contains(&needle))
+        .collect();
+
+    if matched.is_empty() {
+        return (StatusCode::OK, Json(serde_json::json!([])));
+    }
+
+    // Load messages from the most recent matching session.
+    let session_key = matched.last().expect("matched is non-empty");
+    let messages = state
+        .store
+        .db
+        .load_messages(session_key)
+        .unwrap_or_default();
+    let recent: Vec<_> = messages
+        .iter()
+        .rev()
+        .take(limit)
+        .rev()
+        .cloned()
+        .collect::<Vec<serde_json::Value>>();
+    (StatusCode::OK, Json(serde_json::json!(recent)))
+}
+
+/// POST /api/v1/message/broadcast — send the same message to multiple targets.
+async fn message_broadcast(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let channel = body["channel"].as_str().unwrap_or("");
+    let text = body["message"].as_str().unwrap_or("");
+    let targets = body["targets"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if text.is_empty() || channel.is_empty() || targets.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "missing required fields: channel, message, targets"})),
+        );
+    }
+
+    let mut sent = 0u32;
+    let mut failed = 0u32;
+    for target in &targets {
+        let out = crate::channel::OutboundMessage {
+            target_id: target.to_string(),
+            is_group: false,
+            text: text.to_string(),
+            reply_to: None,
+            images: vec![],
+            files: vec![],
+            channel: Some(channel.to_string()),
+        };
+        match state.notification_tx.send(out) {
+            Ok(_) => sent += 1,
+            Err(_) => failed += 1,
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"sent": sent, "failed": failed})),
+    )
 }
 
 async fn agent_status(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
