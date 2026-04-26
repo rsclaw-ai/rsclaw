@@ -45,6 +45,19 @@ pub enum TaskStatus {
     Dead,
 }
 
+/// Outcome of a single agent turn, used by the auto-continue supervisor.
+#[derive(Debug)]
+pub enum TaskOutcome {
+    /// Agent clearly completed the task.
+    Done,
+    /// Agent made progress but explicitly needs to continue.
+    Partial,
+    /// Agent is stuck — no progress, empty reply, or error pattern.
+    Stuck(String),
+    /// Infrastructure error (timeout, channel closed, rate limit).
+    Error(String),
+}
+
 /// A file attachment staged on disk for queue persistence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedFile {
@@ -86,6 +99,12 @@ pub struct QueuedTask {
     pub status: TaskStatus,
     pub retries: u32,
     pub max_retries: u32,
+    /// How many agent turns have been executed for this task.
+    #[serde(default)]
+    pub turns: u32,
+    /// Max agent turns before giving up (0 = single turn, no auto-continue).
+    #[serde(default = "default_max_turns")]
+    pub max_turns: u32,
     pub created_at: i64,
     pub updated_at: i64,
     /// Time-to-live in seconds. 0 means no expiry.
@@ -109,6 +128,8 @@ impl QueuedTask {
             status: TaskStatus::Pending,
             retries: 0,
             max_retries: 3,
+            turns: 0,
+            max_turns: default_max_turns(),
             created_at: now,
             updated_at: now,
             ttl_secs: 3600,
@@ -137,6 +158,10 @@ impl QueuedTask {
             .collect::<Vec<_>>()
             .join("\n\n---\n\n")
     }
+}
+
+fn default_max_turns() -> u32 {
+    10
 }
 
 /// Compute an MD5 hex digest of `text` (for content dedup, not security).
@@ -339,6 +364,100 @@ pub fn submit_to_queue(
 }
 
 // ---------------------------------------------------------------------------
+// Outcome classifier
+// ---------------------------------------------------------------------------
+
+/// Classify an agent reply to decide whether to auto-continue.
+fn classify_outcome(reply: &crate::agent::AgentReply) -> TaskOutcome {
+    let text = reply.text.trim();
+
+    // Empty reply — agent produced nothing.
+    if text.is_empty() && reply.images.is_empty() && reply.files.is_empty() {
+        return TaskOutcome::Stuck("empty reply".to_string());
+    }
+
+    let lower = text.to_lowercase();
+
+    // Error patterns from the LLM or infrastructure.
+    for pat in [
+        "rate limit",
+        "rate_limit",
+        "quota exceeded",
+        "context length exceeded",
+        "context_length_exceeded",
+        "maximum context",
+        "too many tokens",
+    ] {
+        if lower.contains(pat) {
+            return TaskOutcome::Error(pat.to_string());
+        }
+    }
+
+    // Stuck patterns — agent explicitly says it cannot proceed.
+    for pat in [
+        "i can't",
+        "i cannot",
+        "i'm unable",
+        "i am unable",
+        "i don't know how",
+        "i'm not sure how",
+        "i need more information",
+        "please provide",
+        "could you clarify",
+        "i'm stuck",
+    ] {
+        if lower.contains(pat) {
+            return TaskOutcome::Stuck(pat.to_string());
+        }
+    }
+
+    // Partial patterns — agent made progress but signals more work needed.
+    for pat in [
+        "i'll continue",
+        "i will continue",
+        "next step",
+        "let me continue",
+        "continuing",
+        "in progress",
+        "working on",
+        "todo",
+        "to be continued",
+        "not yet complete",
+        "partially done",
+    ] {
+        if lower.contains(pat) {
+            return TaskOutcome::Partial;
+        }
+    }
+
+    // Default: assume done.
+    TaskOutcome::Done
+}
+
+/// Build a continuation prompt based on the outcome.
+fn continuation_prompt(outcome: &TaskOutcome, turn: u32) -> String {
+    match outcome {
+        TaskOutcome::Partial => {
+            format!("[auto-continue turn {turn}] Continue from where you left off. Complete the remaining work.")
+        }
+        TaskOutcome::Stuck(reason) => {
+            format!(
+                "[auto-continue turn {turn}] Previous attempt got stuck ({reason}). \
+                 Try a different approach. If truly impossible, explain why \
+                 concisely and stop."
+            )
+        }
+        TaskOutcome::Error(err) => {
+            format!(
+                "[auto-continue turn {turn}] Previous attempt encountered an error: {err}. \
+                 Retry or work around it."
+            )
+        }
+        TaskOutcome::Done => String::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TaskQueueWorker
 // ---------------------------------------------------------------------------
 
@@ -423,10 +542,15 @@ impl TaskQueueWorker {
         info!("task queue worker exited");
     }
 
-    /// Process a single queued task: send to agent, wait for reply, route back.
+    /// Process a single queued task with auto-continue supervisor loop.
+    ///
+    /// Each turn: send to agent → classify outcome → route reply → continue
+    /// if not done and turns remain. This enables 24/7 autonomous operation
+    /// where the agent keeps working until the task is truly complete.
     async fn process_task(&self, task: QueuedTask) {
         let task_id = task.id.clone();
         let session_key = task.session_key.clone();
+        let max_turns = task.max_turns;
 
         // Determine channel + peer + chat from the first message.
         let Some(first_msg) = task.messages.first() else {
@@ -444,6 +568,7 @@ impl TaskQueueWorker {
             session_key = %session_key,
             channel = %channel_name,
             messages = task.messages.len(),
+            max_turns,
             "task queue worker: processing task"
         );
 
@@ -462,12 +587,9 @@ impl TaskQueueWorker {
             },
         };
 
-        // Build AgentMessage from merged text.
-        let text = task.merged_text();
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-
-        // Collect images and files from all queued messages.
-        let images: Vec<ImageAttachment> = task
+        // First turn: use the original merged text + attachments.
+        let first_text = task.merged_text();
+        let first_images: Vec<ImageAttachment> = task
             .messages
             .iter()
             .flat_map(|m| {
@@ -477,102 +599,138 @@ impl TaskQueueWorker {
                 })
             })
             .collect();
-        let files: Vec<FileAttachment> = task
+        let first_files: Vec<FileAttachment> = task
             .messages
             .iter()
             .flat_map(|m| m.files.iter().map(unstage_file))
             .collect();
 
-        let msg = AgentMessage {
-            session_key: session_key.clone(),
-            text,
-            channel: channel_name.clone(),
-            peer_id: peer_id.clone(),
-            chat_id: chat_id.clone(),
-            reply_tx,
-            extra_tools: vec![],
-            images,
-            files,
-        };
+        let target = if chat_id.is_empty() { peer_id.clone() } else { chat_id.clone() };
+        let mut turn: u32 = 0;
+        let mut next_text = first_text;
+        let mut next_images = first_images;
+        let mut next_files = first_files;
 
-        if handle.tx.send(msg).await.is_err() {
-            error!(task_id = %task_id, "task queue worker: agent channel closed");
-            if let Err(fe) = self.manager.fail(&task_id, "agent channel closed", task.max_retries) {
-                error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}");
-            }
-            return;
-        }
+        loop {
+            turn += 1;
 
-        // Wait for reply with timeout (10 minutes, matching handle_pending_analysis).
-        match tokio::time::timeout(Duration::from_secs(600), reply_rx).await {
-            Ok(Ok(reply)) => {
-                info!(task_id = %task_id, "task queue worker: task completed");
-                if let Err(e) = self.manager.complete(&task_id) {
-                    error!(task_id = %task_id, "task queue worker: complete() error: {e:#}");
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let msg = AgentMessage {
+                session_key: session_key.clone(),
+                text: next_text,
+                channel: channel_name.clone(),
+                peer_id: peer_id.clone(),
+                chat_id: chat_id.clone(),
+                reply_tx,
+                extra_tools: vec![],
+                images: next_images,
+                files: next_files,
+            };
+
+            info!(task_id = %task_id, turn, "task queue worker: agent turn");
+
+            if handle.tx.send(msg).await.is_err() {
+                error!(task_id = %task_id, "task queue worker: agent channel closed");
+                if let Err(fe) = self.manager.fail(&task_id, "agent channel closed", task.max_retries) {
+                    error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}");
                 }
-                cleanup_staged_files(&task);
+                break;
+            }
 
-                let pending = reply.pending_analysis;
+            // Wait for reply (10 min timeout per turn).
+            let reply = match tokio::time::timeout(Duration::from_secs(600), reply_rx).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(_)) => {
+                    error!(task_id = %task_id, turn, "task queue worker: reply channel dropped");
+                    match self.manager.fail(&task_id, "reply channel dropped", task.max_retries) {
+                        Ok(TaskStatus::Dead) => cleanup_staged_files(&task),
+                        Err(fe) => error!(task_id = %task_id, "fail() error: {fe:#}"),
+                        _ => {}
+                    }
+                    break;
+                }
+                Err(_) => {
+                    error!(task_id = %task_id, turn, "task queue worker: reply timeout (600s)");
+                    match self.manager.fail(&task_id, "reply timeout", task.max_retries) {
+                        Ok(TaskStatus::Dead) => cleanup_staged_files(&task),
+                        Err(fe) => error!(task_id = %task_id, "fail() error: {fe:#}"),
+                        _ => {}
+                    }
+                    break;
+                }
+            };
 
-                // Route reply back to the originating channel.
-                if !reply.text.is_empty() || !reply.images.is_empty() || !reply.files.is_empty() {
-                    let target = if chat_id.is_empty() { peer_id.clone() } else { chat_id.clone() };
-                    let out = OutboundMessage {
-                        target_id: target,
+            // Classify outcome before moving fields out of reply.
+            let outcome = classify_outcome(&reply);
+            let pending = reply.pending_analysis;
+
+            // Route reply to user (every turn, so they see progress).
+            if !reply.text.is_empty() || !reply.images.is_empty() || !reply.files.is_empty() {
+                let out = OutboundMessage {
+                    target_id: target.clone(),
+                    is_group,
+                    text: reply.text.clone(),
+                    reply_to: if turn == 1 { reply_to.clone() } else { None },
+                    images: reply.images.clone(),
+                    files: reply.files.clone(),
+                    channel: Some(channel_name.clone()),
+                };
+                if let Some(tx) = self.channel_tx(&channel_name) {
+                    if let Err(e) = tx.send(out).await {
+                        error!(task_id = %task_id, "send reply failed: {e}");
+                    }
+                }
+            }
+
+            // Handle pending analysis.
+            if let Some(analysis) = pending {
+                if let Some(tx) = self.channel_tx(&channel_name) {
+                    crate::gateway::startup::handle_pending_analysis(
+                        analysis,
+                        Arc::clone(&handle),
+                        &tx,
+                        target.clone(),
                         is_group,
-                        text: reply.text,
-                        reply_to: reply_to.clone(),
-                        images: reply.images,
-                        files: reply.files,
-                        channel: Some(channel_name.clone()),
-                    };
-                    if let Some(tx) = self.channel_tx(&channel_name) {
-                        if let Err(e) = tx.send(out).await {
-                            error!(
-                                task_id = %task_id,
-                                channel = %channel_name,
-                                "task queue worker: send reply failed: {e}"
-                            );
-                        }
-                    } else {
-                        tracing::warn!(
-                            task_id = %task_id,
-                            channel = %channel_name,
-                            "task queue worker: no channel sender registered"
-                        );
-                    }
+                        &self.config,
+                    )
+                    .await;
                 }
+            }
 
-                // Handle pending analysis (e.g. background image/file analysis).
-                if let Some(analysis) = pending {
-                    let target = if chat_id.is_empty() { peer_id } else { chat_id };
-                    if let Some(tx) = self.channel_tx(&channel_name) {
-                        crate::gateway::startup::handle_pending_analysis(
-                            analysis,
-                            Arc::clone(&handle),
-                            &tx,
-                            target,
-                            is_group,
-                            &self.config,
-                        )
-                        .await;
+            info!(task_id = %task_id, turn, outcome = ?outcome, "task queue worker: turn outcome");
+
+            match outcome {
+                TaskOutcome::Done => {
+                    info!(task_id = %task_id, turn, "task queue worker: task completed");
+                    if let Err(e) = self.manager.complete(&task_id) {
+                        error!(task_id = %task_id, "complete() error: {e:#}");
                     }
+                    cleanup_staged_files(&task);
+                    break;
                 }
-            }
-            Ok(Err(_)) => {
-                error!(task_id = %task_id, "task queue worker: reply channel dropped");
-                match self.manager.fail(&task_id, "reply channel dropped", task.max_retries) {
-                    Ok(TaskStatus::Dead) => cleanup_staged_files(&task),
-                    Err(fe) => error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}"),
-                    _ => {}
-                }
-            }
-            Err(_) => {
-                error!(task_id = %task_id, "task queue worker: reply timeout (600s)");
-                match self.manager.fail(&task_id, "reply timeout", task.max_retries) {
-                    Ok(TaskStatus::Dead) => cleanup_staged_files(&task),
-                    Err(fe) => error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}"),
-                    _ => {}
+                TaskOutcome::Partial | TaskOutcome::Stuck(_) | TaskOutcome::Error(_) => {
+                    if max_turns == 0 || turn >= max_turns {
+                        info!(
+                            task_id = %task_id, turn, max_turns,
+                            "task queue worker: max turns reached, marking done"
+                        );
+                        if let Err(e) = self.manager.complete(&task_id) {
+                            error!(task_id = %task_id, "complete() error: {e:#}");
+                        }
+                        cleanup_staged_files(&task);
+                        break;
+                    }
+
+                    // Auto-continue: send continuation prompt to the same session.
+                    let prompt = continuation_prompt(&outcome, turn);
+                    info!(task_id = %task_id, turn, "task queue worker: auto-continue");
+                    next_text = prompt;
+                    next_images = vec![];
+                    next_files = vec![];
+                    // Small delay before retry to avoid tight loops on errors.
+                    if matches!(outcome, TaskOutcome::Error(_)) {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
                 }
             }
         }
