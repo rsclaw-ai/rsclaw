@@ -3474,17 +3474,25 @@ impl AgentRuntime {
                 );
             }
 
-            // Temperature: 0.6 when tools are available (reduces randomness,
-            // helps small models preserve digits and call tools reliably).
-            // 0.7 for pure chat (no tools) — slightly creative but not wild.
-            // None for thinking/reasoning (let provider handle CoT temperature).
-            let temperature = if thinking_budget.is_some() {
-                None
-            } else if tools.is_empty() {
-                Some(0.7)
-            } else {
-                Some(0.6)
-            };
+            // Temperature resolution order:
+            //   1. Per-agent override (self.handle.config.temperature)
+            //   2. Global defaults (self.config.agents.defaults.temperature)
+            //   3. "Auto" heuristic — 0.6 with tools, 0.7 chat, None for thinking
+            let temperature = self
+                .handle
+                .config
+                .temperature
+                .or(self.config.agents.defaults.temperature)
+                .map(Some)
+                .unwrap_or_else(|| {
+                    if thinking_budget.is_some() {
+                        None
+                    } else if tools.is_empty() {
+                        Some(0.7)
+                    } else {
+                        Some(0.6)
+                    }
+                });
 
 // Pre-flight check: emergency compact if we'd exceed context.
             let context_limit = self.config.agents.defaults.context_tokens.unwrap_or(64_000) as usize;

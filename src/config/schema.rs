@@ -281,6 +281,10 @@ pub struct AgentDefaults {
     pub thinking: Option<ThinkingConfig>,
     pub strip_think_tags: Option<bool>,
     pub frequency_penalty: Option<f32>,
+    /// Sampling temperature: None = "auto" (use built-in heuristic — 0.7 for
+    /// chat, 0.6 with tools, None for thinking models). Some(t) = explicit
+    /// override, where 0.0 is fully deterministic and 1.0 is most random.
+    pub temperature: Option<f32>,
     pub streaming: Option<StreamingMode>,
     pub timeout: Option<Value>,
     pub tools: Option<Value>,
@@ -347,6 +351,10 @@ pub struct AgentEntry {
     pub agent_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
+    /// Per-agent sampling temperature override. None = inherit from
+    /// `agents.defaults.temperature` (which itself may be None = "auto").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
 }
 
 /// OpenCode ACP configuration for an agent.

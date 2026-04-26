@@ -105,6 +105,7 @@ impl AgentRuntime {
             opencode: None,
             claudecode: None,
             codex: None,
+            temperature: None,
         };
 
         let kind = if persistent {
@@ -216,6 +217,7 @@ impl AgentRuntime {
             opencode: None,
             claudecode: None,
             codex: None,
+            temperature: None,
         };
 
         spawner.spawn_agent(entry)?;

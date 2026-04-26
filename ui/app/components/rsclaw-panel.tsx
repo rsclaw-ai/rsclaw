@@ -71,6 +71,8 @@ interface AgentInfo {
   toolset?: string[];
   channels?: string[];
   maxTokens?: number;
+  // Sampling temperature override. undefined = inherit (auto).
+  temperature?: number;
 }
 
 interface GatewayHealth {
@@ -1669,6 +1671,8 @@ function AgentManagerPage() {
   const [newToolset, setNewToolset] = useState("full");
   const [newMaxTokens, setNewMaxTokens] = useState(0);
   const [newSystem, setNewSystem] = useState("");
+  // "auto" or a numeric string like "0", "0.5", "1"
+  const [newTemperature, setNewTemperature] = useState<string>("auto");
   const [idError, setIdError] = useState("");
   const [channelAccounts, setChannelAccounts] = useState<Record<string, string[]>>({});
   const [configModels, setConfigModels] = useState<string[]>([]);
@@ -1698,7 +1702,13 @@ function AgentManagerPage() {
       const list = (cfg.agents?.list || []).map((a: any) => {
         const rawModel = a.model;
         const modelStr = typeof rawModel === "string" ? rawModel : rawModel?.primary || "";
-        return { ...a, model: modelStr, status: a.status || "idle", maxTokens: rawModel?.maxTokens || a.maxTokens || 0 };
+        return {
+          ...a,
+          model: modelStr,
+          status: a.status || "idle",
+          maxTokens: rawModel?.maxTokens || a.maxTokens || 0,
+          temperature: typeof a.temperature === "number" ? a.temperature : undefined,
+        };
       });
       setAgentList(list);
     } catch {}
@@ -1764,12 +1774,14 @@ function AgentManagerPage() {
       return;
     }
     if (!validateId(newId.trim())) return;
+    const tempVal = newTemperature === "auto" ? undefined : parseFloat(newTemperature);
     const agent: Record<string, any> = {
       id: newId.trim(),
       name: newName || undefined,
       avatar: newAvatar || undefined,
       model: newModel ? { primary: newModel, toolset: newToolset, ...(newMaxTokens > 0 ? { maxTokens: newMaxTokens } : {}) } : (newMaxTokens > 0 ? { maxTokens: newMaxTokens } : undefined),
       channels: newChannels.length > 0 ? newChannels : [],
+      temperature: typeof tempVal === "number" && !Number.isNaN(tempVal) ? tempVal : undefined,
     };
     try {
       const invoke = isTauri ? tauriInvokeV2 : null;
@@ -1869,6 +1881,7 @@ function AgentManagerPage() {
     setNewToolset(agent.toolset?.[0] || "full");
     setNewMaxTokens(agent.maxTokens || 0);
     setNewSystem("");
+    setNewTemperature(typeof agent.temperature === "number" ? String(agent.temperature) : "auto");
     setSelectedProvider("");
     setProviderModels([]);
     setShowModal(true);
@@ -1888,6 +1901,11 @@ function AgentManagerPage() {
           }
           if (agentCfg.channels) setNewChannels(agentCfg.channels);
           if (agentCfg.toolset?.[0]) setNewToolset(agentCfg.toolset[0]);
+          if (typeof agentCfg.temperature === "number") {
+            setNewTemperature(String(agentCfg.temperature));
+          } else {
+            setNewTemperature("auto");
+          }
         }
         // Read SOUL.md from agent workspace
         try {
@@ -1923,6 +1941,7 @@ function AgentManagerPage() {
     setNewToolset("full");
     setNewMaxTokens(0);
     setNewSystem("");
+    setNewTemperature("auto");
     setIdError("");
     setSelectedProvider("");
     setProviderModels([]);
@@ -2045,6 +2064,12 @@ function AgentManagerPage() {
                 <div className={styles["agent-field-label"]}>{Locale.RsClawPanel.Agents.ToolsLabel}</div>
                 <div className={styles["agent-field-value"]}>
                   {agent.toolset?.join(", ") || Locale.RsClawPanel.Agents.NoneValue}
+                </div>
+              </div>
+              <div className={styles["agent-card-field"]}>
+                <div className={styles["agent-field-label"]}>{getLang() === "cn" ? "温度" : "Temperature"}</div>
+                <div className={styles["agent-field-value"]}>
+                  {typeof agent.temperature === "number" ? agent.temperature.toFixed(1) : (getLang() === "cn" ? "自动" : "auto")}
                 </div>
               </div>
             </div>
@@ -2318,6 +2343,30 @@ function AgentManagerPage() {
                 placeholder="0"
                 style={{ maxWidth: 120 }}
               />
+            </div>
+
+            {/* Temperature */}
+            <div className={styles["cfg-f"]}>
+              <div className={styles["cfg-lbl"]}>{getLang() === "cn" ? "采样温度" : "Temperature"} <span style={{ color: "#666", fontWeight: 400 }}>({getLang() === "cn" ? "auto = 沿用全局" : "auto = inherit defaults"})</span></div>
+              <select
+                className={styles["cfg-select"]}
+                value={newTemperature}
+                onChange={(e) => setNewTemperature(e.target.value)}
+                style={{ maxWidth: 200 }}
+              >
+                <option value="auto">{getLang() === "cn" ? "自动 (auto)" : "Auto"}</option>
+                <option value="0">0.0</option>
+                <option value="0.1">0.1</option>
+                <option value="0.2">0.2</option>
+                <option value="0.3">0.3</option>
+                <option value="0.4">0.4</option>
+                <option value="0.5">0.5</option>
+                <option value="0.6">0.6</option>
+                <option value="0.7">0.7</option>
+                <option value="0.8">0.8</option>
+                <option value="0.9">0.9</option>
+                <option value="1">1.0</option>
+              </select>
             </div>
 
             <div className={styles["modal-actions"]}>
@@ -3854,6 +3903,37 @@ function TauriConfigPageInner() {
                 <option value="0.3">{zh ? "轻度 (0.3)" : "Light (0.3)"}</option>
                 <option value="0.5">{zh ? "中度 (0.5)" : "Medium (0.5)"}</option>
                 <option value="0.8">{zh ? "强 (0.8)" : "Strong (0.8)"}</option>
+              </select>
+            </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "采样温度" : "Temperature"} <span style={{ color: V.t3, fontWeight: 400 }}>({zh ? "auto = 自动" : "auto = built-in"})</span></div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.temperature</div>
+              </div>
+              <select
+                style={{ ...fSelect, minWidth: 200 }}
+                value={(() => { const v = getVal("agents.defaults.temperature", undefined); return v === undefined || v === null ? "auto" : String(v); })()}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "auto") {
+                    deleteConfig("agents.defaults.temperature");
+                  } else {
+                    updateConfig("agents.defaults.temperature", parseFloat(v));
+                  }
+                }}
+              >
+                <option value="auto">{zh ? "自动 (auto)" : "Auto"}</option>
+                <option value="0">0.0</option>
+                <option value="0.1">0.1</option>
+                <option value="0.2">0.2</option>
+                <option value="0.3">0.3</option>
+                <option value="0.4">0.4</option>
+                <option value="0.5">0.5</option>
+                <option value="0.6">0.6</option>
+                <option value="0.7">0.7</option>
+                <option value="0.8">0.8</option>
+                <option value="0.9">0.9</option>
+                <option value="1">1.0</option>
               </select>
             </div>
             <div style={fieldRow}>
