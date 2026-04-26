@@ -14,6 +14,18 @@ use super::types::EventFrame;
 pub type ConnId = String;
 pub type OutboundTx = tokio::sync::mpsc::Sender<String>;
 
+/// Summary of an active WS connection for the `acp list` API.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConnSummary {
+    pub conn_id: String,
+    pub client_id: Option<String>,
+    pub version: Option<String>,
+    pub platform: Option<String>,
+    pub mode: Option<String>,
+    pub sessions: usize,
+    pub uptime_secs: u64,
+}
+
 // ---------------------------------------------------------------------------
 // ConnHandle
 // ---------------------------------------------------------------------------
@@ -23,15 +35,22 @@ pub struct ConnHandle {
     pub event_tx: OutboundTx,
     pub subscribed_sessions: HashSet<String>,
     pub seq: u64,
+    /// Client metadata from the WS connect handshake.
+    pub client_info: Option<super::types::ClientInfo>,
+    /// When this connection was established.
+    pub connected_at: std::time::Instant,
 }
 
 impl ConnHandle {
+    /// Create a new connection handle.
     pub fn new(id: ConnId, event_tx: OutboundTx) -> Self {
         Self {
             id,
             event_tx,
             subscribed_sessions: HashSet::new(),
             seq: 0,
+            client_info: None,
+            connected_at: std::time::Instant::now(),
         }
     }
 
@@ -71,8 +90,28 @@ impl ConnRegistry {
         self.inner.write().await.remove(id);
     }
 
+    /// Number of active WS connections.
     pub async fn count(&self) -> usize {
         self.inner.read().await.len()
+    }
+
+    /// Snapshot of all active connections with client metadata.
+    pub async fn list_connections(&self) -> Vec<ConnSummary> {
+        let guard = self.inner.read().await;
+        let mut out = Vec::with_capacity(guard.len());
+        for handle in guard.values() {
+            let h = handle.read().await;
+            out.push(ConnSummary {
+                conn_id: h.id.clone(),
+                client_id: h.client_info.as_ref().and_then(|c| c.id.clone()),
+                version: h.client_info.as_ref().and_then(|c| c.version.clone()),
+                platform: h.client_info.as_ref().and_then(|c| c.platform.clone()),
+                mode: h.client_info.as_ref().and_then(|c| c.mode.clone()),
+                sessions: h.subscribed_sessions.len(),
+                uptime_secs: h.connected_at.elapsed().as_secs(),
+            });
+        }
+        out
     }
 
     /// Broadcast a serialized event frame to every connected WebSocket client.

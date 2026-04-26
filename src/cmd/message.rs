@@ -5,13 +5,9 @@ use crate::config;
 
 /// Resolve gateway URL and auth token from config.
 fn gateway_client() -> Result<(reqwest::Client, String, String)> {
-    let cfg = config::load().context("failed to load config — run `rsclaw setup` first")?;
+    let cfg = config::load().context("failed to load config -- run `rsclaw setup` first")?;
     let port = cfg.gateway.port;
-    let token = cfg
-        .gateway
-        .auth_token
-        .clone()
-        .unwrap_or_default();
+    let token = cfg.gateway.auth_token.unwrap_or_default();
     let base = format!("http://127.0.0.1:{port}");
     Ok((reqwest::Client::new(), base, token))
 }
@@ -82,8 +78,8 @@ async fn get(endpoint: &str, query: &[(&str, &str)]) -> Result<()> {
     Ok(())
 }
 
-fn stub(action: &str) {
-    println!("{action}: not yet implemented via gateway API");
+fn unsupported(action: &str) {
+    eprintln!("[unsupported] `message {action}` is not implemented. Supported: send, read, broadcast");
 }
 
 // ---------------------------------------------------------------------------
@@ -94,28 +90,28 @@ pub async fn cmd_message(sub: MessageCommand) -> Result<()> {
     match sub {
         MessageCommand::Send(args) => message_send(args).await,
         MessageCommand::Read(args) => message_read(args).await,
-        MessageCommand::Broadcast(args) => { stub("broadcast"); let _ = args; Ok(()) }
-        MessageCommand::Edit(args) => message_edit(args).await,
-        MessageCommand::Delete(args) => message_delete(args).await,
-        MessageCommand::Pin(args) => { stub("pin"); let _ = args; Ok(()) }
-        MessageCommand::Unpin(args) => { stub("unpin"); let _ = args; Ok(()) }
-        MessageCommand::Pins(args) => { stub("pins"); let _ = args; Ok(()) }
-        MessageCommand::React(args) => { stub("react"); let _ = args; Ok(()) }
-        MessageCommand::Reactions(args) => { stub("reactions"); let _ = args; Ok(()) }
-        MessageCommand::Poll(args) => { stub("poll"); let _ = args; Ok(()) }
-        MessageCommand::Search(args) => { stub("search"); let _ = args; Ok(()) }
-        MessageCommand::Thread(sub) => { stub(&format!("thread {sub:?}")); Ok(()) }
-        MessageCommand::Voice(sub) => { stub(&format!("voice {sub:?}")); Ok(()) }
-        MessageCommand::Sticker(sub) => { stub(&format!("sticker {sub:?}")); Ok(()) }
-        MessageCommand::Emoji(sub) => { stub(&format!("emoji {sub:?}")); Ok(()) }
-        MessageCommand::Ban(args) => { stub("ban"); let _ = args; Ok(()) }
-        MessageCommand::Kick(args) => { stub("kick"); let _ = args; Ok(()) }
-        MessageCommand::Timeout(args) => { stub("timeout"); let _ = args; Ok(()) }
-        MessageCommand::Member(sub) => { stub(&format!("member {sub:?}")); Ok(()) }
-        MessageCommand::Role(sub) => { stub(&format!("role {sub:?}")); Ok(()) }
-        MessageCommand::Permissions(args) => { stub("permissions"); let _ = args; Ok(()) }
-        MessageCommand::Channel(sub) => { stub(&format!("channel {sub:?}")); Ok(()) }
-        MessageCommand::Event(sub) => { stub(&format!("event {sub:?}")); Ok(()) }
+        MessageCommand::Broadcast(args) => message_broadcast(args).await,
+        MessageCommand::Edit(args) => { unsupported("edit"); let _ = args; Ok(()) }
+        MessageCommand::Delete(args) => { unsupported("delete"); let _ = args; Ok(()) }
+        MessageCommand::Pin(args) => { unsupported("pin"); let _ = args; Ok(()) }
+        MessageCommand::Unpin(args) => { unsupported("unpin"); let _ = args; Ok(()) }
+        MessageCommand::Pins(args) => { unsupported("pins"); let _ = args; Ok(()) }
+        MessageCommand::React(args) => { unsupported("react"); let _ = args; Ok(()) }
+        MessageCommand::Reactions(args) => { unsupported("reactions"); let _ = args; Ok(()) }
+        MessageCommand::Poll(args) => { unsupported("poll"); let _ = args; Ok(()) }
+        MessageCommand::Search(args) => { unsupported("search"); let _ = args; Ok(()) }
+        MessageCommand::Thread(sub) => { unsupported(&format!("thread {sub:?}")); Ok(()) }
+        MessageCommand::Voice(sub) => { unsupported(&format!("voice {sub:?}")); Ok(()) }
+        MessageCommand::Sticker(sub) => { unsupported(&format!("sticker {sub:?}")); Ok(()) }
+        MessageCommand::Emoji(sub) => { unsupported(&format!("emoji {sub:?}")); Ok(()) }
+        MessageCommand::Ban(args) => { unsupported("ban"); let _ = args; Ok(()) }
+        MessageCommand::Kick(args) => { unsupported("kick"); let _ = args; Ok(()) }
+        MessageCommand::Timeout(args) => { unsupported("timeout"); let _ = args; Ok(()) }
+        MessageCommand::Member(sub) => { unsupported(&format!("member {sub:?}")); Ok(()) }
+        MessageCommand::Role(sub) => { unsupported(&format!("role {sub:?}")); Ok(()) }
+        MessageCommand::Permissions(args) => { unsupported("permissions"); let _ = args; Ok(()) }
+        MessageCommand::Channel(sub) => { unsupported(&format!("channel {sub:?}")); Ok(()) }
+        MessageCommand::Event(sub) => { unsupported(&format!("event {sub:?}")); Ok(()) }
     }
 }
 
@@ -154,25 +150,13 @@ async fn message_read(args: MessageReadArgs) -> Result<()> {
     get("read", &query).await
 }
 
-async fn message_edit(args: MessageEditArgs) -> Result<()> {
+async fn message_broadcast(args: MessageBroadcastArgs) -> Result<()> {
     let mut body = serde_json::json!({
-        "target": args.target,
-        "messageId": args.message_id,
+        "targets": args.targets,
         "message": args.message,
     });
     if let Some(ch) = &args.channel {
         body["channel"] = serde_json::Value::String(ch.clone());
     }
-    post("edit", body).await
-}
-
-async fn message_delete(args: MessageDeleteArgs) -> Result<()> {
-    let mut body = serde_json::json!({
-        "target": args.target,
-        "messageId": args.message_id,
-    });
-    if let Some(ch) = &args.channel {
-        body["channel"] = serde_json::Value::String(ch.clone());
-    }
-    post("delete", body).await
+    post("broadcast", body).await
 }

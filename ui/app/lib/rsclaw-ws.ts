@@ -5,7 +5,7 @@
  * Handles connection lifecycle, challenge/response handshake, and event routing.
  */
 
-import { getGatewayUrl, getAuthToken } from "./rsclaw-api";
+import { getGatewayUrl, getAuthToken, setAuthToken } from "./rsclaw-api";
 
 export type ChatCallbacks = {
   onDelta: (fullText: string, delta: string) => void;
@@ -43,6 +43,7 @@ class RsClawWsClient {
   private chatHandlers = new Map<string, { cb: ChatCallbacks; fullText: string }>();
   private notificationHandlers = new Set<(text: string) => void>();
   private restartHandlers = new Set<(payload: RestartRequiredPayload) => void>();
+  private tokenRefresh: Promise<void> | null = null;
 
   /** Ensure the WS is connected. Safe to call multiple times. */
   connect() {
@@ -95,10 +96,15 @@ class RsClawWsClient {
     return () => this.restartHandlers.delete(handler);
   }
 
-  private _doConnect() {
+  private async _doConnect() {
     if (this.retryTimer) {
       clearTimeout(this.retryTimer);
       this.retryTimer = null;
+    }
+
+    // Wait for any pending token refresh before reconnecting.
+    if (this.tokenRefresh) {
+      await this.tokenRefresh;
     }
 
     const gwUrl = getGatewayUrl() || "http://localhost:18888";
@@ -142,6 +148,28 @@ class RsClawWsClient {
     this.retryTimer = setTimeout(() => this._doConnect(), delay);
   }
 
+  /** Re-read auth token from Tauri config on auth failure. */
+  private _refreshTokenFromTauri() {
+    const tauriInvoke = (window as any).__TAURI__?.invoke;
+    if (!tauriInvoke) return;
+    this.tokenRefresh = tauriInvoke("get_gateway_port")
+      .then((gw: any) => {
+        if (gw?.token) {
+          setAuthToken(gw.token);
+          try {
+            localStorage.setItem("rsclaw-auth-token", gw.token);
+          } catch {}
+          console.info("[rsclaw-ws] auth token refreshed from config");
+        }
+      })
+      .catch((e: unknown) => {
+        console.warn("[rsclaw-ws] token refresh failed:", e);
+      })
+      .finally(() => {
+        this.tokenRefresh = null;
+      });
+  }
+
   private _handleFrame(data: any) {
     // Challenge/response handshake
     if (data.event === "connect.challenge") {
@@ -152,9 +180,9 @@ class RsClawWsClient {
           id: "1",
           method: "connect",
           params: {
-            client: "desktop-ui",
-            min_protocol: 3,
-            max_protocol: 3,
+            client: { id: "rsclaw:desktop", version: "dev", platform: "tauri", mode: "ui" },
+            minProtocol: 3,
+            maxProtocol: 3,
             auth: token ? { token } : undefined,
           },
         }),
@@ -164,7 +192,13 @@ class RsClawWsClient {
 
     // Connected confirmation
     if (data.type === "res" && data.id === "1") {
-      this.retryCount = 0;
+      if (data.ok) {
+        this.retryCount = 0;
+      } else {
+        // Auth failed — refresh token from Tauri config before next retry.
+        console.warn("[rsclaw-ws] connect failed:", data.error?.message);
+        this._refreshTokenFromTauri();
+      }
       return;
     }
 

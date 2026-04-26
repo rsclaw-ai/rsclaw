@@ -391,6 +391,7 @@ impl AgentRegistry {
                 codex: None,
                 agent_dir: None,
                 system: None,
+                temperature: None,
             }]
         } else {
             cfg.agents.list.clone()
@@ -665,6 +666,7 @@ mod tests {
             codex: None,
             agent_dir: None,
             system: None,
+            temperature: None,
         }
     }
 

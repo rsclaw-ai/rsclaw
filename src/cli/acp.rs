@@ -65,47 +65,24 @@ pub enum AcpCommand {
 
     #[command(name = "list", about = "List agents on Gateway")]
     List {
-        #[arg(long, default_value = "ws://localhost:18888")]
+        #[arg(long, default_value = "http://localhost:18888")]
         url: String,
 
+        /// Auth token (auto-detected from config if omitted).
         #[arg(long)]
         token: Option<String>,
     },
 
     #[command(name = "kill", about = "Kill an agent on Gateway")]
     Kill {
-        #[arg(long, default_value = "ws://localhost:18888")]
+        #[arg(long, default_value = "http://localhost:18888")]
         url: String,
 
+        /// Auth token (auto-detected from config if omitted).
         #[arg(long)]
         token: Option<String>,
 
         #[arg(long)]
         agent_id: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum AgentCommand {
-    #[command(name = "spawn", about = "Spawn a new agent")]
-    Spawn {
-        /// Agent type: "opencode" or "claudecode"
-        #[arg(long, default_value = "opencode")]
-        agent_type: String,
-
-        #[arg(long)]
-        cwd: Option<String>,
-
-        #[arg(trailing_var_arg = true)]
-        args: Vec<String>,
-    },
-
-    #[command(name = "list", about = "List running agents")]
-    List,
-
-    #[command(name = "kill", about = "Kill an agent")]
-    Kill {
-        #[arg(long)]
-        id: String,
     },
 }

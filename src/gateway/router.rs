@@ -258,6 +258,7 @@ mod tests {
             codex: None,
             agent_dir: None,
             system: None,
+            temperature: None,
         }
     }
 

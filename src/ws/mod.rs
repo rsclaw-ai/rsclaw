@@ -11,6 +11,6 @@ pub mod rate_limit;
 pub mod tick;
 pub mod types;
 
-pub use conn::{ConnHandle, ConnRegistry};
+pub use conn::{ConnHandle, ConnRegistry, ConnSummary};
 pub use handshake::{DeviceStore, root_handler, ws_handler};
 pub use types::{ErrorShape, EventFrame};

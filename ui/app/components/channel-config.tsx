@@ -9,10 +9,11 @@ import CloseIcon from "../icons/close.svg";
 import ConfirmIcon from "../icons/confirm.svg";
 import ReloadIcon from "../icons/reload.svg";
 import { useNavigate } from "react-router-dom";
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { Path } from "../constant";
 import { showConfirm, showToast } from "./ui-lib";
 import { gatewayFetch, wechatQrStart, wechatQrStatus } from "../lib/rsclaw-api";
+import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
 
 // ── Channel type definitions (aligned with onboarding.tsx ALL_CHANNELS) ──
 
@@ -113,6 +114,7 @@ export function ChannelConfigPage() {
   const [formCreds, setFormCreds] = useState<Record<string, string>>({});
   const [qrUrl, setQrUrl] = useState<string | null>(null);
   const [qrPolling, setQrPolling] = useState(false);
+  const qrPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchChannels = useCallback(async () => {
     try {
@@ -130,6 +132,12 @@ export function ChannelConfigPage() {
   useEffect(() => {
     fetchChannels();
   }, [fetchChannels]);
+
+  useEffect(() => {
+    return () => {
+      if (qrPollRef.current) clearInterval(qrPollRef.current);
+    };
+  }, []);
 
   const typeDef = CHANNEL_TYPE_MAP[formType] || CHANNEL_TYPES[0];
 
@@ -217,14 +225,69 @@ export function ChannelConfigPage() {
   };
 
   // ── QR Login (WeChat / Feishu) ──
+  //
+  // In Tauri desktop, both channels use the rsclaw sidecar with --quiet so the
+  // QR PNG and credentials are written to disk silently. In the browser we
+  // fall back to the HTTP wechat endpoint; Feishu has no HTTP endpoint yet.
+
+  const startTauriQrLogin = async (channel: string) => {
+    setQrPolling(true);
+    setQrUrl(null);
+
+    if (qrPollRef.current) clearInterval(qrPollRef.current);
+
+    try {
+      await tauriInvokeV2("channel_login_start", { channel });
+    } catch {
+      setQrPolling(false);
+      showToast("Failed to start QR login");
+      return;
+    }
+
+    let attempts = 0;
+    let qrFound = false;
+    qrPollRef.current = setInterval(async () => {
+      attempts++;
+      try {
+        const status: string = await tauriInvokeV2("channel_login_status");
+        if (status === "done") {
+          if (qrPollRef.current) clearInterval(qrPollRef.current);
+          setQrUrl(null);
+          setQrPolling(false);
+          showToast(channel === "wechat" ? "WeChat login successful!" : "Feishu login successful!");
+          fetchChannels();
+          setShowForm(false);
+          return;
+        }
+        if (!qrFound) {
+          const dataUri: string | null = await tauriInvokeV2("channel_login_qr");
+          if (dataUri) {
+            qrFound = true;
+            setQrUrl(dataUri);
+          }
+        }
+      } catch {
+        // keep polling
+      }
+      if (attempts > 60) {
+        if (qrPollRef.current) clearInterval(qrPollRef.current);
+        setQrPolling(false);
+        if (!qrFound) showToast("QR login timed out");
+      }
+    }, 2000);
+  };
 
   const handleQrLogin = async () => {
+    if (isTauri) {
+      await startTauriQrLogin(formType);
+      return;
+    }
     if (formType === "wechat") {
       try {
         const data = await wechatQrStart();
-        if (data.qrcode_img_content) {
-          setQrUrl(data.qrcode_img_content);
-          pollWechatQr(data.qrcode);
+        if (data.qrcode_url) {
+          setQrUrl(data.qrcode_url);
+          pollWechatQr(data.qrcode_token);
         } else {
           showToast("Failed to get QR code");
         }
@@ -232,7 +295,7 @@ export function ChannelConfigPage() {
         showToast("QR login requires the gateway to be running");
       }
     } else if (formType === "feishu") {
-      showToast("Feishu QR login: use `rsclaw channels login feishu` in terminal");
+      showToast("Feishu QR login requires the desktop app");
     }
   };
 
@@ -242,17 +305,13 @@ export function ChannelConfigPage() {
       await new Promise((r) => setTimeout(r, 2000));
       try {
         const data = await wechatQrStatus(token);
-        if (data.status === "confirmed") {
+        if (data.status === "ok") {
           showToast("WeChat login successful!");
           setQrUrl(null);
           setQrPolling(false);
           fetchChannels();
           setShowForm(false);
           return;
-        }
-        if (data.status === "expired") {
-          showToast("QR code expired, please try again");
-          break;
         }
       } catch {
         break;

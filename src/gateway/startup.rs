@@ -7,7 +7,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     MemoryTier,
@@ -220,10 +220,15 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // share the same sender.
     let (event_tx, _) = broadcast::channel::<crate::events::AgentEvent>(1024);
 
+    // Build LiveConfig BEFORE the spawner: hot-reloadable per-domain locks
+    // that AgentRuntime reads for live-mutable fields (temperature, etc.).
+    let live = Arc::new(LiveConfig::new((*config).clone()));
+
     // Create AgentSpawner — enables agent-to-agent dynamic spawning.
     let spawner = AgentSpawner::new_arc(
         Arc::clone(&registry),
         Arc::clone(&config),
+        Arc::clone(&live),
         Arc::clone(&providers),
         Arc::clone(&skills),
         Arc::clone(&store),
@@ -244,6 +249,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         receivers,
         Arc::clone(&registry),
         Arc::clone(&config),
+        Arc::clone(&live),
         Arc::clone(&store),
         Arc::clone(&skills),
         Arc::clone(&providers),
@@ -390,9 +396,6 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         info!("heartbeat runner started");
     }
 
-    // 11. Build LiveConfig for hot-reloadable per-domain access.
-    let live = Arc::new(LiveConfig::new((*config).clone()));
-
     // 11. Write PID file early so the hot-reload task can clean it on restart.
     let pid_file = crate::config::loader::pid_file();
     if let Some(parent) = pid_file.parent() {
@@ -425,28 +428,33 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             loop {
                 match reload_rx.recv().await {
                     Ok(ConfigChange::FullReload(new_cfg)) => {
+                        // `apply` now uses `diff_restart_sections` as the
+                        // single source of truth: empty = hot-safe (already
+                        // written into live locks); non-empty = a restart is
+                        // recommended for the listed sections.
+                        let new_owned = (*new_cfg).clone();
                         let needs_restart =
-                            live_reload.apply((*new_cfg).clone(), &restart_tx).await;
+                            live_reload.apply(new_owned, &restart_tx).await;
                         if needs_restart.is_empty() {
-                            info!("config hot-reload applied");
+                            info!("config hot-reload applied (hot-safe fields only)");
                         } else {
                             warn!(?needs_restart, "config change requires gateway restart");
+                            // FullReload doesn't fully propagate to running
+                            // agents/channels (providers/prompts/credentials
+                            // are snapshotted at spawn). Surface a Recommended
+                            // banner so the user can apply changes cleanly.
+                            publish_restart(
+                                &bridge_tx,
+                                &bridge_pending,
+                                crate::events::RestartRequest::new(
+                                    crate::events::RestartReason::ConfigChanged {
+                                        sections: needs_restart,
+                                    },
+                                    crate::events::RestartUrgency::Recommended,
+                                    crate::i18n::t("restart_required_config_changed", &lang),
+                                ),
+                            );
                         }
-                        // Even FullReload doesn't fully propagate to running
-                        // agents (their providers/prompts are snapshotted at
-                        // spawn). Surface a Recommended restart banner so the
-                        // user can choose to apply changes cleanly.
-                        publish_restart(
-                            &bridge_tx,
-                            &bridge_pending,
-                            crate::events::RestartRequest::new(
-                                crate::events::RestartReason::ConfigChanged {
-                                    sections: needs_restart,
-                                },
-                                crate::events::RestartUrgency::Recommended,
-                                crate::i18n::t("restart_required_config_changed", &lang),
-                            ),
-                        );
                     }
                     Ok(ConfigChange::RequiresRestart(fields)) => {
                         warn!(?fields, "config change requires restart — surfacing banner");
@@ -708,7 +716,36 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             }
         };
         let mut cmd = std::process::Command::new(&exe);
-        cmd.args(["gateway", "run"]);
+        // Forward --dev, --profile, --base-dir flags so the replacement
+        // process uses the same isolation mode as the original.
+        let original_args: Vec<String> = std::env::args().collect();
+        let mut extra_args: Vec<String> = Vec::new();
+        let mut i = 1; // skip argv[0]
+        while i < original_args.len() {
+            match original_args[i].as_str() {
+                "--dev" => { extra_args.push("--dev".to_owned()); }
+                "--profile" => {
+                    extra_args.push("--profile".to_owned());
+                    if let Some(val) = original_args.get(i + 1) {
+                        extra_args.push(val.clone());
+                        i += 1;
+                    }
+                }
+                "--base-dir" => {
+                    extra_args.push("--base-dir".to_owned());
+                    if let Some(val) = original_args.get(i + 1) {
+                        extra_args.push(val.clone());
+                        i += 1;
+                    }
+                }
+                s if s.starts_with("--profile=") => { extra_args.push(s.to_owned()); }
+                s if s.starts_with("--base-dir=") => { extra_args.push(s.to_owned()); }
+                _ => {}
+            }
+            i += 1;
+        }
+        extra_args.extend(["gateway".to_owned(), "run".to_owned()]);
+        cmd.args(&extra_args);
         // Windows: suppress the console flash when re-execing from a GUI app.
         #[cfg(target_os = "windows")]
         {
@@ -743,6 +780,7 @@ fn spawn_agent_tasks(
     receivers: HashMap<String, mpsc::Receiver<AgentMessage>>,
     registry: Arc<AgentRegistry>,
     config: Arc<RuntimeConfig>,
+    live: Arc<LiveConfig>,
     store: Arc<Store>,
     skills: Arc<SkillRegistry>,
     providers: Arc<ProviderRegistry>,
@@ -782,6 +820,7 @@ fn spawn_agent_tasks(
         let mut runtime = AgentRuntime::new(
             Arc::clone(&handle),
             Arc::clone(&config),
+            Arc::clone(&live),
             Arc::clone(&providers),
             fallback_models,
             Arc::clone(&skills),
@@ -1064,135 +1103,26 @@ pub(crate) async fn handle_pending_analysis(
 // ---------------------------------------------------------------------------
 
 /// Download BGE-Small embedding model files from HuggingFace.
-/// Uses hf-mirror.com for Chinese locale, huggingface.co otherwise.
+/// Downloads BGE model from gitfast.org (ZIP archive).
 async fn download_bge_model(
     target_dir: &std::path::Path,
     search_cfg: Option<&crate::config::schema::MemorySearchConfig>,
-    config_language: Option<&str>,
+    _config_language: Option<&str>,
 ) -> anyhow::Result<()> {
-    use tokio::io::AsyncWriteExt;
-
     let local_cfg = search_cfg.and_then(|c| c.local.as_ref());
 
-    // Determine model repo.
-    let repo = local_cfg
-        .and_then(|c| c.model_repo.as_deref())
-        .unwrap_or("BAAI/bge-small-zh-v1.5");
-
-    // Determine base URL: config override > locale auto-detect.
-    let base_url = if let Some(url) = local_cfg.and_then(|c| c.model_download_url.as_deref()) {
-        // User provided full URL — use as-is.
-        url.trim_end_matches('/').to_owned()
+    // Config override for custom download URL.
+    let url = if let Some(url) = local_cfg.and_then(|c| c.model_download_url.as_deref()) {
+        url.to_owned()
     } else {
-        // Auto-detect: config language > LANG/LC_ALL env var.
-        let is_zh = config_language
-            .map(|l| l.to_lowercase().contains("chinese") || l.to_lowercase().contains("zh"))
-            .unwrap_or_else(|| {
-                std::env::var("LANG")
-                    .or_else(|_| std::env::var("LC_ALL"))
-                    .unwrap_or_default()
-                    .to_lowercase()
-                    .contains("zh")
-            });
-        let host = if is_zh { "https://hf-mirror.com" } else { "https://huggingface.co" };
-        format!("{host}/{repo}/resolve/main")
+        "https://gitfast.org/tools/models/bge-small-zh-v1.5.zip".to_owned()
     };
 
-    let files = ["config.json", "model.safetensors", "tokenizer.json"];
-
-    info!("downloading BGE embedding model from {base_url} ...");
+    info!("downloading BGE embedding model from {url} ...");
     std::fs::create_dir_all(target_dir)?;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
-        .build()?;
-
-    for filename in &files {
-        let url = format!("{base_url}/{filename}");
-        let dest = target_dir.join(filename);
-        let partial = target_dir.join(format!("{filename}.partial"));
-
-        if dest.exists() {
-            debug!("{filename} already exists, skipping");
-            continue;
-        }
-
-        // Retry up to 3 times with resume support.
-        let mut success = false;
-        for attempt in 0..3 {
-            if attempt > 0 {
-                info!("  retrying {filename} (attempt {})...", attempt + 1);
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-
-            // Check if partial file exists for resume.
-            let existing_len = tokio::fs::metadata(&partial).await.map(|m| m.len()).unwrap_or(0);
-
-            let mut req = client.get(&url);
-            if existing_len > 0 {
-                info!("  resuming {filename} from byte {existing_len}...");
-                req = req.header("Range", format!("bytes={existing_len}-"));
-            } else {
-                info!("  downloading {filename} ...");
-            }
-
-            let response = match req.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("  download request failed: {e}");
-                    continue;
-                }
-            };
-
-            let status = response.status();
-            if !status.is_success() && status.as_u16() != 206 {
-                warn!("  download failed: HTTP {status}");
-                continue;
-            }
-
-            // Stream to partial file (append if resuming).
-            let mut file = if existing_len > 0 && status.as_u16() == 206 {
-                tokio::fs::OpenOptions::new().append(true).open(&partial).await?
-            } else {
-                tokio::fs::File::create(&partial).await?
-            };
-
-            let mut stream = response.bytes_stream();
-            use futures::StreamExt;
-            let mut downloaded = existing_len;
-            let mut stream_ok = true;
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(bytes) => {
-                        file.write_all(&bytes).await?;
-                        downloaded += bytes.len() as u64;
-                    }
-                    Err(e) => {
-                        warn!("  stream error at byte {downloaded}: {e}");
-                        stream_ok = false;
-                        break;
-                    }
-                }
-            }
-            file.flush().await?;
-
-            if stream_ok {
-                // Rename partial to final.
-                tokio::fs::rename(&partial, &dest).await?;
-                info!("  {filename} downloaded ({downloaded} bytes)");
-                success = true;
-                break;
-            }
-        }
-
-        if !success {
-            // Clean up partial file on final failure (best-effort, about to bail anyway).
-            if let Err(e) = tokio::fs::remove_file(&partial).await {
-                warn!("could not remove partial download file: {e}");
-            }
-            anyhow::bail!("failed to download {filename} after 3 attempts");
-        }
-    }
+    let client = reqwest::Client::new();
+    crate::cmd::tools::download_and_extract_public(&client, &url, target_dir).await?;
 
     info!("BGE model downloaded to {}", target_dir.display());
     Ok(())

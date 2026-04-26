@@ -23,7 +23,8 @@
 set -euo pipefail
 
 BINARY="rsclaw"
-VERSION="$(git describe --tags --always 2>/dev/null || echo "dev")"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VERSION="$(grep '^version' "$ROOT_DIR/Cargo.toml" | head -1 | sed 's/.*"\(.*\)"/\1/')"
 DIST_DIR="dist"
 
 # All supported targets

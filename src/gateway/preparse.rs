@@ -3,10 +3,7 @@
 //! Functions here handle commands like `/ls`, `/status`, `/version`, `/btw`
 //! without going through the LLM agent loop.
 
-use std::time::Duration;
-
 use futures::StreamExt as _;
-use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::{
@@ -333,64 +330,6 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
     || lower.starts_with("/exec ")
     || t.starts_with("! ")
     || t.starts_with("$ ")
-}
-
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// Processing indicator — send with 3s timeout to avoid blocking
-// ---------------------------------------------------------------------------
-
-/// Returns the configured processing timeout duration (default 120s).
-/// When set to 0, returns a very large duration (effectively disabled).
-/// When intermediateOutput is enabled, also disabled (intermediate text replaces this).
-pub(crate) fn processing_timeout(config: &RuntimeConfig) -> Duration {
-    let intermediate = config.raw.agents.as_ref()
-        .and_then(|a| a.defaults.as_ref())
-        .and_then(|d| d.intermediate_output)
-        .unwrap_or(true);
-    if intermediate {
-        return Duration::from_secs(86400);
-    }
-    let secs = config
-        .raw
-        .gateway
-        .as_ref()
-        .and_then(|g| g.processing_timeout)
-        .unwrap_or(120);
-    if secs == 0 {
-        Duration::from_secs(86400)
-    } else {
-        Duration::from_secs(secs)
-    }
-}
-
-pub(crate) async fn send_processing(
-    tx: &mpsc::Sender<OutboundMessage>,
-    target_id: String,
-    is_group: bool,
-    config: &RuntimeConfig,
-) {
-    let i18n_lang = config
-        .raw
-        .gateway
-        .as_ref()
-        .and_then(|g| g.language.as_deref())
-        .map(crate::i18n::resolve_lang)
-        .unwrap_or("en");
-    let text = crate::i18n::t("processing", i18n_lang);
-    let _ = tokio::time::timeout(
-        Duration::from_secs(3),
-        tx.send(OutboundMessage {
-            target_id,
-            is_group,
-            text,
-            reply_to: None,
-            images: vec![],
-            channel: None,
-
-                    files: vec![],        }),
-    )
-    .await;
 }
 
 // ---------------------------------------------------------------------------

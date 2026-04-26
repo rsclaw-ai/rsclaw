@@ -10,7 +10,7 @@
 //! session (`session:<key>`). Concurrent runs are capped by
 //! `max_concurrent_runs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,6 +54,12 @@ const ERROR_BACKOFF_MS: [u64; 5] = [
     900_000,   // 4th error  →  15 minutes
     3_600_000, // 5th+ error →  60 minutes
 ];
+
+/// Sentinel error message produced when a running job is cancelled because
+/// reload detected the job was deleted, disabled, or its config changed.
+/// Used to distinguish reload-driven cancellation from actual failures so
+/// `consecutive_errors` is not bumped and the new job version starts clean.
+const CANCEL_BY_RELOAD: &str = "cron: cancelled by reload";
 
 /// Get backoff delay for consecutive error count.
 fn error_backoff_ms(consecutive_errors: u32) -> u64 {
@@ -637,28 +643,39 @@ impl CronRunner {
                     .collect();
                 info!(old_count, new_count = new_jobs.len(), file_count, disabled=?disabled_in_file, "cron: reload triggered, reloading from file");
 
-                jobs = self.merge_jobs(&jobs, new_jobs, now_ms);
+                let (merged_jobs, modified_ids) = self.merge_jobs(&jobs, new_jobs, now_ms);
+                jobs = merged_jobs;
 
                 // Debug: check enabled state after merge
                 let disabled_after_merge: Vec<_> = jobs.iter()
                     .filter(|j| !j.enabled)
                     .map(|j| (&j.id, j.enabled))
                     .collect();
-                info!(after_merge_count = jobs.len(), disabled=?disabled_after_merge, "cron: merge complete");
+                info!(after_merge_count = jobs.len(), disabled=?disabled_after_merge, modified=?modified_ids, "cron: merge complete");
 
-                // Cancel running tasks that were removed or disabled.
-                let active_ids: std::collections::HashSet<&str> = jobs.iter()
-                    .filter(|j| j.enabled)
+                // Cancel running tasks that were removed, disabled, OR whose
+                // user-facing config changed.  The "modified" case matters
+                // because a user editing a long-running job (e.g. switching a
+                // 5-minute schedule to 30 minutes) expects the old in-flight
+                // run on the OLD config to stop — otherwise it keeps using the
+                // old message/payload/cadence side-by-side with the new one.
+                let active_unchanged: HashSet<&str> = jobs.iter()
+                    .filter(|j| j.enabled && !modified_ids.contains(&j.id))
                     .map(|j| j.id.as_str())
                     .collect();
                 let to_cancel: Vec<String> = cancel_flags.keys()
-                    .filter(|id| !active_ids.contains(id.as_str()))
+                    .filter(|id| !active_unchanged.contains(id.as_str()))
                     .cloned()
                     .collect();
                 for id in &to_cancel {
                     if let Some(flag) = cancel_flags.remove(id) {
                         flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                        info!(job_id = id, "cron: cancelled running job (deleted/disabled)");
+                        let reason = if modified_ids.contains(id) {
+                            "modified"
+                        } else {
+                            "deleted/disabled"
+                        };
+                        info!(job_id = id, reason, "cron: cancelled running job");
                     }
                 }
 
@@ -701,6 +718,22 @@ impl CronRunner {
                             state.next_run_at_ms = job.schedule.compute_next_run(completion_time);
                             }
                             info!(job_id = %job.id, next_run_at_ms = state.next_run_at_ms, "cron: updated next_run_at_ms after success");
+                        } else if error_msg.as_deref() == Some(CANCEL_BY_RELOAD) {
+                            // Cancellation triggered by reload (delete / disable /
+                            // config edit).  Treat as benign: don't bump
+                            // consecutive_errors, don't apply backoff, don't
+                            // auto-disable.  Leave next_run_at_ms alone — for a
+                            // schedule edit, merge_jobs has already recomputed it
+                            // for the new cadence; for a non-schedule edit the
+                            // existing cadence still applies.
+                            state.last_run_status = Some("cancelled".to_string());
+                            state.last_status = Some("cancelled".to_string());
+                            state.last_error = error_msg;
+                            info!(
+                                job_id = %job.id,
+                                next_run_at_ms = state.next_run_at_ms,
+                                "cron: run cancelled by reload (config changed / disabled / deleted)"
+                            );
                         } else {
                             state.consecutive_errors += 1;
                             state.last_run_status = Some("error".to_string());
@@ -867,28 +900,36 @@ impl CronRunner {
                                     }
                                 }
                             } => {
-                                Err(anyhow::anyhow!("job cancelled"))
+                                Err(anyhow::anyhow!(CANCEL_BY_RELOAD))
                             }
                         }
                     };
                     let duration_ms = current_timestamp_ms() - start_time;
                     drop(permit);
 
-                    // Build delivery message with execution summary
-                    let delivery_text = match &result {
+                    // Build delivery message with execution summary.  None means
+                    // skip delivery entirely (used for reload-driven
+                    // cancellation — that's a control-plane event, not
+                    // something the user wants pushed to their channel).
+                    let delivery_text: Option<String> = match &result {
                         Ok(output) if !output.trim().is_empty() => {
                             // Agent returned output, use it directly
-                            output.clone()
+                            Some(output.clone())
                         }
                         Ok(_) => {
                             // Success but no output - send summary
                             let job_name = job.name.as_deref().unwrap_or(&job.id);
                             let seconds = (duration_ms / 1000).to_string();
-                            crate::i18n::t_fmt(
+                            Some(crate::i18n::t_fmt(
                                 "cron_run_success",
                                 crate::i18n::default_lang(),
                                 &[("name", job_name), ("seconds", &seconds)],
-                            )
+                            ))
+                        }
+                        Err(e) if e.to_string() == CANCEL_BY_RELOAD => {
+                            // Reload cancelled this run.  Skip delivery so the
+                            // user isn't spammed when they edit a job.
+                            None
                         }
                         Err(e) => {
                             // Error - send error notification with consecutive failure count and backoff
@@ -907,7 +948,7 @@ impl CronRunner {
 
                             let consecutive_str = consecutive.to_string();
                             let error_str = e.to_string();
-                            if will_disable {
+                            Some(if will_disable {
                                 crate::i18n::t_fmt(
                                     "cron_run_failed_disabled",
                                     crate::i18n::default_lang(),
@@ -928,7 +969,7 @@ impl CronRunner {
                                         ("error", &error_str),
                                     ],
                                 )
-                            }
+                            })
                         }
                     };
 
@@ -939,22 +980,23 @@ impl CronRunner {
 
                     // Spawn delivery as a detached task so it doesn't block.
                     // The result is logged but we don't wait for it.
-                    let delivery_channels = Arc::clone(&channels);
-                    let delivery_job = job.clone();
-                    let delivery_text = delivery_text;
-                    let delivery_default = default_delivery.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = send_delivery(
-                            &delivery_channels,
-                            &delivery_job,
-                            &delivery_default,
-                            &delivery_text,
-                        )
-                        .await
-                        {
-                            warn!(job_id = %delivery_job.id, %e, "delivery failed");
-                        }
-                    });
+                    if let Some(delivery_text) = delivery_text {
+                        let delivery_channels = Arc::clone(&channels);
+                        let delivery_job = job.clone();
+                        let delivery_default = default_delivery.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = send_delivery(
+                                &delivery_channels,
+                                &delivery_job,
+                                &delivery_default,
+                                &delivery_text,
+                            )
+                            .await
+                            {
+                                warn!(job_id = %delivery_job.id, %e, "delivery failed");
+                            }
+                        });
+                    }
 
                     let entry = build_run_log_entry(
                         &job,
@@ -1099,8 +1141,21 @@ impl CronRunner {
     /// before the new schedule kicks in.  Detect a schedule change here and
     /// force-recompute `next_run_at_ms` so the new cadence takes effect at the
     /// next reload tick.
-    fn merge_jobs(&self, old_jobs: &[CronJob], new_jobs: Vec<CronJob>, now_ms: u64) -> Vec<CronJob> {
+    ///
+    /// Also returns a set of ids whose user-facing config (any field other
+    /// than runtime state and audit timestamps) changed since the previous
+    /// load.  Caller uses this to cancel any in-flight execution of the OLD
+    /// version so the new config takes effect cleanly — without this, a long
+    /// 5-minute job whose schedule was just edited to 30 minutes would keep
+    /// running on the old cadence side-by-side with the new one.
+    fn merge_jobs(
+        &self,
+        old_jobs: &[CronJob],
+        new_jobs: Vec<CronJob>,
+        now_ms: u64,
+    ) -> (Vec<CronJob>, HashSet<String>) {
         let mut result = Vec::with_capacity(new_jobs.len());
+        let mut modified: HashSet<String> = HashSet::new();
 
         for mut new_job in new_jobs {
             let mut schedule_changed = false;
@@ -1112,6 +1167,11 @@ impl CronRunner {
                 // variant payload).
                 schedule_changed = serde_json::to_value(&old_job.schedule).ok()
                     != serde_json::to_value(&new_job.schedule).ok();
+                // Detect any user-facing config change (broader than schedule
+                // alone — covers message/payload/delivery/sessionTarget/etc.).
+                if !cron_jobs_config_equal(old_job, &new_job) {
+                    modified.insert(new_job.id.clone());
+                }
                 // Preserve state from old job
                 new_job.state = old_job.state.clone();
             } else {
@@ -1145,7 +1205,7 @@ impl CronRunner {
             result.push(new_job);
         }
 
-        result
+        (result, modified)
     }
 
     async fn save_store(&self, jobs: &[CronJob]) -> Result<()> {
@@ -1176,6 +1236,32 @@ impl Clone for CronRunner {
             shutdown: self.shutdown.clone(),
         }
     }
+}
+
+/// True when two CronJobs have identical user-facing configuration.
+/// Compared via serde_json::Value so we don't have to derive PartialEq across
+/// every nested type.  Strips fields that should NOT count as a meaningful
+/// change:
+///   - `state`: runtime-only execution state.
+///   - `createdAtMs` / `updatedAtMs`: audit timestamps that don't affect
+///     execution semantics (and `updatedAtMs` flips on every save).
+fn cron_jobs_config_equal(a: &CronJob, b: &CronJob) -> bool {
+    let mut a_v = match serde_json::to_value(a) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let mut b_v = match serde_json::to_value(b) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    for v in [&mut a_v, &mut b_v] {
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("state");
+            obj.remove("createdAtMs");
+            obj.remove("updatedAtMs");
+        }
+    }
+    a_v == b_v
 }
 
 // ---------------------------------------------------------------------------
@@ -1872,6 +1958,93 @@ pub fn save_cron_jobs(jobs: &[CronJob]) -> anyhow::Result<()> {
 /// Without this, concurrent `cron.add` calls (common when an LLM dispatches
 /// multiple tool calls in one turn) race and silently lose writes.
 pub static CRON_FILE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+mod cron_config_equal_tests {
+    use super::*;
+
+    fn job(id: &str, expr: &str, msg: &str) -> CronJob {
+        CronJob {
+            id: id.to_string(),
+            name: Some(id.to_string()),
+            agent_id: "default".to_string(),
+            session_key: None,
+            enabled: true,
+            schedule: CronSchedule::Flat(expr.to_string()),
+            payload: None,
+            message: Some(msg.to_string()),
+            delivery: None,
+            session_target: None,
+            wake_mode: None,
+            state: None,
+            created_at_ms: Some(1_000),
+            updated_at_ms: Some(1_000),
+        }
+    }
+
+    #[test]
+    fn identical_jobs_equal() {
+        let a = job("j1", "*/5 * * * *", "ping");
+        let b = job("j1", "*/5 * * * *", "ping");
+        assert!(cron_jobs_config_equal(&a, &b));
+    }
+
+    #[test]
+    fn different_message_not_equal() {
+        let a = job("j1", "*/5 * * * *", "ping");
+        let b = job("j1", "*/5 * * * *", "pong");
+        assert!(!cron_jobs_config_equal(&a, &b));
+    }
+
+    #[test]
+    fn different_schedule_not_equal() {
+        let a = job("j1", "*/5 * * * *", "ping");
+        let b = job("j1", "*/30 * * * *", "ping");
+        assert!(!cron_jobs_config_equal(&a, &b));
+    }
+
+    #[test]
+    fn state_diff_still_equal() {
+        // State is runtime-only; two configs that differ only in state must
+        // be treated as equal so a state update doesn't trip cancellation.
+        let mut a = job("j1", "*/5 * * * *", "ping");
+        let mut b = job("j1", "*/5 * * * *", "ping");
+        a.state = Some(CronJobState {
+            consecutive_errors: 0,
+            ..Default::default()
+        });
+        b.state = Some(CronJobState {
+            consecutive_errors: 7,
+            last_error: Some("boom".to_string()),
+            next_run_at_ms: Some(99_999),
+            ..Default::default()
+        });
+        assert!(cron_jobs_config_equal(&a, &b));
+    }
+
+    #[test]
+    fn updated_at_diff_still_equal() {
+        // updated_at_ms flips on every save; treating it as a config change
+        // would cause spurious cancellations.
+        let mut a = job("j1", "*/5 * * * *", "ping");
+        let mut b = job("j1", "*/5 * * * *", "ping");
+        a.updated_at_ms = Some(1_000);
+        b.updated_at_ms = Some(2_000);
+        assert!(cron_jobs_config_equal(&a, &b));
+    }
+
+    #[test]
+    fn enabled_diff_not_equal() {
+        // Toggling enabled IS a meaningful change — but the cancellation
+        // path for disabled jobs goes through the active_unchanged filter
+        // (a disabled job is not in active_unchanged), so it'd be cancelled
+        // either way.  This just documents that enabled is part of config.
+        let a = job("j1", "*/5 * * * *", "ping");
+        let mut b = job("j1", "*/5 * * * *", "ping");
+        b.enabled = false;
+        assert!(!cron_jobs_config_equal(&a, &b));
+    }
+}
 
 #[cfg(test)]
 mod cron_validate_tests {

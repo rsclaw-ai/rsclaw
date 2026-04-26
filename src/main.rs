@@ -28,7 +28,7 @@
     clippy::doc_markdown,
 )]
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::Parser;
 use cli::{AcpCommand, Cli, Command};
 use cmd::{
@@ -195,7 +195,6 @@ async fn run() -> Result<()> {
         Command::Update(sub) | Command::Upgrade(sub) => cmd_update(sub).await,
         Command::Pairing(sub) => cmd_pairing(sub).await,
         Command::Acp(sub) => cmd_acp(sub).await,
-        Command::Agent(sub) => cmd_agent(sub).await,
         Command::Approvals(sub) => cmd_approvals(sub).await,
         Command::Devices(sub) => cmd_devices(sub).await,
         Command::Directory(sub) => cmd_directory(sub).await,
@@ -434,32 +433,35 @@ async fn cmd_acp(sub: AcpCommand) -> Result<()> {
         }
 
         AcpCommand::List { url, token } => {
-            eprintln!("Connecting to Gateway: {}", url);
-            let client = GatewayClient::connect(
-                &url,
-                "rsclaw:client",
-                option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
-                token.as_deref(),
-                None,
-            )
-            .await?;
-
-            eprintln!("Listing agents...");
-            let agents = client.list_agents().await?;
-            if agents.is_empty() {
-                println!("No agents running");
+            let auth = resolve_gateway_token(token);
+            let client = reqwest::Client::new();
+            let mut req = client.get(format!("{}/api/v1/acp/connections", url.trim_end_matches('/')));
+            if !auth.is_empty() {
+                req = req.header("Authorization", format!("Bearer {auth}"));
+            }
+            let resp = req.send().await.context("failed to reach gateway")?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("gateway returned {}: {}", status, if body.is_empty() { "endpoint not available (restart gateway?)" } else { &body });
+            }
+            let conns: Vec<serde_json::Value> = resp.json().await.context("invalid JSON response")?;
+            if conns.is_empty() {
+                println!("No active ACP connections");
             } else {
-                for agent in agents {
+                for c in &conns {
+                    let client_id = c["client_id"].as_str().unwrap_or("unknown");
+                    let version = c["version"].as_str().unwrap_or("-");
+                    let platform = c["platform"].as_str().unwrap_or("-");
+                    let mode = c["mode"].as_str().unwrap_or("-");
+                    let sessions = c["sessions"].as_u64().unwrap_or(0);
+                    let uptime = c["uptime_secs"].as_u64().unwrap_or(0);
                     println!(
-                        "{} - {} ({})",
-                        agent.id,
-                        agent.label.unwrap_or_default(),
-                        agent.status
+                        "{:<30} v{:<10} {:<8} mode={:<6} sessions={} uptime={}s",
+                        client_id, version, platform, mode, sessions, uptime,
                     );
                 }
             }
-
-            client.close().await?;
             Ok(())
         }
 
@@ -468,21 +470,19 @@ async fn cmd_acp(sub: AcpCommand) -> Result<()> {
             token,
             agent_id,
         } => {
-            eprintln!("Connecting to Gateway: {}", url);
-            let client = GatewayClient::connect(
-                &url,
-                "rsclaw:client",
-                option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
-                token.as_deref(),
-                None,
-            )
-            .await?;
-
-            eprintln!("Killing agent: {}", agent_id);
-            client.kill_agent(&agent_id).await?;
-            eprintln!("Agent killed");
-
-            client.close().await?;
+            let auth = resolve_gateway_token(token);
+            let client = reqwest::Client::new();
+            let mut req = client.delete(format!("{}/api/v1/agents/{}", url.trim_end_matches('/'), agent_id));
+            if !auth.is_empty() {
+                req = req.header("Authorization", format!("Bearer {auth}"));
+            }
+            let resp = req.send().await.context("failed to reach gateway")?;
+            if resp.status().is_success() {
+                println!("Agent {} deleted", agent_id);
+            } else {
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("delete failed: {}", body);
+            }
             Ok(())
         }
 
@@ -559,36 +559,31 @@ async fn interactive_gateway_loop(client: &rsclaw::acp::GatewayClient) -> Result
     Ok(())
 }
 
-async fn cmd_agent(sub: cli::AgentCommand) -> Result<()> {
-    match sub {
-        cli::AgentCommand::Spawn {
-            agent_type,
-            cwd,
-            args: _,
-        } => {
-            let cwd = cwd.unwrap_or_else(|| {
-                std::env::current_dir()
-                    .expect("current_dir")
-                    .to_string_lossy()
-                    .to_string()
-            });
-            eprintln!("Spawning agent type: {} in {}", agent_type, cwd);
-            Ok(())
-        }
-        cli::AgentCommand::List => {
-            eprintln!("Listing agents...");
-            Ok(())
-        }
-        cli::AgentCommand::Kill { id } => {
-            eprintln!("Killing agent: {}", id);
-            Ok(())
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tracing initialisation
 // ---------------------------------------------------------------------------
+
+/// Resolve the gateway auth token: explicit `--token` > config > env var.
+fn resolve_gateway_token(explicit: Option<String>) -> String {
+    if let Some(t) = explicit {
+        return t;
+    }
+    // Try loading from config file.
+    if let Some(path) = rsclaw::config::loader::detect_config_path() {
+        if let Ok(cfg) = rsclaw::config::loader::load_json5(&path) {
+            if let Some(t) = cfg.gateway.as_ref()
+                .and_then(|g| g.auth.as_ref())
+                .and_then(|a| a.token.as_ref())
+                .and_then(|s| s.as_plain())
+                .map(str::to_owned)
+            {
+                return t;
+            }
+        }
+    }
+    std::env::var("RSCLAW_AUTH_TOKEN").unwrap_or_default()
+}
 
 fn init_tracing(cli: &Cli) {
     // Only `gateway run` gets info-level logs by default.

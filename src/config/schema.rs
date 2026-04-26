@@ -281,6 +281,10 @@ pub struct AgentDefaults {
     pub thinking: Option<ThinkingConfig>,
     pub strip_think_tags: Option<bool>,
     pub frequency_penalty: Option<f32>,
+    /// Sampling temperature: None = "auto" (use built-in heuristic — 0.7 for
+    /// chat, 0.6 with tools, None for thinking models). Some(t) = explicit
+    /// override, where 0.0 is fully deterministic and 1.0 is most random.
+    pub temperature: Option<f32>,
     pub streaming: Option<StreamingMode>,
     pub timeout: Option<Value>,
     pub tools: Option<Value>,
@@ -347,6 +351,10 @@ pub struct AgentEntry {
     pub agent_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
+    /// Per-agent sampling temperature override. None = inherit from
+    /// `agents.defaults.temperature` (which itself may be None = "auto").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
 }
 
 /// OpenCode ACP configuration for an agent.
@@ -1746,8 +1754,8 @@ pub struct MemorySearchConfig {
 pub struct LocalEmbeddingConfig {
     /// Path to a GGUF model file for local embedding
     pub model_path: Option<String>,
-    /// Override HuggingFace download URL for the embedding model.
-    /// Default: auto-detect based on locale (hf-mirror.com for zh, huggingface.co otherwise).
+    /// Override download URL for the embedding model.
+    /// Default: https://gitfast.org/tools/models/bge-small-zh-v1.5.zip
     pub model_download_url: Option<String>,
     /// Model repo name on HuggingFace (default: "BAAI/bge-small-zh-v1.5")
     pub model_repo: Option<String>,

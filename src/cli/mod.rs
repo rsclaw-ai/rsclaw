@@ -37,7 +37,7 @@ pub mod system;
 pub mod tools;
 pub mod webhooks;
 
-pub use acp::{AcpCommand, AgentCommand};
+pub use acp::AcpCommand;
 pub use agent_turn::AgentTurnArgs;
 pub use agents::{AgentsCommand, BindArgs};
 pub use anycli::AnycliCommand;
@@ -262,9 +262,6 @@ pub enum Command {
     #[command(subcommand)]
     Acp(AcpCommand),
 
-    /// Agent management via ACP
-    #[command(subcommand)]
-    Agent(AgentCommand),
 
     /// Manage exec approvals.
     #[command(subcommand)]

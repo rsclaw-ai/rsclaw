@@ -608,6 +608,16 @@ $r: 10px;
   }
 }
 
+.cfg-select-narrow {
+  composes: cfg-select;
+  max-width: 200px;
+}
+
+.cfg-hint {
+  color: $t2;
+  font-weight: 400;
+}
+
 .f-row {
   display: grid;
   grid-template-columns: 1fr 1fr;

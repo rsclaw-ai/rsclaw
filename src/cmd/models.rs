@@ -325,37 +325,76 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
 // Embedding model download / list
 // ---------------------------------------------------------------------------
 
-const WHISPER_TINY_FILES: &[(&str, &str)] = &[
-    ("config.json", "https://huggingface.co/openai/whisper-tiny/resolve/main/config.json"),
-    ("tokenizer.json", "https://huggingface.co/openai/whisper-tiny/resolve/main/tokenizer.json"),
-    ("model.safetensors", "https://huggingface.co/openai/whisper-tiny/resolve/main/model.safetensors"),
-    ("generation_config.json", "https://huggingface.co/openai/whisper-tiny/resolve/main/generation_config.json"),
-];
+struct ModelDef {
+    /// CLI name(s) and aliases.
+    names: &'static [&'static str],
+    /// Display name.
+    label: &'static str,
+    /// Subdirectory under ~/.rsclaw/models/.
+    dir: &'static str,
+    /// Download URL (ZIP or tar.bz2).
+    url: &'static str,
+}
 
-const BGE_SMALL_ZH_FILES: &[(&str, &str)] = &[
-    ("config.json", "https://huggingface.co/BAAI/bge-small-zh-v1.5/resolve/main/config.json"),
-    ("tokenizer.json", "https://huggingface.co/BAAI/bge-small-zh-v1.5/resolve/main/tokenizer.json"),
-    ("model.safetensors", "https://huggingface.co/BAAI/bge-small-zh-v1.5/resolve/main/model.safetensors"),
+const AVAILABLE_MODELS: &[ModelDef] = &[
+    ModelDef {
+        names: &["bge", "bge-small-zh"],
+        label: "BGE-Small-ZH (Chinese embeddings, ~91MB)",
+        dir: "bge-small-zh",
+        url: "https://gitfast.org/tools/models/bge-small-zh-v1.5.zip",
+    },
+    ModelDef {
+        names: &["bge-base-zh"],
+        label: "BGE-Base-ZH (Chinese embeddings, higher quality, ~400MB)",
+        dir: "bge-base-zh",
+        url: "https://gitfast.org/tools/models/bge-base-zh-v1.5.zip",
+    },
+    ModelDef {
+        names: &["bge-small-en"],
+        label: "BGE-Small-EN (English embeddings, ~127MB)",
+        dir: "bge-small-en",
+        url: "https://gitfast.org/tools/models/bge-small-en-v1.5.zip",
+    },
+    ModelDef {
+        names: &["whisper", "whisper-tiny"],
+        label: "Whisper-Tiny (STT lightweight, ~110MB)",
+        dir: "whisper-tiny",
+        url: "https://gitfast.org/tools/models/sherpa-onnx-whisper-tiny.tar.bz2",
+    },
+    ModelDef {
+        names: &["whisper-turbo"],
+        label: "Whisper-Turbo (STT Chinese recommended, ~537MB)",
+        dir: "whisper-turbo",
+        url: "https://gitfast.org/tools/models/sherpa-onnx-whisper-turbo.tar.bz2",
+    },
+    ModelDef {
+        names: &["vits", "vits-theresa"],
+        label: "VITS-Theresa (Chinese TTS female voice, ~115MB)",
+        dir: "vits-theresa",
+        url: "https://gitfast.org/tools/models/vits-zh-hf-theresa.tar.bz2",
+    },
 ];
 
 async fn cmd_download_embedding(model: Option<String>) -> Result<()> {
     let model_name = model.as_deref().unwrap_or("bge");
     let base_dir = crate::config::loader::base_dir();
 
-    match model_name {
-        "bge" | "bge-small-zh" => {
-            let model_dir = base_dir.join("models/bge-small-zh");
-            download_model("BAAI/bge-small-zh-v1.5", &model_dir, BGE_SMALL_ZH_FILES).await?;
-        }
-        "whisper" | "whisper-tiny" => {
-            let model_dir = base_dir.join("models/whisper-tiny");
-            download_model("openai/whisper-tiny", &model_dir, WHISPER_TINY_FILES).await?;
-        }
-        other => {
-            anyhow::bail!("Unknown model: {other}. Available: bge, whisper");
-        }
+    let def = AVAILABLE_MODELS
+        .iter()
+        .find(|m| m.names.iter().any(|n| *n == model_name));
+
+    let Some(def) = def else {
+        let available: Vec<_> = AVAILABLE_MODELS.iter().map(|m| m.names[0]).collect();
+        anyhow::bail!("Unknown model: {model_name}. Available: {}", available.join(", "));
+    };
+
+    let model_dir = base_dir.join("models").join(def.dir);
+    if model_dir.join("config.json").exists() || model_dir.join("tokens.txt").exists() {
+        ok(&format!("{} already installed at {}", def.label, model_dir.display()));
+        return Ok(());
     }
-    Ok(())
+
+    download_archive(def.label, &model_dir, def.url).await
 }
 
 fn cmd_list_installed() {
@@ -365,30 +404,21 @@ fn cmd_list_installed() {
     banner(&format!("rsclaw installed models v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
 
     let mut found = false;
-
-    // Check bge-small-zh
-    let zh_dir = models_dir.join("bge-small-zh");
-    if zh_dir.join("config.json").exists() {
-        let size = dir_size(&zh_dir);
-        println!("  {}    {}    {}MB", cyan("bge-small-zh"), dim("BAAI/bge-small-zh-v1.5"), size / 1_000_000);
-        found = true;
-    }
-
-    // Check bge-small-zh / bge-small-en
-    for (name, repo) in [("bge-small-zh", "BAAI/bge-small-zh-v1.5"), ("bge-small-en", "BAAI/bge-small-en-v1.5")] {
-        let dir = models_dir.join(name);
-        if dir.join("config.json").exists() {
+    for def in AVAILABLE_MODELS {
+        let dir = models_dir.join(def.dir);
+        // Check for common marker files.
+        if dir.join("config.json").exists() || dir.join("tokens.txt").exists() || dir.join("model.onnx").exists() {
             let size = dir_size(&dir);
-            println!("  {}    {}    {}MB", cyan(name), dim(repo), size / 1_000_000);
+            println!("  {:<20} {}    {}MB", cyan(def.dir), dim(def.label), size / 1_000_000);
             found = true;
         }
     }
 
-    // Check whisper-tiny
-    let whisper_dir = models_dir.join("whisper-tiny");
-    if whisper_dir.join("config.json").exists() {
-        let size = dir_size(&whisper_dir);
-        println!("  {}    {}    {}MB", cyan("whisper-tiny"), dim("openai/whisper-tiny"), size / 1_000_000);
+    // Also check bge-base-zh (legacy path).
+    let base_zh = models_dir.join("bge-base-zh");
+    if base_zh.join("config.json").exists() {
+        let size = dir_size(&base_zh);
+        println!("  {:<20} {}    {}MB", cyan("bge-base-zh"), dim("(legacy path)"), size / 1_000_000);
         found = true;
     }
 
@@ -396,29 +426,20 @@ fn cmd_list_installed() {
         warn_msg("no models installed");
         println!();
         println!("  Run: rsclaw models download");
+        println!("  Available: {}", AVAILABLE_MODELS.iter().map(|m| m.names[0]).collect::<Vec<_>>().join(", "));
     }
 }
 
-async fn download_model(name: &str, dest: &PathBuf, files: &[(&str, &str)]) -> Result<()> {
-    println!("Downloading {} ...", bold(name));
+/// Download an archive and extract to dest.
+///
+/// Reuses the streaming download + extract logic from `cmd/tools.rs`.
+async fn download_archive(label: &str, dest: &std::path::Path, url: &str) -> Result<()> {
+    println!("Downloading {} ...", bold(label));
+    println!("  {} {}", dim("from:"), dim(url));
     std::fs::create_dir_all(dest)?;
 
     let client = reqwest::Client::new();
-    for (filename, url) in files {
-        let dest_path = dest.join(filename);
-        if dest_path.exists() {
-            println!("  {} {}", dim(filename), dim("(already exists, skipping)"));
-            continue;
-        }
-        print!("  {} ... ", bold(filename));
-        let resp = client.get(*url)
-            .send()
-            .await?
-            .error_for_status()?;
-        let bytes = resp.bytes().await?;
-        std::fs::write(&dest_path, &bytes)?;
-        println!("{}MB", bytes.len() / 1_000_000);
-    }
+    super::tools::download_and_extract_public(&client, url, dest).await?;
 
     println!();
     ok(&format!("model saved to {}", dest.display()));

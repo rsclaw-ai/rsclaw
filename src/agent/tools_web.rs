@@ -53,13 +53,16 @@ impl AgentRuntime {
             // All general — fall through to normal search below.
         }
 
-        // Read config
-        let ws_cfg = self
-            .config
+        // Read config (snapshot owned to avoid holding the live read lock).
+        let ws_cfg_owned = self
+            .live
             .ext
+            .read()
+            .await
             .tools
             .as_ref()
-            .and_then(|t| t.web_search.as_ref());
+            .and_then(|t| t.web_search.clone());
+        let ws_cfg = ws_cfg_owned.as_ref();
         let limit = args["limit"]
             .as_u64()
             .unwrap_or_else(|| ws_cfg.and_then(|c| c.max_results).unwrap_or(5) as u64)
@@ -621,12 +624,13 @@ impl AgentRuntime {
             .ok_or_else(|| anyhow!("web_fetch: `url` required"))?;
         let prompt = args.get("prompt").and_then(|v| v.as_str());
 
-        let max_length = self.config.ext.tools.as_ref()
-            .and_then(|t| t.web_fetch.as_ref())
+        let wf_cfg = self.live.ext.read().await
+            .tools.as_ref()
+            .and_then(|t| t.web_fetch.clone());
+        let max_length = wf_cfg.as_ref()
             .and_then(|f| f.max_length)
             .unwrap_or(100_000);
-        let user_agent = self.config.ext.tools.as_ref()
-            .and_then(|t| t.web_fetch.as_ref())
+        let user_agent = wf_cfg.as_ref()
             .and_then(|f| f.user_agent.clone())
             .unwrap_or_else(|| "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
                 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".to_owned());
@@ -897,7 +901,8 @@ impl AgentRuntime {
     /// If summaryModel is configured and a prompt is provided, summarize
     /// the content with a secondary model. Otherwise return content as-is.
     pub(crate) async fn maybe_summarize(&self, content: &str, prompt: Option<&str>) -> String {
-        let summary_model = self.config.ext.tools.as_ref()
+        let summary_model = self.live.ext.read().await
+            .tools.as_ref()
             .and_then(|t| t.web_fetch.as_ref())
             .and_then(|f| f.summary_model.clone());
 
@@ -1393,8 +1398,12 @@ impl AgentRuntime {
 
             // Determine headed mode: per-request `headed` param overrides config.
             // Task agents (non-main) always use headless to save resources.
-            let wb_cfg = self.config.ext.tools.as_ref()
-                .and_then(|t| t.web_browser.as_ref());
+            // Snapshot owned so the live read lock is released before entering
+            // any awaits below.
+            let wb_cfg_owned = self.live.ext.read().await
+                .tools.as_ref()
+                .and_then(|t| t.web_browser.clone());
+            let wb_cfg = wb_cfg_owned.as_ref();
             info!(
                 tools_present = self.config.ext.tools.is_some(),
                 web_browser_present = wb_cfg.is_some(),
@@ -1407,9 +1416,11 @@ impl AgentRuntime {
             let headed = request_headed.unwrap_or(config_headed);
             let profile = wb_cfg.and_then(|b| b.profile.clone());
 
-            // If headed mode changed, restart the session.
+            // If headed mode no longer matches the active session, restart it.
+            // This covers both per-request overrides and config-driven changes
+            // (e.g. tools.webBrowser.headed flipped via hot-reload).
             if let Some(ref session) = *guard {
-                if request_headed.is_some() && session.headed != headed {
+                if session.headed != headed {
                     info!(headed, "browser headed mode changed, restarting session");
                     *guard = None;
                 }
@@ -1861,9 +1872,8 @@ async fn fetch_stock_sina(client: &reqwest::Client, query: &str) -> (&'static st
             let parts: Vec<&str> = s.split(',').collect();
             if parts.len() >= 4 {
                 // parts[3] is market+code like "11" for Shanghai
-                let market = parts[1]; // e.g. "51" -> need to map
-                let _code = parts[0]; // not useful directly
-                // Easier: use parts[3] which contains code like "sh600519"
+                // parts[3] already contains a usable code like "sh600519",
+                // so we skip parts[0] (raw code) and parts[1] (market id).
                 Some(parts[3].to_owned())
             } else {
                 None
