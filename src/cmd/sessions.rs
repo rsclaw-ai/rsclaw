@@ -17,10 +17,27 @@ fn gateway_url() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// Resolve auth token from config.
+fn gateway_token() -> String {
+    let base = crate::config::loader::base_dir();
+    let config_path = base.join("rsclaw.json5");
+    crate::config::loader::load_json5(&config_path)
+        .ok()
+        .and_then(|c| c.gateway.as_ref()?.auth.as_ref()?.token.as_ref()?.as_plain().map(str::to_owned))
+        .or_else(|| std::env::var("RSCLAW_AUTH_TOKEN").ok())
+        .unwrap_or_default()
+}
+
 /// GET a JSON endpoint from the running gateway.
 async fn api_get(path: &str) -> Result<serde_json::Value> {
     let url = format!("{}/api/v1{path}", gateway_url());
-    let resp = reqwest::get(&url).await
+    let token = gateway_token();
+    let client = reqwest::Client::new();
+    let mut req = client.get(&url);
+    if !token.is_empty() {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    let resp = req.send().await
         .map_err(|e| anyhow::anyhow!("gateway not reachable ({url}): {e}"))?;
     if !resp.status().is_success() {
         bail!("gateway returned {}: {}", resp.status(), resp.text().await.unwrap_or_default());
