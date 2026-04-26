@@ -4,22 +4,45 @@ interface host-browser {
     browser-open: func(url: string) -> result<string, string>;
     browser-snapshot: func() -> result<string, string>;
     browser-click: func(ref-str: string) -> result<string, string>;
-    browser-click-at: func(x: u32, y: u32) -> result<string, string>;
     browser-fill: func(ref-str: string, text: string) -> result<string, string>;
     browser-press: func(key: string) -> result<string, string>;
-    browser-scroll: func(direction: string, amount: u32) -> result<string, string>;
     browser-eval: func(code: string) -> result<string, string>;
     browser-wait-text: func(text: string, timeout-ms: u32) -> result<string, string>;
     browser-screenshot: func() -> result<string, string>;
     browser-download: func(ref-str: string, filename: string) -> result<string, string>;
     browser-upload: func(ref-str: string, filepath: string) -> result<string, string>;
     browser-get-url: func() -> result<string, string>;
+
+    /// Wait for an element matching `css-selector` to be present in the DOM.
+    /// Polls every 250ms via JS until match or timeout. Returns "ok" on
+    /// match, error on timeout. Use `browser-snapshot` afterwards if you
+    /// need a clickable ref.
+    wait-for-selector: func(css-selector: string, timeout-ms: u32) -> result<string, string>;
+
+    /// Wait until network requests have been quiet for ~500ms, or until
+    /// `timeout-ms` total. Returns "ok" or error on timeout.
+    wait-for-network-idle: func(timeout-ms: u32) -> result<string, string>;
+
+    /// Run a JavaScript function expression with structured arguments.
+    /// `code` MUST evaluate to a function (e.g. `"async (args) => { ... }"`
+    /// or `"function(args) { ... }"`). `args-json` is parsed and passed as
+    /// the function's first argument. The function's return value is
+    /// JSON-stringified and returned. Avoids the brittle string-interpolation
+    /// and manual escaping that `browser-eval` requires.
+    eval-with-args: func(code: string, args-json: string) -> result<string, string>;
+
+    /// Switch the active browser tab to the most recently opened one.
+    /// Useful when an action opens a popup window. Replaces the
+    /// `browser-eval("__switch_latest_tab")` magic-string convention.
+    switch-latest-tab: func() -> result<string, string>;
 }
 
 interface host-runtime {
     log: func(level: string, msg: string);
     sleep: func(ms: u32);
     read-file: func(path: string) -> result<string, string>;
+    /// Send a progress/notification message to the user during long operations.
+    notify: func(message: string) -> result<string, string>;
 }
 
 interface host-storage {
@@ -32,7 +55,6 @@ interface host-storage {
 }
 
 interface plugin-api {
-    get-manifest: func() -> string;
     handle-tool: func(tool-name: string, args-json: string) -> result<string, string>;
 }
 

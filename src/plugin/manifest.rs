@@ -76,6 +76,11 @@ pub struct PluginManifest {
     /// Additional tool definitions exposed by this plugin.
     #[serde(default)]
     pub tools: Vec<PluginToolDef>,
+    /// Minimum interval between tool calls in milliseconds. The host enforces
+    /// this for wasm plugins (replaces the old plugin-side `host::sleep` at
+    /// the top of every dispatch). Default: 0 (no throttling).
+    #[serde(default)]
+    pub min_call_interval_ms: u32,
     /// Minimum rsclaw version required.
     pub requires_rsclaw: Option<String>,
     /// Arbitrary extra fields for future compatibility.

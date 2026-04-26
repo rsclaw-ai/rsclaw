@@ -118,7 +118,20 @@ pub async fn load_all_plugins(
     let wasm_engine = if manifests.iter().any(|m| m.is_wasm()) {
         let mut wasm_config = wasmtime::Config::new();
         wasm_config.async_support(true);
-        Some(wasmtime::Engine::new(&wasm_config)?)
+        // Enable epoch interruption so we can bound wasm-CPU time per call
+        // (caps runaway loops without affecting awaits on host async calls).
+        wasm_config.epoch_interruption(true);
+        let engine = wasmtime::Engine::new(&wasm_config)?;
+        // Tick the engine at 100ms; per-call deadline is set in wasm_runtime.
+        let tick_engine = engine.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
+            loop {
+                ticker.tick().await;
+                tick_engine.increment_epoch();
+            }
+        });
+        Some(engine)
     } else {
         None
     };
