@@ -709,6 +709,20 @@ impl BrowserSession {
         cdp.send("DOM.enable", json!({})).await?;
         cdp.send("Runtime.enable", json!({})).await?;
         cdp.send("Network.enable", json!({})).await?;
+        // Pretend to be Safari on macOS for the whole browser session.
+        // Some jimeng/dreamina endpoints special-case Chrome (block, throttle,
+        // or vary response shape); Safari is what the user's normal browser
+        // would send and matches the UA our server-side reqwest uses for
+        // CDN downloads, so cookies + UA stay consistent end-to-end.
+        let _ = cdp
+            .send(
+                "Network.setUserAgentOverride",
+                json!({
+                    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
+                    "platform": "MacIntel",
+                }),
+            )
+            .await;
         cdp.send("Target.setDiscoverTargets", json!({"discover": true})).await?;
 
         let now = std::time::SystemTime::now()
@@ -774,6 +788,20 @@ impl BrowserSession {
         cdp.send("DOM.enable", json!({})).await?;
         cdp.send("Runtime.enable", json!({})).await?;
         cdp.send("Network.enable", json!({})).await?;
+        // Pretend to be Safari on macOS for the whole browser session.
+        // Some jimeng/dreamina endpoints special-case Chrome (block, throttle,
+        // or vary response shape); Safari is what the user's normal browser
+        // would send and matches the UA our server-side reqwest uses for
+        // CDN downloads, so cookies + UA stay consistent end-to-end.
+        let _ = cdp
+            .send(
+                "Network.setUserAgentOverride",
+                json!({
+                    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
+                    "platform": "MacIntel",
+                }),
+            )
+            .await;
         cdp.send("Target.setDiscoverTargets", json!({"discover": true})).await?;
 
         Ok(cdp)
@@ -1872,9 +1900,14 @@ impl BrowserSession {
         std::fs::write(&dest, &bytes)
             .map_err(|e| anyhow!("download(url): write: {e}"))?;
 
+        // NOTE: do not include a top-level "url" field here — wasm_runtime's
+        // browser_action extractor checks fields in order ["text", "image",
+        // "data", "url", "result"] and picks the first string match. A "url"
+        // field would shadow "result" and the plugin would receive the
+        // *source* URL rather than the local file path.
         Ok(json!({
             "action": "download",
-            "url": url,
+            "source": url,
             "path": dest_path,
             "bytes": bytes.len(),
             "result": dest_path,
