@@ -24,7 +24,7 @@ pub(crate) fn start_zalo_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
-    _channel_senders: Arc<
+    channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
     task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
@@ -90,6 +90,14 @@ pub(crate) fn start_zalo_if_configured(
         let reg = Arc::clone(&registry);
         let cfg_arc = Arc::new(config.clone());
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
+
+        // Register Zalo channel sender for notification routing.
+        {
+            let mut senders = channel_senders.write().expect("channel_senders lock poisoned");
+            senders.insert("zalo".to_string(), out_tx.clone());
+            senders.insert(format!("zalo/{}", acct_name), out_tx.clone());
+        }
+
         let tq = Arc::clone(&task_queue);
 
         // Per-user inbound queue for Zalo.

@@ -101,6 +101,7 @@ pub(crate) fn start_whatsapp_if_configured(
         // Register WhatsApp channel sender for notification routing.
         {
             let mut senders = channel_senders.write().expect("channel_senders lock poisoned");
+            senders.insert("whatsapp".to_string(), out_tx.clone());
             senders.insert(format!("whatsapp/{}", acct_name), out_tx.clone());
         }
 

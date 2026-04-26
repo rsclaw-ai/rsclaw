@@ -99,6 +99,7 @@ pub(crate) fn start_discord_if_configured(
         // Register Discord channel sender for notification routing.
         {
             let mut senders = channel_senders.write().expect("channel_senders lock poisoned");
+            senders.insert("discord".to_string(), out_tx.clone());
             senders.insert(format!("discord/{}", acct_name), out_tx.clone());
         }
 

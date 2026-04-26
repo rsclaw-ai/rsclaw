@@ -261,8 +261,10 @@ pub(crate) fn start_channels(
             let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
             // Register Telegram channel sender for notification routing.
+            // Both bare "telegram" (for task queue routing) and "telegram/{account}" (multi-account).
             {
                 let mut senders = channel_senders.write().expect("channel_senders lock poisoned");
+                senders.insert("telegram".to_string(), out_tx.clone());
                 senders.insert(format!("telegram/{}", acct_name), out_tx.clone());
             }
 

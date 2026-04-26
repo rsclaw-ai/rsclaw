@@ -24,7 +24,7 @@ pub(crate) fn start_wecom_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
-    _channel_senders: Arc<
+    channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
     task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
@@ -103,6 +103,13 @@ pub(crate) fn start_wecom_if_configured(
         let cfg_arc = Arc::new(config.clone());
         let tq = Arc::clone(&task_queue);
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
+
+        // Register WeCom channel sender for notification routing.
+        {
+            let mut senders = channel_senders.write().expect("channel_senders lock poisoned");
+            senders.insert("wecom".to_string(), out_tx.clone());
+            senders.insert(format!("wecom/{}", acct_name), out_tx.clone());
+        }
 
         // Per-user inbound queue for WeCom.
         type WcItem = (

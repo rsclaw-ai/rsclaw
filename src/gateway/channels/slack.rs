@@ -120,6 +120,7 @@ pub(crate) fn start_slack_if_configured(
         // Register Slack channel sender for notification routing.
         {
             let mut senders = channel_senders.write().expect("channel_senders lock poisoned");
+            senders.insert("slack".to_string(), out_tx.clone());
             senders.insert(format!("slack/{}", acct_name), out_tx.clone());
         }
 
