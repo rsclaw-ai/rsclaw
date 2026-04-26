@@ -2266,9 +2266,11 @@ async fn list_provider_models(Json(req): Json<TestProviderRequest>) -> Response 
 
 /// POST /api/v1/channels/wechat/qr-login
 /// Start WeChat QR login, returns qrcode URL and session token.
+/// Uses the silent variant: the HTTP caller (web UI) renders the QR itself
+/// from `qrcode_url`, so terminal rendering would only be noise.
 async fn wechat_qr_start() -> Response {
     let client = reqwest::Client::new();
-    match crate::channel::wechat::WeChatPersonalChannel::start_qr_login(&client).await {
+    match crate::channel::wechat::WeChatPersonalChannel::start_qr_login_silent(&client).await {
         Ok((qrcode_url, qrcode_token)) => Json(serde_json::json!({
             "qrcode_url": qrcode_url,
             "qrcode_token": qrcode_token,
