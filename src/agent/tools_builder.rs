@@ -646,11 +646,21 @@ pub(crate) fn build_tool_list(
         name: "cron".to_owned(),
         description: "List, add, edit, remove, enable or disable cron jobs.\n\
             Supports recurring (cron expression OR fixed interval) and one-shot (delay_ms) schedules.\n\
-            For one-shot: set delay_ms instead of schedule. Example: delay_ms=1200000 for 20 minutes.\n\
-            For fixed-interval recurring (every N seconds): set every_seconds instead of schedule.\n\
-            Example: every_seconds=2700 fires every 45 minutes (use this for non-standard intervals\n\
-            like 45 min that cannot be expressed as a 5-field cron). If both schedule and\n\
-            every_seconds are given, every_seconds wins.\n\
+            \n\
+            CHOOSING ONE-SHOT vs RECURRING — read carefully, this is the most common mistake:\n\
+              ONE-SHOT (set `delay_ms`):\n\
+                Use when the user names a SPECIFIC time/date that fires ONCE.\n\
+                  - \"22:04截图给我\" / \"晚上 8 点提醒我\" / \"15分钟后\" / \"明天下午3点\"\n\
+                Compute milliseconds from now until the target moment, set delay_ms.\n\
+                Auto-removes after firing — exactly what \"once\" means.\n\
+              RECURRING (set `schedule` cron expr or `every_seconds`):\n\
+                Use ONLY when the user explicitly says repetition: 每天 / 每周 / 每小时 /\n\
+                  every day / every Monday / 每隔 N 分钟 / weekly / hourly.\n\
+              DO NOT pick a daily cron expr like \"4 22 * * *\" when the user asked for ONE\n\
+              specific time today (\"22:04截图发我\"). That creates a job that fires every day\n\
+              at 22:04 forever — the user has to manually delete it. The cron tool DOES NOT\n\
+              auto-collapse \"today only\" intent into one-shot; you must do it.\n\
+            \n\
             One-shot jobs auto-remove after execution.\n\
             For edit/remove/enable/disable, prefer using `index` from the list output instead of `id`.\n\
             \n\

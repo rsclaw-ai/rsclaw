@@ -4279,7 +4279,7 @@ impl AgentRuntime {
                     continue;
                 }
 
-                debug!(tool = %tool_name, "dispatching tool call");
+                info!(tool = %tool_name, "dispatching tool call");
 
                 // Detect consecutive identical tool calls (same name + same args).
                 let call_key = crate::agent::loop_detection::hash_tool_call(&tool_name, &tool_input);
