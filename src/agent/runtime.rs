@@ -1808,7 +1808,7 @@ impl AgentRuntime {
             crate::channel::is_audio_attachment(&f.mime_type, &f.filename)
                 && !crate::channel::is_video_attachment(&f.mime_type, &f.filename)
         });
-        let files = regular_files;
+        let mut files = regular_files;
 
         if !media_files.is_empty() {
             // Auto-enable voice mode when user sends audio (not video).
@@ -2279,21 +2279,10 @@ impl AgentRuntime {
             }
         }
 
-        // Save NEW images to uploads/images/ (skip @-referenced images already on disk).
-        // Users reference saved images via @filename in subsequent messages.
+        // Convert NEW images to FileAttachments so they go through the
+        // unified pending-file flow (save → menu → user choice).
+        // @-referenced images skip this (already on disk, going to vision).
         if !images.is_empty() && !is_ref_image {
-            let images_dir = self
-                .handle
-                .config
-                .workspace
-                .as_deref()
-                .or(self.live.agents.read().await.defaults.workspace.as_deref())
-                .map(expand_tilde)
-                .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"))
-                .join("uploads/images");
-            let _ = std::fs::create_dir_all(&images_dir);
-
-            let mut saved: Vec<(String, usize)> = Vec::new();
             for img in &images {
                 use base64::Engine;
                 let b64 = img.data
@@ -2303,88 +2292,25 @@ impl AgentRuntime {
                     .or_else(|| img.data.strip_prefix("data:image/gif;base64,"))
                     .unwrap_or(&img.data);
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                    let orig_ext = if img.mime_type.contains("jpeg") || img.mime_type.contains("jpg") {
-                        "image.jpg"
+                    let ext = if img.mime_type.contains("jpeg") || img.mime_type.contains("jpg") {
+                        "jpg"
                     } else if img.mime_type.contains("webp") {
-                        "image.webp"
+                        "webp"
                     } else if img.mime_type.contains("gif") {
-                        "image.gif"
+                        "gif"
                     } else {
-                        "image.png"
+                        "png"
                     };
-                    let filename = crate::channel::upload_filename(&img.mime_type, orig_ext);
-                    let dest = images_dir.join(&filename);
-                    let size = bytes.len();
-                    if std::fs::write(&dest, &bytes).is_ok() {
-                        info!(path = %dest.display(), size, "image saved to uploads");
-                        saved.push((filename, size));
-                    }
+                    let mime = if img.mime_type.is_empty() { format!("image/{ext}") } else { img.mime_type.clone() };
+                    files.push(super::registry::FileAttachment {
+                        filename: format!("image.{ext}"),
+                        data: bytes,
+                        mime_type: mime,
+                    });
                 }
             }
-
-            if !saved.is_empty() {
-                let i18n_lang = crate::i18n::default_lang();
-                let file_list: String = saved
-                    .iter()
-                    .map(|(name, size)| {
-                        let size_str = if *size > 1_000_000 {
-                            format!("{:.1} MB", *size as f64 / 1_000_000.0)
-                        } else {
-                            format!("{:.1} KB", *size as f64 / 1_000.0)
-                        };
-                        format!("- @{name} ({size_str})")
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let ref_hint = saved
-                    .iter()
-                    .map(|(n, _)| format!("@{n}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let menu = if i18n_lang == "zh" {
-                    format!(
-                        "已保存 {} 张图片:\n{file_list}\n引用: {ref_hint}\n\n1. 分析图片\n2. 仅保留\n3. 删除",
-                        saved.len()
-                    )
-                } else {
-                    format!(
-                        "{} image(s) saved:\n{file_list}\nRef: {ref_hint}\n\n1. Analyze\n2. Keep\n3. Delete",
-                        saved.len()
-                    )
-                };
-
-                // If user also sent text, process it after the save notification.
-                if !text.is_empty() {
-                    let enriched = format!("{text}\n\n[uploaded images: {ref_hint}]");
-                    self.sessions
-                        .entry(session_key.to_owned())
-                        .or_default()
-                        .push(Message {
-                            role: Role::Assistant,
-                            content: MessageContent::Text(menu.clone()),
-                        });
-                    return Box::pin(self.run_turn(
-                        session_key,
-                        &enriched,
-                        channel,
-                        peer_id,
-                        extra_tools,
-                        vec![],
-                        files,
-                    ))
-                    .await;
-                }
-
-                return Ok(AgentReply {
-                    text: menu,
-                    is_empty: false,
-                    tool_calls: None,
-                    images: vec![],
-                    files: vec![],
-                    pending_analysis: None,
-                    was_preparse: false,
-                });
-            }
+            // Clear images — they're now in files and will go through pending-file.
+            images = vec![];
         }
 
         // Build the persisted message: user text + media descriptions (text only).
