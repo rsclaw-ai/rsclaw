@@ -512,6 +512,80 @@ impl RedbStore {
         Ok(result)
     }
 
+    /// Crash-recovery sweep: any task left in `Running` from a previous
+    /// process is moved back to `Pending` so the worker picks it up. Returns
+    /// the count of tasks revived. Does NOT increment retries — the previous
+    /// process simply died, the agent itself didn't fail.
+    pub fn requeue_running_tasks(&self) -> Result<usize> {
+        use crate::gateway::task_queue::TaskStatus;
+
+        let write = self.db.begin_write()?;
+        let count = {
+            let mut table = write.open_table(TASK_QUEUE)?;
+            let mut to_revive = Vec::new();
+            for entry in table.iter()? {
+                let (_k, v) = entry?;
+                let task: crate::gateway::task_queue::QueuedTask =
+                    serde_json::from_str(v.value())?;
+                if task.status == TaskStatus::Running {
+                    to_revive.push(task);
+                }
+            }
+            let count = to_revive.len();
+            for mut task in to_revive {
+                task.status = TaskStatus::Pending;
+                task.updated_at = chrono::Utc::now().timestamp();
+                let json = serde_json::to_string(&task)?;
+                table.insert(task.id.as_str(), json.as_str())?;
+            }
+            count
+        };
+        write.commit()?;
+        Ok(count)
+    }
+
+    /// Persist the most recent agent reply on a task so reconnect-replay
+    /// can re-deliver the answer without consulting the chat-history index.
+    pub fn update_task_last_reply(&self, task_id: &str, text: &str) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(TASK_QUEUE)?;
+            let guard = table
+                .get(task_id)?
+                .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+            let mut task: crate::gateway::task_queue::QueuedTask =
+                serde_json::from_str(guard.value())?;
+            drop(guard);
+            task.last_reply = Some(text.to_owned());
+            task.updated_at = chrono::Utc::now().timestamp();
+            let json = serde_json::to_string(&task)?;
+            table.insert(task_id, json.as_str())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Mark a task's final reply as delivered so reconnect-replay won't
+    /// re-send it.
+    pub fn mark_task_notified(&self, task_id: &str) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(TASK_QUEUE)?;
+            let guard = table
+                .get(task_id)?
+                .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+            let mut task: crate::gateway::task_queue::QueuedTask =
+                serde_json::from_str(guard.value())?;
+            drop(guard);
+            task.notified = true;
+            task.updated_at = chrono::Utc::now().timestamp();
+            let json = serde_json::to_string(&task)?;
+            table.insert(task_id, json.as_str())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
     /// Update task status.
     pub fn update_task_status(
         &self,

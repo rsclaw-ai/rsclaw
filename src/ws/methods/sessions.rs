@@ -232,6 +232,40 @@ pub async fn sessions_messages_subscribe(ctx: MethodCtx) -> MethodResult {
         .subscribed_sessions
         .insert(key.clone());
 
+    // Reconnect-replay: any task for this session that completed while the
+    // client was offline (Done && !notified) gets re-delivered now and the
+    // notified flag is flipped so we don't double-send on the next subscribe.
+    if let Ok(pending) = ctx.state.store.db.list_tasks(
+        Some(crate::gateway::task_queue::TaskStatus::Done),
+    ) {
+        let event_tx = ctx.conn.read().await.event_tx.clone();
+        for task in pending.into_iter().filter(|t| t.session_key == key && !t.notified) {
+            let Some(content) = task.last_reply.as_deref() else {
+                // No captured reply text — nothing useful to replay.
+                continue;
+            };
+            let seq = ctx.conn.write().await.next_seq();
+            let payload = serde_json::json!({
+                "sessionKey": key,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "done": true,
+                    "replayed": true,
+                    "taskId": task.id,
+                }
+            });
+            let frame = crate::ws::types::EventFrame::new("session.message", payload, seq);
+            let json = serde_json::to_string(&frame).unwrap_or_default();
+            if event_tx.send(json).await.is_err() {
+                break;
+            }
+            if let Err(e) = ctx.state.store.db.mark_task_notified(&task.id) {
+                tracing::warn!(task_id = %task.id, "mark_task_notified failed: {e:#}");
+            }
+        }
+    }
+
     // Spawn a long-lived relay task that forwards events for this session.
     let rx = ctx.state.event_bus.subscribe();
     let event_tx = ctx.conn.read().await.event_tx.clone();

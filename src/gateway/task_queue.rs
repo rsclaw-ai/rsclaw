@@ -113,6 +113,15 @@ pub struct QueuedTask {
     pub content_hash: String,
     /// Last error message, if any.
     pub error: Option<String>,
+    /// Whether the final reply was confirmed delivered to the channel. Used
+    /// by WS reconnect (and any other channel that re-attaches) to replay
+    /// completions that fired while the client was offline.
+    #[serde(default)]
+    pub notified: bool,
+    /// Most recent agent reply text — captured per turn so reconnect-replay
+    /// can re-deliver the answer without consulting the chat-history index.
+    #[serde(default)]
+    pub last_reply: Option<String>,
 }
 
 impl QueuedTask {
@@ -135,6 +144,8 @@ impl QueuedTask {
             ttl_secs: 3600,
             content_hash: hash,
             error: None,
+            notified: false,
+            last_reply: None,
         }
     }
 
@@ -443,6 +454,36 @@ impl TaskQueueManager {
         self.store.update_task_status(task_id, TaskStatus::Done)
     }
 
+    /// Crash-recovery sweep — call once at worker startup. Any task left in
+    /// `Running` from a previous process is moved back to `Pending` so it
+    /// can be re-dispatched.
+    pub fn recover_orphan_tasks(&self) -> Result<usize> {
+        self.store.requeue_running_tasks()
+    }
+
+    /// Mark a task's final reply as delivered (for reconnect-replay tracking).
+    pub fn mark_notified(&self, task_id: &str) -> Result<()> {
+        self.store.mark_task_notified(task_id)
+    }
+
+    /// Persist the most recent agent reply on a task so reconnect-replay
+    /// can re-deliver it.
+    pub fn record_last_reply(&self, task_id: &str, text: &str) -> Result<()> {
+        self.store.update_task_last_reply(task_id, text)
+    }
+
+    /// List Done tasks for a session whose final reply has not yet been
+    /// confirmed delivered. Used by WS subscribe to replay completions that
+    /// fired while the client was offline.
+    pub fn list_pending_notifications(
+        &self,
+        session_key: &str,
+    ) -> Result<Vec<QueuedTask>> {
+        let mut all = self.store.list_tasks(Some(TaskStatus::Done))?;
+        all.retain(|t| t.session_key == session_key && !t.notified);
+        Ok(all)
+    }
+
     /// Mark a task as failed. Auto-retries up to `max_retries`; beyond that
     /// the task moves to `Dead` status.
     pub fn fail(&self, task_id: &str, _error: &str, max_retries: u32) -> Result<TaskStatus> {
@@ -728,6 +769,11 @@ impl TaskQueueWorker {
     /// crash-recovered tasks).
     pub async fn run(self: Arc<Self>) {
         info!("task queue worker started");
+        match self.manager.recover_orphan_tasks() {
+            Ok(0) => {}
+            Ok(n) => info!(count = n, "task queue worker: revived orphan Running tasks → Pending"),
+            Err(e) => error!("task queue worker: orphan recovery failed: {e:#}"),
+        }
         loop {
             if self.shutdown.is_draining() {
                 info!("task queue worker: drain signaled, stopping dequeue");
@@ -828,6 +874,10 @@ impl TaskQueueWorker {
         let mut next_text = first_text;
         let mut next_images = first_images;
         let mut next_files = first_files;
+        // Tracks whether the latest reply made it to the channel; consulted
+        // when the loop terminates so we only mark `notified=true` if the
+        // user actually got the final answer.
+        let mut last_send_ok = false;
 
         loop {
             turn += 1;
@@ -885,7 +935,15 @@ impl TaskQueueWorker {
             let pending = reply.pending_analysis;
 
             // Route reply to user (every turn, so they see progress).
-            if !reply.text.is_empty() || !reply.images.is_empty() || !reply.files.is_empty() {
+            let had_reply_payload = !reply.text.is_empty()
+                || !reply.images.is_empty()
+                || !reply.files.is_empty();
+            if !reply.text.is_empty() {
+                if let Err(e) = self.manager.record_last_reply(&task_id, &reply.text) {
+                    tracing::warn!(task_id = %task_id, "record_last_reply failed: {e:#}");
+                }
+            }
+            if had_reply_payload {
                 let out = OutboundMessage {
                     target_id: target.clone(),
                     is_group,
@@ -896,10 +954,15 @@ impl TaskQueueWorker {
                     channel: Some(channel_name.clone()),
                 };
                 if let Some(tx) = self.channel_tx(&channel_name) {
-                    if let Err(e) = tx.send(out).await {
-                        error!(task_id = %task_id, "send reply failed: {e}");
+                    match tx.send(out).await {
+                        Ok(_) => last_send_ok = true,
+                        Err(e) => {
+                            last_send_ok = false;
+                            error!(task_id = %task_id, "send reply failed: {e}");
+                        }
                     }
                 } else {
+                    last_send_ok = false;
                     tracing::warn!(
                         task_id = %task_id,
                         channel = %channel_name,
@@ -931,6 +994,11 @@ impl TaskQueueWorker {
                     if let Err(e) = self.manager.complete(&task_id) {
                         error!(task_id = %task_id, "complete() error: {e:#}");
                     }
+                    if last_send_ok {
+                        if let Err(e) = self.manager.mark_notified(&task_id) {
+                            error!(task_id = %task_id, "mark_notified() error: {e:#}");
+                        }
+                    }
                     cleanup_staged_files(&task);
                     break;
                 }
@@ -942,6 +1010,11 @@ impl TaskQueueWorker {
                         );
                         if let Err(e) = self.manager.complete(&task_id) {
                             error!(task_id = %task_id, "complete() error: {e:#}");
+                        }
+                        if last_send_ok {
+                            if let Err(e) = self.manager.mark_notified(&task_id) {
+                                error!(task_id = %task_id, "mark_notified() error: {e:#}");
+                            }
                         }
                         cleanup_staged_files(&task);
                         break;
