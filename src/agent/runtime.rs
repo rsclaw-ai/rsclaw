@@ -787,6 +787,7 @@ impl AgentRuntime {
         images: Vec<super::registry::ImageAttachment>,
         files: Vec<super::registry::FileAttachment>,
     ) -> Result<AgentReply> {
+        info!(images = images.len(), files = files.len(), text_len = text.len(), "run_turn entry");
         // Resolve @file references (e.g. @i_2604271325ab.png → full path).
         // Image references are auto-loaded as vision attachments.
         let workspace = self
@@ -1810,6 +1811,40 @@ impl AgentRuntime {
         });
         let mut files = regular_files;
 
+        // Convert NEW images to FileAttachments so they go through the
+        // unified pending-file flow (save → menu → user choice).
+        // @-referenced images skip this (already on disk, going to vision).
+        let is_ref_image = !resolved.image_paths.is_empty();
+        if !images.is_empty() && !is_ref_image {
+            for img in &images {
+                use base64::Engine;
+                let b64 = img.data
+                    .strip_prefix("data:image/png;base64,")
+                    .or_else(|| img.data.strip_prefix("data:image/jpeg;base64,"))
+                    .or_else(|| img.data.strip_prefix("data:image/webp;base64,"))
+                    .or_else(|| img.data.strip_prefix("data:image/gif;base64,"))
+                    .unwrap_or(&img.data);
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                    let ext = if img.mime_type.contains("jpeg") || img.mime_type.contains("jpg") {
+                        "jpg"
+                    } else if img.mime_type.contains("webp") {
+                        "webp"
+                    } else if img.mime_type.contains("gif") {
+                        "gif"
+                    } else {
+                        "png"
+                    };
+                    let mime = if img.mime_type.is_empty() { format!("image/{ext}") } else { img.mime_type.clone() };
+                    files.push(super::registry::FileAttachment {
+                        filename: format!("image.{ext}"),
+                        data: bytes,
+                        mime_type: mime,
+                    });
+                }
+            }
+            images = vec![];
+        }
+
         if !media_files.is_empty() {
             // Auto-enable voice mode when user sends audio (not video).
             let has_audio = media_files.iter().any(|f|
@@ -2272,46 +2307,13 @@ impl AgentRuntime {
         let mut vision_images_for_current_turn = Vec::<String>::new(); // base64 URIs for vision model
 
         // @-referenced images go directly to vision (already saved, no re-save).
-        let is_ref_image = !resolved.image_paths.is_empty();
-        if is_ref_image {
+        if !resolved.image_paths.is_empty() {
             for img in &images {
                 vision_images_for_current_turn.push(img.data.clone());
             }
         }
 
-        // Convert NEW images to FileAttachments so they go through the
-        // unified pending-file flow (save → menu → user choice).
-        // @-referenced images skip this (already on disk, going to vision).
-        if !images.is_empty() && !is_ref_image {
-            for img in &images {
-                use base64::Engine;
-                let b64 = img.data
-                    .strip_prefix("data:image/png;base64,")
-                    .or_else(|| img.data.strip_prefix("data:image/jpeg;base64,"))
-                    .or_else(|| img.data.strip_prefix("data:image/webp;base64,"))
-                    .or_else(|| img.data.strip_prefix("data:image/gif;base64,"))
-                    .unwrap_or(&img.data);
-                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                    let ext = if img.mime_type.contains("jpeg") || img.mime_type.contains("jpg") {
-                        "jpg"
-                    } else if img.mime_type.contains("webp") {
-                        "webp"
-                    } else if img.mime_type.contains("gif") {
-                        "gif"
-                    } else {
-                        "png"
-                    };
-                    let mime = if img.mime_type.is_empty() { format!("image/{ext}") } else { img.mime_type.clone() };
-                    files.push(super::registry::FileAttachment {
-                        filename: format!("image.{ext}"),
-                        data: bytes,
-                        mime_type: mime,
-                    });
-                }
-            }
-            // Clear images — they're now in files and will go through pending-file.
-            images = vec![];
-        }
+        // (Image → FileAttachment conversion already done above, before file processing.)
 
         // Build the persisted message: user text + media descriptions (text only).
         let persist_text = if media_descriptions.is_empty() {
