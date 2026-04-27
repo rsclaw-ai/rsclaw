@@ -455,10 +455,25 @@ public class WinScroll {{
                     .ok_or_else(|| anyhow!("computer_use type: `text` required"))?;
                 if is_macos {
                     let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
-                    run_subprocess(
-                        "osascript",
-                        &["-e", &format!("tell application \"System Events\" to keystroke \"{escaped}\"")],
-                    ).await?;
+                    // AppleScript `keystroke` with non-ASCII (CJK / emoji / etc.)
+                    // is unreliable — the active input method swallows or
+                    // mangles the characters, often dropping them or replacing
+                    // with Latin fallback. Route those through the clipboard +
+                    // cmd-V instead, which is layout-independent. Pure ASCII
+                    // still uses keystroke for speed and clipboard-preserving.
+                    if text.is_ascii() {
+                        run_subprocess(
+                            "osascript",
+                            &["-e", &format!("tell application \"System Events\" to keystroke \"{escaped}\"")],
+                        ).await?;
+                    } else {
+                        let script = format!(
+                            "set the clipboard to \"{escaped}\"\n\
+                             delay 0.05\n\
+                             tell application \"System Events\" to keystroke \"v\" using command down"
+                        );
+                        run_subprocess("osascript", &["-e", &script]).await?;
+                    }
                 } else if is_windows {
                     // Escape SendKeys special chars: + ^ % ~ { } ( )
                     // Must handle { } carefully to avoid double-escaping

@@ -148,7 +148,21 @@ impl AgentRuntime {
 
         tracing::info!(cwd = %cwd_str, "OpenCode: using workspace directory");
 
-        let client = crate::acp::client::AcpClient::spawn(&command, &args).await?;
+        // Get init timeout from config (default 600s)
+        let init_timeout_secs = self
+            .handle
+            .config
+            .opencode
+            .as_ref()
+            .and_then(|c| c.init_timeout_seconds);
+
+        let client = crate::acp::client::AcpClient::spawn_with_timeout(
+            &command,
+            &args,
+            Arc::new(crate::acp::client::DefaultAcpHandler),
+            Arc::new(tokio::sync::Mutex::new(crate::acp::notification::NotificationManager::new())),
+            init_timeout_secs,
+        ).await?;
         client
             .initialize("rsclaw", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"))
             .await?;
@@ -695,8 +709,22 @@ impl AgentRuntime {
 
         tracing::info!(cwd = %cwd_str, args = ?args, "Claude Code: using workspace directory");
 
+        // Get init timeout from config (default 600s)
+        let init_timeout_secs = self
+            .handle
+            .config
+            .claudecode
+            .as_ref()
+            .and_then(|c| c.init_timeout_seconds);
+
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let client = crate::acp::client::AcpClient::spawn(&command, &args_ref).await?;
+        let client = crate::acp::client::AcpClient::spawn_with_timeout(
+            &command,
+            &args_ref,
+            Arc::new(crate::acp::client::DefaultAcpHandler),
+            Arc::new(tokio::sync::Mutex::new(crate::acp::notification::NotificationManager::new())),
+            init_timeout_secs,
+        ).await?;
         client
             .initialize("rsclaw", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"))
             .await?;

@@ -21,6 +21,9 @@ use crate::acp::{methods, notification::*, types::*};
 
 pub const ACP_TIMEOUT: Duration = Duration::from_secs(60);
 pub const LONG_TIMEOUT: Duration = Duration::from_secs(300);
+/// Default timeout for initialization/session creation - these can take longer as the agent
+/// may need to load MCP servers, check environment, etc.
+pub const DEFAULT_INIT_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes
 
 // ---------------------------------------------------------------------------
 // Callback Handlers (Agent → Client)
@@ -538,25 +541,36 @@ pub struct AcpClient {
     collected_content: Arc<Mutex<String>>,
     event_tx: broadcast::Sender<SessionEvent>,
     notification_manager: Arc<Mutex<NotificationManager>>,
+    /// Timeout for initialization and session creation operations.
+    /// Can be configured via OpenCodeConfig/ClaudeCodeConfig/CodexConfig.
+    init_timeout: Duration,
 }
 
 impl AcpClient {
     pub async fn spawn(command: &str, args: &[&str]) -> Result<Self> {
-        Self::spawn_with_handler(
+        Self::spawn_with_timeout(
             command,
             args,
             Arc::new(DefaultAcpHandler),
             Arc::new(Mutex::new(NotificationManager::new())),
+            None,
         )
         .await
     }
 
-    pub async fn spawn_with_handler(
+    /// Spawn with custom init timeout (seconds).
+    /// If timeout_secs is None, uses DEFAULT_INIT_TIMEOUT (600s).
+    pub async fn spawn_with_timeout(
         command: &str,
         args: &[&str],
         handler: Arc<dyn AcpCallbackHandler>,
         notification_manager: Arc<Mutex<NotificationManager>>,
+        init_timeout_secs: Option<u64>,
     ) -> Result<Self> {
+        let init_timeout = init_timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_INIT_TIMEOUT);
+
         // First, check if the command exists (for better error messages)
         let command_path = which::which(command)
             .map(|p| p.to_string_lossy().to_string())
@@ -628,7 +642,18 @@ impl AcpClient {
             collected_content: collected,
             event_tx,
             notification_manager,
+            init_timeout,
         })
+    }
+
+    /// Legacy spawn_with_handler for backwards compatibility.
+    pub async fn spawn_with_handler(
+        command: &str,
+        args: &[&str],
+        handler: Arc<dyn AcpCallbackHandler>,
+        notification_manager: Arc<Mutex<NotificationManager>>,
+    ) -> Result<Self> {
+        Self::spawn_with_timeout(command, args, handler, notification_manager, None).await
     }
 
     /// Subscribe to session update events
@@ -742,7 +767,8 @@ impl AcpClient {
                 "terminal": true
             }
         });
-        let resp = self.rpc(methods::INITIALIZE, params).await?;
+        // Use configurable init_timeout for initialization (can take long to load MCP servers)
+        let resp = self.rpc_with_timeout(methods::INITIALIZE, params, self.init_timeout).await?;
         tracing::debug!(response = ?resp, "ACP initialize response");
         let result = resp
             .get("result")
@@ -784,7 +810,8 @@ impl AcpClient {
             tracing::warn!("create_session: no model provided, will use agent default");
         }
 
-        let resp = self.rpc(methods::SESSION_NEW, params).await?;
+        // Use configurable init_timeout for session creation (can take long to initialize)
+        let resp = self.rpc_with_timeout(methods::SESSION_NEW, params, self.init_timeout).await?;
         tracing::debug!(response = ?resp, "ACP session/new response");
         let result = resp
             .get("result")

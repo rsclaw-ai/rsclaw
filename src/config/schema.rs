@@ -376,6 +376,9 @@ pub struct OpenCodeConfig {
     pub cwd: Option<String>,
     /// Default model ID (e.g., "opencode/big-pickle", "alibaba/qwen3.5-plus")
     pub model: Option<String>,
+    /// Timeout for initialization/session creation in seconds (default: 600).
+    /// OpenCode/ClaudeCode/Codex can take long to initialize as they load MCP servers.
+    pub init_timeout_seconds: Option<u64>,
 }
 
 /// Claude Code ACP configuration for an agent.
@@ -392,6 +395,9 @@ pub struct ClaudeCodeConfig {
     pub cwd: Option<String>,
     /// Claude model ID (e.g., "claude-sonnet-4-6", "claude-opus-4-6")
     pub model: Option<String>,
+    /// Timeout for initialization/session creation in seconds (default: 600).
+    /// OpenCode/ClaudeCode/Codex can take long to initialize as they load MCP servers.
+    pub init_timeout_seconds: Option<u64>,
 }
 
 /// Codex MCP configuration for an agent.
@@ -408,6 +414,9 @@ pub struct CodexConfig {
     pub cwd: Option<String>,
     /// OpenAI model ID (optional, uses Codex default)
     pub model: Option<String>,
+    /// Timeout for initialization/session creation in seconds (default: 600).
+    /// OpenCode/ClaudeCode/Codex can take long to initialize as they load MCP servers.
+    pub init_timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
