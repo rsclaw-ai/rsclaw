@@ -987,7 +987,7 @@ impl AgentRuntime {
                         .and_then(|u| u.max_text_chars)
                         .unwrap_or(DEFAULT_MAX_TEXT_CHARS);
                     let mut analysis_text = String::new();
-                    let mut binary_kept = Vec::new();
+                    let mut binary_kept: Vec<(String, String)> = Vec::new();
                     for pf in &files {
                         if let PendingStage::TokenConfirm {
                             ref extracted_text, ..
@@ -1003,7 +1003,8 @@ impl AgentRuntime {
                             analysis_text
                                 .push_str(&format!("[File: {}]\n{}\n", pf.filename, truncated));
                         } else {
-                            binary_kept.push(pf.filename.clone());
+                            let subdir = crate::channel::upload_subdir(&pf.mime_type, &pf.filename);
+                            binary_kept.push((pf.filename.clone(), subdir.to_string()));
                         }
                         let _ = std::fs::remove_file(&pf.path);
                     }
@@ -1011,7 +1012,13 @@ impl AgentRuntime {
                     if analysis_text.is_empty() {
                         let msg = binary_kept
                             .iter()
-                            .map(|f| format!("- {f} (kept in uploads/)"))
+                            .map(|(name, subdir)| {
+                                if i18n_lang == "zh" {
+                                    format!("- {name} (已保留在 uploads/{subdir}/)")
+                                } else {
+                                    format!("- {name} (kept in uploads/{subdir}/)")
+                                }
+                            })
                             .collect::<Vec<_>>()
                             .join("\n");
                         return Ok(AgentReply {
@@ -2065,7 +2072,11 @@ impl AgentRuntime {
                 crate::i18n::t("file_menu", i18n_lang)
             } else {
                 // Binary only -- simplified menu.
-                "1. Keep\n2. Delete".to_owned()
+                if i18n_lang == "zh" {
+                    "1. 保留\n2. 删除".to_owned()
+                } else {
+                    "1. Keep\n2. Delete".to_owned()
+                }
             };
             let ref_hint = file_info
                 .iter()
