@@ -954,18 +954,7 @@ fn decode_audio_to_pcm_ext(audio_bytes: &[u8], file_ext: Option<&str>) -> Result
 
 /// Resolve ffmpeg binary: ~/.rsclaw/tools/ffmpeg/ first, then system PATH.
 fn which_ffmpeg() -> String {
-    let tools_bin = crate::config::loader::base_dir().join("tools/ffmpeg/ffmpeg");
-    if tools_bin.exists() {
-        return tools_bin.to_string_lossy().to_string();
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let tools_exe = crate::config::loader::base_dir().join("tools/ffmpeg/ffmpeg.exe");
-        if tools_exe.exists() {
-            return tools_exe.to_string_lossy().to_string();
-        }
-    }
-    "ffmpeg".to_owned()
+    crate::agent::platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned())
 }
 
 /// Fallback: use ffmpeg CLI to convert any audio/video to 16kHz mono WAV, then read PCM.

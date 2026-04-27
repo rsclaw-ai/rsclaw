@@ -11,24 +11,35 @@ use super::platform::powershell_hidden;
 use super::runtime::{AgentRuntime, RunContext};
 
 /// Persist generated image bytes to `~/Downloads/rsclaw/images/` with the
-/// standardized `dl_i_<ts><ab>.<ext>` filename and return the absolute path.
-/// Avoids shipping multi-MB base64 over the WebSocket — the desktop UI loads
-/// via Tauri's asset protocol; non-WS channels rehydrate to a data URL at the
-/// AgentReply boundary (`image_ref_to_data_url`).
+/// canonical `dl_i_<YYYYMMDDHHmm><abc>.<ext>` filename and return the
+/// absolute path. Avoids shipping multi-MB base64 over the WebSocket — the
+/// desktop UI loads via Tauri's asset protocol; non-WS channels rehydrate
+/// to a data URL at the AgentReply boundary (`image_ref_to_data_url`).
 async fn save_generated_image_bytes(bytes: &[u8], mime: &str) -> Result<String> {
-    let synthetic_name = match mime {
-        "image/jpeg" | "image/jpg" => "x.jpg",
-        "image/webp" => "x.webp",
-        "image/gif" => "x.gif",
-        _ => "x.png",
+    let ext = match mime {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "png",
     };
-    let subdir = crate::channel::media_subdir(mime, synthetic_name);
-    let filename = crate::channel::download_filename(mime, synthetic_name);
-    let save_dir = crate::channel::downloads_root().join(subdir);
+    let kind = crate::channel::kind_from_extension(ext);
+    let category = crate::channel::category_for_kind(kind);
+    let save_dir = dirs_next::download_dir()
+        .unwrap_or_else(|| {
+            dirs_next::home_dir()
+                .unwrap_or_else(crate::config::loader::base_dir)
+                .join("Downloads")
+        })
+        .join("rsclaw")
+        .join(category);
     tokio::fs::create_dir_all(&save_dir)
         .await
         .map_err(|e| anyhow!("image: create_dir: {e}"))?;
-    let save_path = save_dir.join(filename);
+    let ts = chrono::Local::now().format("%Y%m%d%H%M").to_string();
+    let abc: String = (0..3)
+        .map(|_| (rand::random::<u8>() % 26 + b'a') as char)
+        .collect();
+    let save_path = save_dir.join(format!("dl_{kind}_{ts}{abc}.{ext}"));
     tokio::fs::write(&save_path, bytes)
         .await
         .map_err(|e| anyhow!("image: write: {e}"))?;
@@ -743,7 +754,8 @@ impl AgentRuntime {
                 return Err(anyhow!("tts: say failed: {stderr}"));
             }
             // Convert aiff to mp3 via ffmpeg (required for feishu/weixin/etc.)
-            let ffmpeg = tokio::process::Command::new("ffmpeg")
+            let ffmpeg_bin = crate::agent::platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
+            let ffmpeg = tokio::process::Command::new(&ffmpeg_bin)
                 .args(["-i", &aiff_str, "-y", "-q:a", "4", &out_path_str])
                 .output()
                 .await;
@@ -1229,8 +1241,7 @@ $synth.Speak('{}')
         let verified = if output.status.success() {
             match name {
                 "chrome" => super::platform::detect_chrome().is_some(),
-                "ffmpeg" => which::which("ffmpeg").is_ok()
-                    || crate::config::loader::base_dir().join("tools/ffmpeg/ffmpeg").exists(),
+                "ffmpeg" => super::platform::detect_ffmpeg().is_some(),
                 "node" => which::which("node").is_ok()
                     || crate::config::loader::base_dir().join("tools/node/bin/node").exists(),
                 "python" => which::which("python3").is_ok()

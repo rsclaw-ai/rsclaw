@@ -348,11 +348,13 @@ impl Drop for ChromeProcess {
 }
 
 /// Parse the port number from a Chrome DevTools WebSocket URL.
-/// Expects format: `ws://127.0.0.1:PORT/devtools/...`
+/// Accepts either `ws://127.0.0.1:PORT/devtools/...` or
+/// `ws://localhost:PORT/devtools/...` — chrome uses `localhost` when
+/// reusing an already-running browser via /json/version.
 fn parse_port_from_ws_url(url: &str) -> Result<u16> {
-    let after_host = url
-        .find("127.0.0.1:")
-        .map(|i| i + "127.0.0.1:".len())
+    let after_host = ["127.0.0.1:", "localhost:"]
+        .iter()
+        .find_map(|host| url.find(host).map(|i| i + host.len()))
         .ok_or_else(|| anyhow!("cannot parse port from ws URL: {url}"))?;
     let end = url[after_host..]
         .find('/')
@@ -3870,9 +3872,32 @@ const SNAPSHOT_INTERACTIVE_JS: &str = r#"(function(){
 
 #[cfg(test)]
 mod tests {
-    use super::detect_existing_chrome;
+    use super::{detect_existing_chrome, parse_port_from_ws_url};
     use serde_json::json;
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    #[test]
+    fn parse_port_from_ws_url_127() {
+        let p = parse_port_from_ws_url("ws://127.0.0.1:9222/devtools/browser/abc").unwrap();
+        assert_eq!(p, 9222);
+    }
+
+    #[test]
+    fn parse_port_from_ws_url_localhost() {
+        let p = parse_port_from_ws_url("ws://localhost:56346/devtools/browser/xyz").unwrap();
+        assert_eq!(p, 56346);
+    }
+
+    #[test]
+    fn parse_port_from_ws_url_unknown_host_errors() {
+        assert!(parse_port_from_ws_url("ws://example.com:80/devtools/browser/x").is_err());
+    }
+
+    #[test]
+    fn parse_port_from_ws_url_no_path_terminator() {
+        let p = parse_port_from_ws_url("ws://127.0.0.1:9999").unwrap();
+        assert_eq!(p, 9999);
+    }
 
     #[tokio::test]
     async fn detect_existing_chrome_skips_headless() {

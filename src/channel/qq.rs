@@ -960,7 +960,8 @@ async fn extract_audio_and_transcribe(client: &Client, video_bytes: &[u8]) -> Re
 
     std::fs::write(&video_path, video_bytes)?;
 
-    let status = tokio::process::Command::new("ffmpeg")
+    let ffmpeg_bin = crate::agent::platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
+    let status = tokio::process::Command::new(&ffmpeg_bin)
         .args([
             "-y",
             "-i",
