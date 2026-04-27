@@ -1766,14 +1766,23 @@ async fn run_exec_command(
             .with_context(|| format!("agent not found: {}", job.agent_id))?;
 
         // Create summarize prompt with real output
+        // CRITICAL: Tell the LLM that the output MUST be summarized and returned.
+        // The summary will be sent to the user. Do NOT just call memory tool.
+        // Use "summarize:" prefix to disable all tools (internal channels have memory tool).
         let summarize_prompt = format!(
-            "以下是一个命令执行的真实输出结果，请用简洁的语言总结关键信息（不要编造数据，只总结已有内容）：\n\n```\n{}\n```",
+            "【定时任务执行结果】\n\
+            以下是一个脚本执行的真实输出，脚本返回了内容。\n\
+            你必须：\n\
+            1. 用简洁的语言总结关键信息（不要编造数据，只总结已有内容）\n\
+            2. 直接返回摘要文本给用户\n\
+            3. 不要返回 HEARTBEAT_OK\n\n\
+            输出内容：\n```\n{}\n```",
             raw_output
         );
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let msg = AgentMessage {
-            session_key: format!("{}:summarize", session_key), // Use separate session to avoid pollution
+            session_key: format!("summarize:{}", job.id), // Use "summarize:" prefix to disable ALL tools
             text: summarize_prompt,
             channel: "cron".to_string(),
             peer_id: format!("cron:{}", job.id),
@@ -1787,8 +1796,8 @@ async fn run_exec_command(
         handle.tx.send(msg).await.context("agent inbox closed")?;
 
         // Wait for summary with timeout. If timeout or error, fallback to raw output.
-        // This prevents cron failure when agent is busy with other tasks.
-        let summary_timeout = Duration::from_secs(60);
+        // Use 120s timeout - agent may be processing other tasks and summarize needs time.
+        let summary_timeout = Duration::from_secs(120);
         match tokio::time::timeout(summary_timeout, reply_rx).await {
             Ok(Ok(reply)) => {
                 if reply.is_empty {

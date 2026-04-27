@@ -73,10 +73,38 @@ impl AgentRuntime {
         }
 
         // Find opencode executable
-        let command = which::which("opencode")
-            .map(|p| p.to_string_lossy().to_string())
-            .or_else(|_| std::env::var("OPENCODE_PATH"))
-            .unwrap_or_else(|_| "opencode".to_string());
+        // On Windows, npm packages have both shell scripts and .cmd wrappers.
+        // Git Bash/MSYS2's which finds the shell script, but it internally calls
+        // node with Unix-style paths like "/d/Program Files/nodejs/node" which
+        // Windows subprocesses cannot understand. Use the .cmd wrapper instead.
+        let command = if cfg!(target_os = "windows") {
+            // On Windows, prefer the .cmd wrapper over the shell script
+            which::which("opencode.cmd")
+                .or_else(|_| which::which("opencode"))
+                .map(|p| {
+                    let path_str = p.to_string_lossy().to_string();
+                    // Convert any remaining MSYS2 paths to Windows native format
+                    if path_str.starts_with('/') {
+                        let parts: Vec<&str> = path_str.splitn(3, '/').collect();
+                        if parts.len() >= 3 && parts[0].is_empty() && parts[1].len() == 1 {
+                            let drive = parts[1].to_uppercase();
+                            let rest = parts[2];
+                            format!("{}:\\{}", drive, rest.replace('/', "\\"))
+                        } else {
+                            path_str
+                        }
+                    } else {
+                        path_str
+                    }
+                })
+                .or_else(|_| std::env::var("OPENCODE_PATH"))
+                .unwrap_or_else(|_| "opencode.cmd".to_string())
+        } else {
+            which::which("opencode")
+                .map(|p| p.to_string_lossy().to_string())
+                .or_else(|_| std::env::var("OPENCODE_PATH"))
+                .unwrap_or_else(|_| "opencode".to_string())
+        };
 
         // Use "acp" subcommand to start ACP protocol mode
         let args: Vec<&str> = vec!["acp"];
@@ -92,11 +120,18 @@ impl AgentRuntime {
             .as_deref()
             .or(self.config.agents.defaults.workspace.as_deref())
             .map(expand_tilde)
-            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"))
-            .to_string_lossy()
-            .to_string();
+            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+        // Convert to Windows native path string (avoid MSYS2/Git Bash Unix-style paths)
+        let cwd_str = if cfg!(target_os = "windows") {
+            // Use canonicalize to get Windows-native absolute path
+            cwd.canonicalize()
+                .map(|c| c.to_string_lossy().to_string())
+                .unwrap_or_else(|_| cwd.to_string_lossy().to_string())
+        } else {
+            cwd.to_string_lossy().to_string()
+        };
 
-        tracing::info!(cwd = %cwd, "OpenCode: using workspace directory");
+        tracing::info!(cwd = %cwd_str, "OpenCode: using workspace directory");
 
         let client = crate::acp::client::AcpClient::spawn(&command, &args).await?;
         client
@@ -111,7 +146,7 @@ impl AgentRuntime {
             .as_ref()
             .and_then(|c| c.model.clone())
             .or_else(|| std::env::var("OPENCODE_MODEL").ok());
-        let session_resp = client.create_session(&cwd, model.as_deref(), None).await?;
+        let session_resp = client.create_session(&cwd_str, model.as_deref(), None).await?;
 
         tracing::info!(
             session_id = %session_resp.session_id,
@@ -566,7 +601,15 @@ impl AgentRuntime {
             match js_path {
                 Some(p) if p.exists() => {
                     // .js files need to be run with node
-                    ("node".to_string(), vec![p.to_string_lossy().to_string()])
+                    // Convert path to Windows native format (avoid MSYS2/Git Bash paths)
+                    let path_str = if cfg!(target_os = "windows") {
+                        p.canonicalize()
+                            .map(|c| c.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| p.to_string_lossy().to_string())
+                    } else {
+                        p.to_string_lossy().to_string()
+                    };
+                    ("node".to_string(), vec![path_str])
                 }
                 _ => {
                     // Fallback - let spawn handle the error
@@ -585,11 +628,17 @@ impl AgentRuntime {
             .as_deref()
             .or(self.config.agents.defaults.workspace.as_deref())
             .map(expand_tilde)
-            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"))
-            .to_string_lossy()
-            .to_string();
+            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+        // Convert to Windows native path string (avoid MSYS2/Git Bash Unix-style paths)
+        let cwd_str = if cfg!(target_os = "windows") {
+            cwd.canonicalize()
+                .map(|c| c.to_string_lossy().to_string())
+                .unwrap_or_else(|_| cwd.to_string_lossy().to_string())
+        } else {
+            cwd.to_string_lossy().to_string()
+        };
 
-        tracing::info!(cwd = %cwd, args = ?args, "Claude Code: using workspace directory");
+        tracing::info!(cwd = %cwd_str, args = ?args, "Claude Code: using workspace directory");
 
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let client = crate::acp::client::AcpClient::spawn(&command, &args_ref).await?;
@@ -607,7 +656,7 @@ impl AgentRuntime {
             .or_else(|| std::env::var("CLAUDE_MODEL").ok())
             .or_else(|| std::env::var("ANTHROPIC_MODEL").ok());
         eprintln!("[ClaudeCode] model resolution: model={:?}, claudecode_config={:?}", model, self.handle.config.claudecode);
-        let session_resp = client.create_session(&cwd, model.as_deref(), None).await?;
+        let session_resp = client.create_session(&cwd_str, model.as_deref(), None).await?;
 
         tracing::info!(
             session_id = %session_resp.session_id,
@@ -941,15 +990,44 @@ impl AgentRuntime {
         }
 
         // Find codex executable
-        let command = self
-            .handle
-            .config
-            .codex
-            .as_ref()
-            .and_then(|c| c.command.clone())
-            .or_else(|| which::which("codex").map(|p| p.to_string_lossy().to_string()).ok())
-            .or_else(|| std::env::var("CODEX_PATH").ok())
-            .unwrap_or_else(|| "codex".to_string());
+        // On Windows, prefer .cmd wrapper over shell script (same reason as opencode)
+        let command = if cfg!(target_os = "windows") {
+            self.handle
+                .config
+                .codex
+                .as_ref()
+                .and_then(|c| c.command.clone())
+                .or_else(|| {
+                    which::which("codex.cmd")
+                        .or_else(|_| which::which("codex"))
+                        .map(|p| {
+                            let path_str = p.to_string_lossy().to_string();
+                            if path_str.starts_with('/') {
+                                let parts: Vec<&str> = path_str.splitn(3, '/').collect();
+                                if parts.len() >= 3 && parts[0].is_empty() && parts[1].len() == 1 {
+                                    let drive = parts[1].to_uppercase();
+                                    let rest = parts[2];
+                                    format!("{}:\\{}", drive, rest.replace('/', "\\"))
+                                } else {
+                                    path_str
+                                }
+                            } else {
+                                path_str
+                            }
+                        }).ok()
+                })
+                .or_else(|| std::env::var("CODEX_PATH").ok())
+                .unwrap_or_else(|| "codex.cmd".to_string())
+        } else {
+            self.handle
+                .config
+                .codex
+                .as_ref()
+                .and_then(|c| c.command.clone())
+                .or_else(|| which::which("codex").map(|p| p.to_string_lossy().to_string()).ok())
+                .or_else(|| std::env::var("CODEX_PATH").ok())
+                .unwrap_or_else(|| "codex".to_string())
+        };
 
         // Use agent's workspace directory
         let cwd = self

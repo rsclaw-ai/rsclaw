@@ -2200,6 +2200,11 @@ impl AgentRuntime {
                 all.retain(|t| INTERNAL_ALLOWED.contains(&t.name.as_str()));
             }
 
+            // Summarize sessions: no tools allowed, LLM must return text directly
+            if session_key.starts_with("summarize:") {
+                all.clear();
+            }
+
             // Channel-specific tool filtering: only keep the *_actions tool
             // that matches the current channel, strip all others (~500 tokens
             // saved per call).
@@ -3164,6 +3169,9 @@ impl AgentRuntime {
         let mut last_tool_key = String::new();
         let mut same_call_streak: usize = 0;
         const MAX_SAME_CALL_STREAK: usize = 5;
+        // Track consecutive tool errors - stop early when tools keep failing.
+        let mut error_streak: usize = 0;
+        const MAX_ERROR_STREAK: usize = 2;
         let mut max_iterations = BASE_ITERATIONS;
         let mut iteration = 0usize;
 
@@ -3255,6 +3263,24 @@ impl AgentRuntime {
                     tool_calls: None,
                     images: vec![],
                     files: vec![],
+                    pending_analysis: None,
+                    was_preparse: false,
+                });
+            }
+            // Check consecutive tool errors - stop early when tools keep failing.
+            if error_streak >= MAX_ERROR_STREAK {
+                warn!(
+                    session = %ctx.session_key,
+                    error_streak,
+                    "agent_loop: consecutive tool errors, breaking loop"
+                );
+                // Return last error to user instead of continuing to retry
+                return Ok(AgentReply {
+                    text: crate::i18n::t("agent_tool_errors", crate::i18n::default_lang()).to_owned(),
+                    is_empty: false,
+                    tool_calls: None,
+                    images: vec![],
+                    files: tool_files,
                     pending_analysis: None,
                     was_preparse: false,
                 });
@@ -4314,6 +4340,16 @@ impl AgentRuntime {
                     Ok(v) => {
                         // Reset parse error counter on successful tool execution
                         ctx.parse_error_count = 0;
+                        // Check if result contains an error (exit_code != 0 or error field)
+                        let v_str = v.to_string();
+                        let has_error = v_str.contains("\"exit_code\":")
+                            && v_str.contains("\"exit_code\": 0") == false
+                            || v_str.contains("\"error\"");
+                        if has_error {
+                            error_streak += 1;
+                        } else {
+                            error_streak = 0;
+                        }
                         // Record result for progress-aware loop detection.
                         // Same args + different results = making progress, not a loop.
                         // For exec tool: exclude task_id (uuid changes each call) to properly detect loops.
@@ -4377,6 +4413,8 @@ impl AgentRuntime {
                         }
                     }
                     Err(e) => {
+                        // Increment error streak - stop if too many consecutive failures
+                        error_streak += 1;
                         // Use {:#} (anyhow alternate Display) to include the
                         // full error chain — without this the LLM only sees
                         // the outermost with_context() wrapper and root cause

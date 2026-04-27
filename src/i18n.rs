@@ -2182,6 +2182,13 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "vi" => "Phat hien thao tac lap lai khong tien trien. Thu cach tiep can khac.",
     );
 
+    msg!("agent_tool_errors",
+        "en" => "Tool execution failed multiple times. Please check the command or try a different approach.",
+        "zh" => "工具执行连续失败，请检查命令或尝试其他方法。",
+        "cn" => "工具执行连续失败，请检查命令或尝试其他方法。",
+        "ja" => "ツール実行が複数回失敗しました。コマンドを確認するか、別の方法を試してください。",
+    );
+
     msg!("cron_run_success",
         "en" => "[ok] Scheduled task completed\n\n**Task**: {name}\n**Duration**: {seconds}s",
         "zh" => "[ok] 定时任务执行完成\n\n**任务**: {name}\n**耗时**: {seconds}秒",

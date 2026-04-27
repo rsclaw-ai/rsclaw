@@ -558,9 +558,38 @@ impl AcpClient {
         notification_manager: Arc<Mutex<NotificationManager>>,
     ) -> Result<Self> {
         // First, check if the command exists (for better error messages)
-        let command_path = which::which(command)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| command.to_string());
+        // On Windows, prefer .cmd wrapper over shell script to avoid MSYS2 path issues
+        let command_path = if cfg!(target_os = "windows") {
+            let cmd_with_ext = if command.ends_with(".cmd") || command.ends_with(".exe") || command.ends_with(".bat") {
+                command.to_string()
+            } else {
+                // Try .cmd first, then original name
+                which::which(&format!("{}.cmd", command))
+                    .or_else(|_| which::which(command))
+                    .map(|p| {
+                        let path_str = p.to_string_lossy().to_string();
+                        // Convert MSYS2/Git Bash Unix paths to Windows native format
+                        if path_str.starts_with('/') {
+                            let parts: Vec<&str> = path_str.splitn(3, '/').collect();
+                            if parts.len() >= 3 && parts[0].is_empty() && parts[1].len() == 1 {
+                                let drive = parts[1].to_uppercase();
+                                let rest = parts[2];
+                                format!("{}:\\{}", drive, rest.replace('/', "\\"))
+                            } else {
+                                path_str
+                            }
+                        } else {
+                            path_str
+                        }
+                    })
+                    .unwrap_or_else(|_| command.to_string())
+            };
+            cmd_with_ext
+        } else {
+            which::which(command)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| command.to_string())
+        };
 
         // Try to spawn the process first to catch errors early
         let test_child = std::process::Command::new(&command_path)
