@@ -253,6 +253,55 @@ pub async fn distill_with_llm(
     Ok(output)
 }
 
+/// Validate that an LLM-produced SKILL.md string is well-formed enough to
+/// be loaded by the skill registry.
+///
+/// Crystallization runs the LLM unattended, so a malformed reply (missing
+/// frontmatter, empty fields, plain prose without YAML) would land a broken
+/// skill on disk. This check enforces the minimum the loader needs:
+///
+/// - Starts with a `---` frontmatter fence and has a closing `---`.
+/// - Frontmatter parses as YAML.
+/// - `name:` is present and non-empty.
+/// - `description:` is present and non-empty (skill-creator standard
+///   requires it; an empty one renders the skill invisible to the agent).
+///
+/// Returns the parsed name+description on success so the caller can re-use
+/// them without re-parsing.
+pub fn validate_skill_md(content: &str) -> Result<(String, String)> {
+    let trimmed = content.trim_start();
+    let rest = trimmed
+        .strip_prefix("---\n")
+        .or_else(|| trimmed.strip_prefix("---\r\n"))
+        .ok_or_else(|| anyhow!("SKILL.md must start with '---' frontmatter fence"))?;
+
+    let close_idx = rest
+        .find("\n---")
+        .ok_or_else(|| anyhow!("SKILL.md frontmatter has no closing '---'"))?;
+    let fm = &rest[..close_idx];
+
+    let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(fm)
+        .map_err(|e| anyhow!("SKILL.md frontmatter YAML invalid: {e}"))?;
+
+    let name = parsed
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("SKILL.md frontmatter missing non-empty 'name'"))?
+        .to_owned();
+
+    let description = parsed
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("SKILL.md frontmatter missing non-empty 'description'"))?
+        .to_owned();
+
+    Ok((name, description))
+}
+
 /// Extract a slug from the `name:` field of a SKILL.md YAML frontmatter.
 ///
 /// Walks the leading frontmatter (between `---` delimiters) looking for a
@@ -337,5 +386,53 @@ mod tests {
     fn extract_slug_ignores_name_after_closing_delimiter() {
         let md = "---\ndescription: foo\n---\nname: not-a-real-name\n";
         assert_eq!(extract_skill_slug(md, "real"), "real");
+    }
+
+    #[test]
+    fn validate_accepts_well_formed() {
+        let md = "---\nname: my-skill\ndescription: Does X. Use when Y.\n---\nbody\n";
+        let (n, d) = validate_skill_md(md).expect("should be valid");
+        assert_eq!(n, "my-skill");
+        assert_eq!(d, "Does X. Use when Y.");
+    }
+
+    #[test]
+    fn validate_rejects_no_frontmatter() {
+        assert!(validate_skill_md("just body\n").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_unclosed_frontmatter() {
+        assert!(validate_skill_md("---\nname: foo\n").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_missing_name() {
+        let md = "---\ndescription: foo\n---\nbody";
+        assert!(validate_skill_md(md).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_name() {
+        let md = "---\nname: \"\"\ndescription: foo\n---\nbody";
+        assert!(validate_skill_md(md).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_missing_description() {
+        let md = "---\nname: foo\n---\nbody";
+        assert!(validate_skill_md(md).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_description() {
+        let md = "---\nname: foo\ndescription: \"  \"\n---\nbody";
+        assert!(validate_skill_md(md).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_invalid_yaml() {
+        let md = "---\nname: foo\ndescription: [unclosed\n---\nbody";
+        assert!(validate_skill_md(md).is_err());
     }
 }

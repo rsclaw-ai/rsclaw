@@ -2705,6 +2705,17 @@ impl AgentRuntime {
                             }
                         };
 
+                        // Validate the LLM output before writing. A malformed
+                        // SKILL.md (missing frontmatter, empty name/description)
+                        // would land a broken file that the loader can't use.
+                        // Skip without tagging so a future turn can retry.
+                        if let Err(e) = crate::skill::crystallizer::validate_skill_md(&skill_md) {
+                            tracing::warn!(
+                                "crystallization: invalid SKILL.md output, skipping: {e:#}"
+                            );
+                            continue;
+                        }
+
                         // 4. Derive slug from the SKILL.md frontmatter (or fall back
                         //    to a per-cluster id so different clusters don't collide).
                         let fallback = format!(
