@@ -91,7 +91,7 @@ docx-rs = "0.4"
 genpdf = "0.2"
 pdf-extract = "0.10"
 base64 = "0.22"
-aes = "0.8"
+aes = "0.9"
 urlencoding = "2"
 silk-rs = "0.2"
 symphonia = { version = "0.5", features = ["mp3", "aac", "ogg", "flac", "wav", "pcm", "vorbis", "isomp4", "mkv"] }
