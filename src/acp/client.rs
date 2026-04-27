@@ -1311,9 +1311,35 @@ async fn run_subprocess(
 
     let mut stdin = child.stdin.take().context("Failed to get stdin")?;
     let stdout = child.stdout.take().context("Failed to get stdout")?;
+    let stderr = child.stderr.take().context("Failed to get stderr")?;
     let mut reader = BufReader::new(stdout);
+    let mut stderr_reader = BufReader::new(stderr);
 
     tracing::info!("ACP subprocess started: {} {:?}", command, args);
+
+    // Spawn a task to continuously read stderr
+    let stderr_task = tokio::spawn(async move {
+        let mut stderr_buf = Vec::new();
+        loop {
+            stderr_buf.clear();
+            match stderr_reader.read_until(b'\n', &mut stderr_buf).await {
+                Ok(0) => {
+                    tracing::debug!("ACP stderr EOF");
+                    break;
+                }
+                Ok(_) => {
+                    let stderr_line = String::from_utf8_lossy(&stderr_buf).trim().to_string();
+                    if !stderr_line.is_empty() {
+                        tracing::warn!("ACP stderr: {}", stderr_line);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("ACP stderr read error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
 
     loop {
         tokio::select! {
