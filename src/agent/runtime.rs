@@ -1909,11 +1909,12 @@ impl AgentRuntime {
 
             let mut file_info = Vec::new();
             for file in files {
-                // Route to type-specific subdirectory.
+                // Route to type-specific subdirectory with standardized filename.
                 let subdir = crate::channel::upload_subdir(&file.mime_type, &file.filename);
+                let std_name = crate::channel::upload_filename(&file.mime_type, &file.filename);
                 let target_dir = uploads.join(subdir);
                 let _ = std::fs::create_dir_all(&target_dir);
-                let dest = target_dir.join(&file.filename);
+                let dest = target_dir.join(&std_name);
                 let size = file.data.len();
                 let _ = std::fs::write(&dest, &file.data);
 
@@ -2238,14 +2239,14 @@ impl AgentRuntime {
                     .or_else(|| img.data.strip_prefix("data:image/webp;base64,"))
                     .unwrap_or(&img.data);
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                    let ext = if img.mime_type.contains("jpeg") || img.mime_type.contains("jpg") {
-                        "jpg"
+                    let orig_ext = if img.mime_type.contains("jpeg") || img.mime_type.contains("jpg") {
+                        "image.jpg"
                     } else if img.mime_type.contains("webp") {
-                        "webp"
+                        "image.webp"
                     } else {
-                        "png"
+                        "image.png"
                     };
-                    let filename = format!("{}_{}.{}", chrono::Local::now().format("%Y%m%d_%H%M%S"), &uuid::Uuid::new_v4().to_string()[..8], ext);
+                    let filename = crate::channel::upload_filename(&img.mime_type, orig_ext);
                     let dest = images_dir.join(&filename);
                     if std::fs::write(&dest, &bytes).is_ok() {
                         info!(path = %dest.display(), size = bytes.len(), "image auto-saved to uploads");

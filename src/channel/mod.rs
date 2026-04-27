@@ -423,7 +423,7 @@ pub fn is_document_attachment(content_type: &str, filename: &str) -> bool {
 /// Return the upload subdirectory for a file based on its type.
 ///
 /// - video → "videos"
-/// - audio → "voices"
+/// - audio → "audios"
 /// - document → "docs"
 /// - image → "images"
 /// - other → "files"
@@ -431,12 +431,54 @@ pub fn upload_subdir(mime_type: &str, filename: &str) -> &'static str {
     if is_video_attachment(mime_type, filename) {
         "videos"
     } else if is_audio_attachment(mime_type, filename) {
-        "voices"
+        "audios"
     } else if is_document_attachment(mime_type, filename) {
         "docs"
     } else {
         "files"
     }
+}
+
+/// Single-letter prefix for the upload filename.
+fn upload_prefix(mime_type: &str, filename: &str) -> char {
+    if is_video_attachment(mime_type, filename) {
+        'v'
+    } else if is_audio_attachment(mime_type, filename) {
+        'a'
+    } else if is_document_attachment(mime_type, filename) {
+        'd'
+    } else if mime_type.starts_with("image/") {
+        'i'
+    } else {
+        'f'
+    }
+}
+
+/// Generate a standardized upload filename.
+///
+/// Format: `{type}_{YYMMDDHHmm}{ab}.{ext}`
+/// - type: i/v/a/d/f
+/// - timestamp: 10 digits (year without century)
+/// - ab: 2 random lowercase letters
+///
+/// Example: `i_2604271325ab.png`, `v_2604271325xk.mp4`
+pub fn upload_filename(mime_type: &str, original_filename: &str) -> String {
+    let prefix = upload_prefix(mime_type, original_filename);
+    let now = chrono::Local::now();
+    let ts = now.format("%y%m%d%H%M").to_string();
+    let a = (rand::random::<u8>() % 26 + b'a') as char;
+    let b = (rand::random::<u8>() % 26 + b'a') as char;
+    let ext = std::path::Path::new(original_filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or(match prefix {
+            'i' => "png",
+            'v' => "mp4",
+            'a' => "mp3",
+            'd' => "pdf",
+            _ => "bin",
+        });
+    format!("{prefix}_{ts}{a}{b}.{ext}")
 }
 
 // ---------------------------------------------------------------------------
