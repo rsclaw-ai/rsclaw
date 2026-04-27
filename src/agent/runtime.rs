@@ -787,7 +787,6 @@ impl AgentRuntime {
         images: Vec<super::registry::ImageAttachment>,
         files: Vec<super::registry::FileAttachment>,
     ) -> Result<AgentReply> {
-        info!(images = images.len(), files = files.len(), text_len = text.len(), "run_turn entry");
         // Resolve @file references (e.g. @i_2604271325ab.png → full path).
         // Image references are auto-loaded as vision attachments.
         let workspace = self
