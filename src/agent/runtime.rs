@@ -2229,7 +2229,15 @@ impl AgentRuntime {
             .as_ref());
         let tools_enabled = model_cfg.and_then(|m| m.tools_enabled).unwrap_or(true);
 
-        let tools = if !tools_enabled {
+        // `summarize:<original_session>` is the cron summarizer's session
+        // prefix. The summarize turn must produce a plain-text summary, not
+        // a tool call (memory.put / write_file / etc.) — otherwise the cron
+        // delivers a tool acknowledgement instead of the actual summary.
+        // Force the tool list empty so the LLM has no choice but to
+        // respond with text.
+        let is_summarize_turn = session_key.starts_with("summarize:");
+
+        let tools = if !tools_enabled || is_summarize_turn {
             vec![]
         } else {
             // Build full tool list first

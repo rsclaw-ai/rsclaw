@@ -1800,7 +1800,12 @@ async fn run_exec_command(
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let msg = AgentMessage {
-            session_key: format!("{}:summarize", session_key), // Use separate session to avoid pollution
+            // `summarize:` prefix is detected by the agent runtime and disables
+            // ALL tools for the turn — forces the LLM to return a text summary
+            // instead of calling memory.put / write_file / etc. Without this,
+            // the agent treats summarize requests as normal turns and often
+            // chooses tool calls over plain text.
+            session_key: format!("summarize:{}", session_key),
             text: summarize_prompt,
             channel: "cron".to_string(),
             peer_id: format!("cron:{}", job.id),
