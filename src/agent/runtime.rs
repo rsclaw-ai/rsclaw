@@ -2302,7 +2302,7 @@ impl AgentRuntime {
                                     || std::env::var(format!("{}_API_KEY", vp.to_uppercase())).is_ok();
                                 if has_key {
                                     return match vp {
-                                        "doubao" => "doubao/doubao-seed-2-0-pro-260215".to_owned(),
+                                        "doubao" => "doubao/doubao-seed-2-0-pro".to_owned(),
                                         "gemini" => "gemini/gemini-2.0-flash".to_owned(),
                                         "openai" => "openai/gpt-4o-mini".to_owned(),
                                         "qwen" => "qwen/qwen-vl-max".to_owned(),
