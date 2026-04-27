@@ -3566,11 +3566,34 @@ function TauriConfigPageInner() {
         // Must have models to be considered connected
         let apiModels: string[] = (res.models || []).map((m: any) => typeof m === "string" ? m : m.id).filter(Boolean);
         // Doubao returns 100+ entries because every dated snapshot
-        // (`...-260215`, `...-250115`, ...) is its own ID. Drop snapshots
-        // and keep only the unversioned aliases — they always point at the
-        // latest of the family.
+        // (`...-260215`, `...-250115`, ...) is its own ID. Group by
+        // family (the prefix before the trailing -yymmdd / -yyyymmdd)
+        // and keep one entry per family: prefer the unversioned alias
+        // when it exists (rolling-latest pointer); otherwise keep the
+        // newest dated snapshot. The previous "drop everything dated"
+        // approach killed families like doubao-seedream-3-0-241015 that
+        // never had an unversioned alias.
         if (provId === "doubao") {
-          apiModels = apiModels.filter((id) => !/-\d{6,8}$/.test(id));
+          const dateRe = /^(.+?)-(\d{6,8})$/;
+          const families = new Map<string, string>();
+          for (const id of apiModels) {
+            const m = dateRe.exec(id);
+            if (!m) {
+              // Unversioned — always wins, lock the family.
+              families.set(id, id);
+              continue;
+            }
+            const prefix = m[1];
+            const existing = families.get(prefix);
+            if (existing === undefined) {
+              families.set(prefix, id);
+            } else if (dateRe.test(existing) && existing < id) {
+              // Existing is also dated and older — replace with newer.
+              // Skip if existing is the unversioned alias (no date suffix).
+              families.set(prefix, id);
+            }
+          }
+          apiModels = Array.from(families.values()).sort();
         }
         if (apiModels.length > 0) {
           setProvTest((prev) => ({ ...prev, [provId]: "ok" }));
