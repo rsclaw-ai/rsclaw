@@ -3172,6 +3172,8 @@ impl AgentRuntime {
         // Track consecutive tool errors - stop early when tools keep failing.
         let mut error_streak: usize = 0;
         const MAX_ERROR_STREAK: usize = 2;
+        // Store last error info for user feedback when breaking loop
+        let mut last_error_info: Option<String> = None;
         let mut max_iterations = BASE_ITERATIONS;
         let mut iteration = 0usize;
 
@@ -3274,9 +3276,14 @@ impl AgentRuntime {
                     error_streak,
                     "agent_loop: consecutive tool errors, breaking loop"
                 );
-                // Return last error to user instead of continuing to retry
+                // Return last error info to user with details
+                let error_text = if let Some(ref info) = last_error_info {
+                    format!("工具执行连续失败。\n\n最后错误详情：\n{}", info)
+                } else {
+                    crate::i18n::t("agent_tool_errors", crate::i18n::default_lang()).to_owned()
+                };
                 return Ok(AgentReply {
-                    text: crate::i18n::t("agent_tool_errors", crate::i18n::default_lang()).to_owned(),
+                    text: error_text,
                     is_empty: false,
                     tool_calls: None,
                     images: vec![],
@@ -4340,15 +4347,43 @@ impl AgentRuntime {
                     Ok(v) => {
                         // Reset parse error counter on successful tool execution
                         ctx.parse_error_count = 0;
-                        // Check if result contains an error (exit_code != 0 or error field)
-                        let v_str = v.to_string();
-                        let has_error = v_str.contains("\"exit_code\":")
-                            && v_str.contains("\"exit_code\": 0") == false
-                            || v_str.contains("\"error\"");
+                        // Check if result contains an error:
+                        // - exit_code != 0
+                        // - has "error" field
+                        // - stderr length > 0 (script execution failed)
+                        let has_error = match &v {
+                            serde_json::Value::Object(obj) => {
+                                // Check exit_code field directly
+                                obj.get("exit_code")
+                                    .and_then(|c| c.as_i64())
+                                    .map(|c| c != 0)
+                                    .unwrap_or(false)
+                                    || obj.contains_key("error")
+                                    // Check stderr length
+                                    || obj.get("stderr")
+                                        .and_then(|s| s.as_str())
+                                        .map(|s| s.len() > 0)
+                                        .unwrap_or(false)
+                            }
+                            _ => {
+                                // Fallback: check string representation
+                                let v_str = v.to_string();
+                                // Match "exit_code":N where N is not 0
+                                v_str.contains("\"exit_code\":")
+                                    && !v_str.contains("\"exit_code\":0")
+                                    && !v_str.contains("\"exit_code\": 0")
+                                    || v_str.contains("\"error\"")
+                                    || v_str.contains("\"stderr\":")
+                                    && !v_str.contains("\"stderr\":\"\"")
+                            }
+                        };
                         if has_error {
                             error_streak += 1;
+                            // Store error info for user feedback
+                            last_error_info = Some(v.to_string());
                         } else {
                             error_streak = 0;
+                            last_error_info = None;
                         }
                         // Record result for progress-aware loop detection.
                         // Same args + different results = making progress, not a loop.
@@ -4421,6 +4456,8 @@ impl AgentRuntime {
                         // (wasm trap, http status, panic msg) is hidden.
                         let err_chain = format!("{e:#}");
                         warn!(tool = %tool_name, "tool error: {}", err_chain);
+                        // Store error info for user feedback when breaking loop
+                        last_error_info = Some(err_chain.clone());
                         // Record error result for loop detection (errors count as results too).
                         ctx.loop_detector
                             .record_result(&serde_json::json!({"error": err_chain.clone()}));
