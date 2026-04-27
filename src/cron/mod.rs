@@ -1775,14 +1775,22 @@ async fn run_exec_command(
 
     // If summarize=true, send output to agent for summarization
     if summarize {
+        // Try to use a dedicated summarizer agent first to avoid queue conflicts
+        // with the main agent. Falls back to job.agent_id if not available.
+        let summarize_agent_id = if agents.get("_summarizer").is_ok() {
+            "_summarizer"
+        } else {
+            &job.agent_id
+        };
+
         let session_key = job
             .session_key
             .clone()
             .unwrap_or_else(|| format!("cron:{}", job.id));
 
         let handle = agents
-            .get(&job.agent_id)
-            .with_context(|| format!("agent not found: {}", job.agent_id))?;
+            .get(summarize_agent_id)
+            .with_context(|| format!("agent not found: {}", summarize_agent_id))?;
 
         // Create summarize prompt with real output
         let summarize_prompt = format!(
@@ -1805,9 +1813,12 @@ async fn run_exec_command(
 
         handle.tx.send(msg).await.context("agent inbox closed")?;
 
-        // Wait for summary with timeout. If timeout or error, fallback to raw output.
-        // This prevents cron failure when agent is busy with other tasks.
-        let summary_timeout = Duration::from_secs(60);
+        // Wait for summary with timeout. 300s gives the (possibly busy)
+        // agent room to process other tasks first; cron jobs tend to be
+        // batch-style so a longer wait is acceptable. Note that the new
+        // _summarizer agent path above is the real fix for queue
+        // contention — the timeout is just a safety net.
+        let summary_timeout = Duration::from_secs(300);
         match tokio::time::timeout(summary_timeout, reply_rx).await {
             Ok(Ok(reply)) => {
                 if reply.is_empty {
