@@ -47,6 +47,21 @@ interface host-runtime {
     read-file: func(path: string) -> result<string, string>;
     /// Send a progress/notification message to the user during long operations.
     notify: func(message: string) -> result<string, string>;
+
+    /// Send a message + an inline image. The image-data-uri must be a
+    /// `data:image/<format>;base64,<...>` string (the browser-screenshot
+    /// host fn already returns this shape). The host always populates
+    /// the OutboundMessage's `images` field with the data URI; channel
+    /// handlers (feishu, wechat, desktop, etc.) decide how to render —
+    /// IM channels upload it inline, desktop renders/saves it natively.
+    notify-with-image: func(message: string, image-data-uri: string) -> result<string, string>;
+
+    /// Send a message + a file attachment by absolute path. `mime` like
+    /// "video/mp4" or "image/png". The file path must resolve under the
+    /// plugin workspace (canonicalized & allowlisted by the host). The
+    /// host populates OutboundMessage.files; channel handlers decide
+    /// how to deliver (IM channels upload, desktop surfaces the path).
+    notify-with-file: func(message: string, file-path: string, mime: string) -> result<string, string>;
 }
 
 interface host-storage {
