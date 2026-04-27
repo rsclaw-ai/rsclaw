@@ -655,15 +655,21 @@ pub(crate) fn build_tool_list(
             For edit/remove/enable/disable, prefer using `index` from the list output instead of `id`.\n\
             \n\
             KIND — what should fire when the schedule triggers:\n\
-              agentTurn (DEFAULT): dispatch `message` to the agent at fire time. The agent\n\
-                runs LLM + tools and the result is delivered. Use this for tasks that need\n\
-                logic, tool calls, queries, monitoring (e.g. \"check Douyin comments\",\n\
-                \"summarize today's emails\", \"if X then notify\").\n\
-              systemEvent: deliver `message` text VERBATIM to the user, no agent run, no LLM\n\
-                cost. Use this for plain recurring text broadcasts (e.g. \"remind me to drink\n\
-                water every hour\", \"daily 9am: standup time\", fixed reminders).\n\
-              Choose carefully — agentTurn for simple text reminders wastes tokens; systemEvent\n\
-              for tasks requiring agent reasoning produces a useless echo of the prompt.\n\
+              agentTurn (DEFAULT — pick this unless you are CERTAIN systemEvent applies):\n\
+                Dispatch `message` to the agent at fire time. The agent runs LLM + tools\n\
+                and delivers the result. Required for ANY task whose answer changes between\n\
+                runs or depends on outside information: weather, prices, news, comments,\n\
+                emails, system status, file/page contents, conditional logic, summaries.\n\
+              systemEvent: deliver `message` text VERBATIM to the user. NO LLM, NO TOOLS,\n\
+                NO QUERIES — every fire produces the exact same string you wrote in `message`.\n\
+                Use ONLY when the message is a fixed text reminder whose content never\n\
+                needs to be computed (e.g. \"drink water\", \"stand up\", \"daily 9am: standup\").\n\
+              Disqualifying signal: if `message` describes an action to perform (\"check X\",\n\
+                \"query Y\", \"fetch Z\", \"每N分钟查/取/看…\") rather than literal text to display,\n\
+                it MUST be agentTurn. Picking systemEvent here means every fire just echoes\n\
+                the instruction back to the user instead of executing it — a real, observed\n\
+                failure mode. Token cost is not a reason to downgrade to systemEvent; a\n\
+                useless echo is more expensive than a correct LLM call.\n\
             \n\
             CRON FORMAT (schedule field) — EXACTLY 5 fields separated by spaces:\n\
               minute hour day month weekday\n\
@@ -684,7 +690,7 @@ pub(crate) fn build_tool_list(
                 "every_seconds": {"type": "number", "description": "Fire every N seconds (for add). Use for fixed intervals like 45 minutes (every_seconds=2700) that cannot be expressed as a 5-field cron expression."},
                 "delay_ms":      {"type": "number", "description": "Delay in milliseconds for one-shot timer (e.g., 1200000 = 20 min). Use instead of schedule for reminders/timers."},
                 "message":       {"type": "string", "description": "Message or task to run (for add, edit)"},
-                "kind":          {"type": "string", "enum": ["agentTurn", "systemEvent"], "description": "What fires when the schedule hits. agentTurn (default) = run agent (LLM+tools); systemEvent = deliver `message` verbatim, no LLM cost. See tool description for guidance."},
+                "kind":          {"type": "string", "enum": ["agentTurn", "systemEvent"], "description": "What fires when the schedule triggers. agentTurn (default) = run agent (LLM+tools) so the answer reflects current state. systemEvent = deliver `message` verbatim with NO agent run — only valid when `message` is fixed display text whose content never needs to be computed. If the user wants something queried/fetched/checked on a schedule, use agentTurn."},
                 "index":         {"type": "number", "description": "Job index from list (1-based, for edit/remove/enable/disable - preferred)"},
                 "id":            {"type": "string", "description": "Job ID (for edit/remove/enable/disable - use index instead if possible)"},
                 "name":          {"type": "string", "description": "Job name (for add, edit)"},
