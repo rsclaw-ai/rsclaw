@@ -145,7 +145,21 @@ impl AgentRuntime {
 
         tracing::info!(cwd = %cwd_str, "OpenCode: using workspace directory");
 
-        let client = crate::acp::client::AcpClient::spawn(&command, &args).await?;
+        // Get init timeout from config (default 600s)
+        let init_timeout_secs = self
+            .handle
+            .config
+            .opencode
+            .as_ref()
+            .and_then(|c| c.init_timeout_seconds);
+
+        let client = crate::acp::client::AcpClient::spawn_with_timeout(
+            &command,
+            &args,
+            Arc::new(crate::acp::client::DefaultAcpHandler),
+            Arc::new(tokio::sync::Mutex::new(crate::acp::notification::NotificationManager::new())),
+            init_timeout_secs,
+        ).await?;
         client
             .initialize("rsclaw", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"))
             .await?;
@@ -562,11 +576,46 @@ impl AgentRuntime {
         }
 
         // Find claude-agent-acp executable
-        // Can be installed via npm: npm install -g @agentclientprotocol/claude-agent-acp
-        let (command, args) = if let Ok(path) = which::which("claude-agent-acp") {
-            (path.to_string_lossy().to_string(), vec![])
-        } else if let Ok(path) = std::env::var("CLAUDE_AGENT_ACP_PATH") {
-            // If it's a .js file, run with node
+        // On Windows, prefer .cmd wrapper to avoid MSYS2 path issues (same as opencode)
+        let (command, args) = if cfg!(target_os = "windows") {
+            // Search PATH for claude-agent-acp.cmd directly
+            let path_env = std::env::var("PATH").ok().unwrap_or_default();
+            let separator = if path_env.contains(';') { ';' } else { ':' };
+
+            let cmd_found = path_env.split(separator).find_map(|dir| {
+                let win_dir = if dir.starts_with('/') && dir.len() > 2 {
+                    let parts: Vec<&str> = dir.splitn(3, '/').collect();
+                    if parts.len() >= 3 && parts[0].is_empty() && parts[1].len() == 1 {
+                        let drive = parts[1].to_uppercase();
+                        let rest = parts[2];
+                        format!("{}:\\{}", drive, rest.replace('/', "\\"))
+                    } else {
+                        dir.replace('/', "\\")
+                    }
+                } else {
+                    dir.to_string()
+                };
+
+                // Try .cmd first
+                let cmd_path = std::path::PathBuf::from(&win_dir).join("claude-agent-acp.cmd");
+                if cmd_path.exists() {
+                    return Some((cmd_path.to_string_lossy().to_string(), vec![]));
+                }
+                // Then try without extension
+                let bin_path = std::path::PathBuf::from(&win_dir).join("claude-agent-acp");
+                if bin_path.exists() {
+                    return Some((bin_path.to_string_lossy().to_string(), vec![]));
+                }
+                None
+            });
+
+            cmd_found.unwrap_or_else(|| ("claude-agent-acp.cmd".to_string(), vec![]))
+        } else {
+            // Non-Windows: use which::which
+            if let Ok(path) = which::which("claude-agent-acp") {
+                (path.to_string_lossy().to_string(), vec![])
+            } else if let Ok(path) = std::env::var("CLAUDE_AGENT_ACP_PATH") {
+                // If it's a .js file, run with node
             if path.ends_with(".js") {
                 ("node".to_string(), vec![path])
             } else {
@@ -652,8 +701,22 @@ impl AgentRuntime {
 
         tracing::info!(cwd = %cwd_str, args = ?args, "Claude Code: using workspace directory");
 
+        // Get init timeout from config (default 600s)
+        let init_timeout_secs = self
+            .handle
+            .config
+            .claudecode
+            .as_ref()
+            .and_then(|c| c.init_timeout_seconds);
+
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let client = crate::acp::client::AcpClient::spawn(&command, &args_ref).await?;
+        let client = crate::acp::client::AcpClient::spawn_with_timeout(
+            &command,
+            &args_ref,
+            Arc::new(crate::acp::client::DefaultAcpHandler),
+            Arc::new(tokio::sync::Mutex::new(crate::acp::notification::NotificationManager::new())),
+            init_timeout_secs,
+        ).await?;
         client
             .initialize("rsclaw", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"))
             .await?;
