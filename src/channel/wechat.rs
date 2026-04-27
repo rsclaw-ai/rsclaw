@@ -408,6 +408,34 @@ impl WeChatPersonalChannel {
     // Message sending
     // -----------------------------------------------------------------------
 
+    /// Inspect a sendmessage HTTP-200 response body for the ilink `ret` code.
+    ///
+    /// Wechat's ilink protocol returns `{"ret": -2, ...}` for messages it
+    /// accepts at HTTP level but refuses to deliver (anti-spam / invalid
+    /// media reference / similar). Treating this as Ok would silently lose
+    /// the message; treating it as a hard task failure misrepresents what
+    /// happened (the upstream task — video gen, etc — actually succeeded).
+    /// We bail with a `WECHAT_NOTIFY_REJECTED` prefix so callers can
+    /// recognise it and emit a delivery-only fallback (e.g. "📦 视频已生成
+    /// 但通知投递异常") without re-running the task.
+    fn check_send_ret(label: &str, resp_body: &str) -> Result<()> {
+        let parsed: serde_json::Value = match serde_json::from_str(resp_body) {
+            Ok(v) => v,
+            Err(_) => return Ok(()), // empty body or non-JSON = treat as ok
+        };
+        let ret = parsed.get("ret").and_then(|v| v.as_i64()).unwrap_or(0);
+        if ret == 0 {
+            return Ok(());
+        }
+        warn!(
+            label = %label,
+            ret = ret,
+            body = %resp_body,
+            "wechat: ilink ret != 0 — message rejected by upstream (notify failure)"
+        );
+        bail!("WECHAT_NOTIFY_REJECTED:ret={ret}:{resp_body}");
+    }
+
     async fn send_text(&self, to_user_id: &str, text: &str) -> Result<()> {
         let url = format!("{}/ilink/bot/sendmessage", self.base_url);
         let client_id = uuid::Uuid::new_v4().to_string();
@@ -443,7 +471,7 @@ impl WeChatPersonalChannel {
         if !status.is_success() {
             bail!("sendmessage failed: {status} {resp_body}");
         }
-
+        Self::check_send_ret("send_text", &resp_body)?;
         Ok(())
     }
 
@@ -1082,6 +1110,7 @@ impl WeChatPersonalChannel {
             bail!("send image message failed: {status} {resp_body}");
         }
         info!(status = %status, resp = %resp_body, "wechat: send_image_message response");
+        Self::check_send_ret("send_image_message", &resp_body)?;
         Ok(())
     }
 
@@ -1165,6 +1194,7 @@ impl WeChatPersonalChannel {
             bail!("send file message failed: {status} {resp_body}");
         }
         info!(status = %status, resp = %resp_body, "wechat: send_file_message ok");
+        Self::check_send_ret("send_file_message", &resp_body)?;
         Ok(())
     }
 
@@ -1188,7 +1218,8 @@ impl WeChatPersonalChannel {
         std::fs::write(&tmp_src, audio_bytes)?;
 
         // ffmpeg: decode to raw PCM s16le mono 24kHz
-        let output = std::process::Command::new("ffmpeg")
+        let ffmpeg_bin = crate::agent::platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
+        let output = std::process::Command::new(&ffmpeg_bin)
             .args([
                 "-i", &tmp_src.to_string_lossy(),
                 "-y", "-f", "s16le", "-ar", "24000", "-ac", "1",
@@ -1278,6 +1309,7 @@ impl WeChatPersonalChannel {
             bail!("send voice message failed: {status} {resp_body}");
         }
         info!(status = %status, resp = %resp_body, "wechat: send_voice_message response");
+        Self::check_send_ret("send_voice_message", &resp_body)?;
         Ok(())
     }
 
@@ -1333,6 +1365,7 @@ impl WeChatPersonalChannel {
             bail!("send video message failed: {status} {resp_body}");
         }
         info!(status = %status, resp = %resp_body, "wechat: send_video_message response");
+        Self::check_send_ret("send_video_message", &resp_body)?;
         Ok(())
     }
 }
@@ -1475,11 +1508,15 @@ impl Channel for WeChatPersonalChannel {
                     // tell them where the file is and that we can ship it
                     // somewhere else (e.g. publish to douyin) without re-running.
                     if !sent {
-                        let mb = bytes.len() as f64 / 1_048_576.0;
-                        let fallback_text = format!(
-                            "📦 视频已生成（{filename}, {mb:.1}MB），但微信传输失败 — 微信 CDN 抽风。\n\n\
-                             文件保存在：{path_or_url}\n\n\
-                             你可以让我直接发到抖音 / 其他平台，无需重新生成视频。"
+                        let mb_str = format!("{:.1}", bytes.len() as f64 / 1_048_576.0);
+                        let fallback_text = crate::i18n::t_fmt(
+                            "wechat_video_notify_failed",
+                            crate::i18n::default_lang(),
+                            &[
+                                ("filename", filename.as_str()),
+                                ("mb", &mb_str),
+                                ("path", path_or_url.as_str()),
+                            ],
                         );
                         if let Err(send_err) = self.send_text(&msg.target_id, &fallback_text).await {
                             warn!(index = idx, "wechat: video fallback text also failed: {send_err:#}");

@@ -680,6 +680,42 @@ impl TaskQueueWorker {
             .cloned()
     }
 
+    /// Push a user-facing failure message back through the channel so the
+    /// user sees something instead of silence when a turn fails (timeout,
+    /// dropped reply, etc). Best-effort: if the channel sender is gone or
+    /// the send fails, only logs.
+    async fn notify_user_failure(
+        &self,
+        channel_name: &str,
+        target: &str,
+        is_group: bool,
+        reply_to: Option<String>,
+        turn: u32,
+        reason: &str,
+    ) {
+        let Some(tx) = self.channel_tx(channel_name) else {
+            tracing::warn!(channel = %channel_name, "no channel sender registered, failure notice dropped");
+            return;
+        };
+        let text = crate::i18n::t_fmt(
+            "task_notify_failure",
+            crate::i18n::default_lang(),
+            &[("reason", reason)],
+        );
+        let out = OutboundMessage {
+            target_id: target.to_owned(),
+            is_group,
+            text,
+            reply_to: if turn == 1 { reply_to } else { None },
+            images: vec![],
+            files: vec![],
+            channel: Some(channel_name.to_owned()),
+        };
+        if let Err(e) = tx.send(out).await {
+            tracing::error!(channel = %channel_name, "failure notice send failed: {e}");
+        }
+    }
+
     /// Main loop: wait for task notifications and dispatch them. Exits when
     /// the shutdown coordinator signals drain — already-running tasks complete,
     /// but no new ones are pulled. Persistent tasks left in the queue are
@@ -822,6 +858,7 @@ impl TaskQueueWorker {
                 Ok(Ok(r)) => r,
                 Ok(Err(_)) => {
                     error!(task_id = %task_id, turn, "task queue worker: reply channel dropped");
+                    self.notify_user_failure(&channel_name, &target, is_group, reply_to.clone(), turn, "reply channel dropped").await;
                     match self.manager.fail(&task_id, "reply channel dropped", task.max_retries) {
                         Ok(TaskStatus::Dead) => cleanup_staged_files(&task),
                         Err(fe) => error!(task_id = %task_id, "fail() error: {fe:#}"),
@@ -831,6 +868,7 @@ impl TaskQueueWorker {
                 }
                 Err(_) => {
                     error!(task_id = %task_id, turn, "task queue worker: reply timeout (600s)");
+                    self.notify_user_failure(&channel_name, &target, is_group, reply_to.clone(), turn, "reply timeout (600s)").await;
                     match self.manager.fail(&task_id, "reply timeout", task.max_retries) {
                         Ok(TaskStatus::Dead) => cleanup_staged_files(&task),
                         Err(fe) => error!(task_id = %task_id, "fail() error: {fe:#}"),

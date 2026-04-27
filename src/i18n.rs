@@ -288,6 +288,32 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "de" => "Analyse fehlgeschlagen.",
     );
 
+    msg!("task_notify_failure",
+        "en" => "\u{26A0}\u{FE0F} Task delivery failed ({reason}). Please try again or rephrase.",
+        "zh" => "\u{26A0}\u{FE0F} 任务执行失败（{reason}），请稍后重试或换一种说法。",
+        "th" => "\u{26A0}\u{FE0F} \u{0E07}\u{0E32}\u{0E19}\u{0E25}\u{0E49}\u{0E21}\u{0E40}\u{0E2B}\u{0E25}\u{0E27} ({reason}) \u{0E42}\u{0E1B}\u{0E23}\u{0E14}\u{0E25}\u{0E2D}\u{0E07}\u{0E43}\u{0E2B}\u{0E21}\u{0E48}",
+        "vi" => "\u{26A0}\u{FE0F} Tac vu khong giao duoc ({reason}). Vui long thu lai.",
+        "ja" => "\u{26A0}\u{FE0F} タスクの実行に失敗しました（{reason}）。後でもう一度お試しください。",
+        "es" => "\u{26A0}\u{FE0F} Tarea fallida ({reason}). Vuelva a intentarlo.",
+        "ko" => "\u{26A0}\u{FE0F} 작업 실행 실패 ({reason}). 다시 시도하세요.",
+        "ru" => "\u{26A0}\u{FE0F} Сбой задачи ({reason}). Повторите попытку.",
+        "fr" => "\u{26A0}\u{FE0F} Échec de la tâche ({reason}). Réessayez.",
+        "de" => "\u{26A0}\u{FE0F} Aufgabe fehlgeschlagen ({reason}). Bitte erneut versuchen.",
+    );
+
+    msg!("wechat_video_notify_failed",
+        "en" => "\u{1F4E6} Video generated ({filename}, {mb}MB) but WeChat delivery was rejected.\n\nFile saved at: {path}\n\nYou can ask me to publish to Douyin / other platforms — no need to regenerate.",
+        "zh" => "\u{1F4E6} 视频已生成（{filename}, {mb}MB），但微信通知投递异常。\n\n文件保存在：{path}\n\n你可以让我直接发到抖音 / 其他平台，无需重新生成视频。",
+        "th" => "\u{1F4E6} \u{0E27}\u{0E34}\u{0E14}\u{0E35}\u{0E42}\u{0E2D}\u{0E40}\u{0E2A}\u{0E23}\u{0E47}\u{0E08}\u{0E41}\u{0E25}\u{0E49}\u{0E27} ({filename}, {mb}MB) \u{0E41}\u{0E15}\u{0E48}\u{0E2A}\u{0E48}\u{0E07}\u{0E1C}\u{0E48}\u{0E32}\u{0E19} WeChat \u{0E44}\u{0E21}\u{0E48}\u{0E2A}\u{0E33}\u{0E40}\u{0E23}\u{0E47}\u{0E08}\n\u{0E44}\u{0E1F}\u{0E25}\u{0E4C}: {path}",
+        "vi" => "\u{1F4E6} Video da xong ({filename}, {mb}MB) nhung WeChat tu choi giao. File: {path}",
+        "ja" => "\u{1F4E6} 動画は生成されました（{filename}, {mb}MB）が、WeChatでの送信に失敗しました。\nファイル: {path}",
+        "es" => "\u{1F4E6} Video generado ({filename}, {mb}MB) pero WeChat rechazó la entrega.\nArchivo: {path}",
+        "ko" => "\u{1F4E6} 동영상은 생성되었지만 ({filename}, {mb}MB) WeChat 전송이 거부되었습니다.\n파일: {path}",
+        "ru" => "\u{1F4E6} Видео готово ({filename}, {mb}MB), но WeChat отклонил доставку.\nФайл: {path}",
+        "fr" => "\u{1F4E6} Vidéo générée ({filename}, {mb}MB) mais WeChat a refusé la livraison.\nFichier : {path}",
+        "de" => "\u{1F4E6} Video erstellt ({filename}, {mb}MB), aber WeChat-Zustellung abgelehnt.\nDatei: {path}",
+    );
+
     msg!("files_deleted",
         "en" => "Files deleted.",
         "zh" => "文件已删除。",
