@@ -10,33 +10,25 @@ use serde_json::{Value, json};
 use super::platform::powershell_hidden;
 use super::runtime::{AgentRuntime, RunContext};
 
-/// Persist generated image bytes to `~/Downloads/rsclaw/images/` and return
-/// the absolute path. Avoids shipping multi-MB base64 over the WebSocket —
-/// the desktop UI loads via Tauri's asset protocol; non-WS channels rehydrate
-/// to a data URL at the AgentReply boundary (`image_ref_to_data_url`).
+/// Persist generated image bytes to `~/Downloads/rsclaw/images/` with the
+/// standardized `dl_i_<ts><ab>.<ext>` filename and return the absolute path.
+/// Avoids shipping multi-MB base64 over the WebSocket — the desktop UI loads
+/// via Tauri's asset protocol; non-WS channels rehydrate to a data URL at the
+/// AgentReply boundary (`image_ref_to_data_url`).
 async fn save_generated_image_bytes(bytes: &[u8], mime: &str) -> Result<String> {
-    let ext = match mime {
-        "image/jpeg" | "image/jpg" => "jpg",
-        "image/webp" => "webp",
-        "image/gif" => "gif",
-        _ => "png",
+    let synthetic_name = match mime {
+        "image/jpeg" | "image/jpg" => "x.jpg",
+        "image/webp" => "x.webp",
+        "image/gif" => "x.gif",
+        _ => "x.png",
     };
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let save_dir = dirs_next::download_dir()
-        .unwrap_or_else(|| {
-            dirs_next::home_dir()
-                .unwrap_or_else(crate::config::loader::base_dir)
-                .join("Downloads")
-        })
-        .join("rsclaw")
-        .join("images");
+    let subdir = crate::channel::media_subdir(mime, synthetic_name);
+    let filename = crate::channel::download_filename(mime, synthetic_name);
+    let save_dir = crate::channel::downloads_root().join(subdir);
     tokio::fs::create_dir_all(&save_dir)
         .await
         .map_err(|e| anyhow!("image: create_dir: {e}"))?;
-    let save_path = save_dir.join(format!("img_{nanos:x}.{ext}"));
+    let save_path = save_dir.join(filename);
     tokio::fs::write(&save_path, bytes)
         .await
         .map_err(|e| anyhow!("image: write: {e}"))?;

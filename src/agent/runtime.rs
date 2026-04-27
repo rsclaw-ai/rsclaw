@@ -787,7 +787,8 @@ impl AgentRuntime {
         images: Vec<super::registry::ImageAttachment>,
         files: Vec<super::registry::FileAttachment>,
     ) -> Result<AgentReply> {
-        // Resolve @file references (e.g. @i_2604271325ab.png → full path).
+        // Resolve @file references (e.g. @up_i_202604271325ab.png → full path
+        // under workspace/uploads/, @dl_v_... → ~/Downloads/rsclaw/videos/).
         // Image references are auto-loaded as vision attachments.
         let workspace = self
             .handle

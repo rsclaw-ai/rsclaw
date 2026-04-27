@@ -420,18 +420,22 @@ pub fn is_document_attachment(content_type: &str, filename: &str) -> bool {
         || lower.ends_with(".rtf")
 }
 
-/// Return the upload subdirectory for a file based on its type.
+/// Return the media subdirectory for a file based on its type.
+///
+/// Used for both `workspace/uploads/<subdir>/` and `~/Downloads/rsclaw/<subdir>/`.
 ///
 /// - video → "videos"
 /// - audio → "audios"
-/// - document → "docs"
 /// - image → "images"
+/// - document → "docs"
 /// - other → "files"
-pub fn upload_subdir(mime_type: &str, filename: &str) -> &'static str {
+pub fn media_subdir(mime_type: &str, filename: &str) -> &'static str {
     if is_video_attachment(mime_type, filename) {
         "videos"
     } else if is_audio_attachment(mime_type, filename) {
         "audios"
+    } else if is_image_attachment(mime_type, filename) {
+        "images"
     } else if is_document_attachment(mime_type, filename) {
         "docs"
     } else {
@@ -439,33 +443,30 @@ pub fn upload_subdir(mime_type: &str, filename: &str) -> &'static str {
     }
 }
 
-/// Single-letter prefix for the upload filename.
-fn upload_prefix(mime_type: &str, filename: &str) -> char {
+/// Backward-compatible alias for `media_subdir` — kept for upload call sites.
+pub fn upload_subdir(mime_type: &str, filename: &str) -> &'static str {
+    media_subdir(mime_type, filename)
+}
+
+/// Single-letter type prefix: i/v/a/d/f.
+fn media_type_prefix(mime_type: &str, filename: &str) -> char {
     if is_video_attachment(mime_type, filename) {
         'v'
     } else if is_audio_attachment(mime_type, filename) {
         'a'
+    } else if is_image_attachment(mime_type, filename) {
+        'i'
     } else if is_document_attachment(mime_type, filename) {
         'd'
-    } else if mime_type.starts_with("image/") {
-        'i'
     } else {
         'f'
     }
 }
 
-/// Generate a standardized upload filename.
-///
-/// Format: `{type}_{YYMMDDHHmm}{ab}.{ext}`
-/// - type: i/v/a/d/f
-/// - timestamp: 10 digits (year without century)
-/// - ab: 2 random lowercase letters
-///
-/// Example: `i_2604271325ab.png`, `v_2604271325xk.mp4`
-pub fn upload_filename(mime_type: &str, original_filename: &str) -> String {
-    let prefix = upload_prefix(mime_type, original_filename);
+fn make_media_filename(direction: &str, mime_type: &str, original_filename: &str) -> String {
+    let prefix = media_type_prefix(mime_type, original_filename);
     let now = chrono::Local::now();
-    let ts = now.format("%y%m%d%H%M").to_string();
+    let ts = now.format("%Y%m%d%H%M").to_string();
     let a = (rand::random::<u8>() % 26 + b'a') as char;
     let b = (rand::random::<u8>() % 26 + b'a') as char;
     let ext = std::path::Path::new(original_filename)
@@ -478,7 +479,36 @@ pub fn upload_filename(mime_type: &str, original_filename: &str) -> String {
             'd' => "pdf",
             _ => "bin",
         });
-    format!("{prefix}_{ts}{a}{b}.{ext}")
+    format!("{direction}_{prefix}_{ts}{a}{b}.{ext}")
+}
+
+/// Generate a standardized upload filename.
+///
+/// Format: `up_{type}_{YYMMDDHHmm}{ab}.{ext}` (type: i/v/a/d/f).
+/// Example: `up_i_2604271325ab.png`, `up_v_2604271325xk.mp4`.
+pub fn upload_filename(mime_type: &str, original_filename: &str) -> String {
+    make_media_filename("up", mime_type, original_filename)
+}
+
+/// Generate a standardized download filename.
+///
+/// Format: `dl_{type}_{YYMMDDHHmm}{ab}.{ext}` — used for agent-generated/downloaded
+/// files saved under `~/Downloads/rsclaw/<subdir>/`.
+pub fn download_filename(mime_type: &str, original_filename: &str) -> String {
+    make_media_filename("dl", mime_type, original_filename)
+}
+
+/// Return the root directory for agent-generated downloads
+/// (`~/Downloads/rsclaw/`). Falls back to `~/Downloads/rsclaw/` if the OS
+/// download dir cannot be determined.
+pub fn downloads_root() -> std::path::PathBuf {
+    dirs_next::download_dir()
+        .unwrap_or_else(|| {
+            dirs_next::home_dir()
+                .unwrap_or_else(crate::config::loader::base_dir)
+                .join("Downloads")
+        })
+        .join("rsclaw")
 }
 
 // ---------------------------------------------------------------------------
@@ -493,33 +523,39 @@ pub struct ResolvedRefs {
     pub image_paths: Vec<std::path::PathBuf>,
 }
 
-/// Scan text for `@{prefix}_{timestamp}{ab}.{ext}` references and resolve
-/// them to full paths under `workspace/uploads/`.
+/// Scan text for `@up_{type}_...` / `@dl_{type}_...` references and resolve
+/// them to absolute paths.
 ///
-/// Image references (`@i_...`) are collected in `image_paths` so the
-/// caller can load them as vision attachments.
+/// - `@up_*` resolves under `workspace/uploads/<subdir>/`
+/// - `@dl_*` resolves under `~/Downloads/rsclaw/<subdir>/`
 ///
-/// Pattern: `@[ivdaf]_\w+\.\w+`
+/// Image references are collected in `image_paths` so the caller can load
+/// them as vision attachments.
+///
+/// Pattern: `@(up|dl)_[ivadf]_[a-z0-9]+\.\w+`
 pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> ResolvedRefs {
     let uploads = workspace.join("uploads");
-    let re = regex::Regex::new(r"@([ivdaf]_[a-z0-9]+\.\w+)").expect("valid regex");
+    let downloads = downloads_root();
+    let re = regex::Regex::new(r"@((up|dl)_([ivadf])_[a-z0-9]+\.\w+)").expect("valid regex");
 
     let mut resolved = Vec::new();
     let mut image_paths = Vec::new();
     for cap in re.captures_iter(text) {
         let filename = &cap[1];
-        let prefix = filename.chars().next().unwrap_or('f');
-        let subdir = match prefix {
+        let direction = &cap[2];
+        let type_letter = cap[3].chars().next().unwrap_or('f');
+        let subdir = match type_letter {
             'i' => "images",
             'v' => "videos",
             'a' => "audios",
             'd' => "docs",
             _ => "files",
         };
-        let path = uploads.join(subdir).join(filename);
+        let base = if direction == "up" { &uploads } else { &downloads };
+        let path = base.join(subdir).join(filename);
         if path.exists() {
             resolved.push((filename.to_string(), path.to_string_lossy().to_string()));
-            if prefix == 'i' {
+            if type_letter == 'i' {
                 image_paths.push(path);
             }
         }

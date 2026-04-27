@@ -498,38 +498,19 @@ impl rsclaw::plugin::host_storage::Host for HostState {
                 "allocate_artifact: filename must not contain path separators: {filename}"
             )));
         }
-        // Layout: <Downloads>/rsclaw/<videos|images|files>/<nanos_hex>/<filename>
+        // Layout: <Downloads>/rsclaw/<images|videos|audios|docs|files>/dl_<X>_<ts><ab>.<ext>
         // Use the OS Downloads dir (visible, cross-platform: macOS/Windows/Linux
         // all expose one) so Tauri v2's asset protocol scope can match without
-        // fighting `require_literal_leading_dot`. nanos_hex makes each
-        // allocation unique so repeated filenames don't collide.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let category = match std::path::Path::new(&filename)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("mp4" | "mov" | "webm" | "mkv" | "avi" | "m4v") => "videos",
-            Some("jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg") => "images",
-            _ => "files",
-        };
-        let base = dirs_next::download_dir()
-            .unwrap_or_else(|| {
-                dirs_next::home_dir()
-                    .unwrap_or_else(crate::config::loader::base_dir)
-                    .join("Downloads")
-            })
-            .join("rsclaw")
-            .join(category);
-        let subdir = base.join(format!("{nanos:x}"));
-        if let Err(e) = std::fs::create_dir_all(&subdir) {
+        // fighting `require_literal_leading_dot`. The dl_ prefix matches the
+        // @dl_X_... reference scheme; the random suffix in the filename makes
+        // each allocation unique without needing per-call subdirs.
+        let subdir = crate::channel::media_subdir("", &filename);
+        let std_name = crate::channel::download_filename("", &filename);
+        let dir = crate::channel::downloads_root().join(subdir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
             return Ok(Err(format!("allocate_artifact: create_dir: {e}")));
         }
-        let full = subdir.join(&filename);
+        let full = dir.join(&std_name);
         tracing::debug!(target: "wasm_plugin", "allocated artifact: {}", full.display());
         Ok(Ok(full.to_string_lossy().to_string()))
     }
