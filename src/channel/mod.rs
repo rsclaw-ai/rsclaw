@@ -456,29 +456,67 @@ fn upload_prefix(mime_type: &str, filename: &str) -> char {
 
 /// Generate a standardized upload filename.
 ///
-/// Format: `{type}_{YYMMDDHHmm}{ab}.{ext}`
-/// - type: i/v/a/d/f
-/// - timestamp: 10 digits (year without century)
-/// - ab: 2 random lowercase letters
+/// Format: `up_{kind}_{YYYYMMDDHHmm}{abc}.{ext}`
+/// - kind: i/v/a/d/f (image / video / audio / doc / file)
+/// - timestamp: 12 digits (4-digit year)
+/// - abc: 3 random lowercase letters (~17 576 combinations — well under
+///   the birthday-collision threshold for any realistic per-minute rate)
 ///
-/// Example: `i_2604271325ab.png`, `v_2604271325xk.mp4`
+/// Example: `up_i_202604271325abc.png`, `up_v_202604271325xkr.mp4`
 pub fn upload_filename(mime_type: &str, original_filename: &str) -> String {
-    let prefix = upload_prefix(mime_type, original_filename);
-    let now = chrono::Local::now();
-    let ts = now.format("%y%m%d%H%M").to_string();
-    let a = (rand::random::<u8>() % 26 + b'a') as char;
-    let b = (rand::random::<u8>() % 26 + b'a') as char;
+    let kind = upload_prefix(mime_type, original_filename);
+    let ts = canonical_timestamp();
+    let abc = random_suffix3();
     let ext = std::path::Path::new(original_filename)
         .extension()
         .and_then(|e| e.to_str())
-        .unwrap_or(match prefix {
+        .unwrap_or(match kind {
             'i' => "png",
             'v' => "mp4",
             'a' => "mp3",
             'd' => "pdf",
             _ => "bin",
         });
-    format!("{prefix}_{ts}{a}{b}.{ext}")
+    format!("up_{kind}_{ts}{abc}.{ext}")
+}
+
+/// Map a file extension to the single-letter kind used in canonical
+/// `up_/dl_` filenames. Mirrors `upload_prefix` but starts from the
+/// extension (which is what the host has when allocating artifacts on
+/// behalf of a plugin — there's no mime type at that point).
+pub fn kind_from_extension(ext: &str) -> char {
+    let e = ext.to_ascii_lowercase();
+    match e.as_str() {
+        "mp4" | "mov" | "webm" | "mkv" | "avi" | "m4v" => 'v',
+        "mp3" | "wav" | "m4a" | "ogg" | "opus" | "aac" | "flac" => 'a',
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" | "csv" => 'd',
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg" | "heic" | "heif" => 'i',
+        _ => 'f',
+    }
+}
+
+/// Subdirectory under `~/Downloads/rsclaw/` (or `<workspace>/uploads/`)
+/// for a given canonical kind letter.
+pub fn category_for_kind(kind: char) -> &'static str {
+    match kind {
+        'i' => "images",
+        'v' => "videos",
+        'a' => "audios",
+        'd' => "docs",
+        _ => "files",
+    }
+}
+
+fn canonical_timestamp() -> String {
+    chrono::Local::now().format("%Y%m%d%H%M").to_string()
+}
+
+fn random_suffix3() -> String {
+    let mut s = String::with_capacity(3);
+    for _ in 0..3 {
+        s.push((rand::random::<u8>() % 26 + b'a') as char);
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -493,33 +531,47 @@ pub struct ResolvedRefs {
     pub image_paths: Vec<std::path::PathBuf>,
 }
 
-/// Scan text for `@{prefix}_{timestamp}{ab}.{ext}` references and resolve
-/// them to full paths under `workspace/uploads/`.
+/// Scan text for `@<filename>` file references and resolve them to full
+/// paths. Supported shapes:
 ///
-/// Image references (`@i_...`) are collected in `image_paths` so the
-/// caller can load them as vision attachments.
+/// * `@up_<kind>_<suffix>.<ext>` — uploaded by the user; lives under
+///   `<workspace>/uploads/<category>/`
+/// * `@dl_<kind>_<suffix>.<ext>` — generated/downloaded by a plugin;
+///   lives under `~/Downloads/rsclaw/<category>/`
+/// * `@<kind>_<suffix>.<ext>` — legacy upload format (no `up_` prefix);
+///   resolves like `up_*` for backward compatibility
 ///
-/// Pattern: `@[ivdaf]_\w+\.\w+`
+/// Image references are collected in `image_paths` so the caller can
+/// load them as vision attachments.
 pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> ResolvedRefs {
     let uploads = workspace.join("uploads");
-    let re = regex::Regex::new(r"@([ivdaf]_[a-z0-9]+\.\w+)").expect("valid regex");
+    let downloads_root = dirs_next::download_dir()
+        .unwrap_or_else(|| {
+            dirs_next::home_dir()
+                .map(|h| h.join("Downloads"))
+                .unwrap_or_else(|| workspace.to_path_buf())
+        })
+        .join("rsclaw");
+
+    // Capture optional `up_`/`dl_` source prefix and the kind letter so
+    // we can route to the right root without re-parsing inside the loop.
+    let re = regex::Regex::new(r"@((up|dl)_)?([ivdaf])_([a-z0-9_]+)\.(\w+)")
+        .expect("valid regex");
 
     let mut resolved = Vec::new();
     let mut image_paths = Vec::new();
     for cap in re.captures_iter(text) {
-        let filename = &cap[1];
-        let prefix = filename.chars().next().unwrap_or('f');
-        let subdir = match prefix {
-            'i' => "images",
-            'v' => "videos",
-            'a' => "audios",
-            'd' => "docs",
-            _ => "files",
+        let source = cap.get(2).map(|m| m.as_str()).unwrap_or("up");
+        let kind = cap.get(3).and_then(|m| m.as_str().chars().next()).unwrap_or('f');
+        let full_name = &cap[0][1..]; // strip the leading '@'
+        let subdir = category_for_kind(kind);
+        let path = match source {
+            "dl" => downloads_root.join(subdir).join(full_name),
+            _ => uploads.join(subdir).join(full_name),
         };
-        let path = uploads.join(subdir).join(filename);
         if path.exists() {
-            resolved.push((filename.to_string(), path.to_string_lossy().to_string()));
-            if prefix == 'i' {
+            resolved.push((full_name.to_string(), path.to_string_lossy().to_string()));
+            if kind == 'i' {
                 image_paths.push(path);
             }
         }
