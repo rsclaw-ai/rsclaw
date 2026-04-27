@@ -3167,6 +3167,11 @@ impl AgentRuntime {
         let mut last_tool_key = String::new();
         let mut same_call_streak: usize = 0;
         const MAX_SAME_CALL_STREAK: usize = 5;
+        // Track consecutive tool errors — stop early when tools keep failing.
+        let mut error_streak: usize = 0;
+        const MAX_ERROR_STREAK: usize = 2;
+        // Store last error info so we can surface it when the loop breaks.
+        let mut last_error_info: Option<String> = None;
         let mut max_iterations = BASE_ITERATIONS;
         let mut iteration = 0usize;
 
@@ -3258,6 +3263,29 @@ impl AgentRuntime {
                     tool_calls: None,
                     images: vec![],
                     files: vec![],
+                    pending_analysis: None,
+                    was_preparse: false,
+                });
+            }
+            // Check consecutive tool errors — stop early when tools keep failing.
+            if error_streak >= MAX_ERROR_STREAK {
+                warn!(
+                    session = %ctx.session_key,
+                    error_streak,
+                    "agent_loop: consecutive tool errors, breaking loop"
+                );
+                // Return last error info to user with details
+                let error_text = if let Some(ref info) = last_error_info {
+                    format!("工具执行连续失败。\n\n最后错误详情：\n{}", info)
+                } else {
+                    crate::i18n::t("agent_tool_errors", crate::i18n::default_lang()).to_owned()
+                };
+                return Ok(AgentReply {
+                    text: error_text,
+                    is_empty: false,
+                    tool_calls: None,
+                    images: vec![],
+                    files: tool_files,
                     pending_analysis: None,
                     was_preparse: false,
                 });
@@ -4314,6 +4342,38 @@ impl AgentRuntime {
                     Ok(v) => {
                         // Reset parse error counter on successful tool execution
                         ctx.parse_error_count = 0;
+                        // Tool result indicates failure if any of:
+                        //   exit_code != 0  |  has "error" field  |  stderr length > 0
+                        let has_error = match &v {
+                            serde_json::Value::Object(obj) => {
+                                obj.get("exit_code")
+                                    .and_then(|c| c.as_i64())
+                                    .map(|c| c != 0)
+                                    .unwrap_or(false)
+                                    || obj.contains_key("error")
+                                    || obj.get("stderr")
+                                        .and_then(|s| s.as_str())
+                                        .map(|s| !s.is_empty())
+                                        .unwrap_or(false)
+                            }
+                            _ => {
+                                // Fallback: check string representation
+                                let v_str = v.to_string();
+                                v_str.contains("\"exit_code\":")
+                                    && !v_str.contains("\"exit_code\":0")
+                                    && !v_str.contains("\"exit_code\": 0")
+                                    || v_str.contains("\"error\"")
+                                    || v_str.contains("\"stderr\":")
+                                        && !v_str.contains("\"stderr\":\"\"")
+                            }
+                        };
+                        if has_error {
+                            error_streak += 1;
+                            last_error_info = Some(v.to_string());
+                        } else {
+                            error_streak = 0;
+                            last_error_info = None;
+                        }
                         // Record result for progress-aware loop detection.
                         // Same args + different results = making progress, not a loop.
                         // For exec tool: exclude task_id (uuid changes each call) to properly detect loops.
@@ -4383,6 +4443,8 @@ impl AgentRuntime {
                         // (wasm trap, http status, panic msg) is hidden.
                         let err_chain = format!("{e:#}");
                         warn!(tool = %tool_name, "tool error: {}", err_chain);
+                        // Store error info for user feedback when breaking loop
+                        last_error_info = Some(err_chain.clone());
                         // Record error result for loop detection (errors count as results too).
                         ctx.loop_detector
                             .record_result(&serde_json::json!({"error": err_chain.clone()}));
