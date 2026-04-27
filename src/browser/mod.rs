@@ -725,6 +725,20 @@ impl BrowserSession {
     ///    browser (unsaved work risk).
     /// 5. **Launch fresh isolated profile** as the last resort (e.g.
     ///    when only Chrome for Testing is available).
+    /// Helper: launch chrome and connect CDP. Factored out so `start`
+    /// can attempt path-3 (user profile) with a path-5 (rsclaw isolated)
+    /// fallback without duplicating the launch sequence.
+    async fn try_launch(
+        chrome_path: &str,
+        headed: bool,
+        profile: Option<&str>,
+    ) -> Result<(ChromeProcess, u16, CdpClient)> {
+        let chrome = ChromeProcess::launch(chrome_path, headed, profile).await?;
+        let port = chrome.port()?;
+        let cdp = Self::connect_cdp_by_port(port).await?;
+        Ok((chrome, port, cdp))
+    }
+
     pub async fn start(chrome_path: &str, headed: bool, profile: Option<&str>) -> Result<Self> {
         // 1. Any debug-enabled chrome on common ports?
         if let Some(ws_url) = detect_existing_chrome(&[9222, 9223]).await {
@@ -758,16 +772,31 @@ impl BrowserSession {
                      完成后重试请求。"
                 );
             }
-            if user_chrome_profile_dir().map(|d| d.exists()).unwrap_or(false) {
-                info!("BrowserSession: launching user's Chrome with debug enabled (using their daily profile)");
-                chosen_profile = Some("default");
-            }
+            // Always set "default" for system chrome — Chrome creates
+            // the profile dir on first launch if missing, and using it
+            // means later when the user opens chrome themselves they
+            // share the same process / cookies / session naturally.
+            info!("BrowserSession: launching user's Chrome with debug enabled (using their daily profile)");
+            chosen_profile = Some("default");
         }
 
         // 5. Launch (either user's profile via "default" or rsclaw isolated).
-        let chrome = ChromeProcess::launch(chrome_path, headed, chosen_profile).await?;
-        let port = chrome.port()?;
-        let cdp = Self::connect_cdp_by_port(port).await?;
+        //    If the path-3 attempt with the user's profile fails (broken
+        //    Chrome install / corrupted local profile / OS sandbox issue
+        //    — symptom is "Chrome quit unexpectedly"), fall back to
+        //    rsclaw's isolated profile so the gateway stays usable instead
+        //    of returning an error to every tool call.
+        let (chrome, port, cdp) = match Self::try_launch(chrome_path, headed, chosen_profile).await {
+            Ok(triple) => triple,
+            Err(e) if chosen_profile == Some("default") && profile.is_some() => {
+                warn!(
+                    "BrowserSession: launching user's Chrome failed ({e:#}); \
+                     falling back to rsclaw isolated profile"
+                );
+                Self::try_launch(chrome_path, headed, profile).await?
+            }
+            Err(e) => return Err(e),
+        };
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
