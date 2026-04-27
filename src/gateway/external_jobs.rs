@@ -125,6 +125,17 @@ pub struct ExternalJob {
     /// Local file path after download (set when Done — so reconnect-replay
     /// can re-deliver the saved artifact instead of re-downloading).
     pub result_path: Option<String>,
+    /// Wall-clock time the artifact (or failure notice) was successfully
+    /// pushed via `notification_tx`. While `None`, the worker treats the
+    /// row as "needs delivery" and will retry each tick — protects against
+    /// `notification_tx.send` failing on a full broadcast or transient
+    /// channel-handler issue.
+    #[serde(default)]
+    pub delivered_at: Option<i64>,
+    /// Number of delivery attempts so far. Drives the next-retry back-off
+    /// in worker.rs and bounds the retry budget.
+    #[serde(default)]
+    pub delivery_attempts: u32,
 }
 
 /// Default per-job timeout — 30 minutes covers Seedance / MiniMax / Kling
@@ -166,8 +177,26 @@ impl ExternalJob {
             error: None,
             result_url: None,
             result_path: None,
+            delivered_at: None,
+            delivery_attempts: 0,
         }
     }
+
+    /// True when the job is in a terminal state (`Done` / `Failed` /
+    /// `TimedOut`) but the result has not yet been pushed via the
+    /// notification channel. Used by the worker's delivery-retry sweep.
+    pub fn needs_delivery(&self) -> bool {
+        matches!(
+            self.status,
+            ExternalJobStatus::Done | ExternalJobStatus::Failed | ExternalJobStatus::TimedOut
+        ) && self.delivered_at.is_none()
+    }
+
+    /// Max delivery retries before we give up. After this the job is
+    /// considered abandoned (logged) and GC-eligible regardless of
+    /// `delivered_at` so the table doesn't grow forever on a permanently
+    /// broken channel sink.
+    pub const MAX_DELIVERY_ATTEMPTS: u32 = 60; // ~30 min at 30s back-off
 
     /// Compute the next polling delay using a coarse two-step back-off:
     /// dense (10 s) for the first ~2 minutes — when most jobs finish — then

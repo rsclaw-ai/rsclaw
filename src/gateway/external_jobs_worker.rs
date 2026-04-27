@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use serde_json::json;
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast};
 use tracing::{debug, error, info, warn};
 
 use super::external_jobs::{
@@ -31,12 +31,25 @@ const TICK_SECS: u64 = 5;
 /// Retention window for terminal jobs before they get GC'd.
 const FINISHED_RETENTION_SECS: i64 = 24 * 3600;
 
+/// Concurrent in-flight provider HTTP calls (poll + delivery). Caps the
+/// thundering-herd risk after a long restart window when many jobs become
+/// due simultaneously. Provider rate limits typically tolerate this.
+const MAX_CONCURRENT_OPS: usize = 8;
+
+/// Back-off seconds between failed delivery attempts. Constant for now —
+/// `notification_tx.send` failures are nearly always "no live receivers"
+/// during a brief startup gap, not provider issues that need exponential
+/// back-off.
+const DELIVERY_RETRY_DELAY_SECS: u64 = 30;
+
 pub struct ExternalJobsWorker {
     store: Arc<RedbStore>,
     notification_tx: broadcast::Sender<OutboundMessage>,
     shutdown: ShutdownCoordinator,
     config: Arc<RuntimeConfig>,
     client: reqwest::Client,
+    /// Cap on concurrent per-job operations — see MAX_CONCURRENT_OPS.
+    op_semaphore: Arc<Semaphore>,
 }
 
 impl ExternalJobsWorker {
@@ -56,6 +69,7 @@ impl ExternalJobsWorker {
             shutdown,
             config,
             client,
+            op_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_OPS)),
         }
     }
 
@@ -76,7 +90,18 @@ impl ExternalJobsWorker {
                     for job in jobs {
                         let worker = Arc::clone(&self);
                         let guard = self.shutdown.begin_work();
+                        let sem = Arc::clone(&self.op_semaphore);
                         tokio::spawn(async move {
+                            // acquire_owned awaits a permit so concurrent
+                            // ops are bounded by MAX_CONCURRENT_OPS even if
+                            // 100 jobs become due in the same tick.
+                            let _permit = match sem.acquire_owned().await {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    drop(guard);
+                                    return;
+                                }
+                            };
                             worker.process_job(job).await;
                             drop(guard);
                         });
@@ -100,9 +125,28 @@ impl ExternalJobsWorker {
         info!("external jobs worker exited");
     }
 
-    /// Process one job: hard-timeout sweep → poll → record outcome →
-    /// deliver if terminal.
-    async fn process_job(&self, mut job: ExternalJob) {
+    /// Decide whether the job needs a polling cycle (still in flight) or
+    /// a delivery retry (already terminal but `notification_tx.send`
+    /// failed last time), then dispatch.
+    async fn process_job(&self, job: ExternalJob) {
+        if job.needs_delivery() {
+            self.retry_delivery(job).await;
+        } else if matches!(
+            job.status,
+            ExternalJobStatus::Pending | ExternalJobStatus::Polling
+        ) {
+            self.poll_cycle(job).await;
+        }
+        // Else: row is in a state we shouldn't be acting on (e.g. already
+        // delivered terminal). due_external_jobs already filtered, so
+        // hitting this branch means a concurrent state change — skip.
+    }
+
+    /// Full poll cycle: timeout sweep → poll → on terminal, attempt first
+    /// delivery. If delivery fails, the row stays in a terminal status
+    /// with `delivered_at = None` and gets picked up by `retry_delivery`
+    /// on later ticks.
+    async fn poll_cycle(&self, mut job: ExternalJob) {
         if job.is_timed_out() {
             job.status = ExternalJobStatus::TimedOut;
             job.error = Some(format!(
@@ -112,7 +156,7 @@ impl ExternalJobsWorker {
             if let Err(e) = self.store.update_external_job(&job) {
                 error!(job_id = %job.id, "update failed: {e:#}");
             }
-            self.deliver_failure(&job).await;
+            self.attempt_delivery(&mut job).await;
             return;
         }
 
@@ -145,7 +189,7 @@ impl ExternalJobsWorker {
                         if let Err(e) = self.store.update_external_job(&job) {
                             error!(job_id = %job.id, "update (done) failed: {e:#}");
                         }
-                        self.deliver_success(&job).await;
+                        self.attempt_delivery(&mut job).await;
                     }
                     Err(e) => {
                         job.status = ExternalJobStatus::Failed;
@@ -153,7 +197,7 @@ impl ExternalJobsWorker {
                         if let Err(e2) = self.store.update_external_job(&job) {
                             error!(job_id = %job.id, "update (download-fail) failed: {e2:#}");
                         }
-                        self.deliver_failure(&job).await;
+                        self.attempt_delivery(&mut job).await;
                     }
                 }
             }
@@ -163,7 +207,7 @@ impl ExternalJobsWorker {
                 if let Err(e) = self.store.update_external_job(&job) {
                     error!(job_id = %job.id, "update (failed) failed: {e:#}");
                 }
-                self.deliver_failure(&job).await;
+                self.attempt_delivery(&mut job).await;
             }
             Err(e) => {
                 // Transient error — schedule next poll, keep job alive.
@@ -177,6 +221,88 @@ impl ExternalJobsWorker {
                 }
             }
         }
+    }
+
+    /// Re-attempt delivery for a terminal job whose previous delivery
+    /// attempt failed. Reuses the same `attempt_delivery` path so the
+    /// success / failure bookkeeping is identical.
+    async fn retry_delivery(&self, mut job: ExternalJob) {
+        info!(
+            job_id = %job.id,
+            attempts = job.delivery_attempts,
+            "external jobs: retrying delivery"
+        );
+        self.attempt_delivery(&mut job).await;
+    }
+
+    /// Try to push the artifact (or failure notice) through
+    /// `notification_tx`. On success stamp `delivered_at` and write the
+    /// outcome to session history; on failure schedule a retry by
+    /// bumping `next_poll_at`.
+    async fn attempt_delivery(&self, job: &mut ExternalJob) {
+        job.delivery_attempts = job.delivery_attempts.saturating_add(1);
+        let success = if matches!(job.status, ExternalJobStatus::Done) {
+            self.deliver_success(job).await
+        } else {
+            self.deliver_failure(job).await
+        };
+
+        if success {
+            job.delivered_at = Some(chrono::Utc::now().timestamp());
+            if let Err(e) = self.store.update_external_job(job) {
+                error!(job_id = %job.id, "update (delivered) failed: {e:#}");
+            }
+            // Best-effort session-history writeback so the agent sees the
+            // result on the next turn ("hey, your video from earlier...").
+            // Failures here don't affect the user's actual delivery.
+            if let Err(e) = self.write_back_to_session(job) {
+                debug!(job_id = %job.id, "session writeback skipped: {e:#}");
+            }
+        } else {
+            let now = chrono::Utc::now().timestamp();
+            job.next_poll_at = now + DELIVERY_RETRY_DELAY_SECS as i64;
+            warn!(
+                job_id = %job.id,
+                attempts = job.delivery_attempts,
+                "external jobs: delivery failed, will retry"
+            );
+            if let Err(e) = self.store.update_external_job(job) {
+                error!(job_id = %job.id, "update (delivery-retry) failed: {e:#}");
+            }
+        }
+    }
+
+    /// Append a synthetic assistant message to the original session so the
+    /// agent's next turn knows the artifact landed. Best-effort — the
+    /// channel-level delivery is the source of truth for the user.
+    fn write_back_to_session(&self, job: &ExternalJob) -> Result<()> {
+        let kind_label = match job.kind {
+            ExternalJobKind::VideoGen => "video",
+            ExternalJobKind::ImageGen => "image",
+        };
+        let path = job.result_path.as_deref().unwrap_or("");
+        let content = if matches!(job.status, ExternalJobStatus::Done) {
+            format!("[{kind_label} generation complete] {path}")
+        } else {
+            format!(
+                "[{kind_label} generation {}] {}",
+                match job.status {
+                    ExternalJobStatus::Failed => "failed",
+                    ExternalJobStatus::TimedOut => "timed out",
+                    _ => "ended",
+                },
+                job.error.as_deref().unwrap_or("")
+            )
+        };
+        let msg = json!({
+            "role": "assistant",
+            "content": content,
+            "external_job_id": job.id,
+        });
+        self.store
+            .append_message(&job.session_key, &msg)
+            .map(|_| ())
+            .map_err(|e| anyhow!("append_message: {e}"))
     }
 
     /// Pick the right per-provider polling adapter.
@@ -203,7 +329,10 @@ impl ExternalJobsWorker {
             .or_else(|| std::env::var("ARK_API_KEY").ok())
     }
 
-    async fn deliver_success(&self, job: &ExternalJob) {
+    /// Returns true iff the broadcast accepted the message. The caller
+    /// (`attempt_delivery`) uses the boolean to decide whether to stamp
+    /// `delivered_at` or schedule another retry tick.
+    async fn deliver_success(&self, job: &ExternalJob) -> bool {
         let path = job.result_path.as_deref().unwrap_or("");
         let kind_label = match job.kind {
             ExternalJobKind::VideoGen => "video",
@@ -227,12 +356,16 @@ impl ExternalJobsWorker {
             files: vec![(filename.to_string(), mime.to_string(), path.to_string())],
             channel: Some(job.delivery.channel.clone()),
         };
-        if let Err(e) = self.notification_tx.send(out) {
-            error!(job_id = %job.id, "deliver_success: notification_tx failed: {e}");
+        match self.notification_tx.send(out) {
+            Ok(_) => true,
+            Err(e) => {
+                warn!(job_id = %job.id, "deliver_success: notification_tx failed: {e}");
+                false
+            }
         }
     }
 
-    async fn deliver_failure(&self, job: &ExternalJob) {
+    async fn deliver_failure(&self, job: &ExternalJob) -> bool {
         let kind_label = match job.kind {
             ExternalJobKind::VideoGen => "video",
             ExternalJobKind::ImageGen => "image",
@@ -248,8 +381,12 @@ impl ExternalJobsWorker {
             files: vec![],
             channel: Some(job.delivery.channel.clone()),
         };
-        if let Err(e) = self.notification_tx.send(out) {
-            error!(job_id = %job.id, "deliver_failure: notification_tx failed: {e}");
+        match self.notification_tx.send(out) {
+            Ok(_) => true,
+            Err(e) => {
+                warn!(job_id = %job.id, "deliver_failure: notification_tx failed: {e}");
+                false
+            }
         }
     }
 }

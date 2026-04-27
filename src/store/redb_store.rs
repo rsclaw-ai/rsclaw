@@ -856,15 +856,16 @@ impl RedbStore {
         }
     }
 
-    /// Return every job whose `next_poll_at` is at or before `now` and
-    /// whose status is not yet terminal. The worker drains this list each
-    /// tick.
+    /// Return every job that the worker should act on this tick. Two cases
+    /// share the same `next_poll_at` cursor:
+    ///   1. Active jobs (`Pending` / `Polling`) due for another poll cycle.
+    ///   2. Terminal jobs (`Done` / `Failed` / `TimedOut`) whose delivery
+    ///      hasn't succeeded yet — `next_poll_at` is reused as the next
+    ///      delivery-retry time when a previous attempt failed.
     pub fn due_external_jobs(
         &self,
         now: i64,
     ) -> Result<Vec<crate::gateway::external_jobs::ExternalJob>> {
-        use crate::gateway::external_jobs::ExternalJobStatus;
-
         let read = self.db.begin_read()?;
         let table = read.open_table(EXTERNAL_JOBS)?;
         let mut due = Vec::new();
@@ -872,11 +873,21 @@ impl RedbStore {
             let (_k, v) = entry?;
             let job: crate::gateway::external_jobs::ExternalJob =
                 serde_json::from_str(v.value())?;
-            let active = matches!(
+            if job.next_poll_at > now {
+                continue;
+            }
+            // Pending / Polling get polled. Terminal-but-undelivered get a
+            // delivery retry. Already-delivered terminal rows are skipped
+            // (cleanup_finished_external_jobs handles them).
+            let needs_action = matches!(
                 job.status,
-                ExternalJobStatus::Pending | ExternalJobStatus::Polling
-            );
-            if active && job.next_poll_at <= now {
+                crate::gateway::external_jobs::ExternalJobStatus::Pending
+                    | crate::gateway::external_jobs::ExternalJobStatus::Polling
+            ) || job.needs_delivery();
+            if needs_action
+                && job.delivery_attempts
+                    < crate::gateway::external_jobs::ExternalJob::MAX_DELIVERY_ATTEMPTS
+            {
                 due.push(job);
             }
         }
@@ -894,10 +905,14 @@ impl RedbStore {
         Ok(())
     }
 
-    /// Remove every job in a terminal state (`Done` / `Failed` / `TimedOut`)
-    /// older than `retention_secs`. Returns the count removed.
+    /// Remove terminal jobs that are eligible for GC. A row is eligible if:
+    ///   - it's older than `retention_secs`, AND
+    ///   - it has been delivered, OR
+    ///   - it exhausted `MAX_DELIVERY_ATTEMPTS` (broken sink — give up).
+    /// Undelivered terminal rows that haven't exhausted retries stay so
+    /// the worker keeps trying.
     pub fn cleanup_finished_external_jobs(&self, retention_secs: i64) -> Result<usize> {
-        use crate::gateway::external_jobs::ExternalJobStatus;
+        use crate::gateway::external_jobs::{ExternalJob, ExternalJobStatus};
 
         let cutoff = chrono::Utc::now().timestamp() - retention_secs;
         let write = self.db.begin_write()?;
@@ -906,15 +921,16 @@ impl RedbStore {
             let mut victims = Vec::new();
             for entry in table.iter()? {
                 let (_k, v) = entry?;
-                let job: crate::gateway::external_jobs::ExternalJob =
-                    serde_json::from_str(v.value())?;
+                let job: ExternalJob = serde_json::from_str(v.value())?;
                 let terminal = matches!(
                     job.status,
                     ExternalJobStatus::Done
                         | ExternalJobStatus::Failed
                         | ExternalJobStatus::TimedOut
                 );
-                if terminal && job.submitted_at < cutoff {
+                let delivery_settled = job.delivered_at.is_some()
+                    || job.delivery_attempts >= ExternalJob::MAX_DELIVERY_ATTEMPTS;
+                if terminal && delivery_settled && job.submitted_at < cutoff {
                     victims.push(job.id);
                 }
             }
