@@ -1455,10 +1455,45 @@ CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
             .clone()
     };
 
+    // Slash-command short-circuit: if the cron-fired text starts with `/`
+    // and is handled by fast preparse (e.g. /status, /loop, /cron list),
+    // run it through the same path a user would hit when typing it in the
+    // originating channel. Falls through to the agent inbox when preparse
+    // returns None — anything not slash, or slash commands that need the
+    // full LLM (e.g. /help text rendering at agent level), still reach
+    // the agent loop unchanged.
+    let job_text = job.effective_message();
+    if job_text.starts_with('/') {
+        let (preparse_channel, preparse_peer) = match job.delivery.as_ref() {
+            Some(d) => (
+                d.channel.as_deref().unwrap_or(""),
+                d.to.as_deref().unwrap_or(""),
+            ),
+            None => ("", ""),
+        };
+        if let Some(reply) = crate::gateway::preparse::try_preparse_locally(
+            job_text,
+            handle.as_ref(),
+            preparse_channel,
+            preparse_peer,
+        )
+        .await
+        {
+            // Clear the abort flag (we never dispatched to the agent).
+            abort_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+            info!(
+                job_id = %job.id,
+                len = reply.text.len(),
+                "cron job handled by preparse short-circuit"
+            );
+            return Ok(reply.text);
+        }
+    }
+
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let msg = AgentMessage {
         session_key: session_key.clone(),
-        text: job.effective_message().to_owned(),
+        text: job_text.to_owned(),
         channel: "cron".to_string(),
         peer_id: format!("cron:{}", job.id),
         chat_id: String::new(),
