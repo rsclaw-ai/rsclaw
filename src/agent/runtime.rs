@@ -1991,8 +1991,13 @@ impl AgentRuntime {
                 let size = file.data.len();
                 let _ = std::fs::write(&dest, &file.data);
 
-                // Skip text extraction for video/audio (binary, not analyzable as text).
-                let extracted = if crate::channel::is_video_attachment(&file.mime_type, &file.filename)
+                // Images: mark as vision-analyzable. Video/audio: binary.
+                // Others: try text extraction.
+                let is_image = file.mime_type.starts_with("image/");
+                let extracted = if is_image {
+                    // Placeholder — actual analysis via vision when user chooses "1".
+                    Some(format!("[image:vision:@{std_name}]"))
+                } else if crate::channel::is_video_attachment(&file.mime_type, &file.filename)
                     || crate::channel::is_audio_attachment(&file.mime_type, &file.filename) {
                     None
                 } else {
