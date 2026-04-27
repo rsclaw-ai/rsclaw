@@ -9,7 +9,7 @@ use crate::skill::SkillRegistry;
 /// allowedCommands).
 pub(crate) const READONLY_COMMANDS: &[&str] = &[
     "/help", "/version", "/status", "/health", "/uptime", "/models", "/ctx", "/btw", "/clear",
-    "/compact", "/history", "/cron", "/abort",
+    "/compact", "/history", "/cron", "/abort", "/loop", "/task",
 ];
 
 /// Format a Duration as human-readable string.
@@ -118,6 +118,11 @@ pub(crate) fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
 
     h.push_str(if zh { "定时任务：\n" } else { "Cron:\n" });
     h.push_str(if zh { "  /cron list        列出定时任务\n" } else { "  /cron list        List cron jobs\n" });
+    h.push_str(if zh { "  /loop <间隔> <提示词>  循环执行（如 /loop 5m 检查邮件）\n" } else { "  /loop <interval> <prompt>  Recurring task (e.g. /loop 5m check mail)\n" });
+    h.push('\n');
+
+    h.push_str(if zh { "任务模式：\n" } else { "Task mode:\n" });
+    h.push_str(if zh { "  /task <描述>      多轮执行任务\n  /task -h          查看 /task 完整帮助\n" } else { "  /task <desc>      Run a multi-turn task\n  /task -h          Full /task help\n" });
     h.push('\n');
 
     if has("/send") {

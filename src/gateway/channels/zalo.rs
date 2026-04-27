@@ -283,7 +283,7 @@ pub(crate) fn start_zalo_if_configured(
                                 peer_id: sender_id.clone(),
                                 dm_scope,
                             });
-                            if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "zalo", &sender_id).await {
                                 reply.target_id = sender_id.clone();
                                 reply.is_group = false;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {

@@ -20,9 +20,15 @@ use crate::{
 /// Handle certain fast preparse commands locally — without going through the agent queue.
 /// Returns `Some(reply_text)` for commands that can be answered immediately, `None` otherwise.
 /// This avoids blocking on the agent's sequential LLM loop for simple commands like /ls, /status.
+///
+/// `channel` (e.g. "telegram", "wechat") and `peer_id` are passed through so commands
+/// that need to schedule deliveries back to the originating channel/peer (e.g. `/loop`)
+/// can populate a `CronDelivery` correctly.
 pub(crate) async fn try_preparse_locally(
     text: &str,
     handle: &crate::agent::AgentHandle,
+    channel: &str,
+    peer_id: &str,
 ) -> Option<OutboundMessage> {
     use std::sync::atomic::Ordering;
     let t = text.trim();
@@ -233,6 +239,64 @@ $g.Dispose();$b.Dispose()"#
         let reply = crate::agent::tools_cron::format_cron_jobs(&jobs);
         return Some(txt(reply));
     }
+    // /loop <interval> <prompt-or-cmd> — schedule a recurring agentTurn
+    // back to the originating channel/peer. Persists to cron.json5 and
+    // signals the cron runner to reload.
+    if lower == "/loop" || lower == "/loop -h" || lower == "/loop --help" || lower == "/loop help" {
+        return Some(txt(loop_help_text(crate::i18n::default_lang())));
+    }
+    if lower.starts_with("/loop ") {
+        let rest = t.get(6..).unwrap_or("").trim();
+        let (interval_s, prompt) = match rest.split_once(char::is_whitespace) {
+            Some((iv, pr)) => (iv.trim(), pr.trim()),
+            None => (rest, ""),
+        };
+        if interval_s.is_empty() || prompt.is_empty() {
+            return Some(txt(loop_help_text(crate::i18n::default_lang())));
+        }
+        let every_ms = match parse_interval_ms(interval_s) {
+            Some(v) if v >= 2_000 => v,
+            Some(_) => return Some(txt("/loop: interval must be >= 2s".to_owned())),
+            None => return Some(txt(format!("/loop: cannot parse interval `{interval_s}` (e.g. 30s, 5m, 1h, 2h30m)"))),
+        };
+        if peer_id.is_empty() || channel.is_empty() {
+            return Some(txt("/loop: missing channel/peer context (cannot schedule delivery)".to_owned()));
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let id = format!("loop-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+        // ws transport is registered as "desktop" on the delivery side.
+        let delivery_channel: &str = if channel == "ws" { "desktop" } else { channel };
+        let job = serde_json::json!({
+            "id": id,
+            "agentId": handle.id,
+            "enabled": true,
+            "schedule": {"kind": "every", "everyMs": every_ms, "anchorMs": now_ms},
+            "payload": {"kind": "agentTurn", "text": prompt},
+            "delivery": {"channel": delivery_channel, "to": peer_id, "mode": "always"},
+            "createdAtMs": now_ms,
+        });
+        let cron_path = crate::cron::resolve_cron_store_path();
+        let _guard = crate::cron::CRON_FILE_LOCK.lock().await;
+        let mut jobs = crate::agent::tools_cron::read_cron_jobs(&cron_path).await;
+        jobs.push(job);
+        if let Err(e) = crate::agent::tools_cron::write_cron_jobs(&cron_path, &jobs).await {
+            return Some(txt(format!("/loop: failed to save jobs: {e}")));
+        }
+        drop(_guard);
+        crate::cron::trigger_reload();
+        let zh = crate::i18n::default_lang() == "zh";
+        let human = format_interval_ms(every_ms);
+        return Some(txt(if zh {
+            format!("已安排循环（每 {human}）：{prompt}\nID: {id}\n停止：/cron remove {id}（通过 agent）")
+        } else {
+            format!("Scheduled loop (every {human}): {prompt}\nID: {id}\nStop with: /cron remove {id} (via agent)")
+        }));
+    }
+    // /task with no args or -h/--help → print task help (short-circuit;
+    // otherwise it would route into the task queue with an empty message).
+    if lower == "/task" || lower == "/task -h" || lower == "/task --help" || lower == "/task help" {
+        return Some(txt(task_help_text(crate::i18n::default_lang())));
+    }
     // /model — show current model; /models — list providers; /model <name> — switch
     if lower == "/model" || lower == "/models" {
         let model = handle.config.model.as_ref()
@@ -315,6 +379,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
         lower.as_str(),
         "/ls" | "/status" | "/version" | "/help" | "/?" | "/health" | "/uptime"
             | "/model" | "/models" | "/cron" | "/clear" | "/new" | "/reset" | "/abort" | "/sessions"
+            | "/loop" | "/task"
     )
     // Commands with optional/required args
     || lower.starts_with("/ls ")
@@ -328,8 +393,126 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
     || lower.starts_with("/run ")
     || lower.starts_with("/sh ")
     || lower.starts_with("/exec ")
+    || lower.starts_with("/loop ")
+    // /task only short-circuits on help variants; non-help forms must NOT
+    // bypass the queue (the task queue worker owns the multi-turn flow).
+    || lower == "/task -h"
+    || lower == "/task --help"
+    || lower == "/task help"
     || t.starts_with("! ")
     || t.starts_with("$ ")
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for /loop
+// ---------------------------------------------------------------------------
+
+/// Parse a human-readable interval like "30s", "5m", "1h", "2h30m", "1d".
+/// A bare number is interpreted as seconds.
+fn parse_interval_ms(s: &str) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut num_buf = String::new();
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            num_buf.push(c);
+        } else if c.is_ascii_whitespace() {
+            continue;
+        } else if c.is_ascii_alphabetic() {
+            if num_buf.is_empty() {
+                return None;
+            }
+            let n: u64 = num_buf.parse().ok()?;
+            num_buf.clear();
+            let mul: u64 = match c.to_ascii_lowercase() {
+                's' => 1_000,
+                'm' => 60_000,
+                'h' => 3_600_000,
+                'd' => 86_400_000,
+                _ => return None,
+            };
+            total = total.checked_add(n.checked_mul(mul)?)?;
+        } else {
+            return None;
+        }
+    }
+    if !num_buf.is_empty() {
+        // Bare trailing number → seconds (e.g. "300" → 300s).
+        let n: u64 = num_buf.parse().ok()?;
+        total = total.checked_add(n.checked_mul(1_000)?)?;
+    }
+    if total == 0 { None } else { Some(total) }
+}
+
+/// Format an interval in milliseconds as a compact human-readable string.
+fn format_interval_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    let d = secs / 86400;
+    let h = (secs % 86400) / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    let mut parts: Vec<String> = Vec::new();
+    if d > 0 { parts.push(format!("{d}d")); }
+    if h > 0 { parts.push(format!("{h}h")); }
+    if m > 0 { parts.push(format!("{m}m")); }
+    if s > 0 { parts.push(format!("{s}s")); }
+    if parts.is_empty() { "0s".to_owned() } else { parts.join("") }
+}
+
+/// Help text for /loop. Localized en/zh.
+fn loop_help_text(lang: &str) -> String {
+    if lang == "zh" {
+        "/loop <间隔> <提示词或命令>\n\n\
+         以指定间隔重复执行：把 <提示词> 当作一个新的消息发送给当前 agent，\n\
+         agent 的回复会通过当前渠道返回给你。\n\
+         <提示词> 可以是任何 /help 列出的命令，也可以是普通的提示词。\n\n\
+         间隔示例：30s, 5m, 1h, 2h30m, 1d（最小 2s）\n\
+         例：\n\
+         \u{0020}\u{0020}/loop 5m 检查邮箱有没有新邮件\n\
+         \u{0020}\u{0020}/loop 1h /status\n\n\
+         查看：/cron list   停止：让 agent 调用 /cron remove <id>"
+            .to_owned()
+    } else {
+        "/loop <interval> <prompt-or-command>\n\n\
+         Repeat at the given interval: <prompt> is sent as a fresh message to the\n\
+         current agent and its reply is delivered back through this channel.\n\
+         <prompt> can be any command from /help or plain natural-language text.\n\n\
+         Interval examples: 30s, 5m, 1h, 2h30m, 1d (min 2s)\n\
+         Examples:\n\
+         \u{0020}\u{0020}/loop 5m check for new mail\n\
+         \u{0020}\u{0020}/loop 1h /status\n\n\
+         List: /cron list    Stop: ask the agent to /cron remove <id>"
+            .to_owned()
+    }
+}
+
+/// Help text for /task. Localized en/zh.
+fn task_help_text(lang: &str) -> String {
+    if lang == "zh" {
+        "/task [选项] <任务描述>\n\n\
+         在多轮模式下执行一项任务：agent 会反复推理、调用工具，直到任务完成或耗尽预算。\n\n\
+         选项：\n\
+         \u{0020}\u{0020}--turns <N>      最大轮数（默认 10）\n\
+         \u{0020}\u{0020}--timeout <时长> 超时（如 4h、30m，默认 1h）\n\n\
+         例：\n\
+         \u{0020}\u{0020}/task 修复登录页的 bug\n\
+         \u{0020}\u{0020}/task --turns 20 重构支付模块\n\
+         \u{0020}\u{0020}/task --timeout 4h --turns 50 完整跑通新功能\n\n\
+         查看进度：/status   终止：/abort   配合 /loop 定时触发：/loop 1h /task ..."
+            .to_owned()
+    } else {
+        "/task [options] <description>\n\n\
+         Run a task in multi-turn mode: the agent will reason and call tools repeatedly\n\
+         until the task is complete or its budget is exhausted.\n\n\
+         Options:\n\
+         \u{0020}\u{0020}--turns <N>        Max turns (default 10)\n\
+         \u{0020}\u{0020}--timeout <dur>    Timeout (e.g. 4h, 30m, default 1h)\n\n\
+         Examples:\n\
+         \u{0020}\u{0020}/task fix the login bug\n\
+         \u{0020}\u{0020}/task --turns 20 refactor the payment module\n\
+         \u{0020}\u{0020}/task --timeout 4h --turns 50 finish the new feature end-to-end\n\n\
+         Progress: /status   Abort: /abort   Combine with /loop: /loop 1h /task ..."
+            .to_owned()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -431,5 +614,64 @@ pub(crate) async fn btw_direct_call(
         // Strip any residual <think>...</think> tags
         let cleaned = crate::provider::openai::strip_think_tags_pub(&text_buf);
         Some(cleaned)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_interval_ms_basic_units() {
+        assert_eq!(parse_interval_ms("30s"), Some(30_000));
+        assert_eq!(parse_interval_ms("5m"), Some(300_000));
+        assert_eq!(parse_interval_ms("1h"), Some(3_600_000));
+        assert_eq!(parse_interval_ms("1d"), Some(86_400_000));
+    }
+
+    #[test]
+    fn parse_interval_ms_compound() {
+        assert_eq!(parse_interval_ms("2h30m"), Some(9_000_000));
+        assert_eq!(parse_interval_ms("1h30m15s"), Some(5_415_000));
+        assert_eq!(parse_interval_ms("1d2h"), Some(93_600_000));
+    }
+
+    #[test]
+    fn parse_interval_ms_bare_number_is_seconds() {
+        assert_eq!(parse_interval_ms("300"), Some(300_000));
+    }
+
+    #[test]
+    fn parse_interval_ms_case_insensitive() {
+        assert_eq!(parse_interval_ms("5M"), Some(300_000));
+        assert_eq!(parse_interval_ms("1H30M"), Some(5_400_000));
+    }
+
+    #[test]
+    fn parse_interval_ms_rejects_garbage() {
+        assert_eq!(parse_interval_ms(""), None);
+        assert_eq!(parse_interval_ms("m"), None);
+        assert_eq!(parse_interval_ms("5x"), None);
+        assert_eq!(parse_interval_ms("abc"), None);
+    }
+
+    #[test]
+    fn format_interval_ms_drops_zero_components() {
+        assert_eq!(format_interval_ms(300_000), "5m");
+        assert_eq!(format_interval_ms(9_000_000), "2h30m");
+        assert_eq!(format_interval_ms(86_400_000), "1d");
+        assert_eq!(format_interval_ms(0), "0s");
+    }
+
+    #[test]
+    fn is_fast_preparse_recognizes_loop_and_task_help() {
+        assert!(is_fast_preparse("/loop"));
+        assert!(is_fast_preparse("/loop 5m foo"));
+        assert!(is_fast_preparse("/task"));
+        assert!(is_fast_preparse("/task -h"));
+        assert!(is_fast_preparse("/task --help"));
+        // Real /task usage must NOT bypass the queue — task_queue owns that flow.
+        assert!(!is_fast_preparse("/task fix the bug"));
+        assert!(!is_fast_preparse("/task --turns 20 do something"));
     }
 }

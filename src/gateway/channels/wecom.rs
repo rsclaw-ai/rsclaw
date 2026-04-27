@@ -313,7 +313,7 @@ pub(crate) fn start_wecom_if_configured(
                                 peer_id: from.clone(),
                                 dm_scope,
                             });
-                            if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "wecom", &from).await {
                                 reply.target_id = if is_group { chat_id.clone() } else { from.clone() };
                                 reply.is_group = is_group;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {

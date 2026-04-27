@@ -356,7 +356,7 @@ pub(crate) fn start_matrix_if_configured(
                                 peer_id: sender.clone(),
                                 dm_scope,
                             });
-                            if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "matrix", &sender).await {
                                 reply.target_id = room_id.clone();
                                 reply.is_group = is_group;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {

@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -1993,6 +1993,34 @@ pub fn save_cron_jobs(jobs: &[CronJob]) -> anyhow::Result<()> {
 /// Without this, concurrent `cron.add` calls (common when an LLM dispatches
 /// multiple tool calls in one turn) race and silently lose writes.
 pub static CRON_FILE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+// ---------------------------------------------------------------------------
+// Cross-module reload signal
+// ---------------------------------------------------------------------------
+//
+// Lets non-server code paths (e.g. fast preparse `/loop`) ask the cron runner
+// to reload `cron.json5` after appending a new job. Populated once at gateway
+// startup with the same broadcast sender wired into AppState.
+
+static CRON_RELOAD_TX: OnceLock<broadcast::Sender<()>> = OnceLock::new();
+
+/// Install the cron reload broadcast sender. Called once at gateway startup.
+/// Subsequent installs are silently ignored (idempotent).
+pub fn install_reload_sender(tx: broadcast::Sender<()>) {
+    if CRON_RELOAD_TX.set(tx).is_err() {
+        warn!("cron: reload sender already installed, ignoring duplicate install");
+    }
+}
+
+/// Trigger a cron reload from anywhere in the crate. Returns `true` if the
+/// signal was sent, `false` if no sender is installed yet (during early
+/// startup) or if every receiver has been dropped.
+pub fn trigger_reload() -> bool {
+    match CRON_RELOAD_TX.get() {
+        Some(tx) => tx.send(()).is_ok(),
+        None => false,
+    }
+}
 
 #[cfg(test)]
 mod cron_config_equal_tests {

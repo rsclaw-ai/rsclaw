@@ -517,7 +517,7 @@ pub(crate) fn start_channels(
                                     peer_id: peer_id_s.clone(),
                                     dm_scope,
                                 });
-                                if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                                if let Some(mut reply) = try_preparse_locally(&text, &handle, "telegram", &peer_id_s).await {
                                     reply.target_id = chat_id_s;
                                     reply.is_group = is_group;
                                     if !reply.text.is_empty() || !reply.images.is_empty() {
