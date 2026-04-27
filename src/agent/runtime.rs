@@ -1012,11 +1012,12 @@ impl AgentRuntime {
                         let msg = binary_kept
                             .iter()
                             .map(|(name, subdir)| {
-                                if i18n_lang == "zh" {
-                                    format!("- {name} (已保留在 uploads/{subdir}/)")
-                                } else {
-                                    format!("- {name} (kept in uploads/{subdir}/)")
-                                }
+                                let suffix = crate::i18n::t_fmt(
+                                    "file_kept_in_uploads",
+                                    &i18n_lang,
+                                    &[("subdir", subdir.as_str())],
+                                );
+                                format!("- {name} {suffix}")
                             })
                             .collect::<Vec<_>>()
                             .join("\n");

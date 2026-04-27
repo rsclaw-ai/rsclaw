@@ -76,7 +76,10 @@
       },
       "nsis": {
         "languages": ["English", "SimpChinese", "TradChinese", "Japanese", "Korean", "French", "German", "Spanish", "Russian", "Thai"],
-        "displayLanguageSelector": false
+        "displayLanguageSelector": false,
+        "installerIcon": "icons/icon.ico",
+        "headerImage": "icons/nsis-header.bmp",
+        "sidebarImage": "icons/nsis-sidebar.bmp"
       }
     }
   },
