@@ -295,6 +295,15 @@ pub struct AgentDefaults {
     pub max_iterations: Option<u32>,
     /// Send intermediate text to user during multi-step tool calls. Default: true.
     pub intermediate_output: Option<bool>,
+    /// OpenCode ACP configuration for default agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opencode: Option<OpenCodeConfig>,
+    /// Claude Code ACP configuration for default agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claudecode: Option<ClaudeCodeConfig>,
+    /// Codex MCP configuration for default agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex: Option<CodexConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
