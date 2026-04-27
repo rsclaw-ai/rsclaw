@@ -132,11 +132,21 @@ impl AgentRuntime {
             .as_deref()
             .or(self.config.agents.defaults.workspace.as_deref())
             .map(expand_tilde)
-            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"))
-            .to_string_lossy()
-            .to_string();
+            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+        // Convert to Windows native path string (avoid MSYS2/Git Bash Unix-style paths)
+        // Don't use canonicalize() — it returns \\?\ prefix which breaks JSON serialization
+        let cwd_str = if cfg!(target_os = "windows") {
+            let abs_path = if cwd.is_absolute() {
+                cwd.clone()
+            } else {
+                std::env::current_dir().unwrap_or_default().join(&cwd)
+            };
+            abs_path.to_string_lossy().to_string()
+        } else {
+            cwd.to_string_lossy().to_string()
+        };
 
-        tracing::info!(cwd = %cwd, "OpenCode: using workspace directory");
+        tracing::info!(cwd = %cwd_str, "OpenCode: using workspace directory");
 
         let client = crate::acp::client::AcpClient::spawn(&command, &args).await?;
         client
@@ -151,7 +161,7 @@ impl AgentRuntime {
             .as_ref()
             .and_then(|c| c.model.clone())
             .or_else(|| std::env::var("OPENCODE_MODEL").ok());
-        let session_resp = client.create_session(&cwd, model.as_deref(), None).await?;
+        let session_resp = client.create_session(&cwd_str, model.as_deref(), None).await?;
 
         tracing::info!(
             session_id = %session_resp.session_id,
@@ -669,11 +679,21 @@ impl AgentRuntime {
             .as_deref()
             .or(self.config.agents.defaults.workspace.as_deref())
             .map(expand_tilde)
-            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"))
-            .to_string_lossy()
-            .to_string();
+            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+        // Convert to Windows native path string (avoid MSYS2/Git Bash Unix-style paths)
+        // Don't use canonicalize() — it returns \\?\ prefix which breaks JSON serialization
+        let cwd_str = if cfg!(target_os = "windows") {
+            let abs_path = if cwd.is_absolute() {
+                cwd.clone()
+            } else {
+                std::env::current_dir().unwrap_or_default().join(&cwd)
+            };
+            abs_path.to_string_lossy().to_string()
+        } else {
+            cwd.to_string_lossy().to_string()
+        };
 
-        tracing::info!(cwd = %cwd, args = ?args, "Claude Code: using workspace directory");
+        tracing::info!(cwd = %cwd_str, args = ?args, "Claude Code: using workspace directory");
 
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let client = crate::acp::client::AcpClient::spawn(&command, &args_ref).await?;
@@ -695,7 +715,7 @@ impl AgentRuntime {
             claudecode_config = ?self.handle.config.claudecode,
             "Claude Code: model configuration"
         );
-        let session_resp = client.create_session(&cwd, model.as_deref(), None).await?;
+        let session_resp = client.create_session(&cwd_str, model.as_deref(), None).await?;
 
         tracing::info!(
             session_id = %session_resp.session_id,
