@@ -538,8 +538,6 @@ pub struct ResolvedRefs {
 ///   `<workspace>/uploads/<category>/`
 /// * `@dl_<kind>_<suffix>.<ext>` — generated/downloaded by a plugin;
 ///   lives under `~/Downloads/rsclaw/<category>/`
-/// * `@<kind>_<suffix>.<ext>` — legacy upload format (no `up_` prefix);
-///   resolves like `up_*` for backward compatibility
 ///
 /// Image references are collected in `image_paths` so the caller can
 /// load them as vision attachments.
@@ -553,16 +551,14 @@ pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> ResolvedRef
         })
         .join("rsclaw");
 
-    // Capture optional `up_`/`dl_` source prefix and the kind letter so
-    // we can route to the right root without re-parsing inside the loop.
-    let re = regex::Regex::new(r"@((up|dl)_)?([ivdaf])_([a-z0-9_]+)\.(\w+)")
+    let re = regex::Regex::new(r"@(up|dl)_([ivdaf])_([a-z0-9_]+)\.(\w+)")
         .expect("valid regex");
 
     let mut resolved = Vec::new();
     let mut image_paths = Vec::new();
     for cap in re.captures_iter(text) {
-        let source = cap.get(2).map(|m| m.as_str()).unwrap_or("up");
-        let kind = cap.get(3).and_then(|m| m.as_str().chars().next()).unwrap_or('f');
+        let source = &cap[1];
+        let kind = cap[2].chars().next().unwrap_or('f');
         let full_name = &cap[0][1..]; // strip the leading '@'
         let subdir = category_for_kind(kind);
         let path = match source {
