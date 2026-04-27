@@ -949,8 +949,15 @@ impl TaskQueueWorker {
                 break;
             }
 
-            // Wait for reply (10 min timeout per turn).
-            let reply = match tokio::time::timeout(Duration::from_secs(600), reply_rx).await {
+            // Wait for reply (45 min per turn). Long enough to cover the
+            // worst observed jimeng video flow: ~30 min queue wait + ~10
+            // min actual generation + downloads/sends. Setting it lower
+            // would kill the agent mid-task while the upstream provider
+            // is still working, and the user doesn't know the partial
+            // result happened. Lowering this knob is fine for deploys
+            // that don't run video gen, but the default has to cover
+            // it because that's our largest legitimate per-turn wait.
+            let reply = match tokio::time::timeout(Duration::from_secs(2700), reply_rx).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(_)) => {
                     error!(task_id = %task_id, turn, "task queue worker: reply channel dropped");
@@ -963,8 +970,8 @@ impl TaskQueueWorker {
                     break;
                 }
                 Err(_) => {
-                    error!(task_id = %task_id, turn, "task queue worker: reply timeout (600s)");
-                    self.notify_user_failure(&channel_name, &target, is_group, reply_to.clone(), turn, "reply timeout (600s)").await;
+                    error!(task_id = %task_id, turn, "task queue worker: reply timeout (2700s)");
+                    self.notify_user_failure(&channel_name, &target, is_group, reply_to.clone(), turn, "reply timeout (45m)").await;
                     match self.manager.fail(&task_id, "reply timeout", task.max_retries) {
                         Ok(TaskStatus::Dead) => cleanup_staged_files(&task),
                         Err(fe) => error!(task_id = %task_id, "fail() error: {fe:#}"),
