@@ -161,8 +161,21 @@ impl MemoryDoc {
         let was_core = self.tier == MemDocTier::Core;
         let score = self.relevance_score();
 
-        // Promote to Core: access_count >= 10 AND importance >= 0.8
-        if self.access_count >= 10 && self.importance >= 0.8 {
+        // Promote to Core via three independent paths:
+        //   1. Very frequent recall alone (>=15) — the doc has earned its
+        //      place through sheer utility even without positive feedback.
+        //   2. Very high importance alone (>=0.9) — strong positive signal
+        //      from outcome inference is enough on its own.
+        //   3. Both decent (>=5 access AND >=0.8 importance) — earlier
+        //      threshold than path (1) but compounded.
+        //
+        // The previous AND-gate (>=10 AND >=0.8) made promotion compound-rare,
+        // which combined with cluster_size >= 3 effectively starved the
+        // crystallization pipeline.
+        if self.access_count >= 15
+            || self.importance >= 0.9
+            || (self.access_count >= 5 && self.importance >= 0.8)
+        {
             self.tier = MemDocTier::Core;
             return !was_core;
         }
