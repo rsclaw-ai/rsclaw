@@ -902,8 +902,8 @@ impl FeishuChannel {
                         }
                     }
                 }
-                // Image with no text — use placeholder.
-                crate::i18n::t("describe_image", crate::i18n::default_lang())
+                // Image with no text — empty (runtime handles save notification).
+                String::new()
             }
             "media" => {
                 // Video: download and transcribe audio track

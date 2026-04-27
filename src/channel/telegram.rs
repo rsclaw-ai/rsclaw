@@ -803,7 +803,7 @@ impl Channel for TelegramChannel {
                                         t
                                     } else if msg.photo.is_some() {
                                         // Photo with no caption — use placeholder text.
-                                        crate::i18n::t("describe_image", crate::i18n::default_lang())
+                                        String::new()
                                     } else {
                                         continue;
                                     };

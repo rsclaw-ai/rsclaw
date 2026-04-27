@@ -551,7 +551,7 @@ impl DingTalkChannel {
                                 mime_type: "image/png".to_owned(),
                             });
                             info!(size = bytes.len(), "DingTalk image downloaded");
-                            crate::i18n::t("describe_image", crate::i18n::default_lang())
+                            String::new()
                         }
                         Err(e) => {
                             warn!("DingTalk image download failed: {e:#}");
@@ -581,7 +581,7 @@ impl DingTalkChannel {
                                         data: format!("data:image/png;base64,{b64}"),
                                         mime_type: "image/png".to_owned(),
                                     });
-                                    crate::i18n::t("describe_image", crate::i18n::default_lang())
+                                    String::new()
                                 }
                                 Err(e) => {
                                     warn!("DingTalk image URL download failed: {e:#}");
