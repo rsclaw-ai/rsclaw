@@ -803,7 +803,7 @@ export const ALL_PROVIDERS: Record<string, ProviderDef> = {
   siliconflow: { id: "siliconflow", name: "SiliconFlow",        tag: "\u56FD\u5185\u52A0\u901F",      tagEn: "China accel",       keyLabel: "SiliconFlow Key",     keyPlaceholder: "sk-..." },
 };
 
-export const PROV_ORDER_ZH = ["doubao","qwen","custom","codingplan","minimax","deepseek","kimi","zhipu","ollama","gaterouter","openrouter","anthropic","openai","gemini","grok","groq","siliconflow"];
+export const PROV_ORDER_ZH = ["qwen","deepseek","doubao","custom","codingplan","minimax","kimi","zhipu","ollama","gaterouter","openrouter","anthropic","openai","gemini","grok","groq","siliconflow"];
 export const PROV_ORDER_EN = ["anthropic","openai","gemini","grok","openrouter","ollama","custom","codingplan","groq","doubao","qwen","minimax","deepseek","kimi","zhipu","gaterouter","siliconflow"];
 
 function getProviders(lang?: string): ProviderDef[] {
