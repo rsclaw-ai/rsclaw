@@ -787,6 +787,18 @@ impl AgentRuntime {
         images: Vec<super::registry::ImageAttachment>,
         files: Vec<super::registry::FileAttachment>,
     ) -> Result<AgentReply> {
+        // Resolve @file references (e.g. @i_2604271325ab.png → full path).
+        let workspace = self
+            .handle
+            .config
+            .workspace
+            .as_deref()
+            .or(self.live.agents.read().await.defaults.workspace.as_deref())
+            .map(expand_tilde)
+            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+        let text = &crate::channel::resolve_file_refs(text, &workspace);
+        let text = text.as_str();
+
         // Resolve session key alias: if this key maps to a canonical (migrated)
         // key, use that so all messages stay under one session.
         let session_key = self.resolve_session_key(session_key).to_owned();
@@ -1922,7 +1934,7 @@ impl AgentRuntime {
                 let has_text = extracted.is_some();
                 let est_tokens = extracted.as_ref().map(|t| estimate_tokens(t)).unwrap_or(0);
 
-                file_info.push((file.filename.clone(), size, has_text, est_tokens));
+                file_info.push((std_name.clone(), size, has_text, est_tokens));
 
                 // Store pending for later analysis
                 let path =
@@ -1983,7 +1995,17 @@ impl AgentRuntime {
                 // Binary only -- simplified menu.
                 "1. Keep\n2. Delete".to_owned()
             };
-            let reply = format!("{saved_msg}\n{file_list}\n\n{menu_msg}");
+            let ref_hint = file_info
+                .iter()
+                .map(|(name, _, _, _)| format!("@{name}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let ref_msg = if i18n_lang == "zh" {
+                format!("引用: {ref_hint}")
+            } else {
+                format!("Reference: {ref_hint}")
+            };
+            let reply = format!("{saved_msg}\n{file_list}\n{ref_msg}\n\n{menu_msg}");
             return Ok(AgentReply {
                 text: reply,
                 is_empty: false,
@@ -2216,6 +2238,7 @@ impl AgentRuntime {
         // ---------------------------------------------------------------
         let mut media_descriptions = Vec::<String>::new();
         let mut vision_images_for_current_turn = Vec::<String>::new(); // base64 URIs for vision model
+        let mut img_save_idx: usize = 0;
 
         // Auto-save received images to uploads/images/ for persistence.
         let images_dir = self
@@ -2228,6 +2251,7 @@ impl AgentRuntime {
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"))
             .join("uploads/images");
         let _ = std::fs::create_dir_all(&images_dir);
+        let mut saved_image_names: Vec<String> = Vec::new();
 
         for img in &images {
             // Save original image to uploads/images/.
@@ -2250,6 +2274,7 @@ impl AgentRuntime {
                     let dest = images_dir.join(&filename);
                     if std::fs::write(&dest, &bytes).is_ok() {
                         info!(path = %dest.display(), size = bytes.len(), "image auto-saved to uploads");
+                        saved_image_names.push(filename);
                     }
                 }
             }
@@ -2319,15 +2344,24 @@ impl AgentRuntime {
                 };
 
                 if vision_model.is_empty() {
-                    media_descriptions.push("[图片] (无视觉模型可用)".to_owned());
+                    let ref_tag = saved_image_names.get(img_save_idx).map(|n| format!(" (ref: @{n})")).unwrap_or_default();
+                    media_descriptions.push(format!("[图片]{ref_tag} (no vision model)"));
+                    img_save_idx += 1;
                 } else {
                     let desc = crate::agent::context_mgr::describe_image_via_llm(
                         &img.data, &vision_model, &mut self.failover, &self.providers,
                     ).await;
                     match desc {
-                        Some(d) => media_descriptions.push(format!("[图片] {d}")),
-                        None => media_descriptions.push("[图片] (无法生成描述)".to_owned()),
+                        Some(d) => {
+                            let ref_tag = saved_image_names.get(img_save_idx).map(|n| format!(" (ref: @{n})")).unwrap_or_default();
+                            media_descriptions.push(format!("[图片]{ref_tag} {d}"));
+                        }
+                        None => {
+                            let ref_tag = saved_image_names.get(img_save_idx).map(|n| format!(" (ref: @{n})")).unwrap_or_default();
+                            media_descriptions.push(format!("[图片]{ref_tag} (description failed)"));
+                        }
                     }
+                    img_save_idx += 1;
                 }
             }
         }

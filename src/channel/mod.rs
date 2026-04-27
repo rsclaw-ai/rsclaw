@@ -482,6 +482,50 @@ pub fn upload_filename(mime_type: &str, original_filename: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// @-reference resolver
+// ---------------------------------------------------------------------------
+
+/// Scan text for `@{prefix}_{timestamp}{ab}.{ext}` references and resolve
+/// them to full paths under `workspace/uploads/`.
+///
+/// Returns the original text with a `[refs]` block appended if any
+/// references were found and resolved.
+///
+/// Pattern: `@[ivdaf]_\w+\.\w+`
+pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> String {
+    let uploads = workspace.join("uploads");
+    let re = regex::Regex::new(r"@([ivdaf]_[a-z0-9]+\.\w+)").expect("valid regex");
+
+    let mut resolved = Vec::new();
+    for cap in re.captures_iter(text) {
+        let filename = &cap[1];
+        let prefix = filename.chars().next().unwrap_or('f');
+        let subdir = match prefix {
+            'i' => "images",
+            'v' => "videos",
+            'a' => "audios",
+            'd' => "docs",
+            _ => "files",
+        };
+        let path = uploads.join(subdir).join(filename);
+        if path.exists() {
+            resolved.push((filename.to_string(), path.to_string_lossy().to_string()));
+        }
+    }
+
+    if resolved.is_empty() {
+        return text.to_string();
+    }
+
+    let mut result = text.to_string();
+    result.push_str("\n\n[file references]\n");
+    for (name, path) in &resolved {
+        result.push_str(&format!("@{name} = {path}\n"));
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
 // ChannelManager — concurrent channel limit (AGENTS.md §18)
 // ---------------------------------------------------------------------------
 
