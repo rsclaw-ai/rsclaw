@@ -410,7 +410,7 @@ impl AgentRuntime {
     ///
     /// Supports Seedance (ByteDance ARK), MiniMax (Hailuo), and Kling (Kuaishou).
     /// All three use async task-based APIs: submit → poll → download.
-    pub(crate) async fn tool_video(&self, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_video(&self, args: Value, ctx: &super::runtime::RunContext) -> Result<Value> {
         let prompt = args["prompt"]
             .as_str()
             .ok_or_else(|| anyhow!("video_gen: `prompt` required"))?;
@@ -534,13 +534,56 @@ impl AgentRuntime {
         let prompt_preview: String = prompt.chars().take(80).collect();
         tracing::info!(provider, prompt = prompt_preview, duration, aspect_ratio, "tool_video: starting");
 
+        // Async path for Seedance: submit immediately, hand off to the
+        // ExternalJobsWorker which polls + delivers the artifact when ready.
+        // Survives gateway restarts because the job row lives in redb.
+        if provider == "doubao" {
+            let key = api_key.ok_or_else(|| anyhow!("video_gen: no API key for doubao/Seedance"))?;
+            let task_id = crate::gateway::external_jobs_worker::submit_seedance(
+                &client,
+                &key,
+                prompt,
+                duration,
+                aspect_ratio,
+                user_video_model.as_deref(),
+            )
+            .await?;
+            tracing::info!(task_id, "tool_video: seedance task submitted (async)");
+
+            let job = crate::gateway::external_jobs::ExternalJob::new_submitted(
+                ctx.session_key.clone(),
+                crate::gateway::external_jobs::ExternalJobDelivery {
+                    channel: ctx.channel.clone(),
+                    target_id: if ctx.chat_id.is_empty() {
+                        ctx.peer_id.clone()
+                    } else {
+                        ctx.chat_id.clone()
+                    },
+                    is_group: !ctx.chat_id.is_empty() && ctx.chat_id != ctx.peer_id,
+                    reply_to: None,
+                },
+                crate::gateway::external_jobs::ExternalJobOrigin::Agent,
+                "seedance",
+                &task_id,
+                crate::gateway::external_jobs::ExternalJobKind::VideoGen,
+                prompt,
+            );
+            let job_id = job.id.clone();
+            self.store.db.enqueue_external_job(&job)
+                .map_err(|e| anyhow!("video_gen: enqueue external job: {e}"))?;
+
+            return Ok(json!({
+                "status": "submitted",
+                "provider": "seedance",
+                "task_id": task_id,
+                "job_id": job_id,
+                "message": "Video generation submitted. The finished video will be delivered automatically when ready (typically 30s–5min). The user has been informed; do NOT poll or wait — your turn is complete."
+            }));
+        }
+
         let video_url = match provider {
             "llamacpp" => {
                 video_gen_llamacpp(&client, prompt, duration, aspect_ratio, user_video_model.as_deref()).await?
-            }
-            "doubao" => {
-                let key = api_key.ok_or_else(|| anyhow!("video_gen: no API key for doubao/Seedance"))?;
-                video_gen_seedance(&client, &key, prompt, duration, aspect_ratio, user_video_model.as_deref()).await?
             }
             "minimax" => {
                 let key = api_key.ok_or_else(|| anyhow!("video_gen: no API key for MiniMax"))?;
@@ -1395,93 +1438,6 @@ async fn video_gen_llamacpp(
     // The result is either a file path, a URL, or a base64 data URI —
     // return it directly; tool_video will handle download/copy.
     Ok(result)
-}
-
-/// Generate video via ByteDance ARK Seedance 2.0.
-///
-/// API: POST /api/v3/contents/generations/tasks → task_id
-/// Poll: GET /api/v3/contents/generations/tasks/{id} until status == "succeeded"
-async fn video_gen_seedance(
-    client: &reqwest::Client,
-    api_key: &str,
-    prompt: &str,
-    duration: u64,
-    aspect_ratio: &str,
-    model_override: Option<&str>,
-) -> anyhow::Result<String> {
-    let model = model_override.unwrap_or("doubao-seedance-2-0-260128");
-    let base = "https://ark.cn-beijing.volces.com/api/v3";
-
-    // Submit task.
-    let body = json!({
-        "model": model,
-        "content": [{"type": "text", "text": prompt}],
-        "ratio": aspect_ratio,
-        "duration": duration,
-        "watermark": false
-    });
-    let resp: serde_json::Value = client
-        .post(format!("{base}/contents/generations/tasks"))
-        .bearer_auth(&api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| anyhow!("seedance: submit failed: {e}"))?
-        .json()
-        .await
-        .map_err(|e| anyhow!("seedance: submit parse failed: {e}"))?;
-
-    let task_id = resp["id"]
-        .as_str()
-        .ok_or_else(|| anyhow!("seedance: no task id in response: {resp}"))?
-        .to_owned();
-
-    tracing::info!(task_id, "seedance: task submitted, polling");
-
-    // Poll until done (max 10 min, every 5s).
-    for _ in 0..120 {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        let poll: serde_json::Value = client
-            .get(format!("{base}/contents/generations/tasks/{task_id}"))
-            .bearer_auth(&api_key)
-            .send()
-            .await
-            .map_err(|e| anyhow!("seedance: poll failed: {e}"))?
-            .json()
-            .await
-            .map_err(|e| anyhow!("seedance: poll parse failed: {e}"))?;
-
-        let status = poll["status"].as_str().unwrap_or("unknown");
-        tracing::debug!(task_id, status, "seedance: poll");
-
-        match status {
-            "succeeded" => {
-                // ARK content generation response:
-                // {content: [{type:"video_url", video_url:{url:"..."}}]}
-                // Actual API returns {content: {video_url: "https://..."}}
-                // (not array format from docs).
-                let url = poll
-                    .pointer("/content/video_url")
-                    .or_else(|| poll.pointer("/content/0/video_url/url"))
-                    .or_else(|| poll.pointer("/content/0/url"))
-                    .or_else(|| poll.pointer("/result/video_url/url"))
-                    .or_else(|| poll.pointer("/output/url"))
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("seedance: no video URL in result: {poll}"))?
-                    .to_owned();
-                return Ok(url);
-            }
-            "failed" | "cancelled" => {
-                let msg = poll["error"]["message"]
-                    .as_str()
-                    .or_else(|| poll["message"].as_str())
-                    .unwrap_or("task failed");
-                bail!("seedance: task {task_id} {status}: {msg}");
-            }
-            _ => continue,
-        }
-    }
-    bail!("seedance: task {task_id} timed out after 10 minutes")
 }
 
 /// Generate video via MiniMax (Hailuo) video generation API.

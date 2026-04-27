@@ -44,6 +44,18 @@ pub enum ExternalJobOrigin {
     UserDirect,
 }
 
+/// What a single provider poll returned. Worker uses this to decide
+/// whether to keep polling, deliver the artifact, or surface a failure.
+#[derive(Debug, Clone)]
+pub enum PollOutcome {
+    /// Provider says the job is still in progress — schedule another poll.
+    Pending,
+    /// Provider returned the artifact URL.
+    Done(String),
+    /// Provider reported a non-recoverable failure.
+    Failed(String),
+}
+
 /// Lifecycle of an external job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExternalJobStatus {

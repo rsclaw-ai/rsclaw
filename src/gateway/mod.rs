@@ -8,6 +8,7 @@
 
 pub mod channels;
 pub mod external_jobs;
+pub mod external_jobs_worker;
 pub mod hot_reload;
 pub mod live_config;
 pub mod preparse;
