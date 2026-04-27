@@ -374,7 +374,8 @@ impl DiscordChannel {
                             "op": 2,
                             "d": {
                                 "token": self.token,
-                                "intents": (1u32 << 9) | (1u32 << 12),
+                                // GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT
+                                "intents": (1u32 << 9) | (1u32 << 12) | (1u32 << 15),
                                 "properties": {
                                     "os": "linux",
                                     "browser": "rsclaw",
