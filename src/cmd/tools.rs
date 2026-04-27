@@ -224,7 +224,7 @@ fn resolve_tool_name(name: &str) -> &str {
     }
 }
 
-async fn cmd_install(name: &str, force: bool) -> Result<()> {
+pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
     let name = resolve_tool_name(name);
     let names: Vec<&str> = if name == "all" {
         TOOLS.iter().map(|d| d.name).collect()

@@ -2321,6 +2321,7 @@ impl BrowserSession {
             let save_path = save_screenshot_bytes(data, format).await?;
             return Ok(json!({
                 "action": "screenshot",
+                "image": format!("data:{};base64,{}", mime, data),
                 "image_path": save_path,
                 "mime": mime,
                 "legend": legend,
@@ -2331,8 +2332,15 @@ impl BrowserSession {
         let data = result.get("data").and_then(|v| v.as_str()).unwrap_or("");
         let save_path = save_screenshot_bytes(data, format).await?;
 
+        // Return both the data URI (for callers that want to forward
+        // it inline — wasm plugins do this for IM-channel media) and
+        // the saved-on-disk path (for callers that want to reference
+        // the file by path — agent skill / debug viewers). The wasm
+        // browser_action extractor picks `image` first so the plugin's
+        // host::browser_screenshot() returns the data URI directly.
         Ok(json!({
             "action": "screenshot",
+            "image": format!("data:{};base64,{}", mime, data),
             "image_path": save_path,
             "mime": mime,
         }))

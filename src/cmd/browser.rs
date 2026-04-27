@@ -11,8 +11,7 @@ pub async fn cmd_browser(sub: BrowserCommand) -> Result<()> {
         eprintln!("Connected to existing Chrome");
         crate::browser::BrowserSession::connect_existing_reuse(&ws_url).await?
     } else {
-        let chrome_path = crate::agent::platform::detect_chrome()
-            .ok_or_else(|| anyhow::anyhow!("Chrome not found. Install with: rsclaw tools install chrome"))?;
+        let chrome_path = crate::agent::platform::ensure_chrome().await?;
         eprintln!("Launching headless Chrome");
         crate::browser::BrowserSession::start(&chrome_path, false, None).await?
     };

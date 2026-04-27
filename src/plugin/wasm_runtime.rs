@@ -408,6 +408,73 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
         }
     }
 
+    async fn notify_with_image(
+        &mut self,
+        message: String,
+        image_data_uri: String,
+    ) -> Result<Result<String, String>> {
+        tracing::info!(target: "wasm_plugin_notify", "{message}");
+        if let Some(ctx) = &self.notify_ctx {
+            match ctx.tx.send(crate::channel::OutboundMessage {
+                target_id: ctx.target_id.clone(),
+                is_group: false,
+                text: message,
+                reply_to: None,
+                images: vec![image_data_uri],
+                files: vec![],
+                channel: Some(ctx.channel.clone()),
+            }) {
+                Ok(_) => Ok(Ok("dispatched".to_string())),
+                Err(_) => Ok(Ok("no_receivers".to_string())),
+            }
+        } else {
+            Ok(Ok("logged_only".to_string()))
+        }
+    }
+
+    async fn notify_with_file(
+        &mut self,
+        message: String,
+        file_path: String,
+        mime: String,
+    ) -> Result<Result<String, String>> {
+        tracing::info!(target: "wasm_plugin_notify", "{message}");
+        if let Some(ctx) = &self.notify_ctx {
+            // Enforce workspace allowlist on the supplied path. Plugins
+            // can only attach files that already live under the workspace
+            // dir — same containment rule used by `read_file`.
+            let canonical = match canonicalize_plugin_path(&file_path) {
+                Ok(p) => p,
+                Err(e) => return Ok(Err(e)),
+            };
+            if !canonical.exists() {
+                return Ok(Err(format!(
+                    "notify_with_file: file does not exist: {}",
+                    canonical.display()
+                )));
+            }
+            let filename = canonical
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "file".to_string());
+            let path_str = canonical.to_string_lossy().into_owned();
+            match ctx.tx.send(crate::channel::OutboundMessage {
+                target_id: ctx.target_id.clone(),
+                is_group: false,
+                text: message,
+                reply_to: None,
+                images: vec![],
+                files: vec![(filename, mime, path_str)],
+                channel: Some(ctx.channel.clone()),
+            }) {
+                Ok(_) => Ok(Ok("dispatched".to_string())),
+                Err(_) => Ok(Ok("no_receivers".to_string())),
+            }
+        } else {
+            Ok(Ok("logged_only".to_string()))
+        }
+    }
+
     async fn read_file(&mut self, path: String) -> Result<Result<String, String>> {
         let canonical = match canonicalize_plugin_path(&path) {
             Ok(p) => p,
@@ -477,8 +544,9 @@ impl HostState {
         // Auto-start browser if not initialized.
         if guard.is_none() {
             tracing::info!("WASM plugin: auto-starting browser session");
-            let chrome_path = crate::agent::platform::detect_chrome()
-                .ok_or_else(|| "Chrome not found on this system".to_string())?;
+            let chrome_path = crate::agent::platform::ensure_chrome()
+                .await
+                .map_err(|e| format!("failed to obtain Chrome: {e:#}"))?;
             // All wasm plugins share one Chrome profile so that auth state
             // (cookies, localStorage) is reused across the session — e.g.
             // a single login to Bytedance covers jimeng + douyin + xianyu.
