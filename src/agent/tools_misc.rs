@@ -451,9 +451,7 @@ impl AgentRuntime {
 
         // Determine provider from configured model or model_hint.
         let provider = if let Some(hint) = &model_hint {
-            if hint.contains("llama") || hint.contains("local") {
-                "llamacpp"
-            } else if hint.contains("kling") || hint.contains("kuaishou") {
+            if hint.contains("kling") || hint.contains("kuaishou") {
                 "kling"
             } else if hint.contains("minimax") || hint.contains("hailuo") {
                 "minimax"
@@ -462,11 +460,7 @@ impl AgentRuntime {
             }
         } else if let Some(ref vm) = user_video_model {
             let vm = vm.to_lowercase();
-            if vm.contains("llama") || vm.contains("local") || vm.starts_with("http://127.")
-                || vm.starts_with("http://localhost")
-            {
-                "llamacpp"
-            } else if vm.contains("kling") {
+            if vm.contains("kling") {
                 "kling"
             } else if vm.contains("minimax") || vm.contains("hailuo") {
                 "minimax"
@@ -474,15 +468,12 @@ impl AgentRuntime {
                 "doubao"
             }
         } else {
-            // Auto-detect: check provider config first, then env vars.
-            let has_local = std::env::var("LLAMA_VIDEO_URL").is_ok();
+            // Auto-detect: pick the first configured provider.
             let has_ark = resolve_key("doubao", "ARK_API_KEY").is_some();
             let has_minimax = resolve_key("minimax", "MINIMAX_API_KEY").is_some();
             let has_kling = resolve_key("kling", "KLING_ACCESS_KEY").is_some()
                 || std::env::var("KLING_ACCESS_KEY").is_ok();
-            if has_local {
-                "llamacpp"
-            } else if has_ark {
+            if has_ark {
                 "doubao"
             } else if has_minimax {
                 "minimax"
@@ -490,7 +481,7 @@ impl AgentRuntime {
                 "kling"
             } else {
                 return Ok(json!({
-                    "error": "No video provider configured. Configure a provider with API key in rsclaw.json5, or set env vars: LLAMA_VIDEO_URL, ARK_API_KEY, MINIMAX_API_KEY, KLING_ACCESS_KEY+KLING_SECRET_KEY."
+                    "error": "No video provider configured. Configure a provider with API key in rsclaw.json5, or set env vars: ARK_API_KEY, MINIMAX_API_KEY, KLING_ACCESS_KEY+KLING_SECRET_KEY."
                 }));
             }
         };
@@ -499,8 +490,7 @@ impl AgentRuntime {
         let api_key = match provider {
             "doubao" => resolve_key("doubao", "ARK_API_KEY"),
             "minimax" => resolve_key("minimax", "MINIMAX_API_KEY"),
-            "kling" => None, // Kling uses access_key + secret_key pair, resolved inside video_gen_kling
-            "llamacpp" => None, // local, no key needed
+            "kling" => None, // Kling uses access_key + secret_key pair, resolved below
             _ => None,
         };
 
@@ -534,130 +524,66 @@ impl AgentRuntime {
         let prompt_preview: String = prompt.chars().take(80).collect();
         tracing::info!(provider, prompt = prompt_preview, duration, aspect_ratio, "tool_video: starting");
 
-        // Async path for HTTP-API providers (Seedance / MiniMax / Kling):
-        // submit immediately, hand off to the ExternalJobsWorker which polls
-        // + delivers the artifact when ready. Survives gateway restarts
-        // because the job row lives in redb. llamacpp stays sync below
-        // because it's a local server — no benefit to the async path.
-        if matches!(provider, "doubao" | "minimax" | "kling") {
-            let (provider_key, task_id) = match provider {
-                "doubao" => {
-                    let key = api_key.ok_or_else(|| anyhow!("video_gen: no API key for doubao/Seedance"))?;
-                    let id = crate::gateway::external_jobs_worker::submit_seedance(
-                        &client, &key, prompt, duration, aspect_ratio, user_video_model.as_deref(),
-                    ).await?;
-                    ("seedance", id)
-                }
-                "minimax" => {
-                    let key = api_key.ok_or_else(|| anyhow!("video_gen: no API key for MiniMax"))?;
-                    let id = crate::gateway::external_jobs_worker::submit_minimax(
-                        &client, &key, prompt, duration, aspect_ratio, user_video_model.as_deref(),
-                    ).await?;
-                    ("minimax", id)
-                }
-                "kling" => {
-                    let (ak, sk) = kling_keys.unwrap_or((None, None));
-                    let access = ak.ok_or_else(|| anyhow!("video_gen: KLING_ACCESS_KEY not configured"))?;
-                    let secret = sk.ok_or_else(|| anyhow!("video_gen: KLING_SECRET_KEY not configured"))?;
-                    let id = crate::gateway::external_jobs_worker::submit_kling(
-                        &client, &access, &secret, prompt, duration, aspect_ratio, user_video_model.as_deref(),
-                    ).await?;
-                    ("kling", id)
-                }
-                _ => unreachable!(),
-            };
-            tracing::info!(provider = provider_key, task_id, "tool_video: task submitted (async)");
-
-            let job = crate::gateway::external_jobs::ExternalJob::new_submitted(
-                ctx.session_key.clone(),
-                crate::gateway::external_jobs::ExternalJobDelivery {
-                    channel: ctx.channel.clone(),
-                    target_id: if ctx.chat_id.is_empty() {
-                        ctx.peer_id.clone()
-                    } else {
-                        ctx.chat_id.clone()
-                    },
-                    is_group: !ctx.chat_id.is_empty() && ctx.chat_id != ctx.peer_id,
-                    reply_to: None,
-                },
-                crate::gateway::external_jobs::ExternalJobOrigin::Agent,
-                provider_key,
-                &task_id,
-                crate::gateway::external_jobs::ExternalJobKind::VideoGen,
-                prompt,
-            );
-            let job_id = job.id.clone();
-            self.store.db.enqueue_external_job(&job)
-                .map_err(|e| anyhow!("video_gen: enqueue external job: {e}"))?;
-
-            return Ok(json!({
-                "status": "submitted",
-                "provider": provider_key,
-                "task_id": task_id,
-                "job_id": job_id,
-                "message": "Video generation submitted. The finished video will be delivered automatically when ready (typically 30s–5min). The user has been informed; do NOT poll or wait — your turn is complete."
-            }));
-        }
-
-        // Only llamacpp reaches this point — the HTTP-API providers (doubao
-        // / minimax / kling) returned earlier through the async path.
-        let video_url = match provider {
-            "llamacpp" => {
-                video_gen_llamacpp(&client, prompt, duration, aspect_ratio, user_video_model.as_deref()).await?
+        // All supported providers are async HTTP APIs: submit, persist an
+        // ExternalJob with delivery context, return immediately. The
+        // ExternalJobsWorker polls + delivers the artifact when ready and
+        // the row in redb keeps the work alive across gateway restarts.
+        let (provider_key, task_id) = match provider {
+            "doubao" => {
+                let key = api_key.ok_or_else(|| anyhow!("video_gen: no API key for doubao/Seedance"))?;
+                let id = crate::gateway::external_jobs_worker::submit_seedance(
+                    &client, &key, prompt, duration, aspect_ratio, user_video_model.as_deref(),
+                ).await?;
+                ("seedance", id)
             }
-            _ => bail!("video_gen: unknown provider {provider}"),
+            "minimax" => {
+                let key = api_key.ok_or_else(|| anyhow!("video_gen: no API key for MiniMax"))?;
+                let id = crate::gateway::external_jobs_worker::submit_minimax(
+                    &client, &key, prompt, duration, aspect_ratio, user_video_model.as_deref(),
+                ).await?;
+                ("minimax", id)
+            }
+            "kling" => {
+                let (ak, sk) = kling_keys.unwrap_or((None, None));
+                let access = ak.ok_or_else(|| anyhow!("video_gen: KLING_ACCESS_KEY not configured"))?;
+                let secret = sk.ok_or_else(|| anyhow!("video_gen: KLING_SECRET_KEY not configured"))?;
+                let id = crate::gateway::external_jobs_worker::submit_kling(
+                    &client, &access, &secret, prompt, duration, aspect_ratio, user_video_model.as_deref(),
+                ).await?;
+                ("kling", id)
+            }
+            other => bail!("video_gen: unsupported provider {other}"),
         };
+        tracing::info!(provider = provider_key, task_id, "tool_video: task submitted (async)");
 
-        // Resolve video to a local temp file (download URL, copy local path, or decode base64).
-        let ext = if video_url.ends_with(".gif") { "gif" } else { "mp4" };
-        let tmp_path = std::env::temp_dir().join(format!(
-            "rsclaw_video_{}.{ext}",
-            chrono::Utc::now().timestamp_millis()
-        ));
-
-        if video_url.starts_with("data:") {
-            // base64 data URI: data:video/mp4;base64,<data>
-            use base64::Engine;
-            let b64 = video_url
-                .splitn(2, ',')
-                .nth(1)
-                .ok_or_else(|| anyhow!("video_gen: malformed data URI"))?;
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(b64)
-                .map_err(|e| anyhow!("video_gen: base64 decode failed: {e}"))?;
-            std::fs::write(&tmp_path, &bytes)
-                .map_err(|e| anyhow!("video_gen: write temp file failed: {e}"))?;
-        } else if video_url.starts_with('/') || video_url.starts_with("./") {
-            // Local file path returned by llama.cpp server — copy to our temp path.
-            std::fs::copy(&video_url, &tmp_path)
-                .map_err(|e| anyhow!("video_gen: copy local file failed: {e}"))?;
-        } else {
-            // HTTP URL — download.
-            let dl_client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .build()
-                .unwrap_or_default();
-            let video_bytes = dl_client
-                .get(&video_url)
-                .send()
-                .await
-                .map_err(|e| anyhow!("video_gen: download failed: {e}"))?
-                .bytes()
-                .await
-                .map_err(|e| anyhow!("video_gen: read bytes failed: {e}"))?;
-            std::fs::write(&tmp_path, &video_bytes)
-                .map_err(|e| anyhow!("video_gen: write temp file failed: {e}"))?;
-        }
-
-        let filename = format!("video_{}.{ext}", chrono::Utc::now().format("%Y%m%d_%H%M%S"));
-        let file_size = std::fs::metadata(&tmp_path).map(|m| m.len()).unwrap_or(0);
-        tracing::info!(path = %tmp_path.display(), bytes = file_size, "tool_video: done");
+        let job = crate::gateway::external_jobs::ExternalJob::new_submitted(
+            ctx.session_key.clone(),
+            crate::gateway::external_jobs::ExternalJobDelivery {
+                channel: ctx.channel.clone(),
+                target_id: if ctx.chat_id.is_empty() {
+                    ctx.peer_id.clone()
+                } else {
+                    ctx.chat_id.clone()
+                },
+                is_group: !ctx.chat_id.is_empty() && ctx.chat_id != ctx.peer_id,
+                reply_to: None,
+            },
+            crate::gateway::external_jobs::ExternalJobOrigin::Agent,
+            provider_key,
+            &task_id,
+            crate::gateway::external_jobs::ExternalJobKind::VideoGen,
+            prompt,
+        );
+        let job_id = job.id.clone();
+        self.store.db.enqueue_external_job(&job)
+            .map_err(|e| anyhow!("video_gen: enqueue external job: {e}"))?;
 
         Ok(json!({
-            "__send_file": true,
-            "path": tmp_path.to_string_lossy(),
-            "filename": filename,
-            "mime_type": if ext == "gif" { "image/gif" } else { "video/mp4" }
+            "status": "submitted",
+            "provider": provider_key,
+            "task_id": task_id,
+            "job_id": job_id,
+            "message": "Video generation submitted. The finished video will be delivered automatically when ready (typically 30s–5min). The user has been informed; do NOT poll or wait — your turn is complete."
         }))
     }
 
@@ -1350,103 +1276,5 @@ $synth.Speak('{}')
             )
         }))
     }
-}
-
-// ---------------------------------------------------------------------------
-// Video generation — per-provider free functions
-// ---------------------------------------------------------------------------
-
-/// Generate video via a local llama.cpp-compatible video model server.
-///
-/// Uses the same OpenAI-compatible streaming protocol as regular llama.cpp.
-/// Configure with `LLAMA_VIDEO_URL` (default: `http://127.0.0.1:8080`) and
-/// optionally `LLAMA_VIDEO_MODEL`.
-///
-/// The server is expected to stream the video data and return either:
-/// - A local file path in the response text (e.g. `/tmp/output.mp4`)
-/// - A `data:video/mp4;base64,...` URI
-/// - A `http://127.x.x.x/...` URL pointing to the generated file
-async fn video_gen_llamacpp(
-    client: &reqwest::Client,
-    prompt: &str,
-    duration: u64,
-    aspect_ratio: &str,
-    model_override: Option<&str>,
-) -> anyhow::Result<String> {
-    let base = std::env::var("LLAMA_VIDEO_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_owned());
-    let base = base.trim_end_matches('/');
-    let model = model_override
-        .or_else(|| std::env::var("LLAMA_VIDEO_MODEL").ok().as_deref().map(|_| ""))
-        .unwrap_or("default");
-    let model = if model.is_empty() {
-        std::env::var("LLAMA_VIDEO_MODEL").unwrap_or_else(|_| "default".to_owned())
-    } else {
-        model.to_owned()
-    };
-
-    let system = format!(
-        "You are a video generation model. Generate a {duration}-second video with aspect ratio {aspect_ratio}. \
-         Output the generated video as a file path or base64 data URI."
-    );
-
-    // Use OpenAI-compatible chat completions with streaming.
-    use futures::StreamExt;
-    let resp = client
-        .post(format!("{base}/v1/chat/completions"))
-        .json(&json!({
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt}
-            ],
-            "stream": true,
-            "max_tokens": 4096
-        }))
-        .timeout(std::time::Duration::from_secs(600))
-        .send()
-        .await
-        .map_err(|e| anyhow!("llamacpp video: request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        bail!("llamacpp video: server returned {status}: {body}");
-    }
-
-    // Collect the full streamed text response.
-    let mut full_text = String::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| anyhow!("llamacpp video: stream error: {e}"))?;
-        let text = String::from_utf8_lossy(&chunk);
-        // SSE lines: "data: {...}\n\n" or "data: [DONE]\n\n"
-        for line in text.lines() {
-            let line = line.trim();
-            if !line.starts_with("data: ") {
-                continue;
-            }
-            let payload = line.strip_prefix("data: ").unwrap_or(line);
-            if payload == "[DONE]" {
-                break;
-            }
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(payload) {
-                if let Some(delta) = val.pointer("/choices/0/delta/content").and_then(|v| v.as_str()) {
-                    full_text.push_str(delta);
-                }
-            }
-        }
-    }
-
-    let result = full_text.trim().to_owned();
-    if result.is_empty() {
-        bail!("llamacpp video: empty response from server");
-    }
-
-    tracing::info!(len = result.len(), "llamacpp video: got response");
-
-    // The result is either a file path, a URL, or a base64 data URI —
-    // return it directly; tool_video will handle download/copy.
-    Ok(result)
 }
 
