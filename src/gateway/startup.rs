@@ -313,6 +313,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    // Make the senders reachable from inside TaskQueueManager::submit so the
+    // user-facing "task received" ack can fire without threading the map
+    // through every submit call site.
+    super::task_queue::install_channel_senders(Arc::clone(&channel_senders));
 
     // Create task queue manager before channels so channels can submit to it.
     let task_queue_mgr = Arc::new(

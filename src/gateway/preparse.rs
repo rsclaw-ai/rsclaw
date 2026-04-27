@@ -491,12 +491,12 @@ fn task_help_text(lang: &str) -> String {
         "/task [选项] <任务描述>\n\n\
          在多轮模式下执行一项任务：agent 会反复推理、调用工具，直到任务完成或耗尽预算。\n\n\
          选项：\n\
-         \u{0020}\u{0020}--turns <N>      最大轮数（默认 10）\n\
-         \u{0020}\u{0020}--timeout <时长> 超时（如 4h、30m，默认 1h）\n\n\
+         \u{0020}\u{0020}-n <N>       最大轮数（默认 10）\n\
+         \u{0020}\u{0020}-t <时长>    超时（如 4h、30m，默认 1h）\n\n\
          例：\n\
          \u{0020}\u{0020}/task 修复登录页的 bug\n\
-         \u{0020}\u{0020}/task --turns 20 重构支付模块\n\
-         \u{0020}\u{0020}/task --timeout 4h --turns 50 完整跑通新功能\n\n\
+         \u{0020}\u{0020}/task -n 20 重构支付模块\n\
+         \u{0020}\u{0020}/task -n 50 -t 4h 完整跑通新功能\n\n\
          查看进度：/status   终止：/abort   配合 /loop 定时触发：/loop 1h /task ..."
             .to_owned()
     } else {
@@ -504,12 +504,12 @@ fn task_help_text(lang: &str) -> String {
          Run a task in multi-turn mode: the agent will reason and call tools repeatedly\n\
          until the task is complete or its budget is exhausted.\n\n\
          Options:\n\
-         \u{0020}\u{0020}--turns <N>        Max turns (default 10)\n\
-         \u{0020}\u{0020}--timeout <dur>    Timeout (e.g. 4h, 30m, default 1h)\n\n\
+         \u{0020}\u{0020}-n <N>       Max turns (default 10)\n\
+         \u{0020}\u{0020}-t <dur>     Timeout (e.g. 4h, 30m, default 1h)\n\n\
          Examples:\n\
          \u{0020}\u{0020}/task fix the login bug\n\
-         \u{0020}\u{0020}/task --turns 20 refactor the payment module\n\
-         \u{0020}\u{0020}/task --timeout 4h --turns 50 finish the new feature end-to-end\n\n\
+         \u{0020}\u{0020}/task -n 20 refactor the payment module\n\
+         \u{0020}\u{0020}/task -n 50 -t 4h finish the new feature end-to-end\n\n\
          Progress: /status   Abort: /abort   Combine with /loop: /loop 1h /task ..."
             .to_owned()
     }

@@ -4,7 +4,11 @@
 //! here and processed in priority order (System > Cron > User, FIFO within
 //! the same priority level).
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock, RwLock},
+    time::Duration,
+};
 
 use anyhow::Result;
 use md5::{Digest, Md5};
@@ -181,7 +185,15 @@ pub const TASK_DEFAULT_MAX_TURNS: u32 = 10;
 /// Default TTL for /task mode (1 hour).
 pub const TASK_DEFAULT_TTL_SECS: u64 = 3600;
 
-/// Parse `/task` prefix and extract `--turns N` / `--timeout Xh` flags.
+/// Parse `/task` prefix and extract turn/timeout flags.
+///
+/// Supports two flag forms:
+///   * Long: `--turns N` / `--timeout Xh`
+///   * Short: `-n N` / `-t Xh`  (avoids autocorrect on chat clients that
+///     replace `--` with an em-dash, e.g. Feishu/WeChat)
+///
+/// Em-dash and en-dash characters are normalized to `--` before parsing,
+/// so `—turns 10` (auto-corrected by the chat client) still works.
 ///
 /// Returns `(max_turns, ttl_secs)`. If the text does not start with `/task`,
 /// returns `(0, 3600)` (regular chat mode). Modifies `text` in-place to
@@ -190,61 +202,58 @@ pub const TASK_DEFAULT_TTL_SECS: u64 = 3600;
 /// Examples:
 /// - `/task fix the login bug` → turns=10, ttl=3600, text="fix the login bug"
 /// - `/task --turns 20 refactor` → turns=20, ttl=3600, text="refactor"
-/// - `/task --timeout 4h big job` → turns=10, ttl=14400, text="big job"
-/// - `/task --turns 50 --timeout 8h x` → turns=50, ttl=28800, text="x"
+/// - `/task -n 20 refactor` → turns=20, ttl=3600, text="refactor"
+/// - `/task -n 50 -t 8h x` → turns=50, ttl=28800, text="x"
 /// - `hello` → turns=0, ttl=3600, text unchanged
 fn parse_task_prefix(text: &mut String) -> (u32, u64) {
-    let trimmed = text.trim();
+    // Defensive: chat clients (Feishu/WeChat) often replace ASCII `--` with
+    // an em-dash on send. Normalize em/en/figure-dashes back so flag parsing
+    // stays robust regardless of the source client.
+    let normalized: String = text
+        .replace('\u{2014}', "--") // EM DASH
+        .replace('\u{2013}', "--") // EN DASH
+        .replace('\u{2012}', "--") // FIGURE DASH
+        .replace('\u{2015}', "--"); // HORIZONTAL BAR
+    let trimmed = normalized.trim();
     if !trimmed.starts_with("/task ") && trimmed != "/task" {
         // Natural language detection: if it looks like a task, auto-enable.
         if looks_like_task(trimmed) {
+            *text = normalized;
             return (TASK_DEFAULT_MAX_TURNS, TASK_DEFAULT_TTL_SECS);
         }
+        *text = normalized;
         return (0, TASK_DEFAULT_TTL_SECS);
     }
 
-    // Strip "/task " prefix.
+    // Strip "/task" prefix and tokenize the remainder.
     let rest = trimmed.strip_prefix("/task").unwrap_or(trimmed).trim();
     let mut max_turns = TASK_DEFAULT_MAX_TURNS;
     let mut ttl_secs = TASK_DEFAULT_TTL_SECS;
-    let mut remaining = rest.to_string();
-
-    // Parse --turns N
-    if let Some(pos) = remaining.find("--turns") {
-        let after = &remaining[pos + 7..].trim_start();
-        if let Some(end) = after.find(|c: char| c.is_whitespace()).or(Some(after.len())) {
-            if let Ok(n) = after[..end].parse::<u32>() {
-                max_turns = n;
+    let mut msg_parts: Vec<&str> = Vec::new();
+    let mut iter = rest.split_whitespace().peekable();
+    while let Some(tok) = iter.next() {
+        match tok {
+            "--turns" | "-n" => {
+                if let Some(val) = iter.peek().and_then(|v| v.parse::<u32>().ok()) {
+                    max_turns = val;
+                    iter.next();
+                    continue;
+                }
+                msg_parts.push(tok);
             }
-            remaining = format!(
-                "{}{}",
-                &remaining[..pos],
-                after.get(end..).unwrap_or("")
-            )
-            .trim()
-            .to_string();
+            "--timeout" | "-t" => {
+                if let Some(val) = iter.peek().and_then(|v| parse_duration_str(v)) {
+                    ttl_secs = val;
+                    iter.next();
+                    continue;
+                }
+                msg_parts.push(tok);
+            }
+            _ => msg_parts.push(tok),
         }
     }
 
-    // Parse --timeout Xh / Xm / Xs
-    if let Some(pos) = remaining.find("--timeout") {
-        let after = &remaining[pos + 9..].trim_start();
-        if let Some(end) = after.find(|c: char| c.is_whitespace()).or(Some(after.len())) {
-            let val_str = &after[..end];
-            if let Some(parsed) = parse_duration_str(val_str) {
-                ttl_secs = parsed;
-            }
-            remaining = format!(
-                "{}{}",
-                &remaining[..pos],
-                after.get(end..).unwrap_or("")
-            )
-            .trim()
-            .to_string();
-        }
-    }
-
-    *text = remaining;
+    *text = msg_parts.join(" ");
     (max_turns, ttl_secs)
 }
 
@@ -343,6 +352,84 @@ pub struct TaskQueueManager {
     notify: Notify,
 }
 
+// ---------------------------------------------------------------------------
+// Cross-module channel senders registry
+// ---------------------------------------------------------------------------
+//
+// Lets non-worker code (e.g. submit() acks) deliver messages back through the
+// originating channel without threading the senders map through the manager
+// constructor. Populated once at gateway startup with the same Arc the worker
+// uses.
+
+type ChannelSendersMap = Arc<RwLock<HashMap<String, mpsc::Sender<OutboundMessage>>>>;
+static CHANNEL_SENDERS: OnceLock<ChannelSendersMap> = OnceLock::new();
+
+/// Install the channel senders map. Called once at gateway startup.
+/// Subsequent installs are silently ignored (idempotent).
+pub fn install_channel_senders(senders: ChannelSendersMap) {
+    if CHANNEL_SENDERS.set(senders).is_err() {
+        warn!("task_queue: channel senders already installed, ignoring duplicate install");
+    }
+}
+
+/// Look up the outbound mpsc sender for a channel by name. Returns None if
+/// the channel is not registered (or `install_channel_senders` was never
+/// called).
+fn lookup_channel_sender(name: &str) -> Option<mpsc::Sender<OutboundMessage>> {
+    CHANNEL_SENDERS
+        .get()?
+        .read()
+        .ok()?
+        .get(name)
+        .cloned()
+}
+
+/// Format a localized "task received" ack string.
+fn task_ack_text(task_id: &str, max_turns: u32, ttl_secs: u64, lang: &str) -> String {
+    // Render ttl as Xh / Xm — keeps the line short.
+    let ttl_human = if ttl_secs >= 3600 && ttl_secs % 3600 == 0 {
+        format!("{}h", ttl_secs / 3600)
+    } else if ttl_secs >= 60 && ttl_secs % 60 == 0 {
+        format!("{}m", ttl_secs / 60)
+    } else {
+        format!("{ttl_secs}s")
+    };
+    if lang == "zh" {
+        format!(
+            "任务已收到，开始处理（最多 {max_turns} 轮，超时 {ttl_human}）\nID: {task_id}\n中止: /abort"
+        )
+    } else {
+        format!(
+            "Task received, working on it (up to {max_turns} turns, timeout {ttl_human})\nID: {task_id}\nAbort: /abort"
+        )
+    }
+}
+
+/// Best-effort ack delivery for a freshly enqueued task-mode message.
+/// Uses `try_send` so a saturated channel buffer never blocks the submit()
+/// fast path; if the channel sender is missing or full, the ack is dropped
+/// and a warning is logged.
+fn send_task_ack(task: &QueuedTask, max_turns: u32, ttl_secs: u64) {
+    let Some(msg) = task.messages.first() else { return };
+    let Some(tx) = lookup_channel_sender(&msg.channel) else {
+        warn!(channel = %msg.channel, task_id = %task.id, "task_queue: channel sender not registered, ack dropped");
+        return;
+    };
+    let lang = crate::i18n::default_lang();
+    let ack = OutboundMessage {
+        target_id: msg.chat_id.clone(),
+        is_group: msg.is_group,
+        text: task_ack_text(&task.id, max_turns, ttl_secs, lang),
+        reply_to: msg.reply_to.clone(),
+        images: vec![],
+        files: vec![],
+        channel: Some(msg.channel.clone()),
+    };
+    if let Err(e) = tx.try_send(ack) {
+        warn!(channel = %msg.channel, task_id = %task.id, error = %e, "task_queue: ack send failed");
+    }
+}
+
 impl TaskQueueManager {
     /// Create a new manager backed by the given store.
     pub fn new(store: Arc<RedbStore>) -> Self {
@@ -399,6 +486,9 @@ impl TaskQueueManager {
         self.store.enqueue_task(&task)?;
         if max_turns > 0 {
             tracing::info!(session_key, task_id = %id, max_turns, ttl_secs, "task_queue: task enqueued (task mode)");
+            // User-facing ack: tell them the long-running task was accepted
+            // and give them the id so they can /abort or /status it.
+            send_task_ack(&task, max_turns, ttl_secs);
         } else {
             tracing::info!(session_key, task_id = %id, "task_queue: message enqueued");
         }
@@ -434,6 +524,7 @@ impl TaskQueueManager {
         let id = task.id.clone();
         self.store.enqueue_task(&task)?;
         tracing::info!(session_key, task_id = %id, max_turns, ttl_secs, "task_queue: task enqueued");
+        send_task_ack(&task, max_turns, ttl_secs);
         self.notify.notify_one();
         Ok((id, false))
     }
@@ -1115,5 +1206,63 @@ impl TaskQueueWorker {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_task_prefix_short_flags() {
+        let mut text = "/task -n 20 fix the login bug".to_string();
+        let (turns, ttl) = parse_task_prefix(&mut text);
+        assert_eq!(turns, 20);
+        assert_eq!(ttl, TASK_DEFAULT_TTL_SECS);
+        assert_eq!(text, "fix the login bug");
+    }
+
+    #[test]
+    fn parse_task_prefix_short_flags_combined() {
+        let mut text = "/task -n 50 -t 4h refactor payments".to_string();
+        let (turns, ttl) = parse_task_prefix(&mut text);
+        assert_eq!(turns, 50);
+        assert_eq!(ttl, 4 * 3600);
+        assert_eq!(text, "refactor payments");
+    }
+
+    #[test]
+    fn parse_task_prefix_long_flags_still_work() {
+        let mut text = "/task --turns 30 --timeout 2h work".to_string();
+        let (turns, ttl) = parse_task_prefix(&mut text);
+        assert_eq!(turns, 30);
+        assert_eq!(ttl, 2 * 3600);
+        assert_eq!(text, "work");
+    }
+
+    #[test]
+    fn parse_task_prefix_em_dash_normalized() {
+        // Feishu/WeChat autocorrect `--` to em-dash. Result must still parse.
+        let mut text = "/task \u{2014}turns 25 \u{2014}timeout 30m do x".to_string();
+        let (turns, ttl) = parse_task_prefix(&mut text);
+        assert_eq!(turns, 25);
+        assert_eq!(ttl, 30 * 60);
+        assert_eq!(text, "do x");
+    }
+
+    #[test]
+    fn parse_task_prefix_no_task_prefix_chat_mode() {
+        let mut text = "hello there".to_string();
+        let (turns, _ttl) = parse_task_prefix(&mut text);
+        assert_eq!(turns, 0);
+    }
+
+    #[test]
+    fn parse_task_prefix_n_without_value_kept_as_text() {
+        // `-n` not followed by a number must not consume the next token.
+        let mut text = "/task -n investigate logs".to_string();
+        let (turns, _ttl) = parse_task_prefix(&mut text);
+        assert_eq!(turns, TASK_DEFAULT_MAX_TURNS);
+        assert_eq!(text, "-n investigate logs");
     }
 }

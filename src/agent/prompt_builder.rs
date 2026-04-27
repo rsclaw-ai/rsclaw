@@ -122,7 +122,7 @@ pub(crate) fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
     h.push('\n');
 
     h.push_str(if zh { "任务模式：\n" } else { "Task mode:\n" });
-    h.push_str(if zh { "  /task <描述>      多轮执行任务\n  /task -h          查看 /task 完整帮助\n" } else { "  /task <desc>      Run a multi-turn task\n  /task -h          Full /task help\n" });
+    h.push_str(if zh { "  /task <描述>             多轮执行任务\n  /task -n <N> -t <时长> <描述>  指定轮数和超时\n  /task -h                 查看 /task 完整帮助\n" } else { "  /task <desc>              Run a multi-turn task\n  /task -n <N> -t <dur> <desc>  Specify max turns and timeout\n  /task -h                  Full /task help\n" });
     h.push('\n');
 
     if has("/send") {
