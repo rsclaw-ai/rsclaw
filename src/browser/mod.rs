@@ -501,7 +501,14 @@ impl CdpClient {
             .send(msg.to_string())
             .map_err(|_| anyhow!("CDP WebSocket closed"))?;
 
-        let resp = time::timeout(Duration::from_secs(30), rx)
+        // 180s response budget. Most CDP messages return instantly; the
+        // budget is for Runtime.evaluate-with-awaitPromise calls that
+        // legitimately wait on page state (douyin upload processing can
+        // take ~90s). The previous 30s ceiling was lower than several
+        // plugin-side `await new Promise(setTimeout, ...)` waits, so the
+        // host cut their JS short and surfaced "CDP response timeout for
+        // Runtime.evaluate" as a fake publish failure.
+        let resp = time::timeout(Duration::from_secs(180), rx)
             .await
             .map_err(|_| anyhow!("CDP response timeout for {method}"))?
             .map_err(|_| anyhow!("CDP response channel closed for {method}"))?;
