@@ -733,6 +733,7 @@ impl AcpClient {
         client_name: &str,
         client_version: &str,
     ) -> Result<InitializeResponse> {
+        tracing::info!("ACP: initializing connection");
         let params = serde_json::json!({
             "protocolVersion": PROTOCOL_VERSION,
             "clientInfo": {"name": client_name, "version": client_version},
@@ -755,6 +756,11 @@ impl AcpClient {
         state.capabilities = Some(init_resp.agent_capabilities.clone());
         state.agent_info = Some(init_resp.agent_info.clone());
 
+        tracing::info!(
+            agent_name = ?init_resp.agent_info.name,
+            agent_version = ?init_resp.agent_info.version,
+            "ACP: connection initialized"
+        );
         Ok(init_resp)
     }
 
@@ -765,11 +771,7 @@ impl AcpClient {
         model: Option<&str>,
         mcp_servers: Option<Vec<McpServerConfig>>,
     ) -> Result<NewSessionResponse> {
-        tracing::debug!(
-            cwd = %cwd,
-            model = ?model,
-            "create_session: called with params"
-        );
+        tracing::info!(cwd = %cwd, model = ?model, "ACP: creating session");
         let mut params = serde_json::json!({
             "cwd": cwd,
             "mcpServers": mcp_servers.unwrap_or_default()
@@ -795,6 +797,12 @@ impl AcpClient {
         state.session_id = Some(session_resp.session_id.clone());
         state.config_options = session_resp.config_options.clone().unwrap_or_default();
         state.models = session_resp.models.clone();
+
+        tracing::info!(
+            session_id = %session_resp.session_id,
+            model = ?session_resp.models.as_ref().and_then(|m| m.available_models.first()).map(|m| &m.model_id),
+            "ACP: session created"
+        );
 
         if let Some(ref models) = session_resp.models {
             tracing::debug!("Available models: {:?}", models.available_models);
@@ -843,6 +851,11 @@ impl AcpClient {
     /// Send a prompt to the agent.
     pub async fn send_prompt(&self, prompt: &str) -> Result<PromptResponse> {
         let session_id = self.session_id().await.context("No active session")?;
+        tracing::info!(
+            session_id = %session_id,
+            prompt_len = prompt.len(),
+            "ACP: sending prompt"
+        );
         let params = serde_json::json!({
             "sessionId": session_id,
             "prompt": [{"type": "text", "text": prompt}]
