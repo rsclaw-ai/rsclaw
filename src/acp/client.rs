@@ -1181,7 +1181,13 @@ impl AcpClient {
             "params": params
         }))?;
 
-        tracing::debug!(method, id, request = %request, timeout_secs = timeout_duration.as_secs(), "ACP sending request with custom timeout");
+        tracing::info!(
+            method,
+            id,
+            timeout_secs = timeout_duration.as_secs(),
+            request_preview = &request[..request.len().min(200)],
+            "ACP: sending request"
+        );
 
         // Send request while holding the lock, then release lock before waiting for response
         {
@@ -1195,12 +1201,14 @@ impl AcpClient {
             .context("Failed to send request")?;
         } // Lock released here
 
+        tracing::info!(method, id, "ACP: waiting for response (timeout {}s)", timeout_duration.as_secs());
+
         let resp = timeout(timeout_duration, resp_rx.recv())
             .await
             .context("RPC timeout")?
             .context("Channel closed")?;
 
-        tracing::debug!(method, id, response = ?resp, "ACP received response");
+        tracing::info!(method, id, response_preview = ?resp.as_ref().ok().and_then(|r| serde_json::to_string(r).ok()).map(|s| s[..200.min(s.len())].to_string()), "ACP: received response");
         resp
     }
 
@@ -1313,25 +1321,34 @@ async fn run_subprocess(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(SubprocessCmd::SendRequest { request, response_tx }) => {
+                        tracing::info!("ACP subprocess: received request from client");
                         collected_content.lock().await.clear();
 
                         let request_id = serde_json::from_str::<serde_json::Value>(&request)
                             .ok()
                             .and_then(|v| v.get("id").and_then(|i| i.as_i64()));
 
+                        tracing::info!(
+                            request_id,
+                            request_preview = &request[..request.len().min(200)],
+                            "ACP subprocess: writing request to stdin"
+                        );
+
                         // Single write for JSON + newline
                         let mut combined = request.as_bytes().to_vec();
                         combined.push(b'\n');
                         if stdin.write_all(&combined).await.is_err() {
+                            tracing::error!("ACP subprocess: stdin write error");
                             let _ = response_tx.send(Err(anyhow::anyhow!("Write error"))).await;
                             break;
                         }
                         if stdin.flush().await.is_err() {
+                            tracing::error!("ACP subprocess: stdin flush error");
                             let _ = response_tx.send(Err(anyhow::anyhow!("Flush error"))).await;
                             break;
                         }
 
-                        tracing::debug!("ACP request sent: {}", request);
+                        tracing::info!("ACP subprocess: request written to stdin, waiting for response");
 
                         // Read response and notifications until we get the matching response
                         let mut line_buf = Vec::new(); // Use byte buffer to handle non-UTF8
@@ -1343,6 +1360,7 @@ async fn run_subprocess(
                                 result = reader.read_until(b'\n', &mut line_buf) => {
                                     match result {
                                         Ok(0) => {
+                                            tracing::error!("ACP subprocess: EOF received");
                                             let _ = response_tx.send(Err(anyhow::anyhow!("EOF"))).await;
                                             break;
                                         }
@@ -1355,14 +1373,15 @@ async fn run_subprocess(
 
                                             if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
                                                 let method_field = msg.get("method").and_then(|m| m.as_str());
+                                                let resp_id = msg.get("id").and_then(|i| i.as_i64());
 
-                                                // Log all incoming messages with method field at INFO level
+                                                // Log all incoming messages
                                                 if let Some(method) = method_field {
-                                                    tracing::debug!("ACP incoming method: {} | msg: {}", method, line);
-                                                } else if msg.get("id").is_some() {
-                                                    tracing::debug!("ACP response: {}", line);
+                                                    tracing::info!("ACP subprocess: received notification method={} id={:?}", method, resp_id);
+                                                } else if resp_id.is_some() {
+                                                    tracing::info!("ACP subprocess: received response id={:?} preview={}", resp_id, &line[..line.len().min(200)]);
                                                 } else {
-                                                    tracing::debug!("ACP message: {}", line);
+                                                    tracing::debug!("ACP subprocess: received message: {}", line);
                                                 }
 
                                                 // Handle session/update notification
@@ -1373,21 +1392,23 @@ async fn run_subprocess(
 
                                                 // Handle Agent → Client requests
                                                 if let Some(method) = method_field {
-                                                    tracing::debug!("Handling agent request: {}", method);
+                                                    tracing::info!("ACP subprocess: handling agent request method={}", method);
                                                     if handle_agent_request(&mut stdin, &msg, method, &handler).await {
                                                         continue;
                                                     }
                                                 }
 
                                                 // Check if this is the response to our request
-                                                let resp_id = msg.get("id").and_then(|i| i.as_i64());
                                                 if resp_id == request_id {
+                                                    tracing::info!("ACP subprocess: matched response id={} to request_id={}", resp_id.unwrap_or(-1), request_id.unwrap_or(-1));
                                                     let _ = response_tx.send(Ok(msg)).await;
+                                                    tracing::info!("ACP subprocess: response sent to client");
                                                     break;
                                                 }
                                             }
                                         }
                                         Err(e) => {
+                                            tracing::error!("ACP subprocess: JSON parse error: {}", e);
                                             let _ = response_tx.send(Err(anyhow::anyhow!("{}", e))).await;
                                             break;
                                         }
@@ -1404,6 +1425,7 @@ async fn run_subprocess(
                         break;
                     }
                     None => {
+                        tracing::warn!("ACP subprocess: cmd channel closed");
                         break;
                     }
                 }
