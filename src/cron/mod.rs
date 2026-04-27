@@ -473,6 +473,19 @@ impl CronRunner {
             }
         }
 
+        // Sweep zombie one-shot jobs left disabled by previous runs that
+        // crashed or used the pre-fix `cron_store.json` save path. These
+        // would otherwise sit in cron.json5 forever, since the in-loop
+        // retain only fires after a try_recv result event.
+        let zombies_before = jobs.len();
+        jobs.retain(|j| !(j.schedule.is_once() && !j.enabled));
+        if jobs.len() < zombies_before {
+            info!(
+                removed = zombies_before - jobs.len(),
+                "cron: cleaned up zombie one-shot jobs at startup"
+            );
+        }
+
         // Persist initial state
         if let Err(e) = self.save_store(&jobs).await {
             warn!(err = %e, "cron: failed to save initial store");
