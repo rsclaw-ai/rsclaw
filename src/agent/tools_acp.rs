@@ -731,7 +731,11 @@ impl AgentRuntime {
             .and_then(|c| c.model.clone())
             .or_else(|| std::env::var("CLAUDE_MODEL").ok())
             .or_else(|| std::env::var("ANTHROPIC_MODEL").ok());
-        eprintln!("[ClaudeCode] model resolution: model={:?}, claudecode_config={:?}", model, self.handle.config.claudecode);
+        tracing::info!(
+            model = ?model,
+            claudecode_config = ?self.handle.config.claudecode,
+            "Claude Code: model configuration"
+        );
         let session_resp = client.create_session(&cwd_str, model.as_deref(), None).await?;
 
         tracing::info!(
