@@ -151,14 +151,31 @@ struct PendingFile {
     stage: PendingStage,
 }
 
-/// Internal sessions run on a scheduled/automated basis (not initiated by a
-/// human user) and only have the `memory` tool available. Their transcripts
-/// are not useful history — each tick should start fresh, without the
-/// previous tick's "HEARTBEAT_OK" reply polluting context.
+/// Internal sessions are ephemeral: their transcripts are not loaded from
+/// or persisted to redb, and stale entries are purged on boot. Used to
+/// avoid "HEARTBEAT_OK" replies and per-job cron output accumulating in
+/// session history.
+///
+/// Note this does NOT govern prompt/tool minimization — see
+/// `is_minimal_context_session` for that. Cron jobs are ephemeral but
+/// run as user-initiated turns with the full agent prompt and tool set.
 fn is_internal_session(session_key: &str) -> bool {
     session_key.starts_with("heartbeat:")
         || session_key.starts_with("cron:")
         || session_key.starts_with("system:")
+}
+
+/// Sessions that should run with a minimal system prompt and only the
+/// `memory` tool. These are auto-tick style turns (heartbeat ping, system
+/// maintenance) where the LLM is expected to reply briefly or do memory
+/// upkeep — not to execute user actions.
+///
+/// Cron is intentionally excluded: cron-fired `agentTurn` payloads carry
+/// real user instructions (e.g. "执行全屏截图发送给用户") that need the
+/// full system prompt and tool set, even though the session itself is
+/// ephemeral.
+fn is_minimal_context_session(session_key: &str) -> bool {
+    session_key.starts_with("heartbeat:") || session_key.starts_with("system:")
 }
 
 /// Convert an image reference (file path or data URL) into a `data:` URL
@@ -2127,10 +2144,12 @@ impl AgentRuntime {
         // Build system prompt — cached for entire gateway lifetime.
         // Only rebuilt on gateway restart.
         //
-        // Internal sessions (heartbeat/cron/system) get a minimal prompt
+        // Heartbeat / system auto-tick sessions get a minimal prompt
         // since they only have the `memory` tool and don't need workspace
         // files, skills, or tool guidelines. Saves ~3k tokens per tick.
-        let is_internal = is_internal_session(session_key);
+        // Cron is excluded: cron-fired agentTurn carries real user
+        // instructions and needs the full prompt + tool set.
+        let is_internal = is_minimal_context_session(session_key);
         let system_prompt = if is_internal {
             if self.cached_minimal_prompt.is_none() {
                 self.cached_minimal_prompt = Some(build_minimal_system_prompt());
@@ -2275,8 +2294,9 @@ impl AgentRuntime {
                 all.retain(|t| !GROUP_BLOCKED_TOOLS.contains(&t.name.as_str()));
             }
 
-            // Internal channels (heartbeat/cron/system): only memory tool
-            if session_key.starts_with("heartbeat:") || session_key.starts_with("cron:") || session_key.starts_with("system:") {
+            // Auto-tick sessions (heartbeat/system): only memory tool.
+            // Cron is excluded — cron-fired agentTurn needs full tool set.
+            if is_minimal_context_session(session_key) {
                 const INTERNAL_ALLOWED: &[&str] = &["memory"];
                 all.retain(|t| INTERNAL_ALLOWED.contains(&t.name.as_str()));
             }
@@ -6084,6 +6104,32 @@ mod tests {
                 "expected built-in tool `{expected}` in tool list, got: {names:?}"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // is_internal_session vs is_minimal_context_session
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn is_internal_session_classifies_ephemeral_prefixes() {
+        assert!(is_internal_session("heartbeat:tick-42"));
+        assert!(is_internal_session("cron:morning-briefing"));
+        assert!(is_internal_session("system:bootstrap"));
+        assert!(!is_internal_session("agent:main:telegram:direct:u1"));
+        assert!(!is_internal_session("hook:abcd"));
+        assert!(!is_internal_session("session:my-named"));
+    }
+
+    #[test]
+    fn is_minimal_context_session_excludes_cron() {
+        // Heartbeat / system: minimal prompt + memory-only tool set.
+        assert!(is_minimal_context_session("heartbeat:tick-42"));
+        assert!(is_minimal_context_session("system:bootstrap"));
+        // Cron-fired agentTurn must run with the full agent context, even
+        // though the session is ephemeral. Regression guard for the
+        // "HEARTBEAT_OK" reply bug where cron jobs got the minimal prompt.
+        assert!(!is_minimal_context_session("cron:morning-briefing"));
+        assert!(!is_minimal_context_session("agent:main:telegram:direct:u1"));
     }
 }
 
