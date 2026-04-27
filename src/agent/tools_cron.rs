@@ -169,8 +169,20 @@ impl super::runtime::AgentRuntime {
                         "cron add: `schedule`, `every_seconds`/`every_ms`, or `delay_ms` required"
                     ));
                 }
-                // Payload in OpenClaw format.
-                job["payload"] = json!({"kind": "systemEvent", "text": message});
+                // `kind` decides what fires at schedule time:
+                //   agentTurn (default) — dispatch to agent, run LLM + tools,
+                //     deliver agent's response. Use for monitoring / queries.
+                //   systemEvent — deliver `text` verbatim, no agent run, no
+                //     LLM cost. Use for fixed reminders.
+                // The LLM picks via the `kind` arg; we default to agentTurn
+                // when omitted (safer — agent always runs, even if wasteful).
+                let kind = args["kind"].as_str().unwrap_or("agentTurn");
+                let kind = if kind == "systemEvent" || kind == "agentTurn" {
+                    kind
+                } else {
+                    "agentTurn"
+                };
+                job["payload"] = json!({"kind": kind, "text": message});
                 if let Some(n) = name {
                     job["name"] = json!(n);
                 }
@@ -337,7 +349,14 @@ impl super::runtime::AgentRuntime {
                     }
                 }
                 if let Some(message) = args["message"].as_str() {
-                    jobs[idx]["payload"] = json!({"kind": "systemEvent", "text": message});
+                    // `kind` selectable like the create branch — see comment there.
+                    let kind = args["kind"].as_str().unwrap_or("agentTurn");
+                    let kind = if kind == "systemEvent" || kind == "agentTurn" {
+                        kind
+                    } else {
+                        "agentTurn"
+                    };
+                    jobs[idx]["payload"] = json!({"kind": kind, "text": message});
                 }
                 if let Some(name) = args["name"].as_str() {
                     jobs[idx]["name"] = json!(name);

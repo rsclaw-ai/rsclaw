@@ -654,6 +654,17 @@ pub(crate) fn build_tool_list(
             One-shot jobs auto-remove after execution.\n\
             For edit/remove/enable/disable, prefer using `index` from the list output instead of `id`.\n\
             \n\
+            KIND — what should fire when the schedule triggers:\n\
+              agentTurn (DEFAULT): dispatch `message` to the agent at fire time. The agent\n\
+                runs LLM + tools and the result is delivered. Use this for tasks that need\n\
+                logic, tool calls, queries, monitoring (e.g. \"check Douyin comments\",\n\
+                \"summarize today's emails\", \"if X then notify\").\n\
+              systemEvent: deliver `message` text VERBATIM to the user, no agent run, no LLM\n\
+                cost. Use this for plain recurring text broadcasts (e.g. \"remind me to drink\n\
+                water every hour\", \"daily 9am: standup time\", fixed reminders).\n\
+              Choose carefully — agentTurn for simple text reminders wastes tokens; systemEvent\n\
+              for tasks requiring agent reasoning produces a useless echo of the prompt.\n\
+            \n\
             CRON FORMAT (schedule field) — EXACTLY 5 fields separated by spaces:\n\
               minute hour day month weekday\n\
             Common examples:\n\
@@ -673,6 +684,7 @@ pub(crate) fn build_tool_list(
                 "every_seconds": {"type": "number", "description": "Fire every N seconds (for add). Use for fixed intervals like 45 minutes (every_seconds=2700) that cannot be expressed as a 5-field cron expression."},
                 "delay_ms":      {"type": "number", "description": "Delay in milliseconds for one-shot timer (e.g., 1200000 = 20 min). Use instead of schedule for reminders/timers."},
                 "message":       {"type": "string", "description": "Message or task to run (for add, edit)"},
+                "kind":          {"type": "string", "enum": ["agentTurn", "systemEvent"], "description": "What fires when the schedule hits. agentTurn (default) = run agent (LLM+tools); systemEvent = deliver `message` verbatim, no LLM cost. See tool description for guidance."},
                 "index":         {"type": "number", "description": "Job index from list (1-based, for edit/remove/enable/disable - preferred)"},
                 "id":            {"type": "string", "description": "Job ID (for edit/remove/enable/disable - use index instead if possible)"},
                 "name":          {"type": "string", "description": "Job name (for add, edit)"},

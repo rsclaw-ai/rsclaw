@@ -60,7 +60,7 @@
     },
     "resources": ["icons/icon.png", "icons/icon-tray.png", "icons/icon-tray@2x.png"],
     "shortDescription": "RsClaw AI Agent Engine",
-    "targets": "all",
+    "targets": ["deb", "rpm", "appimage", "app", "dmg", "nsis"],
     "windows": {
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",

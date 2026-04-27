@@ -4968,7 +4968,10 @@ function CronTaskPage() {
           agentId: form.agentId || "main",
           enabled: form.enabled,
           schedule: scheduleObj,
-          payload: { kind: "systemEvent", text: form.message },
+          // `agentTurn` dispatches the message to the agent at fire time so
+          // the user gets the agent's actual response (and any tool output),
+          // not just an echo of the trigger prompt.
+          payload: { kind: "agentTurn", text: form.message },
         };
         if (form.deliveryChannel && form.deliveryTo) {
           jobObj.delivery = { channel: form.deliveryChannel, to: form.deliveryTo, mode: form.deliveryMode || "always" };
