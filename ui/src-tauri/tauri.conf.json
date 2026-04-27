@@ -15,7 +15,12 @@
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["$DOWNLOAD/rsclaw/**", "$DOWNLOAD/rsclaw/**/*"]
+        "scope": [
+          "$DOWNLOAD/rsclaw/**",
+          "$DOWNLOAD/rsclaw/**/*",
+          "$HOME/.rsclaw/**",
+          "$HOME/.rsclaw/**/*"
+        ]
       }
     },
     "windows": [
