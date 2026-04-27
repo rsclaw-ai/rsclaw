@@ -107,6 +107,12 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let pending_restart: Arc<std::sync::RwLock<Option<crate::events::RestartRequest>>> =
         Arc::new(std::sync::RwLock::new(None));
 
+    // Graceful-shutdown coordinator — wired to task queue worker, axum graceful
+    // shutdown, and the /api/v1/restart drain handler. Created here (before the
+    // BGE block) so `publish_restart` can stamp the live inflight count on
+    // every event, including the BGE auto-download notifications.
+    let shutdown = crate::gateway::ShutdownCoordinator::new();
+
     // 6. Open shared memory store.
     // Auto-detect embedding model: prefer higher-quality models first.
     // Priority: bge-base-zh > bge-small-zh > bge-small-en > auto-download small-zh.
@@ -130,6 +136,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             let dl_dir = target_dir.clone();
             let bge_restart_tx = restart_request_tx.clone();
             let bge_pending = Arc::clone(&pending_restart);
+            let bge_shutdown = shutdown.clone();
             tokio::spawn(async move {
                 info!("BGE embedding model not found, downloading in background...");
                 match download_bge_model(&dl_dir, search_cfg_clone.as_ref(), cfg_lang.as_deref()).await {
@@ -138,6 +145,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                         publish_restart(
                             &bge_restart_tx,
                             &bge_pending,
+                            &bge_shutdown,
                             crate::events::RestartRequest::new(
                                 crate::events::RestartReason::ModelDownloaded {
                                     name: "bge-small-zh".into(),
@@ -155,6 +163,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                         publish_restart(
                             &bge_restart_tx,
                             &bge_pending,
+                            &bge_shutdown,
                             crate::events::RestartRequest::new(
                                 crate::events::RestartReason::ModelDownloadFailed {
                                     name: "bge-small-zh".into(),
@@ -318,10 +327,6 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Arc::clone(&task_queue_mgr),
     );
 
-    // Graceful-shutdown coordinator — wired to task queue worker, axum graceful
-    // shutdown, and the /api/v1/restart drain handler.
-    let shutdown = crate::gateway::ShutdownCoordinator::new();
-
     // Spawn task queue worker — processes queued tasks in priority order.
     {
         let worker = Arc::new(super::task_queue::TaskQueueWorker::new(
@@ -417,6 +422,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         let (restart_tx, _) = broadcast::channel::<Vec<String>>(8);
         let bridge_tx = restart_request_tx.clone();
         let bridge_pending = Arc::clone(&pending_restart);
+        let bridge_shutdown = shutdown.clone();
         let cfg_lang = config
             .raw
             .gateway
@@ -446,6 +452,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                             publish_restart(
                                 &bridge_tx,
                                 &bridge_pending,
+                                &bridge_shutdown,
                                 crate::events::RestartRequest::new(
                                     crate::events::RestartReason::ConfigChanged {
                                         sections: needs_restart,
@@ -461,6 +468,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                         publish_restart(
                             &bridge_tx,
                             &bridge_pending,
+                            &bridge_shutdown,
                             crate::events::RestartRequest::new(
                                 crate::events::RestartReason::ConfigChanged {
                                     sections: fields,
@@ -1133,15 +1141,54 @@ async fn download_bge_model(
 ///
 /// `send` failure (no live subscribers) is normal and ignored — the latch
 /// guarantees the next subscriber will pick it up.
+///
+/// Stamps the request with the current `shutdown.inflight()` count so the UI
+/// can decide whether to restart immediately (idle) or show the countdown
+/// banner (busy). When the initial count is non-zero, spawns a watcher that
+/// re-publishes (latch + broadcast) with `inflight = 0` as soon as the
+/// gateway drains, capped at 60s. The frontend treats `inflight = 0` as
+/// "ready to restart now" and short-circuits its countdown.
 pub(crate) fn publish_restart(
     tx: &tokio::sync::broadcast::Sender<crate::events::RestartRequest>,
     latch: &Arc<std::sync::RwLock<Option<crate::events::RestartRequest>>>,
-    req: crate::events::RestartRequest,
+    shutdown: &crate::gateway::ShutdownCoordinator,
+    mut req: crate::events::RestartRequest,
 ) {
+    let initial = shutdown.inflight() as u64;
+    req.inflight = initial;
+
     if let Ok(mut guard) = latch.write() {
         *guard = Some(req.clone());
     } else {
         warn!("pending_restart lock poisoned; restart event still broadcast");
     }
-    let _ = tx.send(req);
+    let _ = tx.send(req.clone());
+
+    if initial == 0 {
+        return;
+    }
+
+    // Busy at publish time: poll until idle (or 60s deadline) and re-publish
+    // with inflight = 0 so the UI restarts immediately.
+    let tx = tx.clone();
+    let latch = Arc::clone(latch);
+    let shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if shutdown.inflight() == 0 {
+                let mut updated = req;
+                updated.inflight = 0;
+                if let Ok(mut guard) = latch.write() {
+                    *guard = Some(updated.clone());
+                }
+                let _ = tx.send(updated);
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+        }
+    });
 }

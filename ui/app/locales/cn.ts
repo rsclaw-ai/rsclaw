@@ -994,15 +994,11 @@ const cn = {
       Error: "错误",
     },
 
-    RestartBanner: {
-      DefaultMessage: "需要重启网关以应用更改。",
-      AutoRestartCountdown: (seconds: number) =>
-        `系统将在 ${seconds} 秒后自动重启。如未自动重启，请点击「立即重启」。`,
-      AutoRestarting: "正在自动重启...",
+    RestartPending: {
+      // Inline label shown next to the gateway running indicator when a
+      // restart is required. Kept short so it fits in the sidebar row.
+      Label: (seconds: number) => `检测到配置变化，即将重启 ${seconds}s`,
       RestartNow: "立即重启",
-      Later: "稍后",
-      Dismiss: "忽略",
-      Restarting: "重启中...",
       Failed: "重启失败: ",
     },
 
@@ -1022,7 +1018,6 @@ const cn = {
       BindAll: "0.0.0.0（所有接口）",
       BindCustom: "自定义",
       Language: "网关语言 (language)",
-      ProcessingTimeout: "处理超时 (秒)",
       Models: "模型 (models)",
       Channels: "通道 (channels)",
       Tools: "功能开关 (tools)",

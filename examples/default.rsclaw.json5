@@ -12,7 +12,6 @@
     bind: "loopback",               // "loopback", "all", "custom", or IP address
     // bindAddress: "192.168.1.100", // Custom IP (when bind is "custom" or IP)
     language: "Chinese",            // Default: "English". Options: Chinese, Japanese, Korean, etc.
-    processingTimeout: 60,          // Seconds before "Processing..." indicator (0=disabled)
     // auth: {
     //   mode: "token",
     //   token: "${RSCLAW_AUTH_TOKEN}",  // Or: { source: "env", id: "RSCLAW_AUTH_TOKEN" }

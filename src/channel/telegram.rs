@@ -580,16 +580,17 @@ impl Channel for TelegramChannel {
                 min_chars: 1,
                 break_preference: super::chunker::BreakPreference::Paragraph,
             };
-            let chunks = chunk_text(&msg.text, &chunk_cfg);
-
-            for (i, chunk) in chunks.iter().enumerate() {
-                let reply_to = if i == 0 {
-                    msg.reply_to.as_ref().and_then(|r| r.parse::<i64>().ok())
-                } else {
-                    None
-                };
-                self.send_message_chunk(chat_id, chunk, reply_to, None)
-                    .await?;
+            if !msg.text.is_empty() {
+                let chunks = chunk_text(&msg.text, &chunk_cfg);
+                for (i, chunk) in chunks.iter().enumerate() {
+                    let reply_to = if i == 0 {
+                        msg.reply_to.as_ref().and_then(|r| r.parse::<i64>().ok())
+                    } else {
+                        None
+                    };
+                    self.send_message_chunk(chat_id, chunk, reply_to, None)
+                        .await?;
+                }
             }
 
             // Send image attachments via sendPhoto

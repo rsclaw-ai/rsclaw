@@ -275,6 +275,7 @@ async fn install_wasm_file(src: &std::path::Path) -> Result<()> {
         tools: vec![],
         min_call_interval_ms: 0,
         requires_rsclaw: None,
+        browser_cdn: Default::default(),
         extra: Default::default(),
         dir: std::path::PathBuf::from("."),
     };

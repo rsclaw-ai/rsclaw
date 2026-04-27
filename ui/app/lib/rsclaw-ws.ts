@@ -30,6 +30,14 @@ export type RestartRequiredPayload = {
   urgency: "recommended" | "required";
   /** Pre-translated message from the gateway. */
   message: string;
+  /**
+   * Inflight work count when the event was published. `0` means the gateway
+   * is idle and the UI should restart immediately (no countdown). When `> 0`,
+   * the backend re-publishes with `inflight = 0` once the gateway drains
+   * (max 60s), so the UI can short-circuit its countdown on the follow-up.
+   * Optional for backward compatibility with older gateways.
+   */
+  inflight?: number;
 };
 
 class RsClawWsClient {
@@ -43,6 +51,7 @@ class RsClawWsClient {
   private chatHandlers = new Map<string, { cb: ChatCallbacks; fullText: string }>();
   private notificationHandlers = new Set<(text: string) => void>();
   private restartHandlers = new Set<(payload: RestartRequiredPayload) => void>();
+  private connectHandlers = new Set<() => void>();
   private tokenRefresh: Promise<void> | null = null;
 
   /** Ensure the WS is connected. Safe to call multiple times. */
@@ -94,6 +103,19 @@ class RsClawWsClient {
   ): () => void {
     this.restartHandlers.add(handler);
     return () => this.restartHandlers.delete(handler);
+  }
+
+  /**
+   * Register a handler fired after each successful connect handshake.
+   * Use this to reset transient client state (e.g. dismiss the restart
+   * banner) so a fresh gateway with an empty latch doesn't inherit stale
+   * UI from the previous session. If the new gateway has a latched
+   * `restart.required`, it arrives immediately after this fires and re-arms
+   * the banner. Returns an unsubscribe function.
+   */
+  onConnect(handler: () => void): () => void {
+    this.connectHandlers.add(handler);
+    return () => this.connectHandlers.delete(handler);
   }
 
   private async _doConnect() {
@@ -194,6 +216,16 @@ class RsClawWsClient {
     if (data.type === "res" && data.id === "1") {
       if (data.ok) {
         this.retryCount = 0;
+        // Notify subscribers that a fresh handshake completed. Any latched
+        // events (e.g. restart.required) arrive in subsequent frames, so
+        // subscribers can safely reset state here without losing real events.
+        this.connectHandlers.forEach((h) => {
+          try {
+            h();
+          } catch {
+            // handler errors must not break the WS pipeline
+          }
+        });
       } else {
         // Auth failed — refresh token from Tauri config before next retry.
         console.warn("[rsclaw-ws] connect failed:", data.error?.message);

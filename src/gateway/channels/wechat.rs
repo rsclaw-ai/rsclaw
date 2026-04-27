@@ -82,7 +82,7 @@ pub(crate) fn start_wechat_personal_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, Arc<crate::channel::DmPolicyEnforcer>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
-    _channel_senders: Arc<
+    channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
     task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
@@ -193,6 +193,12 @@ pub(crate) fn start_wechat_personal_if_configured(
         let tq = Arc::clone(&task_queue);
 
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
+
+        // Register WeChat channel sender for notification routing.
+        {
+            let mut senders = channel_senders.write().expect("channel_senders lock poisoned");
+            senders.insert("wechat".to_string(), out_tx.clone());
+        }
 
         // Per-user inbound queue: serializes messages so each user's messages
         // are processed one at a time, preventing reply channel drops when

@@ -1,4 +1,4 @@
-package rsclaw:jimeng;
+package rsclaw:plugin;
 
 interface host-browser {
     browser-open: func(url: string) -> result<string, string>;

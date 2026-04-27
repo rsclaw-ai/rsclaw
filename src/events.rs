@@ -54,10 +54,18 @@ pub struct RestartRequest {
     pub urgency: RestartUrgency,
     /// Pre-translated, human-readable message for the banner.
     pub message: String,
+    /// In-flight work count when this event was published. The frontend uses
+    /// `0` to skip the auto-restart countdown and restart immediately. When
+    /// `> 0`, `publish_restart` spawns a watcher that re-publishes (latch +
+    /// broadcast) with `inflight = 0` once the gateway drains, so the UI
+    /// short-circuits the countdown.
+    #[serde(default)]
+    pub inflight: u64,
 }
 
 impl RestartRequest {
-    /// Construct a new request stamped with `now`.
+    /// Construct a new request stamped with `now`. `inflight` defaults to 0;
+    /// `publish_restart` overwrites it with the live count before broadcast.
     pub fn new(reason: RestartReason, urgency: RestartUrgency, message: String) -> Self {
         let at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -68,6 +76,7 @@ impl RestartRequest {
             reason,
             urgency,
             message,
+            inflight: 0,
         }
     }
 }
