@@ -2262,9 +2262,23 @@ fn build_provider_models_request(
 ) -> Result<reqwest::RequestBuilder, String> {
     use crate::provider::defaults as prov_defaults;
 
-    // For custom/codingplan providers, resolve auth/URL based on api_type
+    // Expand `${VAR}` placeholders so a config like `apiKey: "${ANTHROPIC_API_KEY}"`
+    // tests the actual key, matching the gateway's runtime expansion done in
+    // `config::loader::load_config`. Without this the test sends the literal
+    // template string and Anthropic/etc. return 401.
+    let api_key = crate::config::loader::expand_env_vars(&req.api_key);
+    let base_url_in: Option<String> = req
+        .base_url
+        .as_deref()
+        .map(crate::config::loader::expand_env_vars);
+
+    // For custom/codingplan providers, resolve auth/URL based on api_type.
+    // Doubao also opts in (CodingPlan offers an Anthropic-compat endpoint)
+    // — but its base URL still defaults to ark so we only let api_type
+    // override auth style, not the URL.
     let is_custom_like = req.provider == "custom" || req.provider == "codingplan";
-    let effective_type = if is_custom_like {
+    let supports_api_type = is_custom_like || req.provider == "doubao";
+    let effective_type = if supports_api_type && req.api_type.is_some() {
         req.api_type.as_deref().unwrap_or("openai")
     } else {
         req.provider.as_str()
@@ -2280,7 +2294,7 @@ fn build_provider_models_request(
     };
 
     // Resolve base URL
-    let base_url = if let Some(ref explicit) = req.base_url {
+    let base_url = if let Some(ref explicit) = base_url_in {
         if !explicit.is_empty() { explicit.trim_end_matches('/').to_owned() }
         else if !default_url.is_empty() { default_url }
         else { return Err("no base URL provided".to_owned()); }
@@ -2290,13 +2304,15 @@ fn build_provider_models_request(
         return Err("unknown provider".to_owned());
     };
 
-    // Determine auth style — custom/codingplan provider uses api_type, others use provider default
-    let auth_style = if is_custom_like {
+    // Determine auth style — providers that support api_type (custom,
+    // codingplan, doubao when api_type is set) use the api_type to pick
+    // auth; others use the provider's built-in default.
+    let auth_style = if supports_api_type && req.api_type.is_some() {
         match effective_type {
             "anthropic" => "x-api-key",
             "gemini" => "gemini-key",
             "ollama" => "none",
-            _ => if req.api_key.is_empty() { "none" } else { "bearer" },
+            _ => if api_key.is_empty() { "none" } else { "bearer" },
         }
     } else if effective_type == "gemini" {
         "gemini-key"
@@ -2311,16 +2327,16 @@ fn build_provider_models_request(
         prov_defaults::models_url("ollama", &base_url)
     } else if is_gemini {
         let trimmed = base_url.trim_end_matches('/');
-        format!("{trimmed}/models?key={}", req.api_key)
+        format!("{trimmed}/models?key={}", api_key)
     } else {
         prov_defaults::models_url(&req.provider, &base_url)
     };
 
     let mut request = client.get(&url);
     match auth_style {
-        "bearer" => { request = request.header("Authorization", format!("Bearer {}", req.api_key)); }
+        "bearer" => { request = request.header("Authorization", format!("Bearer {}", api_key)); }
         "x-api-key" => {
-            request = request.header("x-api-key", &req.api_key);
+            request = request.header("x-api-key", &api_key);
             request = request.header("anthropic-version", "2023-06-01");
         }
         _ => {} // "none" or "gemini-key" (already in URL)

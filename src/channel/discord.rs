@@ -374,7 +374,8 @@ impl DiscordChannel {
                             "op": 2,
                             "d": {
                                 "token": self.token,
-                                "intents": (1u32 << 9) | (1u32 << 12),
+                                // GUILDS | GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT
+                                "intents": (1u32 << 0) | (1u32 << 9) | (1u32 << 12) | (1u32 << 15),
                                 "properties": {
                                     "os": "linux",
                                     "browser": "rsclaw",
@@ -494,9 +495,11 @@ impl Channel for DiscordChannel {
                 min_chars: 1,
                 break_preference: BreakPreference::Newline,
             };
-            let chunks = chunk_text(&msg.text, &cfg);
-            for chunk in &chunks {
-                self.send_chunk(&msg.target_id, chunk).await?;
+            if !msg.text.is_empty() {
+                let chunks = chunk_text(&msg.text, &cfg);
+                for chunk in &chunks {
+                    self.send_chunk(&msg.target_id, chunk).await?;
+                }
             }
 
             // Send image attachments via multipart file upload
@@ -551,6 +554,53 @@ impl Channel for DiscordChannel {
                     }
                     Err(e) => warn!(idx, "discord: image upload request failed: {e}"),
                     Ok(_) => {}
+                }
+            }
+
+            // Send file attachments via multipart upload
+            for (idx, (filename, _mime, path)) in msg.files.iter().enumerate() {
+                let bytes = match std::fs::read(path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(idx, %filename, "discord: file read failed: {e}");
+                        continue;
+                    }
+                };
+                let part = match reqwest::multipart::Part::bytes(bytes)
+                    .file_name(filename.clone())
+                    .mime_str("application/octet-stream")
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(idx, "discord: build multipart failed: {e}");
+                        continue;
+                    }
+                };
+                let form = reqwest::multipart::Form::new()
+                    .part("files[0]", part)
+                    .text(
+                        "payload_json",
+                        serde_json::json!({"content": ""}).to_string(),
+                    );
+                let url = format!(
+                    "{}/channels/{}/messages",
+                    self.api_base, msg.target_id
+                );
+                match self
+                    .client
+                    .post(&url)
+                    .header("authorization", self.auth_header())
+                    .multipart(form)
+                    .send()
+                    .await
+                {
+                    Ok(resp) if !resp.status().is_success() => {
+                        let status = resp.status();
+                        let body = resp.text().await.unwrap_or_default();
+                        warn!(idx, %status, "discord: file upload failed: {body}");
+                    }
+                    Err(e) => warn!(idx, "discord: file upload request failed: {e}"),
+                    Ok(_) => info!(idx, %filename, "discord: file sent"),
                 }
             }
 

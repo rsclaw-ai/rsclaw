@@ -81,6 +81,21 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "de" => "{count} Datei(en) in uploads/ gespeichert",
     );
 
+    // Suffix appended to a binary-only file delivery message; rendered as
+    // `- {filename} {suffix}` after the agent skips text extraction.
+    msg!("file_kept_in_uploads",
+        "en" => "(kept in uploads/{subdir}/)",
+        "zh" => "(已保留在 uploads/{subdir}/)",
+        "th" => "(เก็บไว้ใน uploads/{subdir}/)",
+        "vi" => "(giu trong uploads/{subdir}/)",
+        "ja" => "(uploads/{subdir}/ に保存)",
+        "es" => "(conservado en uploads/{subdir}/)",
+        "ko" => "(uploads/{subdir}/에 보관됨)",
+        "ru" => "(сохранено в uploads/{subdir}/)",
+        "fr" => "(conservé dans uploads/{subdir}/)",
+        "de" => "(in uploads/{subdir}/ aufbewahrt)",
+    );
+
     msg!("file_menu",
         "en" => "Choose:\n1. Analyze & keep\n2. Analyze & delete\n3. Delete",
         "zh" => "请选择:\n1. 分析并保留\n2. 分析后删除\n3. 直接删除",

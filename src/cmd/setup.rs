@@ -820,7 +820,18 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
     println!();
     hint(&crate::i18n::t("cli_press_esc_back", lang));
 
-    let defs = load_defaults();
+    let mut defs = load_defaults();
+    // In Chinese mode, surface the China-region providers first so users
+    // see Qwen/DeepSeek/Doubao at the top of the picker.
+    if lang == "zh" {
+        let priority = ["qwen", "deepseek", "doubao"];
+        defs.providers.sort_by_key(|p| {
+            priority
+                .iter()
+                .position(|n| n == &p.name)
+                .unwrap_or(priority.len())
+        });
+    }
     let ec = load_existing_defaults(&defs);
 
     let provider_labels: Vec<&str> = defs.providers.iter().map(|p| p.label.as_str()).collect();

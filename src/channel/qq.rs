@@ -572,7 +572,7 @@ impl QQBotChannel {
                             mime_type: content_type.to_owned(),
                         });
                         if text.is_empty() {
-                            *text = crate::i18n::t("describe_image", crate::i18n::default_lang());
+                            *text = String::new();
                         }
                     }
                     Err(e) => warn!("qq: failed to download image: {e:#}"),

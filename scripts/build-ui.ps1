@@ -2,12 +2,12 @@
 # build-ui.ps1 — Build RsClaw desktop app (Tauri) on Windows
 #
 # Usage:
-#   .\scripts\build-ui.ps1              # debug build
-#   .\scripts\build-ui.ps1 -Release     # release build
+#   .\scripts\build-ui.ps1              # release build (default)
+#   .\scripts\build-ui.ps1 -Debug       # debug build (opt-in, shows console)
 #
 
 param(
-    [switch]$Release,
+    [switch]$Debug,
     [string]$Target = ""
 )
 
@@ -30,20 +30,35 @@ Log "Target: $Target"
 
 $SidecarName = "rsclaw-$Target.exe"
 
-if ($Release) {
-    $Profile = "release"
-    $CargoFlags = "--release"
-    $TauriFlags = ""
-} else {
+# Default = release. Use -Debug to build a debug bundle (e.g. for stack
+# traces or attaching a debugger). Release builds skip --debug-assertions
+# so the windows_subsystem cfg_attr in main.rs hides the console window;
+# debug builds intentionally keep it for stdout/stderr visibility.
+if ($Debug) {
     $Profile = "debug"
     $CargoFlags = ""
     $TauriFlags = "--debug"
+} else {
+    $Profile = "release"
+    $CargoFlags = "--release"
+    $TauriFlags = ""
 }
 
 # Step 1: Build rsclaw CLI
 Log "Building rsclaw CLI ($Profile)..."
-$Version = git -C $RootDir describe --tags --always 2>$null
-if (-not $Version) { $Version = "dev" }
+# Read version from root Cargo.toml [package] block, not from git tags —
+# `git describe` returns the commit hash (e.g. "1bbd5cd") when the working
+# tree has no recent tag, which then ends up baked into the build banner.
+function Get-CargoVersion {
+    $cargoToml = Join-Path $RootDir "Cargo.toml"
+    if (-not (Test-Path $cargoToml)) { return "dev" }
+    $content = Get-Content -Raw $cargoToml
+    if ($content -match '(?s)\[package\].*?(?:^|\n)\s*version\s*=\s*"([^"]+)"') {
+        return $matches[1]
+    }
+    return "dev"
+}
+$Version = Get-CargoVersion
 $BuildDate = Get-Date -Format "yyyy-MM-dd"
 
 $env:RSCLAW_BUILD_VERSION = "v$Version"

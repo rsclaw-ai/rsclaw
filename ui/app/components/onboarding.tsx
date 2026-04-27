@@ -803,7 +803,7 @@ export const ALL_PROVIDERS: Record<string, ProviderDef> = {
   siliconflow: { id: "siliconflow", name: "SiliconFlow",        tag: "\u56FD\u5185\u52A0\u901F",      tagEn: "China accel",       keyLabel: "SiliconFlow Key",     keyPlaceholder: "sk-..." },
 };
 
-export const PROV_ORDER_ZH = ["doubao","qwen","custom","codingplan","minimax","deepseek","kimi","zhipu","ollama","gaterouter","openrouter","anthropic","openai","gemini","grok","groq","siliconflow"];
+export const PROV_ORDER_ZH = ["qwen","deepseek","doubao","custom","codingplan","minimax","kimi","zhipu","ollama","gaterouter","openrouter","anthropic","openai","gemini","grok","groq","siliconflow"];
 export const PROV_ORDER_EN = ["anthropic","openai","gemini","grok","openrouter","ollama","custom","codingplan","groq","doubao","qwen","minimax","deepseek","kimi","zhipu","gaterouter","siliconflow"];
 
 function getProviders(lang?: string): ProviderDef[] {
@@ -827,8 +827,8 @@ export const MODELS: Record<string, ModelDef[]> = {
     { id: "qwen-turbo", tag: "\u5FEB\u901F", tagEn: "Fast", rec: false },
   ],
   doubao: [
-    { id: "doubao-seed-2-0-pro-260215", tag: "\u63A8\u8350", tagEn: "Recommended", rec: true },
-    { id: "doubao-1-5-pro-256k-250115", tag: "\u957F\u6587\u672C", tagEn: "Long context", rec: false },
+    { id: "doubao-seed-2-0-pro", tag: "\u63A8\u8350", tagEn: "Recommended", rec: true },
+    { id: "doubao-1-5-pro-256k", tag: "\u957F\u6587\u672C", tagEn: "Long context", rec: false },
   ],
   deepseek: [
     { id: "deepseek-chat", tag: "\u901A\u7528", tagEn: "General", rec: true },
@@ -2058,6 +2058,9 @@ export function OnboardingPage() {
         const entry: Record<string, any> = { apiKey: ps.apiKey };
         if (ps.baseUrl) entry.baseUrl = ps.baseUrl;
         if (ps.userAgent) entry.userAgent = ps.userAgent;
+        // Standard providers that opt into the api_type field (e.g. doubao
+        // for CodingPlan) save the user's selection.
+        if (id === "doubao" && ps.apiType) entry.api = ps.apiType;
         providers[id] = entry;
       } else {
         providers[id] = {};
@@ -2541,6 +2544,9 @@ export function OnboardingPage() {
                 if (!pDef || pDef.sep) return null;
                 const ps = provs[activeId];
                 const isCustomLike = activeId === "custom" || activeId === "codingplan";
+                // Doubao also offers a CodingPlan-style endpoint (Anthropic-compat),
+                // so it gets the API Type dropdown too. Default stays "openai".
+                const supportsApiType = isCustomLike || activeId === "doubao";
                 const curApiType: ApiType = ps.apiType || "openai";
                 const keyRequired = !isCustomLike || API_TYPE_NEEDS_KEY[curApiType];
                 const inputFieldStyle = { flex: 1, background: "#1f2126", border: `1px solid ${ps.inputState === "ok" ? "#2dd4a0" : ps.inputState === "err" ? "#d95f5f" : "rgba(255,255,255,0.09)"}`, borderRadius: 7, padding: "7px 10px", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none" } as const;
@@ -2549,8 +2555,8 @@ export function OnboardingPage() {
                 const selectStyle = { width: "100%", background: "#1f2126", border: "1px solid rgba(255,255,255,0.09)", borderRadius: 7, padding: "7px 10px", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none", cursor: "pointer" } as const;
                 return (
                   <div style={{ marginTop: 12, background: "#1a1c22", border: "1px solid rgba(255,255,255,0.055)", borderRadius: 10, padding: 16 }}>
-                    {/* Custom/CodingPlan: api_type dropdown */}
-                    {isCustomLike && (
+                    {/* api_type dropdown: custom/codingplan, plus doubao (CodingPlan offering) */}
+                    {supportsApiType && (
                       <div style={{ marginBottom: 10 }}>
                         <div style={fieldLabelStyle}>API Type</div>
                         <select

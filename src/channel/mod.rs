@@ -390,6 +390,159 @@ pub fn is_video_attachment(content_type: &str, filename: &str) -> bool {
         || lower.ends_with(".3gp")
 }
 
+/// Detect if an attachment is a document based on content_type and filename.
+pub fn is_document_attachment(content_type: &str, filename: &str) -> bool {
+    if content_type.starts_with("application/pdf")
+        || content_type.starts_with("application/msword")
+        || content_type.contains("officedocument")
+        || content_type.contains("spreadsheet")
+        || content_type.contains("presentation")
+        || content_type == "text/plain"
+        || content_type == "text/csv"
+        || content_type == "text/markdown"
+        || content_type == "application/json"
+    {
+        return true;
+    }
+    let lower = filename.to_lowercase();
+    lower.ends_with(".pdf")
+        || lower.ends_with(".doc")
+        || lower.ends_with(".docx")
+        || lower.ends_with(".xls")
+        || lower.ends_with(".xlsx")
+        || lower.ends_with(".ppt")
+        || lower.ends_with(".pptx")
+        || lower.ends_with(".txt")
+        || lower.ends_with(".md")
+        || lower.ends_with(".csv")
+        || lower.ends_with(".json")
+        || lower.ends_with(".xml")
+        || lower.ends_with(".rtf")
+}
+
+/// Return the upload subdirectory for a file based on its type.
+///
+/// - video → "videos"
+/// - audio → "audios"
+/// - document → "docs"
+/// - image → "images"
+/// - other → "files"
+pub fn upload_subdir(mime_type: &str, filename: &str) -> &'static str {
+    if is_video_attachment(mime_type, filename) {
+        "videos"
+    } else if is_audio_attachment(mime_type, filename) {
+        "audios"
+    } else if is_document_attachment(mime_type, filename) {
+        "docs"
+    } else {
+        "files"
+    }
+}
+
+/// Single-letter prefix for the upload filename.
+fn upload_prefix(mime_type: &str, filename: &str) -> char {
+    if is_video_attachment(mime_type, filename) {
+        'v'
+    } else if is_audio_attachment(mime_type, filename) {
+        'a'
+    } else if is_document_attachment(mime_type, filename) {
+        'd'
+    } else if mime_type.starts_with("image/") {
+        'i'
+    } else {
+        'f'
+    }
+}
+
+/// Generate a standardized upload filename.
+///
+/// Format: `{type}_{YYMMDDHHmm}{ab}.{ext}`
+/// - type: i/v/a/d/f
+/// - timestamp: 10 digits (year without century)
+/// - ab: 2 random lowercase letters
+///
+/// Example: `i_2604271325ab.png`, `v_2604271325xk.mp4`
+pub fn upload_filename(mime_type: &str, original_filename: &str) -> String {
+    let prefix = upload_prefix(mime_type, original_filename);
+    let now = chrono::Local::now();
+    let ts = now.format("%y%m%d%H%M").to_string();
+    let a = (rand::random::<u8>() % 26 + b'a') as char;
+    let b = (rand::random::<u8>() % 26 + b'a') as char;
+    let ext = std::path::Path::new(original_filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or(match prefix {
+            'i' => "png",
+            'v' => "mp4",
+            'a' => "mp3",
+            'd' => "pdf",
+            _ => "bin",
+        });
+    format!("{prefix}_{ts}{a}{b}.{ext}")
+}
+
+// ---------------------------------------------------------------------------
+// @-reference resolver
+// ---------------------------------------------------------------------------
+
+/// Result of resolving `@` file references in a message.
+pub struct ResolvedRefs {
+    /// Text with `[file references]` block appended.
+    pub text: String,
+    /// Image file paths that should be loaded for vision analysis.
+    pub image_paths: Vec<std::path::PathBuf>,
+}
+
+/// Scan text for `@{prefix}_{timestamp}{ab}.{ext}` references and resolve
+/// them to full paths under `workspace/uploads/`.
+///
+/// Image references (`@i_...`) are collected in `image_paths` so the
+/// caller can load them as vision attachments.
+///
+/// Pattern: `@[ivdaf]_\w+\.\w+`
+pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> ResolvedRefs {
+    let uploads = workspace.join("uploads");
+    let re = regex::Regex::new(r"@([ivdaf]_[a-z0-9]+\.\w+)").expect("valid regex");
+
+    let mut resolved = Vec::new();
+    let mut image_paths = Vec::new();
+    for cap in re.captures_iter(text) {
+        let filename = &cap[1];
+        let prefix = filename.chars().next().unwrap_or('f');
+        let subdir = match prefix {
+            'i' => "images",
+            'v' => "videos",
+            'a' => "audios",
+            'd' => "docs",
+            _ => "files",
+        };
+        let path = uploads.join(subdir).join(filename);
+        if path.exists() {
+            resolved.push((filename.to_string(), path.to_string_lossy().to_string()));
+            if prefix == 'i' {
+                image_paths.push(path);
+            }
+        }
+    }
+
+    if resolved.is_empty() {
+        return ResolvedRefs {
+            text: text.to_string(),
+            image_paths,
+        };
+    }
+
+    let mut result = text.to_string();
+    result.push_str("\n\n[file references]\n");
+    for (name, path) in &resolved {
+        result.push_str(&format!("@{name} = {path}\n"));
+    }
+    ResolvedRefs {
+        text: result,
+        image_paths,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ChannelManager — concurrent channel limit (AGENTS.md §18)
 // ---------------------------------------------------------------------------
