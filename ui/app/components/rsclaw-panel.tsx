@@ -4867,11 +4867,63 @@ interface CronJob {
   delivery?: { channel?: string; to?: string; mode?: string };
   sessionKey?: string;
   sessionTarget?: string;
-  last_run?: string;
-  next_run?: string;
+  // Runtime state stamped by the gateway after each tick. All ms-since-epoch.
+  state?: {
+    last_run_at_ms?: number;
+    last_error?: string;
+    next_run_at_ms?: number;
+    running_at_ms?: number;
+    consecutive_errors?: number;
+  };
 }
 
 type ScheduleKind = "cron" | "every" | "once";
+
+/** Render an ms-since-epoch timestamp as a short relative time + absolute. */
+function formatRelativeTime(ms: number | undefined, zh: boolean): string {
+  if (!ms) return "";
+  const now = Date.now();
+  const diff = ms - now; // positive = future
+  const abs = Math.abs(diff);
+  const sec = Math.round(abs / 1000);
+  const min = Math.round(sec / 60);
+  const hr = Math.round(min / 60);
+  const day = Math.round(hr / 24);
+  const future = diff > 0;
+  let rel: string;
+  if (sec < 60) rel = future ? (zh ? `${sec} 秒后` : `in ${sec}s`) : (zh ? `${sec} 秒前` : `${sec}s ago`);
+  else if (min < 60) rel = future ? (zh ? `${min} 分钟后` : `in ${min}m`) : (zh ? `${min} 分钟前` : `${min}m ago`);
+  else if (hr < 24) rel = future ? (zh ? `${hr} 小时后` : `in ${hr}h`) : (zh ? `${hr} 小时前` : `${hr}h ago`);
+  else rel = future ? (zh ? `${day} 天后` : `in ${day}d`) : (zh ? `${day} 天前` : `${day}d ago`);
+  return rel;
+}
+
+/** Build a compact summary for any cron schedule kind. */
+function scheduleSummary(schedule: CronJob["schedule"], zh: boolean): { badge: string; human: string } {
+  if (!schedule) return { badge: "", human: "" };
+  if (schedule.kind === "every") {
+    const sec = Math.round((schedule.everyMs ?? 0) / 1000);
+    if (sec <= 0) return { badge: zh ? "间隔" : "interval", human: "" };
+    if (sec < 60) return { badge: zh ? `每 ${sec}s` : `every ${sec}s`, human: "" };
+    if (sec < 3600) return { badge: zh ? `每 ${Math.round(sec / 60)} 分钟` : `every ${Math.round(sec / 60)}m`, human: "" };
+    return { badge: zh ? `每 ${Math.round(sec / 3600)} 小时` : `every ${Math.round(sec / 3600)}h`, human: "" };
+  }
+  if (schedule.kind === "once") {
+    if (schedule.atMs) {
+      const d = new Date(schedule.atMs);
+      const ts = `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+      return { badge: zh ? "一次性" : "one-shot", human: zh ? `${ts} 触发` : `at ${ts}` };
+    }
+    if (schedule.delayMs) {
+      const sec = Math.round(schedule.delayMs / 1000);
+      return { badge: zh ? "一次性" : "one-shot", human: zh ? `${sec}s 后触发` : `in ${sec}s` };
+    }
+    return { badge: zh ? "一次性" : "one-shot", human: "" };
+  }
+  // Default: cron expr.
+  const expr = schedule.expr || "";
+  return { badge: expr, human: cronToHuman(expr) };
+}
 
 const CRON_TEMPLATES = [
   { label: { cn: "\u6BCF\u5929 09:00", en: "Daily 09:00" }, cron: "0 9 * * *" },
@@ -5109,24 +5161,46 @@ function CronTaskPage() {
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {jobs.map((job) => {
-              const expr = job.schedule?.expr || "";
+              const summary = scheduleSummary(job.schedule, zh);
               const msg = job.payload?.text || "";
+              const payloadKind = job.payload?.kind || "agentTurn";
+              const isAgentTurn = payloadKind !== "systemEvent" && payloadKind !== "execCommand";
+              const kindLabel = payloadKind === "systemEvent"
+                ? (zh ? "\u5E7F\u64AD" : "Broadcast")
+                : payloadKind === "execCommand"
+                  ? (zh ? "\u6267\u884C" : "Exec")
+                  : "Agent";
+              const kindColor = isAgentTurn
+                ? { bg: "rgba(45,212,160,0.12)", fg: "#2dd4a0", bd: "rgba(45,212,160,0.25)" }
+                : payloadKind === "systemEvent"
+                  ? { bg: "rgba(160,160,255,0.12)", fg: "#a0a0ff", bd: "rgba(160,160,255,0.25)" }
+                  : { bg: "rgba(255,180,90,0.12)", fg: "#ffb45a", bd: "rgba(255,180,90,0.25)" };
+              const deliveryLabel = job.delivery?.channel
+                ? `\u2192 ${job.delivery.channel}${job.delivery.to ? `:${job.delivery.to.length > 12 ? job.delivery.to.slice(0, 6) + "\u2026" + job.delivery.to.slice(-4) : job.delivery.to}` : ""}`
+                : "";
+              const nextRel = formatRelativeTime(job.state?.next_run_at_ms, zh);
+              const lastRel = formatRelativeTime(job.state?.last_run_at_ms, zh);
               return (
                 <div key={job.id} style={{ background: V2.bg2, border: `1px solid ${V2.bd}`, borderRadius: 11, opacity: job.enabled ? 1 : 0.7, transition: "border-color .13s" }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 16px" }}>
                     <div style={{ width: 8, height: 8, borderRadius: "50%", background: job.enabled ? V2.green : V2.bg5, flexShrink: 0 }} />
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 13, fontWeight: 600, color: "#eceaf4" }}>{job.name || job.id}</div>
-                      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 4 }}>
-                        {expr && <span style={{ fontFamily: V2.mono, fontSize: 11, color: "#f97316", background: "rgba(249,115,22,0.12)", border: `1px solid ${V2.obrd}`, padding: "1px 7px", borderRadius: 4 }}>{expr}</span>}
-                        <span style={{ fontSize: 11, color: "rgba(255,255,255,0.45)" }}>{cronToHuman(expr)}</span>
-                        {job.agentId && <span style={{ fontSize: 11, color: "rgba(255,255,255,0.45)", fontFamily: V2.mono }}>{"-> "}{job.agentId}</span>}
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                        <span style={{ fontSize: 13, fontWeight: 600, color: "#eceaf4" }}>{job.name || job.id}</span>
+                        <span style={{ fontSize: 9, padding: "1px 6px", borderRadius: 3, background: kindColor.bg, color: kindColor.fg, border: `1px solid ${kindColor.bd}`, fontFamily: V2.mono, letterSpacing: 0.3 }}>{kindLabel}</span>
                       </div>
-                      {msg && <div style={{ fontSize: 10, color: "rgba(255,255,255,0.38)", marginTop: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 300 }}>{msg.slice(0, 50)}</div>}
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 4, flexWrap: "wrap" }}>
+                        {summary.badge && <span style={{ fontFamily: V2.mono, fontSize: 11, color: "#f97316", background: "rgba(249,115,22,0.12)", border: `1px solid ${V2.obrd}`, padding: "1px 7px", borderRadius: 4 }}>{summary.badge}</span>}
+                        {summary.human && <span style={{ fontSize: 11, color: "rgba(255,255,255,0.45)" }}>{summary.human}</span>}
+                        {job.agentId && <span style={{ fontSize: 11, color: "rgba(255,255,255,0.45)", fontFamily: V2.mono }}>{"\u2192 "}{job.agentId}</span>}
+                        {deliveryLabel && <span style={{ fontSize: 10, color: "rgba(255,255,255,0.5)", fontFamily: V2.mono, padding: "1px 6px", background: "rgba(255,255,255,0.04)", borderRadius: 3 }}>{deliveryLabel}</span>}
+                      </div>
+                      {msg && <div style={{ fontSize: 10, color: "rgba(255,255,255,0.38)", marginTop: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 360 }} title={msg}>{msg.slice(0, 60)}</div>}
                     </div>
-                    <div style={{ textAlign: "right", flexShrink: 0, marginRight: 8 }}>
-                      {job.next_run && <div style={{ fontSize: 10, color: "rgba(255,255,255,0.45)" }}>{zh ? "\u4E0B\u6B21" : "Next"}: {job.next_run}</div>}
-                      {!job.enabled && <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 20, background: "rgba(255,255,255,0.06)", color: "rgba(255,255,255,0.4)", border: "1px solid rgba(255,255,255,0.1)" }}>{zh ? "\u5DF2\u6682\u505C" : "Paused"}</span>}
+                    <div style={{ textAlign: "right", flexShrink: 0, marginRight: 8, fontSize: 10, color: "rgba(255,255,255,0.45)" }}>
+                      {nextRel && <div>{zh ? "\u4E0B\u6B21" : "Next"}: {nextRel}</div>}
+                      {lastRel && <div style={{ marginTop: 2, opacity: 0.7 }}>{zh ? "\u4E0A\u6B21" : "Last"}: {lastRel}</div>}
+                      {!job.enabled && <span style={{ display: "inline-block", marginTop: 4, fontSize: 10, padding: "2px 8px", borderRadius: 20, background: "rgba(255,255,255,0.06)", color: "rgba(255,255,255,0.4)", border: "1px solid rgba(255,255,255,0.1)" }}>{zh ? "\u5DF2\u6682\u505C" : "Paused"}</span>}
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
                       <button onClick={() => { setRunningId(job.id); triggerJob(job.id); setTimeout(() => setRunningId(null), 1500); }}

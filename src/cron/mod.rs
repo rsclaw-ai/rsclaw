@@ -410,7 +410,13 @@ impl CronRunner {
         shutdown: Option<crate::gateway::ShutdownCoordinator>,
     ) -> Self {
         let run_log_dir = data_dir.join("cron");
-        let store_path = data_dir.join("cron_store.json");
+        // Use the canonical cron.json5 path — the same file the UI, CLI,
+        // and tool_cron read/write. Previously this was a separate
+        // `cron_store.json` under data_dir/, so save_store() updates
+        // (including one-shot job removal) never landed in the file
+        // anyone else looked at — the next reload would resurrect the
+        // already-fired one-shot job.
+        let store_path = resolve_cron_store_path();
         if let Err(e) = std::fs::create_dir_all(&run_log_dir) {
             tracing::warn!("failed to create cron run log dir: {e}");
         }
