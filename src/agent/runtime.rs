@@ -2635,13 +2635,11 @@ impl AgentRuntime {
             if !candidates.is_empty() {
                 let mem_clone = Arc::clone(mem);
                 let providers = Arc::clone(&self.providers);
-                let model_for_distill = self
-                    .handle
-                    .config
-                    .model
-                    .as_ref()
-                    .and_then(|m| m.primary.clone())
-                    .unwrap_or_default();
+                // Distillation is a structured one-shot task that fits the
+                // "flash" tier: cheap/fast model, falls back to the agent's
+                // main model when no flash is configured. See
+                // `resolve_flash_model_name` for the full lookup chain.
+                let model_for_distill = self.resolve_flash_model_name();
                 // Crystallized skills go to the global skill directory so the
                 // existing `load_skills(&global_skills, None, ...)` call sites
                 // (gateway/startup.rs, ws/dispatch.rs, ws/methods/catalog.rs)
