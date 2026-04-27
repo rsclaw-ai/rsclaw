@@ -7,17 +7,90 @@
 //! distill them into a `SKILL.md` file that can be loaded by the skill
 //! subsystem.
 
+use std::collections::HashSet;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt as _;
+use tokio::sync::Semaphore;
 
 use crate::agent::memory::{MemDocTier, MemoryDoc, MemoryStore};
 use crate::provider::{
     LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
 };
+
+// ---------------------------------------------------------------------------
+// Process-wide concurrency control
+// ---------------------------------------------------------------------------
+
+/// Single-permit semaphore: only one crystallization LLM call runs at a time
+/// across the whole process. Distillation is rare and expensive; serializing
+/// avoids surprise concurrent burns when multiple turns finish at once.
+fn distill_lock() -> &'static Semaphore {
+    static LOCK: OnceLock<Semaphore> = OnceLock::new();
+    LOCK.get_or_init(|| Semaphore::new(1))
+}
+
+/// Set of cluster fingerprints currently being distilled. Two simultaneous
+/// turns that recall an overlapping cluster would otherwise both spawn an
+/// LLM call against the same set of memories.
+fn inflight_clusters() -> &'static Mutex<HashSet<u64>> {
+    static SET: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Hash a cluster down to a u64 fingerprint, order-independent.
+///
+/// Sorting makes the hash invariant under doc ordering, so two turns that
+/// retrieve the same Core docs in different orders produce the same key.
+pub fn cluster_fingerprint(doc_ids: &[String]) -> u64 {
+    let mut sorted: Vec<&str> = doc_ids.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let mut hasher = DefaultHasher::new();
+    for id in &sorted {
+        id.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// RAII guard that holds an in-flight cluster fingerprint and releases it on
+/// drop. Returned by [`try_claim_cluster`] when the caller wins the race;
+/// returns `None` if the fingerprint is already being processed.
+pub struct ClusterGuard {
+    fingerprint: u64,
+}
+
+impl Drop for ClusterGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = inflight_clusters().lock() {
+            set.remove(&self.fingerprint);
+        }
+    }
+}
+
+/// Try to claim ownership of a cluster fingerprint. Returns a guard on success;
+/// returns `None` if another task is already processing the same fingerprint.
+pub fn try_claim_cluster(doc_ids: &[String]) -> Option<ClusterGuard> {
+    let fingerprint = cluster_fingerprint(doc_ids);
+    let mut set = inflight_clusters().lock().ok()?;
+    if set.insert(fingerprint) {
+        Some(ClusterGuard { fingerprint })
+    } else {
+        None
+    }
+}
+
+/// Acquire the global distillation permit. Held for the duration of the LLM
+/// call to serialize crystallization across the process.
+pub async fn acquire_distill_permit() -> Result<tokio::sync::SemaphorePermit<'static>> {
+    distill_lock()
+        .acquire()
+        .await
+        .map_err(|e| anyhow!("distill semaphore closed: {e}"))
+}
 
 /// Minimum number of related Core memories to trigger crystallization.
 const MIN_CLUSTER_SIZE: usize = 3;
@@ -463,6 +536,38 @@ mod tests {
     fn validate_rejects_invalid_yaml() {
         let md = "---\nname: foo\ndescription: [unclosed\n---\nbody";
         assert!(validate_skill_md(md).is_err());
+    }
+
+    #[test]
+    fn cluster_fingerprint_is_order_invariant() {
+        let a = vec!["doc-1".to_owned(), "doc-2".to_owned(), "doc-3".to_owned()];
+        let b = vec!["doc-3".to_owned(), "doc-1".to_owned(), "doc-2".to_owned()];
+        assert_eq!(cluster_fingerprint(&a), cluster_fingerprint(&b));
+    }
+
+    #[test]
+    fn cluster_fingerprint_distinguishes_different_clusters() {
+        let a = vec!["doc-1".to_owned(), "doc-2".to_owned()];
+        let b = vec!["doc-1".to_owned(), "doc-3".to_owned()];
+        assert_ne!(cluster_fingerprint(&a), cluster_fingerprint(&b));
+    }
+
+    #[test]
+    fn try_claim_cluster_blocks_duplicates_and_releases_on_drop() {
+        // Use a unique-ish id set to avoid colliding with other tests.
+        let ids = vec![
+            "claim-test-aaa".to_owned(),
+            "claim-test-bbb".to_owned(),
+            "claim-test-ccc".to_owned(),
+        ];
+
+        let g1 = try_claim_cluster(&ids).expect("first claim should win");
+        let g2 = try_claim_cluster(&ids);
+        assert!(g2.is_none(), "second claim while first held should fail");
+
+        drop(g1);
+        let g3 = try_claim_cluster(&ids).expect("claim should work after drop");
+        drop(g3);
     }
 
     #[test]

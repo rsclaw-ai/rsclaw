@@ -2666,6 +2666,20 @@ impl AgentRuntime {
                         };
                         let ids: Vec<String> = cluster.iter().map(|d| d.id.clone()).collect();
 
+                        // Skip if another task is already distilling this exact
+                        // cluster (e.g. two simultaneous turns recalled the same
+                        // Core docs). The guard auto-releases on drop.
+                        let _cluster_guard = match crate::skill::crystallizer::try_claim_cluster(&ids) {
+                            Some(g) => g,
+                            None => {
+                                tracing::debug!(
+                                    n = ids.len(),
+                                    "crystallization: cluster already in flight, skipping"
+                                );
+                                continue;
+                            }
+                        };
+
                         // 2. Build the distillation prompt.
                         let prompt =
                             crate::skill::crystallizer::build_distill_prompt(&cluster);
@@ -2689,6 +2703,17 @@ impl AgentRuntime {
                             }
                         };
                         let model_owned = model_id.to_owned();
+
+                        // Hold the process-wide distillation permit for the
+                        // duration of the LLM call to serialize crystallization
+                        // across all agents and clusters.
+                        let _distill_permit = match crate::skill::crystallizer::acquire_distill_permit().await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::warn!("crystallization: failed to acquire permit: {e:#}");
+                                continue;
+                            }
+                        };
                         let skill_md = match crate::skill::crystallizer::distill_with_llm(
                             &prompt,
                             provider_arc,
