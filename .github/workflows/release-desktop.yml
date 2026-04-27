@@ -49,16 +49,21 @@ jobs:
             sidecar_ext: ""
             bundle_ext: dmg
             bundle_path: ui/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          # Windows: NSIS only. MSI is dropped at the bundle config level
+          # (tauri.conf.json bundle.targets) because Wix encodes the major
+          # version as uint8 and our 2026.x.y schema doesn't fit. NSIS
+          # also picks up the installer icon + header/sidebar BMPs +
+          # multi-language auto-detect from tauri.conf.json.
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             sidecar_ext: ".exe"
-            bundle_ext: msi
-            bundle_path: ui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+            bundle_ext: exe
+            bundle_path: ui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
           - target: aarch64-pc-windows-msvc
             os: windows-latest
             sidecar_ext: ".exe"
-            bundle_ext: msi
-            bundle_path: ui/src-tauri/target/aarch64-pc-windows-msvc/release/bundle/msi/*.msi
+            bundle_ext: exe
+            bundle_path: ui/src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
 
     steps:
       - uses: actions/checkout@v6
@@ -192,7 +197,10 @@ jobs:
 
       - name: Flatten nested artifacts
         run: |
-          find artifacts -mindepth 2 -type f \( -name "*.dmg" -o -name "*.msi" -o -name "*.deb" \) -exec mv {} artifacts/ \;
+          # Windows now ships .exe (NSIS), not .msi. macOS .dmg, Linux .deb.
+          find artifacts -mindepth 2 -type f \
+            \( -name "*.dmg" -o -name "*.exe" -o -name "*.deb" \) \
+            -exec mv {} artifacts/ \;
 
       - name: Generate checksums
         run: |
