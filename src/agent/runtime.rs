@@ -1830,15 +1830,15 @@ impl AgentRuntime {
         }
 
         // ---------------------------------------------------------------
-        // File attachment: auto-detect video/audio for direct transcription.
-        // For doubao (Responses API): convert video FileAttachments to
-        // ImageAttachments so they go through Files API → input_video.
-        // This is unified here so all channels benefit without changes.
+        // File attachment: auto-transcribe audio only.
+        // Video and other files go through the normal file-save path
+        // (user chooses analyze/save via the PendingFile prompt).
+        // Doubao's vision API cannot decode inline base64 video, so we no
+        // longer wrap videos as ImageAttachments — they would be rejected
+        // with "Invalid base64 image_url".
         // ---------------------------------------------------------------
         let mut files = files;
         let mut images = images;
-        // Only audio files get auto-transcribed. Video and other files go
-        // through the normal file-save path (user chooses analyze/save).
         let (media_files, regular_files): (Vec<_>, Vec<_>) = files.into_iter().partition(|f| {
             crate::channel::is_audio_attachment(&f.mime_type, &f.filename)
                 && !crate::channel::is_video_attachment(&f.mime_type, &f.filename)
