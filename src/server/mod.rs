@@ -2266,11 +2266,25 @@ fn build_provider_models_request(
     // tests the actual key, matching the gateway's runtime expansion done in
     // `config::loader::load_config`. Without this the test sends the literal
     // template string and Anthropic/etc. return 401.
+    let raw_key = req.api_key.clone();
     let api_key = crate::config::loader::expand_env_vars(&req.api_key);
     let base_url_in: Option<String> = req
         .base_url
         .as_deref()
         .map(crate::config::loader::expand_env_vars);
+    // Diagnose silent failure: user has `apiKey: "${FOO}"` but FOO is
+    // unset/empty in the gateway's process env, so expansion → "" and
+    // we'd send an empty key header. Returning early with a specific
+    // error saves the user from chasing a misleading "invalid key".
+    let needs_key = !matches!(req.provider.as_str(), "ollama");
+    if needs_key && api_key.is_empty() && raw_key.contains("${") {
+        let var = raw_key.trim().trim_start_matches("${").trim_end_matches('}');
+        return Err(format!(
+            "API key expanded to empty — env var '{var}' is unset or empty in the gateway process. \
+             Either export it before starting the gateway, or replace the placeholder in rsclaw.json5 \
+             with the literal key value."
+        ));
+    }
 
     // For custom/codingplan providers, resolve auth/URL based on api_type.
     // Doubao also opts in (CodingPlan offers an Anthropic-compat endpoint)
@@ -2336,8 +2350,15 @@ fn build_provider_models_request(
     match auth_style {
         "bearer" => { request = request.header("Authorization", format!("Bearer {}", api_key)); }
         "x-api-key" => {
-            request = request.header("x-api-key", &api_key);
-            request = request.header("anthropic-version", "2023-06-01");
+            // Send BOTH headers so the same code path covers:
+            //   - Standard Anthropic (api.anthropic.com) — uses x-api-key
+            //   - Volcengine "coding plan" Anthropic-compat
+            //     (ark.cn-beijing.volces.com/api/coding/v1) — uses Bearer
+            // Each backend honors its expected header and ignores the other.
+            request = request
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("Authorization", format!("Bearer {}", api_key));
         }
         _ => {} // "none" or "gemini-key" (already in URL)
     }

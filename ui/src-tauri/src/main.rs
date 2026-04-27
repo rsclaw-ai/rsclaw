@@ -733,8 +733,28 @@ fn expand_env_vars(s: &str) -> String {
 async fn test_provider(provider: String, api_key: String, base_url: Option<String>, api_type: Option<String>) -> Result<serde_json::Value, String> {
     // Expand `${VAR}` env placeholders so a config like `apiKey: "${ANTHROPIC_API_KEY}"`
     // tests the actual key, matching the gateway's runtime expansion.
+    let raw_key = api_key.clone();
     let api_key = expand_env_vars(&api_key);
     let base_url = base_url.map(|u| expand_env_vars(&u));
+    // Diagnose the silent failure mode: user has `apiKey: "${FOO}"` in
+    // config but `FOO` is unset / empty in the gateway's process env, so
+    // expansion produces "" and the test sends an empty header — provider
+    // returns 401, user sees "invalid key" and chases the key value when
+    // the real problem is the env var.
+    let needs_key = matches!(provider.as_str(), "ollama") == false;
+    if needs_key && api_key.is_empty() && raw_key.contains("${") {
+        let var = raw_key
+            .trim()
+            .trim_start_matches("${")
+            .trim_end_matches('}');
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": format!(
+                "API key expanded to empty — env var '{var}' is unset or empty in the desktop app's process environment. \
+                 Either set it before launching RsClaw, or paste the literal key into rsclaw.json5."
+            )
+        }));
+    }
     // Resolve the effective API type. custom/codingplan always pick auth via
     // api_type. doubao opts in too (CodingPlan offering speaks Anthropic),
     // but only when an api_type was explicitly chosen — otherwise it stays
@@ -807,8 +827,15 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
     match auth_style {
         "bearer" => { req = req.header("Authorization", format!("Bearer {api_key}")); }
         "x-api-key" => {
-            req = req.header("x-api-key", &api_key);
-            req = req.header("anthropic-version", "2023-06-01");
+            // Send BOTH headers so the same code path covers:
+            //   - Standard Anthropic (api.anthropic.com) — uses x-api-key
+            //   - Volcengine "coding plan" Anthropic-compat
+            //     (ark.cn-beijing.volces.com/api/coding/v1) — uses Bearer
+            // Each backend honors its expected header and ignores the other.
+            req = req
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("Authorization", format!("Bearer {api_key}"));
         }
         _ => {} // gemini uses query param, ollama needs no auth
     }
