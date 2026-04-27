@@ -10,7 +10,7 @@ use anyhow::Result;
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Notify};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     agent::{AgentMessage, AgentRegistry, FileAttachment, ImageAttachment},
@@ -113,6 +113,15 @@ pub struct QueuedTask {
     pub content_hash: String,
     /// Last error message, if any.
     pub error: Option<String>,
+    /// Whether the final reply was confirmed delivered to the channel. Used
+    /// by WS reconnect (and any other channel that re-attaches) to replay
+    /// completions that fired while the client was offline.
+    #[serde(default)]
+    pub notified: bool,
+    /// Most recent agent reply text — captured per turn so reconnect-replay
+    /// can re-deliver the answer without consulting the chat-history index.
+    #[serde(default)]
+    pub last_reply: Option<String>,
 }
 
 impl QueuedTask {
@@ -135,6 +144,8 @@ impl QueuedTask {
             ttl_secs: 3600,
             content_hash: hash,
             error: None,
+            notified: false,
+            last_reply: None,
         }
     }
 
@@ -443,6 +454,60 @@ impl TaskQueueManager {
         self.store.update_task_status(task_id, TaskStatus::Done)
     }
 
+    /// Crash-recovery sweep — call once at worker startup. Any task left in
+    /// `Running` from a previous process is moved back to `Pending` so it
+    /// can be re-dispatched.
+    pub fn recover_orphan_tasks(&self) -> Result<usize> {
+        self.store.requeue_running_tasks()
+    }
+
+    /// Mark a task's final reply as delivered (for reconnect-replay tracking).
+    pub fn mark_notified(&self, task_id: &str) -> Result<()> {
+        self.store.mark_task_notified(task_id)
+    }
+
+    /// Persist the most recent agent reply on a task so reconnect-replay
+    /// can re-deliver it.
+    pub fn record_last_reply(&self, task_id: &str, text: &str) -> Result<()> {
+        self.store.update_task_last_reply(task_id, text)
+    }
+
+    /// Persist the per-turn counter so a /task resumed after a crash starts
+    /// from the next turn instead of replaying earlier ones.
+    pub fn record_turn(&self, task_id: &str, turn: u32) -> Result<()> {
+        self.store.update_task_turn(task_id, turn)
+    }
+
+    /// Whether `key` has already been recorded as delivered. Used by the
+    /// worker to skip re-sending a turn's reply after a crash-resume.
+    pub fn is_idem_delivered(&self, key: &str) -> Result<bool> {
+        self.store.is_idem_delivered(key)
+    }
+
+    /// Record a successful side-effect under `key` so a subsequent
+    /// crash-resume can skip it.
+    pub fn mark_idem_delivered(&self, key: &str) -> Result<()> {
+        self.store.mark_idem_delivered(key)
+    }
+
+    /// Drop idempotency keys older than `retention_secs`. Returns count
+    /// removed.
+    pub fn cleanup_idem_keys(&self, retention_secs: i64) -> Result<usize> {
+        self.store.cleanup_idem_keys(retention_secs)
+    }
+
+    /// List Done tasks for a session whose final reply has not yet been
+    /// confirmed delivered. Used by WS subscribe to replay completions that
+    /// fired while the client was offline.
+    pub fn list_pending_notifications(
+        &self,
+        session_key: &str,
+    ) -> Result<Vec<QueuedTask>> {
+        let mut all = self.store.list_tasks(Some(TaskStatus::Done))?;
+        all.retain(|t| t.session_key == session_key && !t.notified);
+        Ok(all)
+    }
+
     /// Mark a task as failed. Auto-retries up to `max_retries`; beyond that
     /// the task moves to `Dead` status.
     pub fn fail(&self, task_id: &str, _error: &str, max_retries: u32) -> Result<TaskStatus> {
@@ -680,6 +745,44 @@ impl TaskQueueWorker {
             .cloned()
     }
 
+    /// Push a user-facing failure message back through the channel so the
+    /// user sees something instead of silence when a turn fails (timeout,
+    /// dropped reply, etc). Best-effort: if the channel sender is gone or
+    /// the send fails, only logs.
+    async fn notify_user_failure(
+        &self,
+        channel_name: &str,
+        target: &str,
+        is_group: bool,
+        reply_to: Option<String>,
+        turn: u32,
+        reason: &str,
+    ) {
+        let Some(tx) = self.channel_tx(channel_name) else {
+            warn!(channel = %channel_name, "no channel sender registered, failure notice dropped");
+            return;
+        };
+        // TODO: lookup per-peer language once channels expose a per-target
+        // language hint (currently they don't — falls back to gateway-wide).
+        let text = crate::i18n::t_fmt(
+            "task_notify_failure",
+            crate::i18n::default_lang(),
+            &[("reason", reason)],
+        );
+        let out = OutboundMessage {
+            target_id: target.to_owned(),
+            is_group,
+            text,
+            reply_to: if turn == 1 { reply_to } else { None },
+            images: vec![],
+            files: vec![],
+            channel: Some(channel_name.to_owned()),
+        };
+        if let Err(e) = tx.send(out).await {
+            error!(channel = %channel_name, "failure notice send failed: {e}");
+        }
+    }
+
     /// Main loop: wait for task notifications and dispatch them. Exits when
     /// the shutdown coordinator signals drain — already-running tasks complete,
     /// but no new ones are pulled. Persistent tasks left in the queue are
@@ -690,6 +793,16 @@ impl TaskQueueWorker {
     /// crash-recovered tasks).
     pub async fn run(self: Arc<Self>) {
         info!("task queue worker started");
+        match self.manager.recover_orphan_tasks() {
+            Ok(0) => {}
+            Ok(n) => info!(count = n, "task queue worker: revived orphan Running tasks → Pending"),
+            Err(e) => error!("task queue worker: orphan recovery failed: {e:#}"),
+        }
+        // Idempotency-key retention: anything older than 24h is safe to
+        // drop — a real crash-resume completes on the next tick, not a day
+        // later. Counter ticks each idle/active iteration; ~720 ticks at
+        // the 5s fallback floor → roughly hourly cleanup.
+        let mut idem_gc_counter: u32 = 0;
         loop {
             if self.shutdown.is_draining() {
                 info!("task queue worker: drain signaled, stopping dequeue");
@@ -716,6 +829,15 @@ impl TaskQueueWorker {
                 Err(e) => {
                     error!("task queue worker: dequeue error: {e:#}");
                     tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+
+            idem_gc_counter = idem_gc_counter.wrapping_add(1);
+            if idem_gc_counter % 720 == 0 {
+                match self.manager.cleanup_idem_keys(24 * 3600) {
+                    Ok(0) => {}
+                    Ok(n) => info!(count = n, "task queue worker: cleaned old idem keys"),
+                    Err(e) => warn!("task queue worker: idem cleanup failed: {e:#}"),
                 }
             }
         }
@@ -786,10 +908,20 @@ impl TaskQueueWorker {
             .collect();
 
         let target = if chat_id.is_empty() { peer_id.clone() } else { chat_id.clone() };
-        let mut turn: u32 = 0;
+        // Resume from the persisted turn counter — non-zero only when this
+        // task is being re-picked up after a crash (requeue_running_tasks
+        // moved it back to Pending). Fresh tasks start at 0.
+        let mut turn: u32 = task.turns;
+        if turn > 0 {
+            info!(task_id = %task_id, resume_turn = turn, "task queue worker: resuming /task after recovery");
+        }
         let mut next_text = first_text;
         let mut next_images = first_images;
         let mut next_files = first_files;
+        // Tracks whether the latest reply made it to the channel; consulted
+        // when the loop terminates so we only mark `notified=true` if the
+        // user actually got the final answer.
+        let mut last_send_ok = false;
 
         loop {
             turn += 1;
@@ -817,11 +949,19 @@ impl TaskQueueWorker {
                 break;
             }
 
-            // Wait for reply (10 min timeout per turn).
-            let reply = match tokio::time::timeout(Duration::from_secs(600), reply_rx).await {
+            // Wait for reply (45 min per turn). Long enough to cover the
+            // worst observed jimeng video flow: ~30 min queue wait + ~10
+            // min actual generation + downloads/sends. Setting it lower
+            // would kill the agent mid-task while the upstream provider
+            // is still working, and the user doesn't know the partial
+            // result happened. Lowering this knob is fine for deploys
+            // that don't run video gen, but the default has to cover
+            // it because that's our largest legitimate per-turn wait.
+            let reply = match tokio::time::timeout(Duration::from_secs(2700), reply_rx).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(_)) => {
                     error!(task_id = %task_id, turn, "task queue worker: reply channel dropped");
+                    self.notify_user_failure(&channel_name, &target, is_group, reply_to.clone(), turn, "reply channel dropped").await;
                     match self.manager.fail(&task_id, "reply channel dropped", task.max_retries) {
                         Ok(TaskStatus::Dead) => cleanup_staged_files(&task),
                         Err(fe) => error!(task_id = %task_id, "fail() error: {fe:#}"),
@@ -830,7 +970,8 @@ impl TaskQueueWorker {
                     break;
                 }
                 Err(_) => {
-                    error!(task_id = %task_id, turn, "task queue worker: reply timeout (600s)");
+                    error!(task_id = %task_id, turn, "task queue worker: reply timeout (2700s)");
+                    self.notify_user_failure(&channel_name, &target, is_group, reply_to.clone(), turn, "reply timeout (45m)").await;
                     match self.manager.fail(&task_id, "reply timeout", task.max_retries) {
                         Ok(TaskStatus::Dead) => cleanup_staged_files(&task),
                         Err(fe) => error!(task_id = %task_id, "fail() error: {fe:#}"),
@@ -845,26 +986,64 @@ impl TaskQueueWorker {
             let pending = reply.pending_analysis;
 
             // Route reply to user (every turn, so they see progress).
-            if !reply.text.is_empty() || !reply.images.is_empty() || !reply.files.is_empty() {
-                let out = OutboundMessage {
-                    target_id: target.clone(),
-                    is_group,
-                    text: reply.text.clone(),
-                    reply_to: if turn == 1 { reply_to.clone() } else { None },
-                    images: reply.images.clone(),
-                    files: reply.files.clone(),
-                    channel: Some(channel_name.clone()),
-                };
-                if let Some(tx) = self.channel_tx(&channel_name) {
-                    if let Err(e) = tx.send(out).await {
-                        error!(task_id = %task_id, "send reply failed: {e}");
+            let had_reply_payload = !reply.text.is_empty()
+                || !reply.images.is_empty()
+                || !reply.files.is_empty();
+            if !reply.text.is_empty() {
+                if let Err(e) = self.manager.record_last_reply(&task_id, &reply.text) {
+                    tracing::warn!(task_id = %task_id, "record_last_reply failed: {e:#}");
+                }
+            }
+            if had_reply_payload {
+                // Idempotency: a previous run of THIS turn may have already
+                // delivered to the channel before the gateway crashed. The
+                // post-crash requeue resumes at the same turn and runs the
+                // LLM again — but we must not re-send to the user.
+                let idem_key = format!("task:{task_id}:turn:{turn}");
+                let already_delivered = match self.manager.is_idem_delivered(&idem_key) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(task_id = %task_id, "is_idem_delivered failed: {e:#}");
+                        false
                     }
-                } else {
-                    tracing::warn!(
-                        task_id = %task_id,
-                        channel = %channel_name,
-                        "no channel sender registered, reply dropped"
+                };
+                if already_delivered {
+                    info!(
+                        task_id = %task_id, turn,
+                        "task queue worker: turn reply already delivered, skipping channel send"
                     );
+                    last_send_ok = true;
+                } else {
+                    let out = OutboundMessage {
+                        target_id: target.clone(),
+                        is_group,
+                        text: reply.text.clone(),
+                        reply_to: if turn == 1 { reply_to.clone() } else { None },
+                        images: reply.images.clone(),
+                        files: reply.files.clone(),
+                        channel: Some(channel_name.clone()),
+                    };
+                    if let Some(tx) = self.channel_tx(&channel_name) {
+                        match tx.send(out).await {
+                            Ok(_) => {
+                                last_send_ok = true;
+                                if let Err(e) = self.manager.mark_idem_delivered(&idem_key) {
+                                    warn!(task_id = %task_id, "mark_idem_delivered failed: {e:#}");
+                                }
+                            }
+                            Err(e) => {
+                                last_send_ok = false;
+                                error!(task_id = %task_id, "send reply failed: {e}");
+                            }
+                        }
+                    } else {
+                        last_send_ok = false;
+                        tracing::warn!(
+                            task_id = %task_id,
+                            channel = %channel_name,
+                            "no channel sender registered, reply dropped"
+                        );
+                    }
                 }
             }
 
@@ -885,11 +1064,22 @@ impl TaskQueueWorker {
 
             info!(task_id = %task_id, turn, outcome = ?outcome, "task queue worker: turn outcome");
 
+            // Persist turn counter so a crash mid-/task resumes from the
+            // right place rather than replaying earlier turns.
+            if let Err(e) = self.manager.record_turn(&task_id, turn) {
+                tracing::warn!(task_id = %task_id, "record_turn failed: {e:#}");
+            }
+
             match outcome {
                 TaskOutcome::Done => {
                     info!(task_id = %task_id, turn, "task queue worker: task completed");
                     if let Err(e) = self.manager.complete(&task_id) {
                         error!(task_id = %task_id, "complete() error: {e:#}");
+                    }
+                    if last_send_ok {
+                        if let Err(e) = self.manager.mark_notified(&task_id) {
+                            error!(task_id = %task_id, "mark_notified() error: {e:#}");
+                        }
                     }
                     cleanup_staged_files(&task);
                     break;
@@ -902,6 +1092,11 @@ impl TaskQueueWorker {
                         );
                         if let Err(e) = self.manager.complete(&task_id) {
                             error!(task_id = %task_id, "complete() error: {e:#}");
+                        }
+                        if last_send_ok {
+                            if let Err(e) = self.manager.mark_notified(&task_id) {
+                                error!(task_id = %task_id, "mark_notified() error: {e:#}");
+                            }
                         }
                         cleanup_staged_files(&task);
                         break;

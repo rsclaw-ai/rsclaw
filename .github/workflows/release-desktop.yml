@@ -15,8 +15,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RSCLAW_BUILD_VERSION: ${{ inputs.tag || github.ref_name }}
   RSCLAW_BUILD_DATE: ${{ github.event.head_commit.timestamp || github.event.repository.updated_at }}
+  # RSCLAW_BUILD_VERSION is computed per-job below — we strip the `app-`
+  # prefix from the desktop tag so the embedded `--version` string
+  # matches what the CLI release (tagged `v*`) bakes in. Otherwise the
+  # sidecar inside the desktop bundle reports "app-v2026.4.26" while a
+  # standalone CLI download reports "v2026.4.26", confusing users and
+  # /doctor diagnostics.
 
 jobs:
   desktop:
@@ -49,19 +54,32 @@ jobs:
             sidecar_ext: ""
             bundle_ext: dmg
             bundle_path: ui/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          # Windows: NSIS only. MSI is dropped at the bundle config level
+          # (tauri.conf.json bundle.targets) because Wix encodes the major
+          # version as uint8 and our 2026.x.y schema doesn't fit. NSIS
+          # also picks up the installer icon + header/sidebar BMPs +
+          # multi-language auto-detect from tauri.conf.json.
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             sidecar_ext: ".exe"
-            bundle_ext: msi
-            bundle_path: ui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+            bundle_ext: exe
+            bundle_path: ui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
           - target: aarch64-pc-windows-msvc
             os: windows-latest
             sidecar_ext: ".exe"
-            bundle_ext: msi
-            bundle_path: ui/src-tauri/target/aarch64-pc-windows-msvc/release/bundle/msi/*.msi
+            bundle_ext: exe
+            bundle_path: ui/src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Compute clean version
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          # Strip "app-" prefix so the binary's embedded version matches
+          # what the CLI release pipeline (tagged `v*`) bakes in.
+          echo "RSCLAW_BUILD_VERSION=${TAG#app-}" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -192,7 +210,10 @@ jobs:
 
       - name: Flatten nested artifacts
         run: |
-          find artifacts -mindepth 2 -type f \( -name "*.dmg" -o -name "*.msi" -o -name "*.deb" \) -exec mv {} artifacts/ \;
+          # Windows now ships .exe (NSIS), not .msi. macOS .dmg, Linux .deb.
+          find artifacts -mindepth 2 -type f \
+            \( -name "*.dmg" -o -name "*.exe" -o -name "*.deb" \) \
+            -exec mv {} artifacts/ \;
 
       - name: Generate checksums
         run: |

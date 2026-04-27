@@ -572,7 +572,7 @@ impl QQBotChannel {
                             mime_type: content_type.to_owned(),
                         });
                         if text.is_empty() {
-                            *text = crate::i18n::t("describe_image", crate::i18n::default_lang());
+                            *text = String::new();
                         }
                     }
                     Err(e) => warn!("qq: failed to download image: {e:#}"),
@@ -960,7 +960,8 @@ async fn extract_audio_and_transcribe(client: &Client, video_bytes: &[u8]) -> Re
 
     std::fs::write(&video_path, video_bytes)?;
 
-    let status = tokio::process::Command::new("ffmpeg")
+    let ffmpeg_bin = crate::agent::platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
+    let status = tokio::process::Command::new(&ffmpeg_bin)
         .args([
             "-y",
             "-i",

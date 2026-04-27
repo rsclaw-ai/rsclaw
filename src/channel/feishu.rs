@@ -902,8 +902,8 @@ impl FeishuChannel {
                         }
                     }
                 }
-                // Image with no text — use placeholder.
-                crate::i18n::t("describe_image", crate::i18n::default_lang())
+                // Image with no text — empty (runtime handles save notification).
+                String::new()
             }
             "media" => {
                 // Video: download and transcribe audio track
@@ -1000,7 +1000,7 @@ impl FeishuChannel {
             }
         };
 
-        if (text.is_empty() && file_attachments.is_empty()) || sender_id.is_empty() {
+        if (text.is_empty() && file_attachments.is_empty() && images.is_empty()) || sender_id.is_empty() {
             return Ok(None);
         }
 
@@ -1790,26 +1790,48 @@ async fn extract_and_upload_cover(
     api_base: &str,
     token: &str,
 ) -> Option<String> {
-    let cover_path = format!("{}.cover.jpg", video_path);
+    let ffmpeg_bin = match crate::agent::platform::ensure_ffmpeg().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("feishu: skipping video cover — ffmpeg unavailable: {e:#}");
+            return None;
+        }
+    };
+    // Per-call uuid prevents two concurrent video sends from clobbering
+    // each other's frame extraction (the worker spawns each task as its
+    // own tokio task — same pid, same temp dir).
+    let cover_dir = std::env::temp_dir();
+    let cover_path = cover_dir
+        .join(format!("rsclaw_cover_{}_{}.jpg", std::process::id(), uuid::Uuid::new_v4()))
+        .to_string_lossy()
+        .into_owned();
     // Run ffmpeg to extract first frame at 1s.
-    let output = std::process::Command::new("ffmpeg")
+    let output = std::process::Command::new(&ffmpeg_bin)
         .args(["-y", "-i", video_path, "-ss", "00:00:01", "-frames:v", "1", "-q:v", "2", &cover_path])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
+        .output();
+    let ok_first = matches!(&output, Ok(o) if o.status.success());
+    if !ok_first {
         // Retry at 0s (video might be shorter than 1s).
-        let _ = std::process::Command::new("ffmpeg")
+        let _ = std::process::Command::new(&ffmpeg_bin)
             .args(["-y", "-i", video_path, "-ss", "00:00:00", "-frames:v", "1", "-q:v", "2", &cover_path])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output();
     }
-    let cover_bytes = std::fs::read(&cover_path).ok()?;
-    // Clean up temp file.
+    let cover_bytes = match std::fs::read(&cover_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("feishu: video cover extract failed (read {cover_path}): {e}");
+            return None;
+        }
+    };
     let _ = std::fs::remove_file(&cover_path);
-    if cover_bytes.is_empty() { return None; }
+    if cover_bytes.is_empty() {
+        tracing::warn!("feishu: video cover extract produced empty file");
+        return None;
+    }
 
     // Upload to Feishu images API.
     let part = reqwest::multipart::Part::bytes(cover_bytes)

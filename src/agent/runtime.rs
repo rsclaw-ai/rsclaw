@@ -59,7 +59,7 @@ use super::{
 pub use super::context_mgr::estimate_tokens;
 use super::context_mgr::{
     apply_context_budget_trim, apply_context_pruning, build_clear_summary,
-    compress_image_for_llm, msg_tokens,
+    msg_tokens,
 };
 use super::prompt_builder::{
     build_help_text_filtered, build_minimal_system_prompt, build_system_prompt, format_duration,
@@ -787,6 +787,45 @@ impl AgentRuntime {
         images: Vec<super::registry::ImageAttachment>,
         files: Vec<super::registry::FileAttachment>,
     ) -> Result<AgentReply> {
+        // Resolve @file references (e.g. @up_i_202604271325ab.png → full path
+        // under workspace/uploads/, @dl_v_... → ~/Downloads/rsclaw/videos/).
+        // Image references are auto-loaded as vision attachments.
+        let workspace = self
+            .handle
+            .config
+            .workspace
+            .as_deref()
+            .or(self.live.agents.read().await.defaults.workspace.as_deref())
+            .map(expand_tilde)
+            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+        let resolved = crate::channel::resolve_file_refs(text, &workspace);
+        let text = resolved.text;
+        let text = text.as_str();
+
+        // Load referenced images as vision attachments.
+        let mut images = images;
+        for img_path in &resolved.image_paths {
+            if let Ok(bytes) = std::fs::read(img_path) {
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let ext = img_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("png");
+                let mime = match ext {
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "webp" => "image/webp",
+                    "gif" => "image/gif",
+                    _ => "image/png",
+                };
+                images.push(super::registry::ImageAttachment {
+                    data: format!("data:{mime};base64,{b64}"),
+                    mime_type: mime.to_string(),
+                });
+                info!(path = %img_path.display(), "loaded @-referenced image for vision");
+            }
+        }
+
         // Resolve session key alias: if this key maps to a canonical (migrated)
         // key, use that so all messages stay under one session.
         let session_key = self.resolve_session_key(session_key).to_owned();
@@ -948,7 +987,7 @@ impl AgentRuntime {
                         .and_then(|u| u.max_text_chars)
                         .unwrap_or(DEFAULT_MAX_TEXT_CHARS);
                     let mut analysis_text = String::new();
-                    let mut binary_kept = Vec::new();
+                    let mut binary_kept: Vec<(String, String)> = Vec::new();
                     for pf in &files {
                         if let PendingStage::TokenConfirm {
                             ref extracted_text, ..
@@ -964,7 +1003,8 @@ impl AgentRuntime {
                             analysis_text
                                 .push_str(&format!("[File: {}]\n{}\n", pf.filename, truncated));
                         } else {
-                            binary_kept.push(pf.filename.clone());
+                            let subdir = crate::channel::upload_subdir(&pf.mime_type, &pf.filename);
+                            binary_kept.push((pf.filename.clone(), subdir.to_string()));
                         }
                         let _ = std::fs::remove_file(&pf.path);
                     }
@@ -972,7 +1012,14 @@ impl AgentRuntime {
                     if analysis_text.is_empty() {
                         let msg = binary_kept
                             .iter()
-                            .map(|f| format!("- {f} (kept in uploads/)"))
+                            .map(|(name, subdir)| {
+                                let suffix = crate::i18n::t_fmt(
+                                    "file_kept_in_uploads",
+                                    &i18n_lang,
+                                    &[("subdir", subdir.as_str())],
+                                );
+                                format!("- {name} {suffix}")
+                            })
                             .collect::<Vec<_>>()
                             .join("\n");
                         return Ok(AgentReply {
@@ -1762,53 +1809,49 @@ impl AgentRuntime {
         // ImageAttachments so they go through Files API → input_video.
         // This is unified here so all channels benefit without changes.
         // ---------------------------------------------------------------
-        let cur_model = self.resolve_model_name();
-        let is_doubao = cur_model.to_lowercase().contains("doubao")
-            || cur_model.to_lowercase().contains("seed");
         let mut files = files;
         let mut images = images;
-        let mut text_override: Option<String> = None;
-        if is_doubao {
-            let mut remaining = Vec::new();
-            for f in files {
-                if crate::channel::is_video_attachment(&f.mime_type, &f.filename) {
-                    // NOTE: During base64 encoding, both f.data and the b64 string
-                    // (~133% of original) coexist in memory. The 100 MB upload limit
-                    // (MAX_UPLOAD_SIZE) bounds the worst case to ~233 MB peak.
-                    use base64::Engine;
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&f.data);
-                    let mime = if f.mime_type.is_empty() {
-                        "video/mp4"
+        // Only audio files get auto-transcribed. Video and other files go
+        // through the normal file-save path (user chooses analyze/save).
+        let (media_files, regular_files): (Vec<_>, Vec<_>) = files.into_iter().partition(|f| {
+            crate::channel::is_audio_attachment(&f.mime_type, &f.filename)
+                && !crate::channel::is_video_attachment(&f.mime_type, &f.filename)
+        });
+        let mut files = regular_files;
+
+        // Convert NEW images to FileAttachments so they go through the
+        // unified pending-file flow (save → menu → user choice).
+        // @-referenced images skip this (already on disk, going to vision).
+        let is_ref_image = !resolved.image_paths.is_empty();
+        if !images.is_empty() && !is_ref_image {
+            for img in &images {
+                use base64::Engine;
+                let b64 = img.data
+                    .strip_prefix("data:image/png;base64,")
+                    .or_else(|| img.data.strip_prefix("data:image/jpeg;base64,"))
+                    .or_else(|| img.data.strip_prefix("data:image/webp;base64,"))
+                    .or_else(|| img.data.strip_prefix("data:image/gif;base64,"))
+                    .unwrap_or(&img.data);
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                    let ext = if img.mime_type.contains("jpeg") || img.mime_type.contains("jpg") {
+                        "jpg"
+                    } else if img.mime_type.contains("webp") {
+                        "webp"
+                    } else if img.mime_type.contains("gif") {
+                        "gif"
                     } else {
-                        &f.mime_type
+                        "png"
                     };
-                    let data_uri = format!("data:{mime};base64,{b64}");
-                    images.push(super::registry::ImageAttachment {
-                        data: data_uri,
-                        mime_type: mime.to_owned(),
+                    let mime = if img.mime_type.is_empty() { format!("image/{ext}") } else { img.mime_type.clone() };
+                    files.push(super::registry::FileAttachment {
+                        filename: format!("image.{ext}"),
+                        data: bytes,
+                        mime_type: mime,
                     });
-                    if text.is_empty() && text_override.is_none() {
-                        text_override = Some(crate::i18n::t(
-                            "describe_video",
-                            crate::i18n::default_lang(),
-                        ));
-                    }
-                    info!(
-                        size = f.data.len(),
-                        "video FileAttachment → ImageAttachment for vision"
-                    );
-                } else {
-                    remaining.push(f);
                 }
             }
-            files = remaining;
+            images = vec![];
         }
-        let text = text_override.as_deref().unwrap_or(text);
-        let (media_files, regular_files): (Vec<_>, Vec<_>) = files.into_iter().partition(|f| {
-            crate::channel::is_video_attachment(&f.mime_type, &f.filename)
-                || crate::channel::is_audio_attachment(&f.mime_type, &f.filename)
-        });
-        let files = regular_files;
 
         if !media_files.is_empty() {
             // Auto-enable voice mode when user sends audio (not video).
@@ -1947,15 +1990,31 @@ impl AgentRuntime {
 
             let mut file_info = Vec::new();
             for file in files {
-                let dest = uploads.join(&file.filename);
+                // Route to type-specific subdirectory with standardized filename.
+                let subdir = crate::channel::upload_subdir(&file.mime_type, &file.filename);
+                let std_name = crate::channel::upload_filename(&file.mime_type, &file.filename);
+                let target_dir = uploads.join(subdir);
+                let _ = std::fs::create_dir_all(&target_dir);
+                let dest = target_dir.join(&std_name);
                 let size = file.data.len();
                 let _ = std::fs::write(&dest, &file.data);
 
-                let extracted = extract_file_text(&file.filename, &file.data).await;
+                // Images: mark as vision-analyzable. Video/audio: binary.
+                // Others: try text extraction.
+                let is_image = file.mime_type.starts_with("image/");
+                let extracted = if is_image {
+                    // Placeholder — actual analysis via vision when user chooses "1".
+                    Some(format!("[image:vision:@{std_name}]"))
+                } else if crate::channel::is_video_attachment(&file.mime_type, &file.filename)
+                    || crate::channel::is_audio_attachment(&file.mime_type, &file.filename) {
+                    None
+                } else {
+                    extract_file_text(&file.filename, &file.data).await
+                };
                 let has_text = extracted.is_some();
                 let est_tokens = extracted.as_ref().map(|t| estimate_tokens(t)).unwrap_or(0);
 
-                file_info.push((file.filename.clone(), size, has_text, est_tokens));
+                file_info.push((std_name.clone(), size, has_text, est_tokens));
 
                 // Store pending for later analysis
                 let path =
@@ -1973,7 +2032,7 @@ impl AgentRuntime {
                     .entry(session_key.to_owned())
                     .or_default()
                     .push(PendingFile {
-                        filename: file.filename,
+                        filename: std_name,
                         path,
                         size,
                         mime_type: file.mime_type,
@@ -2004,19 +2063,33 @@ impl AgentRuntime {
                 .collect::<Vec<_>>()
                 .join("\n");
 
-            let saved_msg = crate::i18n::t_fmt(
-                "file_saved",
-                i18n_lang,
-                &[("count", &file_info.len().to_string())],
-            );
+            let saved_msg = if i18n_lang == "zh" {
+                format!("已保存 {} 个文件:", file_info.len())
+            } else {
+                format!("{} file(s) saved:", file_info.len())
+            };
             let any_analyzable = file_info.iter().any(|(_, _, has_text, _)| *has_text);
             let menu_msg = if any_analyzable {
                 crate::i18n::t("file_menu", i18n_lang)
             } else {
                 // Binary only -- simplified menu.
-                "1. Keep\n2. Delete".to_owned()
+                if i18n_lang == "zh" {
+                    "1. 保留\n2. 删除".to_owned()
+                } else {
+                    "1. Keep\n2. Delete".to_owned()
+                }
             };
-            let reply = format!("{saved_msg}\n{file_list}\n\n{menu_msg}");
+            let ref_hint = file_info
+                .iter()
+                .map(|(name, _, _, _)| format!("@{name}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let ref_msg = if i18n_lang == "zh" {
+                format!("引用: {ref_hint}")
+            } else {
+                format!("Reference: {ref_hint}")
+            };
+            let reply = format!("{saved_msg}\n{file_list}\n{ref_msg}\n\n{menu_msg}");
             return Ok(AgentReply {
                 text: reply,
                 is_empty: false,
@@ -2156,7 +2229,15 @@ impl AgentRuntime {
             .as_ref());
         let tools_enabled = model_cfg.and_then(|m| m.tools_enabled).unwrap_or(true);
 
-        let tools = if !tools_enabled {
+        // `summarize:<original_session>` is the cron summarizer's session
+        // prefix. The summarize turn must produce a plain-text summary, not
+        // a tool call (memory.put / write_file / etc.) — otherwise the cron
+        // delivers a tool acknowledgement instead of the actual summary.
+        // Force the tool list empty so the LLM has no choice but to
+        // respond with text.
+        let is_summarize_turn = session_key.starts_with("summarize:");
+
+        let tools = if !tools_enabled || is_summarize_turn {
             vec![]
         } else {
             // Build full tool list first
@@ -2244,7 +2325,7 @@ impl AgentRuntime {
         // kvCacheMode >= 1: images are described then stored as text (never base64 in session).
         // kvCacheMode = 0: images kept as base64 in session for vision models.
         let model_has_vision = model_supports_vision(&model, &self.config);
-        let vision = if kv_mode >= 1 { false } else { model_has_vision };
+        let _vision = if kv_mode >= 1 { false } else { model_has_vision };
 
         // ---------------------------------------------------------------
         // Media processing: convert images/videos to text descriptions.
@@ -2255,84 +2336,14 @@ impl AgentRuntime {
         let mut media_descriptions = Vec::<String>::new();
         let mut vision_images_for_current_turn = Vec::<String>::new(); // base64 URIs for vision model
 
-        for img in &images {
-            if img.mime_type.starts_with("video/") {
-                // Video: generate text placeholder (transcript support is TODO).
-                let desc = crate::agent::context_mgr::describe_video(None, None);
-                media_descriptions.push(desc);
-            } else {
-                // Image: get text description via vision model.
-                // If current model supports vision, also keep the image for the
-                // current LLM turn (so it sees the original).
-                if vision {
-                    // Current model can see images — keep for this turn's API call.
-                    if let Some(compressed) = compress_image_for_llm(&img.data) {
-                        vision_images_for_current_turn.push(compressed);
-                    } else {
-                        vision_images_for_current_turn.push(img.data.clone());
-                    }
-                }
-
-                // Generate text description for session storage.
-                // Use current model if vision-capable (even in kv_cache_mode >= 1,
-                // the image description is a separate LLM call that doesn't pollute
-                // the main session's KV cache). Otherwise find a vision model.
-                let vision_model = if model_has_vision {
-                    model.clone()
-                } else {
-                    // Snapshot the live default-model image before the chain so the
-                    // `.or_else()` closure stays synchronous.
-                    let default_image_model = self
-                        .live
-                        .agents
-                        .read()
-                        .await
-                        .defaults
-                        .model
-                        .as_ref()
-                        .and_then(|m| m.image.clone());
-                    // Try image model config, then fallback to known vision providers.
-                    self.handle.config.model.as_ref()
-                        .and_then(|m| m.image.as_deref())
-                        .map(|s| s.to_owned())
-                        .or(default_image_model)
-                        .unwrap_or_else(|| {
-                            // Auto-detect a vision-capable provider from config.
-                            let vision_providers = ["doubao", "gemini", "openai", "qwen"];
-                            for vp in vision_providers {
-                                let has_key = self.config.model.models.as_ref()
-                                    .and_then(|m| m.providers.get(vp))
-                                    .and_then(|p| p.api_key.as_ref())
-                                    .is_some()
-                                    || std::env::var(format!("{}_API_KEY", vp.to_uppercase())).is_ok();
-                                if has_key {
-                                    return match vp {
-                                        "doubao" => "doubao/doubao-seed-2-0-pro-260215".to_owned(),
-                                        "gemini" => "gemini/gemini-2.0-flash".to_owned(),
-                                        "openai" => "openai/gpt-4o-mini".to_owned(),
-                                        "qwen" => "qwen/qwen-vl-max".to_owned(),
-                                        _ => format!("{vp}/default"),
-                                    };
-                                }
-                            }
-                            tracing::warn!("no vision-capable provider found for image description");
-                            String::new() // no vision model available
-                        })
-                };
-
-                if vision_model.is_empty() {
-                    media_descriptions.push("[图片] (无视觉模型可用)".to_owned());
-                } else {
-                    let desc = crate::agent::context_mgr::describe_image_via_llm(
-                        &img.data, &vision_model, &mut self.failover, &self.providers,
-                    ).await;
-                    match desc {
-                        Some(d) => media_descriptions.push(format!("[图片] {d}")),
-                        None => media_descriptions.push("[图片] (无法生成描述)".to_owned()),
-                    }
-                }
+        // @-referenced images go directly to vision (already saved, no re-save).
+        if !resolved.image_paths.is_empty() {
+            for img in &images {
+                vision_images_for_current_turn.push(img.data.clone());
             }
         }
+
+        // (Image → FileAttachment conversion already done above, before file processing.)
 
         // Build the persisted message: user text + media descriptions (text only).
         let persist_text = if media_descriptions.is_empty() {
@@ -3169,10 +3180,10 @@ impl AgentRuntime {
         let mut last_tool_key = String::new();
         let mut same_call_streak: usize = 0;
         const MAX_SAME_CALL_STREAK: usize = 5;
-        // Track consecutive tool errors - stop early when tools keep failing.
+// Track consecutive tool errors — stop early when tools keep failing.
         let mut error_streak: usize = 0;
         const MAX_ERROR_STREAK: usize = 2;
-        // Store last error info for user feedback when breaking loop
+        // Store last error info so we can surface it when the loop breaks.
         let mut last_error_info: Option<String> = None;
         let mut max_iterations = BASE_ITERATIONS;
         let mut iteration = 0usize;
@@ -3269,7 +3280,7 @@ impl AgentRuntime {
                     was_preparse: false,
                 });
             }
-            // Check consecutive tool errors - stop early when tools keep failing.
+// Check consecutive tool errors — stop early when tools keep failing.
             if error_streak >= MAX_ERROR_STREAK {
                 warn!(
                     session = %ctx.session_key,
@@ -4347,39 +4358,33 @@ impl AgentRuntime {
                     Ok(v) => {
                         // Reset parse error counter on successful tool execution
                         ctx.parse_error_count = 0;
-                        // Check if result contains an error:
-                        // - exit_code != 0
-                        // - has "error" field
-                        // - stderr length > 0 (script execution failed)
+                        // Tool result indicates failure if any of:
+                        //   exit_code != 0  |  has "error" field  |  stderr length > 0
                         let has_error = match &v {
                             serde_json::Value::Object(obj) => {
-                                // Check exit_code field directly
                                 obj.get("exit_code")
                                     .and_then(|c| c.as_i64())
                                     .map(|c| c != 0)
                                     .unwrap_or(false)
                                     || obj.contains_key("error")
-                                    // Check stderr length
                                     || obj.get("stderr")
                                         .and_then(|s| s.as_str())
-                                        .map(|s| s.len() > 0)
+                                        .map(|s| !s.is_empty())
                                         .unwrap_or(false)
                             }
                             _ => {
                                 // Fallback: check string representation
                                 let v_str = v.to_string();
-                                // Match "exit_code":N where N is not 0
                                 v_str.contains("\"exit_code\":")
                                     && !v_str.contains("\"exit_code\":0")
                                     && !v_str.contains("\"exit_code\": 0")
                                     || v_str.contains("\"error\"")
                                     || v_str.contains("\"stderr\":")
-                                    && !v_str.contains("\"stderr\":\"\"")
+                                        && !v_str.contains("\"stderr\":\"\"")
                             }
                         };
                         if has_error {
                             error_streak += 1;
-                            // Store error info for user feedback
                             last_error_info = Some(v.to_string());
                         } else {
                             error_streak = 0;
@@ -5006,7 +5011,7 @@ impl AgentRuntime {
             "web_browser" | "browser" => return self.tool_web_browser(ctx, args).await,
             "computer_use" => return self.tool_computer_use(args).await,
             "image_gen" | "image" => return self.tool_image(args).await,
-            "video_gen" | "video" => return self.tool_video(args).await,
+            "video_gen" | "video" => return self.tool_video(args, ctx).await,
             "pdf" => return self.tool_pdf(args).await,
             "text_to_voice" | "text_to_speech" | "tts" => return self.tool_tts(args).await,
             "send_message" | "message" => return self.tool_message(args).await,

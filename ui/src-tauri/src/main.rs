@@ -697,12 +697,71 @@ fn uninstall_skill(name: String) -> Result<String, String> {
     run_rsclaw_command(&["skills", "uninstall", &name])
 }
 
+/// Expand `${VAR}` placeholders in a string by reading from the process
+/// environment. Mirrors `crate::config::loader::expand_env_vars` in the
+/// gateway so the test path matches actual runtime substitution.
+/// Unknown vars are kept as the literal `${VAR}` token.
+fn expand_env_vars(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            if let Some(end_off) = s[i + 2..].find('}') {
+                let var_name = &s[i + 2..i + 2 + end_off];
+                if !var_name.is_empty()
+                    && var_name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                {
+                    if let Ok(val) = std::env::var(var_name) {
+                        out.push_str(&val);
+                    } else {
+                        out.push_str(&s[i..i + 2 + end_off + 1]);
+                    }
+                    i += 2 + end_off + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 /// Test provider API key by calling /v1/models directly (no gateway needed).
 #[tauri::command]
 async fn test_provider(provider: String, api_key: String, base_url: Option<String>, api_type: Option<String>) -> Result<serde_json::Value, String> {
-    // Resolve the effective API type for custom/codingplan providers
+    // Expand `${VAR}` env placeholders so a config like `apiKey: "${ANTHROPIC_API_KEY}"`
+    // tests the actual key, matching the gateway's runtime expansion.
+    let raw_key = api_key.clone();
+    let api_key = expand_env_vars(&api_key);
+    let base_url = base_url.map(|u| expand_env_vars(&u));
+    // Diagnose the silent failure mode: user has `apiKey: "${FOO}"` in
+    // config but `FOO` is unset / empty in the gateway's process env, so
+    // expansion produces "" and the test sends an empty header — provider
+    // returns 401, user sees "invalid key" and chases the key value when
+    // the real problem is the env var.
+    let needs_key = matches!(provider.as_str(), "ollama") == false;
+    if needs_key && api_key.is_empty() && raw_key.contains("${") {
+        let var = raw_key
+            .trim()
+            .trim_start_matches("${")
+            .trim_end_matches('}');
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": format!(
+                "API key expanded to empty — env var '{var}' is unset or empty in the desktop app's process environment. \
+                 Either set it before launching RsClaw, or paste the literal key into rsclaw.json5."
+            )
+        }));
+    }
+    // Resolve the effective API type. custom/codingplan always pick auth via
+    // api_type. doubao opts in too (CodingPlan offering speaks Anthropic),
+    // but only when an api_type was explicitly chosen — otherwise it stays
+    // "doubao" (auth=bearer, ark base URL).
     let is_custom_like = provider == "custom" || provider == "codingplan";
-    let effective_api_type = if is_custom_like {
+    let supports_api_type = is_custom_like || provider == "doubao";
+    let effective_api_type = if supports_api_type && api_type.is_some() {
         api_type.as_deref().unwrap_or("openai")
     } else {
         provider.as_str()
@@ -768,8 +827,15 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
     match auth_style {
         "bearer" => { req = req.header("Authorization", format!("Bearer {api_key}")); }
         "x-api-key" => {
-            req = req.header("x-api-key", &api_key);
-            req = req.header("anthropic-version", "2023-06-01");
+            // Send BOTH headers so the same code path covers:
+            //   - Standard Anthropic (api.anthropic.com) — uses x-api-key
+            //   - Volcengine "coding plan" Anthropic-compat
+            //     (ark.cn-beijing.volces.com/api/coding/v1) — uses Bearer
+            // Each backend honors its expected header and ignores the other.
+            req = req
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("Authorization", format!("Bearer {api_key}"));
         }
         _ => {} // gemini uses query param, ollama needs no auth
     }

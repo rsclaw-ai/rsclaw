@@ -410,7 +410,13 @@ impl CronRunner {
         shutdown: Option<crate::gateway::ShutdownCoordinator>,
     ) -> Self {
         let run_log_dir = data_dir.join("cron");
-        let store_path = data_dir.join("cron_store.json");
+        // Use the canonical cron.json5 path — the same file the UI, CLI,
+        // and tool_cron read/write. Previously this was a separate
+        // `cron_store.json` under data_dir/, so save_store() updates
+        // (including one-shot job removal) never landed in the file
+        // anyone else looked at — the next reload would resurrect the
+        // already-fired one-shot job.
+        let store_path = resolve_cron_store_path();
         if let Err(e) = std::fs::create_dir_all(&run_log_dir) {
             tracing::warn!("failed to create cron run log dir: {e}");
         }
@@ -465,6 +471,19 @@ impl CronRunner {
                 state.next_run_at_ms = job.schedule.compute_next_run(now_ms);
                 info!(job_id = %job.id, old = ?old_ts, new = ?state.next_run_at_ms, "cron: recomputed next_run_at_ms");
             }
+        }
+
+        // Sweep zombie one-shot jobs left disabled by previous runs that
+        // crashed or used the pre-fix `cron_store.json` save path. These
+        // would otherwise sit in cron.json5 forever, since the in-loop
+        // retain only fires after a try_recv result event.
+        let zombies_before = jobs.len();
+        jobs.retain(|j| !(j.schedule.is_once() && !j.enabled));
+        if jobs.len() < zombies_before {
+            info!(
+                removed = zombies_before - jobs.len(),
+                "cron: cleaned up zombie one-shot jobs at startup"
+            );
         }
 
         // Persist initial state
@@ -1790,7 +1809,12 @@ async fn run_exec_command(
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let msg = AgentMessage {
-            session_key: format!("summarize:{}", job.id), // Use "summarize:" prefix to disable ALL tools
+            // `summarize:` prefix is detected by the agent runtime and disables
+            // ALL tools for the turn — forces the LLM to return a text summary
+            // instead of calling memory.put / write_file / etc. Without this,
+            // the agent treats summarize requests as normal turns and often
+            // chooses tool calls over plain text.
+            session_key: format!("summarize:{}", session_key),
             text: summarize_prompt,
             channel: "cron".to_string(),
             peer_id: format!("cron:{}", job.id),
@@ -1803,9 +1827,11 @@ async fn run_exec_command(
 
         handle.tx.send(msg).await.context("agent inbox closed")?;
 
-        // Wait for summary with timeout.
-        // Use 300s timeout - agent may be processing other tasks and summarize needs time.
-        // Cron jobs are often batch operations, so longer wait is acceptable.
+        // Wait for summary with timeout. 300s gives the (possibly busy)
+        // agent room to process other tasks first; cron jobs tend to be
+        // batch-style so a longer wait is acceptable. Note that the new
+        // _summarizer agent path above is the real fix for queue
+        // contention — the timeout is just a safety net.
         let summary_timeout = Duration::from_secs(300);
         match tokio::time::timeout(summary_timeout, reply_rx).await {
             Ok(Ok(reply)) => {

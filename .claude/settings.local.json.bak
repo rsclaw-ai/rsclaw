@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git fetch:*)",
+      "Bash(git checkout:*)",
+      "Bash(cargo build:*)",
+      "Bash(cmd.exe:*)",
+      "Bash(powershell.exe:*)",
+      "Bash(powershell:*)",
+      "Bash(grep -E \"error\\\\[|error:|src\\\\\\\\\\\\\\\\agent\")",
+      "Bash(dir \"E:\\\\\\\\mickeylan\\\\\\\\ai\\\\\\\\openclaw\\\\\\\\src\")",
+      "Bash(ls /e/mickeylan/ai/openclaw/src/agents/*.ts)",
+      "WebFetch(domain:www.npmjs.com)",
+      "WebFetch(domain:github.com)",
+      "WebSearch",
+      "Bash(git add:*)",
+      "Bash(git commit -m ':*)",
+      "Bash(git push:*)",
+      "Bash(git merge:*)"
+    ]
+  }
+}

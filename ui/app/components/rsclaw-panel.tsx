@@ -581,7 +581,7 @@ function ConfigEditorPage() {
         apiKey,
         baseUrl: baseUrl || "",
         userAgent: userAgent || (pName === "kimi" ? "claude-code/0.1.0" : ""),
-        ...(isCustomLike ? { apiType } : {}),
+        ...((isCustomLike || pName === "doubao") ? { apiType } : {}),
       };
     });
     setProviders(newProviders);
@@ -707,7 +707,8 @@ function ConfigEditorPage() {
       else delete entry.apiKey;
       if (prov.baseUrl) entry.baseUrl = prov.baseUrl;
       else if (isCustomLike || prov.key === "ollama") delete entry.baseUrl;
-      if (isCustomLike && prov.apiType) entry.api = prov.apiType;
+      // Doubao opts into the api_type field too (CodingPlan offering).
+      if ((isCustomLike || prov.key === "doubao") && prov.apiType) entry.api = prov.apiType;
       if (prov.userAgent) entry.userAgent = prov.userAgent;
       else delete entry.userAgent;
       cfg.models.providers[prov.key] = entry;
@@ -919,7 +920,7 @@ function ConfigEditorPage() {
               markDirty();
             }} />
           </div>
-          {isCustomLike && (
+          {(isCustomLike || prov.key === "doubao") && (
             <div style={fieldRow}>
               <div style={fieldLabel}>API Type</div>
               <select
@@ -930,7 +931,11 @@ function ConfigEditorPage() {
                   if (!val) return;
                   const at = val as ApiType;
                   const next = [...providers];
-                  next[idx] = { ...next[idx], apiType: at, baseUrl: "" };
+                  // For custom-like providers, switching api_type wipes the
+                  // base URL (each api_type has its own default). For doubao,
+                  // keep the existing base URL — only the auth/format changes.
+                  const baseUrlReset = isCustomLike ? "" : next[idx].baseUrl;
+                  next[idx] = { ...next[idx], apiType: at, baseUrl: baseUrlReset };
                   setProviders(next);
                   markDirty();
                 }}
@@ -3422,12 +3427,37 @@ function TauriConfigPageInner() {
   };
 
   const handleSave = async () => {
-    try { JSON5.parse(raw); } catch { toast.error(zh ? "JSON5 格式错误" : "Invalid JSON5"); return; }
+    let parsed: any;
+    try { parsed = JSON5.parse(raw); } catch { toast.error(zh ? "JSON5 格式错误" : "Invalid JSON5"); return; }
+    // Strip zombie channel blocks (channels whose accounts is missing or
+    // an empty object). Heals configs left dirty by older versions of
+    // removeAccount that only deleted the inner accounts entry.
+    let cleanedContent = raw;
+    if (parsed && parsed.channels && typeof parsed.channels === "object") {
+      let changed = false;
+      for (const chId of Object.keys(parsed.channels)) {
+        const ch = parsed.channels[chId];
+        const accounts = ch && typeof ch === "object" ? ch.accounts : undefined;
+        const isEmptyAccounts =
+          accounts === undefined ||
+          accounts === null ||
+          (typeof accounts === "object" && !Array.isArray(accounts) && Object.keys(accounts).length === 0);
+        if (isEmptyAccounts) {
+          delete parsed.channels[chId];
+          changed = true;
+        }
+      }
+      if (changed) {
+        cleanedContent = JSON.stringify(parsed, null, 2);
+        setConfig(parsed);
+        setRaw(cleanedContent);
+      }
+    }
     setSaving(true);
     try {
       const invoke = isTauri ? tauriInvokeV2 : null;
       if (invoke) {
-        await invoke("write_config", { content: raw });
+        await invoke("write_config", { content: cleanedContent });
         try { await reloadConfig(); } catch {}
         toast.success(zh ? "配置已保存" : "Config saved");
         setDirty(false);
@@ -3511,7 +3541,10 @@ function TauriConfigPageInner() {
     const apiKey = getVal(`models.providers.${provId}.apiKey`, "");
     const baseUrl = getVal(`models.providers.${provId}.baseUrl`, "");
     const isCustomLike = provId === "custom" || provId === "codingplan";
-    const apiType = isCustomLike ? (getVal(`models.providers.${provId}.api`, "") || getVal(`models.providers.${provId}.api_type`, "")) : undefined;
+    // Doubao opts into api_type for CodingPlan support — read it too so the
+    // test path uses the right auth header (anthropic vs openai).
+    const supportsApiType = isCustomLike || provId === "doubao";
+    const apiType = supportsApiType ? (getVal(`models.providers.${provId}.api`, "") || getVal(`models.providers.${provId}.api_type`, "")) : undefined;
     if (!apiKey && provId !== "ollama" && !(isCustomLike && (apiType === "ollama" || baseUrl))) {
       toast.error(zh ? "请先填写 API Key" : "Enter API Key first");
       return;
@@ -3531,7 +3564,37 @@ function TauriConfigPageInner() {
       }
       if (res.ok || res.success) {
         // Must have models to be considered connected
-        const apiModels: string[] = (res.models || []).map((m: any) => typeof m === "string" ? m : m.id).filter(Boolean);
+        let apiModels: string[] = (res.models || []).map((m: any) => typeof m === "string" ? m : m.id).filter(Boolean);
+        // Doubao returns 100+ entries because every dated snapshot
+        // (`...-260215`, `...-250115`, ...) is its own ID. Group by
+        // family (the prefix before the trailing -yymmdd / -yyyymmdd)
+        // and keep one entry per family: prefer the unversioned alias
+        // when it exists (rolling-latest pointer); otherwise keep the
+        // newest dated snapshot. The previous "drop everything dated"
+        // approach killed families like doubao-seedream-3-0-241015 that
+        // never had an unversioned alias.
+        if (provId === "doubao") {
+          const dateRe = /^(.+?)-(\d{6,8})$/;
+          const families = new Map<string, string>();
+          for (const id of apiModels) {
+            const m = dateRe.exec(id);
+            if (!m) {
+              // Unversioned — always wins, lock the family.
+              families.set(id, id);
+              continue;
+            }
+            const prefix = m[1];
+            const existing = families.get(prefix);
+            if (existing === undefined) {
+              families.set(prefix, id);
+            } else if (dateRe.test(existing) && existing < id) {
+              // Existing is also dated and older — replace with newer.
+              // Skip if existing is the unversioned alias (no date suffix).
+              families.set(prefix, id);
+            }
+          }
+          apiModels = Array.from(families.values()).sort();
+        }
         if (apiModels.length > 0) {
           setProvTest((prev) => ({ ...prev, [provId]: "ok" }));
           setProvModels((prev) => ({ ...prev, [provId]: apiModels.slice(0, 30).map((id) => {
@@ -3687,7 +3750,20 @@ function TauriConfigPageInner() {
   };
 
   const removeAccount = (chId: string, acctId: string) => {
-    deleteConfig(`channels.${chId}.accounts.${acctId}`);
+    // Delete the account, and if it was the last one in the channel, drop
+    // the channel entry entirely so the config doesn't keep a zombie block
+    // like `wechat: { accounts: {} }`.
+    const newConfig = JSON.parse(JSON.stringify(config));
+    const ch = newConfig?.channels?.[chId];
+    if (ch && ch.accounts && typeof ch.accounts === "object") {
+      delete ch.accounts[acctId];
+      if (Object.keys(ch.accounts).length === 0) {
+        delete newConfig.channels[chId];
+      }
+      setConfig(newConfig);
+      setRaw(JSON.stringify(newConfig, null, 2));
+      setDirty(true);
+    }
     setOpenAccts((prev) => { const n = { ...prev }; delete n[`${chId}-${acctId}`]; return n; });
   };
 
@@ -4258,6 +4334,19 @@ function TauriConfigPageInner() {
                           <div style={{ marginBottom: 8 }}>
                             {p.id === "doubao" && (
                               <>
+                                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>API Type</div>
+                                <select
+                                  style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", cursor: "pointer", marginBottom: 8 }}
+                                  value={getVal(`models.providers.${p.id}.api`, "openai")}
+                                  onChange={(e) => {
+                                    updateConfig(`models.providers.${p.id}.api`, e.target.value);
+                                    setProvTest((prev) => ({ ...prev, [p.id]: "idle" }));
+                                  }}
+                                >
+                                  {(Object.keys(API_TYPE_LABELS) as ApiType[]).map((at) => (
+                                    <option key={at} value={at}>{API_TYPE_LABELS[at]}</option>
+                                  ))}
+                                </select>
                                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>API URL</div>
                                 <input
                                   style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", marginBottom: 8 }}
@@ -4502,7 +4591,7 @@ function TauriConfigPageInner() {
                                     </button>
                                     {openAccts[`del-${c.id}-${acct.id}`] && (
                                       <div onClick={(e) => e.stopPropagation()} style={{
-                                        position: "absolute", bottom: "100%", right: 0, marginBottom: 6,
+                                        position: "absolute", bottom: "100%", left: 0, marginBottom: 6,
                                         padding: "10px 12px", minWidth: 160,
                                         background: "var(--white)", border: "1px solid var(--border-in-light)",
                                         borderRadius: 8, boxShadow: "0 4px 12px rgba(0,0,0,0.3)", zIndex: 100,
@@ -4787,13 +4876,76 @@ interface CronJob {
   name: string;
   agentId?: string;
   enabled: boolean;
-  schedule?: { kind: string; expr: string; tz?: string };
+  // Tagged schedule: cron expr, every-interval, or one-shot.
+  schedule?: {
+    kind: string;
+    expr?: string;
+    tz?: string;
+    everyMs?: number;
+    anchorMs?: number;
+    atMs?: number;
+    delayMs?: number;
+  };
   payload?: { kind: string; text?: string };
   delivery?: { channel?: string; to?: string; mode?: string };
   sessionKey?: string;
   sessionTarget?: string;
-  last_run?: string;
-  next_run?: string;
+  // Runtime state stamped by the gateway after each tick. All ms-since-epoch.
+  state?: {
+    last_run_at_ms?: number;
+    last_error?: string;
+    next_run_at_ms?: number;
+    running_at_ms?: number;
+    consecutive_errors?: number;
+  };
+}
+
+type ScheduleKind = "cron" | "every" | "once";
+
+/** Render an ms-since-epoch timestamp as a short relative time + absolute. */
+function formatRelativeTime(ms: number | undefined, zh: boolean): string {
+  if (!ms) return "";
+  const now = Date.now();
+  const diff = ms - now; // positive = future
+  const abs = Math.abs(diff);
+  const sec = Math.round(abs / 1000);
+  const min = Math.round(sec / 60);
+  const hr = Math.round(min / 60);
+  const day = Math.round(hr / 24);
+  const future = diff > 0;
+  let rel: string;
+  if (sec < 60) rel = future ? (zh ? `${sec} 秒后` : `in ${sec}s`) : (zh ? `${sec} 秒前` : `${sec}s ago`);
+  else if (min < 60) rel = future ? (zh ? `${min} 分钟后` : `in ${min}m`) : (zh ? `${min} 分钟前` : `${min}m ago`);
+  else if (hr < 24) rel = future ? (zh ? `${hr} 小时后` : `in ${hr}h`) : (zh ? `${hr} 小时前` : `${hr}h ago`);
+  else rel = future ? (zh ? `${day} 天后` : `in ${day}d`) : (zh ? `${day} 天前` : `${day}d ago`);
+  return rel;
+}
+
+/** Build a compact summary for any cron schedule kind. */
+function scheduleSummary(schedule: CronJob["schedule"], zh: boolean): { badge: string; human: string } {
+  if (!schedule) return { badge: "", human: "" };
+  if (schedule.kind === "every") {
+    const sec = Math.round((schedule.everyMs ?? 0) / 1000);
+    if (sec <= 0) return { badge: zh ? "间隔" : "interval", human: "" };
+    if (sec < 60) return { badge: zh ? `每 ${sec}s` : `every ${sec}s`, human: "" };
+    if (sec < 3600) return { badge: zh ? `每 ${Math.round(sec / 60)} 分钟` : `every ${Math.round(sec / 60)}m`, human: "" };
+    return { badge: zh ? `每 ${Math.round(sec / 3600)} 小时` : `every ${Math.round(sec / 3600)}h`, human: "" };
+  }
+  if (schedule.kind === "once") {
+    if (schedule.atMs) {
+      const d = new Date(schedule.atMs);
+      const ts = `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+      return { badge: zh ? "一次性" : "one-shot", human: zh ? `${ts} 触发` : `at ${ts}` };
+    }
+    if (schedule.delayMs) {
+      const sec = Math.round(schedule.delayMs / 1000);
+      return { badge: zh ? "一次性" : "one-shot", human: zh ? `${sec}s 后触发` : `in ${sec}s` };
+    }
+    return { badge: zh ? "一次性" : "one-shot", human: "" };
+  }
+  // Default: cron expr.
+  const expr = schedule.expr || "";
+  return { badge: expr, human: cronToHuman(expr) };
 }
 
 const CRON_TEMPLATES = [
@@ -4828,7 +4980,21 @@ function CronTaskPage() {
   const [cronEnabled, setCronEnabled] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [editJob, setEditJob] = useState<CronJob | null>(null);
-  const [form, setForm] = useState({ name: "", schedule: "", message: "", agentId: "", enabled: true, deliveryChannel: "", deliveryTo: "", deliveryMode: "always" });
+  const [form, setForm] = useState({
+    name: "",
+    scheduleKind: "cron" as ScheduleKind,
+    schedule: "",
+    everySeconds: 60,
+    onceMode: "delay" as "delay" | "at",
+    onceDelaySeconds: 60,
+    onceAt: "", // local datetime string e.g. "2026-04-27T15:30"
+    message: "",
+    agentId: "",
+    enabled: true,
+    deliveryChannel: "",
+    deliveryTo: "",
+    deliveryMode: "always",
+  });
   const [agents, setAgents] = useState<{ id: string; name?: string }[]>([]);
   const [runningId, setRunningId] = useState<string | null>(null);
 
@@ -4858,13 +5024,29 @@ function CronTaskPage() {
       if (invoke) {
         const data: any = await invoke("get_cron_jobs");
         const existing = data.jobs || [];
+        let scheduleObj: any;
+        if (form.scheduleKind === "every") {
+          scheduleObj = { kind: "every", everyMs: Math.max(1, form.everySeconds) * 1000 };
+        } else if (form.scheduleKind === "once") {
+          if (form.onceMode === "at" && form.onceAt) {
+            // Local datetime → ms since epoch.
+            scheduleObj = { kind: "once", atMs: new Date(form.onceAt).getTime() };
+          } else {
+            scheduleObj = { kind: "once", delayMs: Math.max(1, form.onceDelaySeconds) * 1000 };
+          }
+        } else {
+          scheduleObj = { kind: "cron", expr: form.schedule, tz: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC" };
+        }
         const jobObj: any = {
           id: editJob?.id || crypto.randomUUID(),
           name: form.name,
           agentId: form.agentId || "main",
           enabled: form.enabled,
-          schedule: { kind: "cron", expr: form.schedule, tz: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC" },
-          payload: { kind: "systemEvent", text: form.message },
+          schedule: scheduleObj,
+          // `agentTurn` dispatches the message to the agent at fire time so
+          // the user gets the agent's actual response (and any tool output),
+          // not just an echo of the trigger prompt.
+          payload: { kind: "agentTurn", text: form.message },
         };
         if (form.deliveryChannel && form.deliveryTo) {
           jobObj.delivery = { channel: form.deliveryChannel, to: form.deliveryTo, mode: form.deliveryMode || "always" };
@@ -4927,12 +5109,43 @@ function CronTaskPage() {
 
   const openEdit = (job: CronJob) => {
     setEditJob(job);
-    setForm({ name: job.name, schedule: job.schedule?.expr || "", message: job.payload?.text || "", agentId: job.agentId || "", enabled: job.enabled, deliveryChannel: job.delivery?.channel || "", deliveryTo: job.delivery?.to || "", deliveryMode: job.delivery?.mode || "always" });
+    const sk = (job.schedule?.kind || "cron") as ScheduleKind;
+    const everySeconds = Math.max(1, Math.round((job.schedule?.everyMs ?? 60000) / 1000));
+    const atMsForInput = job.schedule?.atMs;
+    setForm({
+      name: job.name,
+      scheduleKind: sk === "every" || sk === "once" ? sk : "cron",
+      schedule: job.schedule?.expr || "",
+      everySeconds,
+      onceMode: atMsForInput ? "at" : "delay",
+      onceDelaySeconds: Math.max(1, Math.round((job.schedule?.delayMs ?? 60000) / 1000)),
+      onceAt: atMsForInput ? new Date(atMsForInput).toISOString().slice(0, 16) : "",
+      message: job.payload?.text || "",
+      agentId: job.agentId || "",
+      enabled: job.enabled,
+      deliveryChannel: job.delivery?.channel || "",
+      deliveryTo: job.delivery?.to || "",
+      deliveryMode: job.delivery?.mode || "always",
+    });
     setShowForm(true);
   };
   const openNew = () => {
     setEditJob(null);
-    setForm({ name: "", schedule: "", message: "", agentId: agents[0]?.id || "", enabled: true, deliveryChannel: "", deliveryTo: "", deliveryMode: "always" });
+    setForm({
+      name: "",
+      scheduleKind: "cron",
+      schedule: "",
+      everySeconds: 60,
+      onceMode: "delay",
+      onceDelaySeconds: 60,
+      onceAt: "",
+      message: "",
+      agentId: agents[0]?.id || "",
+      enabled: true,
+      deliveryChannel: "",
+      deliveryTo: "",
+      deliveryMode: "always",
+    });
     setShowForm(true);
   };
 
@@ -4971,24 +5184,46 @@ function CronTaskPage() {
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {jobs.map((job) => {
-              const expr = job.schedule?.expr || "";
+              const summary = scheduleSummary(job.schedule, zh);
               const msg = job.payload?.text || "";
+              const payloadKind = job.payload?.kind || "agentTurn";
+              const isAgentTurn = payloadKind !== "systemEvent" && payloadKind !== "execCommand";
+              const kindLabel = payloadKind === "systemEvent"
+                ? (zh ? "\u5E7F\u64AD" : "Broadcast")
+                : payloadKind === "execCommand"
+                  ? (zh ? "\u6267\u884C" : "Exec")
+                  : "Agent";
+              const kindColor = isAgentTurn
+                ? { bg: "rgba(45,212,160,0.12)", fg: "#2dd4a0", bd: "rgba(45,212,160,0.25)" }
+                : payloadKind === "systemEvent"
+                  ? { bg: "rgba(160,160,255,0.12)", fg: "#a0a0ff", bd: "rgba(160,160,255,0.25)" }
+                  : { bg: "rgba(255,180,90,0.12)", fg: "#ffb45a", bd: "rgba(255,180,90,0.25)" };
+              const deliveryLabel = job.delivery?.channel
+                ? `\u2192 ${job.delivery.channel}${job.delivery.to ? `:${job.delivery.to.length > 12 ? job.delivery.to.slice(0, 6) + "\u2026" + job.delivery.to.slice(-4) : job.delivery.to}` : ""}`
+                : "";
+              const nextRel = formatRelativeTime(job.state?.next_run_at_ms, zh);
+              const lastRel = formatRelativeTime(job.state?.last_run_at_ms, zh);
               return (
                 <div key={job.id} style={{ background: V2.bg2, border: `1px solid ${V2.bd}`, borderRadius: 11, opacity: job.enabled ? 1 : 0.7, transition: "border-color .13s" }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 16px" }}>
                     <div style={{ width: 8, height: 8, borderRadius: "50%", background: job.enabled ? V2.green : V2.bg5, flexShrink: 0 }} />
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 13, fontWeight: 600, color: "#eceaf4" }}>{job.name || job.id}</div>
-                      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 4 }}>
-                        {expr && <span style={{ fontFamily: V2.mono, fontSize: 11, color: "#f97316", background: "rgba(249,115,22,0.12)", border: `1px solid ${V2.obrd}`, padding: "1px 7px", borderRadius: 4 }}>{expr}</span>}
-                        <span style={{ fontSize: 11, color: "rgba(255,255,255,0.45)" }}>{cronToHuman(expr)}</span>
-                        {job.agentId && <span style={{ fontSize: 11, color: "rgba(255,255,255,0.45)", fontFamily: V2.mono }}>{"-> "}{job.agentId}</span>}
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                        <span style={{ fontSize: 13, fontWeight: 600, color: "#eceaf4" }}>{job.name || job.id}</span>
+                        <span style={{ fontSize: 9, padding: "1px 6px", borderRadius: 3, background: kindColor.bg, color: kindColor.fg, border: `1px solid ${kindColor.bd}`, fontFamily: V2.mono, letterSpacing: 0.3 }}>{kindLabel}</span>
                       </div>
-                      {msg && <div style={{ fontSize: 10, color: "rgba(255,255,255,0.38)", marginTop: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 300 }}>{msg.slice(0, 50)}</div>}
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 4, flexWrap: "wrap" }}>
+                        {summary.badge && <span style={{ fontFamily: V2.mono, fontSize: 11, color: "#f97316", background: "rgba(249,115,22,0.12)", border: `1px solid ${V2.obrd}`, padding: "1px 7px", borderRadius: 4 }}>{summary.badge}</span>}
+                        {summary.human && <span style={{ fontSize: 11, color: "rgba(255,255,255,0.45)" }}>{summary.human}</span>}
+                        {job.agentId && <span style={{ fontSize: 11, color: "rgba(255,255,255,0.45)", fontFamily: V2.mono }}>{"\u2192 "}{job.agentId}</span>}
+                        {deliveryLabel && <span style={{ fontSize: 10, color: "rgba(255,255,255,0.5)", fontFamily: V2.mono, padding: "1px 6px", background: "rgba(255,255,255,0.04)", borderRadius: 3 }}>{deliveryLabel}</span>}
+                      </div>
+                      {msg && <div style={{ fontSize: 10, color: "rgba(255,255,255,0.38)", marginTop: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 360 }} title={msg}>{msg.slice(0, 60)}</div>}
                     </div>
-                    <div style={{ textAlign: "right", flexShrink: 0, marginRight: 8 }}>
-                      {job.next_run && <div style={{ fontSize: 10, color: "rgba(255,255,255,0.45)" }}>{zh ? "\u4E0B\u6B21" : "Next"}: {job.next_run}</div>}
-                      {!job.enabled && <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 20, background: "rgba(255,255,255,0.06)", color: "rgba(255,255,255,0.4)", border: "1px solid rgba(255,255,255,0.1)" }}>{zh ? "\u5DF2\u6682\u505C" : "Paused"}</span>}
+                    <div style={{ textAlign: "right", flexShrink: 0, marginRight: 8, fontSize: 10, color: "rgba(255,255,255,0.45)" }}>
+                      {nextRel && <div>{zh ? "\u4E0B\u6B21" : "Next"}: {nextRel}</div>}
+                      {lastRel && <div style={{ marginTop: 2, opacity: 0.7 }}>{zh ? "\u4E0A\u6B21" : "Last"}: {lastRel}</div>}
+                      {!job.enabled && <span style={{ display: "inline-block", marginTop: 4, fontSize: 10, padding: "2px 8px", borderRadius: 20, background: "rgba(255,255,255,0.06)", color: "rgba(255,255,255,0.4)", border: "1px solid rgba(255,255,255,0.1)" }}>{zh ? "\u5DF2\u6682\u505C" : "Paused"}</span>}
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
                       <button onClick={() => { setRunningId(job.id); triggerJob(job.id); setTimeout(() => setRunningId(null), 1500); }}
@@ -5030,20 +5265,80 @@ function CronTaskPage() {
                   style={{ width: "100%", padding: "8px 10px", borderRadius: 7, border: "1px solid rgba(255,255,255,.09)", background: "#1f2126", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none" }} />
               </div>
               <div style={{ marginBottom: 14 }}>
-                <div style={{ fontSize: 10, color: "#2e2c3a", letterSpacing: 0.4, marginBottom: 5, fontFamily: "'JetBrains Mono', monospace" }}>CRON {zh ? "\u8868\u8FBE\u5F0F" : "EXPRESSION"}</div>
-                <input value={form.schedule} onChange={(e) => setForm({ ...form, schedule: e.target.value })} placeholder="0 9 * * 1-5"
-                  style={{ width: "100%", padding: "8px 10px", borderRadius: 7, border: "1px solid rgba(255,255,255,.09)", background: "#1f2126", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none" }} />
-                <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
-                  {CRON_TEMPLATES.map((tpl) => (
-                    <button key={tpl.cron} onClick={() => setForm({ ...form, schedule: tpl.cron })}
-                      style={{ padding: "3px 9px", borderRadius: 5, border: "1px solid rgba(255,255,255,.09)", background: "transparent", color: form.schedule === tpl.cron ? "#f97316" : "#4a4858", fontSize: 10, fontFamily: "'JetBrains Mono', monospace", cursor: "pointer" }}>
-                      {zh ? tpl.label.cn : tpl.label.en}
-                    </button>
-                  ))}
+                <div style={{ fontSize: 10, color: "#2e2c3a", letterSpacing: 0.4, marginBottom: 5, fontFamily: "'JetBrains Mono', monospace" }}>{zh ? "\u8C03\u5EA6\u65B9\u5F0F" : "SCHEDULE TYPE"}</div>
+                <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+                  {([
+                    { k: "cron", cn: "Cron \u8868\u8FBE\u5F0F", en: "Cron expr" },
+                    { k: "every", cn: "\u56FA\u5B9A\u95F4\u9694", en: "Interval" },
+                    { k: "once", cn: "\u4E00\u6B21\u6027", en: "One-shot" },
+                  ] as const).map((opt) => {
+                    const active = form.scheduleKind === opt.k;
+                    return (
+                      <button key={opt.k} onClick={() => setForm({ ...form, scheduleKind: opt.k })}
+                        style={{ flex: 1, padding: "6px 10px", borderRadius: 7, border: `1px solid ${active ? "rgba(249,115,22,.4)" : "rgba(255,255,255,.09)"}`, background: active ? "rgba(249,115,22,.12)" : "transparent", color: active ? "#f97316" : "#9896a4", fontSize: 11, fontWeight: 500, cursor: "pointer", fontFamily: "inherit" }}>
+                        {zh ? opt.cn : opt.en}
+                      </button>
+                    );
+                  })}
                 </div>
-                <div style={{ fontSize: 10, color: form.schedule && cronToHuman(form.schedule) ? "#2dd4a0" : "transparent", fontFamily: "'JetBrains Mono', monospace", marginTop: 4, minHeight: 14 }}>
-                  {cronToHuman(form.schedule) || ""}
-                </div>
+                {form.scheduleKind === "every" && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                    <span style={{ fontSize: 11, color: "#9896a4", fontFamily: "'JetBrains Mono', monospace" }}>{zh ? "\u6BCF" : "Every"}</span>
+                    <input type="number" min={1} value={form.everySeconds}
+                      onChange={(e) => setForm({ ...form, everySeconds: Math.max(1, parseInt(e.target.value) || 1) })}
+                      style={{ width: 100, padding: "8px 10px", borderRadius: 7, border: "1px solid rgba(255,255,255,.09)", background: "#1f2126", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none" }} />
+                    <span style={{ fontSize: 11, color: "#9896a4", fontFamily: "'JetBrains Mono', monospace" }}>{zh ? "\u79D2\u89E6\u53D1\u4E00\u6B21" : "seconds"}</span>
+                  </div>
+                )}
+                {form.scheduleKind === "once" && (
+                  <div style={{ marginBottom: 4 }}>
+                    <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                      {([
+                        { m: "delay", cn: "\u5012\u8BA1\u65F6", en: "After delay" },
+                        { m: "at", cn: "\u6307\u5B9A\u65F6\u523B", en: "At time" },
+                      ] as const).map((opt) => {
+                        const active = form.onceMode === opt.m;
+                        return (
+                          <button key={opt.m} onClick={() => setForm({ ...form, onceMode: opt.m })}
+                            style={{ padding: "5px 10px", borderRadius: 6, border: `1px solid ${active ? "rgba(249,115,22,.4)" : "rgba(255,255,255,.09)"}`, background: active ? "rgba(249,115,22,.12)" : "transparent", color: active ? "#f97316" : "#9896a4", fontSize: 10.5, cursor: "pointer", fontFamily: "inherit" }}>
+                            {zh ? opt.cn : opt.en}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    {form.onceMode === "delay" ? (
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <span style={{ fontSize: 11, color: "#9896a4", fontFamily: "'JetBrains Mono', monospace" }}>{zh ? "\u5728" : "In"}</span>
+                        <input type="number" min={1} value={form.onceDelaySeconds}
+                          onChange={(e) => setForm({ ...form, onceDelaySeconds: Math.max(1, parseInt(e.target.value) || 1) })}
+                          style={{ width: 100, padding: "8px 10px", borderRadius: 7, border: "1px solid rgba(255,255,255,.09)", background: "#1f2126", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none" }} />
+                        <span style={{ fontSize: 11, color: "#9896a4", fontFamily: "'JetBrains Mono', monospace" }}>{zh ? "\u79D2\u540E\u89E6\u53D1" : "seconds"}</span>
+                      </div>
+                    ) : (
+                      <input type="datetime-local" value={form.onceAt}
+                        onChange={(e) => setForm({ ...form, onceAt: e.target.value })}
+                        style={{ width: "100%", padding: "8px 10px", borderRadius: 7, border: "1px solid rgba(255,255,255,.09)", background: "#1f2126", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none" }} />
+                    )}
+                  </div>
+                )}
+                {form.scheduleKind === "cron" && (
+                  <>
+                    <div style={{ fontSize: 10, color: "#2e2c3a", letterSpacing: 0.4, marginBottom: 5, marginTop: 4, fontFamily: "'JetBrains Mono', monospace" }}>CRON {zh ? "\u8868\u8FBE\u5F0F" : "EXPRESSION"}</div>
+                    <input value={form.schedule} onChange={(e) => setForm({ ...form, schedule: e.target.value })} placeholder="0 9 * * 1-5"
+                      style={{ width: "100%", padding: "8px 10px", borderRadius: 7, border: "1px solid rgba(255,255,255,.09)", background: "#1f2126", color: "#eceaf4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, outline: "none" }} />
+                    <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
+                      {CRON_TEMPLATES.map((tpl) => (
+                        <button key={tpl.cron} onClick={() => setForm({ ...form, schedule: tpl.cron })}
+                          style={{ padding: "3px 9px", borderRadius: 5, border: "1px solid rgba(255,255,255,.09)", background: "transparent", color: form.schedule === tpl.cron ? "#f97316" : "#4a4858", fontSize: 10, fontFamily: "'JetBrains Mono', monospace", cursor: "pointer" }}>
+                          {zh ? tpl.label.cn : tpl.label.en}
+                        </button>
+                      ))}
+                    </div>
+                    <div style={{ fontSize: 10, color: form.schedule && cronToHuman(form.schedule) ? "#2dd4a0" : "transparent", fontFamily: "'JetBrains Mono', monospace", marginTop: 4, minHeight: 14 }}>
+                      {cronToHuman(form.schedule) || ""}
+                    </div>
+                  </>
+                )}
               </div>
               <div style={{ marginBottom: 14 }}>
                 <div style={{ fontSize: 10, color: "#2e2c3a", letterSpacing: 0.4, marginBottom: 5, fontFamily: "'JetBrains Mono', monospace" }}>{zh ? "\u76EE\u6807\u667A\u80FD\u4F53" : "TARGET AGENT"}</div>
@@ -5085,10 +5380,19 @@ function CronTaskPage() {
             </div>
             <div style={{ padding: "0 22px 20px", display: "flex", justifyContent: "flex-end", gap: 8 }}>
               <button onClick={() => { setShowForm(false); setEditJob(null); }} style={{ padding: "8px 16px", borderRadius: 8, border: "1px solid rgba(255,255,255,.09)", background: "#141618", color: "#4a4858", fontSize: 12, fontWeight: 500, cursor: "pointer" }}>{zh ? "\u53D6\u6D88" : "Cancel"}</button>
-              <button onClick={saveJob} disabled={!form.name || !form.schedule}
-                style={{ padding: "8px 18px", borderRadius: 8, border: "none", background: "#f97316", color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer", opacity: form.name && form.schedule ? 1 : 0.4, boxShadow: "0 2px 8px rgba(249,115,22,.25)" }}>
+              {(() => {
+                const scheduleOk =
+                  (form.scheduleKind === "cron" && !!form.schedule) ||
+                  (form.scheduleKind === "every" && form.everySeconds > 0) ||
+                  (form.scheduleKind === "once" && (form.onceMode === "delay" ? form.onceDelaySeconds > 0 : !!form.onceAt));
+                const canSave = !!form.name && scheduleOk;
+                return (
+              <button onClick={saveJob} disabled={!canSave}
+                style={{ padding: "8px 18px", borderRadius: 8, border: "none", background: "#f97316", color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer", opacity: canSave ? 1 : 0.4, boxShadow: "0 2px 8px rgba(249,115,22,.25)" }}>
                 {zh ? "\u4FDD\u5B58\u4EFB\u52A1" : "Save Task"}
               </button>
+                );
+              })()}
             </div>
           </div>
         </div>

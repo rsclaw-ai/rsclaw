@@ -70,7 +70,19 @@ interface host-storage {
     /// directory, and returns a normalized absolute path. Plugins MUST use
     /// this instead of constructing filesystem paths themselves — the host
     /// owns the on-disk layout.
+    ///
+    /// `filename` is a HINT — the host uses its extension to pick a category
+    /// (i/v/a/d/f) but ignores the stem and writes a canonical
+    /// `dl_<kind>_<YYYYMMDDHHmm><ab>.<ext>` instead. Pass any short
+    /// representative name like `"video.mp4"` / `"image.png"`.
     allocate-artifact: func(filename: string) -> result<string, string>;
+
+    /// Allocate a batch of related artifact paths sharing the same base
+    /// (timestamp + 2-letter random suffix), differing only in the
+    /// `_N` index suffix. Use this when a single tool call produces
+    /// several outputs of the same kind (e.g. a 4-image batch).
+    /// Returns paths in 1-based order.
+    allocate-artifact-group: func(filename: string, count: u32) -> result<list<string>, string>;
 }
 
 interface plugin-api {

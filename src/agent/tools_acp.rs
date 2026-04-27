@@ -72,7 +72,7 @@ impl AgentRuntime {
             return Ok(client.clone());
         }
 
-        // Find opencode executable
+// Find opencode executable.
         // On Windows, npm packages have both shell scripts and .cmd wrappers.
         // Git Bash/MSYS2's which finds the shell script, but it internally calls
         // node with Unix-style paths like "/d/Program Files/nodejs/node" which
@@ -134,7 +134,7 @@ impl AgentRuntime {
             .map(expand_tilde)
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
         // Convert to Windows native path string (avoid MSYS2/Git Bash Unix-style paths)
-        // Don't use canonicalize() - it returns \\?\ prefix which breaks JSON serialization
+        // Don't use canonicalize() — it returns \\?\ prefix which breaks JSON serialization
         let cwd_str = if cfg!(target_os = "windows") {
             // Convert to absolute path and normalize separators
             let abs_path = if cwd.is_absolute() {
@@ -579,7 +579,7 @@ impl AgentRuntime {
             return Ok(client.clone());
         }
 
-        // Find claude-agent-acp executable
+// Find claude-agent-acp executable.
         // On Windows, prefer .cmd wrapper to avoid MSYS2 path issues (same as opencode)
         let (command, args) = if cfg!(target_os = "windows") {
             // Search PATH for claude-agent-acp.cmd directly
@@ -696,7 +696,7 @@ impl AgentRuntime {
             .map(expand_tilde)
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
         // Convert to Windows native path string (avoid MSYS2/Git Bash Unix-style paths)
-        // Don't use canonicalize() - it returns \\?\ prefix which breaks JSON serialization
+        // Don't use canonicalize() — it returns \\?\ prefix which breaks JSON serialization
         let cwd_str = if cfg!(target_os = "windows") {
             // Convert to absolute path and normalize separators
             let abs_path = if cwd.is_absolute() {

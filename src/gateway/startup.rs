@@ -340,6 +340,19 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         info!("task queue worker started");
     }
 
+    // Spawn external-jobs worker — drives long-running provider tasks
+    // (video / image generation) to completion across gateway restarts.
+    {
+        let worker = Arc::new(super::external_jobs_worker::ExternalJobsWorker::new(
+            Arc::clone(&store.db),
+            notification_tx.clone(),
+            shutdown.clone(),
+            Arc::clone(&config),
+        ));
+        tokio::spawn(async move { worker.run().await });
+        info!("external jobs worker started");
+    }
+
     // Spawn notification router task — routes OutboundMessages from ACP tools
     // (OpenCode, ClaudeCode) to the correct channel based on msg.channel.
     {
