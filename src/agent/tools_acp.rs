@@ -72,11 +72,51 @@ impl AgentRuntime {
             return Ok(client.clone());
         }
 
-        // Find opencode executable
-        let command = which::which("opencode")
-            .map(|p| p.to_string_lossy().to_string())
-            .or_else(|_| std::env::var("OPENCODE_PATH"))
-            .unwrap_or_else(|_| "opencode".to_string());
+        // Find opencode executable.
+        // On Windows, npm packages have both shell scripts and .cmd wrappers.
+        // Git Bash/MSYS2's which finds the shell script, but it internally calls
+        // node with Unix-style paths like "/d/Program Files/nodejs/node" which
+        // Windows subprocesses cannot understand. Use the .cmd wrapper instead.
+        let command = if cfg!(target_os = "windows") {
+            // On Windows, search for opencode.cmd directly in PATH directories.
+            // Use Windows-native PATH format (split by ';' with backslash paths).
+            // Git Bash may convert PATH to Unix format, so we also check common locations.
+            let path_env = std::env::var("PATH").ok().unwrap_or_default();
+            // PATH may be Unix-style (from Git Bash) or Windows-style
+            let separator = if path_env.contains(';') { ';' } else { ':' };
+
+            let cmd_found = path_env.split(separator).find_map(|dir| {
+                // Convert Unix-style path to Windows format if needed
+                let win_dir = if dir.starts_with('/') && dir.len() > 2 {
+                    let parts: Vec<&str> = dir.splitn(3, '/').collect();
+                    if parts.len() >= 3 && parts[0].is_empty() && parts[1].len() == 1 {
+                        let drive = parts[1].to_uppercase();
+                        let rest = parts[2];
+                        format!("{}:\\{}", drive, rest.replace('/', "\\"))
+                    } else {
+                        dir.replace('/', "\\")
+                    }
+                } else {
+                    dir.to_string()
+                };
+
+                let cmd_path = std::path::PathBuf::from(&win_dir).join("opencode.cmd");
+                if cmd_path.exists() {
+                    Some(cmd_path.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            });
+
+            cmd_found
+                .or_else(|| std::env::var("OPENCODE_PATH").ok())
+                .unwrap_or_else(|| "opencode.cmd".to_string())
+        } else {
+            which::which("opencode")
+                .map(|p| p.to_string_lossy().to_string())
+                .or_else(|_| std::env::var("OPENCODE_PATH"))
+                .unwrap_or_else(|_| "opencode".to_string())
+        };
 
         // Use "acp" subcommand to start ACP protocol mode
         let args: Vec<&str> = vec!["acp"];
