@@ -788,6 +788,7 @@ impl AgentRuntime {
         files: Vec<super::registry::FileAttachment>,
     ) -> Result<AgentReply> {
         // Resolve @file references (e.g. @i_2604271325ab.png → full path).
+        // Image references are auto-loaded as vision attachments.
         let workspace = self
             .handle
             .config
@@ -796,8 +797,33 @@ impl AgentRuntime {
             .or(self.live.agents.read().await.defaults.workspace.as_deref())
             .map(expand_tilde)
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
-        let text = &crate::channel::resolve_file_refs(text, &workspace);
+        let resolved = crate::channel::resolve_file_refs(text, &workspace);
+        let text = resolved.text;
         let text = text.as_str();
+
+        // Load referenced images as vision attachments.
+        let mut images = images;
+        for img_path in &resolved.image_paths {
+            if let Ok(bytes) = std::fs::read(img_path) {
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let ext = img_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("png");
+                let mime = match ext {
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "webp" => "image/webp",
+                    "gif" => "image/gif",
+                    _ => "image/png",
+                };
+                images.push(super::registry::ImageAttachment {
+                    data: format!("data:{mime};base64,{b64}"),
+                    mime_type: mime.to_string(),
+                });
+                info!(path = %img_path.display(), "loaded @-referenced image for vision");
+            }
+        }
 
         // Resolve session key alias: if this key maps to a canonical (migrated)
         // key, use that so all messages stay under one session.
@@ -2238,9 +2264,18 @@ impl AgentRuntime {
         // ---------------------------------------------------------------
         let mut media_descriptions = Vec::<String>::new();
         let mut vision_images_for_current_turn = Vec::<String>::new(); // base64 URIs for vision model
-        // Save images to uploads/images/ — no auto vision analysis.
+
+        // @-referenced images go directly to vision (already saved, no re-save).
+        let is_ref_image = !resolved.image_paths.is_empty();
+        if is_ref_image {
+            for img in &images {
+                vision_images_for_current_turn.push(img.data.clone());
+            }
+        }
+
+        // Save NEW images to uploads/images/ (skip @-referenced images already on disk).
         // Users reference saved images via @filename in subsequent messages.
-        if !images.is_empty() {
+        if !images.is_empty() && !is_ref_image {
             let images_dir = self
                 .handle
                 .config

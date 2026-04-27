@@ -485,18 +485,27 @@ pub fn upload_filename(mime_type: &str, original_filename: &str) -> String {
 // @-reference resolver
 // ---------------------------------------------------------------------------
 
+/// Result of resolving `@` file references in a message.
+pub struct ResolvedRefs {
+    /// Text with `[file references]` block appended.
+    pub text: String,
+    /// Image file paths that should be loaded for vision analysis.
+    pub image_paths: Vec<std::path::PathBuf>,
+}
+
 /// Scan text for `@{prefix}_{timestamp}{ab}.{ext}` references and resolve
 /// them to full paths under `workspace/uploads/`.
 ///
-/// Returns the original text with a `[refs]` block appended if any
-/// references were found and resolved.
+/// Image references (`@i_...`) are collected in `image_paths` so the
+/// caller can load them as vision attachments.
 ///
 /// Pattern: `@[ivdaf]_\w+\.\w+`
-pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> String {
+pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> ResolvedRefs {
     let uploads = workspace.join("uploads");
     let re = regex::Regex::new(r"@([ivdaf]_[a-z0-9]+\.\w+)").expect("valid regex");
 
     let mut resolved = Vec::new();
+    let mut image_paths = Vec::new();
     for cap in re.captures_iter(text) {
         let filename = &cap[1];
         let prefix = filename.chars().next().unwrap_or('f');
@@ -510,11 +519,17 @@ pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> String {
         let path = uploads.join(subdir).join(filename);
         if path.exists() {
             resolved.push((filename.to_string(), path.to_string_lossy().to_string()));
+            if prefix == 'i' {
+                image_paths.push(path);
+            }
         }
     }
 
     if resolved.is_empty() {
-        return text.to_string();
+        return ResolvedRefs {
+            text: text.to_string(),
+            image_paths,
+        };
     }
 
     let mut result = text.to_string();
@@ -522,7 +537,10 @@ pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> String {
     for (name, path) in &resolved {
         result.push_str(&format!("@{name} = {path}\n"));
     }
-    result
+    ResolvedRefs {
+        text: result,
+        image_paths,
+    }
 }
 
 // ---------------------------------------------------------------------------
