@@ -348,11 +348,13 @@ impl Drop for ChromeProcess {
 }
 
 /// Parse the port number from a Chrome DevTools WebSocket URL.
-/// Expects format: `ws://127.0.0.1:PORT/devtools/...`
+/// Accepts either `ws://127.0.0.1:PORT/devtools/...` or
+/// `ws://localhost:PORT/devtools/...` — chrome uses `localhost` when
+/// reusing an already-running browser via /json/version.
 fn parse_port_from_ws_url(url: &str) -> Result<u16> {
-    let after_host = url
-        .find("127.0.0.1:")
-        .map(|i| i + "127.0.0.1:".len())
+    let after_host = ["127.0.0.1:", "localhost:"]
+        .iter()
+        .find_map(|host| url.find(host).map(|i| i + host.len()))
         .ok_or_else(|| anyhow!("cannot parse port from ws URL: {url}"))?;
     let end = url[after_host..]
         .find('/')
