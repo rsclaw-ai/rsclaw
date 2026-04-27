@@ -143,6 +143,43 @@ pub(crate) async fn ensure_chrome() -> Result<String> {
     })
 }
 
+/// Detect ffmpeg binary path.
+///
+/// Priority: `~/.rsclaw/tools/ffmpeg/ffmpeg` > system PATH.
+/// Local-first because the bundled build is pinned to a known-good version
+/// and ships every codec we need; system ffmpeg may be a stripped distro
+/// build missing libopus/libx264.
+pub(crate) fn detect_ffmpeg() -> Option<String> {
+    let tools_dir = crate::config::loader::base_dir().join("tools/ffmpeg");
+    #[cfg(target_os = "windows")]
+    {
+        let local_win = tools_dir.join("ffmpeg.exe");
+        if local_win.exists() {
+            return Some(local_win.to_string_lossy().to_string());
+        }
+    }
+    let local = tools_dir.join("ffmpeg");
+    if local.exists() {
+        return Some(local.to_string_lossy().to_string());
+    }
+    if let Ok(path) = which::which("ffmpeg") {
+        return Some(path.to_string_lossy().to_string());
+    }
+    None
+}
+
+/// Like `detect_ffmpeg` but auto-installs ffmpeg on miss (downloads ~80MB).
+pub(crate) async fn ensure_ffmpeg() -> Result<String> {
+    if let Some(p) = detect_ffmpeg() {
+        return Ok(p);
+    }
+    tracing::info!("ffmpeg not found locally, auto-installing");
+    crate::cmd::tools::cmd_install("ffmpeg", false).await?;
+    detect_ffmpeg().ok_or_else(|| {
+        anyhow::anyhow!("ffmpeg auto-install completed but binary still not detected")
+    })
+}
+
 /// Run a subprocess and return an error if it fails.
 pub(crate) async fn run_subprocess(cmd: &str, args: &[&str]) -> Result<()> {
     let output = tokio::process::Command::new(cmd)
