@@ -478,6 +478,24 @@ impl TaskQueueManager {
         self.store.update_task_turn(task_id, turn)
     }
 
+    /// Whether `key` has already been recorded as delivered. Used by the
+    /// worker to skip re-sending a turn's reply after a crash-resume.
+    pub fn is_idem_delivered(&self, key: &str) -> Result<bool> {
+        self.store.is_idem_delivered(key)
+    }
+
+    /// Record a successful side-effect under `key` so a subsequent
+    /// crash-resume can skip it.
+    pub fn mark_idem_delivered(&self, key: &str) -> Result<()> {
+        self.store.mark_idem_delivered(key)
+    }
+
+    /// Drop idempotency keys older than `retention_secs`. Returns count
+    /// removed.
+    pub fn cleanup_idem_keys(&self, retention_secs: i64) -> Result<usize> {
+        self.store.cleanup_idem_keys(retention_secs)
+    }
+
     /// List Done tasks for a session whose final reply has not yet been
     /// confirmed delivered. Used by WS subscribe to replay completions that
     /// fired while the client was offline.
@@ -780,6 +798,11 @@ impl TaskQueueWorker {
             Ok(n) => info!(count = n, "task queue worker: revived orphan Running tasks → Pending"),
             Err(e) => error!("task queue worker: orphan recovery failed: {e:#}"),
         }
+        // Idempotency-key retention: anything older than 24h is safe to
+        // drop — a real crash-resume completes on the next tick, not a day
+        // later. Counter ticks each idle/active iteration; ~720 ticks at
+        // the 5s fallback floor → roughly hourly cleanup.
+        let mut idem_gc_counter: u32 = 0;
         loop {
             if self.shutdown.is_draining() {
                 info!("task queue worker: drain signaled, stopping dequeue");
@@ -806,6 +829,15 @@ impl TaskQueueWorker {
                 Err(e) => {
                     error!("task queue worker: dequeue error: {e:#}");
                     tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+
+            idem_gc_counter = idem_gc_counter.wrapping_add(1);
+            if idem_gc_counter % 720 == 0 {
+                match self.manager.cleanup_idem_keys(24 * 3600) {
+                    Ok(0) => {}
+                    Ok(n) => info!(count = n, "task queue worker: cleaned old idem keys"),
+                    Err(e) => warn!("task queue worker: idem cleanup failed: {e:#}"),
                 }
             }
         }
@@ -956,30 +988,55 @@ impl TaskQueueWorker {
                 }
             }
             if had_reply_payload {
-                let out = OutboundMessage {
-                    target_id: target.clone(),
-                    is_group,
-                    text: reply.text.clone(),
-                    reply_to: if turn == 1 { reply_to.clone() } else { None },
-                    images: reply.images.clone(),
-                    files: reply.files.clone(),
-                    channel: Some(channel_name.clone()),
-                };
-                if let Some(tx) = self.channel_tx(&channel_name) {
-                    match tx.send(out).await {
-                        Ok(_) => last_send_ok = true,
-                        Err(e) => {
-                            last_send_ok = false;
-                            error!(task_id = %task_id, "send reply failed: {e}");
-                        }
+                // Idempotency: a previous run of THIS turn may have already
+                // delivered to the channel before the gateway crashed. The
+                // post-crash requeue resumes at the same turn and runs the
+                // LLM again — but we must not re-send to the user.
+                let idem_key = format!("task:{task_id}:turn:{turn}");
+                let already_delivered = match self.manager.is_idem_delivered(&idem_key) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(task_id = %task_id, "is_idem_delivered failed: {e:#}");
+                        false
                     }
-                } else {
-                    last_send_ok = false;
-                    tracing::warn!(
-                        task_id = %task_id,
-                        channel = %channel_name,
-                        "no channel sender registered, reply dropped"
+                };
+                if already_delivered {
+                    info!(
+                        task_id = %task_id, turn,
+                        "task queue worker: turn reply already delivered, skipping channel send"
                     );
+                    last_send_ok = true;
+                } else {
+                    let out = OutboundMessage {
+                        target_id: target.clone(),
+                        is_group,
+                        text: reply.text.clone(),
+                        reply_to: if turn == 1 { reply_to.clone() } else { None },
+                        images: reply.images.clone(),
+                        files: reply.files.clone(),
+                        channel: Some(channel_name.clone()),
+                    };
+                    if let Some(tx) = self.channel_tx(&channel_name) {
+                        match tx.send(out).await {
+                            Ok(_) => {
+                                last_send_ok = true;
+                                if let Err(e) = self.manager.mark_idem_delivered(&idem_key) {
+                                    warn!(task_id = %task_id, "mark_idem_delivered failed: {e:#}");
+                                }
+                            }
+                            Err(e) => {
+                                last_send_ok = false;
+                                error!(task_id = %task_id, "send reply failed: {e}");
+                            }
+                        }
+                    } else {
+                        last_send_ok = false;
+                        tracing::warn!(
+                            task_id = %task_id,
+                            channel = %channel_name,
+                            "no channel sender registered, reply dropped"
+                        );
+                    }
                 }
             }
 

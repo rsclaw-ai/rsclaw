@@ -51,6 +51,14 @@ const TASK_QUEUE: TableDefinition<&str, &str> = TableDefinition::new("task_queue
 /// process died mid-poll.
 const EXTERNAL_JOBS: TableDefinition<&str, &str> = TableDefinition::new("external_jobs");
 
+/// Idempotency keys for outbound side-effects: key → Unix timestamp of
+/// successful delivery. Used by the task-queue worker to avoid double-
+/// sending a turn's reply when the gateway crashed after the channel
+/// accepted the message but before the per-turn counter was persisted.
+/// Rows expire (cleaned up by `cleanup_idem_keys`) once their retention
+/// window passes.
+const IDEM_KEYS: TableDefinition<&str, i64> = TableDefinition::new("idem_keys");
+
 // ---------------------------------------------------------------------------
 // RedbStore
 // ---------------------------------------------------------------------------
@@ -97,6 +105,9 @@ impl RedbStore {
             write
                 .open_table(EXTERNAL_JOBS)
                 .context("init EXTERNAL_JOBS")?;
+            write
+                .open_table(IDEM_KEYS)
+                .context("init IDEM_KEYS")?;
         }
         write.commit().context("commit init")?;
 
@@ -799,6 +810,56 @@ impl RedbStore {
         };
         write.commit()?;
         Ok(merged)
+    }
+
+    // -----------------------------------------------------------------------
+    // Idempotency keys (channel-send dedup across crashes)
+    // -----------------------------------------------------------------------
+
+    /// Whether `key` has already been recorded as a successful delivery.
+    pub fn is_idem_delivered(&self, key: &str) -> Result<bool> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(IDEM_KEYS)?;
+        Ok(table.get(key)?.is_some())
+    }
+
+    /// Record `key` as delivered with the current timestamp. Calling this
+    /// after the channel send succeeds turns the next crash-recovery into a
+    /// no-op for that side-effect.
+    pub fn mark_idem_delivered(&self, key: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(IDEM_KEYS)?;
+            table.insert(key, now)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Drop idempotency keys older than `retention_secs`. Returns count
+    /// removed. Called periodically by the task-queue worker so the table
+    /// doesn't accumulate forever.
+    pub fn cleanup_idem_keys(&self, retention_secs: i64) -> Result<usize> {
+        let cutoff = chrono::Utc::now().timestamp() - retention_secs;
+        let write = self.db.begin_write()?;
+        let count = {
+            let mut table = write.open_table(IDEM_KEYS)?;
+            let mut victims = Vec::new();
+            for entry in table.iter()? {
+                let (k, v) = entry?;
+                if v.value() < cutoff {
+                    victims.push(k.value().to_owned());
+                }
+            }
+            let count = victims.len();
+            for key in &victims {
+                table.remove(key.as_str())?;
+            }
+            count
+        };
+        write.commit()?;
+        Ok(count)
     }
 
     // -----------------------------------------------------------------------
