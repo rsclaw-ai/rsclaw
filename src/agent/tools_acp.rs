@@ -78,27 +78,39 @@ impl AgentRuntime {
         // node with Unix-style paths like "/d/Program Files/nodejs/node" which
         // Windows subprocesses cannot understand. Use the .cmd wrapper instead.
         let command = if cfg!(target_os = "windows") {
-            // On Windows, prefer the .cmd wrapper over the shell script
-            which::which("opencode.cmd")
-                .or_else(|_| which::which("opencode"))
-                .map(|p| {
-                    let path_str = p.to_string_lossy().to_string();
-                    // Convert any remaining MSYS2 paths to Windows native format
-                    if path_str.starts_with('/') {
-                        let parts: Vec<&str> = path_str.splitn(3, '/').collect();
-                        if parts.len() >= 3 && parts[0].is_empty() && parts[1].len() == 1 {
-                            let drive = parts[1].to_uppercase();
-                            let rest = parts[2];
-                            format!("{}:\\{}", drive, rest.replace('/', "\\"))
-                        } else {
-                            path_str
-                        }
+            // On Windows, search for opencode.cmd directly in PATH directories.
+            // Use Windows-native PATH format (split by ';' with backslash paths).
+            // Git Bash may convert PATH to Unix format, so we also check common locations.
+            let path_env = std::env::var("PATH").ok().unwrap_or_default();
+            // PATH may be Unix-style (from Git Bash) or Windows-style
+            let separator = if path_env.contains(';') { ';' } else { ':' };
+
+            let cmd_found = path_env.split(separator).find_map(|dir| {
+                // Convert Unix-style path to Windows format if needed
+                let win_dir = if dir.starts_with('/') && dir.len() > 2 {
+                    let parts: Vec<&str> = dir.splitn(3, '/').collect();
+                    if parts.len() >= 3 && parts[0].is_empty() && parts[1].len() == 1 {
+                        let drive = parts[1].to_uppercase();
+                        let rest = parts[2];
+                        format!("{}:\\{}", drive, rest.replace('/', "\\"))
                     } else {
-                        path_str
+                        dir.replace('/', "\\")
                     }
-                })
-                .or_else(|_| std::env::var("OPENCODE_PATH"))
-                .unwrap_or_else(|_| "opencode.cmd".to_string())
+                } else {
+                    dir.to_string()
+                };
+
+                let cmd_path = std::path::PathBuf::from(&win_dir).join("opencode.cmd");
+                if cmd_path.exists() {
+                    Some(cmd_path.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            });
+
+            cmd_found
+                .or_else(|| std::env::var("OPENCODE_PATH").ok())
+                .unwrap_or_else(|| "opencode.cmd".to_string())
         } else {
             which::which("opencode")
                 .map(|p| p.to_string_lossy().to_string())
