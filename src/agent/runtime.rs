@@ -2622,15 +2622,14 @@ impl AgentRuntime {
                     .as_ref()
                     .and_then(|m| m.primary.clone())
                     .unwrap_or_default();
-                let ws_dir = self
-                    .handle
-                    .config
-                    .workspace
-                    .as_deref()
-                    .or(self.live.agents.read().await.defaults.workspace.as_deref())
-                    .map(crate::agent::runtime::expand_tilde)
-                    .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
-                let skills_dir = ws_dir.join("skills");
+                // Crystallized skills go to the global skill directory so the
+                // existing `load_skills(&global_skills, None, ...)` call sites
+                // (gateway/startup.rs, ws/dispatch.rs, ws/methods/catalog.rs)
+                // pick them up on next reload. By the time a memory crosses the
+                // crystallization gates (Core tier + cluster of 3+), it is
+                // general enough to be cross-agent.
+                let skills_dir = crate::skill::default_global_skills_dir()
+                    .unwrap_or_else(|| crate::config::loader::base_dir().join("skills"));
                 let scope = format!("agent:{}", self.handle.id);
                 tokio::spawn(async move {
                     for doc_id in candidates {
