@@ -1453,16 +1453,36 @@ impl Channel for WeChatPersonalChannel {
                     || filename.ends_with(".avi")
                     || filename.ends_with(".mkv");
                 if is_video {
+                    let mut sent = false;
                     match self.upload_media(&bytes, &msg.target_id, UploadMediaType::Video).await {
                         Ok(uploaded) => {
-                            if let Err(e) = self.send_video_message(&msg.target_id, &uploaded).await {
-                                warn!(index = idx, "wechat: send video message failed: {e:#}");
-                            } else {
-                                info!(index = idx, filename = %filename, "wechat: video sent");
+                            match self.send_video_message(&msg.target_id, &uploaded).await {
+                                Ok(()) => {
+                                    info!(index = idx, filename = %filename, "wechat: video sent");
+                                    sent = true;
+                                }
+                                Err(e) => {
+                                    warn!(index = idx, "wechat: send video message failed: {e:#}");
+                                }
                             }
                         }
                         Err(e) => {
                             warn!(index = idx, "wechat: video upload failed: {e:#}");
+                        }
+                    }
+                    // Fallback: wechat's CDN periodically 5xx's video uploads
+                    // (or times out). Don't leave the user staring at silence —
+                    // tell them where the file is and that we can ship it
+                    // somewhere else (e.g. publish to douyin) without re-running.
+                    if !sent {
+                        let mb = bytes.len() as f64 / 1_048_576.0;
+                        let fallback_text = format!(
+                            "📦 视频已生成（{filename}, {mb:.1}MB），但微信传输失败 — 微信 CDN 抽风。\n\n\
+                             文件保存在：{path_or_url}\n\n\
+                             你可以让我直接发到抖音 / 其他平台，无需重新生成视频。"
+                        );
+                        if let Err(send_err) = self.send_text(&msg.target_id, &fallback_text).await {
+                            warn!(index = idx, "wechat: video fallback text also failed: {send_err:#}");
                         }
                     }
                     continue;
