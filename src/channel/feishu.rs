@@ -1000,7 +1000,7 @@ impl FeishuChannel {
             }
         };
 
-        if (text.is_empty() && file_attachments.is_empty()) || sender_id.is_empty() {
+        if (text.is_empty() && file_attachments.is_empty() && images.is_empty()) || sender_id.is_empty() {
             return Ok(None);
         }
 
