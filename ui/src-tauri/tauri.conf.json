@@ -70,7 +70,7 @@
         "silent": true
       },
       "nsis": {
-        "languages": ["SimpChinese", "English", "TradChinese", "Japanese", "Korean", "French", "German", "Spanish", "Russian", "Thai"],
+        "languages": ["English", "SimpChinese", "TradChinese", "Japanese", "Korean", "French", "German", "Spanish", "Russian", "Thai"],
         "displayLanguageSelector": false
       }
     }
