@@ -2212,7 +2212,43 @@ impl AgentRuntime {
         let mut media_descriptions = Vec::<String>::new();
         let mut vision_images_for_current_turn = Vec::<String>::new(); // base64 URIs for vision model
 
+        // Auto-save received images to uploads/images/ for persistence.
+        let images_dir = self
+            .handle
+            .config
+            .workspace
+            .as_deref()
+            .or(self.live.agents.read().await.defaults.workspace.as_deref())
+            .map(expand_tilde)
+            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"))
+            .join("uploads/images");
+        let _ = std::fs::create_dir_all(&images_dir);
+
         for img in &images {
+            // Save original image to uploads/images/.
+            if !img.mime_type.starts_with("video/") {
+                use base64::Engine;
+                let b64 = img.data
+                    .strip_prefix("data:image/png;base64,")
+                    .or_else(|| img.data.strip_prefix("data:image/jpeg;base64,"))
+                    .or_else(|| img.data.strip_prefix("data:image/webp;base64,"))
+                    .unwrap_or(&img.data);
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                    let ext = if img.mime_type.contains("jpeg") || img.mime_type.contains("jpg") {
+                        "jpg"
+                    } else if img.mime_type.contains("webp") {
+                        "webp"
+                    } else {
+                        "png"
+                    };
+                    let filename = format!("{}_{}.{}", chrono::Local::now().format("%Y%m%d_%H%M%S"), &uuid::Uuid::new_v4().to_string()[..8], ext);
+                    let dest = images_dir.join(&filename);
+                    if std::fs::write(&dest, &bytes).is_ok() {
+                        info!(path = %dest.display(), size = bytes.len(), "image auto-saved to uploads");
+                    }
+                }
+            }
+
             if img.mime_type.starts_with("video/") {
                 // Video: generate text placeholder (transcript support is TODO).
                 let desc = crate::agent::context_mgr::describe_video(None, None);
