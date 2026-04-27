@@ -149,4 +149,4 @@ opt-level = 0
 tokio-test = "0.4"
 tempfile   = "3"
 wiremock = "0.6"
-ctor = "0.4"
+ctor = "0.10"
