@@ -45,6 +45,12 @@ const SESSION_ALIASES: TableDefinition<&str, &str> = TableDefinition::new("sessi
 /// Task queue: task_id → JSON-serialized QueuedTask.
 const TASK_QUEUE: TableDefinition<&str, &str> = TableDefinition::new("task_queue");
 
+/// External provider jobs: job_id → JSON-serialized ExternalJob. Keeps
+/// long-running provider tasks (video / image generation) alive across
+/// gateway restarts so the artifact gets delivered even if the agent
+/// process died mid-poll.
+const EXTERNAL_JOBS: TableDefinition<&str, &str> = TableDefinition::new("external_jobs");
+
 // ---------------------------------------------------------------------------
 // RedbStore
 // ---------------------------------------------------------------------------
@@ -88,6 +94,9 @@ impl RedbStore {
             write
                 .open_table(TASK_QUEUE)
                 .context("init TASK_QUEUE")?;
+            write
+                .open_table(EXTERNAL_JOBS)
+                .context("init EXTERNAL_JOBS")?;
         }
         write.commit().context("commit init")?;
 
@@ -790,6 +799,133 @@ impl RedbStore {
         };
         write.commit()?;
         Ok(merged)
+    }
+
+    // -----------------------------------------------------------------------
+    // External provider jobs (video / image generation surviving restarts)
+    // -----------------------------------------------------------------------
+
+    /// Insert a freshly-submitted external job.
+    pub fn enqueue_external_job(
+        &self,
+        job: &crate::gateway::external_jobs::ExternalJob,
+    ) -> Result<()> {
+        let json = serde_json::to_string(job)?;
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(EXTERNAL_JOBS)?;
+            table.insert(job.id.as_str(), json.as_str())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Replace an existing job row (after polling, status update, etc.).
+    /// Errors if the row no longer exists — callers should treat that as a
+    /// concurrent delete and abandon the update.
+    pub fn update_external_job(
+        &self,
+        job: &crate::gateway::external_jobs::ExternalJob,
+    ) -> Result<()> {
+        let json = serde_json::to_string(job)?;
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(EXTERNAL_JOBS)?;
+            if table.get(job.id.as_str())?.is_none() {
+                anyhow::bail!("external job not found: {}", job.id);
+            }
+            table.insert(job.id.as_str(), json.as_str())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Fetch a single job by id.
+    pub fn get_external_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<crate::gateway::external_jobs::ExternalJob>> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(EXTERNAL_JOBS)?;
+        match table.get(job_id)? {
+            Some(guard) => {
+                let job = serde_json::from_str(guard.value())?;
+                Ok(Some(job))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Return every job whose `next_poll_at` is at or before `now` and
+    /// whose status is not yet terminal. The worker drains this list each
+    /// tick.
+    pub fn due_external_jobs(
+        &self,
+        now: i64,
+    ) -> Result<Vec<crate::gateway::external_jobs::ExternalJob>> {
+        use crate::gateway::external_jobs::ExternalJobStatus;
+
+        let read = self.db.begin_read()?;
+        let table = read.open_table(EXTERNAL_JOBS)?;
+        let mut due = Vec::new();
+        for entry in table.iter()? {
+            let (_k, v) = entry?;
+            let job: crate::gateway::external_jobs::ExternalJob =
+                serde_json::from_str(v.value())?;
+            let active = matches!(
+                job.status,
+                ExternalJobStatus::Pending | ExternalJobStatus::Polling
+            );
+            if active && job.next_poll_at <= now {
+                due.push(job);
+            }
+        }
+        Ok(due)
+    }
+
+    /// Delete a job by id (used after delivery + retention window).
+    pub fn delete_external_job(&self, job_id: &str) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(EXTERNAL_JOBS)?;
+            table.remove(job_id)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Remove every job in a terminal state (`Done` / `Failed` / `TimedOut`)
+    /// older than `retention_secs`. Returns the count removed.
+    pub fn cleanup_finished_external_jobs(&self, retention_secs: i64) -> Result<usize> {
+        use crate::gateway::external_jobs::ExternalJobStatus;
+
+        let cutoff = chrono::Utc::now().timestamp() - retention_secs;
+        let write = self.db.begin_write()?;
+        let count = {
+            let mut table = write.open_table(EXTERNAL_JOBS)?;
+            let mut victims = Vec::new();
+            for entry in table.iter()? {
+                let (_k, v) = entry?;
+                let job: crate::gateway::external_jobs::ExternalJob =
+                    serde_json::from_str(v.value())?;
+                let terminal = matches!(
+                    job.status,
+                    ExternalJobStatus::Done
+                        | ExternalJobStatus::Failed
+                        | ExternalJobStatus::TimedOut
+                );
+                if terminal && job.submitted_at < cutoff {
+                    victims.push(job.id);
+                }
+            }
+            let count = victims.len();
+            for id in &victims {
+                table.remove(id.as_str())?;
+            }
+            count
+        };
+        write.commit()?;
+        Ok(count)
     }
 }
 
