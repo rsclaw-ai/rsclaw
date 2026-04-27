@@ -98,12 +98,18 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
         "chat.send: dispatched ok, waiting for runtime"
     );
 
+    // Track this chat in the gateway's inflight count so a graceful restart
+    // waits for the relay task to finish (event.done or stream end). The
+    // guard is moved into the spawned task and drops on task exit.
+    let inflight_guard = ctx.state.shutdown.begin_work();
+
     // Spawn relay task: emit OpenClaw-format "chat" events back to the WS
     // client that initiated the request.  The payload uses the `event:chat`
     // wire format expected by the WebUI Chat component.
     // NOTE(H-18): This relay runs alongside the auto-relay in handshake.rs.
     // Both are needed — see comment there for rationale.
     tokio::spawn(async move {
+        let _inflight_guard = inflight_guard;
         use futures::StreamExt;
         let mut stream = tokio_stream::wrappers::BroadcastStream::new(rx);
         while let Some(Ok(event)) = stream.next().await {

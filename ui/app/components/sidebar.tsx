@@ -285,14 +285,22 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
     return () => clearInterval(timer);
   }, []);
 
-  // Auto-restart countdown: when a `restart.required` event arrives and the
-  // gateway is running, count down RESTART_PENDING_SECONDS then trigger
-  // doRestart automatically. Manual click on the Restart button cancels via
-  // restartReq.dismiss() (which flips banner.visible to false → effect cleans
-  // up). Web/non-Tauri builds skip auto-restart since the desktop shell owns
-  // the gateway sidecar.
+  // Auto-restart: when a `restart.required` event arrives and the gateway is
+  // running, restart immediately if the gateway is idle (`inflight = 0`),
+  // otherwise count down RESTART_PENDING_SECONDS as a busy-drain ceiling. The
+  // backend re-publishes with `inflight = 0` once it drains, which re-runs
+  // this effect via the `restartInflight` dep and short-circuits the
+  // countdown. Manual click on the Restart button cancels via
+  // restartReq.dismiss() (flips banner.visible to false → effect cleans up).
+  // Web/non-Tauri builds skip auto-restart since the desktop shell owns the
+  // gateway sidecar.
+  const restartInflight = restartReq.payload?.inflight ?? 0;
   React.useEffect(() => {
     if (!restartReq.visible || status !== "online" || !isTauri) return;
+    if (restartInflight === 0) {
+      void doRestartRef.current();
+      return;
+    }
     setRestartSecondsLeft(RESTART_PENDING_SECONDS);
     const timer = setInterval(() => {
       setRestartSecondsLeft((s) => {
@@ -305,7 +313,7 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
       });
     }, 1000);
     return () => clearInterval(timer);
-  }, [restartReq.visible, status]);
+  }, [restartReq.visible, status, restartInflight]);
 
   const isOnline = status === "online";
   const isFailed = status === "failed";

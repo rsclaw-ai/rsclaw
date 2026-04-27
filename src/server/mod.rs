@@ -440,9 +440,13 @@ async fn send_message(
             .unwrap_or_default()
             .as_secs();
         let cid = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+        // Track this streaming request in the gateway's inflight count.
+        // Guard moves into the filter_map closure and drops with the stream.
+        let inflight_guard = state.shutdown.begin_work();
 
         let stream = tokio_stream::wrappers::BroadcastStream::new(rx)
             .filter_map(move |msg| {
+                let _hold_inflight = &inflight_guard;
                 let sid = sid.clone();
                 let cid = cid.clone();
                 async move {
@@ -487,7 +491,8 @@ async fn send_message(
         return (StatusCode::OK, hdrs, axum::body::Body::from_stream(stream)).into_response();
     }
 
-    // Non-streaming: wait for full reply.
+    // Non-streaming: track inflight while we await the agent's full reply.
+    let _inflight_guard = state.shutdown.begin_work();
     let timeout_secs = state.config.raw.agents.as_ref()
         .and_then(|a| a.defaults.as_ref())
         .and_then(|d| d.timeout_seconds)
@@ -1862,9 +1867,15 @@ async fn openai_chat_completions(
             .as_secs();
         let model_str = req.model.as_deref().unwrap_or("rsclaw").to_owned();
         let cid = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+        // Track this streaming request in the gateway's inflight count so a
+        // graceful restart waits for the SSE stream to finish. The guard is
+        // moved into the filter_map closure below; it drops when the stream
+        // is dropped (client disconnect, [DONE] sent, or scan terminator).
+        let inflight_guard = state.shutdown.begin_work();
 
         let stream = tokio_stream::wrappers::BroadcastStream::new(rx)
             .filter_map(move |msg| {
+                let _hold_inflight = &inflight_guard;
                 let sid = sid.clone();
                 let cid = cid.clone();
                 let model_str = model_str.clone();
@@ -1920,6 +1931,8 @@ async fn openai_chat_completions(
         return (StatusCode::OK, response_headers, axum::body::Body::from_stream(stream)).into_response();
     }
 
+    // Non-streaming: track inflight while we await the agent's full reply.
+    let _inflight_guard = state.shutdown.begin_work();
     let timeout_secs = state.config.agents.defaults.timeout_seconds.unwrap_or(600) as u64;
     let reply = match tokio::time::timeout(Duration::from_secs(timeout_secs), reply_rx).await {
         Ok(Ok(r)) => r,
