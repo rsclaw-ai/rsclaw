@@ -310,23 +310,45 @@ impl ExternalJobsWorker {
         match job.provider.as_str() {
             "seedance" => {
                 let key = self
-                    .seedance_key()
+                    .resolve_provider_key("doubao", "ARK_API_KEY")
                     .ok_or_else(|| anyhow!("seedance: no API key configured"))?;
                 poll_seedance(&self.client, &key, &job.external_task_id).await
+            }
+            "minimax" => {
+                let key = self
+                    .resolve_provider_key("minimax", "MINIMAX_API_KEY")
+                    .ok_or_else(|| anyhow!("minimax: no API key configured"))?;
+                poll_minimax(&self.client, &key, &job.external_task_id).await
+            }
+            "kling" => {
+                let (ak, sk) = self
+                    .resolve_kling_keys()
+                    .ok_or_else(|| anyhow!("kling: KLING_ACCESS_KEY / KLING_SECRET_KEY not configured"))?;
+                poll_kling(&self.client, &ak, &sk, &job.external_task_id).await
             }
             other => Err(anyhow!("no async polling adapter for provider: {other}")),
         }
     }
 
-    fn seedance_key(&self) -> Option<String> {
+    /// Resolve a single-bearer-token provider key from rsclaw.json5
+    /// (`models.providers.<name>.api_key`) with env-var fallback.
+    fn resolve_provider_key(&self, provider: &str, env_var: &str) -> Option<String> {
         self.config
             .model
             .models
             .as_ref()
-            .and_then(|m| m.providers.get("doubao"))
+            .and_then(|m| m.providers.get(provider))
             .and_then(|p| p.api_key.as_ref())
             .and_then(|k| k.as_plain().map(str::to_owned))
-            .or_else(|| std::env::var("ARK_API_KEY").ok())
+            .or_else(|| std::env::var(env_var).ok())
+    }
+
+    /// Resolve the Kling access/secret pair. Both must be present, otherwise
+    /// `None` so the caller can fail loudly rather than build a bad JWT.
+    fn resolve_kling_keys(&self) -> Option<(String, String)> {
+        let ak = self.resolve_provider_key("kling", "KLING_ACCESS_KEY")?;
+        let sk = std::env::var("KLING_SECRET_KEY").ok()?;
+        Some((ak, sk))
     }
 
     /// Returns true iff the broadcast accepted the message. The caller
@@ -471,6 +493,212 @@ async fn poll_seedance(
         }
         _ => Ok(PollOutcome::Pending),
     }
+}
+
+// ---------------------------------------------------------------------------
+// MiniMax (Hailuo) — async submit + poll
+// ---------------------------------------------------------------------------
+
+const MINIMAX_BASE: &str = "https://api.minimaxi.com/v1";
+const MINIMAX_DEFAULT_MODEL: &str = "video-01-director";
+
+fn minimax_resolution(aspect_ratio: &str) -> &'static str {
+    match aspect_ratio {
+        "9:16" => "720x1280",
+        "1:1" => "720x720",
+        _ => "1280x720",
+    }
+}
+
+/// Submit a MiniMax video generation task and return the provider's
+/// `task_id`. Status polling resolves to a `file_id`, which a follow-up
+/// `/files/retrieve` call inside `poll_minimax` turns into a download URL.
+pub async fn submit_minimax(
+    client: &reqwest::Client,
+    api_key: &str,
+    prompt: &str,
+    duration: u64,
+    aspect_ratio: &str,
+    model_override: Option<&str>,
+) -> Result<String> {
+    let model = model_override.unwrap_or(MINIMAX_DEFAULT_MODEL);
+    let resp: serde_json::Value = client
+        .post(format!("{MINIMAX_BASE}/video_generation"))
+        .bearer_auth(api_key)
+        .json(&json!({
+            "prompt": prompt,
+            "model": model,
+            "duration": duration,
+            "resolution": minimax_resolution(aspect_ratio),
+        }))
+        .send()
+        .await
+        .map_err(|e| anyhow!("minimax: submit failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| anyhow!("minimax: submit parse failed: {e}"))?;
+    let task_id = resp["task_id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("minimax: no task_id in response: {resp}"))?
+        .to_owned();
+    Ok(task_id)
+}
+
+async fn poll_minimax(
+    client: &reqwest::Client,
+    api_key: &str,
+    task_id: &str,
+) -> Result<PollOutcome> {
+    let poll: serde_json::Value = client
+        .get(format!("{MINIMAX_BASE}/query/video_generation"))
+        .bearer_auth(api_key)
+        .query(&[("task_id", task_id)])
+        .send()
+        .await
+        .map_err(|e| anyhow!("minimax: poll failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| anyhow!("minimax: poll parse failed: {e}"))?;
+    let status = poll
+        .pointer("/task/status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    match status {
+        "Success" => {
+            // MiniMax: status=Success → /task/file_id → /files/retrieve → download_url
+            let file_id = poll
+                .pointer("/task/file_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("minimax: no file_id in result: {poll}"))?
+                .to_owned();
+            let file_resp: serde_json::Value = client
+                .get(format!("{MINIMAX_BASE}/files/retrieve"))
+                .bearer_auth(api_key)
+                .query(&[("file_id", file_id.as_str())])
+                .send()
+                .await
+                .map_err(|e| anyhow!("minimax: file retrieve failed: {e}"))?
+                .json()
+                .await
+                .map_err(|e| anyhow!("minimax: file retrieve parse failed: {e}"))?;
+            let url = file_resp
+                .pointer("/file/download_url")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("minimax: no download_url: {file_resp}"))?
+                .to_owned();
+            Ok(PollOutcome::Done(url))
+        }
+        "Fail" => Ok(PollOutcome::Failed(format!("minimax task {task_id} failed"))),
+        _ => Ok(PollOutcome::Pending),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kling (Kuaishou) — async submit + poll, JWT auth
+// ---------------------------------------------------------------------------
+
+const KLING_BASE: &str = "https://api.klingai.com";
+const KLING_DEFAULT_MODEL: &str = "kling-v2-master";
+
+/// Submit a Kling text→video task and return the provider's `task_id`.
+/// JWT is built fresh for each call (30 min expiry; cheap to regenerate).
+pub async fn submit_kling(
+    client: &reqwest::Client,
+    access_key: &str,
+    secret_key: &str,
+    prompt: &str,
+    duration: u64,
+    aspect_ratio: &str,
+    model_override: Option<&str>,
+) -> Result<String> {
+    let model = model_override.unwrap_or(KLING_DEFAULT_MODEL);
+    let jwt = kling_jwt(access_key, secret_key)?;
+    let resp: serde_json::Value = client
+        .post(format!("{KLING_BASE}/v1/videos/text2video"))
+        .bearer_auth(&jwt)
+        .json(&json!({
+            "model_name": model,
+            "prompt": prompt,
+            "duration": duration.to_string(),
+            "aspect_ratio": aspect_ratio,
+        }))
+        .send()
+        .await
+        .map_err(|e| anyhow!("kling: submit failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| anyhow!("kling: submit parse failed: {e}"))?;
+    let task_id = resp
+        .pointer("/data/task_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("kling: no task_id in response: {resp}"))?
+        .to_owned();
+    Ok(task_id)
+}
+
+async fn poll_kling(
+    client: &reqwest::Client,
+    access_key: &str,
+    secret_key: &str,
+    task_id: &str,
+) -> Result<PollOutcome> {
+    let jwt = kling_jwt(access_key, secret_key)?;
+    let poll: serde_json::Value = client
+        .get(format!("{KLING_BASE}/v1/videos/text2video/{task_id}"))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .map_err(|e| anyhow!("kling: poll failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| anyhow!("kling: poll parse failed: {e}"))?;
+    let status = poll
+        .pointer("/data/task_status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    match status {
+        "succeed" => {
+            let url = poll
+                .pointer("/data/task_result/videos/0/url")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("kling: no video URL in result: {poll}"))?
+                .to_owned();
+            Ok(PollOutcome::Done(url))
+        }
+        "failed" => {
+            let msg = poll
+                .pointer("/data/task_status_msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("task failed");
+            Ok(PollOutcome::Failed(format!("kling: {msg}")))
+        }
+        _ => Ok(PollOutcome::Pending),
+    }
+}
+
+/// Build a short-lived JWT for Kling API authentication (HS256).
+fn kling_jwt(access_key: &str, secret_key: &str) -> Result<String> {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let now = chrono::Utc::now().timestamp();
+    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(r#"{"alg":"HS256","typ":"JWT"}"#);
+    let payload_json = format!(
+        r#"{{"iss":"{access_key}","exp":{},"nbf":{}}}"#,
+        now + 1800,
+        now - 5
+    );
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload_json);
+    let signing_input = format!("{header}.{payload}");
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret_key.as_bytes())
+        .map_err(|e| anyhow!("kling_jwt: invalid key: {e}"))?;
+    mac.update(signing_input.as_bytes());
+    let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+
+    Ok(format!("{signing_input}.{sig}"))
 }
 
 // ---------------------------------------------------------------------------

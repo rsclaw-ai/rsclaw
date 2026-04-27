@@ -534,21 +534,39 @@ impl AgentRuntime {
         let prompt_preview: String = prompt.chars().take(80).collect();
         tracing::info!(provider, prompt = prompt_preview, duration, aspect_ratio, "tool_video: starting");
 
-        // Async path for Seedance: submit immediately, hand off to the
-        // ExternalJobsWorker which polls + delivers the artifact when ready.
-        // Survives gateway restarts because the job row lives in redb.
-        if provider == "doubao" {
-            let key = api_key.ok_or_else(|| anyhow!("video_gen: no API key for doubao/Seedance"))?;
-            let task_id = crate::gateway::external_jobs_worker::submit_seedance(
-                &client,
-                &key,
-                prompt,
-                duration,
-                aspect_ratio,
-                user_video_model.as_deref(),
-            )
-            .await?;
-            tracing::info!(task_id, "tool_video: seedance task submitted (async)");
+        // Async path for HTTP-API providers (Seedance / MiniMax / Kling):
+        // submit immediately, hand off to the ExternalJobsWorker which polls
+        // + delivers the artifact when ready. Survives gateway restarts
+        // because the job row lives in redb. llamacpp stays sync below
+        // because it's a local server — no benefit to the async path.
+        if matches!(provider, "doubao" | "minimax" | "kling") {
+            let (provider_key, task_id) = match provider {
+                "doubao" => {
+                    let key = api_key.ok_or_else(|| anyhow!("video_gen: no API key for doubao/Seedance"))?;
+                    let id = crate::gateway::external_jobs_worker::submit_seedance(
+                        &client, &key, prompt, duration, aspect_ratio, user_video_model.as_deref(),
+                    ).await?;
+                    ("seedance", id)
+                }
+                "minimax" => {
+                    let key = api_key.ok_or_else(|| anyhow!("video_gen: no API key for MiniMax"))?;
+                    let id = crate::gateway::external_jobs_worker::submit_minimax(
+                        &client, &key, prompt, duration, aspect_ratio, user_video_model.as_deref(),
+                    ).await?;
+                    ("minimax", id)
+                }
+                "kling" => {
+                    let (ak, sk) = kling_keys.unwrap_or((None, None));
+                    let access = ak.ok_or_else(|| anyhow!("video_gen: KLING_ACCESS_KEY not configured"))?;
+                    let secret = sk.ok_or_else(|| anyhow!("video_gen: KLING_SECRET_KEY not configured"))?;
+                    let id = crate::gateway::external_jobs_worker::submit_kling(
+                        &client, &access, &secret, prompt, duration, aspect_ratio, user_video_model.as_deref(),
+                    ).await?;
+                    ("kling", id)
+                }
+                _ => unreachable!(),
+            };
+            tracing::info!(provider = provider_key, task_id, "tool_video: task submitted (async)");
 
             let job = crate::gateway::external_jobs::ExternalJob::new_submitted(
                 ctx.session_key.clone(),
@@ -563,7 +581,7 @@ impl AgentRuntime {
                     reply_to: None,
                 },
                 crate::gateway::external_jobs::ExternalJobOrigin::Agent,
-                "seedance",
+                provider_key,
                 &task_id,
                 crate::gateway::external_jobs::ExternalJobKind::VideoGen,
                 prompt,
@@ -574,26 +592,18 @@ impl AgentRuntime {
 
             return Ok(json!({
                 "status": "submitted",
-                "provider": "seedance",
+                "provider": provider_key,
                 "task_id": task_id,
                 "job_id": job_id,
                 "message": "Video generation submitted. The finished video will be delivered automatically when ready (typically 30s–5min). The user has been informed; do NOT poll or wait — your turn is complete."
             }));
         }
 
+        // Only llamacpp reaches this point — the HTTP-API providers (doubao
+        // / minimax / kling) returned earlier through the async path.
         let video_url = match provider {
             "llamacpp" => {
                 video_gen_llamacpp(&client, prompt, duration, aspect_ratio, user_video_model.as_deref()).await?
-            }
-            "minimax" => {
-                let key = api_key.ok_or_else(|| anyhow!("video_gen: no API key for MiniMax"))?;
-                video_gen_minimax(&client, &key, prompt, duration, aspect_ratio, user_video_model.as_deref()).await?
-            }
-            "kling" => {
-                let (ak, sk) = kling_keys.unwrap_or((None, None));
-                let access = ak.ok_or_else(|| anyhow!("video_gen: KLING_ACCESS_KEY not configured"))?;
-                let secret = sk.ok_or_else(|| anyhow!("video_gen: KLING_SECRET_KEY not configured"))?;
-                video_gen_kling(&client, &access, &secret, prompt, duration, aspect_ratio, user_video_model.as_deref()).await?
             }
             _ => bail!("video_gen: unknown provider {provider}"),
         };
@@ -1440,213 +1450,3 @@ async fn video_gen_llamacpp(
     Ok(result)
 }
 
-/// Generate video via MiniMax (Hailuo) video generation API.
-///
-/// API: POST /v1/video_generation → task_id
-/// Poll: GET /v1/query/video_generation?task_id={id}
-/// File: GET /v1/files/retrieve?file_id={id} → download_url
-async fn video_gen_minimax(
-    client: &reqwest::Client,
-    api_key: &str,
-    prompt: &str,
-    duration: u64,
-    aspect_ratio: &str,
-    model_override: Option<&str>,
-) -> anyhow::Result<String> {
-    let model = model_override.unwrap_or("video-01-director");
-    let base = "https://api.minimaxi.com/v1";
-
-    let resolution = match aspect_ratio {
-        "9:16" => "720x1280",
-        "1:1" => "720x720",
-        _ => "1280x720",
-    };
-
-    // Submit.
-    let resp: serde_json::Value = client
-        .post(format!("{base}/video_generation"))
-        .bearer_auth(&api_key)
-        .json(&json!({
-            "prompt": prompt,
-            "model": model,
-            "duration": duration,
-            "resolution": resolution
-        }))
-        .send()
-        .await
-        .map_err(|e| anyhow!("minimax: submit failed: {e}"))?
-        .json()
-        .await
-        .map_err(|e| anyhow!("minimax: submit parse failed: {e}"))?;
-
-    let task_id = resp["task_id"]
-        .as_str()
-        .ok_or_else(|| anyhow!("minimax: no task_id in response: {resp}"))?
-        .to_owned();
-
-    tracing::info!(task_id, "minimax: task submitted, polling");
-
-    // Poll until done.
-    for _ in 0..120 {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        let poll: serde_json::Value = client
-            .get(format!("{base}/query/video_generation"))
-            .bearer_auth(&api_key)
-            .query(&[("task_id", task_id.as_str())])
-            .send()
-            .await
-            .map_err(|e| anyhow!("minimax: poll failed: {e}"))?
-            .json()
-            .await
-            .map_err(|e| anyhow!("minimax: poll parse failed: {e}"))?;
-
-        let status = poll
-            .pointer("/task/status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        tracing::debug!(task_id, status, "minimax: poll");
-
-        match status {
-            "Success" => {
-                // file_id → retrieve download URL
-                let file_id = poll
-                    .pointer("/task/file_id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("minimax: no file_id in result: {poll}"))?
-                    .to_owned();
-                let file_resp: serde_json::Value = client
-                    .get(format!("{base}/files/retrieve"))
-                    .bearer_auth(&api_key)
-                    .query(&[("file_id", file_id.as_str())])
-                    .send()
-                    .await
-                    .map_err(|e| anyhow!("minimax: file retrieve failed: {e}"))?
-                    .json()
-                    .await
-                    .map_err(|e| anyhow!("minimax: file retrieve parse failed: {e}"))?;
-                let url = file_resp
-                    .pointer("/file/download_url")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("minimax: no download_url: {file_resp}"))?
-                    .to_owned();
-                return Ok(url);
-            }
-            "Fail" => {
-                bail!("minimax: task {task_id} failed: {poll}");
-            }
-            _ => continue,
-        }
-    }
-    bail!("minimax: task {task_id} timed out after 10 minutes")
-}
-
-/// Generate video via Kling (Kuaishou) API.
-///
-/// Auth uses JWT (HS256) signed with KLING_ACCESS_KEY + KLING_SECRET_KEY.
-/// API: POST /v1/videos/text2video → task_id
-/// Poll: GET /v1/videos/text2video/{task_id}
-async fn video_gen_kling(
-    client: &reqwest::Client,
-    access_key: &str,
-    secret_key: &str,
-    prompt: &str,
-    duration: u64,
-    aspect_ratio: &str,
-    model_override: Option<&str>,
-) -> anyhow::Result<String> {
-    let model = model_override.unwrap_or("kling-v2-master");
-    let base = "https://api.klingai.com";
-
-    let jwt = kling_jwt(&access_key, &secret_key)?;
-
-    let duration_str = duration.to_string();
-    let resp: serde_json::Value = client
-        .post(format!("{base}/v1/videos/text2video"))
-        .bearer_auth(&jwt)
-        .json(&json!({
-            "model_name": model,
-            "prompt": prompt,
-            "duration": duration_str,
-            "aspect_ratio": aspect_ratio
-        }))
-        .send()
-        .await
-        .map_err(|e| anyhow!("kling: submit failed: {e}"))?
-        .json()
-        .await
-        .map_err(|e| anyhow!("kling: submit parse failed: {e}"))?;
-
-    let task_id = resp
-        .pointer("/data/task_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("kling: no task_id in response: {resp}"))?
-        .to_owned();
-
-    tracing::info!(task_id, "kling: task submitted, polling");
-
-    for _ in 0..120 {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        // Refresh JWT (expires in 30 min, but refresh each poll to be safe for long videos).
-        let jwt = kling_jwt(&access_key, &secret_key)?;
-        let poll: serde_json::Value = client
-            .get(format!("{base}/v1/videos/text2video/{task_id}"))
-            .bearer_auth(&jwt)
-            .send()
-            .await
-            .map_err(|e| anyhow!("kling: poll failed: {e}"))?
-            .json()
-            .await
-            .map_err(|e| anyhow!("kling: poll parse failed: {e}"))?;
-
-        let status = poll
-            .pointer("/data/task_status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        tracing::debug!(task_id, status, "kling: poll");
-
-        match status {
-            "succeed" => {
-                let url = poll
-                    .pointer("/data/task_result/videos/0/url")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("kling: no video URL in result: {poll}"))?
-                    .to_owned();
-                return Ok(url);
-            }
-            "failed" => {
-                let msg = poll
-                    .pointer("/data/task_status_msg")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("task failed");
-                bail!("kling: task {task_id} failed: {msg}");
-            }
-            _ => continue,
-        }
-    }
-    bail!("kling: task {task_id} timed out after 10 minutes")
-}
-
-/// Build a short-lived JWT for Kling API authentication (HS256).
-fn kling_jwt(access_key: &str, secret_key: &str) -> anyhow::Result<String> {
-    use base64::Engine;
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-
-    let now = chrono::Utc::now().timestamp();
-    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(r#"{"alg":"HS256","typ":"JWT"}"#);
-    let payload_json = format!(
-        r#"{{"iss":"{access_key}","exp":{},"nbf":{}}}"#,
-        now + 1800,
-        now - 5
-    );
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload_json);
-    let signing_input = format!("{header}.{payload}");
-
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret_key.as_bytes())
-        .map_err(|e| anyhow!("kling_jwt: invalid key: {e}"))?;
-    mac.update(signing_input.as_bytes());
-    let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
-
-    Ok(format!("{signing_input}.{sig}"))
-}
