@@ -801,6 +801,7 @@ impl AgentRuntime {
         let task_str = task.to_string();
 
         // Send initial notification
+        tracing::info!("tool_claudecode: sending initial notification to {}", target_id);
         if let Some(ref tx) = notif_tx {
             let _ = tx.send(crate::channel::OutboundMessage {
                 target_id: target_id.clone(),
@@ -811,6 +812,8 @@ impl AgentRuntime {
                 files: vec![],
                 channel: Some(channel_name.clone()),
             });
+        } else {
+            tracing::warn!("tool_claudecode: no notification_tx for initial notification");
         }
 
         // Spawn background task - collect events AND send prompt in parallel
@@ -819,6 +822,7 @@ impl AgentRuntime {
         let channel_bg = channel_name.clone();
         let lang_bg = lang;
         tokio::spawn(async move {
+            tracing::info!("tool_claudecode: background task started");
             // Start event collection FIRST (in parallel with send_prompt)
             let mut event_rx = client.subscribe_events();
             let events = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
@@ -1004,7 +1008,7 @@ impl AgentRuntime {
                     };
 
                     // Send notification to user
-                    tracing::debug!(
+                    tracing::info!(
                         "tool_claudecode: sending completion notification, summary_len={}, files={}",
                         summary.len(), notif_files.len()
                     );
@@ -1019,7 +1023,7 @@ impl AgentRuntime {
                             channel: Some(channel_bg.clone()),
                         }) {
                             Ok(_) => {
-                                tracing::debug!("tool_claudecode: notification sent successfully")
+                                tracing::info!("tool_claudecode: notification sent successfully to {}", target_id_bg)
                             }
                             Err(e) => {
                                 tracing::error!("tool_claudecode: failed to send notification: {}", e)
@@ -1032,6 +1036,7 @@ impl AgentRuntime {
                 Err(e) => {
                     tracing::error!("tool_claudecode: send_prompt failed: {}", e);
                     if let Some(ref tx) = notif_tx_bg {
+                        tracing::info!("tool_claudecode: sending error notification to {}", target_id_bg);
                         let _ = tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
@@ -1044,6 +1049,7 @@ impl AgentRuntime {
                     }
                 }
             }
+            tracing::info!("tool_claudecode: background task finished");
             // DON'T await event_collector - it runs forever
         });
 
