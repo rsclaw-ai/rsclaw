@@ -25,7 +25,7 @@ reqwest      = { version = "0.12", features = ["json", "stream", "multipart", "b
 rustls       = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 
 # Storage
-redb         = "2"
+redb         = "4"
 tantivy      = "0.22"
 
 # HNSW vector index for memory search (replaced LanceDB to cut ~500 deps)
