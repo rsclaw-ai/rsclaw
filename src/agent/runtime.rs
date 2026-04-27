@@ -59,7 +59,7 @@ use super::{
 pub use super::context_mgr::estimate_tokens;
 use super::context_mgr::{
     apply_context_budget_trim, apply_context_pruning, build_clear_summary,
-    compress_image_for_llm, msg_tokens,
+    msg_tokens,
 };
 use super::prompt_builder::{
     build_help_text_filtered, build_minimal_system_prompt, build_system_prompt, format_duration,
@@ -2228,7 +2228,7 @@ impl AgentRuntime {
         // kvCacheMode >= 1: images are described then stored as text (never base64 in session).
         // kvCacheMode = 0: images kept as base64 in session for vision models.
         let model_has_vision = model_supports_vision(&model, &self.config);
-        let vision = if kv_mode >= 1 { false } else { model_has_vision };
+        let _vision = if kv_mode >= 1 { false } else { model_has_vision };
 
         // ---------------------------------------------------------------
         // Media processing: convert images/videos to text descriptions.
@@ -2238,131 +2238,103 @@ impl AgentRuntime {
         // ---------------------------------------------------------------
         let mut media_descriptions = Vec::<String>::new();
         let mut vision_images_for_current_turn = Vec::<String>::new(); // base64 URIs for vision model
-        let mut img_save_idx: usize = 0;
+        // Save images to uploads/images/ — no auto vision analysis.
+        // Users reference saved images via @filename in subsequent messages.
+        if !images.is_empty() {
+            let images_dir = self
+                .handle
+                .config
+                .workspace
+                .as_deref()
+                .or(self.live.agents.read().await.defaults.workspace.as_deref())
+                .map(expand_tilde)
+                .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"))
+                .join("uploads/images");
+            let _ = std::fs::create_dir_all(&images_dir);
 
-        // Auto-save received images to uploads/images/ for persistence.
-        let images_dir = self
-            .handle
-            .config
-            .workspace
-            .as_deref()
-            .or(self.live.agents.read().await.defaults.workspace.as_deref())
-            .map(expand_tilde)
-            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"))
-            .join("uploads/images");
-        let _ = std::fs::create_dir_all(&images_dir);
-        let mut saved_image_names: Vec<String> = Vec::new();
-
-        for img in &images {
-            // Save original image to uploads/images/.
-            if !img.mime_type.starts_with("video/") {
+            let mut saved: Vec<(String, usize)> = Vec::new();
+            for img in &images {
                 use base64::Engine;
                 let b64 = img.data
                     .strip_prefix("data:image/png;base64,")
                     .or_else(|| img.data.strip_prefix("data:image/jpeg;base64,"))
                     .or_else(|| img.data.strip_prefix("data:image/webp;base64,"))
+                    .or_else(|| img.data.strip_prefix("data:image/gif;base64,"))
                     .unwrap_or(&img.data);
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
                     let orig_ext = if img.mime_type.contains("jpeg") || img.mime_type.contains("jpg") {
                         "image.jpg"
                     } else if img.mime_type.contains("webp") {
                         "image.webp"
+                    } else if img.mime_type.contains("gif") {
+                        "image.gif"
                     } else {
                         "image.png"
                     };
                     let filename = crate::channel::upload_filename(&img.mime_type, orig_ext);
                     let dest = images_dir.join(&filename);
+                    let size = bytes.len();
                     if std::fs::write(&dest, &bytes).is_ok() {
-                        info!(path = %dest.display(), size = bytes.len(), "image auto-saved to uploads");
-                        saved_image_names.push(filename);
+                        info!(path = %dest.display(), size, "image saved to uploads");
+                        saved.push((filename, size));
                     }
                 }
             }
 
-            if img.mime_type.starts_with("video/") {
-                // Video: generate text placeholder (transcript support is TODO).
-                let desc = crate::agent::context_mgr::describe_video(None, None);
-                media_descriptions.push(desc);
-            } else {
-                // Image: get text description via vision model.
-                // If current model supports vision, also keep the image for the
-                // current LLM turn (so it sees the original).
-                if vision {
-                    // Current model can see images — keep for this turn's API call.
-                    if let Some(compressed) = compress_image_for_llm(&img.data) {
-                        vision_images_for_current_turn.push(compressed);
-                    } else {
-                        vision_images_for_current_turn.push(img.data.clone());
-                    }
-                }
-
-                // Generate text description for session storage.
-                // Use current model if vision-capable (even in kv_cache_mode >= 1,
-                // the image description is a separate LLM call that doesn't pollute
-                // the main session's KV cache). Otherwise find a vision model.
-                let vision_model = if model_has_vision {
-                    model.clone()
+            if !saved.is_empty() {
+                let i18n_lang = crate::i18n::default_lang();
+                let file_list: String = saved
+                    .iter()
+                    .map(|(name, size)| {
+                        let size_str = if *size > 1_000_000 {
+                            format!("{:.1} MB", *size as f64 / 1_000_000.0)
+                        } else {
+                            format!("{:.1} KB", *size as f64 / 1_000.0)
+                        };
+                        format!("- @{name} ({size_str})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let msg = if i18n_lang == "zh" {
+                    format!("已保存 {} 张图片:\n{file_list}\n\n如需分析，请在对话中引用，如: 请分析 @{}", saved.len(), saved[0].0)
                 } else {
-                    // Snapshot the live default-model image before the chain so the
-                    // `.or_else()` closure stays synchronous.
-                    let default_image_model = self
-                        .live
-                        .agents
-                        .read()
-                        .await
-                        .defaults
-                        .model
-                        .as_ref()
-                        .and_then(|m| m.image.clone());
-                    // Try image model config, then fallback to known vision providers.
-                    self.handle.config.model.as_ref()
-                        .and_then(|m| m.image.as_deref())
-                        .map(|s| s.to_owned())
-                        .or(default_image_model)
-                        .unwrap_or_else(|| {
-                            // Auto-detect a vision-capable provider from config.
-                            let vision_providers = ["doubao", "gemini", "openai", "qwen"];
-                            for vp in vision_providers {
-                                let has_key = self.config.model.models.as_ref()
-                                    .and_then(|m| m.providers.get(vp))
-                                    .and_then(|p| p.api_key.as_ref())
-                                    .is_some()
-                                    || std::env::var(format!("{}_API_KEY", vp.to_uppercase())).is_ok();
-                                if has_key {
-                                    return match vp {
-                                        "doubao" => "doubao/doubao-seed-2-0-pro".to_owned(),
-                                        "gemini" => "gemini/gemini-2.0-flash".to_owned(),
-                                        "openai" => "openai/gpt-4o-mini".to_owned(),
-                                        "qwen" => "qwen/qwen-vl-max".to_owned(),
-                                        _ => format!("{vp}/default"),
-                                    };
-                                }
-                            }
-                            tracing::warn!("no vision-capable provider found for image description");
-                            String::new() // no vision model available
-                        })
+                    format!("{} image(s) saved:\n{file_list}\n\nTo analyze, reference in chat: analyze @{}", saved.len(), saved[0].0)
                 };
 
-                if vision_model.is_empty() {
-                    let ref_tag = saved_image_names.get(img_save_idx).map(|n| format!(" (ref: @{n})")).unwrap_or_default();
-                    media_descriptions.push(format!("[图片]{ref_tag} (no vision model)"));
-                    img_save_idx += 1;
-                } else {
-                    let desc = crate::agent::context_mgr::describe_image_via_llm(
-                        &img.data, &vision_model, &mut self.failover, &self.providers,
-                    ).await;
-                    match desc {
-                        Some(d) => {
-                            let ref_tag = saved_image_names.get(img_save_idx).map(|n| format!(" (ref: @{n})")).unwrap_or_default();
-                            media_descriptions.push(format!("[图片]{ref_tag} {d}"));
-                        }
-                        None => {
-                            let ref_tag = saved_image_names.get(img_save_idx).map(|n| format!(" (ref: @{n})")).unwrap_or_default();
-                            media_descriptions.push(format!("[图片]{ref_tag} (description failed)"));
-                        }
-                    }
-                    img_save_idx += 1;
+                // If user also sent text, process it after the save notification.
+                if !text.is_empty() {
+                    // Append image refs to user text for context.
+                    let refs: String = saved.iter().map(|(n, _)| format!("@{n}")).collect::<Vec<_>>().join(" ");
+                    let enriched = format!("{text}\n\n[uploaded images: {refs}]");
+                    // Store notification in session, then continue to process user text.
+                    self.sessions
+                        .entry(session_key.to_owned())
+                        .or_default()
+                        .push(Message {
+                            role: Role::Assistant,
+                            content: MessageContent::Text(msg),
+                        });
+                    return Box::pin(self.run_turn(
+                        session_key,
+                        &enriched,
+                        channel,
+                        peer_id,
+                        extra_tools,
+                        vec![], // images already saved
+                        files,
+                    ))
+                    .await;
                 }
+
+                return Ok(AgentReply {
+                    text: msg,
+                    is_empty: false,
+                    tool_calls: None,
+                    images: vec![],
+                    files: vec![],
+                    pending_analysis: None,
+                    was_preparse: false,
+                });
             }
         }
 

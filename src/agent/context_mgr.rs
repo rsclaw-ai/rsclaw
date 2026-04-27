@@ -263,6 +263,7 @@ pub(crate) fn apply_context_budget_trim(
 /// Compress an image for LLM: resize to max 1024px and convert to JPEG.
 /// Uses the `image` crate (pure Rust, cross-platform).
 /// Returns data URI or None if compression fails.
+#[allow(dead_code)]
 pub(crate) fn compress_image_for_llm(data_uri: &str) -> Option<String> {
     let b64 = data_uri
         .strip_prefix("data:image/png;base64,")
@@ -778,6 +779,7 @@ fn parse_llm_entities(raw: &str) -> Vec<KeyEntity> {
 /// - Non-vision models can still "see" what was in the image
 /// - Session history stays text-only (no base64 bloat)
 /// - KV cache prefix is not disrupted
+#[allow(dead_code)]
 pub(crate) async fn describe_image_via_llm(
     image_data_uri: &str,
     model: &str,
@@ -845,6 +847,7 @@ pub(crate) async fn describe_image_via_llm(
 /// - `[视频 12s] 转录: "大家好，今天..."` (if audio transcript available)
 /// - `[视频 12s] (无音频内容)` (if no audio)
 /// - `[视频] (无法获取时长)` (if duration unknown)
+#[allow(dead_code)]
 pub(crate) fn describe_video(duration_secs: Option<u64>, transcript: Option<&str>) -> String {
     let dur = match duration_secs {
         Some(s) => format!(" {s}s"),
