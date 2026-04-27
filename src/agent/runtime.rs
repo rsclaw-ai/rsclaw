@@ -514,6 +514,47 @@ impl AgentRuntime {
             .unwrap_or("anthropic/claude-sonnet-4-6")
             .to_owned()
     }
+}
+
+/// Resolve the flash (cheap/fast) model name from per-agent + defaults config,
+/// without needing an `AgentRuntime` instance. Returns `None` if no flash or
+/// primary model is configured anywhere — the caller decides on a fallback.
+///
+/// Same lookup chain as [`AgentRuntime::resolve_flash_model_name`]:
+///   1. per-agent `model.flash`
+///   2. per-agent `flash_model.primary` (legacy)
+///   3. `defaults.model.flash`
+///   4. `defaults.flash_model.primary` (legacy)
+pub fn resolve_flash_model_for(
+    per_agent: &crate::config::schema::AgentEntry,
+    defaults: &crate::config::schema::AgentDefaults,
+) -> Option<String> {
+    per_agent
+        .model
+        .as_ref()
+        .and_then(|m| m.flash.as_deref())
+        .or_else(|| {
+            per_agent
+                .flash_model
+                .as_ref()
+                .and_then(|m| m.primary.as_deref())
+        })
+        .or_else(|| {
+            defaults
+                .model
+                .as_ref()
+                .and_then(|m| m.flash.as_deref())
+        })
+        .or_else(|| {
+            defaults
+                .flash_model
+                .as_ref()
+                .and_then(|m| m.primary.as_deref())
+        })
+        .map(str::to_owned)
+}
+
+impl AgentRuntime {
 
     /// Estimate fixed context overhead: system prompt + tools tokens.
     /// Used for pre-flight context budget check before LLM call.
@@ -539,39 +580,7 @@ impl AgentRuntime {
     /// So if no flash model is configured anywhere, we fall back to whatever
     /// the agent is already using — no regression.
     pub(crate) fn resolve_flash_model_name(&self) -> String {
-        // 1. per-agent model.flash
-        self.handle
-            .config
-            .model
-            .as_ref()
-            .and_then(|m| m.flash.as_deref())
-            // 2. per-agent flash_model.primary (legacy)
-            .or_else(|| {
-                self.handle
-                    .config
-                    .flash_model
-                    .as_ref()
-                    .and_then(|m| m.primary.as_deref())
-            })
-            // 3. defaults.model.flash
-            .or_else(|| {
-                self.config
-                    .agents
-                    .defaults
-                    .model
-                    .as_ref()
-                    .and_then(|m| m.flash.as_deref())
-            })
-            // 4. defaults.flash_model.primary (legacy)
-            .or_else(|| {
-                self.config
-                    .agents
-                    .defaults
-                    .flash_model
-                    .as_ref()
-                    .and_then(|m| m.primary.as_deref())
-            })
-            .map(str::to_owned)
+        resolve_flash_model_for(&self.handle.config, &self.config.agents.defaults)
             .unwrap_or_else(|| self.resolve_model_name())
     }
 
@@ -2635,149 +2644,25 @@ impl AgentRuntime {
             if !candidates.is_empty() {
                 let mem_clone = Arc::clone(mem);
                 let providers = Arc::clone(&self.providers);
-                // Distillation is a structured one-shot task that fits the
-                // "flash" tier: cheap/fast model, falls back to the agent's
-                // main model when no flash is configured. See
-                // `resolve_flash_model_name` for the full lookup chain.
-                let model_for_distill = self.resolve_flash_model_name();
+                let flash_model = self.resolve_flash_model_name();
                 // Crystallized skills go to the global skill directory so the
-                // existing `load_skills(&global_skills, None, ...)` call sites
-                // (gateway/startup.rs, ws/dispatch.rs, ws/methods/catalog.rs)
-                // pick them up on next reload. By the time a memory crosses the
-                // crystallization gates (Core tier + cluster of 3+), it is
-                // general enough to be cross-agent.
+                // existing load_skills() call sites pick them up on next reload.
                 let skills_dir = crate::skill::default_global_skills_dir()
                     .unwrap_or_else(|| crate::config::loader::base_dir().join("skills"));
                 let scope = format!("agent:{}", self.handle.id);
                 tokio::spawn(async move {
                     for doc_id in candidates {
-                        // 1. Find cluster (brief read lock).
-                        let cluster_result = {
-                            let store = mem_clone.lock().await;
-                            crate::skill::crystallizer::find_cluster(&store, &doc_id, &scope)
-                        };
-                        let cluster = match cluster_result {
-                            Ok(Some(c)) => c,
-                            Ok(None) => continue, // not enough related memories yet
-                            Err(e) => {
-                                tracing::debug!(doc_id, "crystallization check failed: {e:#}");
-                                continue;
-                            }
-                        };
-                        let ids: Vec<String> = cluster.iter().map(|d| d.id.clone()).collect();
-
-                        // Skip if another task is already distilling this exact
-                        // cluster (e.g. two simultaneous turns recalled the same
-                        // Core docs). The guard auto-releases on drop.
-                        let _cluster_guard = match crate::skill::crystallizer::try_claim_cluster(&ids) {
-                            Some(g) => g,
-                            None => {
-                                tracing::debug!(
-                                    n = ids.len(),
-                                    "crystallization: cluster already in flight, skipping"
-                                );
-                                continue;
-                            }
-                        };
-
-                        // 2. Build the distillation prompt.
-                        let prompt =
-                            crate::skill::crystallizer::build_distill_prompt(&cluster);
-
-                        // 3. Distill via LLM. On any failure, skip this cluster
-                        //    without tagging so a future reply can retry.
-                        if model_for_distill.is_empty() {
-                            tracing::debug!("crystallization: no agent model configured, skipping");
-                            continue;
-                        }
-                        let (provider_name, model_id) =
-                            providers.resolve_model(&model_for_distill);
-                        let provider_arc = match providers.get(provider_name) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                tracing::warn!(
-                                    provider = provider_name,
-                                    "crystallization: provider not registered: {e:#}"
-                                );
-                                continue;
-                            }
-                        };
-                        let model_owned = model_id.to_owned();
-
-                        // Hold the process-wide distillation permit for the
-                        // duration of the LLM call to serialize crystallization
-                        // across all agents and clusters.
-                        let _distill_permit = match crate::skill::crystallizer::acquire_distill_permit().await {
-                            Ok(p) => p,
-                            Err(e) => {
-                                tracing::warn!("crystallization: failed to acquire permit: {e:#}");
-                                continue;
-                            }
-                        };
-                        let skill_md = match crate::skill::crystallizer::distill_with_llm(
-                            &prompt,
-                            provider_arc,
-                            model_owned,
+                        if let Err(e) = crate::skill::crystallizer::crystallize_one(
+                            &mem_clone,
+                            &doc_id,
+                            &scope,
+                            &providers,
+                            &flash_model,
+                            &skills_dir,
                         )
                         .await
                         {
-                            Ok(md) => md,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "crystallization: LLM distillation failed, skipping: {e:#}"
-                                );
-                                continue;
-                            }
-                        };
-
-                        // Validate the LLM output before writing. A malformed
-                        // SKILL.md (missing frontmatter, empty name/description)
-                        // would land a broken file that the loader can't use.
-                        // Skip without tagging so a future turn can retry.
-                        if let Err(e) = crate::skill::crystallizer::validate_skill_md(&skill_md) {
-                            tracing::warn!(
-                                "crystallization: invalid SKILL.md output, skipping: {e:#}"
-                            );
-                            continue;
-                        }
-
-                        // 4. Derive slug from the SKILL.md frontmatter (or fall back
-                        //    to a per-cluster id so different clusters don't collide).
-                        let fallback = format!(
-                            "auto-skill-{}",
-                            &doc_id[..8.min(doc_id.len())]
-                        );
-                        let slug = crate::skill::crystallizer::extract_skill_slug(
-                            &skill_md, &fallback,
-                        );
-
-                        // 5. Write the SKILL.md file.
-                        match crate::skill::crystallizer::write_skill(
-                            &skills_dir,
-                            &slug,
-                            &skill_md,
-                        ) {
-                            Ok(path) => {
-                                tracing::info!(
-                                    ?path,
-                                    slug = %slug,
-                                    n = ids.len(),
-                                    "crystallized memories into skill"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!("skill crystallization write failed: {e:#}");
-                                continue;
-                            }
-                        }
-
-                        // 6. Tag cluster docs as crystallized only after a
-                        //    successful write so transient failures stay retryable.
-                        let mut store = mem_clone.lock().await;
-                        for id in &ids {
-                            if let Err(e) = store.tag_doc(id, "crystallized").await {
-                                tracing::debug!(id, "tag_doc failed: {e:#}");
-                            }
+                            tracing::warn!(doc_id, "crystallize_one hard failure: {e:#}");
                         }
                     }
                 });

@@ -404,12 +404,16 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         .and_then(|h| h.enabled)
         .unwrap_or(true);
     if hb_enabled {
-        let runner = std::sync::Arc::new(crate::heartbeat::HeartbeatRunner::new_with_shutdown(
+        let runner = crate::heartbeat::HeartbeatRunner::new_with_shutdown(
             Arc::clone(&registry),
             &data_dir,
             heartbeat_memory,
             Some(shutdown.clone()),
-        ));
+        )
+        .with_meditation_deps(crate::heartbeat::MeditationDeps {
+            config: Arc::clone(&config),
+        });
+        let runner = std::sync::Arc::new(runner);
         runner.run();
         info!("heartbeat runner started");
     }

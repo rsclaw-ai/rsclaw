@@ -18,6 +18,7 @@ use futures::StreamExt as _;
 use tokio::sync::Semaphore;
 
 use crate::agent::memory::{MemDocTier, MemoryDoc, MemoryStore};
+use crate::provider::registry::ProviderRegistry;
 use crate::provider::{
     LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
 };
@@ -402,6 +403,110 @@ pub fn validate_skill_md(content: &str) -> Result<(String, String)> {
         .to_owned();
 
     Ok((name, description))
+}
+
+/// Crystallize a single seed memory: find its cluster, distill, validate,
+/// write, and tag. Encapsulates the full pipeline so the runtime online
+/// path (Loop B) and the meditation periodic phase can share one
+/// implementation.
+///
+/// Returns:
+/// - `Ok(Some(path))` if a SKILL.md was written and the cluster tagged.
+/// - `Ok(None)` if no work was done (no cluster, in-flight, model missing,
+///   provider missing, distillation failed, validation failed). Logging
+///   happens inside; the caller just continues.
+/// - `Err` only on hard infrastructure failure (file write, tag persistence).
+pub async fn crystallize_one(
+    store: &Arc<tokio::sync::Mutex<MemoryStore>>,
+    doc_id: &str,
+    scope: &str,
+    providers: &Arc<ProviderRegistry>,
+    flash_model: &str,
+    skills_dir: &Path,
+) -> Result<Option<PathBuf>> {
+    // 1. Find cluster (brief lock).
+    let cluster = {
+        let s = store.lock().await;
+        match find_cluster(&s, doc_id, scope) {
+            Ok(Some(c)) => c,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                tracing::debug!(doc_id, "crystallization check failed: {e:#}");
+                return Ok(None);
+            }
+        }
+    };
+    let ids: Vec<String> = cluster.iter().map(|d| d.id.clone()).collect();
+
+    // 2. Claim cluster (skip if another task already has it).
+    let _cluster_guard = match try_claim_cluster(&ids) {
+        Some(g) => g,
+        None => {
+            tracing::debug!(n = ids.len(), "cluster already in flight, skipping");
+            return Ok(None);
+        }
+    };
+
+    // 3. Build the prompt.
+    let prompt = build_distill_prompt(&cluster);
+
+    // 4. Resolve provider.
+    if flash_model.is_empty() {
+        tracing::debug!("crystallization: no flash model resolved, skipping");
+        return Ok(None);
+    }
+    let (provider_name, model_id) = providers.resolve_model(flash_model);
+    let provider_arc = match providers.get(provider_name) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                provider = provider_name,
+                "crystallization: provider not registered: {e:#}"
+            );
+            return Ok(None);
+        }
+    };
+
+    // 5. Acquire global distillation permit and call the LLM.
+    let _permit = match acquire_distill_permit().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("crystallization: failed to acquire permit: {e:#}");
+            return Ok(None);
+        }
+    };
+    let skill_md = match distill_with_llm(&prompt, provider_arc, model_id.to_owned()).await {
+        Ok(md) => md,
+        Err(e) => {
+            tracing::warn!("crystallization: LLM distillation failed: {e:#}");
+            return Ok(None);
+        }
+    };
+
+    // 6. Validate before writing.
+    if let Err(e) = validate_skill_md(&skill_md) {
+        tracing::warn!("crystallization: invalid SKILL.md output: {e:#}");
+        return Ok(None);
+    }
+
+    // 7. Derive slug + write.
+    let fallback = format!("auto-skill-{}", &doc_id[..8.min(doc_id.len())]);
+    let slug = extract_skill_slug(&skill_md, &fallback);
+    let path = write_skill(skills_dir, &slug, &skill_md)
+        .with_context(|| format!("write_skill failed for slug '{slug}'"))?;
+
+    tracing::info!(?path, slug = %slug, n = ids.len(), "crystallized memories into skill");
+
+    // 8. Tag cluster docs as crystallized only after successful write so
+    //    transient failures stay retryable.
+    let mut s = store.lock().await;
+    for id in &ids {
+        if let Err(e) = s.tag_doc(id, "crystallized").await {
+            tracing::debug!(id, "tag_doc failed: {e:#}");
+        }
+    }
+
+    Ok(Some(path))
 }
 
 /// Extract a slug from the `name:` field of a SKILL.md YAML frontmatter.
