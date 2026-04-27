@@ -20,10 +20,25 @@ use tracing::info;
 /// Display a URL as a QR code in the terminal.
 ///
 /// Rendering strategy:
-///   1. iTerm2 / WezTerm / Kitty — render as inline PNG image (pixel-perfect)
-///   2. Other terminals — Unicode half-block characters (best-effort)
+///   1. Non-TTY stdout (Tauri sidecar, daemon, redirected pipe) — silently
+///      drop the PNG to disk only. No banner, no Windows image viewer popup.
+///      Equivalent to [`save_qr_to_path`] for safety in headless contexts.
+///   2. iTerm2 / WezTerm / Kitty — inline PNG image (pixel-perfect).
+///   3. Other terminals — Unicode half-block characters (best-effort).
 pub fn display_qr_terminal(url: &str) -> Result<()> {
     let code = QrCode::new(url.as_bytes()).context("failed to generate QR code")?;
+
+    // Defensive TTY check: if stdout isn't a terminal, this function was
+    // invoked from a non-interactive context (Tauri sidecar with
+    // Stdio::null(), daemon, piped stdout). Falling through would print
+    // banner text into a closed pipe and — on Windows — pop an image viewer
+    // window even though no human can read it. Silently write the PNG so
+    // any caller that watches the temp path still sees the result.
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        let _ = save_qr_png(&code);
+        return Ok(());
+    }
 
     println!();
 
