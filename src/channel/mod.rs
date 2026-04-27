@@ -390,6 +390,55 @@ pub fn is_video_attachment(content_type: &str, filename: &str) -> bool {
         || lower.ends_with(".3gp")
 }
 
+/// Detect if an attachment is a document based on content_type and filename.
+pub fn is_document_attachment(content_type: &str, filename: &str) -> bool {
+    if content_type.starts_with("application/pdf")
+        || content_type.starts_with("application/msword")
+        || content_type.contains("officedocument")
+        || content_type.contains("spreadsheet")
+        || content_type.contains("presentation")
+        || content_type == "text/plain"
+        || content_type == "text/csv"
+        || content_type == "text/markdown"
+        || content_type == "application/json"
+    {
+        return true;
+    }
+    let lower = filename.to_lowercase();
+    lower.ends_with(".pdf")
+        || lower.ends_with(".doc")
+        || lower.ends_with(".docx")
+        || lower.ends_with(".xls")
+        || lower.ends_with(".xlsx")
+        || lower.ends_with(".ppt")
+        || lower.ends_with(".pptx")
+        || lower.ends_with(".txt")
+        || lower.ends_with(".md")
+        || lower.ends_with(".csv")
+        || lower.ends_with(".json")
+        || lower.ends_with(".xml")
+        || lower.ends_with(".rtf")
+}
+
+/// Return the upload subdirectory for a file based on its type.
+///
+/// - video → "videos"
+/// - audio → "voices"
+/// - document → "docs"
+/// - image → "images"
+/// - other → "files"
+pub fn upload_subdir(mime_type: &str, filename: &str) -> &'static str {
+    if is_video_attachment(mime_type, filename) {
+        "videos"
+    } else if is_audio_attachment(mime_type, filename) {
+        "voices"
+    } else if is_document_attachment(mime_type, filename) {
+        "docs"
+    } else {
+        "files"
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ChannelManager — concurrent channel limit (AGENTS.md §18)
 // ---------------------------------------------------------------------------

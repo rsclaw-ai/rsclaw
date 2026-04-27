@@ -1909,7 +1909,11 @@ impl AgentRuntime {
 
             let mut file_info = Vec::new();
             for file in files {
-                let dest = uploads.join(&file.filename);
+                // Route to type-specific subdirectory.
+                let subdir = crate::channel::upload_subdir(&file.mime_type, &file.filename);
+                let target_dir = uploads.join(subdir);
+                let _ = std::fs::create_dir_all(&target_dir);
+                let dest = target_dir.join(&file.filename);
                 let size = file.data.len();
                 let _ = std::fs::write(&dest, &file.data);
 
