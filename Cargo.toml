@@ -58,7 +58,7 @@ regex   = "1"
 chrono  = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "chrono"] }
 rand          = "0.9"
 which         = "7"
 serde_yaml_ng = "0.10"

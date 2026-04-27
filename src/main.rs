@@ -596,17 +596,24 @@ fn init_tracing(cli: &Cli) {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
 
+    let timer = tracing_subscriber::fmt::time::ChronoLocal::rfc_3339();
+
     if cli.json {
         tracing_subscriber::fmt()
             .json()
+            .with_timer(timer.clone())
             .with_env_filter(filter)
             .init();
     } else if cli.no_color {
         tracing_subscriber::fmt()
+            .with_timer(timer)
             .with_env_filter(filter)
             .with_ansi(false)
             .init();
     } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+        tracing_subscriber::fmt()
+            .with_timer(timer)
+            .with_env_filter(filter)
+            .init();
     }
 }
