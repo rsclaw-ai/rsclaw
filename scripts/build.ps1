@@ -50,7 +50,12 @@ function Get-CargoVersion {
     }
     return "dev"
 }
-$Version = Get-CargoVersion
+# Match release-cli.yml + build-ui.ps1: prefix the cargo version with "v"
+# so the binary's --version output, the artifact filename, and what the
+# desktop bundle's sidecar reports all align.
+$Version = "v$(Get-CargoVersion)"
+$env:RSCLAW_BUILD_VERSION = $Version
+$env:RSCLAW_BUILD_DATE = (Get-Date -Format "yyyy-MM-dd")
 
 # Detect host architecture
 function Get-HostTarget {
