@@ -554,63 +554,107 @@ impl AgentRuntime {
             return Ok(client.clone());
         }
 
-        // Find claude-agent-acp executable
-        // Can be installed via npm: npm install -g @agentclientprotocol/claude-agent-acp
-        let (command, args) = if let Ok(path) = which::which("claude-agent-acp") {
-            (path.to_string_lossy().to_string(), vec![])
-        } else if let Ok(path) = std::env::var("CLAUDE_AGENT_ACP_PATH") {
-            // If it's a .js file, run with node
-            if path.ends_with(".js") {
-                ("node".to_string(), vec![path])
-            } else {
-                (path, vec![])
-            }
-        } else {
-            // Try common npm global install paths
-            let npm_global = std::env::var("npm_config_prefix").ok();
-            let js_path = npm_global
-                .as_ref()
-                .map(|p| {
-                    let mut path = std::path::PathBuf::from(p);
-                    path.push("node_modules");
-                    path.push("@agentclientprotocol");
-                    path.push("claude-agent-acp");
-                    path.push("dist");
-                    path.push("index.js");
-                    path
-                })
-                .or_else(|| {
-                    dirs_next::home_dir().map(|h| {
-                        let mut path = h;
-                        path.push(".npm-global");
-                        path.push("node_modules");
-                        path.push("@agentclientprotocol");
-                        path.push("claude-agent-acp");
-                        path.push("dist");
-                        path.push("index.js");
-                        path
-                    })
-                })
-                .or_else(|| {
-                    dirs_next::home_dir().map(|h| {
-                        let mut path = h;
-                        path.push("node_modules");
-                        path.push("@agentclientprotocol");
-                        path.push("claude-agent-acp");
-                        path.push("dist");
-                        path.push("index.js");
-                        path
-                    })
-                });
+        // Find claude-agent-acp executable.
+        // On Windows, prefer .cmd wrapper to avoid MSYS2 path issues (same as opencode)
+        let (command, args) = if cfg!(target_os = "windows") {
+            // Search PATH for claude-agent-acp.cmd directly
+            let path_env = std::env::var("PATH").ok().unwrap_or_default();
+            let separator = if path_env.contains(';') { ';' } else { ':' };
 
-            match js_path {
-                Some(p) if p.exists() => {
-                    // .js files need to be run with node
-                    ("node".to_string(), vec![p.to_string_lossy().to_string()])
+            let cmd_found = path_env.split(separator).find_map(|dir| {
+                let win_dir = if dir.starts_with('/') && dir.len() > 2 {
+                    let parts: Vec<&str> = dir.splitn(3, '/').collect();
+                    if parts.len() >= 3 && parts[0].is_empty() && parts[1].len() == 1 {
+                        let drive = parts[1].to_uppercase();
+                        let rest = parts[2];
+                        format!("{}:\\{}", drive, rest.replace('/', "\\"))
+                    } else {
+                        dir.replace('/', "\\")
+                    }
+                } else {
+                    dir.to_string()
+                };
+
+                // Try .cmd first
+                let cmd_path = std::path::PathBuf::from(&win_dir).join("claude-agent-acp.cmd");
+                if cmd_path.exists() {
+                    return Some((cmd_path.to_string_lossy().to_string(), vec![]));
                 }
-                _ => {
-                    // Fallback - let spawn handle the error
-                    ("claude-agent-acp".to_string(), vec![])
+                // Then try without extension
+                let bin_path = std::path::PathBuf::from(&win_dir).join("claude-agent-acp");
+                if bin_path.exists() {
+                    return Some((bin_path.to_string_lossy().to_string(), vec![]));
+                }
+                None
+            });
+
+            cmd_found.unwrap_or_else(|| ("claude-agent-acp.cmd".to_string(), vec![]))
+        } else {
+            // Non-Windows: use which::which
+            if let Ok(path) = which::which("claude-agent-acp") {
+                (path.to_string_lossy().to_string(), vec![])
+            } else if let Ok(path) = std::env::var("CLAUDE_AGENT_ACP_PATH") {
+                // If it's a .js file, run with node
+                if path.ends_with(".js") {
+                    ("node".to_string(), vec![path])
+                } else {
+                    (path, vec![])
+                }
+            } else {
+                // Try common npm global install paths
+                let npm_global = std::env::var("npm_config_prefix").ok();
+                let js_path = npm_global
+                    .as_ref()
+                    .map(|p| {
+                        let mut path = std::path::PathBuf::from(p);
+                        path.push("node_modules");
+                        path.push("@agentclientprotocol");
+                        path.push("claude-agent-acp");
+                        path.push("dist");
+                        path.push("index.js");
+                        path
+                    })
+                    .or_else(|| {
+                        dirs_next::home_dir().map(|h| {
+                            let mut path = h;
+                            path.push(".npm-global");
+                            path.push("node_modules");
+                            path.push("@agentclientprotocol");
+                            path.push("claude-agent-acp");
+                            path.push("dist");
+                            path.push("index.js");
+                            path
+                        })
+                    })
+                    .or_else(|| {
+                        dirs_next::home_dir().map(|h| {
+                            let mut path = h;
+                            path.push("node_modules");
+                            path.push("@agentclientprotocol");
+                            path.push("claude-agent-acp");
+                            path.push("dist");
+                            path.push("index.js");
+                            path
+                        })
+                    });
+
+                match js_path {
+                    Some(p) if p.exists() => {
+                        // .js files need to be run with node
+                        // Convert path to Windows native format (avoid MSYS2/Git Bash paths)
+                        let path_str = if cfg!(target_os = "windows") {
+                            p.canonicalize()
+                                .map(|c| c.to_string_lossy().to_string())
+                                .unwrap_or_else(|_| p.to_string_lossy().to_string())
+                        } else {
+                            p.to_string_lossy().to_string()
+                        };
+                        ("node".to_string(), vec![path_str])
+                    }
+                    _ => {
+                        // Fallback - let spawn handle the error
+                        ("claude-agent-acp".to_string(), vec![])
+                    }
                 }
             }
         };
