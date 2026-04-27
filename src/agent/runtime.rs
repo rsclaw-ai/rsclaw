@@ -1956,7 +1956,13 @@ impl AgentRuntime {
                 let size = file.data.len();
                 let _ = std::fs::write(&dest, &file.data);
 
-                let extracted = extract_file_text(&file.filename, &file.data).await;
+                // Skip text extraction for video/audio (binary, not analyzable as text).
+                let extracted = if crate::channel::is_video_attachment(&file.mime_type, &file.filename)
+                    || crate::channel::is_audio_attachment(&file.mime_type, &file.filename) {
+                    None
+                } else {
+                    extract_file_text(&file.filename, &file.data).await
+                };
                 let has_text = extracted.is_some();
                 let est_tokens = extracted.as_ref().map(|t| estimate_tokens(t)).unwrap_or(0);
 
@@ -1978,7 +1984,7 @@ impl AgentRuntime {
                     .entry(session_key.to_owned())
                     .or_default()
                     .push(PendingFile {
-                        filename: file.filename,
+                        filename: std_name,
                         path,
                         size,
                         mime_type: file.mime_type,
@@ -2009,11 +2015,11 @@ impl AgentRuntime {
                 .collect::<Vec<_>>()
                 .join("\n");
 
-            let saved_msg = crate::i18n::t_fmt(
-                "file_saved",
-                i18n_lang,
-                &[("count", &file_info.len().to_string())],
-            );
+            let saved_msg = if i18n_lang == "zh" {
+                format!("已保存 {} 个文件:", file_info.len())
+            } else {
+                format!("{} file(s) saved:", file_info.len())
+            };
             let any_analyzable = file_info.iter().any(|(_, _, has_text, _)| *has_text);
             let menu_msg = if any_analyzable {
                 crate::i18n::t("file_menu", i18n_lang)
@@ -2330,24 +2336,32 @@ impl AgentRuntime {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                let msg = if i18n_lang == "zh" {
-                    format!("已保存 {} 张图片:\n{file_list}\n\n如需分析，请在对话中引用，如: 请分析 @{}", saved.len(), saved[0].0)
+                let ref_hint = saved
+                    .iter()
+                    .map(|(n, _)| format!("@{n}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let menu = if i18n_lang == "zh" {
+                    format!(
+                        "已保存 {} 张图片:\n{file_list}\n引用: {ref_hint}\n\n1. 分析图片\n2. 仅保留\n3. 删除",
+                        saved.len()
+                    )
                 } else {
-                    format!("{} image(s) saved:\n{file_list}\n\nTo analyze, reference in chat: analyze @{}", saved.len(), saved[0].0)
+                    format!(
+                        "{} image(s) saved:\n{file_list}\nRef: {ref_hint}\n\n1. Analyze\n2. Keep\n3. Delete",
+                        saved.len()
+                    )
                 };
 
                 // If user also sent text, process it after the save notification.
                 if !text.is_empty() {
-                    // Append image refs to user text for context.
-                    let refs: String = saved.iter().map(|(n, _)| format!("@{n}")).collect::<Vec<_>>().join(" ");
-                    let enriched = format!("{text}\n\n[uploaded images: {refs}]");
-                    // Store notification in session, then continue to process user text.
+                    let enriched = format!("{text}\n\n[uploaded images: {ref_hint}]");
                     self.sessions
                         .entry(session_key.to_owned())
                         .or_default()
                         .push(Message {
                             role: Role::Assistant,
-                            content: MessageContent::Text(msg),
+                            content: MessageContent::Text(menu.clone()),
                         });
                     return Box::pin(self.run_turn(
                         session_key,
@@ -2355,14 +2369,14 @@ impl AgentRuntime {
                         channel,
                         peer_id,
                         extra_tools,
-                        vec![], // images already saved
+                        vec![],
                         files,
                     ))
                     .await;
                 }
 
                 return Ok(AgentReply {
-                    text: msg,
+                    text: menu,
                     is_empty: false,
                     tool_calls: None,
                     images: vec![],
