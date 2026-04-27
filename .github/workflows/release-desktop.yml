@@ -15,8 +15,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RSCLAW_BUILD_VERSION: ${{ inputs.tag || github.ref_name }}
   RSCLAW_BUILD_DATE: ${{ github.event.head_commit.timestamp || github.event.repository.updated_at }}
+  # RSCLAW_BUILD_VERSION is computed per-job below — we strip the `app-`
+  # prefix from the desktop tag so the embedded `--version` string
+  # matches what the CLI release (tagged `v*`) bakes in. Otherwise the
+  # sidecar inside the desktop bundle reports "app-v2026.4.26" while a
+  # standalone CLI download reports "v2026.4.26", confusing users and
+  # /doctor diagnostics.
 
 jobs:
   desktop:
@@ -67,6 +72,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Compute clean version
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          # Strip "app-" prefix so the binary's embedded version matches
+          # what the CLI release pipeline (tagged `v*`) bakes in.
+          echo "RSCLAW_BUILD_VERSION=${TAG#app-}" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@master
         with:
