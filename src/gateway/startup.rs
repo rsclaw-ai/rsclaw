@@ -45,6 +45,13 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // 0. Apply global proxy env vars before any HTTP clients are created.
     crate::config::apply_proxy_env(&config);
 
+    // 0a. Initialize the self-evolution config singleton from
+    //     `[ext.evolution]` (or built-in defaults if absent). Read by memory
+    //     tier transition, crystallizer, and meditation phases.
+    crate::agent::evolution::init_evolution_config(
+        crate::agent::evolution::EvolutionConfig::from_raw(config.ext.evolution.as_ref()),
+    );
+
     // 1. Resolve data directory — respects RSCLAW_BASE_DIR for --dev/--profile.
     let base_dir = crate::config::loader::base_dir();
     let data_dir = base_dir.join("var/data");

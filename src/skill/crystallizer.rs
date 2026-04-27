@@ -93,22 +93,22 @@ pub async fn acquire_distill_permit() -> Result<tokio::sync::SemaphorePermit<'st
         .map_err(|e| anyhow!("distill semaphore closed: {e}"))
 }
 
-/// Minimum number of related Core memories to trigger crystallization.
-const MIN_CLUSTER_SIZE: usize = 3;
-
-/// Cosine similarity threshold for "related" memories.
-const CLUSTER_SIMILARITY: f32 = 0.75;
+// Cluster thresholds are now read from the live evolution config — see
+// `crate::agent::evolution::evolution_config()`. Defaults (3 docs / 0.75
+// cosine) match the original hardcoded constants.
 
 /// Find a cluster of related Core-tier memories around the given document.
 ///
 /// Returns `None` if the cluster (including the source doc) is smaller than
-/// [`MIN_CLUSTER_SIZE`].  All returned docs share the same scope, are Core
-/// tier, and have not yet been tagged `"crystallized"`.
+/// `cluster.min_size` from the live evolution config.  All returned docs
+/// share the same scope, are Core tier, and have not yet been tagged
+/// `"crystallized"`.
 pub fn find_cluster(
     store: &MemoryStore,
     doc_id: &str,
     scope: &str,
 ) -> Result<Option<Vec<MemoryDoc>>> {
+    let evo = crate::agent::evolution::evolution_config();
     let source = store
         .get_sync(doc_id)
         .context("source doc not found in store")?
@@ -122,8 +122,11 @@ pub fn find_cluster(
         return Ok(None);
     }
 
-    let neighbours =
-        store.find_near_duplicates(doc_id, Some(scope), CLUSTER_SIMILARITY)?;
+    let neighbours = store.find_near_duplicates(
+        doc_id,
+        Some(scope),
+        evo.cluster.similarity_threshold,
+    )?;
 
     let mut cluster: Vec<MemoryDoc> = neighbours
         .into_iter()
@@ -138,7 +141,7 @@ pub fn find_cluster(
     // Include the source document itself.
     cluster.insert(0, source);
 
-    if cluster.len() < MIN_CLUSTER_SIZE {
+    if cluster.len() < evo.cluster.min_size {
         return Ok(None);
     }
 
@@ -424,6 +427,11 @@ pub async fn crystallize_one(
     flash_model: &str,
     skills_dir: &Path,
 ) -> Result<Option<PathBuf>> {
+    // 0. Master kill-switch.
+    if !crate::agent::evolution::evolution_config().enabled {
+        return Ok(None);
+    }
+
     // 1. Find cluster (brief lock).
     let cluster = {
         let s = store.lock().await;

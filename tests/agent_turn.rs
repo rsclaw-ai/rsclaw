@@ -94,6 +94,7 @@ fn config_with_echo_agent(port: u16) -> RuntimeConfig {
             tools: None,
             skills: None,
             plugins: None,
+            evolution: None,
         },
         ops: OpsRuntime {
             cron: None,

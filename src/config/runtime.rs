@@ -86,6 +86,7 @@ pub struct ExtRuntime {
     pub tools: Option<ToolsConfig>,
     pub skills: Option<SkillsConfig>,
     pub plugins: Option<PluginsConfig>,
+    pub evolution: Option<crate::config::schema::EvolutionConfig>,
 }
 
 /// Operational: cron, hooks, sandbox, logging, secrets.  Rarely change.
@@ -204,6 +205,7 @@ impl IntoRuntime for Config {
                 tools: self.tools,
                 skills: self.skills,
                 plugins: self.plugins,
+                evolution: self.evolution,
             },
             ops: OpsRuntime {
                 cron: self.cron,

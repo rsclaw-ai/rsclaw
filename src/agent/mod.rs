@@ -8,6 +8,7 @@
 //!   - `collaboration`  — Sequential / Parallel / Orchestrated collab modes
 
 pub mod bootstrap;
+pub mod evolution;
 pub mod btw;
 pub mod collaboration;
 pub mod compaction;
