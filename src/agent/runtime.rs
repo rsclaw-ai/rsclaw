@@ -1762,51 +1762,13 @@ impl AgentRuntime {
         // ImageAttachments so they go through Files API → input_video.
         // This is unified here so all channels benefit without changes.
         // ---------------------------------------------------------------
-        let cur_model = self.resolve_model_name();
-        let is_doubao = cur_model.to_lowercase().contains("doubao")
-            || cur_model.to_lowercase().contains("seed");
         let mut files = files;
         let mut images = images;
-        let mut text_override: Option<String> = None;
-        if is_doubao {
-            let mut remaining = Vec::new();
-            for f in files {
-                if crate::channel::is_video_attachment(&f.mime_type, &f.filename) {
-                    // NOTE: During base64 encoding, both f.data and the b64 string
-                    // (~133% of original) coexist in memory. The 100 MB upload limit
-                    // (MAX_UPLOAD_SIZE) bounds the worst case to ~233 MB peak.
-                    use base64::Engine;
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&f.data);
-                    let mime = if f.mime_type.is_empty() {
-                        "video/mp4"
-                    } else {
-                        &f.mime_type
-                    };
-                    let data_uri = format!("data:{mime};base64,{b64}");
-                    images.push(super::registry::ImageAttachment {
-                        data: data_uri,
-                        mime_type: mime.to_owned(),
-                    });
-                    if text.is_empty() && text_override.is_none() {
-                        text_override = Some(crate::i18n::t(
-                            "describe_video",
-                            crate::i18n::default_lang(),
-                        ));
-                    }
-                    info!(
-                        size = f.data.len(),
-                        "video FileAttachment → ImageAttachment for vision"
-                    );
-                } else {
-                    remaining.push(f);
-                }
-            }
-            files = remaining;
-        }
-        let text = text_override.as_deref().unwrap_or(text);
+        // Only audio files get auto-transcribed. Video and other files go
+        // through the normal file-save path (user chooses analyze/save).
         let (media_files, regular_files): (Vec<_>, Vec<_>) = files.into_iter().partition(|f| {
-            crate::channel::is_video_attachment(&f.mime_type, &f.filename)
-                || crate::channel::is_audio_attachment(&f.mime_type, &f.filename)
+            crate::channel::is_audio_attachment(&f.mime_type, &f.filename)
+                && !crate::channel::is_video_attachment(&f.mime_type, &f.filename)
         });
         let files = regular_files;
 
