@@ -373,6 +373,10 @@ impl AgentRegistry {
         let agent_list = if cfg.agents.list.is_empty() {
             let model = cfg.agents.defaults.model.clone();
             let workspace = cfg.agents.defaults.workspace.clone();
+            // Inherit ACP configs from defaults
+            let opencode = cfg.agents.defaults.opencode.clone();
+            let claudecode = cfg.agents.defaults.claudecode.clone();
+            let codex = cfg.agents.defaults.codex.clone();
             vec![crate::config::schema::AgentEntry {
                 id: "main".to_owned(),
                 default: Some(true),
@@ -386,9 +390,9 @@ impl AgentRegistry {
                 channels: None,
                 commands: None,
                 allowed_commands: None,
-                opencode: None,
-                claudecode: None,
-                codex: None,
+                opencode,
+                claudecode,
+                codex,
                 agent_dir: None,
                 system: None,
                 temperature: None,
