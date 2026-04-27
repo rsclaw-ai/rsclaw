@@ -1797,9 +1797,12 @@ async fn extract_and_upload_cover(
             return None;
         }
     };
+    // Per-call uuid prevents two concurrent video sends from clobbering
+    // each other's frame extraction (the worker spawns each task as its
+    // own tokio task — same pid, same temp dir).
     let cover_dir = std::env::temp_dir();
     let cover_path = cover_dir
-        .join(format!("rsclaw_cover_{}.jpg", std::process::id()))
+        .join(format!("rsclaw_cover_{}_{}.jpg", std::process::id(), uuid::Uuid::new_v4()))
         .to_string_lossy()
         .into_owned();
     // Run ffmpeg to extract first frame at 1s.

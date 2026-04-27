@@ -232,6 +232,12 @@ pub struct WeChatPersonalChannel {
     on_message: Arc<dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>) + Send + Sync>,
 }
 
+/// Sentinel prefix used in the bail message produced by
+/// `WeChatPersonalChannel::check_send_ret`. Callers compare against this
+/// to distinguish a notify-side rejection (don't retry, emit fallback)
+/// from a genuine network / 5xx failure (do retry).
+const NOTIFY_REJECTED_PREFIX: &str = "WECHAT_NOTIFY_REJECTED:";
+
 impl WeChatPersonalChannel {
     /// Create from a saved bot_token (after QR login).
     pub fn new(bot_token: String, on_message: Arc<dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>) + Send + Sync>) -> Self {
@@ -411,13 +417,13 @@ impl WeChatPersonalChannel {
     /// Inspect a sendmessage HTTP-200 response body for the ilink `ret` code.
     ///
     /// Wechat's ilink protocol returns `{"ret": -2, ...}` for messages it
-    /// accepts at HTTP level but refuses to deliver (anti-spam / invalid
-    /// media reference / similar). Treating this as Ok would silently lose
-    /// the message; treating it as a hard task failure misrepresents what
-    /// happened (the upstream task — video gen, etc — actually succeeded).
-    /// We bail with a `WECHAT_NOTIFY_REJECTED` prefix so callers can
-    /// recognise it and emit a delivery-only fallback (e.g. "📦 视频已生成
-    /// 但通知投递异常") without re-running the task.
+    /// accepts at HTTP level but refuses to deliver (anti-spam, invalid
+    /// media reference, similar). Treating this as Ok silently loses the
+    /// message; treating it as a hard task failure misrepresents what
+    /// happened (the upstream work, e.g. video gen, actually succeeded).
+    /// We bail with the `WECHAT_NOTIFY_REJECTED` prefix below so callers
+    /// can recognise the case and emit a delivery-only fallback rather
+    /// than re-running the task.
     fn check_send_ret(label: &str, resp_body: &str) -> Result<()> {
         let parsed: serde_json::Value = match serde_json::from_str(resp_body) {
             Ok(v) => v,
@@ -433,7 +439,7 @@ impl WeChatPersonalChannel {
             body = %resp_body,
             "wechat: ilink ret != 0 — message rejected by upstream (notify failure)"
         );
-        bail!("WECHAT_NOTIFY_REJECTED:ret={ret}:{resp_body}");
+        bail!("{NOTIFY_REJECTED_PREFIX}ret={ret}");
     }
 
     async fn send_text(&self, to_user_id: &str, text: &str) -> Result<()> {
@@ -1444,8 +1450,19 @@ impl Channel for WeChatPersonalChannel {
             };
             if !msg.text.trim().is_empty() {
                 let chunks = chunk_text(&msg.text, &chunk_cfg);
-                for chunk in &chunks {
-                    self.send_text(&msg.target_id, chunk).await?;
+                for (i, chunk) in chunks.iter().enumerate() {
+                    match self.send_text(&msg.target_id, chunk).await {
+                        Ok(()) => {}
+                        Err(e) if e.to_string().starts_with(NOTIFY_REJECTED_PREFIX) => {
+                            // Wechat refused this chunk (anti-spam etc).
+                            // Don't propagate — `send_with_retry` would
+                            // re-clone the OutboundMessage and re-send
+                            // every prior chunk, image, and file. Log
+                            // and move on to whatever's left.
+                            warn!(chunk = i, "wechat: text chunk rejected by upstream: {e:#}");
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             }
 

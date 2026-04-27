@@ -10,7 +10,7 @@ use anyhow::Result;
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Notify};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     agent::{AgentMessage, AgentRegistry, FileAttachment, ImageAttachment},
@@ -694,9 +694,11 @@ impl TaskQueueWorker {
         reason: &str,
     ) {
         let Some(tx) = self.channel_tx(channel_name) else {
-            tracing::warn!(channel = %channel_name, "no channel sender registered, failure notice dropped");
+            warn!(channel = %channel_name, "no channel sender registered, failure notice dropped");
             return;
         };
+        // TODO: lookup per-peer language once channels expose a per-target
+        // language hint (currently they don't — falls back to gateway-wide).
         let text = crate::i18n::t_fmt(
             "task_notify_failure",
             crate::i18n::default_lang(),
@@ -712,7 +714,7 @@ impl TaskQueueWorker {
             channel: Some(channel_name.to_owned()),
         };
         if let Err(e) = tx.send(out).await {
-            tracing::error!(channel = %channel_name, "failure notice send failed: {e}");
+            error!(channel = %channel_name, "failure notice send failed: {e}");
         }
     }
 

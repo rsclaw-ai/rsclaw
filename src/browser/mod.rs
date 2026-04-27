@@ -3872,9 +3872,32 @@ const SNAPSHOT_INTERACTIVE_JS: &str = r#"(function(){
 
 #[cfg(test)]
 mod tests {
-    use super::detect_existing_chrome;
+    use super::{detect_existing_chrome, parse_port_from_ws_url};
     use serde_json::json;
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    #[test]
+    fn parse_port_from_ws_url_127() {
+        let p = parse_port_from_ws_url("ws://127.0.0.1:9222/devtools/browser/abc").unwrap();
+        assert_eq!(p, 9222);
+    }
+
+    #[test]
+    fn parse_port_from_ws_url_localhost() {
+        let p = parse_port_from_ws_url("ws://localhost:56346/devtools/browser/xyz").unwrap();
+        assert_eq!(p, 56346);
+    }
+
+    #[test]
+    fn parse_port_from_ws_url_unknown_host_errors() {
+        assert!(parse_port_from_ws_url("ws://example.com:80/devtools/browser/x").is_err());
+    }
+
+    #[test]
+    fn parse_port_from_ws_url_no_path_terminator() {
+        let p = parse_port_from_ws_url("ws://127.0.0.1:9999").unwrap();
+        assert_eq!(p, 9999);
+    }
 
     #[tokio::test]
     async fn detect_existing_chrome_skips_headless() {
