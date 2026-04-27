@@ -134,11 +134,15 @@ impl AgentRuntime {
             .map(expand_tilde)
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
         // Convert to Windows native path string (avoid MSYS2/Git Bash Unix-style paths)
+        // Don't use canonicalize() - it returns \\?\ prefix which breaks JSON serialization
         let cwd_str = if cfg!(target_os = "windows") {
-            // Use canonicalize to get Windows-native absolute path
-            cwd.canonicalize()
-                .map(|c| c.to_string_lossy().to_string())
-                .unwrap_or_else(|_| cwd.to_string_lossy().to_string())
+            // Convert to absolute path and normalize separators
+            let abs_path = if cwd.is_absolute() {
+                cwd.clone()
+            } else {
+                std::env::current_dir().unwrap_or_default().join(&cwd)
+            };
+            abs_path.to_string_lossy().to_string()
         } else {
             cwd.to_string_lossy().to_string()
         };
@@ -692,10 +696,15 @@ impl AgentRuntime {
             .map(expand_tilde)
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
         // Convert to Windows native path string (avoid MSYS2/Git Bash Unix-style paths)
+        // Don't use canonicalize() - it returns \\?\ prefix which breaks JSON serialization
         let cwd_str = if cfg!(target_os = "windows") {
-            cwd.canonicalize()
-                .map(|c| c.to_string_lossy().to_string())
-                .unwrap_or_else(|_| cwd.to_string_lossy().to_string())
+            // Convert to absolute path and normalize separators
+            let abs_path = if cwd.is_absolute() {
+                cwd.clone()
+            } else {
+                std::env::current_dir().unwrap_or_default().join(&cwd)
+            };
+            abs_path.to_string_lossy().to_string()
         } else {
             cwd.to_string_lossy().to_string()
         };
