@@ -143,16 +143,45 @@ pub fn build_distill_prompt(cluster: &[MemoryDoc]) -> String {
 
 /// Write a `SKILL.md` file into the skills directory under the given slug.
 ///
-/// Creates `{skills_dir}/{slug}/SKILL.md` and returns the full path to the
-/// written file.
+/// Creates `{skills_dir}/{slug}/SKILL.md`. If a SKILL.md already exists at
+/// that path (a different crystallization run picked the same frontmatter
+/// `name:`), append `-2`, `-3`, ... to the slug until a free slot is found,
+/// instead of silently overwriting. Returns the full path written.
 pub fn write_skill(skills_dir: &Path, slug: &str, content: &str) -> Result<PathBuf> {
-    let dir = skills_dir.join(slug);
+    // Probe for a non-colliding slug. Cap at 99 to avoid runaway loops if
+    // someone seeds 100+ identically-named skills (something is very wrong
+    // by then anyway).
+    let mut attempt = 1u32;
+    let (dir, final_slug) = loop {
+        let candidate_slug = if attempt == 1 {
+            slug.to_owned()
+        } else {
+            format!("{slug}-{attempt}")
+        };
+        let candidate_dir = skills_dir.join(&candidate_slug);
+        if !candidate_dir.join("SKILL.md").exists() {
+            break (candidate_dir, candidate_slug);
+        }
+        attempt += 1;
+        if attempt > 99 {
+            bail!("write_skill: too many slug collisions for '{slug}'");
+        }
+    };
+
     fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create skill directory: {}", dir.display()))?;
 
     let path = dir.join("SKILL.md");
     fs::write(&path, content)
         .with_context(|| format!("failed to write SKILL.md at {}", path.display()))?;
+
+    if final_slug != slug {
+        tracing::info!(
+            requested = slug,
+            actual = %final_slug,
+            "skill slug collided, suffix appended"
+        );
+    }
 
     Ok(path)
 }
@@ -434,5 +463,24 @@ mod tests {
     fn validate_rejects_invalid_yaml() {
         let md = "---\nname: foo\ndescription: [unclosed\n---\nbody";
         assert!(validate_skill_md(md).is_err());
+    }
+
+    #[test]
+    fn write_skill_appends_suffix_on_collision() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+
+        let p1 = write_skill(dir, "shared-name", "first\n").expect("first write");
+        let p2 = write_skill(dir, "shared-name", "second\n").expect("second write");
+        let p3 = write_skill(dir, "shared-name", "third\n").expect("third write");
+
+        assert_eq!(p1, dir.join("shared-name").join("SKILL.md"));
+        assert_eq!(p2, dir.join("shared-name-2").join("SKILL.md"));
+        assert_eq!(p3, dir.join("shared-name-3").join("SKILL.md"));
+
+        // Each write landed its own content.
+        assert_eq!(fs::read_to_string(&p1).unwrap(), "first\n");
+        assert_eq!(fs::read_to_string(&p2).unwrap(), "second\n");
+        assert_eq!(fs::read_to_string(&p3).unwrap(), "third\n");
     }
 }
