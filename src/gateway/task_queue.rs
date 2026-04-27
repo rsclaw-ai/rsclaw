@@ -472,6 +472,12 @@ impl TaskQueueManager {
         self.store.update_task_last_reply(task_id, text)
     }
 
+    /// Persist the per-turn counter so a /task resumed after a crash starts
+    /// from the next turn instead of replaying earlier ones.
+    pub fn record_turn(&self, task_id: &str, turn: u32) -> Result<()> {
+        self.store.update_task_turn(task_id, turn)
+    }
+
     /// List Done tasks for a session whose final reply has not yet been
     /// confirmed delivered. Used by WS subscribe to replay completions that
     /// fired while the client was offline.
@@ -870,7 +876,13 @@ impl TaskQueueWorker {
             .collect();
 
         let target = if chat_id.is_empty() { peer_id.clone() } else { chat_id.clone() };
-        let mut turn: u32 = 0;
+        // Resume from the persisted turn counter — non-zero only when this
+        // task is being re-picked up after a crash (requeue_running_tasks
+        // moved it back to Pending). Fresh tasks start at 0.
+        let mut turn: u32 = task.turns;
+        if turn > 0 {
+            info!(task_id = %task_id, resume_turn = turn, "task queue worker: resuming /task after recovery");
+        }
         let mut next_text = first_text;
         let mut next_images = first_images;
         let mut next_files = first_files;
@@ -987,6 +999,12 @@ impl TaskQueueWorker {
             }
 
             info!(task_id = %task_id, turn, outcome = ?outcome, "task queue worker: turn outcome");
+
+            // Persist turn counter so a crash mid-/task resumes from the
+            // right place rather than replaying earlier turns.
+            if let Err(e) = self.manager.record_turn(&task_id, turn) {
+                tracing::warn!(task_id = %task_id, "record_turn failed: {e:#}");
+            }
 
             match outcome {
                 TaskOutcome::Done => {

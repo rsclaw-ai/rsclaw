@@ -544,6 +544,27 @@ impl RedbStore {
         Ok(count)
     }
 
+    /// Persist the per-turn counter so /task tasks resumed after a crash
+    /// pick up where they left off rather than restarting at turn 0.
+    pub fn update_task_turn(&self, task_id: &str, turn: u32) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(TASK_QUEUE)?;
+            let guard = table
+                .get(task_id)?
+                .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+            let mut task: crate::gateway::task_queue::QueuedTask =
+                serde_json::from_str(guard.value())?;
+            drop(guard);
+            task.turns = turn;
+            task.updated_at = chrono::Utc::now().timestamp();
+            let json = serde_json::to_string(&task)?;
+            table.insert(task_id, json.as_str())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
     /// Persist the most recent agent reply on a task so reconnect-replay
     /// can re-deliver the answer without consulting the chat-history index.
     pub fn update_task_last_reply(&self, task_id: &str, text: &str) -> Result<()> {
