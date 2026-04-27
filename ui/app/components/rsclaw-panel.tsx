@@ -3422,12 +3422,37 @@ function TauriConfigPageInner() {
   };
 
   const handleSave = async () => {
-    try { JSON5.parse(raw); } catch { toast.error(zh ? "JSON5 格式错误" : "Invalid JSON5"); return; }
+    let parsed: any;
+    try { parsed = JSON5.parse(raw); } catch { toast.error(zh ? "JSON5 格式错误" : "Invalid JSON5"); return; }
+    // Strip zombie channel blocks (channels whose accounts is missing or
+    // an empty object). Heals configs left dirty by older versions of
+    // removeAccount that only deleted the inner accounts entry.
+    let cleanedContent = raw;
+    if (parsed && parsed.channels && typeof parsed.channels === "object") {
+      let changed = false;
+      for (const chId of Object.keys(parsed.channels)) {
+        const ch = parsed.channels[chId];
+        const accounts = ch && typeof ch === "object" ? ch.accounts : undefined;
+        const isEmptyAccounts =
+          accounts === undefined ||
+          accounts === null ||
+          (typeof accounts === "object" && !Array.isArray(accounts) && Object.keys(accounts).length === 0);
+        if (isEmptyAccounts) {
+          delete parsed.channels[chId];
+          changed = true;
+        }
+      }
+      if (changed) {
+        cleanedContent = JSON.stringify(parsed, null, 2);
+        setConfig(parsed);
+        setRaw(cleanedContent);
+      }
+    }
     setSaving(true);
     try {
       const invoke = isTauri ? tauriInvokeV2 : null;
       if (invoke) {
-        await invoke("write_config", { content: raw });
+        await invoke("write_config", { content: cleanedContent });
         try { await reloadConfig(); } catch {}
         toast.success(zh ? "配置已保存" : "Config saved");
         setDirty(false);
@@ -3687,7 +3712,20 @@ function TauriConfigPageInner() {
   };
 
   const removeAccount = (chId: string, acctId: string) => {
-    deleteConfig(`channels.${chId}.accounts.${acctId}`);
+    // Delete the account, and if it was the last one in the channel, drop
+    // the channel entry entirely so the config doesn't keep a zombie block
+    // like `wechat: { accounts: {} }`.
+    const newConfig = JSON.parse(JSON.stringify(config));
+    const ch = newConfig?.channels?.[chId];
+    if (ch && ch.accounts && typeof ch.accounts === "object") {
+      delete ch.accounts[acctId];
+      if (Object.keys(ch.accounts).length === 0) {
+        delete newConfig.channels[chId];
+      }
+      setConfig(newConfig);
+      setRaw(JSON.stringify(newConfig, null, 2));
+      setDirty(true);
+    }
     setOpenAccts((prev) => { const n = { ...prev }; delete n[`${chId}-${acctId}`]; return n; });
   };
 
@@ -4502,7 +4540,7 @@ function TauriConfigPageInner() {
                                     </button>
                                     {openAccts[`del-${c.id}-${acct.id}`] && (
                                       <div onClick={(e) => e.stopPropagation()} style={{
-                                        position: "absolute", bottom: "100%", right: 0, marginBottom: 6,
+                                        position: "absolute", bottom: "100%", left: 0, marginBottom: 6,
                                         padding: "10px 12px", minWidth: 160,
                                         background: "var(--white)", border: "1px solid var(--border-in-light)",
                                         borderRadius: 8, boxShadow: "0 4px 12px rgba(0,0,0,0.3)", zIndex: 100,
