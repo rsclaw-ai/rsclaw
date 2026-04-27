@@ -13,13 +13,85 @@ pub(crate) fn has_display() -> bool {
     }
 }
 
-/// Detect Chrome/Chromium binary path.
-/// Priority: ~/.rsclaw/tools/ > system PATH > well-known locations.
+/// Detect Chrome / Chromium binary path.
+///
+/// Priority: user's existing system Chrome > `~/.rsclaw/tools/chrome`
+/// (Chrome for Testing we manage). The reorder is intentional — most
+/// users already have Google Chrome installed, and we want to ride on
+/// their version (security updates, extensions, profiles) rather than
+/// silently maintaining a parallel copy.
+///
+/// `tools/chrome` remains as a fallback so that machines without any
+/// Chrome at all still work after a single `rsclaw tools install chrome`.
+/// See `ensure_chrome()` for the auto-install on absence.
 pub(crate) fn detect_chrome() -> Option<String> {
-    // 1. Check locally installed via `rsclaw tools install chrome` (highest priority)
+    // 1. System-installed Chrome (well-known locations + PATH).
+    #[cfg(target_os = "macos")]
+    {
+        let app_paths = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ];
+        for p in &app_paths {
+            if std::path::Path::new(p).exists() {
+                return Some((*p).to_owned());
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Registry (most reliable for system + per-user installs).
+        for key_path in &[
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+            r"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+        ] {
+            for hive in &["HKLM", "HKCU"] {
+                if let Ok(output) = std::process::Command::new("reg")
+                    .args(["query", &format!(r"{hive}\{key_path}"), "/ve"])
+                    .output()
+                {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if let Some(line) = stdout.lines().find(|l| l.contains("REG_SZ")) {
+                        if let Some(path_str) = line.split("REG_SZ").nth(1) {
+                            let path_str = path_str.trim();
+                            if std::path::Path::new(path_str).exists() {
+                                return Some(path_str.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ];
+        for path in &candidates {
+            if std::path::Path::new(path).exists() {
+                return Some((*path).to_string());
+            }
+        }
+        if let Ok(userprofile) = std::env::var("USERPROFILE") {
+            let user_chrome = format!(
+                r"{}\AppData\Local\Google\Chrome\Application\chrome.exe",
+                userprofile
+            );
+            if std::path::Path::new(&user_chrome).exists() {
+                return Some(user_chrome);
+            }
+        }
+    }
+
+    for name in &["google-chrome", "chromium", "chromium-browser", "chrome"] {
+        if let Ok(path) = which::which(name) {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+
+    // 2. Fall back to ~/.rsclaw/tools/chrome (Chrome for Testing we manage).
     let tools_dir = crate::config::loader::base_dir().join("tools/chrome");
     if tools_dir.exists() {
-        // Try multiple known app bundle names (Chrome for Testing, Chromium, etc.)
         #[cfg(target_os = "macos")]
         {
             let candidates = [
@@ -53,81 +125,22 @@ pub(crate) fn detect_chrome() -> Option<String> {
         }
     }
 
-    // 2. System well-known locations
-    #[cfg(target_os = "macos")]
-    {
-        let app_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-        if std::path::Path::new(app_path).exists() {
-            return Some(app_path.to_owned());
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        // Try Windows registry first (most reliable).
-        for key_path in &[
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
-            r"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
-        ] {
-            if let Ok(output) = std::process::Command::new("reg")
-                .args(["query", &format!(r"HKLM\{key_path}"), "/ve"])
-                .output()
-            {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(line) = stdout.lines().find(|l| l.contains("REG_SZ")) {
-                    if let Some(path_str) = line.split("REG_SZ").nth(1) {
-                        let path_str = path_str.trim();
-                        if std::path::Path::new(path_str).exists() {
-                            return Some(path_str.to_owned());
-                        }
-                    }
-                }
-            }
-            // Also try HKCU (per-user installs)
-            if let Ok(output) = std::process::Command::new("reg")
-                .args(["query", &format!(r"HKCU\{key_path}"), "/ve"])
-                .output()
-            {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(line) = stdout.lines().find(|l| l.contains("REG_SZ")) {
-                    if let Some(path_str) = line.split("REG_SZ").nth(1) {
-                        let path_str = path_str.trim();
-                        if std::path::Path::new(path_str).exists() {
-                            return Some(path_str.to_owned());
-                        }
-                    }
-                }
-            }
-        }
-        // Fallback: well-known paths.
-        let candidates = [
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        ];
-        for path in &candidates {
-            if std::path::Path::new(path).exists() {
-                return Some(path.to_string());
-            }
-        }
-        if let Ok(userprofile) = std::env::var("USERPROFILE") {
-            let user_chrome = format!(
-                r"{}\AppData\Local\Google\Chrome\Application\chrome.exe",
-                userprofile
-            );
-            if std::path::Path::new(&user_chrome).exists() {
-                return Some(user_chrome);
-            }
-        }
-    }
-
-    // 3. Search PATH
-    for name in &["google-chrome", "chromium", "chromium-browser", "chrome"] {
-        if let Ok(path) = which::which(name) {
-            return Some(path.to_string_lossy().to_string());
-        }
-    }
-
     None
+}
+
+/// Like `detect_chrome` but auto-installs Chrome for Testing on miss.
+/// First call is slow (downloads ~150MB); subsequent calls are instant.
+/// Returns the absolute path to a Chrome binary, or an error if both
+/// detection and install fail.
+pub(crate) async fn ensure_chrome() -> Result<String> {
+    if let Some(p) = detect_chrome() {
+        return Ok(p);
+    }
+    tracing::info!("Chrome not found locally, auto-installing Chrome for Testing");
+    crate::cmd::tools::cmd_install("chrome", false).await?;
+    detect_chrome().ok_or_else(|| {
+        anyhow::anyhow!("Chrome auto-install completed but binary still not detected")
+    })
 }
 
 /// Run a subprocess and return an error if it fails.

@@ -544,8 +544,9 @@ impl HostState {
         // Auto-start browser if not initialized.
         if guard.is_none() {
             tracing::info!("WASM plugin: auto-starting browser session");
-            let chrome_path = crate::agent::platform::detect_chrome()
-                .ok_or_else(|| "Chrome not found on this system".to_string())?;
+            let chrome_path = crate::agent::platform::ensure_chrome()
+                .await
+                .map_err(|e| format!("failed to obtain Chrome: {e:#}"))?;
             // All wasm plugins share one Chrome profile so that auth state
             // (cookies, localStorage) is reused across the session — e.g.
             // a single login to Bytedance covers jimeng + douyin + xianyu.
