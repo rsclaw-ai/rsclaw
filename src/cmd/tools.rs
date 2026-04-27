@@ -291,10 +291,16 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
             std::fs::create_dir_all(&dest_dir)?;
             println!("  Installing {} via npm ...", bold(def.name));
             let node_bin = find_node_binary(&dir);
+            // Windows ships npm as both `npm` (shell wrapper) and `npm.cmd`
+            // (Windows batch). The shell wrapper goes through bash and
+            // breaks when spawned from a Windows-native subprocess (it
+            // emits Unix-style paths like /d/Program Files/...). Use the
+            // .cmd form on Windows; other platforms keep the bare name.
+            let npm_basename = if cfg!(target_os = "windows") { "npm.cmd" } else { "npm" };
             let npm_bin = node_bin.as_deref().map(|n| {
                 let p = std::path::Path::new(n).parent().unwrap_or(std::path::Path::new(""));
-                p.join("npm").to_string_lossy().to_string()
-            }).unwrap_or_else(|| "npm".to_owned());
+                p.join(npm_basename).to_string_lossy().to_string()
+            }).unwrap_or_else(|| npm_basename.to_owned());
             let status = std::process::Command::new(&npm_bin)
                 .args(["install", "--prefix", &dest_dir.to_string_lossy(), pkg])
                 .status();
