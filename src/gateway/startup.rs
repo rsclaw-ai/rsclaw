@@ -1134,14 +1134,17 @@ async fn run_embedder_reembed(
     /// even with the slowest CPU-only BGE inference.
     const BATCH: usize = 50;
 
-    let embedder = {
+    let (embedder, expected_total) = {
         let mut mem = mem_arc.lock().await;
         let e = mem.embedder_arc();
+        let pending_count = mem.pending_migration_count();
         mem.begin_swap(std::sync::Arc::clone(&e))?;
-        e
+        (e, pending_count)
     };
+    let started = std::time::Instant::now();
 
     let mut total = 0usize;
+    let mut batch_no = 0usize;
     loop {
         let pending = {
             let mem = mem_arc.lock().await;
@@ -1150,7 +1153,10 @@ async fn run_embedder_reembed(
         if pending.is_empty() {
             break;
         }
+        let batch_size = pending.len();
+        batch_no += 1;
         // Heavy work off-lock.
+        let batch_started = std::time::Instant::now();
         let batch: Vec<(usize, Vec<f32>)> = pending
             .into_iter()
             .map(|(idx, text)| (idx, embedder.embed(&text)))
@@ -1171,13 +1177,26 @@ async fn run_embedder_reembed(
             anyhow::bail!("embedder re-embed: batch applied 0 docs, aborting");
         }
         total += applied;
+        info!(
+            batch = batch_no,
+            applied,
+            total,
+            expected = expected_total,
+            batch_ms = batch_started.elapsed().as_millis() as u64,
+            "embedder re-embed: batch complete"
+        );
     }
 
     let migrated = {
         let mut mem = mem_arc.lock().await;
         mem.commit_swap()?
     };
-    info!(total, migrated, "embedder re-embed complete; semantic search now full-coverage");
+    info!(
+        total,
+        migrated,
+        elapsed_secs = started.elapsed().as_secs(),
+        "embedder re-embed complete; semantic search now full-coverage"
+    );
     Ok(())
 }
 
