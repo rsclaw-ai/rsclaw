@@ -289,27 +289,24 @@ fn is_chrome_devtools_port(port: u16) -> bool {
     }
 }
 
-/// Parse the port number from a WebSocket URL.
-/// Supports formats: ws://127.0.0.1:PORT/... or ws://[::1]:PORT/...
+/// Parse the port number from a Chrome DevTools WebSocket URL.
+/// Accepts: `ws://127.0.0.1:PORT/...`, `ws://localhost:PORT/...`, or `ws://[::1]:PORT/...`.
+/// Chrome uses `localhost` when reusing an already-running browser via /json/version.
 fn parse_port_from_ws_url(url: &str) -> Result<u16> {
-    // IPv4: ws://127.0.0.1:PORT/
-    if let Some(pos) = url.find("127.0.0.1:") {
-        let start = pos + "127.0.0.1:".len();
-        let end = url[start..].find('/').unwrap_or(url.len() - start);
-        return url[start..start + end].parse::<u16>()
-            .map_err(|e| anyhow!("invalid port: {e}"));
-    }
-    // IPv6: ws://[::1]:PORT/
-    if let Some(pos) = url.find("[::1]:") {
-        let start = pos + "[::1]:".len();
-        let end = url[start..].find('/').unwrap_or(url.len() - start);
-        return url[start..start + end].parse::<u16>()
-            .map_err(|e| anyhow!("invalid port: {e}"));
-    }
-    Err(anyhow!("cannot parse port from ws URL: {url}"))
+    let after_host = ["127.0.0.1:", "localhost:", "[::1]:"]
+        .iter()
+        .find_map(|host| url.find(host).map(|i| i + host.len()))
+        .ok_or_else(|| anyhow!("cannot parse port from ws URL: {url}"))?;
+    let end = url[after_host..]
+        .find('/')
+        .unwrap_or(url.len() - after_host);
+    let port_str = &url[after_host..after_host + end];
+    port_str
+        .parse::<u16>()
+        .map_err(|e| anyhow!("invalid port in ws URL: {e}"))
 }
 
-/// Fetch the DevTools WebSocket URL via HTTP after Chrome starts.
+/// Try to connect to an already-running Chrome with remote debugging.
 async fn fetch_ws_url_via_http(port: u16, timeout_secs: u64) -> Result<String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -523,24 +520,6 @@ impl Drop for ChromeProcess {
         ACTIVE_INSTANCES.fetch_sub(1, Ordering::Relaxed);
         debug!("Chrome instance dropped, active={}", ACTIVE_INSTANCES.load(Ordering::Relaxed));
     }
-}
-
-/// Parse the port number from a Chrome DevTools WebSocket URL.
-/// Accepts either `ws://127.0.0.1:PORT/devtools/...` or
-/// `ws://localhost:PORT/devtools/...` — chrome uses `localhost` when
-/// reusing an already-running browser via /json/version.
-fn parse_port_from_ws_url(url: &str) -> Result<u16> {
-    let after_host = ["127.0.0.1:", "localhost:"]
-        .iter()
-        .find_map(|host| url.find(host).map(|i| i + host.len()))
-        .ok_or_else(|| anyhow!("cannot parse port from ws URL: {url}"))?;
-    let end = url[after_host..]
-        .find('/')
-        .unwrap_or(url.len() - after_host);
-    let port_str = &url[after_host..after_host + end];
-    port_str
-        .parse::<u16>()
-        .map_err(|e| anyhow!("invalid port in ws URL: {e}"))
 }
 
 /// Try to connect to an already-running Chrome with remote debugging.

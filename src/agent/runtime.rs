@@ -3118,7 +3118,7 @@ impl AgentRuntime {
         let mut last_tool_key = String::new();
         let mut same_call_streak: usize = 0;
         const MAX_SAME_CALL_STREAK: usize = 5;
-        // Track consecutive tool errors — stop early when tools keep failing.
+// Track consecutive tool errors — stop early when tools keep failing.
         let mut error_streak: usize = 0;
         const MAX_ERROR_STREAK: usize = 2;
         // Store last error info so we can surface it when the loop breaks.

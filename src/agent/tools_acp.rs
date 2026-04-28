@@ -134,7 +134,7 @@ impl AgentRuntime {
             .map(expand_tilde)
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
         // Convert to Windows native path string (avoid MSYS2/Git Bash Unix-style paths)
-// Don't use canonicalize() — it returns \\?\ prefix which breaks JSON serialization
+        // Don't use canonicalize() — it returns \\?\ prefix which breaks JSON serialization
         let cwd_str = if cfg!(target_os = "windows") {
             // Convert to absolute path and normalize separators
             let abs_path = if cwd.is_absolute() {
@@ -696,7 +696,7 @@ impl AgentRuntime {
             .map(expand_tilde)
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
         // Convert to Windows native path string (avoid MSYS2/Git Bash Unix-style paths)
-// Don't use canonicalize() — it returns \\?\ prefix which breaks JSON serialization
+        // Don't use canonicalize() — it returns \\?\ prefix which breaks JSON serialization
         let cwd_str = if cfg!(target_os = "windows") {
             // Convert to absolute path and normalize separators
             let abs_path = if cwd.is_absolute() {
@@ -710,6 +710,7 @@ impl AgentRuntime {
         };
 
         tracing::info!(cwd = %cwd_str, args = ?args, "Claude Code: using workspace directory");
+
         // Get init timeout from config (default 600s)
         let init_timeout_secs = self
             .handle
