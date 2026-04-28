@@ -150,8 +150,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     };
 
     // Auto-download BGE model in background (don't block startup). On success,
-    // hot-swap the live MemoryStore embedder so semantic search lights up
-    // without requiring a gateway restart.
+    // run a two-index migration so the existing FNV docs are re-embedded with
+    // BGE off-lock — the gateway keeps serving reads + writes throughout.
     if needs_download {
         let cfg_lang = config
             .raw
@@ -164,24 +164,16 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         let bge_memory = memory.clone();
         tokio::spawn(async move {
             info!("BGE embedding model not found, downloading in background...");
-            match download_bge_model(&dl_dir, search_cfg_clone.as_ref(), cfg_lang.as_deref()).await {
-                Ok(()) => {
-                    let Some(mem_arc) = bge_memory.as_ref() else {
-                        info!("BGE model downloaded; no live memory store to hot-swap");
-                        return;
-                    };
-                    let mut mem = mem_arc.lock().await;
-                    match mem.try_load_local_model(&dl_dir).await {
-                        Ok(reindexed) => info!(
-                            reindexed,
-                            "BGE model downloaded and hot-swapped; semantic search ready"
-                        ),
-                        Err(e) => warn!(
-                            "BGE downloaded but hot-swap failed ({e:#}); will take effect after next restart"
-                        ),
-                    }
-                }
-                Err(e) => warn!("BGE model auto-download failed: {e:#}"),
+            if let Err(e) = download_bge_model(&dl_dir, search_cfg_clone.as_ref(), cfg_lang.as_deref()).await {
+                warn!("BGE model auto-download failed: {e:#}");
+                return;
+            }
+            let Some(mem_arc) = bge_memory.as_ref() else {
+                info!("BGE model downloaded; no live memory store to hot-swap");
+                return;
+            };
+            if let Err(e) = run_embedder_migration(mem_arc, &dl_dir).await {
+                warn!("BGE hot-swap migration failed ({e:#}); will take effect after next restart");
             }
         });
     }
@@ -1124,6 +1116,75 @@ pub(crate) async fn handle_pending_analysis(
 // ---------------------------------------------------------------------------
 // BGE model auto-download
 // ---------------------------------------------------------------------------
+
+/// Drive a hot-swap embedder migration end-to-end. Loads the new embedder,
+/// kicks off the secondary index, and walks all docs in batches — embedding
+/// happens off-lock so search and add() never stall during the rebuild. On
+/// any failure the in-progress swap is aborted so primary keeps serving.
+async fn run_embedder_migration(
+    mem_arc: &std::sync::Arc<tokio::sync::Mutex<crate::agent::MemoryStore>>,
+    model_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    use crate::agent::memory::{EmbedderBackend, LocalBgeEmbedder};
+
+    /// Number of docs embedded per batch between lock acquisitions. Keeps
+    /// each lock window short while amortising the lock-take overhead.
+    const BATCH: usize = 50;
+
+    // Load the new embedder OFF-LOCK — mmap + tokenizer init can take tens
+    // of ms and there's no reason to make readers wait for it.
+    let bge = LocalBgeEmbedder::load(model_dir)
+        .map_err(|e| anyhow::anyhow!("load BGE from {}: {e:#}", model_dir.display()))?;
+    let new_embedder: std::sync::Arc<dyn crate::agent::memory::Embedder> =
+        std::sync::Arc::new(EmbedderBackend::Local(bge));
+
+    {
+        let mut mem = mem_arc.lock().await;
+        mem.begin_swap(std::sync::Arc::clone(&new_embedder))?;
+    }
+
+    let mut total = 0usize;
+    loop {
+        // Snapshot under lock — fast.
+        let pending = {
+            let mem = mem_arc.lock().await;
+            mem.swap_pending(BATCH)
+        };
+        if pending.is_empty() {
+            break;
+        }
+        // Heavy work off-lock.
+        let batch: Vec<(usize, Vec<f32>)> = pending
+            .into_iter()
+            .map(|(idx, text)| (idx, new_embedder.embed(&text)))
+            .collect();
+        let applied = {
+            let mut mem = mem_arc.lock().await;
+            match mem.swap_apply_batch(batch) {
+                Ok(n) => n,
+                Err(e) => {
+                    mem.abort_swap();
+                    return Err(e);
+                }
+            }
+        };
+        if applied == 0 {
+            // Nothing applied (all dim-mismatched or store closed) — bail
+            // out rather than spin.
+            let mut mem = mem_arc.lock().await;
+            mem.abort_swap();
+            anyhow::bail!("embedder migration: batch applied 0 docs, aborting");
+        }
+        total += applied;
+    }
+
+    let migrated = {
+        let mut mem = mem_arc.lock().await;
+        mem.commit_swap()?
+    };
+    info!(total, migrated, "BGE hot-swap migration complete; semantic search ready");
+    Ok(())
+}
 
 /// Download BGE-Small embedding model files from HuggingFace.
 /// Downloads BGE model from gitfast.org (ZIP archive).
