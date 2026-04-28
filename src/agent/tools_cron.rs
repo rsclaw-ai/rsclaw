@@ -187,6 +187,22 @@ impl super::runtime::AgentRuntime {
                     job["name"] = json!(n);
                 }
 
+                // Round-robin iter — scheduler picks `items[cursor]` per fire,
+                // substitutes `{current}`/`{next}`/`{index}`/`{total}` in the
+                // message, and advances+persists the cursor before dispatch.
+                if let Some(arr) = args["iter"].as_array() {
+                    let items: Vec<String> = arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect();
+                    if items.is_empty() {
+                        return Err(anyhow!(
+                            "cron add: `iter` must contain at least one string item"
+                        ));
+                    }
+                    job["iter"] = json!({"items": items, "cursor": 0});
+                }
+
                 // Auto-set delivery to the originating channel+peer when not explicitly specified.
                 // Special case: WS chat transport uses ctx.channel="ws", but the delivery
                 // sink registered in ChannelManager is "desktop" (DesktopChannel broadcasts

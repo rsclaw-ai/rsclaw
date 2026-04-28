@@ -221,6 +221,20 @@ impl CronPayload {
     }
 }
 
+/// Round-robin cursor for jobs that should iterate over a fixed list each
+/// firing (e.g. "查询东京、曼谷、迪拜的天气，每次一个城市"). The cursor is
+/// advanced and persisted on every dispatch — so a crash mid-run doesn't
+/// repeat the previous item, and the LLM never has to remember progress.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CronIter {
+    /// Items to cycle through.
+    pub items: Vec<String>,
+    /// 0-based index of the item to use on the NEXT firing. Wraps modulo `items.len()`.
+    #[serde(default)]
+    pub cursor: usize,
+}
+
 /// Persistent run state (OpenClaw compat).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -270,6 +284,8 @@ pub struct CronJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<CronJobState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iter: Option<CronIter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at_ms: Option<u64>,
@@ -289,6 +305,50 @@ impl CronJob {
 
     pub fn timezone(&self) -> Option<&str> {
         self.schedule.tz()
+    }
+
+    /// Render the message for THIS firing — substitutes `{current}`, `{next}`,
+    /// `{index}` (1-based), and `{total}` from the iter state. Returns the raw
+    /// message unchanged when no iter is configured or it's empty.
+    pub fn render_message(&self) -> String {
+        let raw = self.effective_message();
+        let Some(iter) = self.iter.as_ref() else {
+            return raw.to_owned();
+        };
+        if iter.items.is_empty() {
+            return raw.to_owned();
+        }
+        let n = iter.items.len();
+        let cur = iter.cursor % n;
+        let nxt = (cur + 1) % n;
+        raw.replace("{current}", &iter.items[cur])
+            .replace("{next}", &iter.items[nxt])
+            .replace("{index}", &(cur + 1).to_string())
+            .replace("{total}", &n.to_string())
+    }
+
+    /// Advance the iter cursor by one (wrap-around). Returns the new cursor
+    /// when an iter is configured, None otherwise. Caller persists the store.
+    pub fn advance_iter(&mut self) -> Option<usize> {
+        let iter = self.iter.as_mut()?;
+        if iter.items.is_empty() {
+            return None;
+        }
+        iter.cursor = (iter.cursor + 1) % iter.items.len();
+        Some(iter.cursor)
+    }
+
+    /// Overwrite the message text for this firing — used after `render_message`
+    /// to bake the resolved iter substitution into the dispatched job clone.
+    pub fn bake_message(&mut self, text: String) {
+        if let Some(payload) = self.payload.as_mut() {
+            match payload {
+                CronPayload::Text(s) => *s = text,
+                CronPayload::Structured { text: t, .. } => *t = Some(text),
+            }
+        } else {
+            self.message = Some(text);
+        }
     }
 }
 
@@ -322,6 +382,7 @@ impl From<&CronJobConfig> for CronJob {
             session_target: None,
             wake_mode: None,
             state: None,
+            iter: None,
             created_at_ms: None,
             updated_at_ms: None,
         }
@@ -851,23 +912,41 @@ impl CronRunner {
                     }
                 }
 
-                let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) else {
-                    continue;
+                // Mark as running, render iter substitutions, and clone the job
+                // for dispatch — all under a tight mutable borrow of `jobs`.
+                let started_at = current_timestamp_ms();
+                let (rendered_text, mut job) = {
+                    let Some(job_ref) = jobs.iter_mut().find(|j| j.id == job_id) else {
+                        continue;
+                    };
+                    if let Some(state) = job_ref.state.as_mut() {
+                        state.running_at_ms = Some(started_at);
+                        // Don't compute next_run_at_ms here; compute it AFTER the job finishes
+                        // using the completion time, so interval-based jobs don't fire early
+                    }
+                    let rendered = if job_ref.iter.is_some() {
+                        let r = job_ref.render_message();
+                        let _ = job_ref.advance_iter();
+                        Some(r)
+                    } else {
+                        None
+                    };
+                    (rendered, job_ref.clone())
                 };
 
-                // Mark as running
-                let started_at = current_timestamp_ms();
-                if let Some(state) = job.state.as_mut() {
-                    state.running_at_ms = Some(started_at);
-                    // Don't compute next_run_at_ms here; compute it AFTER the job finishes
-                    // using the completion time, so interval-based jobs don't fire early
+                // Iter cycling: persist the advanced cursor BEFORE dispatch so a
+                // crash/restart can never replay the same item.
+                if let Some(text) = rendered_text {
+                    if let Err(e) = self.save_store(&jobs).await {
+                        warn!(error = %e, job_id, "cron: failed to persist iter cursor; the next run may repeat the same item");
+                    }
+                    job.bake_message(text);
                 }
 
                 let permit = permit.expect("permit checked above");
                 let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 cancel_flags.insert(job.id.clone(), Arc::clone(&cancelled));
                 let job_id_for_log = job.id.clone();  // Clone BEFORE async move
-                let job = job.clone();
                 let agents = Arc::clone(&self.agents);
                 let channels = Arc::clone(&self.channels);
                 let run_log_dir = self.run_log_dir.clone();
@@ -2075,6 +2154,7 @@ mod cron_config_equal_tests {
             session_target: None,
             wake_mode: None,
             state: None,
+            iter: None,
             created_at_ms: Some(1_000),
             updated_at_ms: Some(1_000),
         }
@@ -2141,6 +2221,94 @@ mod cron_config_equal_tests {
         let mut b = job("j1", "*/5 * * * *", "ping");
         b.enabled = false;
         assert!(!cron_jobs_config_equal(&a, &b));
+    }
+}
+
+#[cfg(test)]
+mod cron_iter_tests {
+    use super::*;
+
+    fn bare_job(msg: &str) -> CronJob {
+        CronJob {
+            id: "rot".into(),
+            name: None,
+            agent_id: "default".into(),
+            session_key: None,
+            enabled: true,
+            schedule: CronSchedule::Flat("* * * * *".into()),
+            payload: None,
+            message: Some(msg.into()),
+            delivery: None,
+            session_target: None,
+            wake_mode: None,
+            state: None,
+            iter: None,
+            created_at_ms: None,
+            updated_at_ms: None,
+        }
+    }
+
+    fn iter_job(items: &[&str], cursor: usize, msg: &str) -> CronJob {
+        let mut j = bare_job(msg);
+        j.iter = Some(CronIter {
+            items: items.iter().map(|s| s.to_string()).collect(),
+            cursor,
+        });
+        j
+    }
+
+    #[test]
+    fn render_substitutes_current_and_next() {
+        let j = iter_job(&["东京", "曼谷", "迪拜"], 0, "查询{current}天气，下一次：{next}");
+        assert_eq!(j.render_message(), "查询东京天气，下一次：曼谷");
+    }
+
+    #[test]
+    fn render_index_and_total_one_based() {
+        let j = iter_job(&["a", "b", "c"], 1, "{index}/{total}: {current}");
+        assert_eq!(j.render_message(), "2/3: b");
+    }
+
+    #[test]
+    fn next_wraps_around_at_end() {
+        let j = iter_job(&["a", "b", "c"], 2, "{current}->{next}");
+        assert_eq!(j.render_message(), "c->a");
+    }
+
+    #[test]
+    fn advance_wraps_and_reports_new_cursor() {
+        let mut j = iter_job(&["x", "y"], 1, "{current}");
+        assert_eq!(j.advance_iter(), Some(0));
+        assert_eq!(j.iter.as_ref().unwrap().cursor, 0);
+    }
+
+    #[test]
+    fn render_without_iter_returns_raw() {
+        let mut j = bare_job("hello {current}");
+        assert!(j.iter.is_none());
+        assert_eq!(j.render_message(), "hello {current}");
+        assert_eq!(j.advance_iter(), None);
+    }
+
+    #[test]
+    fn empty_items_falls_back_to_raw() {
+        let j = iter_job(&[], 0, "x={current}");
+        assert_eq!(j.render_message(), "x={current}");
+    }
+
+    #[test]
+    fn bake_overwrites_payload_then_message() {
+        let mut j = iter_job(&["a", "b"], 0, "ignored");
+        j.payload = Some(CronPayload::Structured {
+            kind: Some("agentTurn".into()),
+            text: Some("查询{current}".into()),
+            timeout_seconds: None,
+            summarize: None,
+        });
+        let rendered = j.render_message();
+        assert_eq!(rendered, "查询a");
+        j.bake_message(rendered);
+        assert_eq!(j.effective_message(), "查询a");
     }
 }
 

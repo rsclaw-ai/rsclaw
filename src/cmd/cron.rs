@@ -116,6 +116,7 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
                 session_target: None,
                 wake_mode: None,
                 state: Some(crate::cron::CronJobState::default()),
+                iter: None,
                 created_at_ms: Some(chrono::Utc::now().timestamp_millis() as u64),
                 updated_at_ms: None,
             };

@@ -693,7 +693,29 @@ pub(crate) fn build_tool_list(
               \"0 9 1 * *\"      9:00 AM on the 1st of each month\n\
             Pitfall: '0 17 * * *' is FIVE fields. Writing '017 * * *' (no space after 0) is\n\
             only FOUR fields and will be rejected. Always check your expression has exactly\n\
-            5 whitespace-separated tokens.".to_owned(),
+            5 whitespace-separated tokens.\n\
+            \n\
+            ITER (round-robin) — set when the user wants to rotate through a list,\n\
+            ONE item per firing (e.g. \"按顺序轮流查询东京、曼谷、迪拜的天气\").\n\
+            Pass `iter` as a JSON array of items, and use `{current}` (and optionally\n\
+            `{next}`, `{index}`, `{total}`) as placeholders inside `message`. The\n\
+            scheduler advances the cursor every fire and persists it — the agent\n\
+            never has to remember progress, and a restart can never repeat or skip.\n\
+            Example: message=\"查询{current}的当前天气\", iter=[\"东京\",\"曼谷\",\"迪拜\"].\n\
+            Without iter the LLM must track its own progress in memory, which is\n\
+            unreliable across restarts and embedding-model swaps — prefer iter when rotation is intended.\n\
+            \n\
+            ROTATE vs BATCH — disambiguate before reaching for iter:\n\
+              ROTATE (use iter): the user wants ONE item per fire, cycling. Trigger\n\
+                phrases: \"轮流\" / \"按顺序\" / \"依次\" / \"each time\" / \"one at a time\" /\n\
+                \"rotate\" / \"cycle through\" / \"每次只查一个\".\n\
+              BATCH (do NOT use iter): the user wants ALL items reported together each\n\
+                fire. Phrases: \"每 N 分钟报一次 A、B、C 的价格\" / \"every N min give me\n\
+                the prices of A, B, C\" / lists with no rotation signal. Build a single\n\
+                cron whose message names every item — the agent fans out tool calls in\n\
+                one turn and replies with the combined result.\n\
+              When in doubt, BATCH is the safer default: a single late report is much\n\
+              less surprising than silently dropping items every cycle.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -707,7 +729,8 @@ pub(crate) fn build_tool_list(
                 "id":            {"type": "string", "description": "Job ID (for edit/remove/enable/disable - use index instead if possible)"},
                 "name":          {"type": "string", "description": "Job name (for add, edit)"},
                 "tz":            {"type": "string", "description": "Timezone IANA name. Auto-detected if omitted. Only set if user explicitly requests a different timezone."},
-                "agentId":       {"type": "string", "description": "Agent ID to run the job (for add, edit, default: main)"}
+                "agentId":       {"type": "string", "description": "Agent ID to run the job (for add, edit, default: main)"},
+                "iter":          {"type": "array", "items": {"type": "string"}, "description": "Round-robin items the scheduler cycles through, one per firing. Use `{current}` (and optionally `{next}`, `{index}`, `{total}`) as placeholders in `message`. Set this whenever the user asks for rotating tasks (e.g. 'cycle through cities'); leaves the agent free of progress-tracking duties."}
             },
             "required": ["action"]
         }),
