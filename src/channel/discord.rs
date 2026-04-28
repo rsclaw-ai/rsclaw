@@ -30,6 +30,7 @@ const DISCORD_EDIT_DELAY: std::time::Duration = std::time::Duration::from_millis
 
 use super::{Channel, OutboundMessage};
 use crate::channel::{
+    attachments::{mime_to_ext, parse_data_url, pick_file_mime},
     chunker::{BreakPreference, ChunkConfig, chunk_text, platform_chunk_limit},
     telegram::RetryConfig,
 };
@@ -80,6 +81,11 @@ pub struct DiscordChannel {
     api_base: String,
     /// Gateway WebSocket URL override. When set, skip the /gateway/bot fetch.
     gateway_url: Option<String>,
+    /// Bot's own user ID, captured from the READY event. Used to strip
+    /// the `<@bot_id>` mention prefix that Discord prepends in guild
+    /// messages — without stripping, slash commands like `/ss` arrive as
+    /// `<@123> /ss` and bypass the fast-preparse path.
+    bot_user_id: Arc<std::sync::RwLock<Option<String>>>,
 }
 
 impl DiscordChannel {
@@ -101,6 +107,7 @@ impl DiscordChannel {
             on_message,
             api_base: api_base.unwrap_or_else(|| DISCORD_API_BASE.to_owned()),
             gateway_url,
+            bot_user_id: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -406,6 +413,12 @@ impl DiscordChannel {
                     match event_type {
                         "READY" => {
                             let user = &payload["d"]["user"]["username"];
+                            let uid = payload["d"]["user"]["id"].as_str().unwrap_or("");
+                            if !uid.is_empty() {
+                                if let Ok(mut g) = self.bot_user_id.write() {
+                                    *g = Some(uid.to_owned());
+                                }
+                            }
                             info!("Discord: READY as {user}");
                         }
                         "MESSAGE_CREATE" => {
@@ -464,6 +477,13 @@ impl DiscordChannel {
                                         content.push_str(&format!("[attachment download failed: {filename}]"));
                                     }
                                 }
+                            }
+
+                            // Strip a leading bot mention so commands like
+                            // `<@bot_id> /ss` reach is_fast_preparse intact.
+                            let bot_id = self.bot_user_id.read().ok().and_then(|g| g.clone());
+                            if let Some(bid) = bot_id.as_deref() {
+                                content = strip_bot_mention(&content, bid);
                             }
 
                             if content.is_empty() { continue; }
@@ -730,74 +750,21 @@ fn discord_process_file(filename: &str, bytes: &[u8]) -> String {
     }
 }
 
-/// Parse a `data:image/<subtype>[;params];base64,<payload>` URL.
+/// Strip a leading `<@bot_id>` or `<@!bot_id>` mention (with surrounding
+/// whitespace) from a Discord message body.
 ///
-/// Returns `(mime, base64_payload)` slices borrowed from the input on success.
-/// Anything not matching the data-URL shape (missing `data:` scheme, missing
-/// `;base64,` marker, or non-image MIME) returns `None` so the caller can
-/// decide on a fallback.
-fn parse_data_url(s: &str) -> Option<(&str, &str)> {
-    let rest = s.strip_prefix("data:")?;
-    let comma = rest.find(',')?;
-    let header = &rest[..comma];
-    let payload = &rest[comma + 1..];
-    // Header form: "<mime>[;params];base64". Require base64 marker.
-    let header = header.strip_suffix(";base64")?;
-    // The MIME is the first segment before any optional `;param=value`.
-    let mime = header.split(';').next().unwrap_or(header);
-    if !mime.starts_with("image/") {
-        return None;
+/// Without this, guild messages like `<@123> /ss` arrive at
+/// `is_fast_preparse` with the mention prefix, so the slash command
+/// detector returns false and the message is routed through the LLM
+/// instead of the local fast path.
+pub(crate) fn strip_bot_mention(content: &str, bot_id: &str) -> String {
+    let trimmed = content.trim_start();
+    for prefix in [format!("<@{bot_id}>"), format!("<@!{bot_id}>")] {
+        if let Some(rest) = trimmed.strip_prefix(&prefix) {
+            return rest.trim_start().to_owned();
+        }
     }
-    Some((mime, payload))
-}
-
-/// Pick the MIME to send for a file attachment.
-///
-/// Prefer the MIME the tool layer attached. When it's empty (e.g. a tool
-/// produced a path without metadata), guess from the filename extension —
-/// Discord uses Content-Type to decide whether to inline-preview videos,
-/// audio, and PDFs, so a generic `application/octet-stream` would hide
-/// those previews. Falls back to `application/octet-stream` when the
-/// extension is unknown so callers still see *something* attached.
-fn pick_file_mime<'a>(mime: &'a str, filename: &'a str) -> &'a str {
-    if !mime.is_empty() {
-        return mime;
-    }
-    let ext = std::path::Path::new(filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-    match ext.as_str() {
-        "mp4" => "video/mp4",
-        "mov" => "video/quicktime",
-        "webm" => "video/webm",
-        "mkv" => "video/x-matroska",
-        "mp3" => "audio/mpeg",
-        "ogg" | "oga" => "audio/ogg",
-        "wav" => "audio/wav",
-        "m4a" => "audio/mp4",
-        "flac" => "audio/flac",
-        "pdf" => "application/pdf",
-        "txt" | "log" | "md" => "text/plain",
-        "json" => "application/json",
-        "zip" => "application/zip",
-        _ => "application/octet-stream",
-    }
-}
-
-/// Map an `image/*` MIME type to a sensible filename extension. Discord
-/// renders inline previews based on extension as well as Content-Type, so
-/// matching the two avoids the "downloadable but not previewed" failure mode.
-fn mime_to_ext(mime: &str) -> &'static str {
-    match mime {
-        "image/jpeg" => "jpg",
-        "image/webp" => "webp",
-        "image/gif" => "gif",
-        "image/bmp" => "bmp",
-        "image/svg+xml" => "svg",
-        _ => "png",
-    }
+    content.to_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -827,68 +794,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_data_url_png() {
-        let (mime, b64) = parse_data_url("data:image/png;base64,iVBORw0KGgo=").unwrap();
-        assert_eq!(mime, "image/png");
-        assert_eq!(b64, "iVBORw0KGgo=");
+    fn strip_mention_removes_simple_prefix() {
+        assert_eq!(strip_bot_mention("<@123> /ss", "123"), "/ss");
     }
 
     #[test]
-    fn parse_data_url_webp() {
-        let (mime, b64) = parse_data_url("data:image/webp;base64,UklGRg==").unwrap();
-        assert_eq!(mime, "image/webp");
-        assert_eq!(b64, "UklGRg==");
+    fn strip_mention_removes_nickname_form() {
+        // Discord's legacy `<@!id>` form (used when the bot has a server nick).
+        assert_eq!(strip_bot_mention("<@!123> /screenshot", "123"), "/screenshot");
     }
 
     #[test]
-    fn parse_data_url_strips_extra_params() {
-        // RFC 2397 allows `;charset=...;base64`. Should still extract MIME.
-        let (mime, b64) = parse_data_url("data:image/jpeg;charset=utf-8;base64,/9j/=").unwrap();
-        assert_eq!(mime, "image/jpeg");
-        assert_eq!(b64, "/9j/=");
+    fn strip_mention_handles_leading_whitespace() {
+        assert_eq!(strip_bot_mention("   <@123>  hello", "123"), "hello");
     }
 
     #[test]
-    fn parse_data_url_rejects_non_image() {
-        assert!(parse_data_url("data:text/plain;base64,SGk=").is_none());
+    fn strip_mention_leaves_other_users_alone() {
+        // Mention of a different user — must not be stripped.
+        let s = "<@999> hi";
+        assert_eq!(strip_bot_mention(s, "123"), s);
     }
 
     #[test]
-    fn parse_data_url_rejects_non_base64() {
-        // URL-encoded payload (no ;base64) — not the multipart-upload path.
-        assert!(parse_data_url("data:image/png,raw").is_none());
-    }
-
-    #[test]
-    fn parse_data_url_rejects_http() {
-        assert!(parse_data_url("https://example.com/x.png").is_none());
-    }
-
-    #[test]
-    fn mime_to_ext_known_types() {
-        assert_eq!(mime_to_ext("image/jpeg"), "jpg");
-        assert_eq!(mime_to_ext("image/webp"), "webp");
-        assert_eq!(mime_to_ext("image/png"), "png");
-        // Fallback for unknown MIME — png matches the default mime_str the
-        // upload uses when fallback was hit.
-        assert_eq!(mime_to_ext("image/heic"), "png");
-    }
-
-    #[test]
-    fn pick_file_mime_prefers_explicit() {
-        assert_eq!(pick_file_mime("video/mp4", "weird.bin"), "video/mp4");
-    }
-
-    #[test]
-    fn pick_file_mime_guesses_from_extension_when_empty() {
-        assert_eq!(pick_file_mime("", "clip.mp4"), "video/mp4");
-        assert_eq!(pick_file_mime("", "song.MP3"), "audio/mpeg");
-        assert_eq!(pick_file_mime("", "doc.pdf"), "application/pdf");
-    }
-
-    #[test]
-    fn pick_file_mime_falls_back_when_unknown_extension() {
-        assert_eq!(pick_file_mime("", "blob.xyz"), "application/octet-stream");
-        assert_eq!(pick_file_mime("", "noext"), "application/octet-stream");
+    fn strip_mention_noop_when_no_mention() {
+        assert_eq!(strip_bot_mention("/ss", "123"), "/ss");
     }
 }

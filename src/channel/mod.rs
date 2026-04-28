@@ -24,6 +24,7 @@
 //!   - `matrix`   — Matrix Client-Server API (long-poll sync)
 //!   - `cli`      — CLI interactive channel
 
+pub mod attachments;
 pub mod auth;
 pub mod chunker;
 pub mod cli;
