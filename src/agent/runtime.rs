@@ -4446,16 +4446,85 @@ impl AgentRuntime {
                             }
                         } else if has_error {
                             // Inject error recovery hint into tool result
+                            // Detect specific error types and provide targeted guidance
+                            let stderr_text = v.get("stderr").and_then(|s| s.as_str()).unwrap_or("");
+                            let stdout_text = v.get("stdout").and_then(|s| s.as_str()).unwrap_or("");
+                            let command_text = v.get("command").and_then(|s| s.as_str()).unwrap_or("");
+
+                            // Detect Python syntax errors
+                            let is_python_syntax_error = stderr_text.contains("SyntaxError")
+                                || stderr_text.contains("IndentationError")
+                                || stderr_text.contains("TabError")
+                                || stderr_text.contains("NameError")
+                                || stderr_text.contains("ImportError")
+                                || stderr_text.contains("ModuleNotFoundError")
+                                || stderr_text.contains("TypeError")
+                                || stderr_text.contains("ValueError")
+                                || stderr_text.contains("AttributeError")
+                                || stderr_text.contains("KeyError")
+                                || stderr_text.contains("IndexError")
+                                || stderr_text.contains("ZeroDivisionError");
+
+                            // Detect shell/command errors
+                            let is_shell_error = stderr_text.contains("command not found")
+                                || stderr_text.contains("No such file or directory")
+                                || stderr_text.contains("Permission denied")
+                                || stderr_text.contains("syntax error")
+                                || stderr_text.contains("unexpected token")
+                                || stderr_text.contains("invalid syntax");
+
                             let remaining = MAX_ERROR_STREAK.saturating_sub(error_streak);
-                            let hint = if remaining > 0 {
+
+                            let hint = if remaining == 0 {
+                                "[警告] 工具执行连续失败，本轮对话将结束。请总结你尝试的方法和遇到的错误。".to_owned()
+                            } else if is_python_syntax_error {
+                                // Python error - specific guidance
+                                let error_type = if stderr_text.contains("SyntaxError") { "语法错误" }
+                                else if stderr_text.contains("IndentationError") || stderr_text.contains("TabError") { "缩进错误" }
+                                else if stderr_text.contains("NameError") { "变量名错误（未定义的变量）" }
+                                else if stderr_text.contains("ImportError") || stderr_text.contains("ModuleNotFoundError") { "导入错误（缺少模块）" }
+                                else if stderr_text.contains("TypeError") { "类型错误" }
+                                else if stderr_text.contains("ValueError") { "值错误" }
+                                else if stderr_text.contains("AttributeError") { "属性错误" }
+                                else { "运行时错误" };
+
+                                format!(
+                                    "[Python错误修复提示] 检测到{} (第{}/{})。\n\
+                                    stderr显示：{}\n\n\
+                                    【必须执行的修复步骤】\n\
+                                    1. 分析错误：仔细阅读stderr中的错误信息，找到出错的行号和原因\n\
+                                    2. 修改代码：必须调用 write_file 或直接修改命令来修复错误\n\
+                                    3. 再次执行：修复后必须再次调用 execute_command 运行修复后的代码\n\
+                                    \n\
+                                    不要声称「已修复」而不实际调用工具。你还有{}次机会。",
+                                    error_type, error_streak, MAX_ERROR_STREAK,
+                                    stderr_text.lines().take(5).collect::<Vec<_>>().join("\n"),
+                                    remaining
+                                )
+                            } else if is_shell_error {
+                                // Shell error - specific guidance
+                                format!(
+                                    "[命令执行错误提示] 命令执行失败 (第{}/{})。\n\
+                                    stderr显示：{}\n\n\
+                                    【常见原因和修复方法】\n\
+                                    - \"command not found\": 命令不存在，检查拼写或安装对应工具\n\
+                                    - \"No such file\": 文件不存在，检查路径是否正确\n\
+                                    - \"Permission denied\": 权限不足，检查文件权限\n\
+                                    \n\
+                                    请修正命令后再次执行。你还有{}次机会。",
+                                    error_streak, MAX_ERROR_STREAK,
+                                    stderr_text.lines().take(3).collect::<Vec<_>>().join("\n"),
+                                    remaining
+                                )
+                            } else {
+                                // Generic error
                                 format!(
                                     "[提示] 工具执行失败 (第 {}/{}) 次。请检查错误信息并尝试修正。\
                                     你还有 {} 次机会。常见修正方法：检查路径是否正确、修正命令语法、或尝试其他方法。",
                                     error_streak, MAX_ERROR_STREAK, remaining
                                 )
-                            } else {
-                                "[警告] 工具执行连续失败，本轮对话将结束。请总结你尝试的方法和遇到的错误。".to_owned()
                             };
+
                             match &v {
                                 serde_json::Value::Object(obj) => {
                                     let mut modified = obj.clone();
