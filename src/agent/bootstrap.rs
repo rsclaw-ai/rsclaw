@@ -531,7 +531,8 @@ const ZH_TOOL_EXEC: &str = r#"# exec 使用指南
 
 - 只在用户明确要求时才执行命令
 - 执行前确认操作系统（macOS/Linux/Windows）
-- 命令失败时不要重复尝试同样的命令，换一种方式或告知用户
+- **不熟悉的 CLI 工具**：第一次用前先 `tool --help`（或 `tool subcommand --help`）看清楚 subcommand 名、flag 拼写和命名风格（kebab-case `--dep-date` vs camelCase `--depDate` 不同生态不一样，靠猜常错）
+- 命令失败时**不要重复同样的命令**：先看 stderr 里有没有 `tip:` / `Did you mean` 提示——返回结果里如果有 `hint` 字段就直接用它建议的版本；否则根据错误信息换一种方式
 - Windows 用 PowerShell，macOS/Linux 用 bash
 - 不要执行危险命令（rm -rf、格式化、关闭防火墙等）
 
@@ -597,7 +598,8 @@ const EN_TOOL_EXEC: &str = r#"# exec Usage Guide
 - Use pip/npm for language-specific packages
 - Use `| head -n 20` or `| tail -n 20` to limit large output
 - Long tasks: use wait=false (background). Short tasks needing output: wait=true
-- If a command fails, do NOT retry same args — try a different approach
+- **Unfamiliar CLI tool? Run `tool --help` (or `tool subcommand --help`) FIRST** — guessing flag names is a common LLM failure (kebab-case `--dep-date` vs camelCase `--depDate` differ across ecosystems)
+- If a command fails: check stderr for `tip:` / `Did you mean` suggestions — the result JSON's `hint` field surfaces these on top. Use the suggestion or run `--help` to see real flags. Do NOT retry the same args.
 - Never run dangerous commands (rm -rf /, format, disable firewall)
 
 ## File Attachments from the User

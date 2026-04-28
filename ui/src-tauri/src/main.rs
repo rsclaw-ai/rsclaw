@@ -1196,11 +1196,15 @@ fn main() {
             // Seed the bundled BGE embedding model into the standard rsclaw
             // models directory so the gateway start path finds it without
             // touching the network. Idempotent: skips when model.safetensors
-            // already exists at the target (CLI users with their own model
-            // are unaffected; subsequent app launches are a no-op).
-            if let Err(e) = seed_bundled_bge_model(app.handle()) {
-                eprintln!("[setup] BGE model seeding failed (gateway will fall back to download): {e:#}");
-            }
+            // already exists at the target. Runs on a blocking thread —
+            // copying the ~91MB safetensors blob would otherwise stall the
+            // splash window for several seconds on slow disks.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(e) = seed_bundled_bge_model(&handle) {
+                    eprintln!("[setup] BGE model seeding failed (gateway will fall back to download): {e:#}");
+                }
+            });
 
             // Build system tray
             let open = MenuItemBuilder::with_id("open", "Open RsClaw").build(app)?;

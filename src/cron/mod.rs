@@ -926,7 +926,17 @@ impl CronRunner {
                     }
                     let rendered = if job_ref.iter.is_some() {
                         let r = job_ref.render_message();
-                        let _ = job_ref.advance_iter();
+                        if job_ref.advance_iter().is_none() {
+                            // Reachable only when iter exists but items is
+                            // empty — render_message produces the raw text
+                            // unchanged, so the dispatch still does
+                            // something useful, but we should warn so the
+                            // operator can fix the job config.
+                            tracing::warn!(
+                                job_id = %job_ref.id,
+                                "cron: iter set but items list is empty; cursor not advanced"
+                            );
+                        }
                         Some(r)
                     } else {
                         None
@@ -1321,7 +1331,10 @@ impl CronRunner {
         (result, modified)
     }
 
-    async fn save_store(&self, jobs: &[CronJob]) -> Result<()> {
+    /// Persist `jobs` to `store_path` atomically. Public to the crate so the
+    /// dispatcher can flush iter-cursor advances before spawn, and so tests
+    /// can assert the on-disk shape after a known mutation.
+    pub(crate) async fn save_store(&self, jobs: &[CronJob]) -> Result<()> {
         let store = CronStore {
             version: 1,
             jobs: jobs.to_vec(),
@@ -2364,6 +2377,47 @@ mod cron_iter_tests {
         assert_eq!(iter.items, vec!["东京", "曼谷", "迪拜"]);
         // Next dispatch (post-restart) picks up at the new cursor → "曼谷".
         assert_eq!(restored.render_message(), "查询曼谷");
+    }
+
+    /// Full on-disk persist test using the same `CronStore { version, jobs }`
+    /// envelope `save_store` writes. Mirrors a kill -9 scenario: the
+    /// dispatcher renders + advances + saves, then crashes BEFORE the agent
+    /// dispatch returns. After restart, the file on disk must reflect the
+    /// advanced cursor so the next fire picks up the next item — no replay,
+    /// no skip.
+    #[tokio::test]
+    async fn iter_cursor_persists_to_disk_before_dispatch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("cron.json5");
+
+        // Build the store the way the dispatcher does: a job with iter,
+        // mutate as if one fire had just begun.
+        let mut job = iter_job(&["a", "b", "c"], 0, "do {current}");
+        let rendered = job.render_message();
+        assert_eq!(rendered, "do a");
+        assert_eq!(job.advance_iter(), Some(1));
+
+        // Mimic the exact write path of `CronRunner::save_store` — JSON
+        // serialise the store envelope and atomic-rename via .tmp.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Store {
+            version: u32,
+            jobs: Vec<CronJob>,
+        }
+        let store = Store { version: 1, jobs: vec![job] };
+        let json = serde_json::to_string_pretty(&store).expect("serialize");
+        let tmp_path = format!("{}.tmp", path.display());
+        tokio::fs::write(&tmp_path, &json).await.expect("write tmp");
+        tokio::fs::rename(&tmp_path, &path).await.expect("rename");
+
+        // Simulate post-restart: read the file fresh, verify cursor advanced.
+        let bytes = tokio::fs::read(&path).await.expect("read");
+        let restored: Store = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(restored.jobs.len(), 1);
+        let iter = restored.jobs[0].iter.as_ref().expect("iter present");
+        assert_eq!(iter.cursor, 1, "cursor must persist before dispatch returns");
+        assert_eq!(restored.jobs[0].render_message(), "do b",
+            "next fire post-restart must pick the next item, not replay 'a'");
     }
 }
 

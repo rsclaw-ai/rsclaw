@@ -3121,7 +3121,7 @@ impl AgentRuntime {
         const MAX_SAME_CALL_STREAK: usize = 5;
         // Track consecutive tool errors — stop early when tools keep failing.
         let mut error_streak: usize = 0;
-        const MAX_ERROR_STREAK: usize = 3;
+const MAX_ERROR_STREAK: usize = 5;
         // Store last error info so we can surface it when the loop breaks.
         let mut last_error_info: Option<String> = None;
         // Track consecutive iterations with empty text + tool calls (model not summarizing).
@@ -3237,6 +3237,21 @@ impl AgentRuntime {
                 } else {
                     crate::i18n::t("agent_tool_errors", crate::i18n::default_lang()).to_owned()
                 };
+                // Emit done=true so WS subscribers (desktop chat) see the
+                // terminal text and the terminator frame together. Without
+                // this, the UI hangs forever waiting for done — same fix
+                // pattern as the clear_signal / abort / max_iterations paths.
+                if let Some(ref bus) = self.event_bus {
+                    let _ = bus.send(AgentEvent {
+                        session_id: ctx.session_key.clone(),
+                        agent_id: ctx.agent_id.clone(),
+                        delta: error_text.clone(),
+                        done: true,
+                        files: tool_files.clone(),
+                        images: tool_images.clone(),
+                        tool_log: tool_log.clone(),
+                    });
+                }
                 return Ok(AgentReply {
                     text: error_text,
                     is_empty: false,
@@ -5417,9 +5432,11 @@ impl AgentRuntime {
         let Some(ref mem) = self.memory else {
             return Ok(json!({"error": "memory store not available"}));
         };
-        let mut store = mem.lock().await;
-        store
-            .add(MemoryDoc {
+        // Off-lock add: BERT inference happens between two brief lock
+        // windows so concurrent reads/writes don't stall on it.
+        crate::agent::memory::add_off_lock(
+            mem,
+            MemoryDoc {
                 id: id.clone(),
                 scope: scope.clone(),
                 kind: kind.clone(),
@@ -5434,9 +5451,9 @@ impl AgentRuntime {
                 overview_text: None,
                 tags: vec![],
                 pinned: false,
-            })
-            .await?;
-        drop(store);
+            },
+        )
+        .await?;
         // Also index in tantivy BM25 for hybrid search.
         if let Err(e) = self
             .store

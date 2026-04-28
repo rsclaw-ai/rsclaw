@@ -699,19 +699,38 @@ impl AgentRuntime {
             }
         }
 
-        // Build HTTP client with same-host-only redirect policy.
+        // Build HTTP client with method-aware, same-host-only redirect policy.
+        //
+        // GET: same-host follow (cross-host stops and surfaces the redirect).
+        // Non-GET on 307/308: follow (RFC-mandated method preservation, same-
+        //                     host check still applies — never POST cross-host).
+        // Non-GET on 301/302/303: stop. These status codes downgrade POST→GET
+        //                     in every standard client, which silently changes
+        //                     a write into a read and forwards Authorization
+        //                     headers to a different endpoint than the LLM
+        //                     intended. Returning the 30x to the caller lets
+        //                     the LLM decide whether to re-issue as POST/GET.
         let original_host = reqwest::Url::parse(&fetch_url)
             .ok()
             .and_then(|u| u.host_str().map(|h| h.to_owned()));
+        let policy_is_get = is_get;
         let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() > 10 {
                 return attempt.error(anyhow!("too many redirects"));
             }
-            // Allow same-host (ignoring www. prefix).
             let new_host = attempt.url().host_str().unwrap_or("");
             let strip_www = |h: &str| h.strip_prefix("www.").unwrap_or(h).to_owned();
             let orig = original_host.as_deref().map(strip_www).unwrap_or_default();
-            if strip_www(new_host) == orig {
+            let same_host = strip_www(new_host) == orig;
+            if !same_host {
+                return attempt.stop();
+            }
+            if policy_is_get {
+                return attempt.follow();
+            }
+            // Non-GET, same-host: only follow method-preserving redirects.
+            let status = attempt.status().as_u16();
+            if status == 307 || status == 308 {
                 attempt.follow()
             } else {
                 attempt.stop()
@@ -771,13 +790,28 @@ impl AgentRuntime {
             }
         };
 
-        // Cross-host redirect: report to agent, let it decide.
+        // Surface unfollowed redirects to the caller. Two cases reach here:
+        //   - GET cross-host redirect (policy stops cross-host).
+        //   - Non-GET 301/302/303 redirect (policy stops to avoid silent
+        //     POST→GET method downgrade and unintended header forwarding).
         if response.status().is_redirection() {
             if let Some(loc) = response.headers().get("location").and_then(|v| v.to_str().ok()) {
+                let status = response.status().as_u16();
+                let hint = if is_get {
+                    format!("Redirected to {loc}. Fetch that URL if appropriate.")
+                } else {
+                    format!(
+                        "HTTP {status} with Location: {loc}. Auto-follow was disabled because \
+                         this status downgrades the original {method_str} into a GET in standard \
+                         clients. Re-issue web_fetch yourself — pick GET if 303 (PRG result), \
+                         otherwise decide whether the new endpoint expects {method_str} too."
+                    )
+                };
                 return Ok(json!({
                     "url": url,
+                    "status": status,
                     "redirect": loc,
-                    "text": format!("Redirected to different host: {loc}. Fetch that URL if needed."),
+                    "text": hint,
                 }));
             }
         }
