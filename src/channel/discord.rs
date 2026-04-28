@@ -502,16 +502,50 @@ impl Channel for DiscordChannel {
                 }
             }
 
-            // Send image attachments via multipart file upload
+            // Send image attachments. Two modes:
+            //   - http(s):// URL → embed.image.url (no upload, Discord fetches)
+            //   - data:image/<mime>;base64,... → multipart upload with the
+            //     correct MIME and matching filename extension.
+            //
+            // Previously this path only recognised PNG/JPEG data URLs and fell
+            // back to feeding the entire `data:image/webp;base64,...` string
+            // (or http URL) into the base64 decoder, producing garbage bytes
+            // that Discord rendered as a blank attachment.
             if !msg.images.is_empty() {
                 info!(count = msg.images.len(), "discord: sending images");
             }
             for (idx, image_data) in msg.images.iter().enumerate() {
+                if image_data.starts_with("http://") || image_data.starts_with("https://") {
+                    let payload = serde_json::json!({
+                        "embeds": [{ "image": { "url": image_data } }],
+                    });
+                    let url = format!(
+                        "{}/channels/{}/messages",
+                        self.api_base, msg.target_id
+                    );
+                    match self
+                        .client
+                        .post(&url)
+                        .header("authorization", self.auth_header())
+                        .header("content-type", "application/json")
+                        .body(payload.to_string())
+                        .send()
+                        .await
+                    {
+                        Ok(resp) if !resp.status().is_success() => {
+                            let status = resp.status();
+                            let body = resp.text().await.unwrap_or_default();
+                            warn!(idx, %status, "discord: image embed failed: {body}");
+                        }
+                        Err(e) => warn!(idx, "discord: image embed request failed: {e}"),
+                        Ok(_) => {}
+                    }
+                    continue;
+                }
+
+                let (mime, b64) = parse_data_url(image_data)
+                    .unwrap_or(("image/png", image_data.as_str()));
                 use base64::Engine;
-                let b64 = image_data
-                    .strip_prefix("data:image/png;base64,")
-                    .or_else(|| image_data.strip_prefix("data:image/jpeg;base64,"))
-                    .unwrap_or(image_data);
                 let bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
                     Ok(b) => b,
                     Err(e) => {
@@ -519,9 +553,10 @@ impl Channel for DiscordChannel {
                         continue;
                     }
                 };
+                let ext = mime_to_ext(mime);
                 let part = match reqwest::multipart::Part::bytes(bytes)
-                    .file_name("image.png")
-                    .mime_str("image/png")
+                    .file_name(format!("image.{ext}"))
+                    .mime_str(mime)
                 {
                     Ok(p) => p,
                     Err(e) => {
@@ -557,8 +592,12 @@ impl Channel for DiscordChannel {
                 }
             }
 
-            // Send file attachments via multipart upload
-            for (idx, (filename, _mime, path)) in msg.files.iter().enumerate() {
+            // Send file attachments via multipart upload. Pass the MIME the
+            // tool layer attached so Discord can render inline previews for
+            // video/audio/PDF/etc.; previously this was hardcoded to
+            // application/octet-stream which made every file show up as a
+            // generic blob (videos in particular wouldn't play in-line).
+            for (idx, (filename, mime, path)) in msg.files.iter().enumerate() {
                 let bytes = match std::fs::read(path) {
                     Ok(b) => b,
                     Err(e) => {
@@ -566,9 +605,10 @@ impl Channel for DiscordChannel {
                         continue;
                     }
                 };
+                let mime_str = pick_file_mime(mime, filename);
                 let part = match reqwest::multipart::Part::bytes(bytes)
                     .file_name(filename.clone())
-                    .mime_str("application/octet-stream")
+                    .mime_str(mime_str)
                 {
                     Ok(p) => p,
                     Err(e) => {
@@ -690,6 +730,76 @@ fn discord_process_file(filename: &str, bytes: &[u8]) -> String {
     }
 }
 
+/// Parse a `data:image/<subtype>[;params];base64,<payload>` URL.
+///
+/// Returns `(mime, base64_payload)` slices borrowed from the input on success.
+/// Anything not matching the data-URL shape (missing `data:` scheme, missing
+/// `;base64,` marker, or non-image MIME) returns `None` so the caller can
+/// decide on a fallback.
+fn parse_data_url(s: &str) -> Option<(&str, &str)> {
+    let rest = s.strip_prefix("data:")?;
+    let comma = rest.find(',')?;
+    let header = &rest[..comma];
+    let payload = &rest[comma + 1..];
+    // Header form: "<mime>[;params];base64". Require base64 marker.
+    let header = header.strip_suffix(";base64")?;
+    // The MIME is the first segment before any optional `;param=value`.
+    let mime = header.split(';').next().unwrap_or(header);
+    if !mime.starts_with("image/") {
+        return None;
+    }
+    Some((mime, payload))
+}
+
+/// Pick the MIME to send for a file attachment.
+///
+/// Prefer the MIME the tool layer attached. When it's empty (e.g. a tool
+/// produced a path without metadata), guess from the filename extension —
+/// Discord uses Content-Type to decide whether to inline-preview videos,
+/// audio, and PDFs, so a generic `application/octet-stream` would hide
+/// those previews. Falls back to `application/octet-stream` when the
+/// extension is unknown so callers still see *something* attached.
+fn pick_file_mime<'a>(mime: &'a str, filename: &'a str) -> &'a str {
+    if !mime.is_empty() {
+        return mime;
+    }
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    match ext.as_str() {
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "mp3" => "audio/mpeg",
+        "ogg" | "oga" => "audio/ogg",
+        "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "flac" => "audio/flac",
+        "pdf" => "application/pdf",
+        "txt" | "log" | "md" => "text/plain",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Map an `image/*` MIME type to a sensible filename extension. Discord
+/// renders inline previews based on extension as well as Content-Type, so
+/// matching the two avoids the "downloadable but not previewed" failure mode.
+fn mime_to_ext(mime: &str) -> &'static str {
+    match mime {
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        "image/svg+xml" => "svg",
+        _ => "png",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -714,5 +824,71 @@ mod tests {
         init_crypto();
         let ch = DiscordChannel::new("my-token", false, Arc::new(|_, _, _, _| {}), None, None);
         assert_eq!(ch.auth_header(), "Bot my-token");
+    }
+
+    #[test]
+    fn parse_data_url_png() {
+        let (mime, b64) = parse_data_url("data:image/png;base64,iVBORw0KGgo=").unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(b64, "iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn parse_data_url_webp() {
+        let (mime, b64) = parse_data_url("data:image/webp;base64,UklGRg==").unwrap();
+        assert_eq!(mime, "image/webp");
+        assert_eq!(b64, "UklGRg==");
+    }
+
+    #[test]
+    fn parse_data_url_strips_extra_params() {
+        // RFC 2397 allows `;charset=...;base64`. Should still extract MIME.
+        let (mime, b64) = parse_data_url("data:image/jpeg;charset=utf-8;base64,/9j/=").unwrap();
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(b64, "/9j/=");
+    }
+
+    #[test]
+    fn parse_data_url_rejects_non_image() {
+        assert!(parse_data_url("data:text/plain;base64,SGk=").is_none());
+    }
+
+    #[test]
+    fn parse_data_url_rejects_non_base64() {
+        // URL-encoded payload (no ;base64) — not the multipart-upload path.
+        assert!(parse_data_url("data:image/png,raw").is_none());
+    }
+
+    #[test]
+    fn parse_data_url_rejects_http() {
+        assert!(parse_data_url("https://example.com/x.png").is_none());
+    }
+
+    #[test]
+    fn mime_to_ext_known_types() {
+        assert_eq!(mime_to_ext("image/jpeg"), "jpg");
+        assert_eq!(mime_to_ext("image/webp"), "webp");
+        assert_eq!(mime_to_ext("image/png"), "png");
+        // Fallback for unknown MIME — png matches the default mime_str the
+        // upload uses when fallback was hit.
+        assert_eq!(mime_to_ext("image/heic"), "png");
+    }
+
+    #[test]
+    fn pick_file_mime_prefers_explicit() {
+        assert_eq!(pick_file_mime("video/mp4", "weird.bin"), "video/mp4");
+    }
+
+    #[test]
+    fn pick_file_mime_guesses_from_extension_when_empty() {
+        assert_eq!(pick_file_mime("", "clip.mp4"), "video/mp4");
+        assert_eq!(pick_file_mime("", "song.MP3"), "audio/mpeg");
+        assert_eq!(pick_file_mime("", "doc.pdf"), "application/pdf");
+    }
+
+    #[test]
+    fn pick_file_mime_falls_back_when_unknown_extension() {
+        assert_eq!(pick_file_mime("", "blob.xyz"), "application/octet-stream");
+        assert_eq!(pick_file_mime("", "noext"), "application/octet-stream");
     }
 }
