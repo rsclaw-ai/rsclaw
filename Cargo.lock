@@ -6339,6 +6339,7 @@ dependencies = [
  "hnsw_rs",
  "htmd",
  "image",
+ "indicatif",
  "json5",
  "lark-websocket-protobuf",
  "libc",
