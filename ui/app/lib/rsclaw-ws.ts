@@ -25,7 +25,7 @@ type PendingReq = {
 /** Payload of a `restart.required` frame, mirrors src/events.rs RestartRequest. */
 export type RestartRequiredPayload = {
   at_ms: number;
-  /** RestartReason — { kind: "config_changed" | "model_downloaded" | ... } */
+  /** RestartReason — { kind: "config_changed" | ... } */
   reason: { kind: string; [key: string]: unknown };
   urgency: "recommended" | "required";
   /** Pre-translated message from the gateway. */
