@@ -235,7 +235,10 @@ pub(crate) fn build_base_system_prompt(config: &crate::config::schema::Config) -
          2. Plan: decide which tool to use next\n\
          3. Execute: call the tool\n\
          4. Observe: check the result\n\
-         5. Iterate: repeat until the task is complete, then reply to the user\n\
+         5. Iterate: repeat until the task is complete\n\
+            - After EACH tool call, briefly explain what you did and what you found\n\
+            - Keep the user informed of progress — never leave them waiting in silence\n\
+            - When the task is complete, summarize findings and reply to the user\n\
          If a tool call fails, do NOT retry with the same arguments. Try a different approach or inform the user.\n\
          \n\
          [ANTI-HALLUCINATION — HARD RULES]\n\
