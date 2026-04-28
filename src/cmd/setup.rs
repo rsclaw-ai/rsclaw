@@ -737,7 +737,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
     // Delegates to the unified import_data() in cmd/migrate.rs.
     if migrate_mode == Some(crate::migrate::MigrateMode::Import) {
         step("*", &crate::i18n::t_fmt("cli_importing_sessions", crate::i18n::default_lang(), &[("count", &session_count.to_string())]));
-        match super::migrate::import_data_from(&openclaw_dir, &base) {
+        match super::migrate::import_data_from(&openclaw_dir, &base).await {
             Ok(()) => {
                 step("+", &crate::i18n::t("cli_converted_config", crate::i18n::default_lang()));
             }

@@ -605,27 +605,49 @@ pub async fn download_resumable(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
-    // Belt-and-suspenders: if server returned 206 but the stashed total size
-    // disagrees with what it's now telling us, abort the resume and restart.
-    // Catches CDNs that don't honor If-Range but still serve partial.
-    let restart_due_to_size_mismatch = if resume {
-        match (stashed.as_ref().map(|(n, _)| *n), total_size) {
+    // Restart conditions, all of which mean the partial we have on disk is
+    // unsafe to append to:
+    //   1. server's total differs from the size we stashed last time (file
+    //      changed upstream)
+    //   2. local partial is somehow larger than the upstream total (truncate
+    //      / dd / FS quota glitch extended it past the real size)
+    let restart_due_to_size_mismatch = resume
+        && match (stashed.as_ref().map(|(n, _)| *n), total_size) {
             (Some(stash_total), Some(now_total)) => stash_total != now_total,
             _ => false,
-        }
-    } else {
-        false
-    };
-    let resume = resume && !restart_due_to_size_mismatch;
+        };
+    let restart_due_to_local_overshoot = resume
+        && match total_size {
+            Some(now_total) => already > now_total,
+            None => false,
+        };
+    let resume = resume && !restart_due_to_size_mismatch && !restart_due_to_local_overshoot;
     if restart_due_to_size_mismatch {
         tracing::warn!(
             url,
             "download_resumable: server total size changed since previous start; restarting from byte 0"
         );
     }
+    if restart_due_to_local_overshoot {
+        tracing::warn!(
+            url,
+            already,
+            ?total_size,
+            "download_resumable: local partial larger than upstream total; restarting from byte 0"
+        );
+    }
 
+    // Hide the progress bar in non-TTY contexts (daemon, CI, log file
+    // redirect) — otherwise indicatif's `\r`-painted updates pollute logs
+    // and look like garbled output. Mirrors the QR popup TTY check from
+    // commit 839120a.
+    let draw_target = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        indicatif::ProgressDrawTarget::stderr()
+    } else {
+        indicatif::ProgressDrawTarget::hidden()
+    };
     let bar = if let Some(total) = total_size {
-        let bar = ProgressBar::new(total);
+        let bar = ProgressBar::with_draw_target(Some(total), draw_target);
         bar.set_style(
             ProgressStyle::with_template(
                 "    {prefix:>12} [{bar:30.cyan/blue}] {bytes:>10}/{total_bytes:>10} {bytes_per_sec:>10} ETA {eta:>5}",
@@ -639,7 +661,7 @@ pub async fn download_resumable(
         }
         bar
     } else {
-        let bar = ProgressBar::new_spinner();
+        let bar = ProgressBar::with_draw_target(None, draw_target);
         bar.set_prefix(label.to_owned());
         bar
     };
