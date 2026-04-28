@@ -163,6 +163,13 @@ jobs:
         env:
           HUSKY: "0"
 
+      - name: Fetch bundled BGE embedding model
+        # Pulls the ~91MB model.safetensors (gitignored) into
+        # ui/src-tauri/resources/bge-small-zh/ so tauri build can include
+        # it in the desktop installer. Idempotent.
+        shell: bash
+        run: ./scripts/fetch-bundled-model.sh
+
       - name: Build Tauri app
         working-directory: ui
         run: yarn tauri build --target ${{ matrix.target }}

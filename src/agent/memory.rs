@@ -290,7 +290,10 @@ fn extract_overview(text: &str) -> Option<String> {
 // Embedder trait
 // ---------------------------------------------------------------------------
 
-trait Embedder: Send + Sync {
+/// Pluggable text → vector backend. Implementors are interchangeable at
+/// runtime — see `MemoryStore::begin_swap` for the hot-migration path used
+/// to upgrade from FNV → BGE (or BGE-small → BGE-base) without restart.
+pub trait Embedder: Send + Sync {
     fn embed(&self, text: &str) -> Vec<f32>;
     fn dimension(&self) -> i32;
     /// Count tokens precisely (when tokenizer is available) or estimate.
@@ -381,7 +384,9 @@ pub struct LocalBgeEmbedder {
 }
 
 impl LocalBgeEmbedder {
-    fn load(model_dir: &Path) -> Result<Self> {
+    /// Load BGE weights, tokenizer, and config from a model directory.
+    /// Expects `config.json`, `model.safetensors`, and `tokenizer.json`.
+    pub fn load(model_dir: &Path) -> Result<Self> {
         use candle_core::{DType, Device};
         use candle_nn::VarBuilder;
         use candle_transformers::models::bert::{BertModel, Config as BertConfig};
@@ -730,6 +735,18 @@ fn ollama_model_dim(model: &str) -> i32 {
 // MemoryStore -- hnsw_rs + redb
 // ---------------------------------------------------------------------------
 
+/// In-flight embedder migration. The primary index keeps serving reads while
+/// the secondary is built up doc-by-doc off-lock; `add()` dual-writes so the
+/// new index never falls behind. `commit_swap` atomically replaces primary
+/// with secondary and persists the new vectors to redb in one transaction.
+pub struct MigrationCtx {
+    new_embedder: Arc<dyn Embedder>,
+    new_hnsw: Hnsw<'static, f32, DistCosine>,
+    new_embed_dim: i32,
+    /// Per-doc-index → new vector. Indices are positions in `MemoryStore::docs`.
+    new_vectors: std::collections::HashMap<usize, Vec<f32>>,
+}
+
 pub struct MemoryStore {
     db: redb::Database,
     hnsw: Hnsw<'static, f32, DistCosine>,
@@ -737,6 +754,14 @@ pub struct MemoryStore {
     docs: Vec<MemoryDoc>,
     embedder: Arc<dyn Embedder>,
     embed_dim: i32,
+    /// Active hot-swap migration, if any. While this is `Some`, reads use the
+    /// primary embedder/hnsw and writes go to both primary and secondary.
+    swap: Option<MigrationCtx>,
+    /// Count of docs from redb whose stored vector dimension didn't match the
+    /// active embedder at load time. Non-zero means an embedder upgrade is in
+    /// progress — startup should kick off a background migration so search
+    /// becomes available without blocking gateway boot.
+    pending_migration: usize,
 }
 
 impl MemoryStore {
@@ -841,7 +866,7 @@ impl MemoryStore {
             info!(
                 skipped,
                 expected_dim,
-                "memory: dimension mismatch detected, auto-reindexing"
+                "memory: dimension mismatch detected; caller will drive background re-embed"
             );
         }
 
@@ -849,23 +874,36 @@ impl MemoryStore {
             info!(count = docs.len(), "memory store loaded from redb");
         }
 
-        let mut store = Self {
+        // Skipped docs (dim mismatch from a model upgrade) trigger a deferred
+        // background migration — caller checks `pending_migration_count()`
+        // post-open and runs `run_embedder_migration` off-lock so startup
+        // isn't blocked by re-embedding thousands of docs.
+        let store = Self {
             db,
             hnsw,
             docs,
             embedder,
             embed_dim,
+            swap: None,
+            pending_migration: skipped,
         };
 
-        // Auto-reindex if any docs had mismatched vector dimensions.
-        if skipped > 0 {
-            match store.reindex().await {
-                Ok(n) => info!(count = n, "auto-reindex complete"),
-                Err(e) => warn!("auto-reindex failed: {e:#}"),
-            }
-        }
-
         Ok(store)
+    }
+
+    /// Number of docs whose stored vector dimension doesn't match the
+    /// currently-loaded embedder. Non-zero immediately after `open` when the
+    /// user has upgraded to a different-sized embedding model — the caller
+    /// should drive `begin_swap` + the standard migration loop in the
+    /// background to backfill them.
+    pub fn pending_migration_count(&self) -> usize {
+        self.pending_migration
+    }
+
+    /// Cheap clone of the active embedder Arc — used by the migration driver
+    /// to embed off-lock without holding the store mutex.
+    pub fn embedder_arc(&self) -> Arc<dyn Embedder> {
+        Arc::clone(&self.embedder)
     }
 
     pub async fn add(&mut self, mut doc: MemoryDoc) -> Result<()> {
@@ -907,6 +945,16 @@ impl MemoryStore {
         // Insert into HNSW index.
         let idx = self.docs.len();
         self.hnsw.insert((&doc.vector, idx));
+
+        // Dual-write to the migration secondary so new docs added during a
+        // swap don't get left out. Pre-compute the vector before pushing the
+        // doc so the borrow on `self.docs` doesn't conflict.
+        if let Some(ctx) = self.swap.as_mut() {
+            let new_vec = ctx.new_embedder.embed(&doc.text);
+            ctx.new_hnsw.insert((&new_vec, idx));
+            ctx.new_vectors.insert(idx, new_vec);
+        }
+
         self.docs.push(doc);
 
         debug!(idx, "memory doc stored");
@@ -981,6 +1029,123 @@ impl MemoryStore {
 
     pub async fn get(&self, id: &str) -> Result<Option<MemoryDoc>> {
         Ok(self.docs.iter().find(|d| d.id == id).cloned())
+    }
+
+    /// Whether a hot-swap migration is currently in progress.
+    pub fn is_migrating(&self) -> bool {
+        self.swap.is_some()
+    }
+
+    /// Begin a hot-swap migration to a new embedder. Creates the secondary
+    /// HNSW index; primary keeps serving reads. Caller drives migration via
+    /// `swap_pending` + `swap_apply_batch` + `commit_swap` (typically from a
+    /// dedicated background task that does the heavy embedding work off-lock).
+    pub fn begin_swap(&mut self, new_embedder: Arc<dyn Embedder>) -> Result<()> {
+        if self.swap.is_some() {
+            anyhow::bail!("memory: a swap is already in progress");
+        }
+        let new_embed_dim = new_embedder.dimension();
+        let max_elements = self.docs.len().max(1024);
+        let new_hnsw = Hnsw::<'static, f32, DistCosine>::new(
+            HNSW_MAX_NB_CONN,
+            max_elements,
+            16,
+            HNSW_EF_CONSTRUCTION,
+            DistCosine,
+        );
+        self.swap = Some(MigrationCtx {
+            new_embedder,
+            new_hnsw,
+            new_embed_dim,
+            new_vectors: std::collections::HashMap::new(),
+        });
+        Ok(())
+    }
+
+    /// Snapshot the next batch of doc indices that still need re-embedding.
+    /// Returns `(idx, text)` pairs the caller can embed off-lock.
+    pub fn swap_pending(&self, max: usize) -> Vec<(usize, String)> {
+        let Some(ctx) = self.swap.as_ref() else {
+            return Vec::new();
+        };
+        self.docs
+            .iter()
+            .enumerate()
+            .filter(|(i, d)| !d.id.is_empty() && !ctx.new_vectors.contains_key(i))
+            .take(max)
+            .map(|(i, d)| (i, d.text.clone()))
+            .collect()
+    }
+
+    /// Apply a batch of `(doc_idx, new_vector)` pairs to the secondary index.
+    /// Skips entries whose dimension doesn't match the new embedder.
+    pub fn swap_apply_batch(&mut self, batch: Vec<(usize, Vec<f32>)>) -> Result<usize> {
+        let Some(ctx) = self.swap.as_mut() else {
+            anyhow::bail!("memory: no swap in progress");
+        };
+        let expected = ctx.new_embed_dim as usize;
+        let mut applied = 0usize;
+        for (idx, vector) in batch {
+            if vector.len() != expected {
+                tracing::warn!(idx, got = vector.len(), expected, "swap_apply_batch: dim mismatch, skipping");
+                continue;
+            }
+            ctx.new_hnsw.insert((&vector, idx));
+            ctx.new_vectors.insert(idx, vector);
+            applied += 1;
+        }
+        Ok(applied)
+    }
+
+    /// Atomically replace primary with secondary and persist new vectors to
+    /// redb in a single transaction. Returns the number of docs migrated.
+    pub fn commit_swap(&mut self) -> Result<usize> {
+        let ctx = self
+            .swap
+            .take()
+            .context("memory: no swap in progress")?;
+        let MigrationCtx {
+            new_embedder,
+            new_hnsw,
+            new_embed_dim,
+            new_vectors,
+        } = ctx;
+
+        // Update doc.vector for each migrated doc and persist atomically.
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(REDB_TABLE)?;
+            for (idx, vector) in &new_vectors {
+                if *idx >= self.docs.len() {
+                    continue;
+                }
+                let doc = &mut self.docs[*idx];
+                if doc.id.is_empty() {
+                    continue;
+                }
+                doc.vector = vector.clone();
+                let serialized = serialize_doc(doc)?;
+                table.insert(doc.id.as_str(), serialized.as_slice())?;
+            }
+        }
+        write.commit()?;
+
+        let migrated = new_vectors.len();
+        self.embedder = new_embedder;
+        self.embed_dim = new_embed_dim;
+        self.hnsw = new_hnsw;
+        self.pending_migration = 0;
+
+        info!(migrated, "memory: swap committed");
+        Ok(migrated)
+    }
+
+    /// Drop an in-progress swap without applying any changes. The primary
+    /// index is left untouched and the secondary state is discarded.
+    pub fn abort_swap(&mut self) {
+        if self.swap.take().is_some() {
+            tracing::warn!("memory: swap aborted");
+        }
     }
 
     pub async fn reindex(&mut self) -> Result<usize> {
@@ -1275,5 +1440,181 @@ fn choose_embedder(
             }
             Arc::new(EmbedderBackend::Fnv(FnvEmbedder::new(DEFAULT_EMBED_DIM)))
         }
+    }
+}
+
+#[cfg(test)]
+mod swap_tests {
+    use super::*;
+
+    fn doc(id: &str, text: &str) -> MemoryDoc {
+        MemoryDoc {
+            id: id.into(),
+            scope: "test".into(),
+            kind: "note".into(),
+            text: text.into(),
+            vector: Vec::new(),
+            created_at: 0,
+            accessed_at: 0,
+            access_count: 0,
+            importance: 0.5,
+            tier: MemDocTier::default(),
+            abstract_text: None,
+            overview_text: None,
+            tags: Vec::new(),
+            pinned: false,
+        }
+    }
+
+    /// Hand-rolled embedder so tests don't depend on BGE/FNV: each text → a
+    /// fixed-dim vector seeded by the first byte (deterministic & cheap).
+    struct StubEmbedder { dim: i32, seed_bias: f32 }
+    impl Embedder for StubEmbedder {
+        fn embed(&self, text: &str) -> Vec<f32> {
+            let bias = text.bytes().next().map(|b| b as f32 / 255.0).unwrap_or(0.0)
+                + self.seed_bias;
+            vec![bias; self.dim as usize]
+        }
+        fn dimension(&self) -> i32 { self.dim }
+    }
+
+    async fn open_temp_store() -> (MemoryStore, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = MemoryStore::open(tmp.path(), None, MemoryTier::High, None)
+            .await
+            .expect("open");
+        (store, tmp)
+    }
+
+    #[tokio::test]
+    async fn full_swap_lifecycle() {
+        let (mut store, _tmp) = open_temp_store().await;
+        for (i, text) in ["alpha", "beta", "gamma"].iter().enumerate() {
+            let mut d = doc(&format!("d{i}"), text);
+            d.created_at = 1;
+            store.add(d).await.expect("add");
+        }
+        assert_eq!(store.is_migrating(), false);
+
+        let new_emb: Arc<dyn Embedder> = Arc::new(StubEmbedder { dim: 8, seed_bias: 0.1 });
+        store.begin_swap(Arc::clone(&new_emb)).expect("begin_swap");
+        assert!(store.is_migrating());
+
+        // Drain pending in batches; tests the snapshot/apply flow.
+        loop {
+            let pending = store.swap_pending(2);
+            if pending.is_empty() { break; }
+            let batch: Vec<_> = pending
+                .into_iter()
+                .map(|(i, t)| (i, new_emb.embed(&t)))
+                .collect();
+            store.swap_apply_batch(batch).expect("apply");
+        }
+
+        let migrated = store.commit_swap().expect("commit");
+        assert_eq!(migrated, 3);
+        assert!(!store.is_migrating());
+        assert_eq!(store.embed_dim(), 8);
+        // After commit, every doc carries the new vector.
+        for d in &store.docs {
+            assert_eq!(d.vector.len(), 8);
+        }
+    }
+
+    #[tokio::test]
+    async fn add_during_migration_dual_writes() {
+        let (mut store, _tmp) = open_temp_store().await;
+        store.add(doc("d0", "first")).await.unwrap();
+
+        let new_emb: Arc<dyn Embedder> = Arc::new(StubEmbedder { dim: 8, seed_bias: 0.0 });
+        store.begin_swap(Arc::clone(&new_emb)).unwrap();
+        // Drain initial pending.
+        let pending = store.swap_pending(10);
+        let batch: Vec<_> = pending.into_iter().map(|(i, t)| (i, new_emb.embed(&t))).collect();
+        store.swap_apply_batch(batch).unwrap();
+
+        // Now add a doc mid-migration — it should auto-populate both indexes.
+        store.add(doc("d1", "second")).await.unwrap();
+        assert!(store.swap_pending(10).is_empty(), "dual-write should leave nothing pending");
+
+        let migrated = store.commit_swap().unwrap();
+        assert_eq!(migrated, 2);
+    }
+
+    #[tokio::test]
+    async fn abort_swap_leaves_primary_untouched() {
+        let (mut store, _tmp) = open_temp_store().await;
+        store.add(doc("d0", "x")).await.unwrap();
+        let original_dim = store.embed_dim();
+
+        let new_emb: Arc<dyn Embedder> = Arc::new(StubEmbedder { dim: 16, seed_bias: 0.0 });
+        store.begin_swap(new_emb).unwrap();
+        store.abort_swap();
+        assert!(!store.is_migrating());
+        assert_eq!(store.embed_dim(), original_dim);
+        assert_eq!(store.docs[0].vector.len(), original_dim as usize);
+    }
+
+    #[tokio::test]
+    async fn double_begin_swap_errors() {
+        let (mut store, _tmp) = open_temp_store().await;
+        let new_emb: Arc<dyn Embedder> = Arc::new(StubEmbedder { dim: 4, seed_bias: 0.0 });
+        store.begin_swap(Arc::clone(&new_emb)).unwrap();
+        let err = store.begin_swap(new_emb).expect_err("second begin should fail");
+        assert!(err.to_string().contains("swap is already in progress"));
+    }
+
+    /// Models the bge-small → bge-base upgrade path: docs persisted under the
+    /// old embedder show up as `pending_migration_count` after re-open with a
+    /// different-dim embedder. Driving the standard swap loop drains the
+    /// counter and makes search return them again.
+    #[tokio::test]
+    async fn dim_mismatch_triggers_pending_migration() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Round 1: open + insert under FNV (default 384-dim).
+        {
+            let mut store = MemoryStore::open(tmp.path(), None, MemoryTier::High, None)
+                .await
+                .expect("open");
+            assert_eq!(store.pending_migration_count(), 0);
+            store.add(doc("d0", "alpha")).await.unwrap();
+            store.add(doc("d1", "beta")).await.unwrap();
+        }
+        // Round 2: re-open + migrate the store to a different embedder dim
+        // (16) so the persisted vectors no longer match FNV's default 384.
+        {
+            let mut store = MemoryStore::open(tmp.path(), None, MemoryTier::High, None)
+                .await
+                .expect("reopen for migration");
+            assert_eq!(store.pending_migration_count(), 0);
+            let new_emb: Arc<dyn Embedder> =
+                Arc::new(StubEmbedder { dim: 16, seed_bias: 0.0 });
+            store.begin_swap(Arc::clone(&new_emb)).unwrap();
+            loop {
+                let pending = store.swap_pending(10);
+                if pending.is_empty() {
+                    break;
+                }
+                let batch: Vec<_> = pending
+                    .into_iter()
+                    .map(|(i, t)| (i, new_emb.embed(&t)))
+                    .collect();
+                store.swap_apply_batch(batch).unwrap();
+            }
+            assert_eq!(store.commit_swap().unwrap(), 2);
+            assert_eq!(store.embed_dim(), 16);
+            assert_eq!(store.pending_migration_count(), 0);
+        }
+
+        // Round 3: reopen with default FNV (384-dim) — docs now stored with
+        // 16-dim vectors → pending_migration_count should flag both.
+        let store = MemoryStore::open(tmp.path(), None, MemoryTier::High, None)
+            .await
+            .expect("reopen after dim change");
+        assert_eq!(
+            store.pending_migration_count(),
+            2,
+            "expected 2 docs flagged for migration after dim change 16 -> 384"
+        );
     }
 }

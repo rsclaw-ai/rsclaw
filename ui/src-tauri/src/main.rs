@@ -197,6 +197,56 @@ fn run_setup() -> Result<String, String> {
     run_rsclaw_command(&["setup", "--non-interactive"])
 }
 
+/// Copy the bundled BGE-small-zh model (shipped via tauri.conf.json
+/// `bundle.resources`) into `~/.rsclaw/models/bge-small-zh/` so the gateway
+/// finds it on its standard search path. Idempotent — skips when the
+/// target already has a `model.safetensors`, so we never clobber a
+/// hand-placed or hand-upgraded model.
+fn seed_bundled_bge_model<R: tauri::Runtime>(
+    handle: &tauri::AppHandle<R>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri::Manager;
+
+    let target = dirs::home_dir()
+        .ok_or("no home directory")?
+        .join(".rsclaw/models/bge-small-zh");
+    if target.join("model.safetensors").exists() {
+        return Ok(());
+    }
+
+    // Resource layout under bundle: <resource_dir>/resources/bge-small-zh/{...}
+    let res_dir = handle
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("resource_dir unavailable: {e}"))?
+        .join("resources/bge-small-zh");
+    let weights = res_dir.join("model.safetensors");
+    if !weights.exists() {
+        // No bundled model — gateway will fall back to its own
+        // ensure_bge_model_present (sync download). Only happens during
+        // a stripped/dev build that didn't include the resources.
+        eprintln!(
+            "[setup] no bundled BGE model at {}; gateway will download",
+            res_dir.display()
+        );
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&target)?;
+    for filename in ["config.json", "tokenizer.json", "model.safetensors"] {
+        let src = res_dir.join(filename);
+        let dst = target.join(filename);
+        std::fs::copy(&src, &dst).map_err(|e| {
+            format!("copy {} -> {}: {e}", src.display(), dst.display())
+        })?;
+    }
+    eprintln!(
+        "[setup] seeded bundled BGE model -> {}",
+        target.display()
+    );
+    Ok(())
+}
+
 /// Write a file to an agent's workspace directory (~/.rsclaw/workspace-{agentId}/{fileName})
 #[tauri::command]
 fn write_workspace_file(agent_id: String, file_name: String, content: String) -> Result<String, String> {
@@ -1143,6 +1193,15 @@ fn main() {
             read_file_as_data_url,
         ])
         .setup(|app| {
+            // Seed the bundled BGE embedding model into the standard rsclaw
+            // models directory so the gateway start path finds it without
+            // touching the network. Idempotent: skips when model.safetensors
+            // already exists at the target (CLI users with their own model
+            // are unaffected; subsequent app launches are a no-op).
+            if let Err(e) = seed_bundled_bge_model(app.handle()) {
+                eprintln!("[setup] BGE model seeding failed (gateway will fall back to download): {e:#}");
+            }
+
             // Build system tray
             let open = MenuItemBuilder::with_id("open", "Open RsClaw").build(app)?;
             let sep1 = PredefinedMenuItem::separator(app)?;

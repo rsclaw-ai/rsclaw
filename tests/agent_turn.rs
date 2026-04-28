@@ -72,6 +72,7 @@ fn config_with_echo_agent(port: u16) -> RuntimeConfig {
                 flash_model: None,
                 agent_dir: None,
                 system: None,
+                temperature: None,
             }],
             bindings: vec![],
             external: vec![],

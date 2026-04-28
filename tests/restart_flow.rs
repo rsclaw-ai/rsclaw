@@ -349,50 +349,8 @@ async fn file_watcher_change_emits_restart_required() {
     stream.close(None).await.ok();
 }
 
-#[tokio::test]
-async fn bge_download_emits_restart_required() {
-    // The BGE downloader runs as a `tokio::spawn` task at startup that calls
-    // `publish_restart` with `RestartReason::ModelDownloaded { name }` once
-    // the model finishes downloading. Driving a real download requires
-    // network access plus a multi-hundred-MB GGUF, so this E2E stops at the
-    // contract: a `ModelDownloaded` request published into the same handles
-    // the downloader uses must reach a fresh WS via the latch replay path
-    // and serialize with the snake_case wire shape the UI parses.
-
-    let addr = free_addr();
-    let handles = start_server_with_handles(addr).await;
-
-    let req = RestartRequest::new(
-        RestartReason::ModelDownloaded {
-            name: "BAAI/bge-small-en-v1.5".to_owned(),
-        },
-        RestartUrgency::Recommended,
-        "Embedding model downloaded; restart to load it.".to_owned(),
-    );
-    // `publish_restart` is pub(crate); the two side-effects below are an
-    // inline replication. Latch first so a connection that races the send
-    // still sees the event via replay.
-    {
-        let mut guard = handles
-            .pending_restart
-            .write()
-            .expect("pending_restart lock");
-        *guard = Some(req.clone());
-    }
-    // No live subscribers yet — `send` returning `Err` is normal here. The
-    // latch is what matters for the replay path under test.
-    handles.restart_request_tx.send(req.clone()).ok();
-
-    let mut stream = handshake(addr).await;
-    let frame = read_until_restart_required(&mut stream).await;
-
-    assert_restart_payload_shape(&frame, "model_downloaded");
-    assert_eq!(frame["payload"]["urgency"], "recommended");
-    assert_eq!(frame["payload"]["message"], req.message);
-    assert_eq!(
-        frame["payload"]["reason"]["name"],
-        "BAAI/bge-small-en-v1.5"
-    );
-
-    stream.close(None).await.ok();
-}
+// `bge_download_emits_restart_required` was deleted along with the
+// `RestartReason::ModelDownloaded` variant: the BGE bootstrap is now
+// synchronous (gateway exits if it can't be made present), and the
+// dim-mismatch upgrade path drives a silent background re-embed that
+// doesn't surface a restart banner.

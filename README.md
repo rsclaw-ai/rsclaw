@@ -56,6 +56,15 @@ rsclaw onboard    # Interactive wizard: provider, channels, etc.
 rsclaw start
 ```
 
+**First start** downloads the BGE-small-zh embedding model (~91 MB) into
+`~/.rsclaw/models/bge-small-zh/` — needed for memory semantic search.
+The download is resumable: interrupted transfers pick up where they left
+off on the next start. To pre-place the model and skip the first-run
+download, drop `model.safetensors`, `tokenizer.json`, and `config.json`
+from [BAAI/bge-small-zh-v1.5](https://huggingface.co/BAAI/bge-small-zh-v1.5)
+into that directory before `rsclaw start`. The desktop app ships the
+model bundled — no first-run download needed.
+
 ### 👉 Migrating from OpenClaw
 
 ```bash

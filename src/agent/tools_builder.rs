@@ -208,19 +208,19 @@ pub(crate) fn build_tool_list(
         name: "execute_command".to_owned(),
         description: if cfg!(target_os = "windows") {
             "Run a shell command (PowerShell) on Windows.\n\
-             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`. Only use exec for commands that have no dedicated tool.\n\
+             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use exec for commands that have no dedicated tool.\n\
              Use exec for: git operations, running scripts (node/python/cargo), system info (systeminfo, ipconfig, Get-Process), package management (npm/pip), process management (Start-Process, Stop-Process, taskkill).\n\
+             Do NOT use exec for HTTP requests (curl/wget/Invoke-WebRequest) or file downloads — use `web_fetch` / `web_download` instead.\n\
              \n\
-             Tool selection: PowerShell for file/system ops; python for data processing (CSV/JSON/API/automation); node for quick HTTP/web scraping.\n\
+             Tool selection: PowerShell for file/system ops; python for data processing (CSV/JSON/automation).\n\
              Check tool availability first (`Get-Command python`, `Get-Command node`). Use `install_tool` for system tools.\n\
              \n\
              PowerShell patterns:\n\
              - Pipes: Get-Process | Sort-Object CPU -Descending | Select-Object -First 10\n\
-             - Network: Test-NetConnection host -Port 80; Invoke-WebRequest -Uri <url>\n\
+             - Network connectivity check (not fetch): Test-NetConnection host -Port 80\n\
              - Text: (Get-Content file) -replace 'old','new'\n\
              - Dates: Get-Date -Format 'yyyy-MM-dd'; [DateTimeOffset]::Now.ToUnixTimeSeconds()\n\
              Python patterns: `python -c \"import json; ...\"` for one-liners, write to $env:TEMP\\script.py for multi-line.\n\
-             Node patterns: `node -e \"fetch(url).then(r=>r.json()).then(console.log)\"` (Node 18+), `npx <pkg>` for one-shot tools.\n\
              \n\
              Best practices: Do NOT wrap commands in extra cmd /c or powershell -Command layers. Use `| Select-Object -First 10` to limit output.\n\
              Do NOT use exec for destructive operations on personal directories (Desktop, Downloads, Documents).\n\
@@ -229,30 +229,30 @@ pub(crate) fn build_tool_list(
                 .to_owned()
         } else if cfg!(target_os = "macos") {
             "Run a shell command (bash/zsh) on macOS.\n\
-             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`. Only use exec for commands that have no dedicated tool.\n\
+             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use exec for commands that have no dedicated tool.\n\
              Use exec for: git operations, running scripts (node/python/cargo), system info (uname, df, top), package management (brew/npm/pip), process management (ps, kill).\n\
+             Do NOT use exec for HTTP requests (curl/wget) or file downloads — use `web_fetch` / `web_download` instead.\n\
              \n\
-             Tool selection: bash for file/text/system ops; python3 for data processing (CSV/JSON/API/automation); node for quick HTTP/web scraping.\n\
+             Tool selection: bash for file/text/system ops; python3 for data processing (CSV/JSON/automation).\n\
              Check tool availability first (`which python3`, `which node`). Use `install_tool` for system tools.\n\
              \n\
-             Bash patterns: `| head -n 20` to limit output, `date +%s` for timestamps, `find . -name '*.py' -mtime -7`, `curl -s URL | python3 -m json.tool`.\n\
+             Bash patterns: `| head -n 20` to limit output, `date +%s` for timestamps, `find . -name '*.py' -mtime -7`.\n\
              Python patterns: `python3 -c \"import json; ...\"` for one-liners, write to /tmp/script.py for multi-line, `pip install` for packages.\n\
-             Node patterns: `node -e \"fetch(url).then(r=>r.json()).then(console.log)\"` (Node 18+), `npx <pkg>` for one-shot tools.\n\
              \n\
              Best practices: pipe large output through head/tail, use wait=false for long tasks, never run destructive commands on personal dirs.\n\
              If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user."
                 .to_owned()
         } else {
             "Run a shell command (bash/sh) on Linux.\n\
-             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`. Only use exec for commands that have no dedicated tool.\n\
+             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use exec for commands that have no dedicated tool.\n\
              Use exec for: git operations, running scripts (node/python/cargo), system info (uname, df, top), package management (apt/npm/pip), process management (ps, kill).\n\
+             Do NOT use exec for HTTP requests (curl/wget) or file downloads — use `web_fetch` / `web_download` instead.\n\
              \n\
-             Tool selection: bash for file/text/system ops; python3 for data processing (CSV/JSON/API/automation); node for quick HTTP/web scraping.\n\
+             Tool selection: bash for file/text/system ops; python3 for data processing (CSV/JSON/automation).\n\
              Check tool availability first (`which python3`, `which node`). Use `install_tool` for system tools.\n\
              \n\
-             Bash patterns: `| head -n 20` to limit output, `date +%s` for timestamps, `find . -name '*.py' -mtime -7`, `curl -s URL | python3 -m json.tool`.\n\
+             Bash patterns: `| head -n 20` to limit output, `date +%s` for timestamps, `find . -name '*.py' -mtime -7`.\n\
              Python patterns: `python3 -c \"import json; ...\"` for one-liners, write to /tmp/script.py for multi-line, `pip install` for packages.\n\
-             Node patterns: `node -e \"fetch(url).then(r=>r.json()).then(console.log)\"` (Node 18+), `npx <pkg>` for one-shot tools.\n\
              \n\
              Best practices: pipe large output through head/tail, use wait=false for long tasks, never run destructive commands on personal dirs.\n\
              If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user."
@@ -415,20 +415,33 @@ pub(crate) fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "web_fetch".to_owned(),
-        description: "Fetch a web page and convert to readable text/markdown.\n\
-            Use this to read documentation, articles, API docs, or any web content.\n\
+        description: "PREFERRED tool for HTTP requests — web pages, REST APIs, documentation, articles.\n\
+            Do NOT use execute_command with curl/wget/Invoke-WebRequest — use web_fetch instead.\n\
             - URL must be fully-formed (https://...)\n\
             - HTTP auto-upgraded to HTTPS\n\
-            - Falls back to browser rendering for JS-heavy pages\n\
-            - Results cached 15 minutes\n\
-            - For large pages, use 'prompt' to extract specific information\n\
-            - This is read-only — does not modify anything\n\
-            - If content is behind login, use web_browser instead".to_owned(),
+            - HTML pages are dehydrated to clean text/markdown\n\
+            - JSON / plain-text / non-HTML responses are returned as-is (raw body)\n\
+            - Falls back to browser rendering for JS-heavy pages and CAPTCHA-blocked sites (GET only)\n\
+            - GET responses without headers/body are cached 15 minutes; non-GET bypasses cache\n\
+            - For large pages, pass 'prompt' to LLM-extract specific information\n\
+            \n\
+            METHODS, HEADERS, BODY — supports the full HTTP surface:\n\
+              - method: GET (default), POST, PUT, PATCH, DELETE\n\
+              - headers: object — Authorization, X-API-Key, Cookie, custom Content-Type, etc.\n\
+              - body: string (raw) OR object/array (auto JSON-serialized + Content-Type set)\n\
+            \n\
+            FALL BACK to execute_command + curl only when you need:\n\
+              - File upload via multipart/form-data\n\
+              - Streaming responses (SSE, chunked transfers consumed incrementally)\n\
+              - Sites behind interactive login (use web_browser when interaction is needed)".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "url":    {"type": "string", "description": "Full URL to fetch (e.g. https://docs.example.com/api)"},
-                "prompt": {"type": "string", "description": "What to extract from the page (e.g. 'list all API endpoints')"}
+                "url":     {"type": "string", "description": "Full URL to fetch (e.g. https://docs.example.com/api)"},
+                "method":  {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"], "description": "HTTP method. Default: GET"},
+                "headers": {"type": "object", "description": "Optional request headers, e.g. {\"Authorization\": \"Bearer xyz\", \"X-API-Key\": \"...\"}", "additionalProperties": {"type": "string"}},
+                "body":    {"description": "Optional request body. String → sent as-is (set Content-Type via headers). Object/array → JSON-serialized; Content-Type defaulted to application/json."},
+                "prompt":  {"type": "string", "description": "What to extract from the page (e.g. 'list all API endpoints')"}
             },
             "required": ["url"]
         }),
@@ -691,7 +704,29 @@ pub(crate) fn build_tool_list(
               \"0 9 1 * *\"      9:00 AM on the 1st of each month\n\
             Pitfall: '0 17 * * *' is FIVE fields. Writing '017 * * *' (no space after 0) is\n\
             only FOUR fields and will be rejected. Always check your expression has exactly\n\
-            5 whitespace-separated tokens.".to_owned(),
+            5 whitespace-separated tokens.\n\
+            \n\
+            ITER (round-robin) — set when the user wants to rotate through a list,\n\
+            ONE item per firing (e.g. \"按顺序轮流查询东京、曼谷、迪拜的天气\").\n\
+            Pass `iter` as a JSON array of items, and use `{current}` (and optionally\n\
+            `{next}`, `{index}`, `{total}`) as placeholders inside `message`. The\n\
+            scheduler advances the cursor every fire and persists it — the agent\n\
+            never has to remember progress, and a restart can never repeat or skip.\n\
+            Example: message=\"查询{current}的当前天气\", iter=[\"东京\",\"曼谷\",\"迪拜\"].\n\
+            Without iter the LLM must track its own progress in memory, which is\n\
+            unreliable across restarts and embedding-model swaps — prefer iter when rotation is intended.\n\
+            \n\
+            ROTATE vs BATCH — disambiguate before reaching for iter:\n\
+              ROTATE (use iter): the user wants ONE item per fire, cycling. Trigger\n\
+                phrases: \"轮流\" / \"按顺序\" / \"依次\" / \"each time\" / \"one at a time\" /\n\
+                \"rotate\" / \"cycle through\" / \"每次只查一个\".\n\
+              BATCH (do NOT use iter): the user wants ALL items reported together each\n\
+                fire. Phrases: \"每 N 分钟报一次 A、B、C 的价格\" / \"every N min give me\n\
+                the prices of A, B, C\" / lists with no rotation signal. Build a single\n\
+                cron whose message names every item — the agent fans out tool calls in\n\
+                one turn and replies with the combined result.\n\
+              When in doubt, BATCH is the safer default: a single late report is much\n\
+              less surprising than silently dropping items every cycle.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -705,7 +740,8 @@ pub(crate) fn build_tool_list(
                 "id":            {"type": "string", "description": "Job ID (for edit/remove/enable/disable - use index instead if possible)"},
                 "name":          {"type": "string", "description": "Job name (for add, edit)"},
                 "tz":            {"type": "string", "description": "Timezone IANA name. Auto-detected if omitted. Only set if user explicitly requests a different timezone."},
-                "agentId":       {"type": "string", "description": "Agent ID to run the job (for add, edit, default: main)"}
+                "agentId":       {"type": "string", "description": "Agent ID to run the job (for add, edit, default: main)"},
+                "iter":          {"type": "array", "items": {"type": "string"}, "description": "Round-robin items the scheduler cycles through, one per firing. Use `{current}` (and optionally `{next}`, `{index}`, `{total}`) as placeholders in `message`. Set this whenever the user asks for rotating tasks (e.g. 'cycle through cities'); leaves the agent free of progress-tracking duties."}
             },
             "required": ["action"]
         }),

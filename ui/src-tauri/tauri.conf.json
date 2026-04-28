@@ -63,7 +63,12 @@
       "providerShortName": "K87X8CQ78Y",
       "signingIdentity": "Developer ID Application: Hua Lan (K87X8CQ78Y)"
     },
-    "resources": ["icons/icon.png", "icons/icon-tray.png", "icons/icon-tray@2x.png"],
+    "resources": [
+      "icons/icon.png",
+      "icons/icon-tray.png",
+      "icons/icon-tray@2x.png",
+      "resources/bge-small-zh/*"
+    ],
     "shortDescription": "RsClaw AI Agent Engine",
     "targets": ["deb", "rpm", "appimage", "app", "dmg", "nsis"],
     "windows": {

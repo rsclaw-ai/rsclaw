@@ -120,9 +120,13 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // every event, including the BGE auto-download notifications.
     let shutdown = crate::gateway::ShutdownCoordinator::new();
 
-    // 6. Open shared memory store.
-    // Auto-detect embedding model: prefer higher-quality models first.
-    // Priority: bge-base-zh > bge-small-zh > bge-small-en > auto-download small-zh.
+    // 6. Resolve and validate the BGE embedding model BEFORE opening the
+    // memory store. Production must run with semantic search; failures here
+    // abort startup so users notice immediately rather than silently
+    // degrading to keyword-only retrieval.
+    //
+    // Priority: bge-base-zh > bge-small-zh > bge-small-en. If none of these
+    // dirs already contains a usable model, sync-download bge-small-zh.
     let search_cfg = config.raw.memory_search.as_ref();
     let model_dir = {
         let base_zh = base_dir.join("models/bge-base-zh");
@@ -135,71 +139,47 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         } else if en.join("model.safetensors").exists() {
             en
         } else {
-            // Auto-download BGE model in background (don't block startup).
-            let target_dir = zh; // default to small-zh
-            let cfg_lang = config.raw.gateway.as_ref().and_then(|g| g.language.as_deref()).map(str::to_owned);
-            let i18n_lang = crate::i18n::resolve_lang(cfg_lang.as_deref().unwrap_or("en")).to_owned();
-            let search_cfg_clone = search_cfg.cloned();
-            let dl_dir = target_dir.clone();
-            let bge_restart_tx = restart_request_tx.clone();
-            let bge_pending = Arc::clone(&pending_restart);
-            let bge_shutdown = shutdown.clone();
-            tokio::spawn(async move {
-                info!("BGE embedding model not found, downloading in background...");
-                match download_bge_model(&dl_dir, search_cfg_clone.as_ref(), cfg_lang.as_deref()).await {
-                    Ok(()) => {
-                        info!("BGE model downloaded. Notifying UI to restart.");
-                        publish_restart(
-                            &bge_restart_tx,
-                            &bge_pending,
-                            &bge_shutdown,
-                            crate::events::RestartRequest::new(
-                                crate::events::RestartReason::ModelDownloaded {
-                                    name: "bge-small-zh".into(),
-                                },
-                                crate::events::RestartUrgency::Recommended,
-                                crate::i18n::t("restart_required_model_downloaded", &i18n_lang),
-                            ),
-                        );
-                    }
-                    Err(e) => {
-                        warn!("BGE model auto-download failed: {e:#}");
-                        // Failure is reported via the same banner channel so the
-                        // user sees it in the UI; urgency is Recommended (the
-                        // gateway works without semantic search).
-                        publish_restart(
-                            &bge_restart_tx,
-                            &bge_pending,
-                            &bge_shutdown,
-                            crate::events::RestartRequest::new(
-                                crate::events::RestartReason::ModelDownloadFailed {
-                                    name: "bge-small-zh".into(),
-                                    error: format!("{e:#}"),
-                                },
-                                crate::events::RestartUrgency::Recommended,
-                                crate::i18n::t_fmt(
-                                    "restart_model_download_failed",
-                                    &i18n_lang,
-                                    &[("error", &format!("{e:#}"))],
-                                ),
-                            ),
-                        );
-                    }
-                }
-            });
-            target_dir
+            zh // default download target
         }
     };
+    ensure_bge_model_present(&model_dir, search_cfg).await?;
+
     let memory = match MemoryStore::open(&data_dir, Some(&model_dir), tier, search_cfg).await {
         Ok(m) => {
             info!("memory store opened");
             Some(Arc::new(tokio::sync::Mutex::new(m)))
         }
         Err(e) => {
-            warn!("failed to open memory store: {e:#}");
-            None
+            // Memory store opening should not fail once the model is
+            // validated by ensure_bge_model_present — propagate so startup
+            // surfaces the underlying issue (disk full, redb corruption…).
+            return Err(anyhow::anyhow!("failed to open memory store: {e:#}"));
         }
     };
+
+    // Embedder upgrade detection: if the active model produces a different
+    // vector dimension than what's stored in redb (e.g. user dropped a
+    // bge-base-zh dir and restarted), kick off a background re-embed via the
+    // two-index hot-swap API. The gateway keeps serving — search returns
+    // empty for the migrating docs until the swap commits, then catches up.
+    if let Some(mem_arc) = memory.as_ref() {
+        let pending = {
+            let mem = mem_arc.lock().await;
+            mem.pending_migration_count()
+        };
+        if pending > 0 {
+            info!(
+                pending,
+                "embedder dimension changed since last run; spawning background re-embed"
+            );
+            let bg_mem = Arc::clone(mem_arc);
+            tokio::spawn(async move {
+                if let Err(e) = run_embedder_reembed(&bg_mem).await {
+                    warn!("background re-embed failed ({e:#}); search will be partial until next restart");
+                }
+            });
+        }
+    }
 
     // 7. Load all plugins (JS + WASM) and register built-in memory slot.
     let plugins_dir = base_dir.join("plugins");
@@ -1137,32 +1117,186 @@ pub(crate) async fn handle_pending_analysis(
 }
 
 // ---------------------------------------------------------------------------
-// BGE model auto-download
+// Embedder migration driver — backs the dim-mismatch background re-embed
+// kicked off in start_gateway after MemoryStore::open.
 // ---------------------------------------------------------------------------
 
-/// Download BGE-Small embedding model files from HuggingFace.
-/// Downloads BGE model from gitfast.org (ZIP archive).
-async fn download_bge_model(
-    target_dir: &std::path::Path,
-    search_cfg: Option<&crate::config::schema::MemorySearchConfig>,
-    _config_language: Option<&str>,
+/// Drive a re-embed pass over all docs in `mem_arc` whose stored vector
+/// dimension doesn't match the active embedder. Uses the standard two-index
+/// `begin_swap` / `swap_apply_batch` / `commit_swap` machinery so reads stay
+/// served from primary (empty for the affected docs) and writes dual-write
+/// to both indexes throughout. Heavy embedding work happens off-lock; each
+/// lock window is bounded to a single batch.
+async fn run_embedder_reembed(
+    mem_arc: &std::sync::Arc<tokio::sync::Mutex<crate::agent::MemoryStore>>,
 ) -> anyhow::Result<()> {
-    let local_cfg = search_cfg.and_then(|c| c.local.as_ref());
+    /// Docs embedded per batch. Keeps each lock window to a few hundred ms
+    /// even with the slowest CPU-only BGE inference.
+    const BATCH: usize = 50;
 
-    // Config override for custom download URL.
-    let url = if let Some(url) = local_cfg.and_then(|c| c.model_download_url.as_deref()) {
-        url.to_owned()
-    } else {
-        "https://gitfast.org/tools/models/bge-small-zh-v1.5.zip".to_owned()
+    let embedder = {
+        let mut mem = mem_arc.lock().await;
+        let e = mem.embedder_arc();
+        mem.begin_swap(std::sync::Arc::clone(&e))?;
+        e
     };
 
-    info!("downloading BGE embedding model from {url} ...");
-    std::fs::create_dir_all(target_dir)?;
+    let mut total = 0usize;
+    loop {
+        let pending = {
+            let mem = mem_arc.lock().await;
+            mem.swap_pending(BATCH)
+        };
+        if pending.is_empty() {
+            break;
+        }
+        // Heavy work off-lock.
+        let batch: Vec<(usize, Vec<f32>)> = pending
+            .into_iter()
+            .map(|(idx, text)| (idx, embedder.embed(&text)))
+            .collect();
+        let applied = {
+            let mut mem = mem_arc.lock().await;
+            match mem.swap_apply_batch(batch) {
+                Ok(n) => n,
+                Err(e) => {
+                    mem.abort_swap();
+                    return Err(e);
+                }
+            }
+        };
+        if applied == 0 {
+            let mut mem = mem_arc.lock().await;
+            mem.abort_swap();
+            anyhow::bail!("embedder re-embed: batch applied 0 docs, aborting");
+        }
+        total += applied;
+    }
 
+    let migrated = {
+        let mut mem = mem_arc.lock().await;
+        mem.commit_swap()?
+    };
+    info!(total, migrated, "embedder re-embed complete; semantic search now full-coverage");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// BGE model: validate-or-download with atomic install
+// ---------------------------------------------------------------------------
+
+/// Make sure the BGE model at `model_dir` is present AND loadable. The
+/// gateway must not start without semantic search — if validation fails
+/// here, the error propagates and the process exits with a clear message.
+///
+/// Algorithm:
+///   1. If `model_dir/model.safetensors` exists → try `LocalBgeEmbedder::load`.
+///      Pass: return Ok. Fail: bail (don't auto-delete; might be a
+///      user-placed model or upgrade in flight).
+///   2. Otherwise, sync-download into `model_dir.with_extension("downloading")/`,
+///      validate by attempting to load it, then atomically rename into place.
+///   3. Any failure cleans up the tmp dir and bails.
+async fn ensure_bge_model_present(
+    model_dir: &std::path::Path,
+    search_cfg: Option<&crate::config::schema::MemorySearchConfig>,
+) -> anyhow::Result<()> {
+    use crate::agent::memory::LocalBgeEmbedder;
+
+    if model_dir.join("model.safetensors").exists() {
+        LocalBgeEmbedder::load(model_dir).map_err(|e| {
+            anyhow::anyhow!(
+                "BGE model at {} failed to load: {e:#}\n\
+                 Fix or remove the directory to trigger re-download, then restart.",
+                model_dir.display()
+            )
+        })?;
+        return Ok(());
+    }
+
+    let local_cfg = search_cfg.and_then(|c| c.local.as_ref());
+    let url = local_cfg
+        .and_then(|c| c.model_download_url.as_deref())
+        .unwrap_or("https://gitfast.org/tools/models/bge-small-zh-v1.5.zip")
+        .to_owned();
+
+    // Staging directory holds the resumable archive AND the extracted files.
+    // Survives across restarts so a half-finished download picks up where it
+    // left off via HTTP Range. Only wiped on validation failure.
+    let tmp_dir = model_dir.with_extension("downloading");
+    std::fs::create_dir_all(&tmp_dir).with_context(|| {
+        format!("failed to create download dir {}", tmp_dir.display())
+    })?;
+
+    let archive_name = url.rsplit('/').next().unwrap_or("bge-model.zip");
+    let archive_path = tmp_dir.join(archive_name);
+
+    info!("BGE model not present; downloading from {url} -> {}", archive_path.display());
     let client = reqwest::Client::new();
-    crate::cmd::tools::download_and_extract_public(&client, &url, target_dir).await?;
+    let download_result =
+        crate::cmd::tools::download_resumable(&client, &url, &archive_path, "BGE model").await;
+    if let Err(e) = download_result {
+        // Leave the partial archive in place so the next run resumes from
+        // the same byte. No clean-up here.
+        anyhow::bail!(
+            "BGE model download failed: {e:#}\n\
+             URL: {url}\n\
+             Partial download retained at {} for resume on next start.\n\
+             Or manually place model files at {} and restart.",
+            archive_path.display(),
+            model_dir.display()
+        );
+    }
 
-    info!("BGE model downloaded to {}", target_dir.display());
+    // Wipe any stale extracted files from a prior failed run before extracting fresh.
+    for entry in std::fs::read_dir(&tmp_dir)?.flatten() {
+        let p = entry.path();
+        if p == archive_path {
+            continue;
+        }
+        if p.is_dir() {
+            let _ = std::fs::remove_dir_all(&p);
+        } else {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+    if let Err(e) = crate::cmd::tools::extract_zip_public(&archive_path, &tmp_dir) {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        anyhow::bail!(
+            "BGE model archive extraction failed: {e:#}\n\
+             The downloaded file at {} may be corrupted. Re-run after deleting it.",
+            archive_path.display()
+        );
+    }
+
+    // Load-test before commit — this is our only completeness guarantee.
+    if let Err(e) = LocalBgeEmbedder::load(&tmp_dir) {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        anyhow::bail!(
+            "downloaded BGE model failed validation: {e:#}\n\
+             The download may have been corrupted. Retry by restarting; if this\n\
+             persists, the upstream model URL may be broken: {url}"
+        );
+    }
+
+    // Drop the archive — only the extracted files matter from here on.
+    let _ = std::fs::remove_file(&archive_path);
+
+    // Atomic install. fs::rename across same filesystem is atomic on POSIX
+    // and Windows (when target doesn't exist).
+    if model_dir.exists() {
+        std::fs::remove_dir_all(model_dir).with_context(|| {
+            format!("failed to clear existing {} before install", model_dir.display())
+        })?;
+    }
+    std::fs::rename(&tmp_dir, model_dir).with_context(|| {
+        format!(
+            "failed to install model: rename {} -> {}",
+            tmp_dir.display(),
+            model_dir.display()
+        )
+    })?;
+
+    info!("BGE model installed at {}", model_dir.display());
     Ok(())
 }
 

@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use super::style::*;
 use crate::cli::ToolsCommand;
@@ -475,39 +476,10 @@ async fn download_and_extract(
     url: &str,
     dest: &std::path::Path,
 ) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-
-    let resp = client
-        .get(url)
-        .timeout(std::time::Duration::from_secs(600))
-        .send()
-        .await?
-        .error_for_status()?;
-
-    // Stream to temp file to avoid loading entire archive into memory
-    // (critical for 1-core/1GB machines where 500MB+ archives would OOM)
     let tmp_dir = tempfile::tempdir()?;
     let filename = url.rsplit('/').next().unwrap_or("download");
     let tmp_path = tmp_dir.path().join(filename);
-
-    {
-        let mut stream = resp.bytes_stream();
-        let mut file = tokio::fs::File::create(&tmp_path).await?;
-        let mut downloaded: u64 = 0;
-        use futures::StreamExt;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            file.write_all(&chunk).await?;
-            downloaded += chunk.len() as u64;
-            // Progress every ~10MB
-            if downloaded % (10 * 1024 * 1024) < chunk.len() as u64 {
-                print!("\r    Downloaded {}MB...", downloaded / 1_000_000);
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-            }
-        }
-        file.flush().await?;
-        println!("\r    Downloaded {}MB, extracting...", downloaded / 1_000_000);
-    }
+    download_resumable(client, url, &tmp_path, filename).await?;
 
     if url.ends_with(".zip") {
         extract_zip(&tmp_path, dest)?;
@@ -523,6 +495,121 @@ async fn download_and_extract(
     }
 
     Ok(())
+}
+
+/// Resumable streaming HTTP download with a TTY progress bar. The file lives
+/// at `out_path` across runs — interrupted transfers continue via the HTTP
+/// `Range` header on the next attempt. Servers that ignore the Range header
+/// (replying 200 instead of 206) trigger a clean restart from byte 0.
+///
+/// `label` shows in the progress bar prefix (e.g. "BGE model").
+///
+/// Returns the total bytes resident at `out_path` after the call.
+pub async fn download_resumable(
+    client: &reqwest::Client,
+    url: &str,
+    out_path: &std::path::Path,
+    label: &str,
+) -> Result<u64> {
+    use indicatif::{ProgressBar, ProgressStyle};
+    use tokio::io::AsyncWriteExt;
+    use futures::StreamExt;
+
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let already = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
+
+    // Issue a single GET with a conditional Range header. Lets us combine
+    // the size-discovery and content-fetching into one round trip.
+    let mut req = client.get(url).timeout(Duration::from_secs(600));
+    if already > 0 {
+        req = req.header(reqwest::header::RANGE, format!("bytes={already}-"));
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+
+    let resume = match status.as_u16() {
+        206 => true,                                  // Partial Content — append
+        200 => false,                                 // server ignored Range — restart
+        416 => {
+            // Already have the full file (or local is larger than remote).
+            // Treat as success at current size.
+            return Ok(already);
+        }
+        _ => {
+            anyhow::bail!(
+                "download {url} failed: HTTP {status} {}",
+                status.canonical_reason().unwrap_or("")
+            );
+        }
+    };
+
+    // Total expected size after this transfer completes.
+    let total_size = if resume {
+        // Content-Range: bytes start-end/total
+        resp.headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.rsplit('/').next())
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| resp.content_length().map(|n| already + n))
+    } else {
+        resp.content_length()
+    };
+
+    let bar = if let Some(total) = total_size {
+        let bar = ProgressBar::new(total);
+        bar.set_style(
+            ProgressStyle::with_template(
+                "    {prefix:>12} [{bar:30.cyan/blue}] {bytes:>10}/{total_bytes:>10} {bytes_per_sec:>10} ETA {eta:>5}",
+            )
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("=> "),
+        );
+        bar.set_prefix(label.to_owned());
+        if resume {
+            bar.set_position(already);
+        }
+        bar
+    } else {
+        let bar = ProgressBar::new_spinner();
+        bar.set_prefix(label.to_owned());
+        bar
+    };
+
+    let mut file = if resume {
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(out_path)
+            .await?
+    } else {
+        tokio::fs::File::create(out_path).await?
+    };
+
+    let mut written = if resume { already } else { 0 };
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        file.write_all(&chunk).await?;
+        written += chunk.len() as u64;
+        bar.set_position(written);
+    }
+    file.flush().await?;
+    bar.finish_and_clear();
+
+    Ok(written)
+}
+
+/// Extract a zip archive to `dest`, stripping the top-level directory.
+/// Public so the gateway can extract a pre-downloaded archive without
+/// re-downloading.
+pub fn extract_zip_public(
+    archive_path: &std::path::Path,
+    dest: &std::path::Path,
+) -> Result<()> {
+    extract_zip(archive_path, dest)
 }
 
 fn extract_zip(archive_path: &std::path::Path, dest: &std::path::Path) -> Result<()> {
