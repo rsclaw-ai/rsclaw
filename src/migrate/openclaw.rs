@@ -1276,9 +1276,67 @@ pub fn copy_skills(src_workspace: &Path, dst_workspace: &Path) -> Result<usize> 
             copy_dir_recursive(&src_path, &dst_path)?;
             count += 1;
             debug!(skill = ?name, "copied skill");
+            // OpenClaw skill SKILL.md frontmatter often wraps URLs / paths
+            // in backticks for visual decoration (`https://example.com`).
+            // Backticks aren't a valid YAML scalar start char; rsclaw's
+            // strict YAML loader rejects the file with "found character
+            // that cannot start any token". Strip them post-copy.
+            let skill_md = dst_path.join("SKILL.md");
+            if skill_md.is_file()
+                && let Err(e) = sanitize_skill_md_frontmatter(&skill_md)
+            {
+                warn!(error = %e, file = %skill_md.display(), "failed to sanitize SKILL.md frontmatter");
+            }
         }
     }
     Ok(count)
+}
+
+/// Strip backtick-wrapped scalar values from SKILL.md YAML frontmatter so
+/// rsclaw's strict YAML loader can parse it.
+///
+/// Rewrites lines that look like `key: \`value\`` into `key: value`. Idempotent
+/// — running twice is a no-op. Returns Ok(true) if the file was modified.
+fn sanitize_skill_md_frontmatter(path: &Path) -> Result<bool> {
+    let content = fs::read_to_string(path)?;
+    let Some(rest) = content.strip_prefix("---\n") else {
+        return Ok(false);
+    };
+    let Some(end_offset) = rest.find("\n---\n") else {
+        return Ok(false);
+    };
+    let frontmatter = &rest[..end_offset];
+    let after = &rest[end_offset..]; // includes leading "\n---\n" and body
+
+    let mut changed = false;
+    let mut new_fm = String::with_capacity(frontmatter.len());
+    for line in frontmatter.lines() {
+        // Look for `key: `value`` pattern. Be conservative: only strip when
+        // the entire value is backtick-wrapped on a single line.
+        if let Some(colon_tick) = line.find(": `") {
+            let key_part = &line[..colon_tick];
+            let after_open = &line[colon_tick + 3..];
+            if let Some(close_tick_off) = after_open.rfind('`') {
+                let value = &after_open[..close_tick_off];
+                let trailing = &after_open[close_tick_off + 1..]; // any post-close text (rare)
+                if !value.contains('`') && trailing.trim().is_empty() {
+                    new_fm.push_str(key_part);
+                    new_fm.push_str(": ");
+                    new_fm.push_str(value);
+                    new_fm.push('\n');
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+        new_fm.push_str(line);
+        new_fm.push('\n');
+    }
+    if !changed {
+        return Ok(false);
+    }
+    fs::write(path, format!("---\n{new_fm}{after}"))?;
+    Ok(true)
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
@@ -1665,6 +1723,45 @@ pub fn collect_all_memories(openclaw_dir: &Path, config_json: &str) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skill_md_strips_backtick_wrapped_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("SKILL.md");
+        std::fs::write(
+            &path,
+            "---\nname: foo\nhomepage: `https://example.com/`\nmetadata: {\"k\":\"v\"}\n---\n\n# Body\n",
+        )
+        .unwrap();
+        assert!(sanitize_skill_md_frontmatter(&path).unwrap());
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("homepage: https://example.com/"),
+            "expected backticks stripped, got:\n{after}"
+        );
+        // Body untouched.
+        assert!(after.ends_with("\n# Body\n"));
+        // Idempotent.
+        assert!(!sanitize_skill_md_frontmatter(&path).unwrap());
+    }
+
+    #[test]
+    fn skill_md_no_frontmatter_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("SKILL.md");
+        std::fs::write(&path, "# Just markdown\n\nNo frontmatter here.\n").unwrap();
+        assert!(!sanitize_skill_md_frontmatter(&path).unwrap());
+    }
+
+    #[test]
+    fn skill_md_preserves_quoted_strings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("SKILL.md");
+        let original = "---\nname: bar\ndescription: \"already quoted\"\n---\n\nbody\n";
+        std::fs::write(&path, original).unwrap();
+        assert!(!sanitize_skill_md_frontmatter(&path).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
 
     #[test]
     fn extract_string_content() {
