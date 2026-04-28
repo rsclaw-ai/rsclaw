@@ -128,7 +128,7 @@ pub(crate) fn start_whatsapp_if_configured(
                         match enforcer.check(&from).await {
                             PolicyResult::Allow => {}
                             PolicyResult::Deny => {
-                                debug!(peer_id = %from, "whatsapp DM rejected by policy");
+                                warn!(peer_id = %from, "whatsapp DM rejected by policy");
                                 return;
                             }
                             PolicyResult::SendPairingCode(code) => {

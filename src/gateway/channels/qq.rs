@@ -152,12 +152,12 @@ pub(crate) fn start_qq_if_configured(
                     if is_group {
                         match group_policy.as_ref() {
                             crate::config::schema::GroupPolicy::Disabled => {
-                                debug!("qq group message rejected: groupPolicy=disabled");
+                                warn!("qq group message rejected: groupPolicy=disabled");
                                 return;
                             }
                             crate::config::schema::GroupPolicy::Allowlist => {
                                 if !group_allow.iter().any(|g| *g == target_id) {
-                                    debug!("qq group message rejected: not in groupAllowFrom");
+                                    warn!("qq group message rejected: not in groupAllowFrom");
                                     return;
                                 }
                             }
@@ -170,7 +170,7 @@ pub(crate) fn start_qq_if_configured(
                         match enforcer.check(&sender_id).await {
                             PolicyResult::Allow => {}
                             PolicyResult::Deny => {
-                                debug!(peer_id = %sender_id, "qq DM rejected by policy");
+                                warn!(peer_id = %sender_id, "qq DM rejected by policy");
                                 return;
                             }
                             PolicyResult::SendPairingCode(code) => {

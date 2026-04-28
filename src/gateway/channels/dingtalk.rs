@@ -171,12 +171,12 @@ pub(crate) fn start_dingtalk_if_configured(
                     if is_group {
                         match group_policy.as_ref() {
                             crate::config::schema::GroupPolicy::Disabled => {
-                                debug!("dingtalk group message rejected: groupPolicy=disabled");
+                                warn!("dingtalk group message rejected: groupPolicy=disabled");
                                 return;
                             }
                             crate::config::schema::GroupPolicy::Allowlist => {
                                 if !group_allow.iter().any(|g| *g == conversation_id) {
-                                    debug!(
+                                    warn!(
                                         "dingtalk group message rejected: not in groupAllowFrom"
                                     );
                                     return;
@@ -191,7 +191,7 @@ pub(crate) fn start_dingtalk_if_configured(
                         match enforcer.check(&sender_id).await {
                             PolicyResult::Allow => {}
                             PolicyResult::Deny => {
-                                debug!(peer_id = %sender_id, "dingtalk DM rejected by policy");
+                                warn!(peer_id = %sender_id, "dingtalk DM rejected by policy");
                                 return;
                             }
                             PolicyResult::SendPairingCode(code) => {

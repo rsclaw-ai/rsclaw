@@ -123,7 +123,7 @@ pub(crate) fn start_zalo_if_configured(
                         match enforcer.check(&sender_id).await {
                             PolicyResult::Allow => {}
                             PolicyResult::Deny => {
-                                debug!(peer_id = %sender_id, "zalo DM rejected by policy");
+                                warn!(peer_id = %sender_id, "zalo DM rejected by policy");
                                 return;
                             }
                             PolicyResult::SendPairingCode(code) => {

@@ -305,13 +305,13 @@ pub(crate) fn start_channels(
                         if is_group {
                             match group_policy.as_ref() {
                                 crate::config::schema::GroupPolicy::Disabled => {
-                                    debug!(chat_id, "telegram group message rejected: groupPolicy=disabled");
+                                    warn!(chat_id, "telegram group message rejected: groupPolicy=disabled");
                                     return;
                                 }
                                 crate::config::schema::GroupPolicy::Allowlist => {
                                     let cid = chat_id.to_string();
                                     if !group_allow.iter().any(|g| *g == cid) {
-                                        debug!(chat_id, "telegram group message rejected: not in groupAllowFrom");
+                                        warn!(chat_id, "telegram group message rejected: not in groupAllowFrom");
                                         return;
                                     }
                                 }
@@ -324,7 +324,7 @@ pub(crate) fn start_channels(
                             match enforcer.check(&peer_id.to_string()).await {
                                 PolicyResult::Allow => {}
                                 PolicyResult::Deny => {
-                                    debug!(peer_id, "telegram DM rejected by policy");
+                                    warn!(peer_id, "telegram DM rejected by policy");
                                     return;
                                 }
                                 PolicyResult::SendPairingCode(code) => {
