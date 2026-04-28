@@ -1,7 +1,8 @@
-//! Syntax checking for script files before execution.
+//! Syntax checking and error parsing for script files.
 //!
-//! Provides pre-execution syntax validation to catch errors early,
-//! giving the LLM clear diagnostic messages instead of confusing runtime errors.
+//! Provides:
+//! - Pre-execution syntax validation to catch errors early
+//! - Runtime error parsing for clearer diagnostic messages
 
 use std::path::Path;
 use std::process::Command;
@@ -300,4 +301,200 @@ fn parse_ts_error(stderr: &str, path: &str) -> Value {
             "Review TypeScript errors and fix before executing.".to_string()
         }
     })
+}
+
+// ---------------------------------------------------------------------------
+// Runtime error parsing (for execution failures)
+// ---------------------------------------------------------------------------
+
+/// Parse Python runtime error from stderr output.
+/// Handles both syntax errors and runtime errors (KeyError, ValueError, etc.)
+/// Returns a structured error object for clearer diagnostics.
+pub fn parse_python_runtime_error(stderr: &str) -> Value {
+    // Python error format (traceback):
+    // Traceback (most recent call last):
+    //   File "script.py", line 5, in <module>
+    //     result = conn.execute("SELECT ...")
+    // duckdb.duckdb.ProgrammingError: Binder Error: Referenced column "ts_code" not found
+
+    let mut line_num: Option<usize> = None;
+    let mut file_name: Option<String> = None;
+    let mut error_type: Option<String> = None;
+    let mut error_msg: Option<String> = None;
+    let mut error_line_content: Option<String> = None;
+
+    for line in stderr.lines() {
+        // Extract location: File "script.py", line 5, in <module>
+        if line.contains("File \"") && line.contains(", line ") {
+            // Extract file name
+            if let Some(start) = line.find("File \"") {
+                if let Some(end) = line[start + 6..].find("\"") {
+                    file_name = Some(line[start + 6..start + 6 + end].to_string());
+                }
+            }
+            // Extract line number
+            if let Some(pos) = line.find(", line ") {
+                let rest = &line[pos + 7..];
+                if let Some(num_str) = rest.split(',').next() {
+                    line_num = num_str.trim().parse().ok();
+                }
+            }
+        }
+        // Extract error line content (the actual code that caused error)
+        if line_num.is_some() && line.trim().starts_with("    ") {
+            error_line_content = Some(line.trim().to_string());
+        }
+        // Extract error type and message (last non-empty line usually)
+        // Formats: "ErrorType: message" or "module.ErrorType: message"
+        if line.contains(": ") && !line.contains("File \"") && !line.contains("Traceback") {
+            // Skip lines that look like traceback location
+            let trimmed = line.trim();
+            if !trimmed.starts_with("File") && !trimmed.starts_with("Traceback") {
+                // This might be the error line
+                if let Some(pos) = trimmed.rfind(": ") {
+                    // Error type might have module prefix like "duckdb.duckdb.ProgrammingError"
+                    let before_colon = &trimmed[..pos];
+                    let after_colon = &trimmed[pos + 2..];
+                    // Check if before_colon looks like an error type (contains dots or capital letters)
+                    if before_colon.contains('.') || before_colon.chars().any(|c| c.is_uppercase()) {
+                        error_type = Some(before_colon.to_string());
+                        error_msg = Some(after_colon.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Build hint based on error type
+    let hint = match error_type.as_deref() {
+        Some("SyntaxError") | Some("IndentationError") => {
+            if let Some(ln) = line_num {
+                format!("Syntax error at line {}. Check for missing parenthesis, mismatched quotes, or indentation issues.", ln)
+            } else {
+                "Check for syntax errors in the code.".to_string()
+            }
+        }
+        Some("KeyError") => {
+            if let Some(msg) = &error_msg {
+                format!("Key not found: {}. Check if the key exists in the data structure.", msg)
+            } else {
+                "A key was not found. Check the data structure for the correct key name.".to_string()
+            }
+        }
+        Some("ValueError") => {
+            if let Some(msg) = &error_msg {
+                format!("Invalid value: {}. Check the input values are correct.", msg)
+            } else {
+                "Invalid value provided. Check input format and constraints.".to_string()
+            }
+        }
+        Some("NameError") => {
+            if let Some(msg) = &error_msg {
+                format!("Name '{}' is not defined. Check if the variable/function exists.", msg)
+            } else {
+                "A name is not defined. Check for typo or missing import.".to_string()
+            }
+        }
+        Some("ProgrammingError") | Some("duckdb.ProgrammingError") | Some("duckdb.duckdb.ProgrammingError") => {
+            if let Some(msg) = &error_msg {
+                if msg.contains("not found") || msg.contains("does not exist") {
+                    format!("Database error: {}. Check column/table names are correct.", msg)
+                } else {
+                    format!("Database error: {}. Check your SQL query syntax.", msg)
+                }
+            } else {
+                "Database error. Check SQL query syntax and table/column names.".to_string()
+            }
+        }
+        Some("OperationalError") | Some("sqlite3.OperationalError") => {
+            "Database operational error. Check table/column names and SQL syntax.".to_string()
+        }
+        Some("TypeError") => {
+            if let Some(msg) = &error_msg {
+                format!("Type error: {}. Check function arguments and types.", msg)
+            } else {
+                "Type mismatch. Check function arguments and variable types.".to_string()
+            }
+        }
+        Some("ImportError") | Some("ModuleNotFoundError") => {
+            "Module not found. Install the required package or check the import name.".to_string()
+        }
+        _ => {
+            if let Some(ln) = line_num {
+                format!("Error at line {}. Review the traceback for details.", ln)
+            } else {
+                "Review the error traceback for details.".to_string()
+            }
+        }
+    };
+
+    json!({
+        "error": true,
+        "error_type": error_type,
+        "message": error_msg,
+        "file": file_name,
+        "line": line_num,
+        "line_content": error_line_content,
+        "raw_output": stderr.trim(),
+        "hint": hint
+    })
+}
+
+/// Parse shell runtime error from stderr output.
+pub fn parse_shell_runtime_error(stderr: &str) -> Value {
+    // Shell error format varies. Common patterns:
+    // /bin/bash: line 5: command: command not found
+    // python: can't open file 'script.py': [Errno 2] No such file or directory
+
+    let mut line_num: Option<usize> = None;
+    let mut error_msg: Option<String> = None;
+
+    for line in stderr.lines() {
+        if line.contains(": line ") {
+            if let Some(pos) = line.find(": line ") {
+                let rest = &line[pos + 7..];
+                if let Some(end) = rest.find(':') {
+                    line_num = rest[..end].trim().parse().ok();
+                    error_msg = Some(rest[end + 1..].trim().to_string());
+                }
+            }
+        }
+        // Python file not found error
+        if line.contains("can't open file") || line.contains("No such file or directory") {
+            error_msg = Some(line.trim().to_string());
+        }
+    }
+
+    json!({
+        "error": true,
+        "message": error_msg,
+        "line": line_num,
+        "raw_output": stderr.trim(),
+        "hint": if let Some(ln) = line_num {
+            format!("Error at line {}. Check command syntax and arguments.", ln)
+        } else {
+            "Check the command syntax and file paths.".to_string()
+        }
+    })
+}
+
+/// Parse runtime error based on command type (python, bash, etc.)
+pub fn parse_runtime_error(command: &str, stderr: &str) -> Value {
+    if stderr.is_empty() {
+        return json!({"error": false, "raw_output": ""});
+    }
+
+    // Detect command type
+    if command.contains("python") || command.contains("python3") {
+        parse_python_runtime_error(stderr)
+    } else if command.contains("bash") || command.contains("sh") || command.contains("shell") {
+        parse_shell_runtime_error(stderr)
+    } else {
+        // Generic fallback
+        json!({
+            "error": true,
+            "raw_output": stderr.trim(),
+            "hint": "Check the command output for errors.".to_string()
+        })
+    }
 }

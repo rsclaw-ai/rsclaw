@@ -433,6 +433,10 @@ impl super::runtime::AgentRuntime {
         let syntax_result = super::syntax_check::check_syntax(&full, &content);
 
         if let Some(syntax_err) = syntax_result {
+            tracing::warn!(
+                path = %path,
+                "write_file: syntax error detected in script file"
+            );
             // Return both success + syntax warning
             Ok(json!({
                 "written": true,
@@ -441,6 +445,7 @@ impl super::runtime::AgentRuntime {
                 "syntax_check": syntax_err
             }))
         } else {
+            tracing::debug!(path = %path, "write_file: no syntax issues detected");
             Ok(json!({"written": true, "path": path, "bytes": content.len()}))
         }
     }
@@ -724,12 +729,28 @@ impl super::runtime::AgentRuntime {
             let stderr = String::from_utf8_lossy(&output.stderr);
             tracing::info!(cwd = %workspace.display(), command = %command, exit_code = ?output.status.code(), stdout_len = stdout.len(), stderr_len = stderr.len(), "exec: done");
 
-            Ok(json!({
-                "task_id": task_id,
-                "exit_code": output.status.code(),
-                "stdout": stdout,
-                "stderr": stderr,
-            }))
+            // Parse runtime error if execution failed
+            let exit_code_val = output.status.code();
+            let is_error = exit_code_val.map(|c| c != 0).unwrap_or(true);
+
+            if is_error && !stderr.is_empty() {
+                // Parse the error for clearer diagnostics
+                let parsed_error = super::syntax_check::parse_runtime_error(&command, &stderr);
+                Ok(json!({
+                    "task_id": task_id,
+                    "exit_code": exit_code_val,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "error_parsed": parsed_error
+                }))
+            } else {
+                Ok(json!({
+                    "task_id": task_id,
+                    "exit_code": exit_code_val,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                }))
+            }
         } else {
             // Background execution — spawn and return task_id immediately.
             // The result will be collected by exec_pool on the next turn.
