@@ -816,6 +816,142 @@ pub fn import_sessions_to_redb(
 }
 
 // ---------------------------------------------------------------------------
+// Memory store import (BGE embedding required)
+// ---------------------------------------------------------------------------
+
+/// Stats for the openclaw → MemoryStore memory import.
+#[derive(Debug, Default)]
+pub struct MemoryImportStats {
+    pub total: usize,
+    pub imported: usize,
+    pub errors: usize,
+}
+
+/// Import every `memory_put` entry across every agent into the rsclaw
+/// MemoryStore. Embedding (the slow part) runs off-lock in parallel via
+/// rayon; insertion takes a brief lock per batch. Safe to call from any
+/// async context — `mem_arc` is the same `Arc<Mutex<MemoryStore>>` the
+/// gateway uses, so calling this AFTER `start_gateway` would race with
+/// live agent writes (intended use is during one-shot setup before the
+/// gateway boots).
+pub async fn import_memories_to_store(
+    openclaw_dir: &Path,
+    mem_arc: &std::sync::Arc<tokio::sync::Mutex<crate::agent::MemoryStore>>,
+) -> Result<MemoryImportStats> {
+    use crate::agent::memory::MemoryDoc;
+    use rayon::prelude::*;
+
+    let agents_dir = openclaw_dir.join("agents");
+    if !agents_dir.is_dir() {
+        info!("openclaw memory import: no agents/ directory");
+        return Ok(MemoryImportStats::default());
+    }
+
+    let mut all_memories: Vec<ConvertedMemory> = Vec::new();
+    for entry in fs::read_dir(&agents_dir)?.flatten() {
+        let agent_dir = entry.path();
+        if !agent_dir.is_dir() {
+            continue;
+        }
+        let agent_id = agent_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_owned();
+        if agent_id.is_empty() {
+            continue;
+        }
+        if let Ok(mems) = read_agent_memories(&agent_dir, &agent_id) {
+            all_memories.extend(mems);
+        }
+    }
+
+    let total = all_memories.len();
+    if total == 0 {
+        return Ok(MemoryImportStats::default());
+    }
+
+    info!(total, "openclaw memory import: parallel embed starting");
+    let started = std::time::Instant::now();
+    /// Tunable: large enough to amortise lock + redb tx overhead, small
+    /// enough that one batch's worth of intermediate tensors stays under a
+    /// few hundred MB on a low-RAM machine.
+    const BATCH: usize = 100;
+
+    let mut imported = 0usize;
+    let mut errors = 0usize;
+    for chunk in all_memories.chunks(BATCH) {
+        // Snapshot the embedders under a brief lock.
+        let (primary, secondary) = {
+            let mem = mem_arc.lock().await;
+            mem.embedders_for_dual_write()
+        };
+
+        // Parallel embed off-lock — rayon picks the global pool size
+        // (defaults to num CPUs) so this saturates whatever cores the
+        // machine has without our managing thread counts.
+        let prepared: Vec<(MemoryDoc, Vec<f32>, Option<Vec<f32>>)> = chunk
+            .par_iter()
+            .map(|cm| {
+                let doc = MemoryDoc {
+                    id: format!("oc:{}:{}", cm.agent_id, cm.key),
+                    scope: cm.agent_id.clone(),
+                    kind: "openclaw_memory".to_owned(),
+                    text: cm.value.clone(),
+                    vector: Vec::new(),
+                    created_at: 0,
+                    accessed_at: 0,
+                    access_count: 0,
+                    importance: 0.5,
+                    tier: Default::default(),
+                    abstract_text: None,
+                    overview_text: None,
+                    tags: vec!["openclaw_import".to_owned()],
+                    pinned: false,
+                };
+                let pv = primary.embed(&doc.text);
+                let sv = secondary.as_ref().map(|e| e.embed(&doc.text));
+                (doc, pv, sv)
+            })
+            .collect();
+
+        // Sequential add under a single brief lock per batch — HNSW + redb
+        // need &mut and the inserts are cheap (~ms each) compared to the
+        // embeds we just amortised in parallel.
+        let mut mem = mem_arc.lock().await;
+        for (doc, pv, sv) in prepared {
+            match mem.add_pre_embedded(doc, pv, sv).await {
+                Ok(()) => imported += 1,
+                Err(e) => {
+                    warn!(error = %e, "openclaw memory import: add_pre_embedded failed");
+                    errors += 1;
+                }
+            }
+        }
+        info!(
+            imported,
+            total,
+            errors,
+            elapsed_secs = started.elapsed().as_secs(),
+            "openclaw memory import: batch complete"
+        );
+    }
+
+    info!(
+        total,
+        imported,
+        errors,
+        elapsed_secs = started.elapsed().as_secs(),
+        "openclaw memory import: done"
+    );
+    Ok(MemoryImportStats {
+        total,
+        imported,
+        errors,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Workspace file migration
 // ---------------------------------------------------------------------------
 

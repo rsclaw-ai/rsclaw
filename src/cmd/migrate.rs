@@ -66,7 +66,7 @@ pub async fn cmd_migrate(args: MigrateArgs) -> Result<()> {
             handle_fresh(&rsclaw_dir, args.dry_run)?;
         }
         MigrateMode::Import => {
-            handle_import(&openclaw_dir, &rsclaw_dir, args.dry_run)?;
+            handle_import(&openclaw_dir, &rsclaw_dir, args.dry_run).await?;
         }
     }
 
@@ -93,7 +93,7 @@ fn handle_fresh(rsclaw_dir: &PathBuf, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn handle_import(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf, dry_run: bool) -> Result<()> {
+async fn handle_import(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf, dry_run: bool) -> Result<()> {
     if !openclaw_dir.is_dir() {
         err_msg("no OpenClaw data directory found to import from");
         err_msg("specify --openclaw-dir or ensure OpenClaw is installed");
@@ -132,7 +132,7 @@ fn handle_import(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf, dry_run: bool) ->
     }
 
     // Perform the actual import.
-    import_data(openclaw_dir, rsclaw_dir)?;
+    import_data(openclaw_dir, rsclaw_dir).await?;
 
     Ok(())
 }
@@ -168,11 +168,11 @@ fn show_scan_results(openclaw_dir: &PathBuf) -> Result<openclaw::OpenClawScanRes
 }
 
 /// Public entry point for setup.rs to call the unified import logic.
-pub fn import_data_from(openclaw_dir: &std::path::Path, rsclaw_dir: &std::path::Path) -> Result<()> {
-    import_data(&openclaw_dir.to_path_buf(), &rsclaw_dir.to_path_buf())
+pub async fn import_data_from(openclaw_dir: &std::path::Path, rsclaw_dir: &std::path::Path) -> Result<()> {
+    import_data(&openclaw_dir.to_path_buf(), &rsclaw_dir.to_path_buf()).await
 }
 
-fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()> {
+async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()> {
     use crate::store::redb_store::RedbStore;
 
     std::fs::create_dir_all(rsclaw_dir)?;
@@ -182,6 +182,51 @@ fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()> {
     let store = RedbStore::open(&redb_dir.join("data.redb"), crate::MemoryTier::Standard)?;
 
     let mut stats = openclaw::import_sessions_to_redb(openclaw_dir, &store)?;
+
+    // Memory import: requires BGE model + async MemoryStore. Best-effort —
+    // log + warn on failure so a user without network can still complete the
+    // session import. They can re-run `rsclaw migrate` later to backfill.
+    let model_dir = rsclaw_dir.join("models/bge-small-zh");
+    let memory_data_dir = rsclaw_dir.join("var/data");
+    std::fs::create_dir_all(&memory_data_dir).ok();
+    match crate::gateway::startup::ensure_bge_model_present(&model_dir, None).await {
+        Ok(()) => {
+            match crate::agent::memory::MemoryStore::open(
+                &memory_data_dir,
+                Some(&model_dir),
+                crate::MemoryTier::Standard,
+                None,
+            )
+            .await
+            {
+                Ok(mem) => {
+                    let mem_arc = std::sync::Arc::new(tokio::sync::Mutex::new(mem));
+                    match openclaw::import_memories_to_store(openclaw_dir, &mem_arc).await {
+                        Ok(mstats) => {
+                            stats.memories = mstats.imported;
+                            if mstats.errors > 0 {
+                                stats.errors += mstats.errors;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "openclaw memory import failed");
+                            stats.errors += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not open MemoryStore for memory import; skipping");
+                    stats.errors += 1;
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "BGE model unavailable; skipping memory import. Re-run `rsclaw migrate` after fixing network or placing model files manually."
+            );
+        }
+    }
 
     // --- Import workspace files and skills ---
     let config_path = openclaw_dir.join("openclaw.json");

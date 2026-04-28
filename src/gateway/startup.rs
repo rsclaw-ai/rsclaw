@@ -1154,10 +1154,14 @@ async fn run_embedder_reembed(
             break;
         }
         batch_no += 1;
-        // Heavy work off-lock.
+        // Heavy work off-lock — parallel across the rayon pool so a 100-doc
+        // batch finishes in batch_size/num_cores * inference time instead of
+        // sequential. BertModel::forward takes `&self`, so concurrent embed
+        // calls are safe.
         let batch_started = std::time::Instant::now();
+        use rayon::prelude::*;
         let batch: Vec<(usize, Vec<f32>)> = pending
-            .into_iter()
+            .into_par_iter()
             .map(|(idx, text)| (idx, embedder.embed(&text)))
             .collect();
         let applied = {
@@ -1246,7 +1250,7 @@ fn read_sentinel_bytes(model_dir: &std::path::Path) -> Option<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 
-async fn ensure_bge_model_present(
+pub(crate) async fn ensure_bge_model_present(
     model_dir: &std::path::Path,
     search_cfg: Option<&crate::config::schema::MemorySearchConfig>,
 ) -> anyhow::Result<()> {
