@@ -880,6 +880,7 @@ pub async fn import_memories_to_store(
 
     let mut imported = 0usize;
     let mut errors = 0usize;
+    let show_progress = total > BATCH;
     for chunk in all_memories.chunks(BATCH) {
         // Snapshot the embedders under a brief lock.
         let (primary, secondary) = {
@@ -935,6 +936,9 @@ pub async fn import_memories_to_store(
             elapsed_secs = started.elapsed().as_secs(),
             "openclaw memory import: batch complete"
         );
+        if show_progress {
+            eprintln!("    · embedded {imported}/{total}");
+        }
     }
 
     info!(
@@ -1050,10 +1054,13 @@ pub async fn import_workspace_memory(
     }
 
     // Ingest into MemoryStore — same parallel-embed-then-brief-lock-insert
-    // pattern as `import_memories_to_store`.
+    // pattern as `import_memories_to_store`. Print a per-batch tick to
+    // stderr when the dataset is large enough to span multiple batches —
+    // gives the user visible progress during the longest migration phase.
     const BATCH: usize = 50;
     let mut imported = 0usize;
     let mut embed_errors = 0usize;
+    let show_progress = sources.len() > BATCH;
     for chunk in sources.chunks(BATCH) {
         let (primary, secondary) = {
             let mem = mem_arc.lock().await;
@@ -1101,6 +1108,9 @@ pub async fn import_workspace_memory(
                     embed_errors += 1;
                 }
             }
+        }
+        if show_progress {
+            eprintln!("    · embedded {imported}/{total}");
         }
     }
 
