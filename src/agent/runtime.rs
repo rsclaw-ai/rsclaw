@@ -3988,13 +3988,20 @@ impl AgentRuntime {
                 // IMPORTANT: Check turn_scratchpad for tool calls from earlier iterations,
                 // not just current iteration's tool_calls (which is empty at this point).
                 let deception_keywords = [
-                    "已委托", "已用opencode", "已让opencode", "委托给opencode",
-                    "已检查", "已搜索", "已运行", "已执行",
-                    "已交给", "交给opencode", "opencode正在", "opencode已经",
+                    // Chinese - claiming delegation/execution
+                    "已委托", "已提交", "已用opencode", "已让opencode", "委托给opencode",
+                    "已检查", "已搜索", "已运行", "已执行", "已完成",
+                    "已交给", "交给opencode", "opencode正在", "opencode已经", "opencode会",
                     "已访问", "访问了", "用浏览器", "用cdp", "用CDP",
-                    "I delegated", "I asked opencode", "opencode is", "I ran",
-                    "I checked", "I searched", "I executed", "I visited",
+                    "正在执行", "正在运行", "正在检查", "正在搜索",
+                    "我来执行", "我来运行", "我来检查", "我来搜索",
+                    "帮你执行", "帮你运行", "帮你检查", "帮你搜索",
+                    // English - claiming delegation/execution
+                    "I delegated", "I submitted", "I asked opencode", "opencode is", "I ran",
+                    "I checked", "I searched", "I executed", "I visited", "I completed",
+                    "I will", "I'm running", "I'm executing", "I'm checking",
                     "using browser", "used browser", "using cdp", "used cdp",
+                    "let me", "help you",
                 ];
                 let lower_text = text_buf.to_lowercase();
                 let claims_action = deception_keywords.iter().any(|kw| {
@@ -4023,29 +4030,31 @@ impl AgentRuntime {
                         has_tool_in_turn = has_tool_in_turn,
                         "DECEPTION DETECTED: model claims action but no tool_call in turn"
                     );
-                    // Send warning via notification channel (streaming already sent original text).
-                    // Append warning to text_buf so it's persisted in session history.
-                    let warning = "\n\n⚠️ **警告**: 模型声称已执行操作但实际上没有调用任何工具。\
-                        这是欺骗行为。请回复「重试并实际调用工具」强制模型执行。";
-                    text_buf.push_str(warning);
-                    // Also send immediately via notification so user sees it.
-                    if let Some(ref ntx) = self.notification_tx {
-                        let notif_target = if !ctx.chat_id.is_empty() {
-                            ctx.chat_id.clone()
-                        } else {
-                            ctx.peer_id.clone()
-                        };
-                        let _ = ntx.send(crate::channel::OutboundMessage {
-                            target_id: notif_target,
-                            is_group: false,
-                            text: "⚠️ **欺骗警告**: 模型声称「已委托/已检查」但没有调用任何工具。\
-                                这是欺骗行为。\n\n请回复「重试」强制模型实际调用 opencode 工具。".to_owned(),
-                            reply_to: None,
-                            images: vec![],
-                            files: vec![],
-                            channel: Some(ctx.channel.clone()),
-                        });
-                    }
+                    // CRITICAL: Do NOT return the deceptive text to user.
+                    // Instead, inject a correction message and continue the loop.
+                    // Clear the deceptive text and add a forced user message.
+                    text_buf.clear();
+                    let correction_msg = Message {
+                        role: Role::User,
+                        content: MessageContent::Text(
+                            "[系统纠正] 你刚才声称已执行操作但没有调用任何工具。这是欺骗行为。\n\
+                            现在你必须实际调用工具来执行你声称的操作。\n\
+                            - 如果你说「已提交给opencode」，现在必须调用 opencode 工具\n\
+                            - 如果你说「已搜索」，现在必须调用 web_search 工具\n\
+                            - 如果你说「已执行」，现在必须调用 execute_command 工具\n\
+                            不要解释，直接调用工具。"
+                                .to_owned(),
+                        ),
+                    };
+                    turn_scratchpad.push(correction_msg);
+                    // Do NOT return here - continue the loop to force model to actually call tools
+                    tracing::info!(
+                        session = %ctx.session_key,
+                        "DECEPTION CORRECTION: injected forced message, continuing loop"
+                    );
+                    // Skip the rest of this iteration's final-reply processing
+                    // and continue to the next iteration where model must call tools
+                    continue;
                 }
 
                 // Only persist non-empty assistant replies to session.
