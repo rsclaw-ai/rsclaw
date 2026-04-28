@@ -137,6 +137,15 @@ pub struct ToolCallRecord {
     pub result_hash: Option<String>,
 }
 
+/// Result of ping-pong streak detection.
+#[derive(Debug, Clone, Default)]
+struct PingPongResult {
+    count: usize,
+    paired_tool_name: Option<String>,
+    paired_signature: Option<String>,
+    no_progress_evidence: bool,
+}
+
 /// Max consecutive failures with IDENTICAL error for the same tool before blocking.
 /// Gives LLM enough room for iterative debugging (5 "fix and retry" cycles) while
 /// still catching genuine dead-ends.
@@ -372,6 +381,36 @@ impl LoopDetector {
 
         let (warning_threshold, critical_threshold) = self.thresholds_for(tool_name);
 
+        // Fourth axis: ping-pong detection (A → B → A → B alternating pattern).
+        // Detects when model alternates between two different tools/calls with no progress.
+        let ping_pong = self.get_ping_pong_streak(&args_hash);
+        if ping_pong.count >= critical_threshold && ping_pong.no_progress_evidence {
+            return LoopCheckResult::Critical {
+                tool_name: tool_name.to_owned(),
+                count: ping_pong.count,
+                message: format!(
+                    "CRITICAL: Ping-pong loop detected: alternating between `{}` and `{}` \
+                     {} times with no progress. Session execution blocked to prevent resource waste.",
+                    tool_name,
+                    ping_pong.paired_tool_name.as_deref().unwrap_or("unknown"),
+                    ping_pong.count,
+                ),
+            };
+        }
+        if ping_pong.count >= warning_threshold {
+            return LoopCheckResult::Warning {
+                tool_name: tool_name.to_owned(),
+                count: ping_pong.count,
+                message: format!(
+                    "WARNING: Ping-pong loop pattern detected: alternating between `{}` and `{}` \
+                     {} times. This looks like a stuck loop; stop retrying and report the task as failed.",
+                    tool_name,
+                    ping_pong.paired_tool_name.as_deref().unwrap_or("unknown"),
+                    ping_pong.count,
+                ),
+            };
+        }
+
         // Critical threshold — blocks execution
         if count >= critical_threshold {
             return LoopCheckResult::Critical {
@@ -454,6 +493,105 @@ impl LoopDetector {
             // Success clears both streaks for this tool.
             self.error_streak.remove(&name);
             self.any_failure_streak.remove(&name);
+        }
+    }
+
+    /// Detect ping-pong loop pattern (A → B → A → B alternating calls).
+    /// Returns count of alternating calls and whether there's evidence of no progress.
+    fn get_ping_pong_streak(&self, current_signature: &str) -> PingPongResult {
+        let last = self.history.back();
+        if last.is_none() {
+            return PingPongResult::default();
+        }
+        let last = last.unwrap();
+
+        // Find a different args_hash in history (the "other" tool in the ping-pong pair)
+        let mut other_signature: Option<String> = None;
+        for i in (0..self.history.len().saturating_sub(1)).rev() {
+            if let Some(call) = self.history.iter().nth(i) {
+                if call.args_hash != last.args_hash {
+                    other_signature = Some(call.args_hash.clone());
+                    break;
+                }
+            }
+        }
+
+        if other_signature.is_none() {
+            return PingPongResult::default();
+        }
+        let other_signature = other_signature.unwrap();
+
+        // Count alternating tail: A → B → A → B...
+        let mut alternating_tail_count = 0;
+        let history_len = self.history.len();
+        for i in (0..history_len).rev() {
+            if let Some(call) = self.history.iter().nth(i) {
+                let expected = if alternating_tail_count % 2 == 0 {
+                    &last.args_hash
+                } else {
+                    &other_signature
+                };
+                if &call.args_hash != expected {
+                    break;
+                }
+                alternating_tail_count += 1;
+            }
+        }
+
+        if alternating_tail_count < 2 {
+            return PingPongResult::default();
+        }
+
+        // Check if current call continues the alternating pattern
+        let expected_current = &other_signature;
+        if current_signature != expected_current.as_str() {
+            return PingPongResult::default();
+        }
+
+        // Check for no-progress evidence: both A and B produce same results each time
+        let tail_start = history_len.saturating_sub(alternating_tail_count);
+        let mut first_hash_a: Option<String> = None;
+        let mut first_hash_b: Option<String> = None;
+        let mut no_progress_evidence = true;
+
+        for i in tail_start..history_len {
+            if let Some(call) = self.history.iter().nth(i) {
+                if call.result_hash.is_none() {
+                    no_progress_evidence = false;
+                    break;
+                }
+                let result_hash = call.result_hash.clone().unwrap();
+                if call.args_hash == last.args_hash {
+                    if first_hash_a.is_none() {
+                        first_hash_a = Some(result_hash.clone());
+                    } else if first_hash_a.as_ref() != Some(&result_hash) {
+                        no_progress_evidence = false;
+                        break;
+                    }
+                } else if call.args_hash == other_signature {
+                    if first_hash_b.is_none() {
+                        first_hash_b = Some(result_hash.clone());
+                    } else if first_hash_b.as_ref() != Some(&result_hash) {
+                        no_progress_evidence = false;
+                        break;
+                    }
+                } else {
+                    no_progress_evidence = false;
+                    break;
+                }
+            }
+        }
+
+        // Need both A and B to have stable outcomes before treating as no-progress
+        if first_hash_a.is_none() || first_hash_b.is_none() {
+            no_progress_evidence = false;
+        }
+
+        PingPongResult {
+            count: alternating_tail_count + 1,
+            paired_tool_name: Some(last.tool_name.clone()),
+            paired_signature: Some(last.args_hash.clone()),
+            no_progress_evidence,
         }
     }
 
@@ -750,5 +888,112 @@ mod tests {
         assert!(is_warning(&d.check_with_params("exec", &params)));  // count=3 >= warn(3)
         assert!(is_warning(&d.check_with_params("exec", &params)));  // count=4
         assert!(is_critical(&d.check_with_params("exec", &params))); // count=5 >= crit(5)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Ping-pong detection tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn ping_pong_no_alternating_pattern() {
+        // No alternating pattern: just repeated same calls
+        let mut d = LoopDetector::with_dual_thresholds(10, 3, 5);
+        let params_a = serde_json::json!({"command": "ls"});
+        let params_b = serde_json::json!({"command": "pwd"});
+
+        // A, A, A - no ping-pong
+        assert!(is_ok(&d.check_with_params("exec", &params_a)));
+        d.record_result(&serde_json::json!({"stdout": "same"}));
+        assert!(is_ok(&d.check_with_params("exec", &params_a)));
+        d.record_result(&serde_json::json!({"stdout": "same"}));
+        // This should trigger same-call warning, not ping-pong
+        assert!(is_warning(&d.check_with_params("exec", &params_a)));
+    }
+
+    #[test]
+    fn ping_pong_alternating_with_same_results() {
+        // A → B → A → B with same results each time = ping-pong loop
+        let mut d = LoopDetector::with_dual_thresholds(10, 3, 5);
+        let params_a = serde_json::json!({"command": "ls"});
+        let params_b = serde_json::json!({"command": "pwd"});
+
+        // A (call 1)
+        assert!(is_ok(&d.check_with_params("exec", &params_a)));
+        d.record_result(&serde_json::json!({"stdout": "result_a"}));
+
+        // B (call 2)
+        assert!(is_ok(&d.check_with_params("exec", &params_b)));
+        d.record_result(&serde_json::json!({"stdout": "result_b"}));
+
+        // A (call 3) - starts alternating pattern
+        assert!(is_ok(&d.check_with_params("exec", &params_a)));
+        d.record_result(&serde_json::json!({"stdout": "result_a"})); // same as first A
+
+        // B (call 4) - alternating continues
+        // This is the 4th call in A→B→A→B pattern with no progress
+        // count = 4 >= warning_threshold(3), should be warning
+        assert!(is_warning(&d.check_with_params("exec", &params_b)));
+
+        // Continue alternating with same results
+        d.record_result(&serde_json::json!({"stdout": "result_b"})); // same as first B
+        assert!(is_warning(&d.check_with_params("exec", &params_a)));
+        d.record_result(&serde_json::json!({"stdout": "result_a"}));
+        // 6th call in pattern >= critical_threshold(5) with no_progress_evidence = true
+        assert!(is_critical(&d.check_with_params("exec", &params_b)));
+    }
+
+    #[test]
+    fn ping_pong_with_different_results_no_critical() {
+        // A → B → A → B but with DIFFERENT results = making progress, no critical
+        let mut d = LoopDetector::with_dual_thresholds(10, 3, 5);
+        let params_a = serde_json::json!({"command": "ls"});
+        let params_b = serde_json::json!({"command": "pwd"});
+
+        // A (call 1)
+        assert!(is_ok(&d.check_with_params("exec", &params_a)));
+        d.record_result(&serde_json::json!({"stdout": "a1"}));
+
+        // B (call 2)
+        assert!(is_ok(&d.check_with_params("exec", &params_b)));
+        d.record_result(&serde_json::json!({"stdout": "b1"}));
+
+        // A (call 3) - different result from first A
+        assert!(is_ok(&d.check_with_params("exec", &params_a)));
+        d.record_result(&serde_json::json!({"stdout": "a2"})); // DIFFERENT from a1
+
+        // B (call 4) - different result from first B
+        // No-progress evidence is false, so should only be warning
+        assert!(is_warning(&d.check_with_params("exec", &params_b)));
+        d.record_result(&serde_json::json!({"stdout": "b2"})); // DIFFERENT from b1
+
+        // Continue alternating with different results - should stay warning, not critical
+        assert!(is_warning(&d.check_with_params("exec", &params_a)));
+        d.record_result(&serde_json::json!({"stdout": "a3"}));
+        assert!(is_warning(&d.check_with_params("exec", &params_b)));
+        d.record_result(&serde_json::json!({"stdout": "b3"}));
+        // Even at 6+ calls, no_progress_evidence=false, so should still be warning
+        assert!(is_warning(&d.check_with_params("exec", &params_a)));
+    }
+
+    #[test]
+    fn ping_pong_broken_pattern_no_warning() {
+        // Pattern breaks (third different tool): no ping-pong warning
+        let mut d = LoopDetector::with_dual_thresholds(10, 3, 5);
+        let params_a = serde_json::json!({"command": "ls"});
+        let params_b = serde_json::json!({"command": "pwd"});
+        let params_c = serde_json::json!({"command": "echo"});
+
+        // A → B → A → C (breaks pattern)
+        assert!(is_ok(&d.check_with_params("exec", &params_a)));
+        d.record_result(&serde_json::json!({"stdout": "a"}));
+
+        assert!(is_ok(&d.check_with_params("exec", &params_b)));
+        d.record_result(&serde_json::json!({"stdout": "b"}));
+
+        assert!(is_ok(&d.check_with_params("exec", &params_a)));
+        d.record_result(&serde_json::json!({"stdout": "a"}));
+
+        // C breaks the A→B alternating pattern
+        assert!(is_ok(&d.check_with_params("exec", &params_c)));
     }
 }
