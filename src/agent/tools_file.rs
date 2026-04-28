@@ -428,7 +428,21 @@ impl super::runtime::AgentRuntime {
         tokio::fs::write(&full, &content)
             .await
             .map_err(|e| anyhow!("write `{}`: {e}", full.display()))?;
-        Ok(json!({"written": true, "path": path, "bytes": content.len()}))
+
+        // Syntax check for script files
+        let syntax_result = super::syntax_check::check_syntax(&full, &content);
+
+        if let Some(syntax_err) = syntax_result {
+            // Return both success + syntax warning
+            Ok(json!({
+                "written": true,
+                "path": path,
+                "bytes": content.len(),
+                "syntax_check": syntax_err
+            }))
+        } else {
+            Ok(json!({"written": true, "path": path, "bytes": content.len()}))
+        }
     }
 
     /// Poll a background exec task by task_id.

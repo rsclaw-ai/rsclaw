@@ -26,6 +26,7 @@ pub mod registry;
 pub mod runtime;
 pub mod security;
 pub mod spawner;
+pub mod syntax_check;
 pub mod tool_call_repair;
 pub mod tools_acp;
 pub mod tools_agent;
