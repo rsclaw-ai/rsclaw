@@ -163,6 +163,7 @@ impl AgentRuntime {
             Arc::new(crate::acp::client::DefaultAcpHandler),
             Arc::new(tokio::sync::Mutex::new(crate::acp::notification::NotificationManager::new())),
             init_timeout_secs,
+            "OpenCode",
         ).await?;
         client
             .initialize("rsclaw", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"))
@@ -726,6 +727,7 @@ impl AgentRuntime {
             Arc::new(crate::acp::client::DefaultAcpHandler),
             Arc::new(tokio::sync::Mutex::new(crate::acp::notification::NotificationManager::new())),
             init_timeout_secs,
+            "Claude Code",
         ).await?;
         client
             .initialize("rsclaw", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"))

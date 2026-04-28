@@ -544,28 +544,41 @@ pub struct AcpClient {
     /// Timeout for initialization and session creation operations.
     /// Can be configured via OpenCodeConfig/ClaudeCodeConfig/CodexConfig.
     init_timeout: Duration,
+    /// Tool name for error messages (e.g., "OpenCode", "Claude Code", "Codex").
+    tool_name: String,
 }
 
 impl AcpClient {
     pub async fn spawn(command: &str, args: &[&str]) -> Result<Self> {
+        // Infer tool name from command for backward compatibility
+        let tool_name = if command.contains("claude") || command.contains("claudecode") {
+            "Claude Code"
+        } else if command.contains("codex") {
+            "Codex"
+        } else {
+            "OpenCode"
+        };
         Self::spawn_with_timeout(
             command,
             args,
             Arc::new(DefaultAcpHandler),
             Arc::new(Mutex::new(NotificationManager::new())),
             None,
+            tool_name,
         )
         .await
     }
 
     /// Spawn with custom init timeout (seconds).
     /// If timeout_secs is None, uses DEFAULT_INIT_TIMEOUT (600s).
+    /// tool_name is used for error messages (e.g., "OpenCode", "Claude Code", "Codex").
     pub async fn spawn_with_timeout(
         command: &str,
         args: &[&str],
         handler: Arc<dyn AcpCallbackHandler>,
         notification_manager: Arc<Mutex<NotificationManager>>,
         init_timeout_secs: Option<u64>,
+        tool_name: &str,
     ) -> Result<Self> {
         let init_timeout = init_timeout_secs
             .map(Duration::from_secs)
@@ -672,6 +685,7 @@ impl AcpClient {
             event_tx,
             notification_manager,
             init_timeout,
+            tool_name: tool_name.to_string(),
         })
     }
 
@@ -682,7 +696,15 @@ impl AcpClient {
         handler: Arc<dyn AcpCallbackHandler>,
         notification_manager: Arc<Mutex<NotificationManager>>,
     ) -> Result<Self> {
-        Self::spawn_with_timeout(command, args, handler, notification_manager, None).await
+        // Infer tool name from command for backward compatibility
+        let tool_name = if command.contains("claude") || command.contains("claudecode") {
+            "Claude Code"
+        } else if command.contains("codex") {
+            "Codex"
+        } else {
+            "OpenCode"
+        };
+        Self::spawn_with_timeout(command, args, handler, notification_manager, None, tool_name).await
     }
 
     /// Subscribe to session update events
@@ -928,7 +950,7 @@ impl AcpClient {
                     || e.to_string().contains("Channel closed")
                 {
                     let lang = crate::i18n::default_lang();
-                    anyhow::anyhow!("{}", crate::i18n::t_fmt("acp_timeout", lang, &[("name", "OpenCode")]))
+                    anyhow::anyhow!("{}", crate::i18n::t_fmt("acp_timeout", lang, &[("name", &self.tool_name)]))
                 } else {
                     e
                 }
@@ -1356,7 +1378,7 @@ async fn run_subprocess(
 
                         tracing::info!(
                             request_id,
-                            request_preview = &request[..request.len().min(200)],
+                            request_preview = request.chars().take(200).collect::<String>(),
                             "ACP subprocess: writing request to stdin"
                         );
 

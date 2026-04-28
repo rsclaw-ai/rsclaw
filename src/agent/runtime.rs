@@ -3118,11 +3118,16 @@ impl AgentRuntime {
         let mut last_tool_key = String::new();
         let mut same_call_streak: usize = 0;
         const MAX_SAME_CALL_STREAK: usize = 5;
-// Track consecutive tool errors — stop early when tools keep failing.
+        // Track consecutive tool errors — stop early when tools keep failing.
         let mut error_streak: usize = 0;
-        const MAX_ERROR_STREAK: usize = 2;
+        const MAX_ERROR_STREAK: usize = 3;
         // Store last error info so we can surface it when the loop breaks.
         let mut last_error_info: Option<String> = None;
+        // Track consecutive iterations with empty text + tool calls (model not summarizing).
+        let mut empty_tool_streak: usize = 0;
+        const MAX_EMPTY_TOOL_STREAK: usize = 3;
+        // Track total web_search calls in this turn (to inject consolidation hint).
+        let mut web_search_count: usize = 0;
         let mut max_iterations = BASE_ITERATIONS;
         let mut iteration = 0usize;
 
@@ -3944,6 +3949,39 @@ impl AgentRuntime {
                 text_len = text_buf.len(),
                 "agent_loop: stream finished"
             );
+
+            // Track consecutive empty text + tool calls: model is not summarizing results.
+            // When this happens repeatedly, inject a warning to prompt the model to respond.
+            if text_buf.trim().is_empty() && !tool_calls.is_empty() {
+                empty_tool_streak += 1;
+                tracing::warn!(
+                    session = %ctx.session_key,
+                    empty_tool_streak,
+                    tool_call_count = tool_calls.len(),
+                    "agent_loop: empty text with tool calls (model not summarizing)"
+                );
+                if empty_tool_streak >= MAX_EMPTY_TOOL_STREAK {
+                    tracing::warn!(
+                        session = %ctx.session_key,
+                        empty_tool_streak,
+                        "agent_loop: too many empty-tool iterations, injecting warning"
+                    );
+                    // Inject warning as a user message in scratchpad to prompt model to respond.
+                    let warning_msg = Message {
+                        role: Role::User,
+                        content: MessageContent::Text(
+                            "[系统提示] 你已经连续多次只调用工具而没有输出任何文字。\
+                            请现在整合之前的搜索结果，用文字回复用户。不要再调用更多工具。"
+                                .to_owned(),
+                        ),
+                    };
+                    turn_scratchpad.push(warning_msg);
+                }
+            } else if !text_buf.trim().is_empty() || tool_calls.is_empty() {
+                // Reset streak when model outputs text OR has no tool calls.
+                empty_tool_streak = 0;
+            }
+
             if tool_calls.is_empty() {
                 // Deception detection: model claims action but no tool was called.
                 // This is a critical trust violation that must be flagged to the user.
@@ -4359,23 +4397,73 @@ impl AgentRuntime {
                                 }
                             }
                         }
+                        // Track web_search count and inject consolidation hint when count > 3.
+                        // This prompts the model to summarize results instead of searching more.
+                        // Also inject error recovery hints when tool execution fails.
+                        let v_modified = if tool_name == "web_search" {
+                            web_search_count += 1;
+                            if web_search_count > 3 {
+                                tracing::warn!(
+                                    session = %ctx.session_key,
+                                    web_search_count,
+                                    "agent_loop: multiple web_search calls, injecting hint"
+                                );
+                                // Inject hint into result JSON
+                                let hint = format!(
+                                    "[提示] 本次对话已进行 {} 次搜索。请整合现有结果回复用户，不要再搜索。",
+                                    web_search_count
+                                );
+                                match &v {
+                                    serde_json::Value::Object(obj) => {
+                                        let mut modified = obj.clone();
+                                        modified.insert("_search_hint".to_owned(), json!(hint));
+                                        serde_json::Value::Object(modified)
+                                    }
+                                    other => other.clone()
+                                }
+                            } else {
+                                v.clone()
+                            }
+                        } else if has_error {
+                            // Inject error recovery hint into tool result
+                            let remaining = MAX_ERROR_STREAK.saturating_sub(error_streak);
+                            let hint = if remaining > 0 {
+                                format!(
+                                    "[提示] 工具执行失败 (第 {}/{}) 次。请检查错误信息并尝试修正。\
+                                    你还有 {} 次机会。常见修正方法：检查路径是否正确、修正命令语法、或尝试其他方法。",
+                                    error_streak, MAX_ERROR_STREAK, remaining
+                                )
+                            } else {
+                                "[警告] 工具执行连续失败，本轮对话将结束。请总结你尝试的方法和遇到的错误。".to_owned()
+                            };
+                            match &v {
+                                serde_json::Value::Object(obj) => {
+                                    let mut modified = obj.clone();
+                                    modified.insert("_error_hint".to_owned(), json!(hint));
+                                    serde_json::Value::Object(modified)
+                                }
+                                other => other.clone()
+                            }
+                        } else {
+                            v.clone()
+                        };
                         // Extract images from tool result to avoid passing large
                         // base64 back to LLM. Check "image" (data-URL screenshots
                         // and image-gen), "image_path" (new screenshot path), and
                         // "url" (image gen). File paths get forwarded as-is so
                         // the UI can load them via Tauri's asset protocol —
                         // much lighter than shipping base64 over WS.
-                        let img_data = v.get("image").and_then(|i| i.as_str()).or_else(|| {
-                            v.get("url")
+                        let img_data = v_modified.get("image").and_then(|i| i.as_str()).or_else(|| {
+                            v_modified.get("url")
                                 .and_then(|u| u.as_str())
                                 .filter(|u| u.starts_with("data:image/"))
                         });
-                        let img_path = v.get("image_path").and_then(|p| p.as_str());
+                        let img_path = v_modified.get("image_path").and_then(|p| p.as_str());
                         if let Some(img) = img_data.or(img_path) {
-                            let desc = v
+                            let desc = v_modified
                                 .get("revised_prompt")
                                 .and_then(|p| p.as_str())
-                                .or_else(|| v.get("action").and_then(|a| a.as_str()))
+                                .or_else(|| v_modified.get("action").and_then(|a| a.as_str()))
                                 .unwrap_or("image generated");
                             (
                                 format!(
@@ -4383,11 +4471,11 @@ impl AgentRuntime {
                                 ),
                                 vec![img.to_owned()],
                             )
-                        } else if v.is_string() {
-                            (v.as_str().unwrap_or("").to_owned(), vec![])
+                        } else if v_modified.is_string() {
+                            (v_modified.as_str().unwrap_or("").to_owned(), vec![])
                         } else {
                             // Format structured tool results (exec, read, etc.) for better LLM comprehension
-                            (format_tool_result(&v), vec![])
+                            (format_tool_result(&v_modified), vec![])
                         }
                     }
                     Err(e) => {
@@ -4404,10 +4492,21 @@ impl AgentRuntime {
                         // Record error result for loop detection (errors count as results too).
                         ctx.loop_detector
                             .record_result(&serde_json::json!({"error": err_chain.clone()}));
+                        let remaining = MAX_ERROR_STREAK.saturating_sub(error_streak);
+                        let hint = if remaining > 0 {
+                            format!(
+                                "Tool execution failed (attempt {}/{}). Check the error and try to fix it. \
+                                You have {} more attempts before the turn ends. \
+                                Common fixes: check file paths, fix command syntax, or try a different approach.",
+                                error_streak, MAX_ERROR_STREAK, remaining
+                            )
+                        } else {
+                            "Tool execution failed repeatedly. This turn will end. \
+                            Summarize what you tried and the errors encountered.".to_owned()
+                        };
                         let payload = serde_json::json!({
                             "error": err_chain,
-                            "_do_not_retry": true,
-                            "hint": "This tool call failed. Do NOT retry the same tool with the same arguments. Try a different approach or inform the user.",
+                            "_retry_hint": hint,
                         });
                         (payload.to_string(), vec![])
                     }
