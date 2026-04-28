@@ -30,10 +30,16 @@ if [[ -s "$LOCAL_SRC/model.safetensors" ]]; then
   exit 0
 fi
 
-# Download fresh.
+# Download fresh. Use a single temp dir for both archive and extraction so
+# cleanup is one rm and the script stays portable across BSD/GNU mktemp
+# (git-bash on Windows runners is GNU; macOS is BSD).
 echo "[fetch-bundled-model] downloading $URL"
-TMP_ZIP="$(mktemp -t bge-model.XXXXXX.zip)"
-trap 'rm -f "$TMP_ZIP"' EXIT
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "$WORK_DIR"' EXIT
+TMP_ZIP="$WORK_DIR/bge-model.zip"
+EXTRACT_DIR="$WORK_DIR/extract"
+mkdir -p "$EXTRACT_DIR"
+
 if command -v curl >/dev/null; then
   curl -fL --retry 3 -o "$TMP_ZIP" "$URL"
 elif command -v wget >/dev/null; then
@@ -43,8 +49,6 @@ else
   exit 1
 fi
 
-EXTRACT_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_ZIP" "$EXTRACT_DIR"' EXIT
 unzip -q "$TMP_ZIP" -d "$EXTRACT_DIR"
 
 # The zip ships either flat or under a subdirectory; locate the safetensors.
