@@ -3987,18 +3987,24 @@ impl AgentRuntime {
                 // This is a critical trust violation that must be flagged to the user.
                 // IMPORTANT: Check turn_scratchpad for tool calls from earlier iterations,
                 // not just current iteration's tool_calls (which is empty at this point).
+                //
+                // Skip deception detection for internal/summarize sessions.
+                // - Internal (heartbeat/cron/system): may legitimately report without tools
+                // - Summarize: pure summary task with NO tools available by design
+                let is_internal = is_internal_session(&ctx.session_key);
+                let skip_deception_check = is_internal || ctx.session_key.starts_with("summarize:");
                 let deception_keywords = [
-                    // Chinese - claiming delegation/execution
+                    // Chinese - claiming delegation/execution (NOT generic "已完成")
                     "已委托", "已提交", "已用opencode", "已让opencode", "委托给opencode",
-                    "已检查", "已搜索", "已运行", "已执行", "已完成",
+                    "已检查", "已搜索", "已运行", "已执行",
                     "已交给", "交给opencode", "opencode正在", "opencode已经", "opencode会",
                     "已访问", "访问了", "用浏览器", "用cdp", "用CDP",
                     "正在执行", "正在运行", "正在检查", "正在搜索",
                     "我来执行", "我来运行", "我来检查", "我来搜索",
                     "帮你执行", "帮你运行", "帮你检查", "帮你搜索",
-                    // English - claiming delegation/execution
+                    // English - claiming delegation/execution (NOT generic "I completed")
                     "I delegated", "I submitted", "I asked opencode", "opencode is", "I ran",
-                    "I checked", "I searched", "I executed", "I visited", "I completed",
+                    "I checked", "I searched", "I executed", "I visited",
                     "I will", "I'm running", "I'm executing", "I'm checking",
                     "using browser", "used browser", "using cdp", "used cdp",
                     "let me", "help you",
@@ -4022,10 +4028,14 @@ impl AgentRuntime {
                     }
                 });
 
-                // Only flag deception if model claims action AND no tool was called in entire turn
-                if claims_action && !text_buf.trim().is_empty() && !has_tool_in_turn {
+                // Only flag deception for regular sessions when model claims action
+                // AND no tool was called in entire turn.
+                // Internal/summarize sessions are exempt - they may legitimately report
+                // status without tool calls (summarize sessions have NO tools by design).
+                if !skip_deception_check && claims_action && !text_buf.trim().is_empty() && !has_tool_in_turn {
                     tracing::warn!(
                         session = %ctx.session_key,
+                        skip_deception_check = skip_deception_check,
                         text_preview = %text_buf.chars().take(200).collect::<String>(),
                         has_tool_in_turn = has_tool_in_turn,
                         "DECEPTION DETECTED: model claims action but no tool_call in turn"
