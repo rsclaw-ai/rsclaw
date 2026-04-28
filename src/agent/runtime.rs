@@ -3226,6 +3226,21 @@ impl AgentRuntime {
                 } else {
                     crate::i18n::t("agent_tool_errors", crate::i18n::default_lang()).to_owned()
                 };
+                // Emit done=true so WS subscribers (desktop chat) see the
+                // terminal text and the terminator frame together. Without
+                // this, the UI hangs forever waiting for done — same fix
+                // pattern as the clear_signal / abort / max_iterations paths.
+                if let Some(ref bus) = self.event_bus {
+                    let _ = bus.send(AgentEvent {
+                        session_id: ctx.session_key.clone(),
+                        agent_id: ctx.agent_id.clone(),
+                        delta: error_text.clone(),
+                        done: true,
+                        files: tool_files.clone(),
+                        images: tool_images.clone(),
+                        tool_log: tool_log.clone(),
+                    });
+                }
                 return Ok(AgentReply {
                     text: error_text,
                     is_empty: false,
