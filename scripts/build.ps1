@@ -39,13 +39,23 @@ $MacosTargets = @(
 )
 $AllTargets = $WindowsTargets + $LinuxTargets + $MacosTargets
 
-# Detect version from git
-try {
-    $Version = git describe --tags --always 2>$null
-    if (-not $Version) { $Version = "dev" }
-} catch {
-    $Version = "dev"
+# Read version from Cargo.toml [package] section. Matches the first
+# `version = "..."` that appears under `[package]` so it's not confused
+# by versions of dependencies declared elsewhere in the file.
+function Get-CargoVersion {
+    if (-not (Test-Path "Cargo.toml")) { return "dev" }
+    $content = Get-Content -Raw "Cargo.toml"
+    if ($content -match '(?s)\[package\].*?(?:^|\n)\s*version\s*=\s*"([^"]+)"') {
+        return $matches[1]
+    }
+    return "dev"
 }
+# Match release-cli.yml + build-ui.ps1: prefix the cargo version with "v"
+# so the binary's --version output, the artifact filename, and what the
+# desktop bundle's sidecar reports all align.
+$Version = "v$(Get-CargoVersion)"
+$env:RSCLAW_BUILD_VERSION = $Version
+$env:RSCLAW_BUILD_DATE = (Get-Date -Format "yyyy-MM-dd")
 
 # Detect host architecture
 function Get-HostTarget {

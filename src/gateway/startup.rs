@@ -45,6 +45,13 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // 0. Apply global proxy env vars before any HTTP clients are created.
     crate::config::apply_proxy_env(&config);
 
+    // 0a. Initialize the self-evolution config singleton from
+    //     `[ext.evolution]` (or built-in defaults if absent). Read by memory
+    //     tier transition, crystallizer, and meditation phases.
+    crate::agent::evolution::init_evolution_config(
+        crate::agent::evolution::EvolutionConfig::from_raw(config.ext.evolution.as_ref()),
+    );
+
     // 1. Resolve data directory — respects RSCLAW_BASE_DIR for --dev/--profile.
     let base_dir = crate::config::loader::base_dir();
     let data_dir = base_dir.join("var/data");
@@ -306,6 +313,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let channel_senders: Arc<
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    // Make the senders reachable from inside TaskQueueManager::submit so the
+    // user-facing "task received" ack can fire without threading the map
+    // through every submit call site.
+    super::task_queue::install_channel_senders(Arc::clone(&channel_senders));
 
     // Create task queue manager before channels so channels can submit to it.
     let task_queue_mgr = Arc::new(
@@ -338,6 +349,19 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         ));
         tokio::spawn(async move { worker.run().await });
         info!("task queue worker started");
+    }
+
+    // Spawn external-jobs worker — drives long-running provider tasks
+    // (video / image generation) to completion across gateway restarts.
+    {
+        let worker = Arc::new(super::external_jobs_worker::ExternalJobsWorker::new(
+            Arc::clone(&store.db),
+            notification_tx.clone(),
+            shutdown.clone(),
+            Arc::clone(&config),
+        ));
+        tokio::spawn(async move { worker.run().await });
+        info!("external jobs worker started");
     }
 
     // Spawn notification router task — routes OutboundMessages from ACP tools
@@ -391,12 +415,16 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         .and_then(|h| h.enabled)
         .unwrap_or(true);
     if hb_enabled {
-        let runner = std::sync::Arc::new(crate::heartbeat::HeartbeatRunner::new_with_shutdown(
+        let runner = crate::heartbeat::HeartbeatRunner::new_with_shutdown(
             Arc::clone(&registry),
             &data_dir,
             heartbeat_memory,
             Some(shutdown.clone()),
-        ));
+        )
+        .with_meditation_deps(crate::heartbeat::MeditationDeps {
+            config: Arc::clone(&config),
+        });
+        let runner = std::sync::Arc::new(runner);
         runner.run();
         info!("heartbeat runner started");
     }
@@ -542,6 +570,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     // Create cron reload broadcast channel (used to notify CronRunner of new jobs)
     let (cron_reload_tx, _cron_reload_rx) = tokio::sync::broadcast::channel::<()>(16);
+    // Make the sender reachable from non-server paths (fast preparse `/loop`).
+    crate::cron::install_reload_sender(cron_reload_tx.clone());
 
     // Start cron runner — jobs loaded from base_dir/cron.json5
     {

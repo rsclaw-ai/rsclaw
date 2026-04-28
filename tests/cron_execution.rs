@@ -123,6 +123,7 @@ fn runtime_with_agent(agent_id: &str) -> RuntimeConfig {
             tools: None,
             skills: None,
             plugins: None,
+            evolution: None,
         },
         ops: OpsRuntime {
             cron: None,

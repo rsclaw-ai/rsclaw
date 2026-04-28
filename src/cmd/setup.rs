@@ -496,6 +496,25 @@ struct ExistingConfig {
     provider_models: std::collections::HashMap<String, String>,
 }
 
+/// `load_defaults` + locale-aware reorder. In Chinese mode the China-region
+/// providers (Qwen / DeepSeek / Doubao) get surfaced first; other locales
+/// keep the defaults.toml order. Used by both `cmd_onboard` (initial
+/// wizard) and `cmd_configure` (interactive section editor) so a user
+/// running either entry point sees the same picker order.
+fn load_defaults_for_lang(lang: &str) -> Defaults {
+    let mut defs = load_defaults();
+    if lang == "zh" {
+        let priority = ["qwen", "deepseek", "doubao"];
+        defs.providers.sort_by_key(|p| {
+            priority
+                .iter()
+                .position(|n| n == &p.name)
+                .unwrap_or(priority.len())
+        });
+    }
+    defs
+}
+
 fn load_existing_defaults(defs: &Defaults) -> ExistingConfig {
     let mut ec = ExistingConfig {
         agent_name: "main".into(),
@@ -820,7 +839,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
     println!();
     hint(&crate::i18n::t("cli_press_esc_back", lang));
 
-    let defs = load_defaults();
+    let defs = load_defaults_for_lang(lang);
     let ec = load_existing_defaults(&defs);
 
     let provider_labels: Vec<&str> = defs.providers.iter().map(|p| p.label.as_str()).collect();
@@ -871,7 +890,12 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                     StepResult::Next(idx) => {
                         provider_idx = idx;
                         let prov = &defs.providers[idx];
-                        if prov.name == "custom" || prov.name == "codingplan" {
+                        // custom / codingplan / doubao surface the API
+                        // protocol picker — doubao because the CodingPlan
+                        // offering speaks Anthropic, the regular Ark
+                        // endpoint speaks OpenAI-compat. Other providers
+                        // have a fixed protocol baked into the URL.
+                        if prov.name == "custom" || prov.name == "codingplan" || prov.name == "doubao" {
                             wiz_step = STEP_API_TYPE;
                         } else {
                             wiz_step = STEP_BASE_URL;
@@ -1171,8 +1195,8 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
             if !effective_base_url.is_empty() {
                 prov_obj.insert("baseUrl".into(), json!(effective_base_url));
             }
-            // Write api type for custom/codingplan providers
-            if (provider.name == "custom" || provider.name == "codingplan") && !api_type.is_empty() {
+            // Write api type for custom / codingplan / doubao providers
+            if (provider.name == "custom" || provider.name == "codingplan" || provider.name == "doubao") && !api_type.is_empty() {
                 prov_obj.insert("api".into(), json!(api_type));
             }
             // Write user_agent (from wizard input or provider default)
@@ -1407,7 +1431,7 @@ pub async fn cmd_configure(args: ConfigureArgs) -> Result<()> {
     step("*", &crate::i18n::t_fmt("cli_editing", lang, &[("path", &path.display().to_string())]));
     hint(&crate::i18n::t("cli_press_esc", lang));
 
-    let defs = load_defaults();
+    let defs = load_defaults_for_lang(lang);
     let mut ec = load_existing_defaults(&defs);
     let original = val.clone();
 
@@ -1649,10 +1673,13 @@ async fn configure_model(
         new_base_url = provider.base_url.to_string();
     }
 
-    // API type + User-Agent for custom/codingplan providers
+    // API type for custom / codingplan / doubao; User-Agent only for the
+    // first two (doubao Ark always uses Volcengine's UA).
     let mut new_api_type = String::new();
     let mut new_user_agent = String::new();
-    if provider.name == "custom" || provider.name == "codingplan" {
+    let supports_api_type =
+        provider.name == "custom" || provider.name == "codingplan" || provider.name == "doubao";
+    if supports_api_type {
         // API protocol selection
         let api_labels = &[
             "OpenAI Chat (default)",
@@ -1671,13 +1698,16 @@ async fn configure_model(
             StepResult::Back | StepResult::Cancel => return Ok(()),
         }
 
-        // User-Agent header
-        let current_ua = get_nested_value(val, &format!("models.providers.{}.userAgent", provider.name))
-            .and_then(|v| v.as_str().map(|s| s.to_owned()))
-            .unwrap_or_else(|| if provider.user_agent.is_empty() { crate::provider::DEFAULT_USER_AGENT.to_string() } else { provider.user_agent.clone() });
-        match input_step("  User-Agent header", current_ua) {
-            StepResult::Next(ua) => { new_user_agent = ua; }
-            StepResult::Back | StepResult::Cancel => return Ok(()),
+        // User-Agent header — only meaningful for custom/codingplan
+        // (doubao always reaches Volcengine ark, which doesn't care).
+        if provider.name == "custom" || provider.name == "codingplan" {
+            let current_ua = get_nested_value(val, &format!("models.providers.{}.userAgent", provider.name))
+                .and_then(|v| v.as_str().map(|s| s.to_owned()))
+                .unwrap_or_else(|| if provider.user_agent.is_empty() { crate::provider::DEFAULT_USER_AGENT.to_string() } else { provider.user_agent.clone() });
+            match input_step("  User-Agent header", current_ua) {
+                StepResult::Next(ua) => { new_user_agent = ua; }
+                StepResult::Back | StepResult::Cancel => return Ok(()),
+            }
         }
     }
 

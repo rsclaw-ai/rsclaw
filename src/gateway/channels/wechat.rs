@@ -368,7 +368,7 @@ pub(crate) fn start_wechat_personal_if_configured(
                                 peer_id: from_user.clone(),
                                 dm_scope,
                             });
-                            if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "wechat", &from_user).await {
                                 reply.target_id = from_user.clone();
                                 reply.is_group = false;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {

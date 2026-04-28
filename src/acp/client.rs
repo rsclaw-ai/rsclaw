@@ -1212,6 +1212,7 @@ impl AcpClient {
         resp
     }
 
+
     /// RPC call without timeout - for long-running operations like
     /// session/prompt
     async fn rpc_no_timeout(

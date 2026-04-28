@@ -143,7 +143,7 @@ impl LineChannel {
                                 data: format!("data:image/jpeg;base64,{b64}"),
                                 mime_type: "image/jpeg".to_owned(),
                             });
-                            text = crate::i18n::t("describe_image", crate::i18n::default_lang());
+                            text = String::new();
                             info!(size = bytes.len(), "LINE: image downloaded");
                         }
                         Err(e) => {
@@ -418,7 +418,8 @@ async fn line_extract_audio_and_transcribe(
 
     std::fs::write(&video_path, video_bytes)?;
 
-    let status = tokio::process::Command::new("ffmpeg")
+    let ffmpeg_bin = crate::agent::platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
+    let status = tokio::process::Command::new(&ffmpeg_bin)
         .args([
             "-y",
             "-i",

@@ -162,6 +162,16 @@ fn parse_time_range(s: &str) -> Result<(NaiveTime, NaiveTime)> {
     Ok((start, end))
 }
 
+/// Optional dependencies required by the meditation crystallization phase.
+/// When present, meditation extends from "dedup + cleanup" to also scan
+/// Core un-crystallized memories and distill them into SKILL.md files.
+#[derive(Clone)]
+pub struct MeditationDeps {
+    /// Runtime config — used to resolve per-agent flash model with fallback
+    /// to global defaults.
+    pub config: Arc<crate::config::runtime::RuntimeConfig>,
+}
+
 /// Heartbeat runner — scans agent workspaces and spawns per-agent heartbeat loops.
 /// Periodically rescans to discover new HEARTBEAT.md files from dynamically created agents.
 pub struct HeartbeatRunner {
@@ -175,6 +185,9 @@ pub struct HeartbeatRunner {
     /// next tick when draining; the rescan loop also stops scheduling new
     /// agent loops.
     shutdown: Option<crate::gateway::ShutdownCoordinator>,
+    /// Optional deps for the meditation crystallization phase. When `None`,
+    /// meditation runs with dedup + cleanup only (back-compat).
+    meditation_deps: Option<MeditationDeps>,
 }
 
 impl HeartbeatRunner {
@@ -201,7 +214,16 @@ impl HeartbeatRunner {
             active: std::sync::Mutex::new(std::collections::HashSet::new()),
             memory,
             shutdown,
+            meditation_deps: None,
         }
+    }
+
+    /// Attach optional meditation dependencies. When set, meditation cycles
+    /// also run the crystallization phase (scan Core un-crystallized
+    /// memories, distill into SKILL.md). Returns `self` for chaining.
+    pub fn with_meditation_deps(mut self, deps: MeditationDeps) -> Self {
+        self.meditation_deps = Some(deps);
+        self
     }
 
     /// Start heartbeat loops for existing agents and spawn a rescan task
@@ -380,8 +402,10 @@ impl HeartbeatRunner {
 
     /// Run a meditation cycle for the given agent.
     ///
-    /// Delegates to [`meditation::meditate`] to perform dedup, conflict
-    /// resolution, and crystallized-memory cleanup on the agent's memory store.
+    /// Delegates to [`meditation::meditate`] for dedup + cleanup. If the
+    /// runner was constructed with [`MeditationDeps`], also runs the
+    /// crystallize phase (Core un-crystallized → SKILL.md), bounded to a
+    /// few clusters per cycle.
     async fn run_meditation(&self, agent_id: &str) -> Result<()> {
         let mem = match self.memory.as_ref() {
             Some(m) => m,
@@ -393,13 +417,71 @@ impl HeartbeatRunner {
 
         let scope = format!("agent:{agent_id}");
         let config = meditation::MeditationConfig::default();
-        let mut store = mem.lock().await;
-        let report = meditation::meditate(&mut store, &scope, &config).await?;
+
+        // Phase 1+3: dedup + cleanup (always run, holds &mut lock).
+        let mut report = {
+            let mut store = mem.lock().await;
+            meditation::meditate(&mut store, &scope, &config).await?
+        };
+
+        // Phase 2: crystallize (only if deps were provided). Runs after
+        // dedup so duplicate Core docs don't waste LLM calls on overlapping
+        // clusters.
+        if let Some(deps) = &self.meditation_deps {
+            let handle = match self.registry.get(agent_id) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(agent_id, "crystallize phase: agent handle missing: {e:#}");
+                    return Ok(());
+                }
+            };
+            let flash_model = crate::agent::runtime::resolve_flash_model_for(
+                &handle.config,
+                &deps.config.agents.defaults,
+            )
+            .unwrap_or_else(|| {
+                handle
+                    .config
+                    .model
+                    .as_ref()
+                    .and_then(|m| m.primary.clone())
+                    .or_else(|| {
+                        deps.config
+                            .agents
+                            .defaults
+                            .model
+                            .as_ref()
+                            .and_then(|m| m.primary.clone())
+                    })
+                    .unwrap_or_else(|| "anthropic/claude-sonnet-4-6".to_owned())
+            });
+            let skills_dir = crate::skill::default_global_skills_dir()
+                .unwrap_or_else(|| crate::config::loader::base_dir().join("skills"));
+
+            match meditation::crystallize_phase(
+                mem,
+                &scope,
+                &handle.providers,
+                &flash_model,
+                &skills_dir,
+            )
+            .await
+            {
+                Ok(n) => {
+                    report.skills_crystallized = n;
+                    report.total_processed += n;
+                }
+                Err(e) => {
+                    warn!(agent_id, "crystallize phase failed: {e:#}");
+                }
+            }
+        }
 
         info!(
             agent_id,
             merged = report.duplicates_merged,
             cleaned = report.crystallized_cleaned,
+            crystallized = report.skills_crystallized,
             processed = report.total_processed,
             "meditation cycle complete"
         );

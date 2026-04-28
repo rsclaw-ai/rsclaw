@@ -8,6 +8,7 @@ pub mod pool;
 
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
         atomic::{AtomicU32, AtomicU64, Ordering},
         Arc,
@@ -524,6 +525,24 @@ impl Drop for ChromeProcess {
     }
 }
 
+/// Parse the port number from a Chrome DevTools WebSocket URL.
+/// Accepts either `ws://127.0.0.1:PORT/devtools/...` or
+/// `ws://localhost:PORT/devtools/...` — chrome uses `localhost` when
+/// reusing an already-running browser via /json/version.
+fn parse_port_from_ws_url(url: &str) -> Result<u16> {
+    let after_host = ["127.0.0.1:", "localhost:"]
+        .iter()
+        .find_map(|host| url.find(host).map(|i| i + host.len()))
+        .ok_or_else(|| anyhow!("cannot parse port from ws URL: {url}"))?;
+    let end = url[after_host..]
+        .find('/')
+        .unwrap_or(url.len() - after_host);
+    let port_str = &url[after_host..after_host + end];
+    port_str
+        .parse::<u16>()
+        .map_err(|e| anyhow!("invalid port in ws URL: {e}"))
+}
+
 /// Try to connect to an already-running Chrome with remote debugging.
 /// Probes the given ports on both IPv4 (127.0.0.1) and IPv6 ([::1]) localhost.
 /// Returns the browser WebSocket URL if found.
@@ -669,7 +688,14 @@ impl CdpClient {
             .send(msg.to_string())
             .map_err(|_| anyhow!("CDP WebSocket closed"))?;
 
-        let resp = time::timeout(Duration::from_secs(30), rx)
+        // 180s response budget. Most CDP messages return instantly; the
+        // budget is for Runtime.evaluate-with-awaitPromise calls that
+        // legitimately wait on page state (douyin upload processing can
+        // take ~90s). The previous 30s ceiling was lower than several
+        // plugin-side `await new Promise(setTimeout, ...)` waits, so the
+        // host cut their JS short and surfaced "CDP response timeout for
+        // Runtime.evaluate" as a fake publish failure.
+        let resp = time::timeout(Duration::from_secs(180), rx)
             .await
             .map_err(|_| anyhow!("CDP response timeout for {method}"))?
             .map_err(|_| anyhow!("CDP response channel closed for {method}"))?;
@@ -778,12 +804,185 @@ impl Drop for BrowserSession {
     }
 }
 
+/// User's daily-driver Chrome profile dir (NOT rsclaw's isolated one).
+fn user_chrome_profile_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        return Some(
+            dirs_next::home_dir()?
+                .join("Library/Application Support/Google/Chrome"),
+        );
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return Some(dirs_next::data_local_dir()?.join("Google/Chrome/User Data"));
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        return Some(dirs_next::config_dir()?.join("google-chrome"));
+    }
+}
+
+/// Whether the user's daily Chrome is currently running on its default
+/// profile. Used to decide between (a) launching it on the user's behalf
+/// with debug enabled vs (b) refusing and prompting the user — we never
+/// auto-quit a running browser because of unsaved-work risk.
+#[cfg(unix)]
+fn user_chrome_is_running() -> bool {
+    let Some(dir) = user_chrome_profile_dir() else {
+        return false;
+    };
+    let dir_str = dir.to_string_lossy().to_string();
+    std::process::Command::new("pgrep")
+        .args(["-f", &format!("user-data-dir={dir_str}")])
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn user_chrome_is_running() -> bool {
+    // Lock-file probe: chrome creates these and removes them on clean exit.
+    let Some(dir) = user_chrome_profile_dir() else {
+        return false;
+    };
+    dir.join("lockfile").exists()
+}
+
+/// Whether `chrome_path` points at the user's system Chrome (vs the
+/// rsclaw-managed Chrome for Testing under `~/.rsclaw/tools/chrome/`).
+/// Only system Chrome is a candidate for "use the user's profile" —
+/// our self-managed Testing build doesn't have the user's cookies
+/// anyway, so reusing its profile defeats the purpose.
+fn is_system_chrome(chrome_path: &str) -> bool {
+    !chrome_path.contains(".rsclaw/tools/")
+}
+
+/// Look up an already-running Chrome on the named profile by reading its
+/// `DevToolsActivePort` marker file. Chrome writes this on every launch
+/// with `port\n/devtools/browser/<id>` and removes it on clean exit
+/// (stale-after-crash files are detected by the port no longer being
+/// open). Returns the browser-level CDP WebSocket URL ready to attach.
+///
+/// This is the foundation for "don't kill the user's browser between
+/// gateway restarts" — every relaunch resets the anti-bot fingerprint
+/// and triggers verification dialogs, so reusing an existing chrome on
+/// the same profile keeps the session warm.
+async fn find_chrome_by_profile(profile_name: &str) -> Option<String> {
+    let profile_dir = crate::config::loader::base_dir()
+        .join("browser-profiles")
+        .join(profile_name);
+    let port_file = profile_dir.join("DevToolsActivePort");
+    let content = std::fs::read_to_string(&port_file).ok()?;
+    let mut lines = content.lines();
+    let port: u16 = lines.next()?.parse().ok()?;
+    let url = format!("http://localhost:{}/json/version", port);
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: Value = resp.json().await.ok()?;
+    let ws = json.get("webSocketDebuggerUrl").and_then(|v| v.as_str())?;
+    Some(ws.to_string())
+}
+
 impl BrowserSession {
-    /// Launch Chrome, discover the default page target, and connect CDP.
-    pub async fn start(chrome_path: &str, headed: bool, profile: Option<&str>) -> Result<Self> {
+    /// Open a Chrome session. Decision tree (most-preferred first):
+    ///
+    /// 1. **CDP attach to any debug-enabled chrome** on 9222 / 9223 — if
+    ///    the user already runs chrome with `--remote-debugging-port=`,
+    ///    we ride on their actual session (cookies, extensions, history,
+    ///    logins, anti-bot warm).
+    /// 2. **rsclaw's own profile dir** (`<base>/browser-profiles/<profile>/`)
+    ///    if a chrome is alive there — keeps the rsclaw session warm
+    ///    across gateway restarts (verification dialogs hate fresh
+    ///    fingerprints).
+    /// 3. **Launch the user's system Chrome** with `--remote-debugging-port`
+    ///    pointing at THEIR profile dir, but ONLY if no chrome is
+    ///    currently running on it (singleton lock). User gets all their
+    ///    daily session state for free.
+    /// 4. **Refuse and surface a clear error** if user's chrome is
+    ///    running but without debug enabled — never auto-quit a live
+    ///    browser (unsaved work risk).
+    /// 5. **Launch fresh isolated profile** as the last resort (e.g.
+    ///    when only Chrome for Testing is available).
+    /// Helper: launch chrome and connect CDP. Factored out so `start`
+    /// can attempt path-3 (user profile) with a path-5 (rsclaw isolated)
+    /// fallback without duplicating the launch sequence.
+    async fn try_launch(
+        chrome_path: &str,
+        headed: bool,
+        profile: Option<&str>,
+    ) -> Result<(ChromeProcess, u16, CdpClient)> {
         let chrome = ChromeProcess::launch(chrome_path, headed, profile).await?;
         let port = chrome.port();
         let cdp = Self::connect_cdp_by_port(port).await?;
+        Ok((chrome, port, cdp))
+    }
+
+    pub async fn start(chrome_path: &str, headed: bool, profile: Option<&str>) -> Result<Self> {
+        // 1. Any debug-enabled chrome on common ports?
+        if let Some(ws_url) = detect_existing_chrome(&[9222, 9223]).await {
+            info!("BrowserSession: attaching to existing CDP-enabled chrome");
+            return Self::connect_existing_reuse(&ws_url).await;
+        }
+
+        // 2. rsclaw's named profile already has a chrome alive on it?
+        if let Some(profile_name) = profile {
+            if let Some(ws_url) = find_chrome_by_profile(profile_name).await {
+                info!(profile = profile_name, "BrowserSession: reusing existing chrome on rsclaw profile");
+                return Self::connect_existing_reuse(&ws_url).await;
+            }
+        }
+
+        // 3. System Chrome + user's profile available + nobody using it?
+        //    Launch it on the user's behalf with debug enabled. The
+        //    `Some("default")` shortcut in ChromeProcess::launch already
+        //    resolves to the user's Library/Application Support/Google/
+        //    Chrome dir (or the platform equivalent), so we get full
+        //    cookies / extensions / history for free.
+        let mut chosen_profile = profile;
+        if is_system_chrome(chrome_path) {
+            if user_chrome_is_running() {
+                // 4. User's chrome IS running, but without debug. Don't kill it.
+                bail!(
+                    "RSCLAW_CHROME_NEEDS_CDP: 你的 Chrome 正在运行但没启用调试模式 (CDP 端口未开)。\n\n\
+                     两个解决办法：\n\
+                     1) 退出 Chrome（cmd+Q），让 rsclaw 自动启动新进程（你的标签和登录态会被恢复）\n\
+                     2) 或者手动用以下命令重新启动：\n   {chrome_path} --remote-debugging-port=9222 &\n\n\
+                     完成后重试请求。"
+                );
+            }
+            // Always set "default" for system chrome — Chrome creates
+            // the profile dir on first launch if missing, and using it
+            // means later when the user opens chrome themselves they
+            // share the same process / cookies / session naturally.
+            info!("BrowserSession: launching user's Chrome with debug enabled (using their daily profile)");
+            chosen_profile = Some("default");
+        }
+
+        // 5. Launch (either user's profile via "default" or rsclaw isolated).
+        //    If the path-3 attempt with the user's profile fails (broken
+        //    Chrome install / corrupted local profile / OS sandbox issue
+        //    — symptom is "Chrome quit unexpectedly"), fall back to
+        //    rsclaw's isolated profile so the gateway stays usable instead
+        //    of returning an error to every tool call.
+        let (chrome, port, cdp) = match Self::try_launch(chrome_path, headed, chosen_profile).await {
+            Ok(triple) => triple,
+            Err(e) if chosen_profile == Some("default") && profile.is_some() => {
+                warn!(
+                    "BrowserSession: launching user's Chrome failed ({e:#}); \
+                     falling back to rsclaw isolated profile"
+                );
+                Self::try_launch(chrome_path, headed, profile).await?
+            }
+            Err(e) => return Err(e),
+        };
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3857,9 +4056,32 @@ const SNAPSHOT_INTERACTIVE_JS: &str = r#"(function(){
 
 #[cfg(test)]
 mod tests {
-    use super::detect_existing_chrome;
+    use super::{detect_existing_chrome, parse_port_from_ws_url};
     use serde_json::json;
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    #[test]
+    fn parse_port_from_ws_url_127() {
+        let p = parse_port_from_ws_url("ws://127.0.0.1:9222/devtools/browser/abc").unwrap();
+        assert_eq!(p, 9222);
+    }
+
+    #[test]
+    fn parse_port_from_ws_url_localhost() {
+        let p = parse_port_from_ws_url("ws://localhost:56346/devtools/browser/xyz").unwrap();
+        assert_eq!(p, 56346);
+    }
+
+    #[test]
+    fn parse_port_from_ws_url_unknown_host_errors() {
+        assert!(parse_port_from_ws_url("ws://example.com:80/devtools/browser/x").is_err());
+    }
+
+    #[test]
+    fn parse_port_from_ws_url_no_path_terminator() {
+        let p = parse_port_from_ws_url("ws://127.0.0.1:9999").unwrap();
+        assert_eq!(p, 9999);
+    }
 
     #[tokio::test]
     async fn detect_existing_chrome_skips_headless() {

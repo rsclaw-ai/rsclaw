@@ -161,8 +161,21 @@ impl MemoryDoc {
         let was_core = self.tier == MemDocTier::Core;
         let score = self.relevance_score();
 
-        // Promote to Core: access_count >= 10 AND importance >= 0.8
-        if self.access_count >= 10 && self.importance >= 0.8 {
+        // Promote to Core via three independent paths (thresholds from the
+        // live evolution config):
+        //   1. access_only         — sheer recall frequency
+        //   2. importance_only     — strong positive feedback alone
+        //   3. both_*              — both signals decent
+        //
+        // The previous AND-gate (>=10 AND >=0.8) made promotion compound-rare,
+        // which combined with cluster_size >= 3 effectively starved the
+        // crystallization pipeline.
+        let promo = &crate::agent::evolution::evolution_config().promotion;
+        if self.access_count >= promo.access_only
+            || self.importance >= promo.importance_only
+            || (self.access_count >= promo.both_access
+                && self.importance >= promo.both_importance)
+        {
             self.tier = MemDocTier::Core;
             return !was_core;
         }

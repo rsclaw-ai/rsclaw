@@ -33,6 +33,72 @@ fn tier_promotion_returns_true_on_first_core() {
 }
 
 #[test]
+fn tier_promotion_via_high_access_alone() {
+    let mut doc = MemoryDoc {
+        id: "frequent".to_owned(),
+        scope: "agent:test".to_owned(),
+        kind: "note".to_owned(),
+        text: "broadly relevant".to_owned(),
+        vector: vec![],
+        created_at: 0,
+        accessed_at: 0,
+        access_count: 15,    // hits path 1
+        importance: 0.5,     // mediocre
+        tier: MemDocTier::Working,
+        abstract_text: None,
+        overview_text: None,
+        tags: vec![],
+        pinned: false,
+    };
+    assert!(doc.evaluate_tier_transition());
+    assert_eq!(doc.tier, MemDocTier::Core);
+}
+
+#[test]
+fn tier_promotion_via_high_importance_alone() {
+    let mut doc = MemoryDoc {
+        id: "important".to_owned(),
+        scope: "agent:test".to_owned(),
+        kind: "note".to_owned(),
+        text: "strong positive feedback".to_owned(),
+        vector: vec![],
+        created_at: 0,
+        accessed_at: 0,
+        access_count: 2,     // rarely recalled
+        importance: 0.95,    // hits path 2
+        tier: MemDocTier::Working,
+        abstract_text: None,
+        overview_text: None,
+        tags: vec![],
+        pinned: false,
+    };
+    assert!(doc.evaluate_tier_transition());
+    assert_eq!(doc.tier, MemDocTier::Core);
+}
+
+#[test]
+fn tier_no_promotion_when_below_all_paths() {
+    let mut doc = MemoryDoc {
+        id: "marginal".to_owned(),
+        scope: "agent:test".to_owned(),
+        kind: "note".to_owned(),
+        text: "not enough yet".to_owned(),
+        vector: vec![],
+        created_at: 0,
+        accessed_at: 0,
+        access_count: 4,     // <5 (fails path 3) and <15 (fails path 1)
+        importance: 0.85,    // <0.9 (fails path 2), >=0.8 but access too low for path 3
+        tier: MemDocTier::Working,
+        abstract_text: None,
+        overview_text: None,
+        tags: vec![],
+        pinned: false,
+    };
+    assert!(!doc.evaluate_tier_transition());
+    assert_ne!(doc.tier, MemDocTier::Core);
+}
+
+#[test]
 fn tier_demotion_does_not_return_true() {
     let mut doc = MemoryDoc {
         id: "d2".to_owned(),

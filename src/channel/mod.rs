@@ -390,6 +390,209 @@ pub fn is_video_attachment(content_type: &str, filename: &str) -> bool {
         || lower.ends_with(".3gp")
 }
 
+/// Detect if an attachment is a document based on content_type and filename.
+pub fn is_document_attachment(content_type: &str, filename: &str) -> bool {
+    if content_type.starts_with("application/pdf")
+        || content_type.starts_with("application/msword")
+        || content_type.contains("officedocument")
+        || content_type.contains("spreadsheet")
+        || content_type.contains("presentation")
+        || content_type == "text/plain"
+        || content_type == "text/csv"
+        || content_type == "text/markdown"
+        || content_type == "application/json"
+    {
+        return true;
+    }
+    let lower = filename.to_lowercase();
+    lower.ends_with(".pdf")
+        || lower.ends_with(".doc")
+        || lower.ends_with(".docx")
+        || lower.ends_with(".xls")
+        || lower.ends_with(".xlsx")
+        || lower.ends_with(".ppt")
+        || lower.ends_with(".pptx")
+        || lower.ends_with(".txt")
+        || lower.ends_with(".md")
+        || lower.ends_with(".csv")
+        || lower.ends_with(".json")
+        || lower.ends_with(".xml")
+        || lower.ends_with(".rtf")
+}
+
+/// Return the upload subdirectory for a file based on its type.
+///
+/// - video → "videos"
+/// - audio → "audios"
+/// - document → "docs"
+/// - image → "images"
+/// - other → "files"
+pub fn upload_subdir(mime_type: &str, filename: &str) -> &'static str {
+    if is_video_attachment(mime_type, filename) {
+        "videos"
+    } else if is_audio_attachment(mime_type, filename) {
+        "audios"
+    } else if is_image_attachment(mime_type, filename) {
+        "images"
+    } else if is_document_attachment(mime_type, filename) {
+        "docs"
+    } else {
+        "files"
+    }
+}
+
+/// Single-letter prefix for the upload filename.
+fn upload_prefix(mime_type: &str, filename: &str) -> char {
+    if is_video_attachment(mime_type, filename) {
+        'v'
+    } else if is_audio_attachment(mime_type, filename) {
+        'a'
+    } else if is_document_attachment(mime_type, filename) {
+        'd'
+    } else if mime_type.starts_with("image/") {
+        'i'
+    } else {
+        'f'
+    }
+}
+
+/// Generate a standardized upload filename.
+///
+/// Format: `up_{kind}_{YYYYMMDDHHmm}{abc}.{ext}`
+/// - kind: i/v/a/d/f (image / video / audio / doc / file)
+/// - timestamp: 12 digits (4-digit year)
+/// - abc: 3 random lowercase letters (~17 576 combinations — well under
+///   the birthday-collision threshold for any realistic per-minute rate)
+///
+/// Example: `up_i_202604271325abc.png`, `up_v_202604271325xkr.mp4`
+pub fn upload_filename(mime_type: &str, original_filename: &str) -> String {
+    let kind = upload_prefix(mime_type, original_filename);
+    let ts = canonical_timestamp();
+    let abc = random_suffix3();
+    let ext = std::path::Path::new(original_filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or(match kind {
+            'i' => "png",
+            'v' => "mp4",
+            'a' => "mp3",
+            'd' => "pdf",
+            _ => "bin",
+        });
+    format!("up_{kind}_{ts}{abc}.{ext}")
+}
+
+/// Map a file extension to the single-letter kind used in canonical
+/// `up_/dl_` filenames. Mirrors `upload_prefix` but starts from the
+/// extension (which is what the host has when allocating artifacts on
+/// behalf of a plugin — there's no mime type at that point).
+pub fn kind_from_extension(ext: &str) -> char {
+    let e = ext.to_ascii_lowercase();
+    match e.as_str() {
+        "mp4" | "mov" | "webm" | "mkv" | "avi" | "m4v" => 'v',
+        "mp3" | "wav" | "m4a" | "ogg" | "opus" | "aac" | "flac" => 'a',
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" | "csv" => 'd',
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg" | "heic" | "heif" => 'i',
+        _ => 'f',
+    }
+}
+
+/// Subdirectory under `~/Downloads/rsclaw/` (or `<workspace>/uploads/`)
+/// for a given canonical kind letter.
+pub fn category_for_kind(kind: char) -> &'static str {
+    match kind {
+        'i' => "images",
+        'v' => "videos",
+        'a' => "audios",
+        'd' => "docs",
+        _ => "files",
+    }
+}
+
+fn canonical_timestamp() -> String {
+    chrono::Local::now().format("%Y%m%d%H%M").to_string()
+}
+
+fn random_suffix3() -> String {
+    let mut s = String::with_capacity(3);
+    for _ in 0..3 {
+        s.push((rand::random::<u8>() % 26 + b'a') as char);
+    }
+    s
+}
+
+// ---------------------------------------------------------------------------
+// @-reference resolver
+// ---------------------------------------------------------------------------
+
+/// Result of resolving `@` file references in a message.
+pub struct ResolvedRefs {
+    /// Text with `[file references]` block appended.
+    pub text: String,
+    /// Image file paths that should be loaded for vision analysis.
+    pub image_paths: Vec<std::path::PathBuf>,
+}
+
+/// Scan text for `@<filename>` file references and resolve them to full
+/// paths. Supported shapes:
+///
+/// * `@up_<kind>_<suffix>.<ext>` — uploaded by the user; lives under
+///   `<workspace>/uploads/<category>/`
+/// * `@dl_<kind>_<suffix>.<ext>` — generated/downloaded by a plugin;
+///   lives under `~/Downloads/rsclaw/<category>/`
+///
+/// Image references are collected in `image_paths` so the caller can
+/// load them as vision attachments.
+pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> ResolvedRefs {
+    let uploads = workspace.join("uploads");
+    let downloads_root = dirs_next::download_dir()
+        .unwrap_or_else(|| {
+            dirs_next::home_dir()
+                .map(|h| h.join("Downloads"))
+                .unwrap_or_else(|| workspace.to_path_buf())
+        })
+        .join("rsclaw");
+
+    let re = regex::Regex::new(r"@(up|dl)_([ivdaf])_([a-z0-9_]+)\.(\w+)")
+        .expect("valid regex");
+
+    let mut resolved = Vec::new();
+    let mut image_paths = Vec::new();
+    for cap in re.captures_iter(text) {
+        let source = &cap[1];
+        let kind = cap[2].chars().next().unwrap_or('f');
+        let full_name = &cap[0][1..]; // strip the leading '@'
+        let subdir = category_for_kind(kind);
+        let path = match source {
+            "dl" => downloads_root.join(subdir).join(full_name),
+            _ => uploads.join(subdir).join(full_name),
+        };
+        if path.exists() {
+            resolved.push((full_name.to_string(), path.to_string_lossy().to_string()));
+            if kind == 'i' {
+                image_paths.push(path);
+            }
+        }
+    }
+
+    if resolved.is_empty() {
+        return ResolvedRefs {
+            text: text.to_string(),
+            image_paths,
+        };
+    }
+
+    let mut result = text.to_string();
+    result.push_str("\n\n[file references]\n");
+    for (name, path) in &resolved {
+        result.push_str(&format!("@{name} = {path}\n"));
+    }
+    ResolvedRefs {
+        text: result,
+        image_paths,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ChannelManager — concurrent channel limit (AGENTS.md §18)
 // ---------------------------------------------------------------------------

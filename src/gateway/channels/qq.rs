@@ -337,7 +337,7 @@ pub(crate) fn start_qq_if_configured(
                                 peer_id: sender_id.clone(),
                                 dm_scope,
                             });
-                            if let Some(mut reply) = try_preparse_locally(&text, &handle).await {
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "qq", &sender_id).await {
                                 reply.target_id = target_id.clone();
                                 reply.is_group = is_group;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {

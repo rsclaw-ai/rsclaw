@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -410,7 +410,13 @@ impl CronRunner {
         shutdown: Option<crate::gateway::ShutdownCoordinator>,
     ) -> Self {
         let run_log_dir = data_dir.join("cron");
-        let store_path = data_dir.join("cron_store.json");
+        // Use the canonical cron.json5 path — the same file the UI, CLI,
+        // and tool_cron read/write. Previously this was a separate
+        // `cron_store.json` under data_dir/, so save_store() updates
+        // (including one-shot job removal) never landed in the file
+        // anyone else looked at — the next reload would resurrect the
+        // already-fired one-shot job.
+        let store_path = resolve_cron_store_path();
         if let Err(e) = std::fs::create_dir_all(&run_log_dir) {
             tracing::warn!("failed to create cron run log dir: {e}");
         }
@@ -465,6 +471,19 @@ impl CronRunner {
                 state.next_run_at_ms = job.schedule.compute_next_run(now_ms);
                 info!(job_id = %job.id, old = ?old_ts, new = ?state.next_run_at_ms, "cron: recomputed next_run_at_ms");
             }
+        }
+
+        // Sweep zombie one-shot jobs left disabled by previous runs that
+        // crashed or used the pre-fix `cron_store.json` save path. These
+        // would otherwise sit in cron.json5 forever, since the in-loop
+        // retain only fires after a try_recv result event.
+        let zombies_before = jobs.len();
+        jobs.retain(|j| !(j.schedule.is_once() && !j.enabled));
+        if jobs.len() < zombies_before {
+            info!(
+                removed = zombies_before - jobs.len(),
+                "cron: cleaned up zombie one-shot jobs at startup"
+            );
         }
 
         // Persist initial state
@@ -1436,10 +1455,45 @@ CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
             .clone()
     };
 
+    // Slash-command short-circuit: if the cron-fired text starts with `/`
+    // and is handled by fast preparse (e.g. /status, /loop, /cron list),
+    // run it through the same path a user would hit when typing it in the
+    // originating channel. Falls through to the agent inbox when preparse
+    // returns None — anything not slash, or slash commands that need the
+    // full LLM (e.g. /help text rendering at agent level), still reach
+    // the agent loop unchanged.
+    let job_text = job.effective_message();
+    if job_text.starts_with('/') {
+        let (preparse_channel, preparse_peer) = match job.delivery.as_ref() {
+            Some(d) => (
+                d.channel.as_deref().unwrap_or(""),
+                d.to.as_deref().unwrap_or(""),
+            ),
+            None => ("", ""),
+        };
+        if let Some(reply) = crate::gateway::preparse::try_preparse_locally(
+            job_text,
+            handle.as_ref(),
+            preparse_channel,
+            preparse_peer,
+        )
+        .await
+        {
+            // Clear the abort flag (we never dispatched to the agent).
+            abort_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+            info!(
+                job_id = %job.id,
+                len = reply.text.len(),
+                "cron job handled by preparse short-circuit"
+            );
+            return Ok(reply.text);
+        }
+    }
+
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let msg = AgentMessage {
         session_key: session_key.clone(),
-        text: job.effective_message().to_owned(),
+        text: job_text.to_owned(),
         channel: "cron".to_string(),
         peer_id: format!("cron:{}", job.id),
         chat_id: String::new(),
@@ -1790,7 +1844,12 @@ async fn run_exec_command(
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let msg = AgentMessage {
-            session_key: format!("summarize:{}", job.id), // Use "summarize:" prefix to disable ALL tools
+            // `summarize:` prefix is detected by the agent runtime and disables
+            // ALL tools for the turn — forces the LLM to return a text summary
+            // instead of calling memory.put / write_file / etc. Without this,
+            // the agent treats summarize requests as normal turns and often
+            // chooses tool calls over plain text.
+            session_key: format!("summarize:{}", session_key),
             text: summarize_prompt,
             channel: "cron".to_string(),
             peer_id: format!("cron:{}", job.id),
@@ -1803,9 +1862,11 @@ async fn run_exec_command(
 
         handle.tx.send(msg).await.context("agent inbox closed")?;
 
-        // Wait for summary with timeout.
-        // Use 300s timeout - agent may be processing other tasks and summarize needs time.
-        // Cron jobs are often batch operations, so longer wait is acceptable.
+        // Wait for summary with timeout. 300s gives the (possibly busy)
+        // agent room to process other tasks first; cron jobs tend to be
+        // batch-style so a longer wait is acceptable. Note that the new
+        // _summarizer agent path above is the real fix for queue
+        // contention — the timeout is just a safety net.
         let summary_timeout = Duration::from_secs(300);
         match tokio::time::timeout(summary_timeout, reply_rx).await {
             Ok(Ok(reply)) => {
@@ -1976,6 +2037,34 @@ pub fn save_cron_jobs(jobs: &[CronJob]) -> anyhow::Result<()> {
 /// Without this, concurrent `cron.add` calls (common when an LLM dispatches
 /// multiple tool calls in one turn) race and silently lose writes.
 pub static CRON_FILE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+// ---------------------------------------------------------------------------
+// Cross-module reload signal
+// ---------------------------------------------------------------------------
+//
+// Lets non-server code paths (e.g. fast preparse `/loop`) ask the cron runner
+// to reload `cron.json5` after appending a new job. Populated once at gateway
+// startup with the same broadcast sender wired into AppState.
+
+static CRON_RELOAD_TX: OnceLock<broadcast::Sender<()>> = OnceLock::new();
+
+/// Install the cron reload broadcast sender. Called once at gateway startup.
+/// Subsequent installs are silently ignored (idempotent).
+pub fn install_reload_sender(tx: broadcast::Sender<()>) {
+    if CRON_RELOAD_TX.set(tx).is_err() {
+        warn!("cron: reload sender already installed, ignoring duplicate install");
+    }
+}
+
+/// Trigger a cron reload from anywhere in the crate. Returns `true` if the
+/// signal was sent, `false` if no sender is installed yet (during early
+/// startup) or if every receiver has been dropped.
+pub fn trigger_reload() -> bool {
+    match CRON_RELOAD_TX.get() {
+        Some(tx) => tx.send(()).is_ok(),
+        None => false,
+    }
+}
 
 #[cfg(test)]
 mod cron_config_equal_tests {

@@ -232,6 +232,12 @@ pub struct WeChatPersonalChannel {
     on_message: Arc<dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>) + Send + Sync>,
 }
 
+/// Sentinel prefix used in the bail message produced by
+/// `WeChatPersonalChannel::check_send_ret`. Callers compare against this
+/// to distinguish a notify-side rejection (don't retry, emit fallback)
+/// from a genuine network / 5xx failure (do retry).
+const NOTIFY_REJECTED_PREFIX: &str = "WECHAT_NOTIFY_REJECTED:";
+
 impl WeChatPersonalChannel {
     /// Create from a saved bot_token (after QR login).
     pub fn new(bot_token: String, on_message: Arc<dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>) + Send + Sync>) -> Self {
@@ -408,6 +414,34 @@ impl WeChatPersonalChannel {
     // Message sending
     // -----------------------------------------------------------------------
 
+    /// Inspect a sendmessage HTTP-200 response body for the ilink `ret` code.
+    ///
+    /// Wechat's ilink protocol returns `{"ret": -2, ...}` for messages it
+    /// accepts at HTTP level but refuses to deliver (anti-spam, invalid
+    /// media reference, similar). Treating this as Ok silently loses the
+    /// message; treating it as a hard task failure misrepresents what
+    /// happened (the upstream work, e.g. video gen, actually succeeded).
+    /// We bail with the `WECHAT_NOTIFY_REJECTED` prefix below so callers
+    /// can recognise the case and emit a delivery-only fallback rather
+    /// than re-running the task.
+    fn check_send_ret(label: &str, resp_body: &str) -> Result<()> {
+        let parsed: serde_json::Value = match serde_json::from_str(resp_body) {
+            Ok(v) => v,
+            Err(_) => return Ok(()), // empty body or non-JSON = treat as ok
+        };
+        let ret = parsed.get("ret").and_then(|v| v.as_i64()).unwrap_or(0);
+        if ret == 0 {
+            return Ok(());
+        }
+        warn!(
+            label = %label,
+            ret = ret,
+            body = %resp_body,
+            "wechat: ilink ret != 0 — message rejected by upstream (notify failure)"
+        );
+        bail!("{NOTIFY_REJECTED_PREFIX}ret={ret}");
+    }
+
     async fn send_text(&self, to_user_id: &str, text: &str) -> Result<()> {
         let url = format!("{}/ilink/bot/sendmessage", self.base_url);
         let client_id = uuid::Uuid::new_v4().to_string();
@@ -443,7 +477,7 @@ impl WeChatPersonalChannel {
         if !status.is_success() {
             bail!("sendmessage failed: {status} {resp_body}");
         }
-
+        Self::check_send_ret("send_text", &resp_body)?;
         Ok(())
     }
 
@@ -1082,6 +1116,7 @@ impl WeChatPersonalChannel {
             bail!("send image message failed: {status} {resp_body}");
         }
         info!(status = %status, resp = %resp_body, "wechat: send_image_message response");
+        Self::check_send_ret("send_image_message", &resp_body)?;
         Ok(())
     }
 
@@ -1165,6 +1200,7 @@ impl WeChatPersonalChannel {
             bail!("send file message failed: {status} {resp_body}");
         }
         info!(status = %status, resp = %resp_body, "wechat: send_file_message ok");
+        Self::check_send_ret("send_file_message", &resp_body)?;
         Ok(())
     }
 
@@ -1188,7 +1224,8 @@ impl WeChatPersonalChannel {
         std::fs::write(&tmp_src, audio_bytes)?;
 
         // ffmpeg: decode to raw PCM s16le mono 24kHz
-        let output = std::process::Command::new("ffmpeg")
+        let ffmpeg_bin = crate::agent::platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
+        let output = std::process::Command::new(&ffmpeg_bin)
             .args([
                 "-i", &tmp_src.to_string_lossy(),
                 "-y", "-f", "s16le", "-ar", "24000", "-ac", "1",
@@ -1278,6 +1315,7 @@ impl WeChatPersonalChannel {
             bail!("send voice message failed: {status} {resp_body}");
         }
         info!(status = %status, resp = %resp_body, "wechat: send_voice_message response");
+        Self::check_send_ret("send_voice_message", &resp_body)?;
         Ok(())
     }
 
@@ -1333,6 +1371,7 @@ impl WeChatPersonalChannel {
             bail!("send video message failed: {status} {resp_body}");
         }
         info!(status = %status, resp = %resp_body, "wechat: send_video_message response");
+        Self::check_send_ret("send_video_message", &resp_body)?;
         Ok(())
     }
 }
@@ -1411,8 +1450,19 @@ impl Channel for WeChatPersonalChannel {
             };
             if !msg.text.trim().is_empty() {
                 let chunks = chunk_text(&msg.text, &chunk_cfg);
-                for chunk in &chunks {
-                    self.send_text(&msg.target_id, chunk).await?;
+                for (i, chunk) in chunks.iter().enumerate() {
+                    match self.send_text(&msg.target_id, chunk).await {
+                        Ok(()) => {}
+                        Err(e) if e.to_string().starts_with(NOTIFY_REJECTED_PREFIX) => {
+                            // Wechat refused this chunk (anti-spam etc).
+                            // Don't propagate — `send_with_retry` would
+                            // re-clone the OutboundMessage and re-send
+                            // every prior chunk, image, and file. Log
+                            // and move on to whatever's left.
+                            warn!(chunk = i, "wechat: text chunk rejected by upstream: {e:#}");
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             }
 
@@ -1453,16 +1503,40 @@ impl Channel for WeChatPersonalChannel {
                     || filename.ends_with(".avi")
                     || filename.ends_with(".mkv");
                 if is_video {
+                    let mut sent = false;
                     match self.upload_media(&bytes, &msg.target_id, UploadMediaType::Video).await {
                         Ok(uploaded) => {
-                            if let Err(e) = self.send_video_message(&msg.target_id, &uploaded).await {
-                                warn!(index = idx, "wechat: send video message failed: {e:#}");
-                            } else {
-                                info!(index = idx, filename = %filename, "wechat: video sent");
+                            match self.send_video_message(&msg.target_id, &uploaded).await {
+                                Ok(()) => {
+                                    info!(index = idx, filename = %filename, "wechat: video sent");
+                                    sent = true;
+                                }
+                                Err(e) => {
+                                    warn!(index = idx, "wechat: send video message failed: {e:#}");
+                                }
                             }
                         }
                         Err(e) => {
                             warn!(index = idx, "wechat: video upload failed: {e:#}");
+                        }
+                    }
+                    // Fallback: wechat's CDN periodically 5xx's video uploads
+                    // (or times out). Don't leave the user staring at silence —
+                    // tell them where the file is and that we can ship it
+                    // somewhere else (e.g. publish to douyin) without re-running.
+                    if !sent {
+                        let mb_str = format!("{:.1}", bytes.len() as f64 / 1_048_576.0);
+                        let fallback_text = crate::i18n::t_fmt(
+                            "wechat_video_notify_failed",
+                            crate::i18n::default_lang(),
+                            &[
+                                ("filename", filename.as_str()),
+                                ("mb", &mb_str),
+                                ("path", path_or_url.as_str()),
+                            ],
+                        );
+                        if let Err(send_err) = self.send_text(&msg.target_id, &fallback_text).await {
+                            warn!(index = idx, "wechat: video fallback text also failed: {send_err:#}");
                         }
                     }
                     continue;

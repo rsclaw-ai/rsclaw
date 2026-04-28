@@ -413,6 +413,7 @@ mod tests {
                 tools: None,
                 skills: None,
                 plugins: None,
+                evolution: None,
             },
             ops: OpsRuntime {
                 cron: None,
@@ -468,6 +469,7 @@ mod tests {
                 tools: None,
                 skills: None,
                 plugins: None,
+                evolution: None,
             },
             ops: OpsRuntime {
                 cron: None,

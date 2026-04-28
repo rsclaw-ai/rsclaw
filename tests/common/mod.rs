@@ -90,6 +90,7 @@ pub fn minimal_config(port: u16) -> RuntimeConfig {
             tools: None,
             skills: None,
             plugins: None,
+            evolution: None,
         },
         ops: OpsRuntime {
             cron: None,

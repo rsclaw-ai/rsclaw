@@ -1,14 +1,18 @@
 //! Meditation engine -- periodic memory maintenance triggered by heartbeat.
 //!
-//! Three phases:
+//! Phases (each returns its own count in [`MeditationReport`]):
 //! 1. Dedup: merge near-duplicate Core/Working memories (cosine sim > 0.92)
-//! 2. Conflict: detect contradictory high-importance memories, LLM resolves
-//! 3. Cleanup: demote "crystallized"-tagged memories to Peripheral after 7 days
+//! 2. Crystallize: distill Core un-crystallized clusters into SKILL.md
+//!    files (only runs when crystallization deps are provided)
+//! 3. Cleanup: demote "crystallized"-tagged memories to Peripheral after
+//!    [`MeditationConfig::crystallized_ttl_days`]
 
 use anyhow::Result;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::agent::memory::{MemDocTier, MemoryStore};
+use crate::provider::registry::ProviderRegistry;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -26,10 +30,13 @@ pub struct MeditationConfig {
 
 impl Default for MeditationConfig {
     fn default() -> Self {
+        // Pick up live values from the evolution config (matches the
+        // previous hardcoded constants when no override is set).
+        let evo = crate::agent::evolution::evolution_config();
         Self {
-            dedup_threshold: 0.92,
+            dedup_threshold: evo.meditation.dedup_threshold,
             batch_size: 50,
-            crystallized_ttl_days: 7,
+            crystallized_ttl_days: evo.meditation.crystallized_ttl_days,
         }
     }
 }
@@ -45,9 +52,14 @@ pub struct MeditationReport {
     pub duplicates_merged: usize,
     /// Number of crystallized documents cleaned (demoted).
     pub crystallized_cleaned: usize,
+    /// Number of new SKILL.md files written by the crystallize phase.
+    pub skills_crystallized: usize,
     /// Total documents inspected across all phases.
     pub total_processed: usize,
 }
+
+// Crystallize phase cap is read from the live evolution config —
+// `meditation.max_per_cycle`.
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -136,6 +148,65 @@ async fn dedup_phase(
 // ---------------------------------------------------------------------------
 // Cleanup phase
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Crystallize phase (optional)
+// ---------------------------------------------------------------------------
+
+/// Scan Core memories that haven't been crystallized yet and try to distill
+/// each into a `SKILL.md` file. Caps work at the live evolution config's
+/// `meditation.max_per_cycle` to bound LLM cost per cycle.
+///
+/// This is the bottom-line path that catches Core memories the runtime
+/// online trigger missed (e.g. promoted but never recalled again).
+///
+/// Takes `Arc<Mutex<MemoryStore>>` (not `&mut MemoryStore`) because
+/// `crystallize_one` releases the lock during the LLM call to avoid
+/// blocking other memory consumers for tens of seconds.
+pub async fn crystallize_phase(
+    store: &Arc<tokio::sync::Mutex<MemoryStore>>,
+    scope: &str,
+    providers: &Arc<ProviderRegistry>,
+    flash_model: &str,
+    skills_dir: &std::path::Path,
+) -> Result<usize> {
+    let max_per_cycle = crate::agent::evolution::evolution_config()
+        .meditation
+        .max_per_cycle;
+
+    // 1. Collect candidate doc IDs (brief lock).
+    let candidates: Vec<String> = {
+        let s = store.lock().await;
+        s.find_by_tier(&MemDocTier::Core, Some(scope))
+            .into_iter()
+            .filter(|d| !d.tags.iter().any(|t| t == "crystallized"))
+            .take(max_per_cycle)
+            .map(|d| d.id.clone())
+            .collect()
+    };
+
+    let mut written = 0usize;
+    for doc_id in candidates {
+        match crate::skill::crystallizer::crystallize_one(
+            store,
+            &doc_id,
+            scope,
+            providers,
+            flash_model,
+            skills_dir,
+        )
+        .await
+        {
+            Ok(Some(_path)) => written += 1,
+            Ok(None) => {} // no cluster / in-flight / model issue — already logged
+            Err(e) => {
+                tracing::warn!(doc_id, "crystallize_phase hard failure: {e:#}");
+            }
+        }
+    }
+
+    Ok(written)
+}
 
 /// Demote crystallized memories that have exceeded their TTL.
 ///

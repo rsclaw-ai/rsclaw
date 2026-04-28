@@ -45,6 +45,20 @@ const SESSION_ALIASES: TableDefinition<&str, &str> = TableDefinition::new("sessi
 /// Task queue: task_id → JSON-serialized QueuedTask.
 const TASK_QUEUE: TableDefinition<&str, &str> = TableDefinition::new("task_queue");
 
+/// External provider jobs: job_id → JSON-serialized ExternalJob. Keeps
+/// long-running provider tasks (video / image generation) alive across
+/// gateway restarts so the artifact gets delivered even if the agent
+/// process died mid-poll.
+const EXTERNAL_JOBS: TableDefinition<&str, &str> = TableDefinition::new("external_jobs");
+
+/// Idempotency keys for outbound side-effects: key → Unix timestamp of
+/// successful delivery. Used by the task-queue worker to avoid double-
+/// sending a turn's reply when the gateway crashed after the channel
+/// accepted the message but before the per-turn counter was persisted.
+/// Rows expire (cleaned up by `cleanup_idem_keys`) once their retention
+/// window passes.
+const IDEM_KEYS: TableDefinition<&str, i64> = TableDefinition::new("idem_keys");
+
 // ---------------------------------------------------------------------------
 // RedbStore
 // ---------------------------------------------------------------------------
@@ -88,6 +102,12 @@ impl RedbStore {
             write
                 .open_table(TASK_QUEUE)
                 .context("init TASK_QUEUE")?;
+            write
+                .open_table(EXTERNAL_JOBS)
+                .context("init EXTERNAL_JOBS")?;
+            write
+                .open_table(IDEM_KEYS)
+                .context("init IDEM_KEYS")?;
         }
         write.commit().context("commit init")?;
 
@@ -512,6 +532,101 @@ impl RedbStore {
         Ok(result)
     }
 
+    /// Crash-recovery sweep: any task left in `Running` from a previous
+    /// process is moved back to `Pending` so the worker picks it up. Returns
+    /// the count of tasks revived. Does NOT increment retries — the previous
+    /// process simply died, the agent itself didn't fail.
+    pub fn requeue_running_tasks(&self) -> Result<usize> {
+        use crate::gateway::task_queue::TaskStatus;
+
+        let write = self.db.begin_write()?;
+        let count = {
+            let mut table = write.open_table(TASK_QUEUE)?;
+            let mut to_revive = Vec::new();
+            for entry in table.iter()? {
+                let (_k, v) = entry?;
+                let task: crate::gateway::task_queue::QueuedTask =
+                    serde_json::from_str(v.value())?;
+                if task.status == TaskStatus::Running {
+                    to_revive.push(task);
+                }
+            }
+            let count = to_revive.len();
+            for mut task in to_revive {
+                task.status = TaskStatus::Pending;
+                task.updated_at = chrono::Utc::now().timestamp();
+                let json = serde_json::to_string(&task)?;
+                table.insert(task.id.as_str(), json.as_str())?;
+            }
+            count
+        };
+        write.commit()?;
+        Ok(count)
+    }
+
+    /// Persist the per-turn counter so /task tasks resumed after a crash
+    /// pick up where they left off rather than restarting at turn 0.
+    pub fn update_task_turn(&self, task_id: &str, turn: u32) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(TASK_QUEUE)?;
+            let guard = table
+                .get(task_id)?
+                .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+            let mut task: crate::gateway::task_queue::QueuedTask =
+                serde_json::from_str(guard.value())?;
+            drop(guard);
+            task.turns = turn;
+            task.updated_at = chrono::Utc::now().timestamp();
+            let json = serde_json::to_string(&task)?;
+            table.insert(task_id, json.as_str())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Persist the most recent agent reply on a task so reconnect-replay
+    /// can re-deliver the answer without consulting the chat-history index.
+    pub fn update_task_last_reply(&self, task_id: &str, text: &str) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(TASK_QUEUE)?;
+            let guard = table
+                .get(task_id)?
+                .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+            let mut task: crate::gateway::task_queue::QueuedTask =
+                serde_json::from_str(guard.value())?;
+            drop(guard);
+            task.last_reply = Some(text.to_owned());
+            task.updated_at = chrono::Utc::now().timestamp();
+            let json = serde_json::to_string(&task)?;
+            table.insert(task_id, json.as_str())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Mark a task's final reply as delivered so reconnect-replay won't
+    /// re-send it.
+    pub fn mark_task_notified(&self, task_id: &str) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(TASK_QUEUE)?;
+            let guard = table
+                .get(task_id)?
+                .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+            let mut task: crate::gateway::task_queue::QueuedTask =
+                serde_json::from_str(guard.value())?;
+            drop(guard);
+            task.notified = true;
+            task.updated_at = chrono::Utc::now().timestamp();
+            let json = serde_json::to_string(&task)?;
+            table.insert(task_id, json.as_str())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
     /// Update task status.
     pub fn update_task_status(
         &self,
@@ -695,6 +810,199 @@ impl RedbStore {
         };
         write.commit()?;
         Ok(merged)
+    }
+
+    // -----------------------------------------------------------------------
+    // Idempotency keys (channel-send dedup across crashes)
+    // -----------------------------------------------------------------------
+
+    /// Whether `key` has already been recorded as a successful delivery.
+    pub fn is_idem_delivered(&self, key: &str) -> Result<bool> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(IDEM_KEYS)?;
+        Ok(table.get(key)?.is_some())
+    }
+
+    /// Record `key` as delivered with the current timestamp. Calling this
+    /// after the channel send succeeds turns the next crash-recovery into a
+    /// no-op for that side-effect.
+    pub fn mark_idem_delivered(&self, key: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(IDEM_KEYS)?;
+            table.insert(key, now)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Drop idempotency keys older than `retention_secs`. Returns count
+    /// removed. Called periodically by the task-queue worker so the table
+    /// doesn't accumulate forever.
+    pub fn cleanup_idem_keys(&self, retention_secs: i64) -> Result<usize> {
+        let cutoff = chrono::Utc::now().timestamp() - retention_secs;
+        let write = self.db.begin_write()?;
+        let count = {
+            let mut table = write.open_table(IDEM_KEYS)?;
+            let mut victims = Vec::new();
+            for entry in table.iter()? {
+                let (k, v) = entry?;
+                if v.value() < cutoff {
+                    victims.push(k.value().to_owned());
+                }
+            }
+            let count = victims.len();
+            for key in &victims {
+                table.remove(key.as_str())?;
+            }
+            count
+        };
+        write.commit()?;
+        Ok(count)
+    }
+
+    // -----------------------------------------------------------------------
+    // External provider jobs (video / image generation surviving restarts)
+    // -----------------------------------------------------------------------
+
+    /// Insert a freshly-submitted external job.
+    pub fn enqueue_external_job(
+        &self,
+        job: &crate::gateway::external_jobs::ExternalJob,
+    ) -> Result<()> {
+        let json = serde_json::to_string(job)?;
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(EXTERNAL_JOBS)?;
+            table.insert(job.id.as_str(), json.as_str())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Replace an existing job row (after polling, status update, etc.).
+    /// Errors if the row no longer exists — callers should treat that as a
+    /// concurrent delete and abandon the update.
+    pub fn update_external_job(
+        &self,
+        job: &crate::gateway::external_jobs::ExternalJob,
+    ) -> Result<()> {
+        let json = serde_json::to_string(job)?;
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(EXTERNAL_JOBS)?;
+            if table.get(job.id.as_str())?.is_none() {
+                anyhow::bail!("external job not found: {}", job.id);
+            }
+            table.insert(job.id.as_str(), json.as_str())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Fetch a single job by id.
+    pub fn get_external_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<crate::gateway::external_jobs::ExternalJob>> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(EXTERNAL_JOBS)?;
+        match table.get(job_id)? {
+            Some(guard) => {
+                let job = serde_json::from_str(guard.value())?;
+                Ok(Some(job))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Return every job that the worker should act on this tick. Two cases
+    /// share the same `next_poll_at` cursor:
+    ///   1. Active jobs (`Pending` / `Polling`) due for another poll cycle.
+    ///   2. Terminal jobs (`Done` / `Failed` / `TimedOut`) whose delivery
+    ///      hasn't succeeded yet — `next_poll_at` is reused as the next
+    ///      delivery-retry time when a previous attempt failed.
+    pub fn due_external_jobs(
+        &self,
+        now: i64,
+    ) -> Result<Vec<crate::gateway::external_jobs::ExternalJob>> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(EXTERNAL_JOBS)?;
+        let mut due = Vec::new();
+        for entry in table.iter()? {
+            let (_k, v) = entry?;
+            let job: crate::gateway::external_jobs::ExternalJob =
+                serde_json::from_str(v.value())?;
+            if job.next_poll_at > now {
+                continue;
+            }
+            // Pending / Polling get polled. Terminal-but-undelivered get a
+            // delivery retry. Already-delivered terminal rows are skipped
+            // (cleanup_finished_external_jobs handles them).
+            let needs_action = matches!(
+                job.status,
+                crate::gateway::external_jobs::ExternalJobStatus::Pending
+                    | crate::gateway::external_jobs::ExternalJobStatus::Polling
+            ) || job.needs_delivery();
+            if needs_action
+                && job.delivery_attempts
+                    < crate::gateway::external_jobs::ExternalJob::MAX_DELIVERY_ATTEMPTS
+            {
+                due.push(job);
+            }
+        }
+        Ok(due)
+    }
+
+    /// Delete a job by id (used after delivery + retention window).
+    pub fn delete_external_job(&self, job_id: &str) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(EXTERNAL_JOBS)?;
+            table.remove(job_id)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Remove terminal jobs that are eligible for GC. A row is eligible if:
+    ///   - it's older than `retention_secs`, AND
+    ///   - it has been delivered, OR
+    ///   - it exhausted `MAX_DELIVERY_ATTEMPTS` (broken sink — give up).
+    /// Undelivered terminal rows that haven't exhausted retries stay so
+    /// the worker keeps trying.
+    pub fn cleanup_finished_external_jobs(&self, retention_secs: i64) -> Result<usize> {
+        use crate::gateway::external_jobs::{ExternalJob, ExternalJobStatus};
+
+        let cutoff = chrono::Utc::now().timestamp() - retention_secs;
+        let write = self.db.begin_write()?;
+        let count = {
+            let mut table = write.open_table(EXTERNAL_JOBS)?;
+            let mut victims = Vec::new();
+            for entry in table.iter()? {
+                let (_k, v) = entry?;
+                let job: ExternalJob = serde_json::from_str(v.value())?;
+                let terminal = matches!(
+                    job.status,
+                    ExternalJobStatus::Done
+                        | ExternalJobStatus::Failed
+                        | ExternalJobStatus::TimedOut
+                );
+                let delivery_settled = job.delivered_at.is_some()
+                    || job.delivery_attempts >= ExternalJob::MAX_DELIVERY_ATTEMPTS;
+                if terminal && delivery_settled && job.submitted_at < cutoff {
+                    victims.push(job.id);
+                }
+            }
+            let count = victims.len();
+            for id in &victims {
+                table.remove(id.as_str())?;
+            }
+            count
+        };
+        write.commit()?;
+        Ok(count)
     }
 }
 

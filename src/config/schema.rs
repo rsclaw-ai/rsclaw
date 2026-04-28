@@ -32,6 +32,7 @@ pub struct Config {
     pub logging: Option<LoggingConfig>,
     pub skills: Option<SkillsConfig>,
     pub plugins: Option<PluginsConfig>,
+    pub evolution: Option<EvolutionConfig>,
     pub hooks: Option<HooksConfig>,
     pub secrets: Option<SecretsConfig>,
     pub memory_search: Option<MemorySearchConfig>,
@@ -1545,6 +1546,49 @@ pub struct SkillEntryConfig {
     pub enabled: Option<bool>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
+}
+
+// ---------------------------------------------------------------------------
+// evolution — self-evolution thresholds for memory crystallization
+// ---------------------------------------------------------------------------
+
+/// Top-level evolution config block. All fields optional; missing values fall
+/// back to [`crate::agent::evolution::EvolutionConfig::default`].
+///
+/// `preset = "test"` swaps the base to looser test-mode thresholds before
+/// individual field overrides apply.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EvolutionConfig {
+    pub enabled: Option<bool>,
+    pub preset: Option<String>,
+    pub cluster: Option<EvolutionClusterConfig>,
+    pub promotion: Option<EvolutionPromotionConfig>,
+    pub meditation: Option<EvolutionMeditationConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EvolutionClusterConfig {
+    pub min_size: Option<usize>,
+    pub similarity_threshold: Option<f32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EvolutionPromotionConfig {
+    pub access_only: Option<i64>,
+    pub importance_only: Option<f32>,
+    pub both_access: Option<i64>,
+    pub both_importance: Option<f32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EvolutionMeditationConfig {
+    pub max_per_cycle: Option<usize>,
+    pub dedup_threshold: Option<f32>,
+    pub crystallized_ttl_days: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------

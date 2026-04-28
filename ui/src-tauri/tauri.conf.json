@@ -15,7 +15,12 @@
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["$DOWNLOAD/rsclaw/**", "$DOWNLOAD/rsclaw/**/*"]
+        "scope": [
+          "$DOWNLOAD/rsclaw/**",
+          "$DOWNLOAD/rsclaw/**/*",
+          "$HOME/.rsclaw/**",
+          "$HOME/.rsclaw/**/*"
+        ]
       }
     },
     "windows": [
@@ -60,7 +65,7 @@
     },
     "resources": ["icons/icon.png", "icons/icon-tray.png", "icons/icon-tray@2x.png"],
     "shortDescription": "RsClaw AI Agent Engine",
-    "targets": "all",
+    "targets": ["deb", "rpm", "appimage", "app", "dmg", "nsis"],
     "windows": {
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
@@ -70,8 +75,11 @@
         "silent": true
       },
       "nsis": {
-        "languages": ["SimpChinese", "English", "TradChinese", "Japanese", "Korean", "French", "German", "Spanish", "Russian", "Thai"],
-        "displayLanguageSelector": false
+        "languages": ["English", "SimpChinese", "TradChinese", "Japanese", "Korean", "French", "German", "Spanish", "Russian", "Thai"],
+        "displayLanguageSelector": false,
+        "installerIcon": "icons/icon.ico",
+        "headerImage": "icons/nsis-header.bmp",
+        "sidebarImage": "icons/nsis-sidebar.bmp"
       }
     }
   },

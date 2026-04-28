@@ -492,47 +492,75 @@ impl rsclaw::plugin::host_storage::Host for HostState {
         &mut self,
         filename: String,
     ) -> Result<Result<String, String>> {
-        // Reject path separators — plugins must supply a bare filename.
-        if filename.contains('/') || filename.contains('\\') {
-            return Ok(Err(format!(
-                "allocate_artifact: filename must not contain path separators: {filename}"
-            )));
-        }
-        // Layout: <Downloads>/rsclaw/<videos|images|files>/<nanos_hex>/<filename>
-        // Use the OS Downloads dir (visible, cross-platform: macOS/Windows/Linux
-        // all expose one) so Tauri v2's asset protocol scope can match without
-        // fighting `require_literal_leading_dot`. nanos_hex makes each
-        // allocation unique so repeated filenames don't collide.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let category = match std::path::Path::new(&filename)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("mp4" | "mov" | "webm" | "mkv" | "avi" | "m4v") => "videos",
-            Some("jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg") => "images",
-            _ => "files",
-        };
-        let base = dirs_next::download_dir()
-            .unwrap_or_else(|| {
-                dirs_next::home_dir()
-                    .unwrap_or_else(crate::config::loader::base_dir)
-                    .join("Downloads")
-            })
-            .join("rsclaw")
-            .join(category);
-        let subdir = base.join(format!("{nanos:x}"));
-        if let Err(e) = std::fs::create_dir_all(&subdir) {
-            return Ok(Err(format!("allocate_artifact: create_dir: {e}")));
-        }
-        let full = subdir.join(&filename);
-        tracing::debug!(target: "wasm_plugin", "allocated artifact: {}", full.display());
-        Ok(Ok(full.to_string_lossy().to_string()))
+        Ok(allocate_dl_paths(&filename, 1).map(|paths| paths.into_iter().next().unwrap_or_default()))
     }
+
+    async fn allocate_artifact_group(
+        &mut self,
+        filename: String,
+        count: u32,
+    ) -> Result<Result<Vec<String>, String>> {
+        Ok(allocate_dl_paths(&filename, count.max(1) as usize))
+    }
+}
+
+/// Build `count` canonical download paths, all sharing the same
+/// `dl_<kind>_<TS><abc>` base. For `count > 1` each path gets a `_N`
+/// (1-based) index suffix; for `count == 1` no suffix is appended.
+///
+/// Layout: `~/Downloads/rsclaw/<category>/<dl_kind_TS_abc[_N]>.<ext>`.
+/// The host owns the on-disk shape; plugins only pass a hint filename
+/// whose extension drives the category and ext.
+fn allocate_dl_paths(filename: &str, count: usize) -> Result<Vec<String>, String> {
+    if filename.contains('/') || filename.contains('\\') {
+        return Err(format!(
+            "allocate_artifact: filename must not contain path separators: {filename}"
+        ));
+    }
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("bin")
+        .to_ascii_lowercase();
+    let kind = crate::channel::kind_from_extension(&ext);
+    let category = crate::channel::category_for_kind(kind);
+    let dir = dirs_next::download_dir()
+        .unwrap_or_else(|| {
+            dirs_next::home_dir()
+                .unwrap_or_else(crate::config::loader::base_dir)
+                .join("Downloads")
+        })
+        .join("rsclaw")
+        .join(category);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return Err(format!("allocate_artifact: create_dir: {e}"));
+    }
+    // Pick a (timestamp, abc) base that doesn't collide with anything
+    // already on disk. 26^3 = 17 576 combinations, so for any sane rate
+    // a single retry is enough; cap at 10 so we surface a real failure
+    // instead of looping if the directory is somehow saturated.
+    let ts = chrono::Local::now().format("%Y%m%d%H%M").to_string();
+    for _ in 0..10 {
+        let abc: String = (0..3)
+            .map(|_| (rand::random::<u8>() % 26 + b'a') as char)
+            .collect();
+        let base = format!("dl_{kind}_{ts}{abc}");
+        let names: Vec<String> = if count <= 1 {
+            vec![format!("{base}.{ext}")]
+        } else {
+            (1..=count).map(|i| format!("{base}_{i}.{ext}")).collect()
+        };
+        if names.iter().any(|n| dir.join(n).exists()) {
+            continue;
+        }
+        let paths: Vec<String> = names
+            .into_iter()
+            .map(|n| dir.join(n).to_string_lossy().to_string())
+            .collect();
+        tracing::debug!(target: "wasm_plugin", "allocated artifact group: {} paths under {}", paths.len(), dir.display());
+        return Ok(paths);
+    }
+    Err("allocate_artifact: could not pick a unique name after 10 attempts".to_owned())
 }
 
 impl HostState {
