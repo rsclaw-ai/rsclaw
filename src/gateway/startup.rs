@@ -897,16 +897,18 @@ fn spawn_agent_tasks(
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
-                        was_preparse: false,
+                        needs_outer_done_emit: false,
                     }
                 });
-                // Emit to event_bus for preparse turns (agent_loop already
-                // emits streaming deltas + done for LLM turns, so a second
-                // emit would duplicate the done frame) *and* for turns that
+                // Emit to event_bus for any reply path that bypassed
+                // agent_loop (preparse, file-attach short-circuits, /btw,
+                // disk-low, __DIRECT_REPLY__, etc.) *and* for turns that
                 // failed with Err (agent_loop returns early via `?` on LLM
                 // errors and never gets to emit done — WS clients would hang
-                // waiting for the terminator forever).
-                if reply.was_preparse || turn_errored {
+                // waiting for the terminator forever). Normal LLM turns
+                // already emit deltas + done from inside agent_loop, so a
+                // second emit would duplicate the done frame.
+                if reply.needs_outer_done_emit || turn_errored {
                     if !reply.text.is_empty() {
                         // receiver may have been dropped
                         let _ = event_tx_task.send(crate::events::AgentEvent {

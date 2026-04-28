@@ -171,7 +171,7 @@ impl AgentSpawner {
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
-                        was_preparse: false,
+                        needs_outer_done_emit: false,
                     }
                 });
                 let _ = reply_tx.send(reply);

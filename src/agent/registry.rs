@@ -315,10 +315,20 @@ pub struct AgentReply {
     /// If set, the worker should send a follow-up LLM analysis after the
     /// immediate reply.
     pub pending_analysis: Option<PendingAnalysis>,
-    /// True when the reply was produced by the preparse engine (not LLM).
-    /// The outer agent loop uses this to decide whether to emit to event_bus,
-    /// since agent_loop already emits for LLM turns.
-    pub was_preparse: bool,
+    /// True when the runtime's outer dispatcher should emit a `done=true`
+    /// event_bus frame after this reply.
+    ///
+    /// Set to `true` for every reply path that bypasses `agent_loop` (preparse
+    /// short-circuits, file-attachment short-circuits, `__DIRECT_REPLY__`,
+    /// `/btw` side queries, disk-low responses, etc.) since those paths
+    /// don't emit a streaming terminator themselves. `agent_loop` emits its
+    /// own done frame internally for normal LLM turns and its own
+    /// early-return paths (clear_signal, abort, max_iterations, error_streak,
+    /// loop-detected), so it sets this to `false`.
+    ///
+    /// Without this flag, WS subscribers (the desktop chat UI) wait forever
+    /// for the terminator and the input freezes.
+    pub needs_outer_done_emit: bool,
 }
 
 // ---------------------------------------------------------------------------
