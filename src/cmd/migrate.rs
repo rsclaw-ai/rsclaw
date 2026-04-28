@@ -528,15 +528,47 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
         }
     }
 
-    // --- Migrate feishu allowFrom to channel config ---
-    let allow_from_path = openclaw_dir.join("credentials/feishu-main-bot-allowFrom.json");
-    if allow_from_path.is_file() {
-        if let Ok(data) = std::fs::read_to_string(&allow_from_path) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
-                if let Some(allow_from) = val.get("allowFrom").and_then(|v| v.as_array()) {
-                    if !allow_from.is_empty() {
-                        item("*", &format!("{} feishu allowFrom entries found (add to channels.feishu.allowFrom in config)", allow_from.len()));
-                    }
+    // --- Migrate per-channel allowFrom credential files. OpenClaw stores
+    // approved peers in `<openclaw>/credentials/<channel>-<account>-allowFrom.json`;
+    // rsclaw uses the same format under `<rsclaw>/credentials/`, so a
+    // straight file copy lights up the existing trust list on first run.
+    let oc_creds = openclaw_dir.join("credentials");
+    let rs_creds = rsclaw_dir.join("credentials");
+    if oc_creds.is_dir() {
+        if let Err(e) = std::fs::create_dir_all(&rs_creds) {
+            warn_msg(&format!("failed to create credentials dir: {e}"));
+        } else if let Ok(entries) = std::fs::read_dir(&oc_creds) {
+            for entry in entries.flatten() {
+                let src = entry.path();
+                let Some(name) = src.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !name.ends_with("-allowFrom.json") {
+                    continue;
+                }
+                let count = std::fs::read_to_string(&src)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| {
+                        v.get("allowFrom")
+                            .and_then(|a| a.as_array())
+                            .map(|a| a.len())
+                    })
+                    .unwrap_or(0);
+                if count == 0 {
+                    continue;
+                }
+                let dst = rs_creds.join(name);
+                if dst.exists() {
+                    item(
+                        " ",
+                        &format!("allowFrom: {name} already at target, skipping"),
+                    );
+                    continue;
+                }
+                match std::fs::copy(&src, &dst) {
+                    Ok(_) => item("*", &format!("allowFrom migrated: {name} ({count} entries)")),
+                    Err(e) => warn_msg(&format!("allowFrom copy failed for {name}: {e}")),
                 }
             }
         }
