@@ -1302,6 +1302,50 @@ pub(crate) async fn ensure_bge_model_present(
 ) -> anyhow::Result<()> {
     use crate::agent::memory::LocalBgeEmbedder;
 
+    // Wait for an in-progress Tauri seed to finish before deciding whether
+    // to download. The Tauri app writes `<model_dir>.seeding.tauri` with its
+    // PID while copying the bundled model into place; if that PID is still
+    // alive we hold off up to 30s rather than redundantly hitting the CDN.
+    // Stale lock files (PID gone) are ignored.
+    let seeding_lock = model_dir.with_extension("seeding.tauri");
+    if seeding_lock.exists() {
+        let lock_pid = std::fs::read_to_string(&seeding_lock)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        if let Some(pid) = lock_pid {
+            if pid_alive(pid) {
+                tracing::info!(
+                    pid,
+                    lock = %seeding_lock.display(),
+                    "BGE model seed in progress (Tauri); waiting up to 30s"
+                );
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while seeding_lock.exists() && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    // Re-check liveness — Tauri might have crashed mid-copy.
+                    let still_alive = std::fs::read_to_string(&seeding_lock)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                        .map(pid_alive)
+                        .unwrap_or(false);
+                    if !still_alive {
+                        let _ = std::fs::remove_file(&seeding_lock);
+                        break;
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    stale_pid = pid,
+                    "stale seed lock from dead PID, removing"
+                );
+                let _ = std::fs::remove_file(&seeding_lock);
+            }
+        } else {
+            // Unparseable PID — treat as stale.
+            let _ = std::fs::remove_file(&seeding_lock);
+        }
+    }
+
     let weights_path = model_dir.join("model.safetensors");
     if weights_path.exists() {
         let weights_bytes = std::fs::metadata(&weights_path).map(|m| m.len()).ok();
