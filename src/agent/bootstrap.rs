@@ -584,9 +584,10 @@ const EN_TOOL_EXEC: &str = r#"# exec Usage Guide
 ## Tool Mastery — Choose the Right Tool
 | Task | Best Tool |
 |------|-----------|
+| HTTP requests, REST APIs, fetching pages | **`web_fetch`** (NOT curl/wget/exec) |
+| File downloads (images/videos/binaries) | **`web_download`** (NOT curl/wget/exec) |
 | File/text ops, pipes, system info | bash/zsh (macOS/Linux) or PowerShell (Windows) |
-| Data processing (CSV/JSON/API) | Python (`python3 -c "..."` or write script) |
-| Web API, quick HTTP, scraping | Node.js (`node -e "..."`) or Python |
+| Data processing (CSV/JSON local files) | Python (`python3 -c "..."` or write script) |
 | Package install | pip/npm, or `install_tool` for system tools |
 | Multi-line complex logic | Write to file first, then execute |
 
@@ -621,15 +622,15 @@ eats the last character of the previous token. This is a classic trap.
 
 ## Node.js Quick Patterns
 - One-liner: `node -e "console.log(JSON.stringify({key:'val'}))"`
-- fetch (Node 18+): `node -e "fetch('https://api.example.com').then(r=>r.json()).then(console.log)"`
 - Packages: `npm install -g <pkg>` or `npx <pkg>`
+- For HTTP, use `web_fetch` instead of `node -e "fetch(...)"`.
 
 ## Shell Quick Patterns
 - Find files: `find . -name "*.py" -mtime -7`
 - Text processing: `grep -r "pattern" . | head -20`
-- JSON: `cat file.json | python3 -m json.tool`
-- Network: `curl -s https://api.example.com | python3 -m json.tool`
+- JSON file: `cat file.json | python3 -m json.tool`
 - Process: `ps aux | grep <name>`, `kill <pid>`
+- For HTTP/API requests, use `web_fetch` — NOT `curl`/`wget`.
 "#;
 
 // -- web_search / web_fetch prompts -----------------------------------------
@@ -643,15 +644,15 @@ const ZH_TOOL_WEB_SEARCH: &str = r#"# web_search 使用指南
 - 下载文件/图片/视频 → 用 `web_download`（支持续传、浏览器 cookie），不要用 curl/wget
 
 ## 优先走结构化 API
-以下类型用 `execute_command` + curl 直接打接口，比搜索 SEO 结果准得多：
+以下类型用 `web_fetch` 直接打接口，比搜索 SEO 结果准得多（JSON 会原样返回）。**不要用 curl/exec**：
 
-| 需求 | 命令 |
+| 需求 | URL |
 |---|---|
-| 天气 | `curl -s 'wttr.in/城市?lang=zh&format=j1'` |
-| IP 归属 | `curl -s 'ipinfo.io/8.8.8.8/json'` |
-| 汇率 | `curl -s 'https://api.exchangerate.host/latest?base=USD&symbols=CNY'` |
-| 维基摘要 | `curl -s 'https://zh.wikipedia.org/api/rest_v1/page/summary/主题'` |
-| GitHub | `curl -s 'https://api.github.com/repos/owner/name'` |
+| 天气 | `https://wttr.in/城市?lang=zh&format=j1` |
+| IP 归属 | `https://ipinfo.io/8.8.8.8/json` |
+| 汇率 | `https://api.exchangerate.host/latest?base=USD&symbols=CNY` |
+| 维基摘要 | `https://zh.wikipedia.org/api/rest_v1/page/summary/主题` |
+| GitHub | `https://api.github.com/repos/owner/name` |
 
 有直接 API 就用，web_search 留给开放性、非结构化问题。
 
@@ -681,15 +682,15 @@ const EN_TOOL_WEB_SEARCH: &str = r#"# web_search Usage Guide
 - Download files/images/videos -> use `web_download` (supports resume, browser cookies), do NOT use curl/wget
 
 ## Prefer direct APIs
-These are cleaner and faster than scraping SEO-polluted search results:
+These are cleaner and faster than scraping SEO-polluted search results. Use `web_fetch` (JSON is returned as-is). **Do NOT use curl/exec for these**:
 
-| Intent | Command |
+| Intent | URL |
 |---|---|
-| Weather | `curl -s 'wttr.in/City?format=j1'` |
-| IP geolocation | `curl -s 'ipinfo.io/8.8.8.8/json'` |
-| Currency rate | `curl -s 'https://api.exchangerate.host/latest?base=USD&symbols=CNY'` |
-| Wikipedia | `curl -s 'https://en.wikipedia.org/api/rest_v1/page/summary/TOPIC'` |
-| GitHub | `curl -s 'https://api.github.com/repos/owner/name'` |
+| Weather | `https://wttr.in/City?format=j1` |
+| IP geolocation | `https://ipinfo.io/8.8.8.8/json` |
+| Currency rate | `https://api.exchangerate.host/latest?base=USD&symbols=CNY` |
+| Wikipedia | `https://en.wikipedia.org/api/rest_v1/page/summary/TOPIC` |
+| GitHub | `https://api.github.com/repos/owner/name` |
 
 Use direct API first. web_search for open-ended or unstructured questions only.
 
@@ -712,8 +713,11 @@ Use direct API first. web_search for open-ended or unstructured questions only.
 
 const ZH_TOOL_WEB_FETCH: &str = r#"# web_fetch 使用指南
 
-- 抓取网页内容优先用 web_fetch，不要打开浏览器
-- 只能获取静态内容，需要交互（登录、点击）时用 web_browser
+- **任何 HTTP 请求都优先用 web_fetch**——网页、JSON API、文档、文章、REST 接口都行
+- **绝对不要**用 `execute_command` + `curl`/`wget`/`Invoke-WebRequest` 抓 HTTP，一律改用 web_fetch
+- HTML 页面会自动转成干净的 markdown
+- JSON / 纯文本 / 非 HTML 响应**原样返回 body**——wttr.in、openweather、github、ipinfo 这种 REST API 直接传 URL 就行
+- 静态内容用 web_fetch；需要交互（登录、点击）才用 web_browser
 - HTTP 失败或遇到验证码时会自动回退到浏览器抓取
 
 ## web_download
@@ -725,8 +729,11 @@ const ZH_TOOL_WEB_FETCH: &str = r#"# web_fetch 使用指南
 
 const EN_TOOL_WEB_FETCH: &str = r#"# web_fetch Usage Guide
 
-- Use web_fetch to read web pages — do NOT open a browser for static content
-- Only use web_browser when interaction is needed (login, clicking, form filling)
+- **PREFERRED tool for any HTTP request** — web pages, JSON APIs, REST endpoints, documentation, articles
+- **Do NOT** use `execute_command` with `curl`/`wget`/`Invoke-WebRequest` for HTTP — always use web_fetch
+- HTML pages are auto-converted to clean text/markdown
+- JSON / plain-text / non-HTML responses are returned **as-is (raw body)** — works for wttr.in, openweather, github, ipinfo, etc.
+- Use web_fetch for static content; only use web_browser when interaction is needed (login, clicking, form filling)
 - Automatically falls back to browser on HTTP failure or CAPTCHA
 
 ## web_download
