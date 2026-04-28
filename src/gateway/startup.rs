@@ -1174,12 +1174,21 @@ async fn run_embedder_reembed(
                 }
             }
         };
-        if applied == 0 {
+        // applied == 0 used to abort, but with the swap_apply_batch
+        // idempotency guard a concurrent `add` dual-write can legitimately
+        // cover the entire batch before we land. Trust `swap_pending` to
+        // exclude the now-covered docs on the next iteration; the loop
+        // terminates naturally when nothing remains. Cap at 2x expected
+        // to make pathological cases (embedder always returning wrong
+        // dim) surface as a bounded failure instead of an infinite spin.
+        total += applied;
+        if batch_no > expected_total.saturating_mul(2).max(64) {
             let mut mem = mem_arc.lock().await;
             mem.abort_swap();
-            anyhow::bail!("embedder re-embed: batch applied 0 docs, aborting");
+            anyhow::bail!(
+                "embedder re-embed: ran {batch_no} batches against {expected_total} expected docs without converging — aborting"
+            );
         }
-        total += applied;
         info!(
             batch = batch_no,
             applied,
@@ -1206,6 +1215,43 @@ async fn run_embedder_reembed(
 // ---------------------------------------------------------------------------
 // BGE model: validate-or-download with atomic install
 // ---------------------------------------------------------------------------
+
+/// Conservative liveness check: does a process with `pid` exist? Used by
+/// the staging-dir sweep to clean up after crashed previous runs without
+/// disturbing concurrent processes that are mid-download. Errs on the
+/// side of "alive" so we never wipe an active stage dir.
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // kill(pid, 0) returns 0 if the process exists (any state, incl
+        // zombie); ESRCH means no such process. EPERM means it exists but
+        // we can't signal it — still alive.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 || *libc::__error() == libc::EPERM }
+    }
+    #[cfg(windows)]
+    {
+        // Open a handle with PROCESS_QUERY_LIMITED_INFORMATION — sufficient
+        // to test existence. NULL handle == doesn't exist.
+        use winapi::um::handleapi::CloseHandle;
+        use winapi::um::processthreadsapi::OpenProcess;
+        use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                false
+            } else {
+                CloseHandle(h);
+                true
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // Unknown platform: assume alive so we never wrongly delete.
+        let _ = pid;
+        true
+    }
+}
 
 /// Make sure the BGE model at `model_dir` is present AND loadable. The
 /// gateway must not start without semantic search — if validation fails
@@ -1312,10 +1358,45 @@ pub(crate) async fn ensure_bge_model_present(
         .unwrap_or("https://gitfast.org/tools/models/bge-small-zh-v1.5.zip")
         .to_owned();
 
-    // Staging directory holds the resumable archive AND the extracted files.
-    // Survives across restarts so a half-finished download picks up where it
-    // left off via HTTP Range. Only wiped on validation failure.
-    let tmp_dir = model_dir.with_extension("downloading");
+    // Per-PID staging directory. Two concurrent gateway processes hitting the
+    // same model_dir (e.g. a fast `gateway restart` overlap or two CLIs) must
+    // not write into the same staging dir — one would overwrite the other's
+    // half-extracted state and the load-test would see Frankenstein files.
+    // Each process gets its own stage; whichever finishes first atomic-renames
+    // into model_dir, the other's load-test passes against the now-existing
+    // files (same model URL → same content) or its rename overwrites cleanly.
+    //
+    // Resume semantics: download_resumable's sidecar `.meta` lives next to the
+    // archive in the per-PID dir, so resume only kicks in if the SAME process
+    // restarts. Across-process resume isn't worth the file-locking complexity
+    // for a one-shot bootstrap.
+    let pid = std::process::id();
+    let tmp_dir = model_dir.with_extension(format!("downloading.pid{pid}"));
+    // Sweep stale per-PID staging dirs from crashed previous runs (any dir
+    // matching `<basename>.downloading.pid*` whose pid is no longer alive).
+    if let Some(parent) = model_dir.parent() {
+        let prefix = model_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| format!("{n}.downloading.pid"))
+            .unwrap_or_default();
+        if !prefix.is_empty()
+            && let Ok(entries) = std::fs::read_dir(parent)
+        {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if let Some(name) = p.file_name().and_then(|n| n.to_str())
+                    && let Some(other_pid_str) = name.strip_prefix(&prefix)
+                    && let Ok(other_pid) = other_pid_str.parse::<u32>()
+                    && other_pid != pid
+                    && !pid_alive(other_pid)
+                {
+                    tracing::info!(stale = %p.display(), "sweeping stale staging dir");
+                    let _ = std::fs::remove_dir_all(&p);
+                }
+            }
+        }
+    }
     std::fs::create_dir_all(&tmp_dir).with_context(|| {
         format!("failed to create download dir {}", tmp_dir.display())
     })?;
