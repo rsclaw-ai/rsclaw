@@ -886,11 +886,11 @@ impl AgentRuntime {
     // JSONL transcript (AGENTS.md $20 step 11)
     // -----------------------------------------------------------------------
 
-    /// Append user + assistant messages to `~/.rsclaw/transcripts/<key>.jsonl`.
+    /// Append user + assistant messages to `<base_dir>/transcripts/<key>.jsonl`.
+    /// Routes through `config::loader::base_dir()` so non-default profiles
+    /// (`--dev`, `--profile`) write transcripts under the matching base dir.
     pub(crate) async fn append_transcript(&self, session_key: &str, user_text: &str, assistant_text: &str) {
-        let transcripts_dir = dirs_next::home_dir()
-            .unwrap_or_default()
-            .join(".rsclaw/transcripts");
+        let transcripts_dir = crate::config::loader::base_dir().join("transcripts");
 
         // Sanitize session key for use as a filename.
         let safe_key: String = session_key

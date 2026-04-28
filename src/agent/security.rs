@@ -91,10 +91,26 @@ pub(crate) fn check_read_safety(path: &str, full: &std::path::Path) -> anyhow::R
         ".claude/",
         ".opencode/",
         ".openclaw/credentials/",
-        ".rsclaw/credentials/",
     ];
     for dir in SENSITIVE_DIRS {
         if path_lower.contains(dir) || path_str.contains(dir) {
+            anyhow::bail!("[blocked] access to sensitive directory: {path}");
+        }
+    }
+    // rsclaw credentials live under whatever profile dir the user runs
+    // (`~/.rsclaw/`, `~/.rsclaw-dev/`, `~/.rsclaw-<profile>/`, or
+    // `RSCLAW_BASE_DIR`). Substring-matching `.rsclaw/credentials/` would
+    // miss the suffixed variants, so use the live base_dir to detect.
+    if let Ok(canon) = std::fs::canonicalize(&full) {
+        let creds = crate::config::loader::base_dir().join("credentials");
+        if let Ok(canon_creds) = std::fs::canonicalize(&creds)
+            && canon.starts_with(&canon_creds)
+        {
+            anyhow::bail!("[blocked] access to sensitive directory: {path}");
+        }
+        // Also block when the directory hasn't been canonicalised yet
+        // (e.g. user trying to read before init): plain prefix match.
+        if canon.starts_with(&creds) {
             anyhow::bail!("[blocked] access to sensitive directory: {path}");
         }
     }

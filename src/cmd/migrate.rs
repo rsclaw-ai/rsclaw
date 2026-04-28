@@ -286,9 +286,15 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
                 if let Some(obj) = defaults.as_object_mut() {
                     // Remove openclaw-specific fields.
                     obj.remove("memorySearch");
-                    // Set rsclaw defaults.
-                    obj.insert("workspace".to_owned(),
-                        serde_json::Value::String("~/.rsclaw/workspace".to_owned()));
+                    // Set rsclaw defaults. Use the actual rsclaw_dir so a
+                    // `--dev` migration writes paths into the dev profile,
+                    // not the prod ~/.rsclaw.
+                    obj.insert(
+                        "workspace".to_owned(),
+                        serde_json::Value::String(
+                            rsclaw_dir.join("workspace").to_string_lossy().into_owned(),
+                        ),
+                    );
                     obj.insert("compaction".to_owned(),
                         serde_json::json!({"mode": "layered"}));
                 }
@@ -322,8 +328,15 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
                             .to_owned();
                         obj.remove("agentDir");
                         if obj.contains_key("workspace") {
-                            obj.insert("workspace".to_owned(),
-                                serde_json::Value::String(format!("~/.rsclaw/workspace-{agent_id}")));
+                            obj.insert(
+                                "workspace".to_owned(),
+                                serde_json::Value::String(
+                                    rsclaw_dir
+                                        .join(format!("workspace-{agent_id}"))
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                ),
+                            );
                         }
                         // Inject channels from bindings.
                         if let Some(chs) = agent_channels.get(&agent_id) {

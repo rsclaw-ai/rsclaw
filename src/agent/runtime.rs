@@ -5278,7 +5278,12 @@ impl AgentRuntime {
             .workspace
             .clone()
             .or(default_workspace)
-            .unwrap_or_else(|| "~/.rsclaw/workspace".to_owned());
+            .unwrap_or_else(|| {
+                crate::config::loader::base_dir()
+                    .join("workspace")
+                    .to_string_lossy()
+                    .into_owned()
+            });
         let ws = if ws_str.starts_with('~') {
             dirs_next::home_dir().unwrap_or_default().join(&ws_str[2..])
         } else {
