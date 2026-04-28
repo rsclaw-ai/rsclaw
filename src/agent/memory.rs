@@ -757,6 +757,11 @@ pub struct MemoryStore {
     /// Active hot-swap migration, if any. While this is `Some`, reads use the
     /// primary embedder/hnsw and writes go to both primary and secondary.
     swap: Option<MigrationCtx>,
+    /// Count of docs from redb whose stored vector dimension didn't match the
+    /// active embedder at load time. Non-zero means an embedder upgrade is in
+    /// progress — startup should kick off a background migration so search
+    /// becomes available without blocking gateway boot.
+    pending_migration: usize,
 }
 
 impl MemoryStore {
@@ -869,24 +874,36 @@ impl MemoryStore {
             info!(count = docs.len(), "memory store loaded from redb");
         }
 
-        let mut store = Self {
+        // Skipped docs (dim mismatch from a model upgrade) trigger a deferred
+        // background migration — caller checks `pending_migration_count()`
+        // post-open and runs `run_embedder_migration` off-lock so startup
+        // isn't blocked by re-embedding thousands of docs.
+        let store = Self {
             db,
             hnsw,
             docs,
             embedder,
             embed_dim,
             swap: None,
+            pending_migration: skipped,
         };
 
-        // Auto-reindex if any docs had mismatched vector dimensions.
-        if skipped > 0 {
-            match store.reindex().await {
-                Ok(n) => info!(count = n, "auto-reindex complete"),
-                Err(e) => warn!("auto-reindex failed: {e:#}"),
-            }
-        }
-
         Ok(store)
+    }
+
+    /// Number of docs whose stored vector dimension doesn't match the
+    /// currently-loaded embedder. Non-zero immediately after `open` when the
+    /// user has upgraded to a different-sized embedding model — the caller
+    /// should drive `begin_swap` + the standard migration loop in the
+    /// background to backfill them.
+    pub fn pending_migration_count(&self) -> usize {
+        self.pending_migration
+    }
+
+    /// Cheap clone of the active embedder Arc — used by the migration driver
+    /// to embed off-lock without holding the store mutex.
+    pub fn embedder_arc(&self) -> Arc<dyn Embedder> {
+        Arc::clone(&self.embedder)
     }
 
     pub async fn add(&mut self, mut doc: MemoryDoc) -> Result<()> {
@@ -1117,6 +1134,7 @@ impl MemoryStore {
         self.embedder = new_embedder;
         self.embed_dim = new_embed_dim;
         self.hnsw = new_hnsw;
+        self.pending_migration = 0;
 
         info!(migrated, "memory: swap committed");
         Ok(migrated)
@@ -1544,5 +1562,59 @@ mod swap_tests {
         store.begin_swap(Arc::clone(&new_emb)).unwrap();
         let err = store.begin_swap(new_emb).expect_err("second begin should fail");
         assert!(err.to_string().contains("swap is already in progress"));
+    }
+
+    /// Models the bge-small → bge-base upgrade path: docs persisted under the
+    /// old embedder show up as `pending_migration_count` after re-open with a
+    /// different-dim embedder. Driving the standard swap loop drains the
+    /// counter and makes search return them again.
+    #[tokio::test]
+    async fn dim_mismatch_triggers_pending_migration() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Round 1: open + insert under FNV (default 384-dim).
+        {
+            let mut store = MemoryStore::open(tmp.path(), None, MemoryTier::High, None)
+                .await
+                .expect("open");
+            assert_eq!(store.pending_migration_count(), 0);
+            store.add(doc("d0", "alpha")).await.unwrap();
+            store.add(doc("d1", "beta")).await.unwrap();
+        }
+        // Round 2: re-open + migrate the store to a different embedder dim
+        // (16) so the persisted vectors no longer match FNV's default 384.
+        {
+            let mut store = MemoryStore::open(tmp.path(), None, MemoryTier::High, None)
+                .await
+                .expect("reopen for migration");
+            assert_eq!(store.pending_migration_count(), 0);
+            let new_emb: Arc<dyn Embedder> =
+                Arc::new(StubEmbedder { dim: 16, seed_bias: 0.0 });
+            store.begin_swap(Arc::clone(&new_emb)).unwrap();
+            loop {
+                let pending = store.swap_pending(10);
+                if pending.is_empty() {
+                    break;
+                }
+                let batch: Vec<_> = pending
+                    .into_iter()
+                    .map(|(i, t)| (i, new_emb.embed(&t)))
+                    .collect();
+                store.swap_apply_batch(batch).unwrap();
+            }
+            assert_eq!(store.commit_swap().unwrap(), 2);
+            assert_eq!(store.embed_dim(), 16);
+            assert_eq!(store.pending_migration_count(), 0);
+        }
+
+        // Round 3: reopen with default FNV (384-dim) — docs now stored with
+        // 16-dim vectors → pending_migration_count should flag both.
+        let store = MemoryStore::open(tmp.path(), None, MemoryTier::High, None)
+            .await
+            .expect("reopen after dim change");
+        assert_eq!(
+            store.pending_migration_count(),
+            2,
+            "expected 2 docs flagged for migration after dim change 16 -> 384"
+        );
     }
 }

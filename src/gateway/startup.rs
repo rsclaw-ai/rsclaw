@@ -157,6 +157,30 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         }
     };
 
+    // Embedder upgrade detection: if the active model produces a different
+    // vector dimension than what's stored in redb (e.g. user dropped a
+    // bge-base-zh dir and restarted), kick off a background re-embed via the
+    // two-index hot-swap API. The gateway keeps serving — search returns
+    // empty for the migrating docs until the swap commits, then catches up.
+    if let Some(mem_arc) = memory.as_ref() {
+        let pending = {
+            let mem = mem_arc.lock().await;
+            mem.pending_migration_count()
+        };
+        if pending > 0 {
+            info!(
+                pending,
+                "embedder dimension changed since last run; spawning background re-embed"
+            );
+            let bg_mem = Arc::clone(mem_arc);
+            tokio::spawn(async move {
+                if let Err(e) = run_embedder_reembed(&bg_mem).await {
+                    warn!("background re-embed failed ({e:#}); search will be partial until next restart");
+                }
+            });
+        }
+    }
+
     // 7. Load all plugins (JS + WASM) and register built-in memory slot.
     let plugins_dir = base_dir.join("plugins");
     let wasm_browser: Arc<tokio::sync::Mutex<Option<crate::browser::BrowserSession>>> =
@@ -1090,6 +1114,71 @@ pub(crate) async fn handle_pending_analysis(
                 .await;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Embedder migration driver — backs the dim-mismatch background re-embed
+// kicked off in start_gateway after MemoryStore::open.
+// ---------------------------------------------------------------------------
+
+/// Drive a re-embed pass over all docs in `mem_arc` whose stored vector
+/// dimension doesn't match the active embedder. Uses the standard two-index
+/// `begin_swap` / `swap_apply_batch` / `commit_swap` machinery so reads stay
+/// served from primary (empty for the affected docs) and writes dual-write
+/// to both indexes throughout. Heavy embedding work happens off-lock; each
+/// lock window is bounded to a single batch.
+async fn run_embedder_reembed(
+    mem_arc: &std::sync::Arc<tokio::sync::Mutex<crate::agent::MemoryStore>>,
+) -> anyhow::Result<()> {
+    /// Docs embedded per batch. Keeps each lock window to a few hundred ms
+    /// even with the slowest CPU-only BGE inference.
+    const BATCH: usize = 50;
+
+    let embedder = {
+        let mut mem = mem_arc.lock().await;
+        let e = mem.embedder_arc();
+        mem.begin_swap(std::sync::Arc::clone(&e))?;
+        e
+    };
+
+    let mut total = 0usize;
+    loop {
+        let pending = {
+            let mem = mem_arc.lock().await;
+            mem.swap_pending(BATCH)
+        };
+        if pending.is_empty() {
+            break;
+        }
+        // Heavy work off-lock.
+        let batch: Vec<(usize, Vec<f32>)> = pending
+            .into_iter()
+            .map(|(idx, text)| (idx, embedder.embed(&text)))
+            .collect();
+        let applied = {
+            let mut mem = mem_arc.lock().await;
+            match mem.swap_apply_batch(batch) {
+                Ok(n) => n,
+                Err(e) => {
+                    mem.abort_swap();
+                    return Err(e);
+                }
+            }
+        };
+        if applied == 0 {
+            let mut mem = mem_arc.lock().await;
+            mem.abort_swap();
+            anyhow::bail!("embedder re-embed: batch applied 0 docs, aborting");
+        }
+        total += applied;
+    }
+
+    let migrated = {
+        let mut mem = mem_arc.lock().await;
+        mem.commit_swap()?
+    };
+    info!(total, migrated, "embedder re-embed complete; semantic search now full-coverage");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
