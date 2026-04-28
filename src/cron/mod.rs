@@ -890,12 +890,14 @@ impl CronRunner {
                         CronPayload::Structured { kind, .. } => kind.as_deref(),
                         _ => None,
                     }) == Some("systemEvent") {
+                        tracing::info!(job_id = %job.id, kind = "systemEvent", "cron: dispatching payload");
                         Ok(job.effective_message().to_owned())
                     } else if job.payload.as_ref().and_then(|p| match p {
                         CronPayload::Structured { kind, .. } => kind.as_deref(),
                         _ => None,
                     }) == Some("execCommand") {
                         // Execute command directly, bypassing agent to avoid session history pollution
+                        tracing::info!(job_id = %job.id, kind = "execCommand", command = %job.effective_message(), summarize = job.payload.as_ref().map(|p| p.summarize()).unwrap_or(false), "cron: dispatching execCommand");
                         run_exec_command(
                             job.effective_message(),
                             job.payload.as_ref().and_then(|p| match p {
@@ -1081,11 +1083,13 @@ impl CronRunner {
             CronPayload::Structured { kind, .. } => kind.as_deref(),
             _ => None,
         }) == Some("systemEvent") {
+            tracing::info!(job_id = %job.id, kind = "systemEvent", "cron manual: dispatching payload");
             Ok(job.effective_message().to_owned())
         } else if job.payload.as_ref().and_then(|p| match p {
             CronPayload::Structured { kind, .. } => kind.as_deref(),
             _ => None,
         }) == Some("execCommand") {
+            tracing::info!(job_id = %job.id, kind = "execCommand", command = %job.effective_message(), summarize = job.payload.as_ref().map(|p| p.summarize()).unwrap_or(false), "cron manual: dispatching execCommand");
             run_exec_command(
                 job.effective_message(),
                 job.payload.as_ref().and_then(|p| match p {
@@ -1831,14 +1835,23 @@ async fn run_exec_command(
         // CRITICAL: Tell the LLM that the output MUST be summarized and returned.
         // The summary will be sent to the user. Do NOT just call memory tool.
         // Use "summarize:" prefix to disable all tools (internal channels have memory tool).
+        // STRICT RULE: model must ONLY use content from raw_output, no fabrication.
         let summarize_prompt = format!(
-            "【定时任务执行结果】\n\
-            以下是一个脚本执行的真实输出，脚本返回了内容。\n\
-            你必须：\n\
-            1. 用简洁的语言总结关键信息（不要编造数据，只总结已有内容）\n\
-            2. 直接返回摘要文本给用户\n\
-            3. 不要返回 HEARTBEAT_OK\n\n\
-            输出内容：\n```\n{}\n```",
+            "【定时任务执行结果 - 禁止编造】\n\
+            以下是一个脚本执行的真实输出。\n\
+            \n\
+            【硬性规则 - 必须遵守】\n\
+            1. 你只能总结下面输出内容中已有的信息，绝不能添加任何不在输出中的内容\n\
+            2. 如果输出中没有具体数据（如股票数量、价格），不要自己编造数字\n\
+            3. 如果输出为空或只有错误信息，如实报告\"脚本执行失败\"或\"无输出\"\n\
+            4. 不要声称\"已完成\"\"已发现\"\"已执行\"等动作 - 你只是总结，没有执行任何操作\n\
+            5. 直接返回摘要文本，不要返回 HEARTBEAT_OK\n\
+            \n\
+            【输出内容】\n\
+            ```\n{}\n\
+            ```\n\
+            \n\
+            请严格按上述规则总结，违反规则将被视为欺骗。",
             raw_output
         );
 

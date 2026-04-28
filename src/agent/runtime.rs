@@ -163,6 +163,7 @@ fn is_internal_session(session_key: &str) -> bool {
     session_key.starts_with("heartbeat:")
         || session_key.starts_with("cron:")
         || session_key.starts_with("system:")
+        || session_key.starts_with("summarize:")
 }
 
 /// Sessions that should run with a minimal system prompt and only the
