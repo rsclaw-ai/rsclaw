@@ -947,10 +947,17 @@ impl MemoryStore {
         self.hnsw.insert((&doc.vector, idx));
 
         // Dual-write to the migration secondary so new docs added during a
-        // swap don't get left out. Pre-compute the vector before pushing the
-        // doc so the borrow on `self.docs` doesn't conflict.
+        // swap don't get left out. When the swap target is the SAME embedder
+        // as the primary (the dim-mismatch re-embed path uses this pattern
+        // — pass the current embedder back into begin_swap to repopulate
+        // HNSW with new dim), reuse the primary vector instead of running
+        // BERT inference twice for the identical result.
         if let Some(ctx) = self.swap.as_mut() {
-            let new_vec = ctx.new_embedder.embed(&doc.text);
+            let new_vec = if Arc::ptr_eq(&self.embedder, &ctx.new_embedder) {
+                doc.vector.clone()
+            } else {
+                ctx.new_embedder.embed(&doc.text)
+            };
             ctx.new_hnsw.insert((&new_vec, idx));
             ctx.new_vectors.insert(idx, new_vec);
         }
@@ -1040,6 +1047,14 @@ impl MemoryStore {
     /// HNSW index; primary keeps serving reads. Caller drives migration via
     /// `swap_pending` + `swap_apply_batch` + `commit_swap` (typically from a
     /// dedicated background task that does the heavy embedding work off-lock).
+    ///
+    /// When `new_embedder` is the SAME instance as the current primary
+    /// (the dim-mismatch re-embed pattern: caller passes the active embedder
+    /// to repopulate HNSW from existing in-memory vectors), already-correct
+    /// vectors are seeded into the secondary index up front so `swap_pending`
+    /// only returns the docs that genuinely need re-embedding. Without that
+    /// seed `commit_swap` would replace primary HNSW with a secondary that
+    /// dropped the matching-dim docs — a silent recall regression.
     pub fn begin_swap(&mut self, new_embedder: Arc<dyn Embedder>) -> Result<()> {
         if self.swap.is_some() {
             anyhow::bail!("memory: a swap is already in progress");
@@ -1053,25 +1068,53 @@ impl MemoryStore {
             HNSW_EF_CONSTRUCTION,
             DistCosine,
         );
+        let mut new_vectors = std::collections::HashMap::new();
+        if Arc::ptr_eq(&self.embedder, &new_embedder) {
+            let expected = new_embed_dim as usize;
+            for (i, doc) in self.docs.iter().enumerate() {
+                if !doc.id.is_empty() && doc.vector.len() == expected {
+                    new_hnsw.insert((&doc.vector, i));
+                    new_vectors.insert(i, doc.vector.clone());
+                }
+            }
+        }
         self.swap = Some(MigrationCtx {
             new_embedder,
             new_hnsw,
             new_embed_dim,
-            new_vectors: std::collections::HashMap::new(),
+            new_vectors,
         });
         Ok(())
     }
 
     /// Snapshot the next batch of doc indices that still need re-embedding.
     /// Returns `(idx, text)` pairs the caller can embed off-lock.
+    ///
+    /// When the swap target embedder is the SAME instance as the primary
+    /// (the dim-mismatch re-embed pattern), only docs whose stored vector
+    /// dim doesn't match the current embedder are returned — re-embedding
+    /// already-correct vectors would be wasted CPU and produce identical
+    /// output. For a true embedder swap (different model), every doc still
+    /// needs re-embedding, so the dim filter is skipped.
     pub fn swap_pending(&self, max: usize) -> Vec<(usize, String)> {
         let Some(ctx) = self.swap.as_ref() else {
             return Vec::new();
         };
+        let same_embedder = Arc::ptr_eq(&self.embedder, &ctx.new_embedder);
+        let expected = ctx.new_embed_dim as usize;
         self.docs
             .iter()
             .enumerate()
-            .filter(|(i, d)| !d.id.is_empty() && !ctx.new_vectors.contains_key(i))
+            .filter(|(i, d)| {
+                if d.id.is_empty() || ctx.new_vectors.contains_key(i) {
+                    return false;
+                }
+                if same_embedder && d.vector.len() == expected {
+                    // Already-correct vector under the same embedder; skip.
+                    return false;
+                }
+                true
+            })
             .take(max)
             .map(|(i, d)| (i, d.text.clone()))
             .collect()

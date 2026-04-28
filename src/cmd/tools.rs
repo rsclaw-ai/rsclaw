@@ -499,8 +499,13 @@ async fn download_and_extract(
 
 /// Resumable streaming HTTP download with a TTY progress bar. The file lives
 /// at `out_path` across runs — interrupted transfers continue via the HTTP
-/// `Range` header on the next attempt. Servers that ignore the Range header
-/// (replying 200 instead of 206) trigger a clean restart from byte 0.
+/// `Range` header on the next attempt.
+///
+/// Resume safety: a sidecar `<out_path>.meta` stashes the upstream
+/// `(content_length, last_modified || date)` of the version we started
+/// downloading. On resume we send `If-Range` plus a manual size check so a
+/// CDN that quietly swapped the file mid-transfer can't produce a Frankenstein
+/// archive. Mismatch → wipe the partial and restart from byte 0.
 ///
 /// `label` shows in the progress bar prefix (e.g. "BGE model").
 ///
@@ -519,23 +524,53 @@ pub async fn download_resumable(
         std::fs::create_dir_all(parent)?;
     }
 
-    let already = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
+    let meta_path = out_path.with_extension(format!(
+        "{}meta",
+        out_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!("{e}."))
+            .unwrap_or_default()
+    ));
 
-    // Issue a single GET with a conditional Range header. Lets us combine
-    // the size-discovery and content-fetching into one round trip.
+    let mut already = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
+    // Stashed (content_length, version_token) from the previous start. We
+    // only attempt a resume when the partial bytes AND the meta both exist;
+    // a partial without meta is a leftover from a pre-meta version of this
+    // function and gets wiped to be safe.
+    let stashed: Option<(u64, String)> = if already > 0 {
+        std::fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|s| s.split_once('\t').map(|(a, b)| (a.to_owned(), b.to_owned())))
+            .and_then(|(len_s, tok)| len_s.parse::<u64>().ok().map(|n| (n, tok)))
+    } else {
+        None
+    };
+    if already > 0 && stashed.is_none() {
+        let _ = std::fs::remove_file(out_path);
+        let _ = std::fs::remove_file(&meta_path);
+        already = 0;
+    }
+
+    // Issue a single GET with conditional Range + If-Range. If-Range tells the
+    // server "only partial-content me if the version still matches"; mismatch
+    // makes it return the full body (200) which we handle as a clean restart.
     let mut req = client.get(url).timeout(Duration::from_secs(600));
-    if already > 0 {
-        req = req.header(reqwest::header::RANGE, format!("bytes={already}-"));
+    if let Some((_stashed_len, ref token)) = stashed {
+        req = req
+            .header(reqwest::header::RANGE, format!("bytes={already}-"))
+            .header(reqwest::header::IF_RANGE, token.as_str());
     }
     let resp = req.send().await?;
     let status = resp.status();
 
     let resume = match status.as_u16() {
-        206 => true,                                  // Partial Content — append
-        200 => false,                                 // server ignored Range — restart
+        206 => true,
+        200 => false, // server ignored Range or If-Range mismatch — restart
         416 => {
             // Already have the full file (or local is larger than remote).
-            // Treat as success at current size.
+            // Treat as success at current size and drop the meta sidecar.
+            let _ = std::fs::remove_file(&meta_path);
             return Ok(already);
         }
         _ => {
@@ -546,9 +581,8 @@ pub async fn download_resumable(
         }
     };
 
-    // Total expected size after this transfer completes.
+    // Capture upstream version token + total size BEFORE consuming the body.
     let total_size = if resume {
-        // Content-Range: bytes start-end/total
         resp.headers()
             .get(reqwest::header::CONTENT_RANGE)
             .and_then(|v| v.to_str().ok())
@@ -558,6 +592,37 @@ pub async fn download_resumable(
     } else {
         resp.content_length()
     };
+    // Prefer Last-Modified over Date for If-Range — Date is the response
+    // generation timestamp (changes on every request), Last-Modified is
+    // the file mtime (stable). ETag would be ideal but many CDNs don't set
+    // it. Date is the last-resort fallback so we still catch obvious
+    // size-shifts even when the server is barebones.
+    let version_token: Option<String> = resp
+        .headers()
+        .get(reqwest::header::ETAG)
+        .or_else(|| resp.headers().get(reqwest::header::LAST_MODIFIED))
+        .or_else(|| resp.headers().get(reqwest::header::DATE))
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    // Belt-and-suspenders: if server returned 206 but the stashed total size
+    // disagrees with what it's now telling us, abort the resume and restart.
+    // Catches CDNs that don't honor If-Range but still serve partial.
+    let restart_due_to_size_mismatch = if resume {
+        match (stashed.as_ref().map(|(n, _)| *n), total_size) {
+            (Some(stash_total), Some(now_total)) => stash_total != now_total,
+            _ => false,
+        }
+    } else {
+        false
+    };
+    let resume = resume && !restart_due_to_size_mismatch;
+    if restart_due_to_size_mismatch {
+        tracing::warn!(
+            url,
+            "download_resumable: server total size changed since previous start; restarting from byte 0"
+        );
+    }
 
     let bar = if let Some(total) = total_size {
         let bar = ProgressBar::new(total);
@@ -579,14 +644,23 @@ pub async fn download_resumable(
         bar
     };
 
+    // (Re)create or append. Persist the version token + total length BEFORE
+    // any bytes hit disk so a kill-9 mid-transfer leaves a usable resume
+    // anchor.
     let mut file = if resume {
         tokio::fs::OpenOptions::new()
             .append(true)
             .open(out_path)
             .await?
     } else {
+        // Restarting fresh — drop any stale partial and meta.
+        let _ = std::fs::remove_file(out_path);
+        let _ = std::fs::remove_file(&meta_path);
         tokio::fs::File::create(out_path).await?
     };
+    if let (Some(total), Some(token)) = (total_size, version_token.as_ref()) {
+        let _ = std::fs::write(&meta_path, format!("{total}\t{token}"));
+    }
 
     let mut written = if resume { already } else { 0 };
     let mut stream = resp.bytes_stream();
@@ -598,6 +672,9 @@ pub async fn download_resumable(
     }
     file.flush().await?;
     bar.finish_and_clear();
+
+    // Successful download — meta sidecar served its purpose, drop it.
+    let _ = std::fs::remove_file(&meta_path);
 
     Ok(written)
 }

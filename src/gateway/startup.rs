@@ -1196,21 +1196,92 @@ async fn run_embedder_reembed(
 ///   2. Otherwise, sync-download into `model_dir.with_extension("downloading")/`,
 ///      validate by attempting to load it, then atomically rename into place.
 ///   3. Any failure cleans up the tmp dir and bails.
+/// Sentinel filename + content schema for "rsclaw owns this model dir".
+/// Presence = managed (we may freely wipe / re-download on failure).
+/// Absence = user-placed (preserve files; fail loudly, never auto-delete).
+/// Body is one `key=value` per line, intentionally readable + grep-able.
+const SENTINEL_FILE: &str = ".rsclaw-managed";
+
+fn write_managed_sentinel(model_dir: &std::path::Path, url: &str, bytes: u64) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let body = format!(
+        "version={ver}\nurl={url}\nbytes={bytes}\ninstalled_at_ms={now_ms}\n",
+        ver = env!("CARGO_PKG_VERSION"),
+    );
+    if let Err(e) = std::fs::write(model_dir.join(SENTINEL_FILE), body) {
+        tracing::warn!(
+            error = %e,
+            "failed to write {SENTINEL_FILE} — re-download recovery on next start will be disabled"
+        );
+    }
+}
+
+/// Read the `bytes=` field of the sentinel, if present and parseable.
+/// Used to detect silent corruption (file size shifted since install).
+fn read_sentinel_bytes(model_dir: &std::path::Path) -> Option<u64> {
+    let body = std::fs::read_to_string(model_dir.join(SENTINEL_FILE)).ok()?;
+    body.lines()
+        .find_map(|line| line.strip_prefix("bytes="))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 async fn ensure_bge_model_present(
     model_dir: &std::path::Path,
     search_cfg: Option<&crate::config::schema::MemorySearchConfig>,
 ) -> anyhow::Result<()> {
     use crate::agent::memory::LocalBgeEmbedder;
 
-    if model_dir.join("model.safetensors").exists() {
-        LocalBgeEmbedder::load(model_dir).map_err(|e| {
-            anyhow::anyhow!(
-                "BGE model at {} failed to load: {e:#}\n\
-                 Fix or remove the directory to trigger re-download, then restart.",
-                model_dir.display()
-            )
-        })?;
-        return Ok(());
+    let weights_path = model_dir.join("model.safetensors");
+    if weights_path.exists() {
+        let weights_bytes = std::fs::metadata(&weights_path).map(|m| m.len()).ok();
+        let dir_is_managed = model_dir.join(SENTINEL_FILE).exists();
+
+        // Sentinel + size-mismatch = silent corruption (truncated file from a
+        // crash mid-extract, partial write to a full disk, etc.). For OUR
+        // installs we can safely auto-recover by deleting and re-downloading.
+        if dir_is_managed {
+            if let (Some(actual), Some(expected)) =
+                (weights_bytes, read_sentinel_bytes(model_dir))
+            {
+                if actual != expected {
+                    tracing::warn!(
+                        actual,
+                        expected,
+                        "BGE model.safetensors size differs from sentinel; re-downloading"
+                    );
+                    let _ = std::fs::remove_dir_all(model_dir);
+                    // Fall through to download path below.
+                }
+            }
+        }
+
+        // If we still have files (size matched OR not managed), try loading.
+        if model_dir.join("model.safetensors").exists() {
+            match LocalBgeEmbedder::load(model_dir) {
+                Ok(_) => return Ok(()),
+                Err(e) if dir_is_managed => {
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        dir = %model_dir.display(),
+                        "managed BGE model failed to load; auto-recovering"
+                    );
+                    let _ = std::fs::remove_dir_all(model_dir);
+                    // Fall through to download path.
+                }
+                Err(e) => {
+                    anyhow::bail!(
+                        "BGE model at {} failed to load: {e:#}\n\
+                         This is a user-placed directory (no {SENTINEL_FILE} sentinel) — \
+                         fix the files or remove the directory to trigger a fresh \
+                         download, then restart.",
+                        model_dir.display()
+                    );
+                }
+            }
+        }
     }
 
     let local_cfg = search_cfg.and_then(|c| c.local.as_ref());
@@ -1281,20 +1352,63 @@ async fn ensure_bge_model_present(
     // Drop the archive — only the extracted files matter from here on.
     let _ = std::fs::remove_file(&archive_path);
 
-    // Atomic install. fs::rename across same filesystem is atomic on POSIX
-    // and Windows (when target doesn't exist).
-    if model_dir.exists() {
-        std::fs::remove_dir_all(model_dir).with_context(|| {
-            format!("failed to clear existing {} before install", model_dir.display())
+    // Install. The presence of `SENTINEL_FILE` in the existing model_dir
+    // tells us "rsclaw owns this dir" (managed) — we may freely wipe and
+    // rename. Without the sentinel we treat the dir as user-managed and
+    // copy-merge to preserve hand-placed files (different config.json,
+    // partial transfer in progress, etc.). model.safetensors is always
+    // overwritten when it's our turn to install — its mismatch is what
+    // brought us into this branch in the first place.
+    let dir_is_managed = model_dir.exists() && model_dir.join(SENTINEL_FILE).exists();
+    if !model_dir.exists() || dir_is_managed {
+        if model_dir.exists() {
+            std::fs::remove_dir_all(model_dir).with_context(|| {
+                format!("failed to clear managed dir {}", model_dir.display())
+            })?;
+        }
+        std::fs::rename(&tmp_dir, model_dir).with_context(|| {
+            format!(
+                "failed to install model: rename {} -> {}",
+                tmp_dir.display(),
+                model_dir.display()
+            )
         })?;
+    } else {
+        std::fs::create_dir_all(model_dir).with_context(|| {
+            format!("failed to ensure install dir {}", model_dir.display())
+        })?;
+        for entry in std::fs::read_dir(&tmp_dir)?.flatten() {
+            let src = entry.path();
+            let Some(name) = src.file_name() else {
+                continue;
+            };
+            let dst = model_dir.join(name);
+            if dst.exists() && name != "model.safetensors" {
+                tracing::debug!(file = %dst.display(), "preserving user-placed file");
+                continue;
+            }
+            if let Err(e) = std::fs::rename(&src, &dst) {
+                // Cross-device rename can fail on overlay filesystems; fall
+                // back to copy + remove.
+                std::fs::copy(&src, &dst).with_context(|| {
+                    format!(
+                        "failed to install {} -> {}: rename {e}",
+                        src.display(),
+                        dst.display()
+                    )
+                })?;
+                let _ = std::fs::remove_file(&src);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
-    std::fs::rename(&tmp_dir, model_dir).with_context(|| {
-        format!(
-            "failed to install model: rename {} -> {}",
-            tmp_dir.display(),
-            model_dir.display()
-        )
-    })?;
+
+    // Stamp the sentinel so a future restart can size-check the install and
+    // safely auto-recover from corruption / truncation.
+    let installed_bytes = std::fs::metadata(model_dir.join("model.safetensors"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    write_managed_sentinel(model_dir, &url, installed_bytes);
 
     info!("BGE model installed at {}", model_dir.display());
     Ok(())

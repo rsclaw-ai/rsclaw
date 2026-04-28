@@ -926,7 +926,17 @@ impl CronRunner {
                     }
                     let rendered = if job_ref.iter.is_some() {
                         let r = job_ref.render_message();
-                        let _ = job_ref.advance_iter();
+                        if job_ref.advance_iter().is_none() {
+                            // Reachable only when iter exists but items is
+                            // empty — render_message produces the raw text
+                            // unchanged, so the dispatch still does
+                            // something useful, but we should warn so the
+                            // operator can fix the job config.
+                            tracing::warn!(
+                                job_id = %job_ref.id,
+                                "cron: iter set but items list is empty; cursor not advanced"
+                            );
+                        }
                         Some(r)
                     } else {
                         None
