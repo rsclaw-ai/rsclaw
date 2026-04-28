@@ -124,70 +124,18 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // Auto-detect embedding model: prefer higher-quality models first.
     // Priority: bge-base-zh > bge-small-zh > bge-small-en > auto-download small-zh.
     let search_cfg = config.raw.memory_search.as_ref();
-    let model_dir = {
+    let (model_dir, needs_download) = {
         let base_zh = base_dir.join("models/bge-base-zh");
         let zh = base_dir.join("models/bge-small-zh");
         let en = base_dir.join("models/bge-small-en");
         if base_zh.join("model.safetensors").exists() {
-            base_zh
+            (base_zh, false)
         } else if zh.join("model.safetensors").exists() {
-            zh
+            (zh, false)
         } else if en.join("model.safetensors").exists() {
-            en
+            (en, false)
         } else {
-            // Auto-download BGE model in background (don't block startup).
-            let target_dir = zh; // default to small-zh
-            let cfg_lang = config.raw.gateway.as_ref().and_then(|g| g.language.as_deref()).map(str::to_owned);
-            let i18n_lang = crate::i18n::resolve_lang(cfg_lang.as_deref().unwrap_or("en")).to_owned();
-            let search_cfg_clone = search_cfg.cloned();
-            let dl_dir = target_dir.clone();
-            let bge_restart_tx = restart_request_tx.clone();
-            let bge_pending = Arc::clone(&pending_restart);
-            let bge_shutdown = shutdown.clone();
-            tokio::spawn(async move {
-                info!("BGE embedding model not found, downloading in background...");
-                match download_bge_model(&dl_dir, search_cfg_clone.as_ref(), cfg_lang.as_deref()).await {
-                    Ok(()) => {
-                        info!("BGE model downloaded. Notifying UI to restart.");
-                        publish_restart(
-                            &bge_restart_tx,
-                            &bge_pending,
-                            &bge_shutdown,
-                            crate::events::RestartRequest::new(
-                                crate::events::RestartReason::ModelDownloaded {
-                                    name: "bge-small-zh".into(),
-                                },
-                                crate::events::RestartUrgency::Recommended,
-                                crate::i18n::t("restart_required_model_downloaded", &i18n_lang),
-                            ),
-                        );
-                    }
-                    Err(e) => {
-                        warn!("BGE model auto-download failed: {e:#}");
-                        // Failure is reported via the same banner channel so the
-                        // user sees it in the UI; urgency is Recommended (the
-                        // gateway works without semantic search).
-                        publish_restart(
-                            &bge_restart_tx,
-                            &bge_pending,
-                            &bge_shutdown,
-                            crate::events::RestartRequest::new(
-                                crate::events::RestartReason::ModelDownloadFailed {
-                                    name: "bge-small-zh".into(),
-                                    error: format!("{e:#}"),
-                                },
-                                crate::events::RestartUrgency::Recommended,
-                                crate::i18n::t_fmt(
-                                    "restart_model_download_failed",
-                                    &i18n_lang,
-                                    &[("error", &format!("{e:#}"))],
-                                ),
-                            ),
-                        );
-                    }
-                }
-            });
-            target_dir
+            (zh, true) // default target: small-zh
         }
     };
     let memory = match MemoryStore::open(&data_dir, Some(&model_dir), tier, search_cfg).await {
@@ -200,6 +148,43 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             None
         }
     };
+
+    // Auto-download BGE model in background (don't block startup). On success,
+    // hot-swap the live MemoryStore embedder so semantic search lights up
+    // without requiring a gateway restart.
+    if needs_download {
+        let cfg_lang = config
+            .raw
+            .gateway
+            .as_ref()
+            .and_then(|g| g.language.as_deref())
+            .map(str::to_owned);
+        let search_cfg_clone = search_cfg.cloned();
+        let dl_dir = model_dir.clone();
+        let bge_memory = memory.clone();
+        tokio::spawn(async move {
+            info!("BGE embedding model not found, downloading in background...");
+            match download_bge_model(&dl_dir, search_cfg_clone.as_ref(), cfg_lang.as_deref()).await {
+                Ok(()) => {
+                    let Some(mem_arc) = bge_memory.as_ref() else {
+                        info!("BGE model downloaded; no live memory store to hot-swap");
+                        return;
+                    };
+                    let mut mem = mem_arc.lock().await;
+                    match mem.try_load_local_model(&dl_dir).await {
+                        Ok(reindexed) => info!(
+                            reindexed,
+                            "BGE model downloaded and hot-swapped; semantic search ready"
+                        ),
+                        Err(e) => warn!(
+                            "BGE downloaded but hot-swap failed ({e:#}); will take effect after next restart"
+                        ),
+                    }
+                }
+                Err(e) => warn!("BGE model auto-download failed: {e:#}"),
+            }
+        });
+    }
 
     // 7. Load all plugins (JS + WASM) and register built-in memory slot.
     let plugins_dir = base_dir.join("plugins");

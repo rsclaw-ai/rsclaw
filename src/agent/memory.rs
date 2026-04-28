@@ -983,6 +983,17 @@ impl MemoryStore {
         Ok(self.docs.iter().find(|d| d.id == id).cloned())
     }
 
+    /// Hot-swap to a locally-loaded BGE embedder and re-embed all docs in place.
+    /// Used when BGE finishes downloading after the store was opened with the
+    /// FNV fallback — avoids requiring a gateway restart.
+    pub async fn try_load_local_model(&mut self, model_dir: &Path) -> Result<usize> {
+        let bge = LocalBgeEmbedder::load(model_dir)
+            .with_context(|| format!("load BGE from {}", model_dir.display()))?;
+        self.embedder = Arc::new(EmbedderBackend::Local(bge));
+        self.embed_dim = self.embedder.dimension();
+        self.reindex().await
+    }
+
     pub async fn reindex(&mut self) -> Result<usize> {
         let active_docs: Vec<MemoryDoc> = self
             .docs
