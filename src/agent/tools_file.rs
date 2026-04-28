@@ -22,6 +22,104 @@ use super::security::{check_file_content_safety, check_read_safety, check_write_
 /// 2. Same for plain `>` / `>>` / `<` when glued (but only when the prior
 ///    token ends with a digit or letter — don't break `1>&2` etc).
 /// 3. Leave the rest of the command untouched.
+/// Surface CLI auto-correction hints from stderr at the top of the tool
+/// result. LLMs routinely miss tip lines buried in a wall of error text;
+/// promoting them to a dedicated `hint` field makes the next-turn fix
+/// obvious without any auto-retry magic that could execute the wrong
+/// thing on a typo'd subcommand.
+///
+/// Recognised formats (one per line, case-insensitive on the trigger):
+///   - clap (Rust):      `tip: some similar subcommands exist: 'a', 'b'`
+///                       `tip: a similar argument exists: '--foo'`
+///   - cobra (Go):       `Did you mean this?\n  xyz`
+///   - commander (Node): `(Did you mean --xyz?)`
+///   - click (Python):   `Did you mean "xyz"?` / `Did you mean 'xyz'?`
+///   - generic:          any line containing `did you mean` (lowered)
+fn extract_cli_hint(stderr: &str) -> Option<String> {
+    let mut tip_line: Option<String> = None;
+    let mut after_did_you_mean_this: Option<String> = None;
+    let mut prev_was_did_you_mean_this = false;
+
+    for raw in stderr.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let lower = line.to_lowercase();
+
+        // clap: "tip: ..."
+        if lower.starts_with("tip:") {
+            tip_line = Some(line.trim_start_matches("tip:").trim().to_owned());
+        }
+        // cobra: "Did you mean this?" then candidates on the next non-empty line
+        if prev_was_did_you_mean_this {
+            after_did_you_mean_this = Some(line.to_owned());
+            prev_was_did_you_mean_this = false;
+        }
+        if lower.contains("did you mean this?") {
+            prev_was_did_you_mean_this = true;
+            continue;
+        }
+        // commander / click / generic "did you mean"
+        if lower.contains("did you mean") && tip_line.is_none() {
+            tip_line = Some(line.to_owned());
+        }
+    }
+
+    match (tip_line, after_did_you_mean_this) {
+        (Some(t), Some(c)) => Some(format!("{t} ({c})")),
+        (Some(t), None) => Some(t),
+        (None, Some(c)) => Some(format!("Did you mean: {c}")),
+        (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::extract_cli_hint;
+
+    #[test]
+    fn clap_subcommand_tip() {
+        let s = "error: unrecognized subcommand 'star'\n\n  tip: some similar subcommands exist: 'status', 'restart', 'start'";
+        assert_eq!(
+            extract_cli_hint(s).as_deref(),
+            Some("some similar subcommands exist: 'status', 'restart', 'start'")
+        );
+    }
+
+    #[test]
+    fn clap_arg_tip() {
+        let s = "error: unknown option '--depDate'\n  tip: a similar argument exists: '--dep-date'";
+        assert!(extract_cli_hint(s).unwrap().contains("--dep-date"));
+    }
+
+    #[test]
+    fn commander_did_you_mean() {
+        let s = "error: unknown option '--depDate'\n(Did you mean --dep-date?)";
+        assert!(extract_cli_hint(s).unwrap().to_lowercase().contains("dep-date"));
+    }
+
+    #[test]
+    fn cobra_did_you_mean_this() {
+        let s = "Error: unknown command \"star\" for \"rsclaw\"\n\nDid you mean this?\n\tstart\n\nRun 'rsclaw --help' for usage.";
+        let hint = extract_cli_hint(s).unwrap();
+        assert!(hint.contains("start"), "got: {hint}");
+    }
+
+    #[test]
+    fn no_hint_clean_error() {
+        let s = "error: file not found";
+        assert_eq!(extract_cli_hint(s), None);
+    }
+
+    #[test]
+    fn no_hint_for_unrelated_text_with_did_you_mean_substring() {
+        // This shouldn't match — checks we don't false-positive on unrelated content.
+        let s = "Successfully wrote 5 lines";
+        assert_eq!(extract_cli_hint(s), None);
+    }
+}
+
 fn sanitize_shell_redirects(cmd: &str) -> String {
     // Conservative: only fix the common `something2>&1` → `something 2>&1` case.
     // Broader rewrites risk changing user intent.
@@ -444,14 +542,20 @@ impl super::runtime::AgentRuntime {
         // Try to collect result
         if let Some(result) = self.exec_pool.try_collect_by_task(task_id).await {
             let is_error = result.exit_code.map(|c| c != 0).unwrap_or(true);
-            return Ok(json!({
+            let mut payload = json!({
                 "task_id": task_id,
                 "status": "completed",
                 "exit_code": result.exit_code,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
                 "is_error": is_error,
-            }));
+            });
+            if is_error
+                && let Some(hint) = extract_cli_hint(&result.stderr)
+            {
+                payload["hint"] = json!(hint);
+            }
+            return Ok(payload);
         }
         Ok(json!({
             "task_id": task_id,
@@ -710,12 +814,18 @@ impl super::runtime::AgentRuntime {
             let stderr = String::from_utf8_lossy(&output.stderr);
             tracing::info!(cwd = %workspace.display(), command = %command, exit_code = ?output.status.code(), stdout_len = stdout.len(), stderr_len = stderr.len(), "exec: done");
 
-            Ok(json!({
+            let mut result = json!({
                 "task_id": task_id,
                 "exit_code": output.status.code(),
                 "stdout": stdout,
                 "stderr": stderr,
-            }))
+            });
+            if output.status.code().map(|c| c != 0).unwrap_or(true)
+                && let Some(hint) = extract_cli_hint(&stderr)
+            {
+                result["hint"] = json!(hint);
+            }
+            Ok(result)
         } else {
             // Background execution — spawn and return task_id immediately.
             // The result will be collected by exec_pool on the next turn.
