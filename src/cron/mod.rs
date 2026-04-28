@@ -936,6 +936,17 @@ impl CronRunner {
 
                 // Iter cycling: persist the advanced cursor BEFORE dispatch so a
                 // crash/restart can never replay the same item.
+                //
+                // Trade-off: a reload-driven cancel that fires AFTER this point
+                // (CANCEL_BY_RELOAD) leaves the cursor advanced even though the
+                // current item never actually delivered. The next fire picks
+                // up at the following item instead of retrying the cancelled
+                // one. We accept this — "every fire moves the cursor" is
+                // simpler to reason about than a rewind, matches the user
+                // expectation that an iter job runs forward through the list,
+                // and the alternative (rewinding under reload while keeping
+                // the advance under a real crash) requires distinguishing
+                // cancellation causes after the fact.
                 if let Some(text) = rendered_text {
                     if let Err(e) = self.save_store(&jobs).await {
                         warn!(error = %e, job_id, "cron: failed to persist iter cursor; the next run may repeat the same item");
@@ -2309,6 +2320,28 @@ mod cron_iter_tests {
         assert_eq!(rendered, "查询a");
         j.bake_message(rendered);
         assert_eq!(j.effective_message(), "查询a");
+    }
+
+    /// The dispatcher persists the advanced cursor BEFORE handing the rendered
+    /// job to the agent. Verify that the iter struct round-trips through the
+    /// same JSON form `save_store` writes — if cursor doesn't survive the
+    /// serde dance, a crash mid-fire would replay the same item next start.
+    #[test]
+    fn iter_cursor_survives_serde_roundtrip() {
+        let mut j = iter_job(&["东京", "曼谷", "迪拜"], 0, "查询{current}");
+        // Simulate one dispatch's mutations: render captures item 0 ("东京"),
+        // advance moves cursor to 1, persistence writes the new state.
+        let rendered = j.render_message();
+        assert_eq!(rendered, "查询东京");
+        assert_eq!(j.advance_iter(), Some(1));
+
+        let json = serde_json::to_string(&j).expect("serialize");
+        let restored: CronJob = serde_json::from_str(&json).expect("deserialize");
+        let iter = restored.iter.as_ref().expect("iter must round-trip");
+        assert_eq!(iter.cursor, 1, "cursor must survive serde roundtrip");
+        assert_eq!(iter.items, vec!["东京", "曼谷", "迪拜"]);
+        // Next dispatch (post-restart) picks up at the new cursor → "曼谷".
+        assert_eq!(restored.render_message(), "查询曼谷");
     }
 }
 
