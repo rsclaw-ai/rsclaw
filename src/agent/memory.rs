@@ -866,7 +866,7 @@ impl MemoryStore {
             info!(
                 skipped,
                 expected_dim,
-                "memory: dimension mismatch detected, auto-reindexing"
+                "memory: dimension mismatch detected; caller will drive background re-embed"
             );
         }
 
