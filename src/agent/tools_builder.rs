@@ -415,29 +415,33 @@ pub(crate) fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "web_fetch".to_owned(),
-        description: "PREFERRED tool for HTTP GET requests — web pages, JSON/text/REST APIs, documentation, articles.\n\
-            Do NOT use execute_command with curl/wget/Invoke-WebRequest for plain GET fetches — use web_fetch.\n\
+        description: "PREFERRED tool for HTTP requests — web pages, REST APIs, documentation, articles.\n\
+            Do NOT use execute_command with curl/wget/Invoke-WebRequest — use web_fetch instead.\n\
             - URL must be fully-formed (https://...)\n\
             - HTTP auto-upgraded to HTTPS\n\
             - HTML pages are dehydrated to clean text/markdown\n\
-            - JSON / plain-text / non-HTML responses are returned as-is (raw body) — works for REST APIs like wttr.in, openweather, github, etc.\n\
-            - Falls back to browser rendering for JS-heavy pages and CAPTCHA-blocked sites\n\
-            - Results cached 15 minutes\n\
+            - JSON / plain-text / non-HTML responses are returned as-is (raw body)\n\
+            - Falls back to browser rendering for JS-heavy pages and CAPTCHA-blocked sites (GET only)\n\
+            - GET responses without headers/body are cached 15 minutes; non-GET bypasses cache\n\
             - For large pages, pass 'prompt' to LLM-extract specific information\n\
-            - Read-only; does not modify anything\n\
             \n\
-            LIMITATIONS — fall back to execute_command + curl/wget when you need:\n\
-              - HTTP methods other than GET (POST/PUT/PATCH/DELETE)\n\
-              - Custom request headers (Authorization, X-API-Key, Cookie, etc.)\n\
-              - Request body (form-encoded, JSON, file upload / multipart)\n\
-              - Bearer / basic / OAuth auth, signed requests\n\
+            METHODS, HEADERS, BODY — supports the full HTTP surface:\n\
+              - method: GET (default), POST, PUT, PATCH, DELETE\n\
+              - headers: object — Authorization, X-API-Key, Cookie, custom Content-Type, etc.\n\
+              - body: string (raw) OR object/array (auto JSON-serialized + Content-Type set)\n\
+            \n\
+            FALL BACK to execute_command + curl only when you need:\n\
+              - File upload via multipart/form-data\n\
               - Streaming responses (SSE, chunked transfers consumed incrementally)\n\
-              - Sites behind login (use web_browser when interaction is needed)".to_owned(),
+              - Sites behind interactive login (use web_browser when interaction is needed)".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "url":    {"type": "string", "description": "Full URL to fetch (e.g. https://docs.example.com/api)"},
-                "prompt": {"type": "string", "description": "What to extract from the page (e.g. 'list all API endpoints')"}
+                "url":     {"type": "string", "description": "Full URL to fetch (e.g. https://docs.example.com/api)"},
+                "method":  {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"], "description": "HTTP method. Default: GET"},
+                "headers": {"type": "object", "description": "Optional request headers, e.g. {\"Authorization\": \"Bearer xyz\", \"X-API-Key\": \"...\"}", "additionalProperties": {"type": "string"}},
+                "body":    {"description": "Optional request body. String → sent as-is (set Content-Type via headers). Object/array → JSON-serialized; Content-Type defaulted to application/json."},
+                "prompt":  {"type": "string", "description": "What to extract from the page (e.g. 'list all API endpoints')"}
             },
             "required": ["url"]
         }),

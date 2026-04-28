@@ -611,7 +611,9 @@ impl AgentRuntime {
         use moka::future::Cache;
         use std::sync::LazyLock;
 
-        /// LRU cache: URL -> (title, markdown). 15 min TTL, ~50 MB.
+        /// LRU cache for GET responses: URL -> (title, markdown). 15 min TTL,
+        /// ~50 MB. Non-GET requests bypass the cache entirely — POST/PUT/DELETE
+        /// are inherently non-idempotent and may carry per-call auth.
         static FETCH_CACHE: LazyLock<Cache<String, (String, String)>> = LazyLock::new(|| {
             Cache::builder()
                 .max_capacity(500)
@@ -623,6 +625,45 @@ impl AgentRuntime {
             .as_str()
             .ok_or_else(|| anyhow!("web_fetch: `url` required"))?;
         let prompt = args.get("prompt").and_then(|v| v.as_str());
+
+        // Optional method (default GET). Anything other than GET disables
+        // the response cache and the same-host redirect policy stays in
+        // effect (avoids accidental cross-host POST replays).
+        let method_str = args
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("GET")
+            .to_uppercase();
+        let method = reqwest::Method::from_bytes(method_str.as_bytes())
+            .map_err(|_| anyhow!("web_fetch: invalid HTTP method `{method_str}`"))?;
+        let is_get = method == reqwest::Method::GET;
+
+        // Optional headers map. Used for Authorization, X-API-Key, custom
+        // content-types, etc. Reserved hop-by-hop headers (Host,
+        // Content-Length, Transfer-Encoding, Connection) are silently
+        // dropped — reqwest manages those.
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(map) = args.get("headers").and_then(|v| v.as_object()) {
+            const RESERVED: &[&str] = &["host", "content-length", "transfer-encoding", "connection"];
+            for (k, v) in map {
+                if RESERVED.iter().any(|r| r.eq_ignore_ascii_case(k)) {
+                    continue;
+                }
+                let Some(val_str) = v.as_str() else {
+                    bail!("web_fetch: header `{k}` value must be a string");
+                };
+                let name = reqwest::header::HeaderName::try_from(k.as_str())
+                    .map_err(|_| anyhow!("web_fetch: invalid header name `{k}`"))?;
+                let val = reqwest::header::HeaderValue::try_from(val_str)
+                    .map_err(|_| anyhow!("web_fetch: invalid value for header `{k}`"))?;
+                headers.insert(name, val);
+            }
+        }
+
+        // Optional body. Object → JSON-serialized + Content-Type set unless
+        // caller already provided one. String → raw body (caller controls
+        // Content-Type via headers). Anything else → error.
+        let body_value = args.get("body").cloned();
 
         let wf_cfg = self.live.ext.read().await
             .tools.as_ref()
@@ -642,16 +683,20 @@ impl AgentRuntime {
             url.to_owned()
         };
 
-        // Check cache.
-        if let Some((cached_title, cached_md)) = FETCH_CACHE.get(&fetch_url).await {
-            let text = truncate_chars(&cached_md, max_length);
-            let text = self.maybe_summarize(&text, prompt).await;
-            return Ok(json!({
-                "url": url,
-                "title": cached_title,
-                "text": text,
-                "length": text.len(),
-            }));
+        // Cache lookup is GET-only. POST/PUT/PATCH/DELETE skip the cache
+        // since they may have side effects, carry per-call auth, or be
+        // inherently non-idempotent.
+        if is_get && body_value.is_none() && headers.is_empty() {
+            if let Some((cached_title, cached_md)) = FETCH_CACHE.get(&fetch_url).await {
+                let text = truncate_chars(&cached_md, max_length);
+                let text = self.maybe_summarize(&text, prompt).await;
+                return Ok(json!({
+                    "url": url,
+                    "title": cached_title,
+                    "text": text,
+                    "length": text.len(),
+                }));
+            }
         }
 
         // Build HTTP client with same-host-only redirect policy.
@@ -679,9 +724,33 @@ impl AgentRuntime {
             .redirect(redirect_policy)
             .build()?;
 
-        let response = match client.get(&fetch_url).send().await {
+        // Build request: method + url + headers + body.
+        let mut req = client.request(method.clone(), &fetch_url);
+        if !headers.is_empty() {
+            req = req.headers(headers.clone());
+        }
+        if let Some(body) = body_value.as_ref() {
+            match body {
+                Value::String(s) => {
+                    req = req.body(s.clone());
+                }
+                Value::Object(_) | Value::Array(_) => {
+                    // JSON body: reqwest's `.json()` sets Content-Type for us
+                    // unless the caller already provided one.
+                    req = req.json(body);
+                }
+                _ => bail!("web_fetch: `body` must be a string, object, or array"),
+            }
+        }
+
+        let response = match req.send().await {
             Ok(r) => r,
             Err(e) => {
+                // For non-GET, browser fallback is meaningless (it can only
+                // replay GETs). Surface the error directly.
+                if !is_get {
+                    return Err(e.into());
+                }
                 // HTTP request failed — try browser fallback before giving up.
                 tracing::warn!(url = %fetch_url, error = %e, "web_fetch: HTTP failed, trying browser fallback");
                 match self.browser_get_article(&fetch_url).await {
@@ -756,8 +825,9 @@ impl AgentRuntime {
             tracing::warn!(url = %fetch_url, "web_fetch: CAPTCHA/bot-check detected, trying browser fallback");
         }
 
-        let (final_title, final_md) = if is_spa || is_captcha {
-            // Try browser fallback for JS-rendered or bot-blocked pages.
+        let (final_title, final_md) = if is_get && (is_spa || is_captcha) {
+            // Browser fallback only makes sense for GET — POST/PUT can't be
+            // safely replayed in a browser tab.
             match self.browser_get_article(&fetch_url).await {
                 Ok((t, md)) if !md.is_empty() => (t, md),
                 _ => (title.clone(), markdown.clone()),
@@ -766,8 +836,10 @@ impl AgentRuntime {
             (title.clone(), markdown.clone())
         };
 
-        // Cache the result.
-        FETCH_CACHE.insert(fetch_url, (final_title.clone(), final_md.clone())).await;
+        // Only cache cacheable requests: GET with no headers / body.
+        if is_get && body_value.is_none() && headers.is_empty() {
+            FETCH_CACHE.insert(fetch_url, (final_title.clone(), final_md.clone())).await;
+        }
 
         let text = truncate_chars(&final_md, max_length);
         let text = self.maybe_summarize(&text, prompt).await;
