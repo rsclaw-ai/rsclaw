@@ -42,3 +42,8 @@ ui/src-tauri/gen/
 # Ephemeral state files that shouldn't be committed.
 .claude/scheduled_tasks.lock
 .claude/scheduled_tasks.json
+
+# Tauri-bundled embedding model — too large for git, fetched into place by
+# scripts/fetch-bundled-model.sh before `tauri build`. config.json and
+# tokenizer.json are tiny and stay in the repo.
+ui/src-tauri/resources/bge-small-zh/model.safetensors
