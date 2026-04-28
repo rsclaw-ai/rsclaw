@@ -415,8 +415,8 @@ pub(crate) fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "web_fetch".to_owned(),
-        description: "PREFERRED tool for any HTTP request — web pages, JSON/text APIs, documentation, articles.\n\
-            Do NOT use execute_command with curl/wget/Invoke-WebRequest for HTTP — always use web_fetch instead.\n\
+        description: "PREFERRED tool for HTTP GET requests — web pages, JSON/text/REST APIs, documentation, articles.\n\
+            Do NOT use execute_command with curl/wget/Invoke-WebRequest for plain GET fetches — use web_fetch.\n\
             - URL must be fully-formed (https://...)\n\
             - HTTP auto-upgraded to HTTPS\n\
             - HTML pages are dehydrated to clean text/markdown\n\
@@ -425,7 +425,14 @@ pub(crate) fn build_tool_list(
             - Results cached 15 minutes\n\
             - For large pages, pass 'prompt' to LLM-extract specific information\n\
             - Read-only; does not modify anything\n\
-            - If content is behind login, use web_browser instead".to_owned(),
+            \n\
+            LIMITATIONS — fall back to execute_command + curl/wget when you need:\n\
+              - HTTP methods other than GET (POST/PUT/PATCH/DELETE)\n\
+              - Custom request headers (Authorization, X-API-Key, Cookie, etc.)\n\
+              - Request body (form-encoded, JSON, file upload / multipart)\n\
+              - Bearer / basic / OAuth auth, signed requests\n\
+              - Streaming responses (SSE, chunked transfers consumed incrementally)\n\
+              - Sites behind login (use web_browser when interaction is needed)".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {

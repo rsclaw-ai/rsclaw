@@ -713,12 +713,20 @@ Use direct API first. web_search for open-ended or unstructured questions only.
 
 const ZH_TOOL_WEB_FETCH: &str = r#"# web_fetch 使用指南
 
-- **任何 HTTP 请求都优先用 web_fetch**——网页、JSON API、文档、文章、REST 接口都行
-- **绝对不要**用 `execute_command` + `curl`/`wget`/`Invoke-WebRequest` 抓 HTTP，一律改用 web_fetch
+- **HTTP GET 请求优先用 web_fetch**——网页、JSON API、文档、文章、REST 接口都行
+- 简单 GET 不要用 `execute_command` + `curl`/`wget`/`Invoke-WebRequest`，一律走 web_fetch
 - HTML 页面会自动转成干净的 markdown
 - JSON / 纯文本 / 非 HTML 响应**原样返回 body**——wttr.in、openweather、github、ipinfo 这种 REST API 直接传 URL 就行
 - 静态内容用 web_fetch；需要交互（登录、点击）才用 web_browser
 - HTTP 失败或遇到验证码时会自动回退到浏览器抓取
+
+## 什么时候必须用 curl/exec
+web_fetch 只支持纯 GET。下面这些情况退回 `execute_command + curl`：
+- 非 GET 方法：POST/PUT/PATCH/DELETE
+- 自定义 header：Authorization、X-API-Key、Cookie 等
+- 请求体：form / json / multipart 文件上传
+- 鉴权：Bearer / Basic / OAuth、签名请求
+- 流式响应：SSE、chunked 边收边处理
 
 ## web_download
 - 下载文件/图片/视频用 `web_download`（支持续传、浏览器 cookie），不要用 curl/wget
@@ -729,12 +737,20 @@ const ZH_TOOL_WEB_FETCH: &str = r#"# web_fetch 使用指南
 
 const EN_TOOL_WEB_FETCH: &str = r#"# web_fetch Usage Guide
 
-- **PREFERRED tool for any HTTP request** — web pages, JSON APIs, REST endpoints, documentation, articles
-- **Do NOT** use `execute_command` with `curl`/`wget`/`Invoke-WebRequest` for HTTP — always use web_fetch
+- **PREFERRED for HTTP GET requests** — web pages, JSON APIs, REST endpoints, documentation, articles
+- For plain GET, do NOT use `execute_command` with `curl`/`wget`/`Invoke-WebRequest` — use web_fetch
 - HTML pages are auto-converted to clean text/markdown
 - JSON / plain-text / non-HTML responses are returned **as-is (raw body)** — works for wttr.in, openweather, github, ipinfo, etc.
 - Use web_fetch for static content; only use web_browser when interaction is needed (login, clicking, form filling)
 - Automatically falls back to browser on HTTP failure or CAPTCHA
+
+## When to fall back to curl/exec
+web_fetch is GET-only. Use `execute_command + curl` when you need:
+- HTTP methods other than GET (POST/PUT/PATCH/DELETE)
+- Custom headers (Authorization, X-API-Key, Cookie, etc.)
+- Request body (form, json, multipart upload)
+- Auth: Bearer / Basic / OAuth, signed requests
+- Streaming responses (SSE, chunked consumed incrementally)
 
 ## web_download
 - Download files/images/videos: use `web_download` (supports resume, browser cookies). Do NOT use curl/wget.
