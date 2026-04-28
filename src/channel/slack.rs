@@ -203,6 +203,22 @@ impl SlackChannel {
                     // channels were silently dropped because the default
                     // arm only logged at debug level.
                     if etype == "message" || etype == "app_mention" {
+                        // Skip messages the bot itself sent — Slack pushes
+                        // every message in subscribed channels including
+                        // the bot's own replies, which without this guard
+                        // produces an infinite self-reply loop:
+                        //   bot replies → Slack pushes the reply →
+                        //   on_message → agent treats it as a user msg →
+                        //   replies again → loop forever.
+                        // Slack marks bot-sent messages with either a
+                        // `bot_id` field or a `subtype == "bot_message"`.
+                        let is_bot_msg = event.get("bot_id").is_some()
+                            || event.get("subtype").and_then(|v| v.as_str())
+                                == Some("bot_message");
+                        if is_bot_msg {
+                            info!("Slack: skipping bot's own message");
+                            continue;
+                        }
                         let user = event["user"].as_str().unwrap_or("").to_owned();
                         let mut text = event["text"].as_str().unwrap_or("").to_owned();
                         let channel = event["channel"].as_str().unwrap_or("").to_owned();
