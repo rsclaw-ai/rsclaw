@@ -810,6 +810,7 @@ impl AgentRuntime {
         text: &str,
         channel: &str,
         peer_id: &str,
+        chat_id: &str,
         extra_tools: Vec<ToolDef>,
         images: Vec<super::registry::ImageAttachment>,
         files: Vec<super::registry::FileAttachment>,
@@ -1917,6 +1918,7 @@ impl AgentRuntime {
                     &full_text,
                     channel,
                     peer_id,
+                    chat_id,
                     extra_tools,
                     images,
                     vec![],
@@ -1934,6 +1936,7 @@ impl AgentRuntime {
                     &full_text,
                     channel,
                     peer_id,
+                    chat_id,
                     extra_tools,
                     images,
                     files,
@@ -2476,7 +2479,11 @@ impl AgentRuntime {
             session_key: session_key.to_owned(),
             channel: channel.to_owned(),
             peer_id: peer_id.to_owned(),
-            chat_id: String::new(),
+            // Channel/group ID for the inbound message. Notification routing
+            // and tool callbacks fall back to peer_id when this is empty,
+            // which on Discord groups produces a 404 (Discord rejects POST
+            // to /channels/<user_id>/messages — DMs need a created channel).
+            chat_id: chat_id.to_owned(),
             exec_pool: Arc::clone(&self.exec_pool),
             loop_detector: {
                 let ld_cfg_owned = self
@@ -4123,8 +4130,22 @@ impl AgentRuntime {
             // Send intermediate text to user immediately (progress feedback).
             // Model often says "好的，我来帮你搜索" before calling tools — send it now
             // instead of waiting for the entire turn to complete.
+            //
+            // SKIP for ws/desktop channels: WS clients already receive
+            // streaming `delta` events through the event_bus pipeline that
+            // render progressively into the main reply bubble. Sending the
+            // same text via notification_tx would surface as a duplicate
+            // standalone bubble (the "ws" alias in startup.rs bridges
+            // notification_tx to the desktop channel, so it lands in chat
+            // alongside the streaming bubble).
+            let is_streaming_channel =
+                ctx.channel == "ws" || ctx.channel == "desktop";
             let intermediate_enabled = self.live.agents.read().await.defaults.intermediate_output.unwrap_or(true);
-            if intermediate_enabled && !text_buf.is_empty() && !tool_calls.is_empty() {
+            if intermediate_enabled
+                && !is_streaming_channel
+                && !text_buf.is_empty()
+                && !tool_calls.is_empty()
+            {
                 if let Some(ref ntx) = self.notification_tx {
                     let notif_target = if !ctx.chat_id.is_empty() {
                         ctx.chat_id.clone()
