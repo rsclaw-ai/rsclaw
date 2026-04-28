@@ -1153,7 +1153,6 @@ async fn run_embedder_reembed(
         if pending.is_empty() {
             break;
         }
-        let batch_size = pending.len();
         batch_no += 1;
         // Heavy work off-lock.
         let batch_started = std::time::Instant::now();

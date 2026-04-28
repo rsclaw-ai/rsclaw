@@ -5234,9 +5234,11 @@ impl AgentRuntime {
         let Some(ref mem) = self.memory else {
             return Ok(json!({"error": "memory store not available"}));
         };
-        let mut store = mem.lock().await;
-        store
-            .add(MemoryDoc {
+        // Off-lock add: BERT inference happens between two brief lock
+        // windows so concurrent reads/writes don't stall on it.
+        crate::agent::memory::add_off_lock(
+            mem,
+            MemoryDoc {
                 id: id.clone(),
                 scope: scope.clone(),
                 kind: kind.clone(),
@@ -5251,9 +5253,9 @@ impl AgentRuntime {
                 overview_text: None,
                 tags: vec![],
                 pinned: false,
-            })
-            .await?;
-        drop(store);
+            },
+        )
+        .await?;
         // Also index in tantivy BM25 for hybrid search.
         if let Err(e) = self
             .store

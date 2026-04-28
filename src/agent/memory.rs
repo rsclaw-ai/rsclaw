@@ -906,7 +906,49 @@ impl MemoryStore {
         Arc::clone(&self.embedder)
     }
 
-    pub async fn add(&mut self, mut doc: MemoryDoc) -> Result<()> {
+    /// Snapshot the embedders an off-lock `add` needs to compute vectors for.
+    /// Returns `(primary, Some(secondary))` only when a swap is in progress
+    /// AND the secondary differs from primary; otherwise `(primary, None)`
+    /// signals the caller to skip the second embed and let `add_pre_embedded`
+    /// reuse the primary vector for the dual-write path.
+    pub fn embedders_for_dual_write(&self) -> (Arc<dyn Embedder>, Option<Arc<dyn Embedder>>) {
+        let primary = Arc::clone(&self.embedder);
+        let secondary = self.swap.as_ref().and_then(|ctx| {
+            if Arc::ptr_eq(&primary, &ctx.new_embedder) {
+                None
+            } else {
+                Some(Arc::clone(&ctx.new_embedder))
+            }
+        });
+        (primary, secondary)
+    }
+
+    pub async fn add(&mut self, doc: MemoryDoc) -> Result<()> {
+        // Embed under lock — backward-compatible path. Hot callers that hold
+        // a shared `Mutex<MemoryStore>` should use `add_off_lock` instead so
+        // the BERT inference doesn't stall every concurrent read/write.
+        let primary_vec = self.embedder.embed(&doc.text);
+        let secondary_vec = self.swap.as_ref().and_then(|ctx| {
+            if Arc::ptr_eq(&self.embedder, &ctx.new_embedder) {
+                None
+            } else {
+                Some(ctx.new_embedder.embed(&doc.text))
+            }
+        });
+        self.add_pre_embedded(doc, primary_vec, secondary_vec).await
+    }
+
+    /// Insert a doc whose vector(s) have already been computed off-lock.
+    /// `secondary_vec` is required when a swap is in progress AND the swap
+    /// target is a different embedder than primary; pass `None` when the
+    /// caller's `embedders_for_dual_write` returned a single embedder so we
+    /// safely reuse the primary vector.
+    pub async fn add_pre_embedded(
+        &mut self,
+        mut doc: MemoryDoc,
+        primary_vec: Vec<f32>,
+        secondary_vec: Option<Vec<f32>>,
+    ) -> Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -929,7 +971,15 @@ impl MemoryStore {
             doc.overview_text = extract_overview(&doc.text);
         }
 
-        doc.vector = self.embedder.embed(&doc.text);
+        // Sanity: primary vector must match active embedder's dim.
+        if primary_vec.len() != self.embed_dim as usize {
+            anyhow::bail!(
+                "add_pre_embedded: primary vector dim {} != active embedder dim {}",
+                primary_vec.len(),
+                self.embed_dim
+            );
+        }
+        doc.vector = primary_vec;
 
         // Persist to redb.
         let serialized = serialize_doc(&doc)?;
@@ -948,18 +998,23 @@ impl MemoryStore {
 
         // Dual-write to the migration secondary so new docs added during a
         // swap don't get left out. When the swap target is the SAME embedder
-        // as the primary (the dim-mismatch re-embed path uses this pattern
-        // — pass the current embedder back into begin_swap to repopulate
-        // HNSW with new dim), reuse the primary vector instead of running
-        // BERT inference twice for the identical result.
+        // as primary, reuse the primary vector — caller would have passed
+        // None for `secondary_vec` in that case.
         if let Some(ctx) = self.swap.as_mut() {
-            let new_vec = if Arc::ptr_eq(&self.embedder, &ctx.new_embedder) {
-                doc.vector.clone()
-            } else {
-                ctx.new_embedder.embed(&doc.text)
+            let new_vec = match secondary_vec {
+                Some(v) => v,
+                None => doc.vector.clone(),
             };
-            ctx.new_hnsw.insert((&new_vec, idx));
-            ctx.new_vectors.insert(idx, new_vec);
+            if new_vec.len() == ctx.new_embed_dim as usize {
+                ctx.new_hnsw.insert((&new_vec, idx));
+                ctx.new_vectors.insert(idx, new_vec);
+            } else {
+                tracing::warn!(
+                    got = new_vec.len(),
+                    expected = ctx.new_embed_dim,
+                    "add_pre_embedded: secondary vector dim mismatch — secondary index will miss this doc until next swap"
+                );
+            }
         }
 
         self.docs.push(doc);
@@ -1413,6 +1468,28 @@ fn serialize_doc(doc: &MemoryDoc) -> Result<Vec<u8>> {
 // Embedder selection
 // ---------------------------------------------------------------------------
 
+/// Add a doc to a shared `MemoryStore` without stalling other readers /
+/// writers on the BERT inference. The expensive `embedder.embed` calls
+/// happen between two brief lock windows: one to grab the embedder Arcs,
+/// one to commit the persisted doc + HNSW insert.
+///
+/// Use this from any path that holds an `Arc<Mutex<MemoryStore>>` shared
+/// across tasks. Single-owner stores (CLI tools that opened a fresh store
+/// for one shot) can keep using `MemoryStore::add` directly.
+pub async fn add_off_lock(
+    mem_arc: &Arc<tokio::sync::Mutex<MemoryStore>>,
+    doc: MemoryDoc,
+) -> Result<()> {
+    let (primary_embedder, secondary_embedder) = {
+        let mem = mem_arc.lock().await;
+        mem.embedders_for_dual_write()
+    };
+    let primary_vec = primary_embedder.embed(&doc.text);
+    let secondary_vec = secondary_embedder.map(|e| e.embed(&doc.text));
+    let mut mem = mem_arc.lock().await;
+    mem.add_pre_embedded(doc, primary_vec, secondary_vec).await
+}
+
 fn choose_embedder(
     cfg: Option<&MemorySearchConfig>,
     model_dir: Option<&Path>,
@@ -1582,6 +1659,59 @@ mod swap_tests {
 
         let migrated = store.commit_swap().unwrap();
         assert_eq!(migrated, 2);
+    }
+
+    /// `add_off_lock` is the production hot path — it's the only thing that
+    /// keeps a shared `Mutex<MemoryStore>` from stalling every concurrent
+    /// reader on a multi-second BERT inference. Verify it produces the same
+    /// final state as the in-line `add()` for both the no-swap and the
+    /// in-flight-migration cases.
+    #[tokio::test]
+    async fn add_off_lock_matches_add() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = MemoryStore::open(tmp.path(), None, MemoryTier::High, None)
+            .await
+            .expect("open");
+        let mem = std::sync::Arc::new(tokio::sync::Mutex::new(store));
+
+        // Plain add path (no swap).
+        super::add_off_lock(&mem, doc("d0", "alpha")).await.unwrap();
+        super::add_off_lock(&mem, doc("d1", "beta")).await.unwrap();
+        {
+            let m = mem.lock().await;
+            assert_eq!(m.docs.len(), 2);
+            assert_eq!(m.docs[0].vector.len(), m.embed_dim() as usize);
+            assert!(!m.docs[1].vector.iter().all(|x| *x == 0.0));
+        }
+
+        // Mid-swap dual-write path: begin_swap, then add through the off-lock
+        // helper. Secondary index must pick up the new doc the same way the
+        // in-line add does.
+        let new_emb: Arc<dyn Embedder> = Arc::new(StubEmbedder { dim: 16, seed_bias: 0.5 });
+        {
+            let mut m = mem.lock().await;
+            m.begin_swap(Arc::clone(&new_emb)).unwrap();
+            // Drain pre-existing docs through the migration loop.
+            loop {
+                let pending = m.swap_pending(10);
+                if pending.is_empty() {
+                    break;
+                }
+                let batch: Vec<_> =
+                    pending.into_iter().map(|(i, t)| (i, new_emb.embed(&t))).collect();
+                m.swap_apply_batch(batch).unwrap();
+            }
+        }
+        super::add_off_lock(&mem, doc("d2", "gamma")).await.unwrap();
+        {
+            let m = mem.lock().await;
+            assert!(
+                m.swap_pending(10).is_empty(),
+                "off-lock add must dual-write — secondary should have nothing pending after"
+            );
+        }
+        let migrated = mem.lock().await.commit_swap().unwrap();
+        assert_eq!(migrated, 3, "all three docs end up in the new primary");
     }
 
     #[tokio::test]
