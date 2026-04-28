@@ -1714,6 +1714,54 @@ mod swap_tests {
         assert_eq!(migrated, 3, "all three docs end up in the new primary");
     }
 
+    /// Stress test: 100 concurrent `add_off_lock` tasks against the same
+    /// shared store. Verifies no doc is lost (all 100 land), no doc is
+    /// double-counted (HashSet of IDs has 100 unique), and the lock-around-
+    /// embed-around-lock dance doesn't deadlock or panic.
+    #[tokio::test]
+    async fn add_off_lock_concurrent_no_loss_no_dupe() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = MemoryStore::open(tmp.path(), None, MemoryTier::High, None)
+            .await
+            .expect("open");
+        let mem = std::sync::Arc::new(tokio::sync::Mutex::new(store));
+
+        const N: usize = 100;
+        let mut handles = Vec::with_capacity(N);
+        for i in 0..N {
+            let mem = std::sync::Arc::clone(&mem);
+            handles.push(tokio::spawn(async move {
+                let d = doc(&format!("c{i}"), &format!("concurrent doc {i}"));
+                super::add_off_lock(&mem, d).await
+            }));
+        }
+        let mut errors = 0usize;
+        for h in handles {
+            match h.await.expect("task panicked") {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("add_off_lock returned error: {e:#}");
+                    errors += 1;
+                }
+            }
+        }
+        assert_eq!(errors, 0, "no add_off_lock call should fail under concurrency");
+
+        let m = mem.lock().await;
+        let active: Vec<&MemoryDoc> = m.docs.iter().filter(|d| !d.id.is_empty()).collect();
+        assert_eq!(active.len(), N, "all {N} concurrent adds must land");
+        let unique_ids: std::collections::HashSet<&str> =
+            active.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(unique_ids.len(), N, "no doc may be duplicated");
+        for d in active {
+            assert_eq!(
+                d.vector.len(),
+                m.embed_dim() as usize,
+                "every persisted vector must match the active embedder dim"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn abort_swap_leaves_primary_untouched() {
         let (mut store, _tmp) = open_temp_store().await;

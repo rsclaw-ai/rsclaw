@@ -741,7 +741,8 @@ pub(crate) fn build_tool_list(
                 "name":          {"type": "string", "description": "Job name (for add, edit)"},
                 "tz":            {"type": "string", "description": "Timezone IANA name. Auto-detected if omitted. Only set if user explicitly requests a different timezone."},
                 "agentId":       {"type": "string", "description": "Agent ID to run the job (for add, edit, default: main)"},
-                "iter":          {"type": "array", "items": {"type": "string"}, "description": "Round-robin items the scheduler cycles through, one per firing. Use `{current}` (and optionally `{next}`, `{index}`, `{total}`) as placeholders in `message`. Set this whenever the user asks for rotating tasks (e.g. 'cycle through cities'); leaves the agent free of progress-tracking duties."}
+                "iter":          {"type": "array", "items": {"type": "string"}, "description": "Round-robin items the scheduler cycles through, one per firing. Use `{current}` (and optionally `{next}`, `{index}`, `{total}`) as placeholders in `message`. Set this whenever the user asks for rotating tasks (e.g. 'cycle through cities'); leaves the agent free of progress-tracking duties. On `edit`: pass a new array to replace items; pass `null` or `[]` to clear iter mode."},
+                "iter_cursor":   {"type": "number", "description": "On `edit`: explicitly set the iter cursor (0-based). Use to reset rotation back to the start, or to jump to a specific item. Without `iter`, requires the job to already have iter configured."}
             },
             "required": ["action"]
         }),
