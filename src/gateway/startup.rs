@@ -693,6 +693,49 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         }
     });
 
+    // Global signal handler: a single SIGINT or SIGTERM triggers the
+    // shared graceful drain (same path as POST /api/v1/shutdown). Without
+    // this, no component listens for OS signals — Ctrl-C would be silently
+    // absorbed by tokio's signal subsystem and the gateway would only
+    // exit via HTTP or kill -9.
+    {
+        let sd = shutdown.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm = match signal(SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("failed to install SIGTERM handler: {e:#}");
+                        return;
+                    }
+                };
+                tokio::select! {
+                    res = tokio::signal::ctrl_c() => {
+                        if let Err(e) = res {
+                            warn!("ctrl_c handler error: {e:#}");
+                            return;
+                        }
+                        info!("SIGINT received, beginning graceful shutdown");
+                    }
+                    _ = sigterm.recv() => {
+                        info!("SIGTERM received, beginning graceful shutdown");
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                if let Err(e) = tokio::signal::ctrl_c().await {
+                    warn!("ctrl_c handler error: {e:#}");
+                    return;
+                }
+                info!("Ctrl-C received, beginning graceful shutdown");
+            }
+            sd.begin_drain();
+        });
+    }
+
     let result = serve(state, bind_addr).await;
 
     // At this point `axum::serve` has returned, which means the listener has

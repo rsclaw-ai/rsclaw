@@ -499,7 +499,12 @@ impl CronRunner {
         &self.jobs
     }
 
-    /// Start all enabled cron jobs and block until Ctrl-C.
+    /// Start all enabled cron jobs and block until shutdown is signalled.
+    ///
+    /// When constructed with a `ShutdownCoordinator`, waits on
+    /// `shutdown.notified()` so the gateway-wide drain (HTTP /shutdown,
+    /// SIGINT, SIGTERM) coordinates a single graceful exit. Without one,
+    /// falls back to listening for Ctrl-C directly (test/standalone use).
     pub async fn run(&self) -> Result<()> {
         info!("cron scheduler starting");
 
@@ -571,7 +576,15 @@ impl CronRunner {
             runner.timer_loop(jobs, running_clone, semaphore, reload_rx).await;
         });
 
-        tokio::signal::ctrl_c().await?;
+        // Wait for shutdown: prefer the shared coordinator (gateway-wide
+        // drain) so SIGINT/SIGTERM/HTTP shutdown all funnel through one
+        // path. Fall back to a direct Ctrl-C listener for tests that
+        // don't pass a coordinator.
+        if let Some(sd) = self.shutdown.clone() {
+            sd.notified().await;
+        } else {
+            tokio::signal::ctrl_c().await?;
+        }
         info!("cron scheduler shutting down");
         running.store(false, std::sync::atomic::Ordering::SeqCst);
 
