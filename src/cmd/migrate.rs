@@ -201,15 +201,34 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
             {
                 Ok(mem) => {
                     let mem_arc = std::sync::Arc::new(tokio::sync::Mutex::new(mem));
+                    // Path 1: session-JSONL `memory_put` events (older
+                    // OpenClaw versions, pre-workspace-md storage).
                     match openclaw::import_memories_to_store(openclaw_dir, &mem_arc).await {
                         Ok(mstats) => {
-                            stats.memories = mstats.imported;
+                            stats.memories += mstats.imported;
                             if mstats.errors > 0 {
                                 stats.errors += mstats.errors;
                             }
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "openclaw memory import failed");
+                            tracing::warn!(error = %e, "openclaw session memory import failed");
+                            stats.errors += 1;
+                        }
+                    }
+                    // Path 2: workspace MEMORY.md + memory/*.md (the actual
+                    // long-term memory store every modern OpenClaw user has).
+                    // Copies files onto disk AND ingests text via add_off_lock.
+                    match openclaw::import_workspace_memory(openclaw_dir, rsclaw_dir, &mem_arc)
+                        .await
+                    {
+                        Ok(mstats) => {
+                            stats.memories += mstats.imported;
+                            if mstats.errors > 0 {
+                                stats.errors += mstats.errors;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "openclaw workspace memory import failed");
                             stats.errors += 1;
                         }
                     }

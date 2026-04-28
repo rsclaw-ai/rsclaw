@@ -951,6 +951,183 @@ pub async fn import_memories_to_store(
     })
 }
 
+/// Import workspace memory MARKDOWN files (the actual long-term memory in
+/// every OpenClaw install) into rsclaw: copy them onto disk under the
+/// matching rsclaw workspace AND ingest each file's text into the
+/// MemoryStore so semantic search picks them up. This is the path zeroclaw
+/// upstream uses for its OpenClaw migration; without it, the user's daily
+/// notes (`workspace-*/memory/YYYY-MM-DD.md`) and the top-level `MEMORY.md`
+/// stay invisible to rsclaw's HNSW.
+///
+/// Sources scanned per workspace (`<openclaw>/workspace*/`):
+///   - `MEMORY.md`             → stored with kind="openclaw_memory_core"
+///   - `memory/*.md`           → stored with kind="openclaw_memory_daily"
+///
+/// `rsclaw_dir` is the rsclaw base dir (e.g. `~/.rsclaw`). The matching
+/// workspace dir under it gets the file copies.
+pub async fn import_workspace_memory(
+    openclaw_dir: &Path,
+    rsclaw_dir: &Path,
+    mem_arc: &std::sync::Arc<tokio::sync::Mutex<crate::agent::MemoryStore>>,
+) -> Result<MemoryImportStats> {
+    use crate::agent::memory::MemoryDoc;
+    use rayon::prelude::*;
+
+    let mut sources: Vec<(String, String, String)> = Vec::new(); // (scope, kind, text)
+    let mut copy_jobs: Vec<(PathBuf, PathBuf)> = Vec::new();
+
+    for entry in fs::read_dir(openclaw_dir)?.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("workspace") {
+            continue;
+        }
+        let scope = name.strip_prefix("workspace-").unwrap_or("global").to_owned();
+        let dst_workspace = rsclaw_dir.join(name);
+
+        // Top-level MEMORY.md → core memory.
+        let core_src = p.join("MEMORY.md");
+        if core_src.is_file()
+            && let Ok(text) = fs::read_to_string(&core_src)
+            && !text.trim().is_empty()
+        {
+            sources.push((scope.clone(), "openclaw_memory_core".to_owned(), text));
+            copy_jobs.push((core_src, dst_workspace.join("MEMORY.md")));
+        }
+
+        // Daily memory/*.md → daily memory.
+        let daily_dir = p.join("memory");
+        if daily_dir.is_dir() {
+            for f in fs::read_dir(&daily_dir)?.flatten() {
+                let fp = f.path();
+                if fp.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let Ok(text) = fs::read_to_string(&fp) else {
+                    continue;
+                };
+                if text.trim().is_empty() {
+                    continue;
+                }
+                sources.push((scope.clone(), "openclaw_memory_daily".to_owned(), text.clone()));
+                let fname = fp
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("daily.md")
+                    .to_owned();
+                copy_jobs.push((fp.clone(), dst_workspace.join("memory").join(fname)));
+            }
+        }
+    }
+
+    let total = sources.len();
+    if total == 0 {
+        info!("openclaw workspace memory import: nothing to import");
+        return Ok(MemoryImportStats::default());
+    }
+
+    info!(total, "openclaw workspace memory import: copying + embedding");
+    let started = std::time::Instant::now();
+
+    // File copies — small (kB-scale per file), do sequentially.
+    let mut copy_errors = 0usize;
+    for (src, dst) in copy_jobs {
+        if let Some(parent) = dst.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if dst.exists() {
+            continue; // never clobber an existing file
+        }
+        if let Err(e) = fs::copy(&src, &dst) {
+            warn!(error = %e, src = %src.display(), dst = %dst.display(), "workspace memory copy failed");
+            copy_errors += 1;
+        }
+    }
+
+    // Ingest into MemoryStore — same parallel-embed-then-brief-lock-insert
+    // pattern as `import_memories_to_store`.
+    const BATCH: usize = 50;
+    let mut imported = 0usize;
+    let mut embed_errors = 0usize;
+    for chunk in sources.chunks(BATCH) {
+        let (primary, secondary) = {
+            let mem = mem_arc.lock().await;
+            mem.embedders_for_dual_write()
+        };
+        let prepared: Vec<(MemoryDoc, Vec<f32>, Option<Vec<f32>>)> = chunk
+            .par_iter()
+            .enumerate()
+            .map(|(i, (scope, kind, text))| {
+                let id = format!(
+                    "oc-ws:{}:{}:{}",
+                    scope,
+                    kind,
+                    sha256_short(text)
+                );
+                let doc = MemoryDoc {
+                    id,
+                    scope: scope.clone(),
+                    kind: kind.clone(),
+                    text: text.clone(),
+                    vector: Vec::new(),
+                    created_at: 0,
+                    accessed_at: 0,
+                    access_count: 0,
+                    importance: if kind == "openclaw_memory_core" { 0.8 } else { 0.5 },
+                    tier: Default::default(),
+                    abstract_text: None,
+                    overview_text: None,
+                    tags: vec!["openclaw_import".to_owned()],
+                    pinned: kind == "openclaw_memory_core",
+                };
+                let _ = i;
+                let pv = primary.embed(&doc.text);
+                let sv = secondary.as_ref().map(|e| e.embed(&doc.text));
+                (doc, pv, sv)
+            })
+            .collect();
+
+        let mut mem = mem_arc.lock().await;
+        for (doc, pv, sv) in prepared {
+            match mem.add_pre_embedded(doc, pv, sv).await {
+                Ok(()) => imported += 1,
+                Err(e) => {
+                    warn!(error = %e, "workspace memory ingest: add_pre_embedded failed");
+                    embed_errors += 1;
+                }
+            }
+        }
+    }
+
+    info!(
+        total,
+        imported,
+        copy_errors,
+        embed_errors,
+        elapsed_secs = started.elapsed().as_secs(),
+        "openclaw workspace memory import: done"
+    );
+    Ok(MemoryImportStats {
+        total,
+        imported,
+        errors: copy_errors + embed_errors,
+    })
+}
+
+/// 8-char hex prefix of sha256(text). Used as a stable doc-id suffix so
+/// re-running an import doesn't double-insert the same content.
+fn sha256_short(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    hex::encode(&h.finalize()[..4])
+}
+
 // ---------------------------------------------------------------------------
 // Workspace file migration
 // ---------------------------------------------------------------------------

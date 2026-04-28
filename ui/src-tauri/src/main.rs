@@ -199,9 +199,18 @@ fn run_setup() -> Result<String, String> {
 
 /// Copy the bundled BGE-small-zh model (shipped via tauri.conf.json
 /// `bundle.resources`) into `~/.rsclaw/models/bge-small-zh/` so the gateway
-/// finds it on its standard search path. Idempotent — skips when the
-/// target already has a `model.safetensors`, so we never clobber a
-/// hand-placed or hand-upgraded model.
+/// finds it on its standard search path.
+///
+/// Atomic install: copy to a per-PID staging dir, atomic-rename when
+/// complete, write the `.rsclaw-managed` sentinel matching what the CLI's
+/// `ensure_bge_model_present` writes. While copying, leave a `.seeding.tauri`
+/// lock file (containing this PID) next to the target. The CLI's
+/// `ensure_bge_model_present` checks for that lock and waits a few seconds
+/// before falling back to network download — eliminates the race where a
+/// fast user clicks Import before the seed finishes.
+///
+/// Idempotent: skips when the target already has model.safetensors, so a
+/// hand-placed or upgraded model is never clobbered.
 fn seed_bundled_bge_model<R: tauri::Runtime>(
     handle: &tauri::AppHandle<R>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -222,9 +231,6 @@ fn seed_bundled_bge_model<R: tauri::Runtime>(
         .join("resources/bge-small-zh");
     let weights = res_dir.join("model.safetensors");
     if !weights.exists() {
-        // No bundled model — gateway will fall back to its own
-        // ensure_bge_model_present (sync download). Only happens during
-        // a stripped/dev build that didn't include the resources.
         eprintln!(
             "[setup] no bundled BGE model at {}; gateway will download",
             res_dir.display()
@@ -232,14 +238,59 @@ fn seed_bundled_bge_model<R: tauri::Runtime>(
         return Ok(());
     }
 
-    std::fs::create_dir_all(&target)?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Lock file: tells the CLI's ensure_bge_model_present "wait, Tauri is
+    // installing — don't redundantly download". Lock body is our PID so the
+    // CLI can detect a stale lock from a crashed previous Tauri instance.
+    let lock_path = target.with_extension("seeding.tauri");
+    let pid = std::process::id();
+    let _ = std::fs::write(&lock_path, pid.to_string());
+    // RAII guard: delete the lock on every exit path including panic/early
+    // return. Inline to avoid adding scopeguard as a Tauri-side dep.
+    struct LockGuard(std::path::PathBuf);
+    impl Drop for LockGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _lock_guard = LockGuard(lock_path.clone());
+
+    let staging = target.with_extension(format!("seeding.tauri.pid{pid}"));
+    if staging.exists() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    std::fs::create_dir_all(&staging)?;
     for filename in ["config.json", "tokenizer.json", "model.safetensors"] {
         let src = res_dir.join(filename);
-        let dst = target.join(filename);
+        let dst = staging.join(filename);
         std::fs::copy(&src, &dst).map_err(|e| {
             format!("copy {} -> {}: {e}", src.display(), dst.display())
         })?;
     }
+    // Sentinel content matches what the CLI writes — version + bundle
+    // marker so a sentinel-aware tool can tell where the install came from.
+    let bytes = std::fs::metadata(staging.join("model.safetensors"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let sentinel_body = format!(
+        "version={ver}\nsource=tauri-bundle\nbytes={bytes}\ninstalled_at_ms={now}\n",
+        ver = env!("CARGO_PKG_VERSION"),
+        now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    let _ = std::fs::write(staging.join(".rsclaw-managed"), sentinel_body);
+
+    if target.exists() {
+        let _ = std::fs::remove_dir_all(&target);
+    }
+    std::fs::rename(&staging, &target).map_err(|e| {
+        format!("rename {} -> {}: {e}", staging.display(), target.display())
+    })?;
     eprintln!(
         "[setup] seeded bundled BGE model -> {}",
         target.display()
