@@ -153,11 +153,7 @@ impl ShellBridgePlugin {
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
-        // Register pending oneshot BEFORE writing to avoid a race where the reader
-        // sees the response before we've recorded our waiter.
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
-
+        // Serialize first so a malformed request never leaves a pending slot behind.
         let request = json!({
             "id":     id,
             "method": method,
@@ -165,20 +161,26 @@ impl ShellBridgePlugin {
         });
         let line = serde_json::to_string(&request).context("serialize request")?;
 
-        // Send request. On any write error, drop the pending entry to free memory.
-        {
+        // Register pending oneshot BEFORE writing to avoid a race where the reader
+        // sees the response before we've recorded our waiter.
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+
+        // Send request. Hold stdin only for the duration of the write; release
+        // before re-acquiring `pending` on error so the lock ordering is one-way.
+        let write_result: Result<()> = {
             let mut stdin = self.stdin.lock().await;
-            let write_result: Result<()> = async {
+            async {
                 stdin.write_all(line.as_bytes()).await.context("write request")?;
                 stdin.write_all(b"\n").await.context("write newline")?;
                 stdin.flush().await.context("flush stdin")?;
                 Ok(())
             }
-            .await;
-            if let Err(e) = write_result {
-                self.pending.lock().await.remove(&id);
-                return Err(e).with_context(|| format!("write to plugin `{}`", self.name));
-            }
+            .await
+        };
+        if let Err(e) = write_result {
+            self.pending.lock().await.remove(&id);
+            return Err(e).with_context(|| format!("write to plugin `{}`", self.name));
         }
 
         // Wait for response with timeout.
@@ -187,6 +189,8 @@ impl ShellBridgePlugin {
             Ok(Ok(Err(e))) => bail!("plugin `{}` error: {e}", self.name),
             Ok(Err(_canceled)) => {
                 // Sender was dropped — reader task ended (EOF or read error).
+                // Clear our entry so the dead map doesn't accumulate stale slots.
+                self.pending.lock().await.remove(&id);
                 bail!("plugin `{}` reader task ended unexpectedly", self.name);
             }
             Err(_timeout) => {
