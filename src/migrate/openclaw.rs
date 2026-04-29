@@ -816,18 +816,397 @@ pub fn import_sessions_to_redb(
 }
 
 // ---------------------------------------------------------------------------
+// Memory store import (BGE embedding required)
+// ---------------------------------------------------------------------------
+
+/// Stats for the openclaw → MemoryStore memory import.
+#[derive(Debug, Default)]
+pub struct MemoryImportStats {
+    pub total: usize,
+    pub imported: usize,
+    pub errors: usize,
+}
+
+/// Import every `memory_put` entry across every agent into the rsclaw
+/// MemoryStore. Embedding (the slow part) runs off-lock in parallel via
+/// rayon; insertion takes a brief lock per batch. Safe to call from any
+/// async context — `mem_arc` is the same `Arc<Mutex<MemoryStore>>` the
+/// gateway uses, so calling this AFTER `start_gateway` would race with
+/// live agent writes (intended use is during one-shot setup before the
+/// gateway boots).
+pub async fn import_memories_to_store(
+    openclaw_dir: &Path,
+    mem_arc: &std::sync::Arc<tokio::sync::Mutex<crate::agent::MemoryStore>>,
+) -> Result<MemoryImportStats> {
+    use crate::agent::memory::MemoryDoc;
+    use rayon::prelude::*;
+
+    let agents_dir = openclaw_dir.join("agents");
+    if !agents_dir.is_dir() {
+        info!("openclaw memory import: no agents/ directory");
+        return Ok(MemoryImportStats::default());
+    }
+
+    let mut all_memories: Vec<ConvertedMemory> = Vec::new();
+    for entry in fs::read_dir(&agents_dir)?.flatten() {
+        let agent_dir = entry.path();
+        if !agent_dir.is_dir() {
+            continue;
+        }
+        let agent_id = agent_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_owned();
+        if agent_id.is_empty() {
+            continue;
+        }
+        if let Ok(mems) = read_agent_memories(&agent_dir, &agent_id) {
+            all_memories.extend(mems);
+        }
+    }
+
+    let total = all_memories.len();
+    if total == 0 {
+        return Ok(MemoryImportStats::default());
+    }
+
+    info!(total, "openclaw memory import: parallel embed starting");
+    let started = std::time::Instant::now();
+    /// Tunable: large enough to amortise lock + redb tx overhead, small
+    /// enough that one batch's worth of intermediate tensors stays under a
+    /// few hundred MB on a low-RAM machine.
+    const BATCH: usize = 100;
+
+    let mut imported = 0usize;
+    let mut errors = 0usize;
+    let show_progress = total > BATCH;
+    for chunk in all_memories.chunks(BATCH) {
+        // Snapshot the embedders under a brief lock.
+        let (primary, secondary) = {
+            let mem = mem_arc.lock().await;
+            mem.embedders_for_dual_write()
+        };
+
+        // Parallel embed off-lock — rayon picks the global pool size
+        // (defaults to num CPUs) so this saturates whatever cores the
+        // machine has without our managing thread counts.
+        let prepared: Vec<(MemoryDoc, Vec<f32>, Option<Vec<f32>>)> = chunk
+            .par_iter()
+            .map(|cm| {
+                let doc = MemoryDoc {
+                    id: format!("oc:{}:{}", cm.agent_id, cm.key),
+                    scope: cm.agent_id.clone(),
+                    kind: "openclaw_memory".to_owned(),
+                    text: cm.value.clone(),
+                    vector: Vec::new(),
+                    created_at: 0,
+                    accessed_at: 0,
+                    access_count: 0,
+                    importance: 0.5,
+                    tier: Default::default(),
+                    abstract_text: None,
+                    overview_text: None,
+                    tags: vec!["openclaw_import".to_owned()],
+                    pinned: false,
+                };
+                let pv = primary.embed(&doc.text);
+                let sv = secondary.as_ref().map(|e| e.embed(&doc.text));
+                (doc, pv, sv)
+            })
+            .collect();
+
+        // Sequential add under a single brief lock per batch — HNSW + redb
+        // need &mut and the inserts are cheap (~ms each) compared to the
+        // embeds we just amortised in parallel.
+        let mut mem = mem_arc.lock().await;
+        for (doc, pv, sv) in prepared {
+            match mem.add_pre_embedded(doc, pv, sv).await {
+                Ok(()) => imported += 1,
+                Err(e) => {
+                    warn!(error = %e, "openclaw memory import: add_pre_embedded failed");
+                    errors += 1;
+                }
+            }
+        }
+        info!(
+            imported,
+            total,
+            errors,
+            elapsed_secs = started.elapsed().as_secs(),
+            "openclaw memory import: batch complete"
+        );
+        if show_progress {
+            eprintln!("    · embedded {imported}/{total}");
+        }
+    }
+
+    info!(
+        total,
+        imported,
+        errors,
+        elapsed_secs = started.elapsed().as_secs(),
+        "openclaw memory import: done"
+    );
+    Ok(MemoryImportStats {
+        total,
+        imported,
+        errors,
+    })
+}
+
+/// Import workspace memory MARKDOWN files (the actual long-term memory in
+/// every OpenClaw install) into rsclaw: copy them onto disk under the
+/// matching rsclaw workspace AND ingest each file's text into the
+/// MemoryStore so semantic search picks them up. This is the path zeroclaw
+/// upstream uses for its OpenClaw migration; without it, the user's daily
+/// notes (`workspace-*/memory/YYYY-MM-DD.md`) and the top-level `MEMORY.md`
+/// stay invisible to rsclaw's HNSW.
+///
+/// Sources scanned per workspace (`<openclaw>/workspace*/`):
+///   - `MEMORY.md`             → stored with kind="openclaw_memory_core"
+///   - `memory/*.md`           → stored with kind="openclaw_memory_daily"
+///
+/// `rsclaw_dir` is the rsclaw base dir (e.g. `~/.rsclaw`). The matching
+/// workspace dir under it gets the file copies.
+pub async fn import_workspace_memory(
+    openclaw_dir: &Path,
+    rsclaw_dir: &Path,
+    mem_arc: &std::sync::Arc<tokio::sync::Mutex<crate::agent::MemoryStore>>,
+) -> Result<MemoryImportStats> {
+    use crate::agent::memory::MemoryDoc;
+    use rayon::prelude::*;
+
+    let mut sources: Vec<(String, String, String)> = Vec::new(); // (scope, kind, text)
+    let mut copy_jobs: Vec<(PathBuf, PathBuf)> = Vec::new();
+
+    for entry in fs::read_dir(openclaw_dir)?.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("workspace") {
+            continue;
+        }
+        let scope = name.strip_prefix("workspace-").unwrap_or("global").to_owned();
+        let dst_workspace = rsclaw_dir.join(name);
+
+        // Top-level MEMORY.md → core memory.
+        let core_src = p.join("MEMORY.md");
+        if core_src.is_file()
+            && let Ok(text) = fs::read_to_string(&core_src)
+            && !text.trim().is_empty()
+        {
+            sources.push((scope.clone(), "openclaw_memory_core".to_owned(), text));
+            copy_jobs.push((core_src, dst_workspace.join("MEMORY.md")));
+        }
+
+        // Daily memory/*.md → daily memory.
+        let daily_dir = p.join("memory");
+        if daily_dir.is_dir() {
+            for f in fs::read_dir(&daily_dir)?.flatten() {
+                let fp = f.path();
+                if fp.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let Ok(text) = fs::read_to_string(&fp) else {
+                    continue;
+                };
+                if text.trim().is_empty() {
+                    continue;
+                }
+                sources.push((scope.clone(), "openclaw_memory_daily".to_owned(), text.clone()));
+                let fname = fp
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("daily.md")
+                    .to_owned();
+                copy_jobs.push((fp.clone(), dst_workspace.join("memory").join(fname)));
+            }
+        }
+    }
+
+    let total = sources.len();
+    if total == 0 {
+        info!("openclaw workspace memory import: nothing to import");
+        return Ok(MemoryImportStats::default());
+    }
+
+    info!(total, "openclaw workspace memory import: copying + embedding");
+    let started = std::time::Instant::now();
+
+    // File copies — small (kB-scale per file), do sequentially.
+    let mut copy_errors = 0usize;
+    for (src, dst) in copy_jobs {
+        if let Some(parent) = dst.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if dst.exists() {
+            continue; // never clobber an existing file
+        }
+        if let Err(e) = fs::copy(&src, &dst) {
+            warn!(error = %e, src = %src.display(), dst = %dst.display(), "workspace memory copy failed");
+            copy_errors += 1;
+        }
+    }
+
+    // Ingest into MemoryStore — same parallel-embed-then-brief-lock-insert
+    // pattern as `import_memories_to_store`. Print a per-batch tick to
+    // stderr when the dataset is large enough to span multiple batches —
+    // gives the user visible progress during the longest migration phase.
+    const BATCH: usize = 50;
+    let mut imported = 0usize;
+    let mut embed_errors = 0usize;
+    let show_progress = sources.len() > BATCH;
+    for chunk in sources.chunks(BATCH) {
+        let (primary, secondary) = {
+            let mem = mem_arc.lock().await;
+            mem.embedders_for_dual_write()
+        };
+        let prepared: Vec<(MemoryDoc, Vec<f32>, Option<Vec<f32>>)> = chunk
+            .par_iter()
+            .enumerate()
+            .map(|(i, (scope, kind, text))| {
+                let id = format!(
+                    "oc-ws:{}:{}:{}",
+                    scope,
+                    kind,
+                    sha256_short(text)
+                );
+                let doc = MemoryDoc {
+                    id,
+                    scope: scope.clone(),
+                    kind: kind.clone(),
+                    text: text.clone(),
+                    vector: Vec::new(),
+                    created_at: 0,
+                    accessed_at: 0,
+                    access_count: 0,
+                    importance: if kind == "openclaw_memory_core" { 0.8 } else { 0.5 },
+                    tier: Default::default(),
+                    abstract_text: None,
+                    overview_text: None,
+                    tags: vec!["openclaw_import".to_owned()],
+                    pinned: kind == "openclaw_memory_core",
+                };
+                let _ = i;
+                let pv = primary.embed(&doc.text);
+                let sv = secondary.as_ref().map(|e| e.embed(&doc.text));
+                (doc, pv, sv)
+            })
+            .collect();
+
+        let mut mem = mem_arc.lock().await;
+        for (doc, pv, sv) in prepared {
+            match mem.add_pre_embedded(doc, pv, sv).await {
+                Ok(()) => imported += 1,
+                Err(e) => {
+                    warn!(error = %e, "workspace memory ingest: add_pre_embedded failed");
+                    embed_errors += 1;
+                }
+            }
+        }
+        if show_progress {
+            eprintln!("    · embedded {imported}/{total}");
+        }
+    }
+
+    info!(
+        total,
+        imported,
+        copy_errors,
+        embed_errors,
+        elapsed_secs = started.elapsed().as_secs(),
+        "openclaw workspace memory import: done"
+    );
+    Ok(MemoryImportStats {
+        total,
+        imported,
+        errors: copy_errors + embed_errors,
+    })
+}
+
+/// 8-char hex prefix of sha256(text). Used as a stable doc-id suffix so
+/// re-running an import doesn't double-insert the same content.
+fn sha256_short(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    hex::encode(&h.finalize()[..4])
+}
+
+// ---------------------------------------------------------------------------
 // Workspace file migration
 // ---------------------------------------------------------------------------
 
 /// Workspace .md files to copy (MEMORY.md is also copied as-is for system prompt,
-/// AND parsed into memory store for vector search).
+/// AND parsed into memory store for vector search). AGENT.md and SYSTEM.md are
+/// user-customised extras some OpenClaw setups carry alongside the canonical
+/// AGENTS.md.
 const WORKSPACE_FILES: &[&str] = &[
     "SOUL.md",
     "IDENTITY.md",
+    "AGENT.md",
     "AGENTS.md",
+    "SYSTEM.md",
     "USER.md",
     "MEMORY.md",
 ];
+
+/// Subset of workspace files that should have OpenClaw → rsclaw branding
+/// rewritten on copy. These are the agent-identity files where leftover
+/// "OpenClaw" / "🦞" / "龙虾" references would confuse a freshly migrated
+/// agent's self-concept. User data (USER.md, MEMORY.md) is left verbatim.
+const REBRAND_FILES: &[&str] = &[
+    "SOUL.md",
+    "IDENTITY.md",
+    "AGENT.md",
+    "AGENTS.md",
+    "SYSTEM.md",
+];
+
+/// Apply OpenClaw → rsclaw branding rewrites in-place.
+///
+/// Order matters: the exact `OpenClaw → RsClaw` pass runs first so the
+/// CamelCase form is preserved, then a case-insensitive sweep catches any
+/// remaining `openclaw` / `OPENCLAW` / mixed-case occurrences.
+fn rebrand_content(input: &str) -> String {
+    // 1. Exact CamelCase first.
+    let step1 = input.replace("OpenClaw", "RsClaw");
+    // 2. Case-insensitive sweep for the lowercase form.
+    //    Done by scanning byte-by-byte to avoid pulling in the regex crate
+    //    just for one literal pattern.
+    let needle = "openclaw";
+    let mut out = String::with_capacity(step1.len());
+    let bytes = step1.as_bytes();
+    let n = needle.len();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + n <= bytes.len() && bytes[i..i + n].eq_ignore_ascii_case(needle.as_bytes()) {
+            out.push_str("rsclaw");
+            i += n;
+        } else {
+            // Push the current char (handles multi-byte UTF-8 correctly).
+            let ch_start = i;
+            // Advance by one full UTF-8 char.
+            let ch_len = match bytes[i] {
+                b if b < 0x80 => 1,
+                b if b < 0xC0 => 1, // continuation byte (shouldn't happen at boundary)
+                b if b < 0xE0 => 2,
+                b if b < 0xF0 => 3,
+                _ => 4,
+            };
+            let end = (ch_start + ch_len).min(bytes.len());
+            out.push_str(&step1[ch_start..end]);
+            i = end;
+        }
+    }
+    // 3. Mascot rewrite — lobster → crab.
+    out.replace("龙虾", "螃蟹").replace("🦞", "🦀")
+}
 
 /// Copy workspace .md files from an OpenClaw workspace dir to rsclaw workspace.
 pub fn copy_workspace_files(
@@ -840,20 +1219,164 @@ pub fn copy_workspace_files(
     std::fs::create_dir_all(dst_workspace)?;
     let mut count = 0;
 
+    // Promote AGENT.md → AGENTS.md when only the singular form exists.
+    // AGENTS.md is the canonical name the runtime reads; AGENT.md is a
+    // user-customised variant that would otherwise be ignored at runtime.
+    // We still preserve a copy under the original name so the user's mental
+    // model isn't broken, but the canonical slot gets filled too.
+    let has_agents = src_workspace.join("AGENTS.md").is_file();
+    let has_agent = src_workspace.join("AGENT.md").is_file();
+    let promote_agent = has_agent && !has_agents;
+
     for filename in WORKSPACE_FILES {
         let src = src_workspace.join(filename);
-        if src.is_file() {
-            let dst = dst_workspace.join(filename);
-            if !dst.exists() {
-                std::fs::copy(&src, &dst)?;
-                debug!(file = %filename, "copied workspace file");
-                count += 1;
-            } else {
-                debug!(file = %filename, "skipped (already exists)");
+        if !src.is_file() {
+            continue;
+        }
+        // Targets to write for this source: usually one (same name), but
+        // AGENT.md → [AGENT.md, AGENTS.md] when promotion applies.
+        let targets: &[&str] = if *filename == "AGENT.md" && promote_agent {
+            &["AGENT.md", "AGENTS.md"]
+        } else {
+            std::slice::from_ref(filename)
+        };
+
+        for &target_name in targets {
+            let dst = dst_workspace.join(target_name);
+            if dst.exists() {
+                debug!(file = %target_name, "skipped (already exists)");
+                continue;
             }
+            // Rebrand if EITHER the source name OR the target name is in
+            // the rebrand list (covers the AGENT.md → AGENTS.md promotion).
+            let needs_rebrand =
+                REBRAND_FILES.contains(filename) || REBRAND_FILES.contains(&target_name);
+            if needs_rebrand {
+                let raw = std::fs::read_to_string(&src)?;
+                let rebranded = rebrand_content(&raw);
+                std::fs::write(&dst, rebranded)?;
+                debug!(file = %target_name, src = %filename, "copied workspace file (rebranded)");
+            } else {
+                std::fs::copy(&src, &dst)?;
+                debug!(file = %target_name, src = %filename, "copied workspace file");
+            }
+            count += 1;
         }
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod rebrand_tests {
+    use super::rebrand_content;
+
+    #[test]
+    fn camelcase_preserved() {
+        assert_eq!(rebrand_content("OpenClaw runs"), "RsClaw runs");
+    }
+
+    #[test]
+    fn lowercase_swapped() {
+        assert_eq!(rebrand_content("openclaw runs"), "rsclaw runs");
+    }
+
+    #[test]
+    fn uppercase_swapped() {
+        // Step 2 produces lowercase regardless of source casing — that
+        // matches the user's spec ("openclaw → rsclaw, case-insensitive").
+        assert_eq!(rebrand_content("OPENCLAW"), "rsclaw");
+    }
+
+    #[test]
+    fn mixed_in_one_doc() {
+        let src = "OpenClaw is built on top of openclaw — see openClaw.json";
+        let out = rebrand_content(src);
+        assert_eq!(out, "RsClaw is built on top of rsclaw — see rsclaw.json");
+    }
+
+    #[test]
+    fn lobster_to_crab() {
+        assert_eq!(rebrand_content("我是 🦞 龙虾"), "我是 🦀 螃蟹");
+    }
+
+    #[test]
+    fn untouched_when_absent() {
+        let s = "no branding here, just regular text 中文 also fine";
+        assert_eq!(rebrand_content(s), s);
+    }
+
+    #[test]
+    fn does_not_corrupt_utf8() {
+        // Mix of ASCII branding and multi-byte chars on either side.
+        let src = "前置中文OpenClaw后置🦞结尾";
+        assert_eq!(rebrand_content(src), "前置中文RsClaw后置🦀结尾");
+    }
+}
+
+#[cfg(test)]
+mod copy_workspace_tests {
+    use super::copy_workspace_files;
+    use std::fs;
+
+    fn write(p: &std::path::Path, body: &str) {
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, body).unwrap();
+    }
+
+    #[test]
+    fn promotes_singular_agent_to_canonical_when_only_one_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        write(&src.join("AGENT.md"), "rules from OpenClaw user");
+
+        let n = copy_workspace_files(&src, &dst).unwrap();
+        // Two writes: AGENT.md (preserved) + AGENTS.md (promoted).
+        assert_eq!(n, 2);
+        assert!(dst.join("AGENT.md").is_file());
+        assert!(dst.join("AGENTS.md").is_file());
+        // Both should have rebranded content.
+        let agents = fs::read_to_string(dst.join("AGENTS.md")).unwrap();
+        assert!(agents.contains("RsClaw"), "expected rebrand: {agents}");
+        assert!(!agents.contains("OpenClaw"));
+    }
+
+    #[test]
+    fn does_not_promote_when_canonical_already_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        write(&src.join("AGENT.md"), "user singular content");
+        write(&src.join("AGENTS.md"), "canonical content");
+
+        copy_workspace_files(&src, &dst).unwrap();
+        // Both files copy verbatim (rebranded since both are identity files),
+        // but AGENT.md content does NOT overwrite the canonical AGENTS.md.
+        assert_eq!(
+            fs::read_to_string(dst.join("AGENTS.md")).unwrap(),
+            "canonical content"
+        );
+        assert_eq!(
+            fs::read_to_string(dst.join("AGENT.md")).unwrap(),
+            "user singular content"
+        );
+    }
+
+    #[test]
+    fn skips_targets_that_already_exist_at_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        write(&src.join("AGENT.md"), "incoming");
+        // Pre-seed AGENTS.md at destination — promotion must NOT overwrite.
+        write(&dst.join("AGENTS.md"), "pre-existing canonical");
+
+        copy_workspace_files(&src, &dst).unwrap();
+        assert_eq!(
+            fs::read_to_string(dst.join("AGENTS.md")).unwrap(),
+            "pre-existing canonical"
+        );
+    }
 }
 
 /// Convert OpenClaw's free-form HEARTBEAT.md to rsclaw's frontmatter format.
@@ -963,9 +1486,67 @@ pub fn copy_skills(src_workspace: &Path, dst_workspace: &Path) -> Result<usize> 
             copy_dir_recursive(&src_path, &dst_path)?;
             count += 1;
             debug!(skill = ?name, "copied skill");
+            // OpenClaw skill SKILL.md frontmatter often wraps URLs / paths
+            // in backticks for visual decoration (`https://example.com`).
+            // Backticks aren't a valid YAML scalar start char; rsclaw's
+            // strict YAML loader rejects the file with "found character
+            // that cannot start any token". Strip them post-copy.
+            let skill_md = dst_path.join("SKILL.md");
+            if skill_md.is_file()
+                && let Err(e) = sanitize_skill_md_frontmatter(&skill_md)
+            {
+                warn!(error = %e, file = %skill_md.display(), "failed to sanitize SKILL.md frontmatter");
+            }
         }
     }
     Ok(count)
+}
+
+/// Strip backtick-wrapped scalar values from SKILL.md YAML frontmatter so
+/// rsclaw's strict YAML loader can parse it.
+///
+/// Rewrites lines that look like `key: \`value\`` into `key: value`. Idempotent
+/// — running twice is a no-op. Returns Ok(true) if the file was modified.
+fn sanitize_skill_md_frontmatter(path: &Path) -> Result<bool> {
+    let content = fs::read_to_string(path)?;
+    let Some(rest) = content.strip_prefix("---\n") else {
+        return Ok(false);
+    };
+    let Some(end_offset) = rest.find("\n---\n") else {
+        return Ok(false);
+    };
+    let frontmatter = &rest[..end_offset];
+    let after = &rest[end_offset..]; // includes leading "\n---\n" and body
+
+    let mut changed = false;
+    let mut new_fm = String::with_capacity(frontmatter.len());
+    for line in frontmatter.lines() {
+        // Look for `key: `value`` pattern. Be conservative: only strip when
+        // the entire value is backtick-wrapped on a single line.
+        if let Some(colon_tick) = line.find(": `") {
+            let key_part = &line[..colon_tick];
+            let after_open = &line[colon_tick + 3..];
+            if let Some(close_tick_off) = after_open.rfind('`') {
+                let value = &after_open[..close_tick_off];
+                let trailing = &after_open[close_tick_off + 1..]; // any post-close text (rare)
+                if !value.contains('`') && trailing.trim().is_empty() {
+                    new_fm.push_str(key_part);
+                    new_fm.push_str(": ");
+                    new_fm.push_str(value);
+                    new_fm.push('\n');
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+        new_fm.push_str(line);
+        new_fm.push('\n');
+    }
+    if !changed {
+        return Ok(false);
+    }
+    fs::write(path, format!("---\n{new_fm}{after}"))?;
+    Ok(true)
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
@@ -1352,6 +1933,45 @@ pub fn collect_all_memories(openclaw_dir: &Path, config_json: &str) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skill_md_strips_backtick_wrapped_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("SKILL.md");
+        std::fs::write(
+            &path,
+            "---\nname: foo\nhomepage: `https://example.com/`\nmetadata: {\"k\":\"v\"}\n---\n\n# Body\n",
+        )
+        .unwrap();
+        assert!(sanitize_skill_md_frontmatter(&path).unwrap());
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("homepage: https://example.com/"),
+            "expected backticks stripped, got:\n{after}"
+        );
+        // Body untouched.
+        assert!(after.ends_with("\n# Body\n"));
+        // Idempotent.
+        assert!(!sanitize_skill_md_frontmatter(&path).unwrap());
+    }
+
+    #[test]
+    fn skill_md_no_frontmatter_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("SKILL.md");
+        std::fs::write(&path, "# Just markdown\n\nNo frontmatter here.\n").unwrap();
+        assert!(!sanitize_skill_md_frontmatter(&path).unwrap());
+    }
+
+    #[test]
+    fn skill_md_preserves_quoted_strings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("SKILL.md");
+        let original = "---\nname: bar\ndescription: \"already quoted\"\n---\n\nbody\n";
+        std::fs::write(&path, original).unwrap();
+        assert!(!sanitize_skill_md_frontmatter(&path).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
 
     #[test]
     fn extract_string_content() {

@@ -72,6 +72,7 @@ fn config_with_echo_agent(port: u16) -> RuntimeConfig {
                 flash_model: None,
                 agent_dir: None,
                 system: None,
+                temperature: None,
             }],
             bindings: vec![],
             external: vec![],
@@ -132,7 +133,7 @@ async fn start_echo_server(addr: SocketAddr) {
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
-                    was_preparse: false,
+                    needs_outer_done_emit: false,
                 });
             }
         });

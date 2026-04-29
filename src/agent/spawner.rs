@@ -84,6 +84,12 @@ impl AgentSpawner {
             .lane_concurrency
             .or(self.config.agents.defaults.max_concurrent)
             .unwrap_or(4) as usize;
+        let context_window = entry
+            .model
+            .as_ref()
+            .and_then(|m| m.context_tokens)
+            .or(self.config.agents.defaults.context_tokens)
+            .unwrap_or(0) as usize;
         let handle = Arc::new(AgentHandle {
             id: id.clone(),
             kind,
@@ -106,6 +112,7 @@ impl AgentSpawner {
             new_session_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reset_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             memory: None,
+            context_window,
         });
 
         self.registry.insert_handle(Arc::clone(&handle));
@@ -149,7 +156,7 @@ impl AgentSpawner {
                     extra_tools,
                     images,
                     files,
-                    chat_id: _,
+                    chat_id,
                 } = msg;
                 let result = runtime
                     .run_turn(
@@ -157,6 +164,7 @@ impl AgentSpawner {
                         &text,
                         &channel,
                         &peer_id,
+                        &chat_id,
                         extra_tools,
                         images,
                         files,
@@ -171,7 +179,7 @@ impl AgentSpawner {
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
-                        was_preparse: false,
+                        needs_outer_done_emit: false,
                     }
                 });
                 let _ = reply_tx.send(reply);

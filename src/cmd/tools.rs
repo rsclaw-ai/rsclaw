@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use super::style::*;
 use crate::cli::ToolsCommand;
@@ -475,39 +476,10 @@ async fn download_and_extract(
     url: &str,
     dest: &std::path::Path,
 ) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-
-    let resp = client
-        .get(url)
-        .timeout(std::time::Duration::from_secs(600))
-        .send()
-        .await?
-        .error_for_status()?;
-
-    // Stream to temp file to avoid loading entire archive into memory
-    // (critical for 1-core/1GB machines where 500MB+ archives would OOM)
     let tmp_dir = tempfile::tempdir()?;
     let filename = url.rsplit('/').next().unwrap_or("download");
     let tmp_path = tmp_dir.path().join(filename);
-
-    {
-        let mut stream = resp.bytes_stream();
-        let mut file = tokio::fs::File::create(&tmp_path).await?;
-        let mut downloaded: u64 = 0;
-        use futures::StreamExt;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            file.write_all(&chunk).await?;
-            downloaded += chunk.len() as u64;
-            // Progress every ~10MB
-            if downloaded % (10 * 1024 * 1024) < chunk.len() as u64 {
-                print!("\r    Downloaded {}MB...", downloaded / 1_000_000);
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-            }
-        }
-        file.flush().await?;
-        println!("\r    Downloaded {}MB, extracting...", downloaded / 1_000_000);
-    }
+    download_resumable(client, url, &tmp_path, filename).await?;
 
     if url.ends_with(".zip") {
         extract_zip(&tmp_path, dest)?;
@@ -523,6 +495,220 @@ async fn download_and_extract(
     }
 
     Ok(())
+}
+
+/// Resumable streaming HTTP download with a TTY progress bar. The file lives
+/// at `out_path` across runs — interrupted transfers continue via the HTTP
+/// `Range` header on the next attempt.
+///
+/// Resume safety: a sidecar `<out_path>.meta` stashes the upstream
+/// `(content_length, last_modified || date)` of the version we started
+/// downloading. On resume we send `If-Range` plus a manual size check so a
+/// CDN that quietly swapped the file mid-transfer can't produce a Frankenstein
+/// archive. Mismatch → wipe the partial and restart from byte 0.
+///
+/// `label` shows in the progress bar prefix (e.g. "BGE model").
+///
+/// Returns the total bytes resident at `out_path` after the call.
+pub async fn download_resumable(
+    client: &reqwest::Client,
+    url: &str,
+    out_path: &std::path::Path,
+    label: &str,
+) -> Result<u64> {
+    use indicatif::{ProgressBar, ProgressStyle};
+    use tokio::io::AsyncWriteExt;
+    use futures::StreamExt;
+
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let meta_path = out_path.with_extension(format!(
+        "{}meta",
+        out_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!("{e}."))
+            .unwrap_or_default()
+    ));
+
+    let mut already = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
+    // Stashed (content_length, version_token) from the previous start. We
+    // only attempt a resume when the partial bytes AND the meta both exist;
+    // a partial without meta is a leftover from a pre-meta version of this
+    // function and gets wiped to be safe.
+    let stashed: Option<(u64, String)> = if already > 0 {
+        std::fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|s| s.split_once('\t').map(|(a, b)| (a.to_owned(), b.to_owned())))
+            .and_then(|(len_s, tok)| len_s.parse::<u64>().ok().map(|n| (n, tok)))
+    } else {
+        None
+    };
+    if already > 0 && stashed.is_none() {
+        let _ = std::fs::remove_file(out_path);
+        let _ = std::fs::remove_file(&meta_path);
+        already = 0;
+    }
+
+    // Issue a single GET with conditional Range + If-Range. If-Range tells the
+    // server "only partial-content me if the version still matches"; mismatch
+    // makes it return the full body (200) which we handle as a clean restart.
+    let mut req = client.get(url).timeout(Duration::from_secs(600));
+    if let Some((_stashed_len, ref token)) = stashed {
+        req = req
+            .header(reqwest::header::RANGE, format!("bytes={already}-"))
+            .header(reqwest::header::IF_RANGE, token.as_str());
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+
+    let resume = match status.as_u16() {
+        206 => true,
+        200 => false, // server ignored Range or If-Range mismatch — restart
+        416 => {
+            // Already have the full file (or local is larger than remote).
+            // Treat as success at current size and drop the meta sidecar.
+            let _ = std::fs::remove_file(&meta_path);
+            return Ok(already);
+        }
+        _ => {
+            anyhow::bail!(
+                "download {url} failed: HTTP {status} {}",
+                status.canonical_reason().unwrap_or("")
+            );
+        }
+    };
+
+    // Capture upstream version token + total size BEFORE consuming the body.
+    let total_size = if resume {
+        resp.headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.rsplit('/').next())
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| resp.content_length().map(|n| already + n))
+    } else {
+        resp.content_length()
+    };
+    // Prefer Last-Modified over Date for If-Range — Date is the response
+    // generation timestamp (changes on every request), Last-Modified is
+    // the file mtime (stable). ETag would be ideal but many CDNs don't set
+    // it. Date is the last-resort fallback so we still catch obvious
+    // size-shifts even when the server is barebones.
+    let version_token: Option<String> = resp
+        .headers()
+        .get(reqwest::header::ETAG)
+        .or_else(|| resp.headers().get(reqwest::header::LAST_MODIFIED))
+        .or_else(|| resp.headers().get(reqwest::header::DATE))
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    // Restart conditions, all of which mean the partial we have on disk is
+    // unsafe to append to:
+    //   1. server's total differs from the size we stashed last time (file
+    //      changed upstream)
+    //   2. local partial is somehow larger than the upstream total (truncate
+    //      / dd / FS quota glitch extended it past the real size)
+    let restart_due_to_size_mismatch = resume
+        && match (stashed.as_ref().map(|(n, _)| *n), total_size) {
+            (Some(stash_total), Some(now_total)) => stash_total != now_total,
+            _ => false,
+        };
+    let restart_due_to_local_overshoot = resume
+        && match total_size {
+            Some(now_total) => already > now_total,
+            None => false,
+        };
+    let resume = resume && !restart_due_to_size_mismatch && !restart_due_to_local_overshoot;
+    if restart_due_to_size_mismatch {
+        tracing::warn!(
+            url,
+            "download_resumable: server total size changed since previous start; restarting from byte 0"
+        );
+    }
+    if restart_due_to_local_overshoot {
+        tracing::warn!(
+            url,
+            already,
+            ?total_size,
+            "download_resumable: local partial larger than upstream total; restarting from byte 0"
+        );
+    }
+
+    // Hide the progress bar in non-TTY contexts (daemon, CI, log file
+    // redirect) — otherwise indicatif's `\r`-painted updates pollute logs
+    // and look like garbled output. Mirrors the QR popup TTY check from
+    // commit 839120a.
+    let draw_target = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        indicatif::ProgressDrawTarget::stderr()
+    } else {
+        indicatif::ProgressDrawTarget::hidden()
+    };
+    let bar = if let Some(total) = total_size {
+        let bar = ProgressBar::with_draw_target(Some(total), draw_target);
+        bar.set_style(
+            ProgressStyle::with_template(
+                "    {prefix:>12} [{bar:30.cyan/blue}] {bytes:>10}/{total_bytes:>10} {bytes_per_sec:>10} ETA {eta:>5}",
+            )
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("=> "),
+        );
+        bar.set_prefix(label.to_owned());
+        if resume {
+            bar.set_position(already);
+        }
+        bar
+    } else {
+        let bar = ProgressBar::with_draw_target(None, draw_target);
+        bar.set_prefix(label.to_owned());
+        bar
+    };
+
+    // (Re)create or append. Persist the version token + total length BEFORE
+    // any bytes hit disk so a kill-9 mid-transfer leaves a usable resume
+    // anchor.
+    let mut file = if resume {
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(out_path)
+            .await?
+    } else {
+        // Restarting fresh — drop any stale partial and meta.
+        let _ = std::fs::remove_file(out_path);
+        let _ = std::fs::remove_file(&meta_path);
+        tokio::fs::File::create(out_path).await?
+    };
+    if let (Some(total), Some(token)) = (total_size, version_token.as_ref()) {
+        let _ = std::fs::write(&meta_path, format!("{total}\t{token}"));
+    }
+
+    let mut written = if resume { already } else { 0 };
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        file.write_all(&chunk).await?;
+        written += chunk.len() as u64;
+        bar.set_position(written);
+    }
+    file.flush().await?;
+    bar.finish_and_clear();
+
+    // Successful download — meta sidecar served its purpose, drop it.
+    let _ = std::fs::remove_file(&meta_path);
+
+    Ok(written)
+}
+
+/// Extract a zip archive to `dest`, stripping the top-level directory.
+/// Public so the gateway can extract a pre-downloaded archive without
+/// re-downloading.
+pub fn extract_zip_public(
+    archive_path: &std::path::Path,
+    dest: &std::path::Path,
+) -> Result<()> {
+    extract_zip(archive_path, dest)
 }
 
 fn extract_zip(archive_path: &std::path::Path, dest: &std::path::Path) -> Result<()> {

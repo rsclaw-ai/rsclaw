@@ -52,6 +52,13 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         crate::agent::evolution::EvolutionConfig::from_raw(config.ext.evolution.as_ref()),
     );
 
+    // 0b. Propagate skill-registry credentials from rsclaw.json5 into
+    //     process env. Spawned skill subprocesses (python CLIs etc.)
+    //     inherit env, so this is the bridge that lets users keep keys
+    //     in the config file instead of shell rc / launchctl. Done here,
+    //     pre-runtime, while the process is still single-threaded.
+    propagate_skill_registry_env(&config);
+
     // 1. Resolve data directory — respects RSCLAW_BASE_DIR for --dev/--profile.
     let base_dir = crate::config::loader::base_dir();
     let data_dir = base_dir.join("var/data");
@@ -120,9 +127,13 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // every event, including the BGE auto-download notifications.
     let shutdown = crate::gateway::ShutdownCoordinator::new();
 
-    // 6. Open shared memory store.
-    // Auto-detect embedding model: prefer higher-quality models first.
-    // Priority: bge-base-zh > bge-small-zh > bge-small-en > auto-download small-zh.
+    // 6. Resolve and validate the BGE embedding model BEFORE opening the
+    // memory store. Production must run with semantic search; failures here
+    // abort startup so users notice immediately rather than silently
+    // degrading to keyword-only retrieval.
+    //
+    // Priority: bge-base-zh > bge-small-zh > bge-small-en. If none of these
+    // dirs already contains a usable model, sync-download bge-small-zh.
     let search_cfg = config.raw.memory_search.as_ref();
     let model_dir = {
         let base_zh = base_dir.join("models/bge-base-zh");
@@ -135,71 +146,47 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         } else if en.join("model.safetensors").exists() {
             en
         } else {
-            // Auto-download BGE model in background (don't block startup).
-            let target_dir = zh; // default to small-zh
-            let cfg_lang = config.raw.gateway.as_ref().and_then(|g| g.language.as_deref()).map(str::to_owned);
-            let i18n_lang = crate::i18n::resolve_lang(cfg_lang.as_deref().unwrap_or("en")).to_owned();
-            let search_cfg_clone = search_cfg.cloned();
-            let dl_dir = target_dir.clone();
-            let bge_restart_tx = restart_request_tx.clone();
-            let bge_pending = Arc::clone(&pending_restart);
-            let bge_shutdown = shutdown.clone();
-            tokio::spawn(async move {
-                info!("BGE embedding model not found, downloading in background...");
-                match download_bge_model(&dl_dir, search_cfg_clone.as_ref(), cfg_lang.as_deref()).await {
-                    Ok(()) => {
-                        info!("BGE model downloaded. Notifying UI to restart.");
-                        publish_restart(
-                            &bge_restart_tx,
-                            &bge_pending,
-                            &bge_shutdown,
-                            crate::events::RestartRequest::new(
-                                crate::events::RestartReason::ModelDownloaded {
-                                    name: "bge-small-zh".into(),
-                                },
-                                crate::events::RestartUrgency::Recommended,
-                                crate::i18n::t("restart_required_model_downloaded", &i18n_lang),
-                            ),
-                        );
-                    }
-                    Err(e) => {
-                        warn!("BGE model auto-download failed: {e:#}");
-                        // Failure is reported via the same banner channel so the
-                        // user sees it in the UI; urgency is Recommended (the
-                        // gateway works without semantic search).
-                        publish_restart(
-                            &bge_restart_tx,
-                            &bge_pending,
-                            &bge_shutdown,
-                            crate::events::RestartRequest::new(
-                                crate::events::RestartReason::ModelDownloadFailed {
-                                    name: "bge-small-zh".into(),
-                                    error: format!("{e:#}"),
-                                },
-                                crate::events::RestartUrgency::Recommended,
-                                crate::i18n::t_fmt(
-                                    "restart_model_download_failed",
-                                    &i18n_lang,
-                                    &[("error", &format!("{e:#}"))],
-                                ),
-                            ),
-                        );
-                    }
-                }
-            });
-            target_dir
+            zh // default download target
         }
     };
+    ensure_bge_model_present(&model_dir, search_cfg).await?;
+
     let memory = match MemoryStore::open(&data_dir, Some(&model_dir), tier, search_cfg).await {
         Ok(m) => {
             info!("memory store opened");
             Some(Arc::new(tokio::sync::Mutex::new(m)))
         }
         Err(e) => {
-            warn!("failed to open memory store: {e:#}");
-            None
+            // Memory store opening should not fail once the model is
+            // validated by ensure_bge_model_present — propagate so startup
+            // surfaces the underlying issue (disk full, redb corruption…).
+            return Err(anyhow::anyhow!("failed to open memory store: {e:#}"));
         }
     };
+
+    // Embedder upgrade detection: if the active model produces a different
+    // vector dimension than what's stored in redb (e.g. user dropped a
+    // bge-base-zh dir and restarted), kick off a background re-embed via the
+    // two-index hot-swap API. The gateway keeps serving — search returns
+    // empty for the migrating docs until the swap commits, then catches up.
+    if let Some(mem_arc) = memory.as_ref() {
+        let pending = {
+            let mem = mem_arc.lock().await;
+            mem.pending_migration_count()
+        };
+        if pending > 0 {
+            info!(
+                pending,
+                "embedder dimension changed since last run; spawning background re-embed"
+            );
+            let bg_mem = Arc::clone(mem_arc);
+            tokio::spawn(async move {
+                if let Err(e) = run_embedder_reembed(&bg_mem).await {
+                    warn!("background re-embed failed ({e:#}); search will be partial until next restart");
+                }
+            });
+        }
+    }
 
     // 7. Load all plugins (JS + WASM) and register built-in memory slot.
     let plugins_dir = base_dir.join("plugins");
@@ -589,8 +576,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
         // Load jobs from openclaw-compatible path
         let cron_file = crate::cron::resolve_cron_store_path();
-        let jobs = crate::cron::load_cron_jobs();
-        if !jobs.is_empty() {
+        let (jobs, parse_ok) = crate::cron::load_cron_jobs();
+        if !parse_ok {
+            error!(file = %cron_file.display(), "cron.json5 has syntax errors - jobs will NOT run until file is fixed");
+        } else if !jobs.is_empty() {
             info!(file = %cron_file.display(), count = jobs.len(), "loaded cron jobs");
         }
 
@@ -599,6 +588,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             let runner = CronRunner::new_with_shutdown(
                 &cron_cfg,
                 jobs,
+                !parse_ok, // skip_initial_save if parse failed
                 Arc::clone(&registry),
                 Arc::clone(&channel_manager),
                 cron_data_dir,
@@ -713,6 +703,49 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         }
     });
 
+    // Global signal handler: a single SIGINT or SIGTERM triggers the
+    // shared graceful drain (same path as POST /api/v1/shutdown). Without
+    // this, no component listens for OS signals — Ctrl-C would be silently
+    // absorbed by tokio's signal subsystem and the gateway would only
+    // exit via HTTP or kill -9.
+    {
+        let sd = shutdown.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm = match signal(SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("failed to install SIGTERM handler: {e:#}");
+                        return;
+                    }
+                };
+                tokio::select! {
+                    res = tokio::signal::ctrl_c() => {
+                        if let Err(e) = res {
+                            warn!("ctrl_c handler error: {e:#}");
+                            return;
+                        }
+                        info!("SIGINT received, beginning graceful shutdown");
+                    }
+                    _ = sigterm.recv() => {
+                        info!("SIGTERM received, beginning graceful shutdown");
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                if let Err(e) = tokio::signal::ctrl_c().await {
+                    warn!("ctrl_c handler error: {e:#}");
+                    return;
+                }
+                info!("Ctrl-C received, beginning graceful shutdown");
+            }
+            sd.begin_drain();
+        });
+    }
+
     let result = serve(state, bind_addr).await;
 
     // At this point `axum::serve` has returned, which means the listener has
@@ -814,6 +847,47 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
+/// Map a registry name to the env vars it cares about: `(api_key_var,
+/// base_url_var)`. Hard-coded here because the env name is part of each
+/// registry's published contract — we don't want users renaming their
+/// existing env vars by editing defaults.toml.
+fn registry_env_names(name: &str) -> Option<(&'static str, &'static str)> {
+    match name {
+        "iwencai" => Some(("IWENCAI_API_KEY", "IWENCAI_BASE_URL")),
+        // Future registries with paid keys go here.
+        _ => None,
+    }
+}
+
+/// Read `skill_registries.<name>.{apiKey,baseUrl}` from the resolved
+/// config and export each non-empty value to the corresponding env var.
+/// SAFETY: called once during single-threaded gateway startup, before any
+/// async runtime tasks spawn — matches the existing precedent in
+/// `apply_proxy_env`.
+fn propagate_skill_registry_env(config: &RuntimeConfig) {
+    let Some(map) = config.raw.skill_registries.as_ref() else { return };
+    for (name, entry) in map {
+        let Some((api_key_var, base_url_var)) = registry_env_names(name) else { continue };
+        if let Some(key_field) = entry.api_key.as_ref() {
+            if let Some(val) = key_field.resolve_early().filter(|s| !s.is_empty()) {
+                if std::env::var(api_key_var).is_err() {
+                    // SAFETY: pre-async-runtime, single-threaded.
+                    unsafe { std::env::set_var(api_key_var, &val) };
+                    info!(registry = %name, env = api_key_var, "exported registry api key to env");
+                }
+            }
+        }
+        if let Some(url_field) = entry.base_url.as_ref() {
+            if let Some(val) = url_field.resolve_early().filter(|s| !s.is_empty()) {
+                if std::env::var(base_url_var).is_err() {
+                    unsafe { std::env::set_var(base_url_var, &val) };
+                    info!(registry = %name, env = base_url_var, "exported registry base url to env");
+                }
+            }
+        }
+    }
+}
+
 fn spawn_agent_tasks(
     receivers: HashMap<String, mpsc::Receiver<AgentMessage>>,
     registry: Arc<AgentRegistry>,
@@ -890,7 +964,7 @@ fn spawn_agent_tasks(
                     text,
                     channel,
                     peer_id,
-                    chat_id: _,
+                    chat_id,
                     reply_tx,
                     extra_tools,
                     images,
@@ -902,6 +976,7 @@ fn spawn_agent_tasks(
                         &text,
                         &channel,
                         &peer_id,
+                        &chat_id,
                         extra_tools,
                         images,
                         files,
@@ -917,16 +992,18 @@ fn spawn_agent_tasks(
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
-                        was_preparse: false,
+                        needs_outer_done_emit: false,
                     }
                 });
-                // Emit to event_bus for preparse turns (agent_loop already
-                // emits streaming deltas + done for LLM turns, so a second
-                // emit would duplicate the done frame) *and* for turns that
+                // Emit to event_bus for any reply path that bypassed
+                // agent_loop (preparse, file-attach short-circuits, /btw,
+                // disk-low, __DIRECT_REPLY__, etc.) *and* for turns that
                 // failed with Err (agent_loop returns early via `?` on LLM
                 // errors and never gets to emit done — WS clients would hang
-                // waiting for the terminator forever).
-                if reply.was_preparse || turn_errored {
+                // waiting for the terminator forever). Normal LLM turns
+                // already emit deltas + done from inside agent_loop, so a
+                // second emit would duplicate the done frame.
+                if reply.needs_outer_done_emit || turn_errored {
                     if !reply.text.is_empty() {
                         // receiver may have been dropped
                         let _ = event_tx_task.send(crate::events::AgentEvent {
@@ -1137,32 +1214,447 @@ pub(crate) async fn handle_pending_analysis(
 }
 
 // ---------------------------------------------------------------------------
-// BGE model auto-download
+// Embedder migration driver — backs the dim-mismatch background re-embed
+// kicked off in start_gateway after MemoryStore::open.
 // ---------------------------------------------------------------------------
 
-/// Download BGE-Small embedding model files from HuggingFace.
-/// Downloads BGE model from gitfast.org (ZIP archive).
-async fn download_bge_model(
-    target_dir: &std::path::Path,
-    search_cfg: Option<&crate::config::schema::MemorySearchConfig>,
-    _config_language: Option<&str>,
+/// Drive a re-embed pass over all docs in `mem_arc` whose stored vector
+/// dimension doesn't match the active embedder. Uses the standard two-index
+/// `begin_swap` / `swap_apply_batch` / `commit_swap` machinery so reads stay
+/// served from primary (empty for the affected docs) and writes dual-write
+/// to both indexes throughout. Heavy embedding work happens off-lock; each
+/// lock window is bounded to a single batch.
+async fn run_embedder_reembed(
+    mem_arc: &std::sync::Arc<tokio::sync::Mutex<crate::agent::MemoryStore>>,
 ) -> anyhow::Result<()> {
-    let local_cfg = search_cfg.and_then(|c| c.local.as_ref());
+    /// Docs embedded per batch. Keeps each lock window to a few hundred ms
+    /// even with the slowest CPU-only BGE inference.
+    const BATCH: usize = 50;
 
-    // Config override for custom download URL.
-    let url = if let Some(url) = local_cfg.and_then(|c| c.model_download_url.as_deref()) {
-        url.to_owned()
-    } else {
-        "https://gitfast.org/tools/models/bge-small-zh-v1.5.zip".to_owned()
+    let (embedder, expected_total) = {
+        let mut mem = mem_arc.lock().await;
+        let e = mem.embedder_arc();
+        let pending_count = mem.pending_migration_count();
+        mem.begin_swap(std::sync::Arc::clone(&e))?;
+        (e, pending_count)
     };
+    let started = std::time::Instant::now();
 
-    info!("downloading BGE embedding model from {url} ...");
-    std::fs::create_dir_all(target_dir)?;
+    let mut total = 0usize;
+    let mut batch_no = 0usize;
+    loop {
+        let pending = {
+            let mem = mem_arc.lock().await;
+            mem.swap_pending(BATCH)
+        };
+        if pending.is_empty() {
+            break;
+        }
+        batch_no += 1;
+        // Heavy work off-lock — parallel across the rayon pool so a 100-doc
+        // batch finishes in batch_size/num_cores * inference time instead of
+        // sequential. BertModel::forward takes `&self`, so concurrent embed
+        // calls are safe.
+        let batch_started = std::time::Instant::now();
+        use rayon::prelude::*;
+        let batch: Vec<(usize, Vec<f32>)> = pending
+            .into_par_iter()
+            .map(|(idx, text)| (idx, embedder.embed(&text)))
+            .collect();
+        let applied = {
+            let mut mem = mem_arc.lock().await;
+            match mem.swap_apply_batch(batch) {
+                Ok(n) => n,
+                Err(e) => {
+                    mem.abort_swap();
+                    return Err(e);
+                }
+            }
+        };
+        // applied == 0 used to abort, but with the swap_apply_batch
+        // idempotency guard a concurrent `add` dual-write can legitimately
+        // cover the entire batch before we land. Trust `swap_pending` to
+        // exclude the now-covered docs on the next iteration; the loop
+        // terminates naturally when nothing remains. Cap at 2x expected
+        // to make pathological cases (embedder always returning wrong
+        // dim) surface as a bounded failure instead of an infinite spin.
+        total += applied;
+        if batch_no > expected_total.saturating_mul(2).max(64) {
+            let mut mem = mem_arc.lock().await;
+            mem.abort_swap();
+            anyhow::bail!(
+                "embedder re-embed: ran {batch_no} batches against {expected_total} expected docs without converging — aborting"
+            );
+        }
+        info!(
+            batch = batch_no,
+            applied,
+            total,
+            expected = expected_total,
+            batch_ms = batch_started.elapsed().as_millis() as u64,
+            "embedder re-embed: batch complete"
+        );
+    }
 
+    let migrated = {
+        let mut mem = mem_arc.lock().await;
+        mem.commit_swap()?
+    };
+    info!(
+        total,
+        migrated,
+        elapsed_secs = started.elapsed().as_secs(),
+        "embedder re-embed complete; semantic search now full-coverage"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// BGE model: validate-or-download with atomic install
+// ---------------------------------------------------------------------------
+
+/// Conservative liveness check: does a process with `pid` exist? Used by
+/// the staging-dir sweep to clean up after crashed previous runs without
+/// disturbing concurrent processes that are mid-download. Errs on the
+/// side of "alive" so we never wipe an active stage dir.
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // kill(pid, 0) returns 0 if the process exists (any state, incl
+        // zombie); ESRCH means no such process. EPERM means it exists but
+        // we can't signal it — still alive.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 || *libc::__error() == libc::EPERM }
+    }
+    #[cfg(windows)]
+    {
+        // Open a handle with PROCESS_QUERY_LIMITED_INFORMATION — sufficient
+        // to test existence. NULL handle == doesn't exist.
+        use winapi::um::handleapi::CloseHandle;
+        use winapi::um::processthreadsapi::OpenProcess;
+        use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                false
+            } else {
+                CloseHandle(h);
+                true
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // Unknown platform: assume alive so we never wrongly delete.
+        let _ = pid;
+        true
+    }
+}
+
+/// Make sure the BGE model at `model_dir` is present AND loadable. The
+/// gateway must not start without semantic search — if validation fails
+/// here, the error propagates and the process exits with a clear message.
+///
+/// Algorithm:
+///   1. If `model_dir/model.safetensors` exists → try `LocalBgeEmbedder::load`.
+///      Pass: return Ok. Fail: bail (don't auto-delete; might be a
+///      user-placed model or upgrade in flight).
+///   2. Otherwise, sync-download into `model_dir.with_extension("downloading")/`,
+///      validate by attempting to load it, then atomically rename into place.
+///   3. Any failure cleans up the tmp dir and bails.
+/// Sentinel filename + content schema for "rsclaw owns this model dir".
+/// Presence = managed (we may freely wipe / re-download on failure).
+/// Absence = user-placed (preserve files; fail loudly, never auto-delete).
+/// Body is one `key=value` per line, intentionally readable + grep-able.
+const SENTINEL_FILE: &str = ".rsclaw-managed";
+
+fn write_managed_sentinel(model_dir: &std::path::Path, url: &str, bytes: u64) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let body = format!(
+        "version={ver}\nurl={url}\nbytes={bytes}\ninstalled_at_ms={now_ms}\n",
+        ver = env!("CARGO_PKG_VERSION"),
+    );
+    if let Err(e) = std::fs::write(model_dir.join(SENTINEL_FILE), body) {
+        tracing::warn!(
+            error = %e,
+            "failed to write {SENTINEL_FILE} — re-download recovery on next start will be disabled"
+        );
+    }
+}
+
+/// Read the `bytes=` field of the sentinel, if present and parseable.
+/// Used to detect silent corruption (file size shifted since install).
+fn read_sentinel_bytes(model_dir: &std::path::Path) -> Option<u64> {
+    let body = std::fs::read_to_string(model_dir.join(SENTINEL_FILE)).ok()?;
+    body.lines()
+        .find_map(|line| line.strip_prefix("bytes="))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+pub(crate) async fn ensure_bge_model_present(
+    model_dir: &std::path::Path,
+    search_cfg: Option<&crate::config::schema::MemorySearchConfig>,
+) -> anyhow::Result<()> {
+    use crate::agent::memory::LocalBgeEmbedder;
+
+    // Wait for an in-progress Tauri seed to finish before deciding whether
+    // to download. The Tauri app writes `<model_dir>.seeding.tauri` with its
+    // PID while copying the bundled model into place; if that PID is still
+    // alive we hold off up to 30s rather than redundantly hitting the CDN.
+    // Stale lock files (PID gone) are ignored.
+    let seeding_lock = model_dir.with_extension("seeding.tauri");
+    if seeding_lock.exists() {
+        let lock_pid = std::fs::read_to_string(&seeding_lock)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        if let Some(pid) = lock_pid {
+            if pid_alive(pid) {
+                tracing::info!(
+                    pid,
+                    lock = %seeding_lock.display(),
+                    "BGE model seed in progress (Tauri); waiting up to 30s"
+                );
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while seeding_lock.exists() && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    // Re-check liveness — Tauri might have crashed mid-copy.
+                    let still_alive = std::fs::read_to_string(&seeding_lock)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                        .map(pid_alive)
+                        .unwrap_or(false);
+                    if !still_alive {
+                        let _ = std::fs::remove_file(&seeding_lock);
+                        break;
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    stale_pid = pid,
+                    "stale seed lock from dead PID, removing"
+                );
+                let _ = std::fs::remove_file(&seeding_lock);
+            }
+        } else {
+            // Unparseable PID — treat as stale.
+            let _ = std::fs::remove_file(&seeding_lock);
+        }
+    }
+
+    let weights_path = model_dir.join("model.safetensors");
+    if weights_path.exists() {
+        let weights_bytes = std::fs::metadata(&weights_path).map(|m| m.len()).ok();
+        let dir_is_managed = model_dir.join(SENTINEL_FILE).exists();
+
+        // Sentinel + size-mismatch = silent corruption (truncated file from a
+        // crash mid-extract, partial write to a full disk, etc.). For OUR
+        // installs we can safely auto-recover by deleting and re-downloading.
+        if dir_is_managed {
+            if let (Some(actual), Some(expected)) =
+                (weights_bytes, read_sentinel_bytes(model_dir))
+            {
+                if actual != expected {
+                    tracing::warn!(
+                        actual,
+                        expected,
+                        "BGE model.safetensors size differs from sentinel; re-downloading"
+                    );
+                    let _ = std::fs::remove_dir_all(model_dir);
+                    // Fall through to download path below.
+                }
+            }
+        }
+
+        // If we still have files (size matched OR not managed), try loading.
+        if model_dir.join("model.safetensors").exists() {
+            match LocalBgeEmbedder::load(model_dir) {
+                Ok(_) => return Ok(()),
+                Err(e) if dir_is_managed => {
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        dir = %model_dir.display(),
+                        "managed BGE model failed to load; auto-recovering"
+                    );
+                    let _ = std::fs::remove_dir_all(model_dir);
+                    // Fall through to download path.
+                }
+                Err(e) => {
+                    anyhow::bail!(
+                        "BGE model at {} failed to load: {e:#}\n\
+                         This is a user-placed directory (no {SENTINEL_FILE} sentinel) — \
+                         fix the files or remove the directory to trigger a fresh \
+                         download, then restart.",
+                        model_dir.display()
+                    );
+                }
+            }
+        }
+    }
+
+    let local_cfg = search_cfg.and_then(|c| c.local.as_ref());
+    let url = local_cfg
+        .and_then(|c| c.model_download_url.as_deref())
+        .unwrap_or("https://gitfast.org/tools/models/bge-small-zh-v1.5.zip")
+        .to_owned();
+
+    // Per-PID staging directory. Two concurrent gateway processes hitting the
+    // same model_dir (e.g. a fast `gateway restart` overlap or two CLIs) must
+    // not write into the same staging dir — one would overwrite the other's
+    // half-extracted state and the load-test would see Frankenstein files.
+    // Each process gets its own stage; whichever finishes first atomic-renames
+    // into model_dir, the other's load-test passes against the now-existing
+    // files (same model URL → same content) or its rename overwrites cleanly.
+    //
+    // Resume semantics: download_resumable's sidecar `.meta` lives next to the
+    // archive in the per-PID dir, so resume only kicks in if the SAME process
+    // restarts. Across-process resume isn't worth the file-locking complexity
+    // for a one-shot bootstrap.
+    let pid = std::process::id();
+    let tmp_dir = model_dir.with_extension(format!("downloading.pid{pid}"));
+    // Sweep stale per-PID staging dirs from crashed previous runs (any dir
+    // matching `<basename>.downloading.pid*` whose pid is no longer alive).
+    if let Some(parent) = model_dir.parent() {
+        let prefix = model_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| format!("{n}.downloading.pid"))
+            .unwrap_or_default();
+        if !prefix.is_empty()
+            && let Ok(entries) = std::fs::read_dir(parent)
+        {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if let Some(name) = p.file_name().and_then(|n| n.to_str())
+                    && let Some(other_pid_str) = name.strip_prefix(&prefix)
+                    && let Ok(other_pid) = other_pid_str.parse::<u32>()
+                    && other_pid != pid
+                    && !pid_alive(other_pid)
+                {
+                    tracing::info!(stale = %p.display(), "sweeping stale staging dir");
+                    let _ = std::fs::remove_dir_all(&p);
+                }
+            }
+        }
+    }
+    std::fs::create_dir_all(&tmp_dir).with_context(|| {
+        format!("failed to create download dir {}", tmp_dir.display())
+    })?;
+
+    let archive_name = url.rsplit('/').next().unwrap_or("bge-model.zip");
+    let archive_path = tmp_dir.join(archive_name);
+
+    info!("BGE model not present; downloading from {url} -> {}", archive_path.display());
     let client = reqwest::Client::new();
-    crate::cmd::tools::download_and_extract_public(&client, &url, target_dir).await?;
+    let download_result =
+        crate::cmd::tools::download_resumable(&client, &url, &archive_path, "BGE model").await;
+    if let Err(e) = download_result {
+        // Leave the partial archive in place so the next run resumes from
+        // the same byte. No clean-up here.
+        anyhow::bail!(
+            "BGE model download failed: {e:#}\n\
+             URL: {url}\n\
+             Partial download retained at {} for resume on next start.\n\
+             Or manually place model files at {} and restart.",
+            archive_path.display(),
+            model_dir.display()
+        );
+    }
 
-    info!("BGE model downloaded to {}", target_dir.display());
+    // Wipe any stale extracted files from a prior failed run before extracting fresh.
+    for entry in std::fs::read_dir(&tmp_dir)?.flatten() {
+        let p = entry.path();
+        if p == archive_path {
+            continue;
+        }
+        if p.is_dir() {
+            let _ = std::fs::remove_dir_all(&p);
+        } else {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+    if let Err(e) = crate::cmd::tools::extract_zip_public(&archive_path, &tmp_dir) {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        anyhow::bail!(
+            "BGE model archive extraction failed: {e:#}\n\
+             The downloaded file at {} may be corrupted. Re-run after deleting it.",
+            archive_path.display()
+        );
+    }
+
+    // Load-test before commit — this is our only completeness guarantee.
+    if let Err(e) = LocalBgeEmbedder::load(&tmp_dir) {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        anyhow::bail!(
+            "downloaded BGE model failed validation: {e:#}\n\
+             The download may have been corrupted. Retry by restarting; if this\n\
+             persists, the upstream model URL may be broken: {url}"
+        );
+    }
+
+    // Drop the archive — only the extracted files matter from here on.
+    let _ = std::fs::remove_file(&archive_path);
+
+    // Install. The presence of `SENTINEL_FILE` in the existing model_dir
+    // tells us "rsclaw owns this dir" (managed) — we may freely wipe and
+    // rename. Without the sentinel we treat the dir as user-managed and
+    // copy-merge to preserve hand-placed files (different config.json,
+    // partial transfer in progress, etc.). model.safetensors is always
+    // overwritten when it's our turn to install — its mismatch is what
+    // brought us into this branch in the first place.
+    let dir_is_managed = model_dir.exists() && model_dir.join(SENTINEL_FILE).exists();
+    if !model_dir.exists() || dir_is_managed {
+        if model_dir.exists() {
+            std::fs::remove_dir_all(model_dir).with_context(|| {
+                format!("failed to clear managed dir {}", model_dir.display())
+            })?;
+        }
+        std::fs::rename(&tmp_dir, model_dir).with_context(|| {
+            format!(
+                "failed to install model: rename {} -> {}",
+                tmp_dir.display(),
+                model_dir.display()
+            )
+        })?;
+    } else {
+        std::fs::create_dir_all(model_dir).with_context(|| {
+            format!("failed to ensure install dir {}", model_dir.display())
+        })?;
+        for entry in std::fs::read_dir(&tmp_dir)?.flatten() {
+            let src = entry.path();
+            let Some(name) = src.file_name() else {
+                continue;
+            };
+            let dst = model_dir.join(name);
+            if dst.exists() && name != "model.safetensors" {
+                tracing::debug!(file = %dst.display(), "preserving user-placed file");
+                continue;
+            }
+            if let Err(e) = std::fs::rename(&src, &dst) {
+                // Cross-device rename can fail on overlay filesystems; fall
+                // back to copy + remove.
+                std::fs::copy(&src, &dst).with_context(|| {
+                    format!(
+                        "failed to install {} -> {}: rename {e}",
+                        src.display(),
+                        dst.display()
+                    )
+                })?;
+                let _ = std::fs::remove_file(&src);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // Stamp the sentinel so a future restart can size-check the install and
+    // safely auto-recover from corruption / truncation.
+    let installed_bytes = std::fs::metadata(model_dir.join("model.safetensors"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    write_managed_sentinel(model_dir, &url, installed_bytes);
+
+    info!("BGE model installed at {}", model_dir.display());
     Ok(())
 }
 

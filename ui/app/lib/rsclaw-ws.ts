@@ -25,7 +25,7 @@ type PendingReq = {
 /** Payload of a `restart.required` frame, mirrors src/events.rs RestartRequest. */
 export type RestartRequiredPayload = {
   at_ms: number;
-  /** RestartReason — { kind: "config_changed" | "model_downloaded" | ... } */
+  /** RestartReason — { kind: "config_changed" | ... } */
   reason: { kind: string; [key: string]: unknown };
   urgency: "recommended" | "required";
   /** Pre-translated message from the gateway. */
@@ -49,7 +49,7 @@ class RsClawWsClient {
   private reqCounter = 2; // 1 is reserved for the connect handshake
   private pendingReqs = new Map<string, PendingReq>();
   private chatHandlers = new Map<string, { cb: ChatCallbacks; fullText: string }>();
-  private notificationHandlers = new Set<(text: string) => void>();
+  private notificationHandlers = new Set<(text: string, kind?: string) => void>();
   private restartHandlers = new Set<(payload: RestartRequiredPayload) => void>();
   private connectHandlers = new Set<() => void>();
   private tokenRefresh: Promise<void> | null = null;
@@ -87,7 +87,7 @@ class RsClawWsClient {
   }
 
   /** Register a notification handler. Returns an unsubscribe function. */
-  onNotification(handler: (text: string) => void): () => void {
+  onNotification(handler: (text: string, kind?: string) => void): () => void {
     this.notificationHandlers.add(handler);
     return () => this.notificationHandlers.delete(handler);
   }
@@ -254,8 +254,10 @@ class RsClawWsClient {
     if (event === "notification") {
       const text =
         data.payload?.text || data.data?.text || data.text || "";
+      const kind: string | undefined =
+        data.payload?.kind || data.data?.kind || data.kind || undefined;
       if (text) {
-        this.notificationHandlers.forEach((h) => h(text));
+        this.notificationHandlers.forEach((h) => h(text, kind));
       }
       return;
     }

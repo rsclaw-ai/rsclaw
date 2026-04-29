@@ -116,13 +116,26 @@ pub(crate) fn start_discord_if_configured(
         let bound = bound_agent.clone();
 
         // Per-user inbound queue for Discord.
-        type DcItem = (String, String, String, bool, Option<String>);
+        type DcItem = (
+            String,
+            String,
+            String,
+            bool,
+            Option<String>,
+            Vec<crate::agent::registry::ImageAttachment>,
+            Vec<crate::agent::registry::FileAttachment>,
+        );
         let dc_user_queues: Arc<
             tokio::sync::Mutex<std::collections::HashMap<String, mpsc::Sender<DcItem>>>,
         > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
         let on_message = Arc::new(
-            move |peer_id: String, text: String, channel_id: String, is_guild: bool| {
+            move |peer_id: String,
+                  text: String,
+                  channel_id: String,
+                  is_guild: bool,
+                  images: Vec<crate::agent::registry::ImageAttachment>,
+                  files: Vec<crate::agent::registry::FileAttachment>| {
                 let reg = Arc::clone(&reg);
                 let cfg = Arc::clone(&cfg_arc);
                 let tx = out_tx.clone();
@@ -137,12 +150,12 @@ pub(crate) fn start_discord_if_configured(
                     if is_guild {
                         match group_policy.as_ref() {
                             crate::config::schema::GroupPolicy::Disabled => {
-                                debug!("discord group message rejected: groupPolicy=disabled");
+                                warn!("discord group message rejected: groupPolicy=disabled");
                                 return;
                             }
                             crate::config::schema::GroupPolicy::Allowlist => {
                                 if !group_allow.iter().any(|g| *g == channel_id) {
-                                    debug!("discord group message rejected: not in groupAllowFrom");
+                                    warn!("discord group message rejected: not in groupAllowFrom");
                                     return;
                                 }
                             }
@@ -155,7 +168,7 @@ pub(crate) fn start_discord_if_configured(
                         match enforcer.check(&peer_id).await {
                             PolicyResult::Allow => {}
                             PolicyResult::Deny => {
-                                debug!(peer_id = %peer_id, "discord DM rejected by policy");
+                                warn!(peer_id = %peer_id, "discord DM rejected by policy");
                                 return;
                             }
                             PolicyResult::SendPairingCode(code) => {
@@ -221,7 +234,7 @@ pub(crate) fn start_discord_if_configured(
                             let w_tq = Arc::clone(&tq);
                             let w_uid = peer_id.clone();
                             tokio::spawn(async move {
-                                while let Some((text, peer_id, channel_id, is_guild, bound)) =
+                                while let Some((text, peer_id, channel_id, is_guild, bound, images, file_attachments)) =
                                     urx.recv().await
                                 {
                                     // No debounce -- task queue merge_into_pending
@@ -263,8 +276,10 @@ pub(crate) fn start_discord_if_configured(
                                         is_group: is_guild,
                                         reply_to: None,
                                         timestamp: chrono::Utc::now().timestamp(),
-                                        images: vec![],
-                                        files: vec![],
+                                        images: images.iter().map(|i| i.data.clone()).collect(),
+                                        files: file_attachments.iter().filter_map(|f| {
+                                            crate::gateway::task_queue::stage_file(&f.filename, &f.data, &f.mime_type).ok()
+                                        }).collect(),
                                     };
                                     if let Err(e) = w_tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
                                         error!(user = %w_uid, "discord: queue submit failed: {e:#}");
@@ -323,6 +338,8 @@ pub(crate) fn start_discord_if_configured(
                         let peer_id = peer_id.clone();
                         let channel_id = channel_id.clone();
                         let bound = bound.clone();
+                        let images = images.clone();
+                        let files = files.clone();
                         tokio::spawn(async move {
                             let handle = if let Some(ref agent_id) = bound {
                                 match reg.get(agent_id) {
@@ -354,7 +371,7 @@ pub(crate) fn start_discord_if_configured(
                                 dm_scope,
                             });
                             if let Some(mut reply) = try_preparse_locally(&text, &handle, "discord", &peer_id).await {
-                                reply.target_id = channel_id;
+                                reply.target_id = channel_id.clone();
                                 reply.is_group = is_guild;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {
                                     if let Err(e) = tx.send(reply).await {
@@ -371,11 +388,11 @@ pub(crate) fn start_discord_if_configured(
                                 text,
                                 channel: "discord".to_string(),
                                 peer_id,
-                                chat_id: String::new(),
+                                chat_id: channel_id.clone(),
                                 reply_tx,
                                 extra_tools: vec![],
-                                images: vec![],
-                                files: vec![],
+                                images,
+                                files,
                             };
                             if handle.tx.send(msg).await.is_err() {
                                 return;
@@ -399,9 +416,15 @@ pub(crate) fn start_discord_if_configured(
                         });
                         return;
                     }
-                    if let Err(e) =
-                        user_tx.try_send((text, peer_id.clone(), channel_id, is_guild, bound))
-                    {
+                    if let Err(e) = user_tx.try_send((
+                        text,
+                        peer_id.clone(),
+                        channel_id,
+                        is_guild,
+                        bound,
+                        images,
+                        files,
+                    )) {
                         warn!(user = %peer_id, error = %e, "discord: user queue full, dropping message");
                     }
                 });

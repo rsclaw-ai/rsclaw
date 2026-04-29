@@ -182,7 +182,11 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
 
             for slug in &slugs {
                 print!("Updating '{}'... ", cyan(slug));
-                match client.install(slug, &global_dir).await {
+                // Use install_with_fallback so re-resolution walks the full
+                // chain (clawhub → skillhub → iwencai). Bare `install` only
+                // hits clawhub and would mark every iwencai/skillhub skill
+                // as a "failed" update.
+                match client.install_with_fallback(slug, &global_dir).await {
                     Ok(locked) => println!("{}", green(&format!("v{}", locked.version))),
                     Err(e) => println!("{}", red(&format!("failed: {e:#}"))),
                 }

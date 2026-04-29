@@ -30,6 +30,7 @@ const DISCORD_EDIT_DELAY: std::time::Duration = std::time::Duration::from_millis
 
 use super::{Channel, OutboundMessage};
 use crate::channel::{
+    attachments::{mime_to_ext, parse_data_url, pick_file_mime},
     chunker::{BreakPreference, ChunkConfig, chunk_text, platform_chunk_limit},
     telegram::RetryConfig,
 };
@@ -74,19 +75,46 @@ pub struct DiscordChannel {
     client: Client,
     retry: RetryConfig,
     allow_bots: bool,
-    on_message: Arc<dyn Fn(String, String, String, bool) + Send + Sync>,
-    // (peer_id, text, channel_id, is_guild)
+    #[allow(clippy::type_complexity)]
+    on_message: Arc<
+        dyn Fn(
+                String,
+                String,
+                String,
+                bool,
+                Vec<crate::agent::registry::ImageAttachment>,
+                Vec<crate::agent::registry::FileAttachment>,
+            ) + Send
+            + Sync,
+    >,
+    // (peer_id, text, channel_id, is_guild, images, files)
     /// HTTP API base URL (overridable for testing).
     api_base: String,
     /// Gateway WebSocket URL override. When set, skip the /gateway/bot fetch.
     gateway_url: Option<String>,
+    /// Bot's own user ID, captured from the READY event. Used to strip
+    /// the `<@bot_id>` mention prefix that Discord prepends in guild
+    /// messages — without stripping, slash commands like `/ss` arrive as
+    /// `<@123> /ss` and bypass the fast-preparse path.
+    bot_user_id: Arc<std::sync::RwLock<Option<String>>>,
 }
 
 impl DiscordChannel {
+    #[allow(clippy::type_complexity)]
     pub fn new(
         token: impl Into<String>,
         allow_bots: bool,
-        on_message: Arc<dyn Fn(String, String, String, bool) + Send + Sync>,
+        on_message: Arc<
+            dyn Fn(
+                    String,
+                    String,
+                    String,
+                    bool,
+                    Vec<crate::agent::registry::ImageAttachment>,
+                    Vec<crate::agent::registry::FileAttachment>,
+                ) + Send
+                + Sync,
+        >,
         api_base: Option<String>,
         gateway_url: Option<String>,
     ) -> Self {
@@ -101,6 +129,7 @@ impl DiscordChannel {
             on_message,
             api_base: api_base.unwrap_or_else(|| DISCORD_API_BASE.to_owned()),
             gateway_url,
+            bot_user_id: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -406,6 +435,12 @@ impl DiscordChannel {
                     match event_type {
                         "READY" => {
                             let user = &payload["d"]["user"]["username"];
+                            let uid = payload["d"]["user"]["id"].as_str().unwrap_or("");
+                            if !uid.is_empty() {
+                                if let Ok(mut g) = self.bot_user_id.write() {
+                                    *g = Some(uid.to_owned());
+                                }
+                            }
                             info!("Discord: READY as {user}");
                         }
                         "MESSAGE_CREATE" => {
@@ -419,7 +454,16 @@ impl DiscordChannel {
                             let peer_id = d["author"]["id"].as_str().unwrap_or("").to_owned();
                             let is_guild = d["guild_id"].is_string();
 
-                            // Process attachments (images, audio, video, files)
+                            // Process attachments (images, audio, video, files).
+                            // Images go into `images` so the runtime can hand
+                            // them to the vision model AND so `pending_files`
+                            // gets a chance to fire (analyze vs save prompt).
+                            // Other files go into `files` for the same reason.
+                            // Audio/video still get auto-transcribed inline.
+                            let mut images: Vec<crate::agent::registry::ImageAttachment> =
+                                Vec::new();
+                            let mut files: Vec<crate::agent::registry::FileAttachment> =
+                                Vec::new();
                             if let Some(attachments) = d["attachments"].as_array() {
                                 for att in attachments {
                                     let url = att["url"].as_str().unwrap_or("");
@@ -451,11 +495,41 @@ impl DiscordChannel {
                                                 }
                                             }
                                         } else if content_type.starts_with("image/") {
-                                            // Image: note it for now (no vision vec in Discord callback)
-                                            if !content.is_empty() { content.push('\n'); }
-                                            content.push_str(&crate::i18n::t("image_attachment_received", crate::i18n::default_lang()));
+                                            use base64::Engine as _;
+                                            let b64 = base64::engine::general_purpose::STANDARD
+                                                .encode(&bytes);
+                                            let mime = if content_type.is_empty() {
+                                                "image/png"
+                                            } else {
+                                                content_type
+                                            };
+                                            images.push(crate::agent::registry::ImageAttachment {
+                                                data: format!("data:{mime};base64,{b64}"),
+                                                mime_type: mime.to_owned(),
+                                            });
+                                            info!(
+                                                size = bytes.len(),
+                                                %filename,
+                                                "Discord: image attachment forwarded for vision"
+                                            );
                                         } else {
-                                            let processed = discord_process_file(filename, &bytes);
+                                            // Forward as a FileAttachment so
+                                            // the runtime's PendingFile flow
+                                            // can prompt analyze/save. Also
+                                            // keep the inline text extraction
+                                            // (PDF/Office/text) so plain Q&A
+                                            // works without two roundtrips.
+                                            let processed =
+                                                discord_process_file(filename, &bytes);
+                                            files.push(crate::agent::registry::FileAttachment {
+                                                filename: filename.to_owned(),
+                                                data: bytes.clone(),
+                                                mime_type: if content_type.is_empty() {
+                                                    "application/octet-stream".to_owned()
+                                                } else {
+                                                    content_type.to_owned()
+                                                },
+                                            });
                                             if !content.is_empty() { content.push('\n'); }
                                             content.push_str(&processed);
                                         }
@@ -466,9 +540,26 @@ impl DiscordChannel {
                                 }
                             }
 
+                            // Strip a leading bot mention so commands like
+                            // `<@bot_id> /ss` reach is_fast_preparse intact.
+                            let bot_id = self.bot_user_id.read().ok().and_then(|g| g.clone());
+                            if let Some(bid) = bot_id.as_deref() {
+                                content = strip_bot_mention(&content, bid);
+                            }
+                            // Allow `\xxx` as an alias for `/xxx` — Discord
+                            // intercepts a leading `/` for native slash
+                            // commands so users sometimes can't easily type
+                            // /ss / /webshot / /help. Mirrors the Slack
+                            // alias added earlier.
+                            if let Some(rest) = content.strip_prefix('\\') {
+                                if rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+                                    content = format!("/{rest}");
+                                }
+                            }
+
                             if content.is_empty() { continue; }
                             debug!(peer = %peer_id, channel = %channel_id, "Discord: MESSAGE_CREATE");
-                            (self.on_message)(peer_id, content, channel_id, is_guild);
+                            (self.on_message)(peer_id, content, channel_id, is_guild, images, files);
                         }
                         _ => {
                             debug!("Discord: event {event_type}");
@@ -502,16 +593,50 @@ impl Channel for DiscordChannel {
                 }
             }
 
-            // Send image attachments via multipart file upload
+            // Send image attachments. Two modes:
+            //   - http(s):// URL → embed.image.url (no upload, Discord fetches)
+            //   - data:image/<mime>;base64,... → multipart upload with the
+            //     correct MIME and matching filename extension.
+            //
+            // Previously this path only recognised PNG/JPEG data URLs and fell
+            // back to feeding the entire `data:image/webp;base64,...` string
+            // (or http URL) into the base64 decoder, producing garbage bytes
+            // that Discord rendered as a blank attachment.
             if !msg.images.is_empty() {
                 info!(count = msg.images.len(), "discord: sending images");
             }
             for (idx, image_data) in msg.images.iter().enumerate() {
+                if image_data.starts_with("http://") || image_data.starts_with("https://") {
+                    let payload = serde_json::json!({
+                        "embeds": [{ "image": { "url": image_data } }],
+                    });
+                    let url = format!(
+                        "{}/channels/{}/messages",
+                        self.api_base, msg.target_id
+                    );
+                    match self
+                        .client
+                        .post(&url)
+                        .header("authorization", self.auth_header())
+                        .header("content-type", "application/json")
+                        .body(payload.to_string())
+                        .send()
+                        .await
+                    {
+                        Ok(resp) if !resp.status().is_success() => {
+                            let status = resp.status();
+                            let body = resp.text().await.unwrap_or_default();
+                            warn!(idx, %status, "discord: image embed failed: {body}");
+                        }
+                        Err(e) => warn!(idx, "discord: image embed request failed: {e}"),
+                        Ok(_) => {}
+                    }
+                    continue;
+                }
+
+                let (mime, b64) = parse_data_url(image_data)
+                    .unwrap_or(("image/png", image_data.as_str()));
                 use base64::Engine;
-                let b64 = image_data
-                    .strip_prefix("data:image/png;base64,")
-                    .or_else(|| image_data.strip_prefix("data:image/jpeg;base64,"))
-                    .unwrap_or(image_data);
                 let bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
                     Ok(b) => b,
                     Err(e) => {
@@ -519,9 +644,10 @@ impl Channel for DiscordChannel {
                         continue;
                     }
                 };
+                let ext = mime_to_ext(mime);
                 let part = match reqwest::multipart::Part::bytes(bytes)
-                    .file_name("image.png")
-                    .mime_str("image/png")
+                    .file_name(format!("image.{ext}"))
+                    .mime_str(mime)
                 {
                     Ok(p) => p,
                     Err(e) => {
@@ -557,8 +683,12 @@ impl Channel for DiscordChannel {
                 }
             }
 
-            // Send file attachments via multipart upload
-            for (idx, (filename, _mime, path)) in msg.files.iter().enumerate() {
+            // Send file attachments via multipart upload. Pass the MIME the
+            // tool layer attached so Discord can render inline previews for
+            // video/audio/PDF/etc.; previously this was hardcoded to
+            // application/octet-stream which made every file show up as a
+            // generic blob (videos in particular wouldn't play in-line).
+            for (idx, (filename, mime, path)) in msg.files.iter().enumerate() {
                 let bytes = match std::fs::read(path) {
                     Ok(b) => b,
                     Err(e) => {
@@ -566,9 +696,10 @@ impl Channel for DiscordChannel {
                         continue;
                     }
                 };
+                let mime_str = pick_file_mime(mime, filename);
                 let part = match reqwest::multipart::Part::bytes(bytes)
                     .file_name(filename.clone())
-                    .mime_str("application/octet-stream")
+                    .mime_str(mime_str)
                 {
                     Ok(p) => p,
                     Err(e) => {
@@ -690,6 +821,23 @@ fn discord_process_file(filename: &str, bytes: &[u8]) -> String {
     }
 }
 
+/// Strip a leading `<@bot_id>` or `<@!bot_id>` mention (with surrounding
+/// whitespace) from a Discord message body.
+///
+/// Without this, guild messages like `<@123> /ss` arrive at
+/// `is_fast_preparse` with the mention prefix, so the slash command
+/// detector returns false and the message is routed through the LLM
+/// instead of the local fast path.
+pub(crate) fn strip_bot_mention(content: &str, bot_id: &str) -> String {
+    let trimmed = content.trim_start();
+    for prefix in [format!("<@{bot_id}>"), format!("<@!{bot_id}>")] {
+        if let Some(rest) = trimmed.strip_prefix(&prefix) {
+            return rest.trim_start().to_owned();
+        }
+    }
+    content.to_owned()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -705,14 +853,42 @@ mod tests {
     #[test]
     fn channel_name() {
         init_crypto();
-        let ch = DiscordChannel::new("token", false, Arc::new(|_, _, _, _| {}), None, None);
+        let ch = DiscordChannel::new("token", false, Arc::new(|_, _, _, _, _, _| {}), None, None);
         assert_eq!(ch.name(), "discord");
     }
 
     #[test]
     fn auth_header_format() {
         init_crypto();
-        let ch = DiscordChannel::new("my-token", false, Arc::new(|_, _, _, _| {}), None, None);
+        let ch = DiscordChannel::new("my-token", false, Arc::new(|_, _, _, _, _, _| {}), None, None);
         assert_eq!(ch.auth_header(), "Bot my-token");
+    }
+
+    #[test]
+    fn strip_mention_removes_simple_prefix() {
+        assert_eq!(strip_bot_mention("<@123> /ss", "123"), "/ss");
+    }
+
+    #[test]
+    fn strip_mention_removes_nickname_form() {
+        // Discord's legacy `<@!id>` form (used when the bot has a server nick).
+        assert_eq!(strip_bot_mention("<@!123> /screenshot", "123"), "/screenshot");
+    }
+
+    #[test]
+    fn strip_mention_handles_leading_whitespace() {
+        assert_eq!(strip_bot_mention("   <@123>  hello", "123"), "hello");
+    }
+
+    #[test]
+    fn strip_mention_leaves_other_users_alone() {
+        // Mention of a different user — must not be stripped.
+        let s = "<@999> hi";
+        assert_eq!(strip_bot_mention(s, "123"), s);
+    }
+
+    #[test]
+    fn strip_mention_noop_when_no_mention() {
+        assert_eq!(strip_bot_mention("/ss", "123"), "/ss");
     }
 }

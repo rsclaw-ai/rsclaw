@@ -69,6 +69,12 @@ Role files live in `.claude/roles/`. Activate with: `cp .claude/roles/<role>.md 
 - Error handling: never unwrap(). Use ? or .expect("reason") with explanation.
 - No emojis anywhere: code, comments, logs, commit messages.
 - i18n: all user-facing strings through src/i18n.rs only.
+- LLM-facing prompts (system messages, tool descriptions, summarize/analyze
+  prompts, agent instructions) are ALWAYS English and DO NOT go through
+  i18n. The codebase standardises on one language to avoid zh/en drift,
+  and English yields the most reliable instruction-following across
+  providers. i18n is for what the human sees; English is for what the
+  LLM reads.
 - Config fields: camelCase in JSON5, snake_case in Rust via #[serde(rename_all = "camelCase")]
 - Secrets: SecretOrString — plain string or { source: "env", id: "VAR_NAME" }
 - Channel handler order: group policy → DM policy (pairing/allowlist) → per-user queue → agent dispatch
@@ -119,6 +125,8 @@ Role files live in `.claude/roles/`. Activate with: `cp .claude/roles/<role>.md 
 ### i18n (Internationalisation)
 
 All user-facing strings sent through channels (Telegram, Discord, WeChat, etc.) **must** go through `src/i18n.rs`. CLI output, log messages, and internal errors stay in English.
+
+**Important:** strings that the LLM reads (system prompts, tool descriptions, summarize/analyze prompts, agent instructions) are NOT i18n'd. They live as English-only literals in the source. See the Rust rules above — different language per LLM call would drift over time and English instruction-following is consistently the strongest across providers.
 
 **Adding a new message key**
 

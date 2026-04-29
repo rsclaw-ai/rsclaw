@@ -197,6 +197,107 @@ fn run_setup() -> Result<String, String> {
     run_rsclaw_command(&["setup", "--non-interactive"])
 }
 
+/// Copy the bundled BGE-small-zh model (shipped via tauri.conf.json
+/// `bundle.resources`) into `~/.rsclaw/models/bge-small-zh/` so the gateway
+/// finds it on its standard search path.
+///
+/// Atomic install: copy to a per-PID staging dir, atomic-rename when
+/// complete, write the `.rsclaw-managed` sentinel matching what the CLI's
+/// `ensure_bge_model_present` writes. While copying, leave a `.seeding.tauri`
+/// lock file (containing this PID) next to the target. The CLI's
+/// `ensure_bge_model_present` checks for that lock and waits a few seconds
+/// before falling back to network download — eliminates the race where a
+/// fast user clicks Import before the seed finishes.
+///
+/// Idempotent: skips when the target already has model.safetensors, so a
+/// hand-placed or upgraded model is never clobbered.
+fn seed_bundled_bge_model<R: tauri::Runtime>(
+    handle: &tauri::AppHandle<R>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri::Manager;
+
+    let target = dirs::home_dir()
+        .ok_or("no home directory")?
+        .join(".rsclaw/models/bge-small-zh");
+    if target.join("model.safetensors").exists() {
+        return Ok(());
+    }
+
+    // Resource layout under bundle: <resource_dir>/resources/bge-small-zh/{...}
+    let res_dir = handle
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("resource_dir unavailable: {e}"))?
+        .join("resources/bge-small-zh");
+    let weights = res_dir.join("model.safetensors");
+    if !weights.exists() {
+        eprintln!(
+            "[setup] no bundled BGE model at {}; gateway will download",
+            res_dir.display()
+        );
+        return Ok(());
+    }
+
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Lock file: tells the CLI's ensure_bge_model_present "wait, Tauri is
+    // installing — don't redundantly download". Lock body is our PID so the
+    // CLI can detect a stale lock from a crashed previous Tauri instance.
+    let lock_path = target.with_extension("seeding.tauri");
+    let pid = std::process::id();
+    let _ = std::fs::write(&lock_path, pid.to_string());
+    // RAII guard: delete the lock on every exit path including panic/early
+    // return. Inline to avoid adding scopeguard as a Tauri-side dep.
+    struct LockGuard(std::path::PathBuf);
+    impl Drop for LockGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _lock_guard = LockGuard(lock_path.clone());
+
+    let staging = target.with_extension(format!("seeding.tauri.pid{pid}"));
+    if staging.exists() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    std::fs::create_dir_all(&staging)?;
+    for filename in ["config.json", "tokenizer.json", "model.safetensors"] {
+        let src = res_dir.join(filename);
+        let dst = staging.join(filename);
+        std::fs::copy(&src, &dst).map_err(|e| {
+            format!("copy {} -> {}: {e}", src.display(), dst.display())
+        })?;
+    }
+    // Sentinel content matches what the CLI writes — version + bundle
+    // marker so a sentinel-aware tool can tell where the install came from.
+    let bytes = std::fs::metadata(staging.join("model.safetensors"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let sentinel_body = format!(
+        "version={ver}\nsource=tauri-bundle\nbytes={bytes}\ninstalled_at_ms={now}\n",
+        ver = env!("CARGO_PKG_VERSION"),
+        now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    let _ = std::fs::write(staging.join(".rsclaw-managed"), sentinel_body);
+
+    if target.exists() {
+        let _ = std::fs::remove_dir_all(&target);
+    }
+    std::fs::rename(&staging, &target).map_err(|e| {
+        format!("rename {} -> {}: {e}", staging.display(), target.display())
+    })?;
+    eprintln!(
+        "[setup] seeded bundled BGE model -> {}",
+        target.display()
+    );
+    Ok(())
+}
+
 /// Write a file to an agent's workspace directory (~/.rsclaw/workspace-{agentId}/{fileName})
 #[tauri::command]
 fn write_workspace_file(agent_id: String, file_name: String, content: String) -> Result<String, String> {
@@ -218,8 +319,14 @@ fn read_workspace_file(agent_id: String, file_name: String) -> Result<String, St
 }
 
 /// Write config file to ~/.rsclaw/rsclaw.json5
+/// Validates the content parses as JSON5 before writing.
 #[tauri::command]
 fn write_config(content: String) -> Result<String, String> {
+    // Validate content parses before writing
+    if json5::from_str::<serde_json::Value>(&content).is_err() {
+        return Err("invalid JSON5 syntax - fix errors before saving".to_string());
+    }
+
     let home = dirs::home_dir().ok_or("no home dir")?;
     let config_path = home.join(".rsclaw").join("rsclaw.json5");
     // Create dir if needed.
@@ -1143,6 +1250,19 @@ fn main() {
             read_file_as_data_url,
         ])
         .setup(|app| {
+            // Seed the bundled BGE embedding model into the standard rsclaw
+            // models directory so the gateway start path finds it without
+            // touching the network. Idempotent: skips when model.safetensors
+            // already exists at the target. Runs on a blocking thread —
+            // copying the ~91MB safetensors blob would otherwise stall the
+            // splash window for several seconds on slow disks.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(e) = seed_bundled_bge_model(&handle) {
+                    eprintln!("[setup] BGE model seeding failed (gateway will fall back to download): {e:#}");
+                }
+            });
+
             // Build system tray
             let open = MenuItemBuilder::with_id("open", "Open RsClaw").build(app)?;
             let sep1 = PredefinedMenuItem::separator(app)?;

@@ -230,7 +230,7 @@ pub(crate) fn start_wechat_personal_if_configured(
                         match enforcer.check(&from_user).await {
                             PolicyResult::Allow => {}
                             PolicyResult::Deny => {
-                                debug!(peer_id = %from_user, "wechat DM rejected by policy");
+                                warn!(peer_id = %from_user, "wechat DM rejected by policy");
                                 return;
                             }
                             PolicyResult::SendPairingCode(code) => {

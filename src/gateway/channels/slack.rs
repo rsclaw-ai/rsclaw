@@ -137,13 +137,26 @@ pub(crate) fn start_slack_if_configured(
         let bound = bound_agent.clone();
 
         // Per-user inbound queue for Slack.
-        type SlItem = (String, String, String, bool, Option<String>);
+        type SlItem = (
+            String,
+            String,
+            String,
+            bool,
+            Option<String>,
+            Vec<crate::agent::registry::ImageAttachment>,
+            Vec<crate::agent::registry::FileAttachment>,
+        );
         let sl_user_queues: Arc<
             tokio::sync::Mutex<std::collections::HashMap<String, mpsc::Sender<SlItem>>>,
         > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
         let on_message = Arc::new(
-            move |peer_id: String, text: String, channel_id: String, is_channel: bool| {
+            move |peer_id: String,
+                  text: String,
+                  channel_id: String,
+                  is_channel: bool,
+                  images: Vec<crate::agent::registry::ImageAttachment>,
+                  files: Vec<crate::agent::registry::FileAttachment>| {
                 let reg = Arc::clone(&reg);
                 let cfg = Arc::clone(&cfg_arc);
                 let tx = out_tx.clone();
@@ -158,12 +171,12 @@ pub(crate) fn start_slack_if_configured(
                     if is_channel {
                         match group_policy.as_ref() {
                             crate::config::schema::GroupPolicy::Disabled => {
-                                debug!("slack group message rejected: groupPolicy=disabled");
+                                warn!("slack group message rejected: groupPolicy=disabled");
                                 return;
                             }
                             crate::config::schema::GroupPolicy::Allowlist => {
                                 if !group_allow.iter().any(|g| *g == channel_id) {
-                                    debug!("slack group message rejected: not in groupAllowFrom");
+                                    warn!("slack group message rejected: not in groupAllowFrom");
                                     return;
                                 }
                             }
@@ -176,7 +189,7 @@ pub(crate) fn start_slack_if_configured(
                         match enforcer.check(&peer_id).await {
                             PolicyResult::Allow => {}
                             PolicyResult::Deny => {
-                                debug!(peer_id = %peer_id, "slack DM rejected by policy");
+                                warn!(peer_id = %peer_id, "slack DM rejected by policy");
                                 return;
                             }
                             PolicyResult::SendPairingCode(code) => {
@@ -242,7 +255,7 @@ pub(crate) fn start_slack_if_configured(
                             let w_tq = Arc::clone(&tq);
                             let w_uid = peer_id.clone();
                             tokio::spawn(async move {
-                                while let Some((text, peer_id, channel_id, is_channel, bound)) =
+                                while let Some((text, peer_id, channel_id, is_channel, bound, images, file_attachments)) =
                                     urx.recv().await
                                 {
                                     // No debounce -- task queue merge_into_pending
@@ -284,8 +297,10 @@ pub(crate) fn start_slack_if_configured(
                                         is_group: is_channel,
                                         reply_to: None,
                                         timestamp: chrono::Utc::now().timestamp(),
-                                        images: vec![],
-                                        files: vec![],
+                                        images: images.iter().map(|i| i.data.clone()).collect(),
+                                        files: file_attachments.iter().filter_map(|f| {
+                                            crate::gateway::task_queue::stage_file(&f.filename, &f.data, &f.mime_type).ok()
+                                        }).collect(),
                                     };
                                     if let Err(e) = w_tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
                                         error!(user = %w_uid, "slack: queue submit failed: {e:#}");
@@ -392,11 +407,11 @@ pub(crate) fn start_slack_if_configured(
                                 text,
                                 channel: "slack".to_string(),
                                 peer_id,
-                                chat_id: String::new(),
+                                chat_id: channel_id.clone(),
                                 reply_tx,
                                 extra_tools: vec![],
-                                images: vec![],
-                                files: vec![],
+                                images,
+                                files,
                             };
                             if handle.tx.send(msg).await.is_err() {
                                 return;
@@ -420,9 +435,15 @@ pub(crate) fn start_slack_if_configured(
                         });
                         return;
                     }
-                    if let Err(e) =
-                        user_tx.try_send((text, peer_id.clone(), channel_id, is_channel, bound))
-                    {
+                    if let Err(e) = user_tx.try_send((
+                        text,
+                        peer_id.clone(),
+                        channel_id,
+                        is_channel,
+                        bound,
+                        images,
+                        files,
+                    )) {
                         warn!(user = %peer_id, error = %e, "slack: user queue full, dropping message");
                     }
                 });

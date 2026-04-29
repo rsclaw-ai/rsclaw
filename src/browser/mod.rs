@@ -1011,6 +1011,11 @@ impl BrowserSession {
 
     /// Restart the Chrome process (e.g. after crash or idle expiry).
     /// For external Chrome (chrome is None), only reconnects CDP.
+    /// Resets `last_activity` to "now" before returning so the very next
+    /// execute() doesn't immediately re-trigger idle-expiry on the same
+    /// stale timestamp (caused a tight restart loop that ended in
+    /// "Chrome exited without printing DevTools URL" — see
+    /// browser/mod.rs::execute checks 1 and 2).
     async fn restart(&mut self) -> Result<()> {
         warn!("restarting Chrome browser session");
         if self.chrome.is_some() {
@@ -1067,6 +1072,10 @@ impl BrowserSession {
         }
         self.refs.clear();
         self.ref_counter = 0;
+        // Reset the idle clock — without this, the very next execute()
+        // re-evaluates is_idle_expired against the pre-restart timestamp
+        // and triggers another restart, looping until plugin times out.
+        self.touch_activity();
         Ok(())
     }
 
@@ -2291,6 +2300,22 @@ impl BrowserSession {
         let quality = args.get("quality").and_then(|v| v.as_i64());
         let full_page = args.get("full_page").and_then(|v| v.as_bool()).unwrap_or(false);
         let annotate = args.get("annotate").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        // One-shot mode: when `url` is given, navigate to it first so a
+        // bare `action=screenshot url=...` call returns the page instead
+        // of whatever the persistent session was last showing (often a
+        // blank dark new-tab → near-black PNG that channels happily
+        // forwarded as a "blank image").
+        if let Some(url) = args.get("url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            let normalised = if url.starts_with("http://") || url.starts_with("https://") {
+                url.to_owned()
+            } else {
+                format!("https://{url}")
+            };
+            self.cmd_open(&json!({ "url": normalised })).await?;
+            // Brief settle so SPA frameworks have a chance to paint.
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        }
 
         let mut params = json!({ "format": format });
         if let Some(q) = quality {

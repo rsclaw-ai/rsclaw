@@ -187,6 +187,22 @@ impl super::runtime::AgentRuntime {
                     job["name"] = json!(n);
                 }
 
+                // Round-robin iter — scheduler picks `items[cursor]` per fire,
+                // substitutes `{current}`/`{next}`/`{index}`/`{total}` in the
+                // message, and advances+persists the cursor before dispatch.
+                if let Some(arr) = args["iter"].as_array() {
+                    let items: Vec<String> = arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect();
+                    if items.is_empty() {
+                        return Err(anyhow!(
+                            "cron add: `iter` must contain at least one string item"
+                        ));
+                    }
+                    job["iter"] = json!({"items": items, "cursor": 0});
+                }
+
                 // Auto-set delivery to the originating channel+peer when not explicitly specified.
                 // Special case: WS chat transport uses ctx.channel="ws", but the delivery
                 // sink registered in ChannelManager is "desktop" (DesktopChannel broadcasts
@@ -363,6 +379,47 @@ impl super::runtime::AgentRuntime {
                 }
                 if let Some(agent_id) = args["agentId"].as_str().or(args["agent_id"].as_str()) {
                     jobs[idx]["agentId"] = json!(agent_id);
+                }
+                // Iter list edit. Pass `iter` to replace the items array;
+                // pass `iter_cursor` (default 0) to set the cursor explicitly.
+                // Pass `iter` as null or an empty array to clear iter mode.
+                if args.get("iter").is_some() {
+                    let raw = &args["iter"];
+                    if raw.is_null() || raw.as_array().is_some_and(|a| a.is_empty()) {
+                        jobs[idx].as_object_mut().map(|o| o.remove("iter"));
+                    } else if let Some(arr) = raw.as_array() {
+                        let items: Vec<String> = arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(str::to_owned))
+                            .collect();
+                        if items.is_empty() {
+                            return Err(anyhow!(
+                                "cron edit: `iter` must be a non-empty array of strings, or null/[] to clear"
+                            ));
+                        }
+                        let cursor = args
+                            .get("iter_cursor")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0)
+                            .min(items.len() as u64 - 1);
+                        jobs[idx]["iter"] = json!({"items": items, "cursor": cursor});
+                    } else {
+                        return Err(anyhow!("cron edit: `iter` must be an array of strings"));
+                    }
+                } else if let Some(cursor) = args.get("iter_cursor").and_then(|v| v.as_u64()) {
+                    // Cursor-only edit: must already have iter configured.
+                    let len = jobs[idx]
+                        .get("iter")
+                        .and_then(|i| i.get("items"))
+                        .and_then(|a| a.as_array())
+                        .map(|a| a.len() as u64)
+                        .unwrap_or(0);
+                    if len == 0 {
+                        return Err(anyhow!(
+                            "cron edit: `iter_cursor` requires job to already have an `iter` configured"
+                        ));
+                    }
+                    jobs[idx]["iter"]["cursor"] = json!(cursor.min(len - 1));
                 }
                 jobs[idx]["updatedAtMs"] = json!(Utc::now().timestamp_millis() as u64);
                 write_cron_jobs(&cron_path, &jobs).await?;

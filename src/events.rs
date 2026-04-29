@@ -27,11 +27,6 @@ pub enum RestartReason {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         sections: Vec<String>,
     },
-    /// A model finished downloading in the background — restart loads it.
-    ModelDownloaded { name: String },
-    /// A model download failed; not strictly a restart trigger, but the UI
-    /// shows it in the same banner channel.
-    ModelDownloadFailed { name: String, error: String },
 }
 
 /// How urgently the gateway recommends restarting.

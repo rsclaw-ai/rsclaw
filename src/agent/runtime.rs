@@ -290,6 +290,12 @@ pub struct RunContext {
     pub recalled_memory_ids: std::collections::HashSet<String>,
     /// Whether a loop-detection warning was triggered during this turn.
     pub loop_warning_triggered: bool,
+    /// Per-turn difficulty counters for workflow crystallization.
+    pub turn_metrics: super::turn_metrics::TurnMetrics,
+    /// The original user request text for this turn — saved on RunContext
+    /// so the workflow distiller has the verbatim ask without re-walking
+    /// session history.
+    pub user_text: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -693,7 +699,8 @@ impl AgentRuntime {
             images: vec![],
             files: vec![],
             pending_analysis: None,
-            was_preparse: false,
+            // /btw bypasses agent_loop — outer must emit done.
+            needs_outer_done_emit: true,
         })
     }
 
@@ -809,6 +816,7 @@ impl AgentRuntime {
         text: &str,
         channel: &str,
         peer_id: &str,
+        chat_id: &str,
         extra_tools: Vec<ToolDef>,
         images: Vec<super::registry::ImageAttachment>,
         files: Vec<super::registry::FileAttachment>,
@@ -1055,7 +1063,8 @@ impl AgentRuntime {
                             images: vec![],
                             files: vec![],
                             pending_analysis: None,
-                            was_preparse: false,
+                            // File-handling short-circuit bypasses agent_loop.
+                            needs_outer_done_emit: true,
                         });
                     }
                     // Has extractable text: return "analyzing..." immediately,
@@ -1072,7 +1081,8 @@ impl AgentRuntime {
                             channel: channel.to_owned(),
                             peer_id: peer_id.to_owned(),
                         }),
-                        was_preparse: false,
+                        // pending_analysis short-circuit bypasses agent_loop.
+                        needs_outer_done_emit: true,
                     });
                 }
                 "2" => {
@@ -1130,7 +1140,8 @@ impl AgentRuntime {
                             images: vec![],
                             files: vec![],
                             pending_analysis: None,
-                            was_preparse: false,
+                            // File-handling short-circuit bypasses agent_loop.
+                            needs_outer_done_emit: true,
                         });
                     }
                     // Has extractable text: return "analyzing..." immediately,
@@ -1153,7 +1164,8 @@ impl AgentRuntime {
                             channel: channel.to_owned(),
                             peer_id: peer_id.to_owned(),
                         }),
-                        was_preparse: false,
+                        // pending_analysis short-circuit bypasses agent_loop.
+                        needs_outer_done_emit: true,
                     });
                 }
                 _ => {
@@ -1169,7 +1181,8 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
-                        was_preparse: false,
+                        // File-handling short-circuit bypasses agent_loop.
+                        needs_outer_done_emit: true,
                     });
                 }
             }
@@ -1293,7 +1306,7 @@ impl AgentRuntime {
                             };
                             self.sessions.insert(session_key.to_owned(), vec![msg]);
                         }
-                        "Session cleared.".to_owned()
+                        crate::i18n::t("session_cleared", crate::i18n::default_lang()).to_owned()
                     }
                     "__COMPACT__" => {
                         // Manual compaction: force compress + save summary to memory.
@@ -1342,12 +1355,12 @@ impl AgentRuntime {
                                         Err(e) => warn!("compact: failed to save to memory: {e}"),
                                     }
                                 }
-                                "✓ Session compacted and saved to memory.".to_owned()
+                                crate::i18n::t("compact_done", crate::i18n::default_lang()).to_owned()
                             } else {
-                                "✓ Session compacted (no summary to save).".to_owned()
+                                crate::i18n::t("compact_done_no_summary", crate::i18n::default_lang()).to_owned()
                             }
                         } else {
-                            "Nothing to compact.".to_owned()
+                            crate::i18n::t("compact_nothing", crate::i18n::default_lang()).to_owned()
                         }
                     }
                     "__ABORT__" => {
@@ -1368,7 +1381,7 @@ impl AgentRuntime {
                         let _ = self.store.db.delete_session(&key);
                         self.voice_mode_sessions.remove(&key);
                         self.handle.remove_session_tokens(&key);
-                        "Session reset.".to_owned()
+                        crate::i18n::t("session_reset", crate::i18n::default_lang()).to_owned()
                     }
                     "__TEXT_MODE__" => {
                         self.voice_mode_sessions.remove(session_key);
@@ -1652,7 +1665,7 @@ impl AgentRuntime {
                             images: vec![],
                             files: vec![],
                             pending_analysis: None,
-                            was_preparse: true,
+                            needs_outer_done_emit: true,
                         });
                     }
                     other => other.to_owned(),
@@ -1665,7 +1678,7 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
-                        was_preparse: true,
+                        needs_outer_done_emit: true,
                     });
                 }
                 // Fall through to LLM for unhandled directives
@@ -1683,7 +1696,7 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
-                        was_preparse: true,
+                        needs_outer_done_emit: true,
                     });
                 }
                 info!(tool = %tool, "pre-parse: executing tool directly");
@@ -1711,6 +1724,8 @@ impl AgentRuntime {
                             parse_error_count: 0,
                             recalled_memory_ids: std::collections::HashSet::new(),
                             loop_warning_triggered: false,
+                            turn_metrics: super::turn_metrics::TurnMetrics::new(),
+                            user_text: String::new(),
                         },
                         "",
                         &tool,
@@ -1734,7 +1749,7 @@ impl AgentRuntime {
                             images: reply_images,
                             files: vec![],
                             pending_analysis: None,
-                            was_preparse: true,
+                            needs_outer_done_emit: true,
                         });
                     }
                     Err(e) => {
@@ -1745,7 +1760,7 @@ impl AgentRuntime {
                             images: vec![],
                             files: vec![],
                             pending_analysis: None,
-                            was_preparse: true,
+                            needs_outer_done_emit: true,
                         });
                     }
                 }
@@ -1768,7 +1783,7 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
-                        was_preparse: true,
+                        needs_outer_done_emit: true,
                     });
                 }
                 // Safety off: fall through to execute anyway
@@ -1792,7 +1807,7 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
-                        was_preparse: true,
+                        needs_outer_done_emit: true,
                     });
                 }
                 // Safety off: fall through to execute anyway
@@ -1808,7 +1823,7 @@ impl AgentRuntime {
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
-                    was_preparse: true,
+                    needs_outer_done_emit: true,
                 });
             }
         }
@@ -1825,7 +1840,8 @@ impl AgentRuntime {
                 images: vec![],
                 files: vec![],
                 pending_analysis: None,
-                was_preparse: false,
+                // __DIRECT_REPLY__ bypasses agent_loop.
+                needs_outer_done_emit: true,
             });
         }
 
@@ -1837,7 +1853,6 @@ impl AgentRuntime {
         // longer wrap videos as ImageAttachments — they would be rejected
         // with "Invalid base64 image_url".
         // ---------------------------------------------------------------
-        let mut files = files;
         let mut images = images;
         let (media_files, regular_files): (Vec<_>, Vec<_>) = files.into_iter().partition(|f| {
             crate::channel::is_audio_attachment(&f.mime_type, &f.filename)
@@ -1910,6 +1925,7 @@ impl AgentRuntime {
                     &full_text,
                     channel,
                     peer_id,
+                    chat_id,
                     extra_tools,
                     images,
                     vec![],
@@ -1927,6 +1943,7 @@ impl AgentRuntime {
                     &full_text,
                     channel,
                     peer_id,
+                    chat_id,
                     extra_tools,
                     images,
                     files,
@@ -1984,7 +2001,8 @@ impl AgentRuntime {
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
-                    was_preparse: false,
+                    // File-size-exceeded short-circuit bypasses agent_loop.
+                    needs_outer_done_emit: true,
                 });
             }
             let files = accepted;
@@ -2010,7 +2028,8 @@ impl AgentRuntime {
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
-                    was_preparse: false,
+                    // Disk-low short-circuit bypasses agent_loop.
+                    needs_outer_done_emit: true,
                 });
             }
 
@@ -2123,7 +2142,8 @@ impl AgentRuntime {
                 images: vec![],
                 files: vec![],
                 pending_analysis: None,
-                was_preparse: false,
+                // File-saved short-circuit bypasses agent_loop.
+                needs_outer_done_emit: true,
             });
         }
 
@@ -2357,7 +2377,7 @@ impl AgentRuntime {
         // Session stores ONLY text — no base64, no binary blobs.
         // This preserves KV cache and prevents context bloat.
         // ---------------------------------------------------------------
-        let mut media_descriptions = Vec::<String>::new();
+        let media_descriptions: Vec<String> = Vec::new();
         let mut vision_images_for_current_turn = Vec::<String>::new(); // base64 URIs for vision model
 
         // @-referenced images go directly to vision (already saved, no re-save).
@@ -2456,7 +2476,8 @@ impl AgentRuntime {
                 images: vec![],
                 files: vec![],
                 pending_analysis: None,
-                was_preparse: false,
+                // Pre-loop abort bypasses agent_loop.
+                needs_outer_done_emit: true,
             });
         }
 
@@ -2465,7 +2486,11 @@ impl AgentRuntime {
             session_key: session_key.to_owned(),
             channel: channel.to_owned(),
             peer_id: peer_id.to_owned(),
-            chat_id: String::new(),
+            // Channel/group ID for the inbound message. Notification routing
+            // and tool callbacks fall back to peer_id when this is empty,
+            // which on Discord groups produces a 404 (Discord rejects POST
+            // to /channels/<user_id>/messages — DMs need a created channel).
+            chat_id: chat_id.to_owned(),
             exec_pool: Arc::clone(&self.exec_pool),
             loop_detector: {
                 let ld_cfg_owned = self
@@ -2520,6 +2545,8 @@ impl AgentRuntime {
             parse_error_count: 0,
             recalled_memory_ids: auto_recalled_ids,
             loop_warning_triggered: false,
+            turn_metrics: super::turn_metrics::TurnMetrics::new(),
+            user_text: text.to_owned(),
         };
 
         // --- Plugins & Skills: cached, frozen at session start ---
@@ -2756,7 +2783,7 @@ impl AgentRuntime {
         if self.voice_mode_sessions.contains(session_key)
             && !reply.text.is_empty()
             && !reply.is_empty
-            && !reply.was_preparse
+            && !reply.needs_outer_done_emit
         {
             match self.generate_tts_audio(&reply.text).await {
                 Ok(audio_path) => {
@@ -2875,22 +2902,73 @@ impl AgentRuntime {
             return (None, snapshot);
         }
 
+        // Inject only `name + version + description + dir`, NOT the full
+        // SKILL.md body. With ~22 hithink-* skills installed the bodies
+        // sum to ~260KB which torpedoes the prompt budget. The agent
+        // discovers the full SKILL.md on demand via read_file when it
+        // matches a description and decides to invoke a skill.
         let skill_prompts: String = all_skills
             .iter()
-            .map(|s| format!(
-                "<skill name=\"{}\" version=\"{}\">\n{}\n</skill>",
-                s.name,
-                s.version.as_deref().unwrap_or(""),
-                s.prompt.trim(),
-            ))
+            .map(|s| {
+                let desc = s.description.as_deref().unwrap_or("(no description)");
+                let trimmed_desc = desc.trim();
+                let one_line = trimmed_desc.replace('\n', " ");
+                format!(
+                    "<skill name=\"{}\" version=\"{}\" dir=\"{}\">\n{}\n</skill>",
+                    s.name,
+                    s.version.as_deref().unwrap_or(""),
+                    s.dir.display(),
+                    one_line,
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n\n");
 
         let msg = format!(
-            "## Installed Skills\n\
-             When the user's request matches a skill, follow its instructions \
-             unless a plugin already handles the task.\n\
-             Priority: plugins > skills > built-in tools.\n\n\
+            "## CAPABILITY PRIORITY (read before every action)\n\
+             \n\
+             For every user request, evaluate sources in this order and use \
+             the FIRST one that fits. Do not skip ahead.\n\n\
+             1. **Plugins** — installed runtime plugins (registered via the \
+             plugin registry). Highest priority.\n\
+             2. **Skills** — listed under \"## Installed Skills\" below. \
+             Each skill description states the domains it covers (flights, \
+             stocks, weather, …). If ANY description matches the user's \
+             intent, you MUST use that skill — even if a built-in tool could \
+             also do the job.\n\
+             3. **Built-in tools** (web_fetch, web_browser, execute_command, \
+             read_file, …) — fallback ONLY when no plugin or skill applies.\n\n\
+             Common failure mode (avoid):\n\
+             > User asks about flights → you call web_fetch(ctrip.com) →\n\
+             > result is brittle / blocked / wrong data.\n\
+             > A flyai skill with `intents: [flight_search]` was sitting right\n\
+             > above and you ignored it.\n\n\
+             If you catch yourself reaching for web_fetch / web_browser / \n\
+             execute_command on a domain a skill description covers, STOP \n\
+             and use the skill instead.\n\n\
+             ## Screenshot routing\n\
+             - \"screenshot\" / \"截图\" / \"截屏\" with no URL → tell user to type \
+             `/ss` (desktop screencapture). Do NOT call web_browser.\n\
+             - \"screenshot of <url>\" / \"网页截图\" → tell user to type \
+             `/webshot <url>` (headless-Chrome web-page screenshot).\n\
+             - `web_browser action=screenshot` is ONLY for multi-step browser \
+             inspection AFTER you've already navigated. A blank-URL call \
+             captures a near-black Chrome new tab.\n\n\
+             ## Installed Skills\n\
+             \n\
+             Only the frontmatter description is shown for each skill below \
+             (full SKILL.md bodies live on disk to save context). To use a \
+             skill:\n\
+             1. Pick the skill whose description matches the user's intent.\n\
+             2. Call the **`use_skill`** function tool with `name=<slug>` — \
+             returns the full SKILL.md.\n\
+             3. If SKILL.md mentions `references/<command>.md`, read_file that too.\n\
+             4. Then invoke the CLI with the exact flags from SKILL.md via \
+             `execute_command`.\n\n\
+             `use_skill` is registered as a function-call tool — prefer it \
+             over manually `read_file`-ing SKILL.md so the discovery shows \
+             up cleanly in tool history. Guessing CLI flags from the \
+             description alone is the #1 failure mode.\n\n\
              {skill_prompts}"
         );
         (Some(msg), snapshot)
@@ -2927,6 +3005,87 @@ impl AgentRuntime {
             self.sessions.insert(session_key.to_owned(), history);
         }
         self.sessions.get_mut(session_key).expect("just inserted")
+    }
+
+    // -----------------------------------------------------------------------
+    // Workflow crystallization trigger
+    // -----------------------------------------------------------------------
+
+    /// Inspect this turn's metrics and, if the difficulty score crosses
+    /// the configured threshold, spawn a background workflow distillation.
+    /// Skipped silently when:
+    ///   - `[ext.evolution.workflow]` is disabled
+    ///   - tool_calls below `min_tool_calls`
+    ///   - tool_errors below `min_errors`
+    ///   - difficulty score below threshold
+    ///   - rate limit exceeded OR signature already crystallized this run
+    fn maybe_crystallize_workflow(&self, ctx: &RunContext, final_text: &str) {
+        let evo = crate::agent::evolution::evolution_config();
+        if !evo.enabled || !evo.workflow.enabled {
+            return;
+        }
+        let m = &ctx.turn_metrics;
+        if m.tool_calls < evo.workflow.min_tool_calls {
+            return;
+        }
+        if m.tool_errors < evo.workflow.min_errors {
+            return;
+        }
+        let score = m.difficulty_score();
+        if score < evo.workflow.score_threshold {
+            return;
+        }
+        let signature = m.signature();
+        if !crate::agent::turn_metrics::try_admit_workflow(signature, evo.workflow.max_per_hour) {
+            tracing::debug!(
+                signature,
+                score,
+                "workflow crystallization: dedup or rate-limit, skipping"
+            );
+            return;
+        }
+
+        // Snapshot the data the background task needs — agent_loop's stack
+        // frame goes away as soon as we return.
+        let providers = Arc::clone(&self.providers);
+        let flash_model = self.resolve_flash_model_name();
+        let skills_dir = crate::skill::default_global_skills_dir()
+            .unwrap_or_else(|| crate::config::loader::base_dir().join("skills"));
+        let user_text = ctx.user_text.clone();
+        let reply_text = final_text.to_owned();
+        let metrics = ctx.turn_metrics.clone();
+
+        tracing::info!(
+            score,
+            tool_calls = m.tool_calls,
+            tool_errors = m.tool_errors,
+            distinct_tools = m.distinct_tools.len(),
+            "spawning workflow crystallization"
+        );
+        tokio::spawn(async move {
+            match crate::skill::workflow_distill::crystallize_workflow(
+                &user_text,
+                &reply_text,
+                &metrics,
+                &providers,
+                &flash_model,
+                &skills_dir,
+            )
+            .await
+            {
+                Ok(Some(_path)) => { /* logged inside crystallize_workflow */ }
+                Ok(None) => {
+                    // Distillation skipped (kill-switch / model issue / LLM
+                    // error / validation failure). Roll the signature back
+                    // so a future retry isn't blocked by the dedup set.
+                    crate::agent::turn_metrics::release_signature(signature);
+                }
+                Err(e) => {
+                    tracing::warn!("workflow crystallization hard failure: {e:#}");
+                    crate::agent::turn_metrics::release_signature(signature);
+                }
+            }
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -3115,7 +3274,7 @@ impl AgentRuntime {
         const MAX_SAME_CALL_STREAK: usize = 5;
         // Track consecutive tool errors — stop early when tools keep failing.
         let mut error_streak: usize = 0;
-        const MAX_ERROR_STREAK: usize = 2;
+        const MAX_ERROR_STREAK: usize = 5;
         // Store last error info so we can surface it when the loop breaks.
         let mut last_error_info: Option<String> = None;
         let mut max_iterations = BASE_ITERATIONS;
@@ -3148,7 +3307,7 @@ impl AgentRuntime {
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
-                    was_preparse: false,
+                    needs_outer_done_emit: false,
                 });
             }
             // Check abort flag at start of each iteration (allows /abort to
@@ -3175,7 +3334,7 @@ impl AgentRuntime {
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
-                    was_preparse: false,
+                    needs_outer_done_emit: false,
                 });
             }
             if iteration > max_iterations {
@@ -3210,7 +3369,7 @@ impl AgentRuntime {
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
-                    was_preparse: false,
+                    needs_outer_done_emit: false,
                 });
             }
             // Check consecutive tool errors — stop early when tools keep failing.
@@ -3226,6 +3385,21 @@ impl AgentRuntime {
                 } else {
                     crate::i18n::t("agent_tool_errors", crate::i18n::default_lang()).to_owned()
                 };
+                // Emit done=true so WS subscribers (desktop chat) see the
+                // terminal text and the terminator frame together. Without
+                // this, the UI hangs forever waiting for done — same fix
+                // pattern as the clear_signal / abort / max_iterations paths.
+                if let Some(ref bus) = self.event_bus {
+                    let _ = bus.send(AgentEvent {
+                        session_id: ctx.session_key.clone(),
+                        agent_id: ctx.agent_id.clone(),
+                        delta: error_text.clone(),
+                        done: true,
+                        files: tool_files.clone(),
+                        images: tool_images.clone(),
+                        tool_log: tool_log.clone(),
+                    });
+                }
                 return Ok(AgentReply {
                     text: error_text,
                     is_empty: false,
@@ -3233,7 +3407,7 @@ impl AgentRuntime {
                     images: vec![],
                     files: tool_files,
                     pending_analysis: None,
-                    was_preparse: false,
+                    needs_outer_done_emit: false,
                 });
             }
             // Apply legacy context pruning (hard clear / soft trim) as fallback.
@@ -3501,7 +3675,22 @@ impl AgentRuntime {
             };
 
 // Pre-flight check: emergency compact if we'd exceed context.
-            let context_limit = self.live.agents.read().await.defaults.context_tokens.unwrap_or(64_000) as usize;
+            // Same resolution chain as AgentHandle.context_window (the
+            // value /status displays): per-agent model.contextTokens →
+            // agents.defaults.contextTokens → 64000. Previously this only
+            // read defaults, so a per-agent override of 200_000 was
+            // ignored here and emergency compaction kicked in too early.
+            let context_limit = {
+                let agents_live = self.live.agents.read().await;
+                let per_agent = agents_live
+                    .list
+                    .iter()
+                    .find(|a| a.id == self.handle.id)
+                    .and_then(|a| a.model.as_ref().and_then(|m| m.context_tokens));
+                per_agent
+                    .or(agents_live.defaults.context_tokens)
+                    .unwrap_or(64_000) as usize
+            };
             let overhead = self.estimate_fixed_overhead();
             let session_tokens: usize = self.sessions
                 .get(&ctx.session_key)
@@ -4058,6 +4247,12 @@ impl AgentRuntime {
                     text_buf
                 };
 
+                // Workflow crystallization trigger — only on the normal
+                // (non-error_streak / non-max-iter / non-abort) completion
+                // path so we never persist failed workflows as skills.
+                ctx.turn_metrics.final_text_len = final_text.len();
+                self.maybe_crystallize_workflow(&ctx, &final_text);
+
                 if !tool_images.is_empty() {
                     info!("AgentReply returning with {} image(s), first {} bytes", tool_images.len(), tool_images.first().map(|s| s.len()).unwrap_or(0));
                 }
@@ -4080,15 +4275,29 @@ impl AgentRuntime {
                     images: reply_images,
                     files: tool_files,
                     pending_analysis: None,
-                    was_preparse: false,
+                    needs_outer_done_emit: false,
                 });
             }
 
             // Send intermediate text to user immediately (progress feedback).
             // Model often says "好的，我来帮你搜索" before calling tools — send it now
             // instead of waiting for the entire turn to complete.
+            //
+            // SKIP for ws/desktop channels: WS clients already receive
+            // streaming `delta` events through the event_bus pipeline that
+            // render progressively into the main reply bubble. Sending the
+            // same text via notification_tx would surface as a duplicate
+            // standalone bubble (the "ws" alias in startup.rs bridges
+            // notification_tx to the desktop channel, so it lands in chat
+            // alongside the streaming bubble).
+            let is_streaming_channel =
+                ctx.channel == "ws" || ctx.channel == "desktop";
             let intermediate_enabled = self.live.agents.read().await.defaults.intermediate_output.unwrap_or(true);
-            if intermediate_enabled && !text_buf.is_empty() && !tool_calls.is_empty() {
+            if intermediate_enabled
+                && !is_streaming_channel
+                && !text_buf.is_empty()
+                && !tool_calls.is_empty()
+            {
                 if let Some(ref ntx) = self.notification_tx {
                     let notif_target = if !ctx.chat_id.is_empty() {
                         ctx.chat_id.clone()
@@ -4166,7 +4375,7 @@ impl AgentRuntime {
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
-                    was_preparse: false,
+                    needs_outer_done_emit: false,
                 });
             }
 
@@ -4223,6 +4432,8 @@ impl AgentRuntime {
                 let call_key = crate::agent::loop_detection::hash_tool_call(&tool_name, &tool_input);
                 if call_key == last_tool_key {
                     same_call_streak += 1;
+                    ctx.turn_metrics.same_call_streak_max =
+                        ctx.turn_metrics.same_call_streak_max.max(same_call_streak);
                     if same_call_streak >= MAX_SAME_CALL_STREAK {
                         warn!(
                             tool = %tool_name,
@@ -4230,14 +4441,34 @@ impl AgentRuntime {
                             "agent_loop: identical tool call repeated {} times, breaking loop",
                             same_call_streak
                         );
+                        let terminal_text = crate::i18n::t(
+                            "agent_loop_detected",
+                            crate::i18n::default_lang(),
+                        )
+                        .to_owned();
+                        // Emit done=true so WS subscribers (desktop chat) see
+                        // the terminal text and the terminator frame together.
+                        // Same fix pattern as the clear_signal / abort /
+                        // max_iterations / error_streak paths.
+                        if let Some(ref bus) = self.event_bus {
+                            let _ = bus.send(AgentEvent {
+                                session_id: ctx.session_key.clone(),
+                                agent_id: ctx.agent_id.clone(),
+                                delta: terminal_text.clone(),
+                                done: true,
+                                files: tool_files.clone(),
+                                images: tool_images.clone(),
+                                tool_log: tool_log.clone(),
+                            });
+                        }
                         return Ok(AgentReply {
-                            text: crate::i18n::t("agent_loop_detected", crate::i18n::default_lang()).to_owned(),
+                            text: terminal_text,
                             is_empty: false,
                             tool_calls: None,
                             images: vec![],
                             files: vec![],
                             pending_analysis: None,
-                            was_preparse: false,
+                            needs_outer_done_emit: false,
                         });
                     }
                 } else {
@@ -4270,6 +4501,9 @@ impl AgentRuntime {
                 .await;
 
                 let tool_input_str = tool_input.to_string();
+                // Clone for the per-turn metrics record (after dispatch
+                // moves the value).
+                let tool_input_for_metrics = tool_input.clone();
                 let result = self
                     .dispatch_tool(ctx, &tool_id, &tool_name, tool_input)
                     .await;
@@ -4320,6 +4554,24 @@ impl AgentRuntime {
                             error_streak = 0;
                             last_error_info = None;
                         }
+                        // Record into per-turn metrics for workflow
+                        // crystallization. Truncate args/result so we don't
+                        // hold megabytes of base64 screenshots in RAM.
+                        const SUMMARY_CHARS: usize = 400;
+                        let args_summary: String =
+                            serde_json::to_string(&tool_input_for_metrics)
+                                .unwrap_or_default()
+                                .chars()
+                                .take(SUMMARY_CHARS)
+                                .collect();
+                        let result_summary: String =
+                            v.to_string().chars().take(SUMMARY_CHARS).collect();
+                        ctx.turn_metrics.record_tool(
+                            &tool_name,
+                            args_summary,
+                            result_summary,
+                            has_error,
+                        );
                         // Record result for progress-aware loop detection.
                         // Same args + different results = making progress, not a loop.
                         // For exec tool: exclude task_id (uuid changes each call) to properly detect loops.
@@ -4695,6 +4947,17 @@ impl AgentRuntime {
                             "read_file" | "read" => {
                                 limits.and_then(|l| l.default).unwrap_or(3000)
                             }
+                            // use_skill returns SKILL.md, which is a contract
+                            // document the LLM MUST see in full. Truncating
+                            // it caused the agent to hallucinate CLI
+                            // invocations (e.g. flyai's SKILL.md says
+                            // `npm i -g @fly-ai/flyai-cli` on line 60 — past
+                            // the 3000-char cut — so the agent saw only
+                            // `runtime: node` in frontmatter and made up
+                            // `node index.js` instead).
+                            "use_skill" => {
+                                limits.and_then(|l| l.default).unwrap_or(60_000)
+                            }
                             _ => limits.and_then(|l| l.default).unwrap_or(3000),
                         };
                         if result_text.len() > max_chars {
@@ -4911,6 +5174,7 @@ impl AgentRuntime {
             "read_file" | "read" => return self.tool_read(args).await,
             "write_file" | "write" => return self.tool_write(args).await,
             "execute_command" | "exec" => return self.tool_exec(ctx, _id, args).await,
+            "use_skill" => return self.tool_use_skill(args),
             "install_tool" | "tool_install" => return self.tool_install(args).await,
             "list_dir" => return self.tool_list_dir(args).await,
             "search_file" => return self.tool_search_file(args).await,
@@ -5200,6 +5464,42 @@ impl AgentRuntime {
         }
     }
 
+    /// `use_skill` — first-class function-call tool that activates an
+    /// installed skill. The whole reason this exists is that the LLM
+    /// strongly prefers tools registered in the function-call API over
+    /// suggestions buried in the system prompt; without `use_skill` the
+    /// model would reach for `web_fetch`/`web_browser` even when a skill's
+    /// description matched the task. Returns the skill's full SKILL.md so
+    /// the LLM can derive the exact CLI invocation, then call
+    /// `execute_command` to run it.
+    pub(crate) fn tool_use_skill(&self, args: Value) -> Result<Value> {
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("use_skill: 'name' is required"))?;
+        let Some(skill) = self.skills.get(name) else {
+            let available: Vec<&str> = self.skills.all().map(|s| s.name.as_str()).collect();
+            return Ok(serde_json::json!({
+                "error": format!("skill '{name}' not installed"),
+                "available": available,
+            }));
+        };
+        let dir = skill.dir.display().to_string();
+        let skill_md_path = skill.dir.join("SKILL.md");
+        let skill_md = std::fs::read_to_string(&skill_md_path).unwrap_or_else(|e| {
+            format!("(failed to read SKILL.md: {e}; check {})", skill_md_path.display())
+        });
+        Ok(serde_json::json!({
+            "name": skill.name,
+            "dir": dir,
+            "skill_md": skill_md,
+            "next_step": "Read skill_md to find the exact CLI command and flags, \
+                          then call execute_command to run it. \
+                          Pass the user's actual question / parameters via the \
+                          flags documented in skill_md."
+        }))
+    }
+
     pub(crate) async fn tool_memory_put(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let text = args["text"].as_str().unwrap_or("").to_owned();
         // Internal channels (heartbeat/cron/system) get a separate scope so
@@ -5219,9 +5519,11 @@ impl AgentRuntime {
         let Some(ref mem) = self.memory else {
             return Ok(json!({"error": "memory store not available"}));
         };
-        let mut store = mem.lock().await;
-        store
-            .add(MemoryDoc {
+        // Off-lock add: BERT inference happens between two brief lock
+        // windows so concurrent reads/writes don't stall on it.
+        crate::agent::memory::add_off_lock(
+            mem,
+            MemoryDoc {
                 id: id.clone(),
                 scope: scope.clone(),
                 kind: kind.clone(),
@@ -5236,9 +5538,9 @@ impl AgentRuntime {
                 overview_text: None,
                 tags: vec![],
                 pinned: false,
-            })
-            .await?;
-        drop(store);
+            },
+        )
+        .await?;
         // Also index in tantivy BM25 for hybrid search.
         if let Err(e) = self
             .store
@@ -5261,7 +5563,12 @@ impl AgentRuntime {
             .workspace
             .clone()
             .or(default_workspace)
-            .unwrap_or_else(|| "~/.rsclaw/workspace".to_owned());
+            .unwrap_or_else(|| {
+                crate::config::loader::base_dir()
+                    .join("workspace")
+                    .to_string_lossy()
+                    .into_owned()
+            });
         let ws = if ws_str.starts_with('~') {
             dirs_next::home_dir().unwrap_or_default().join(&ws_str[2..])
         } else {

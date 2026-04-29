@@ -54,6 +54,7 @@ pub struct LockedSkill {
 pub enum SkillSource {
     Clawhub,
     Skillhub,
+    Iwencai,
     Github,
     Url,
     Local,
@@ -136,6 +137,61 @@ struct SkillhubUrls {
     download: String,
     search: String,
     primary_download: String,
+}
+
+/// Load iwencai URLs from defaults.toml. `IWENCAI_BASE_URL` env (or the
+/// `base_url_env` field) overrides the static defaults so 同花顺 can roll
+/// out a new gateway without us shipping a release.
+fn iwencai_urls() -> IwencaiUrls {
+    static URLS: std::sync::LazyLock<IwencaiUrls> = std::sync::LazyLock::new(|| {
+        #[derive(serde::Deserialize, Default)]
+        struct Defs {
+            #[serde(default)]
+            skill_registries: std::collections::HashMap<String, toml::Value>,
+        }
+        let defaults_str = crate::config::loader::load_defaults_toml();
+        let defs: Defs = toml::from_str(&defaults_str).unwrap_or_default();
+        let entry = defs.skill_registries.get("iwencai");
+        let install_template = entry
+            .and_then(|v| v.get("install_url_template"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(
+                "http://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name={slug}",
+            )
+            .to_owned();
+        let list_url = entry
+            .and_then(|v| v.get("list_url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("http://ms.10jqka.com.cn/gateway/market/api/v1/skills/square")
+            .to_owned();
+        let env_override = std::env::var("IWENCAI_BASE_URL").ok().filter(|s| !s.is_empty());
+        IwencaiUrls {
+            install_template: rebase_url(&install_template, env_override.as_deref()),
+            list: rebase_url(&list_url, env_override.as_deref()),
+        }
+    });
+    URLS.clone()
+}
+
+/// Replace the scheme+authority of `url` with `base` when set. Keeps the
+/// path/query so per-endpoint paths in defaults.toml work unchanged.
+/// Plain string-splice to avoid pulling the `url` crate in just for this.
+fn rebase_url(url: &str, base: Option<&str>) -> String {
+    let Some(base) = base.map(|s| s.trim_end_matches('/')) else { return url.to_owned() };
+    let path_idx = match url.find("://") {
+        Some(i) => match url[i + 3..].find('/') {
+            Some(p) => i + 3 + p,
+            None => return base.to_owned(), // url has only scheme+host
+        },
+        None => return url.to_owned(), // not a URL we can rebase
+    };
+    format!("{base}{}", &url[path_idx..])
+}
+
+#[derive(Clone, Default)]
+struct IwencaiUrls {
+    install_template: String,
+    list: String,
 }
 
 /// Raw API response from clawhub `/v1/skills/<slug>`.
@@ -423,7 +479,25 @@ impl ClawhubClient {
             }
         }
 
-        bail!("skill `{spec}` not found on clawhub or skillhub")
+        // 5. Fallback to iwencai (同花顺金融技能库). Plain GET → returns the
+        //    skill zip directly. No auth needed for download itself; the
+        //    installed skill reads `IWENCAI_API_KEY` at runtime when it
+        //    calls openapi.iwencai.com.
+        let iw = iwencai_urls();
+        let iwencai_url = iw.install_template.replace("{slug}", slug);
+        debug!(slug, url = %iwencai_url, "trying iwencai fallback");
+        match self.install_from_url(&iwencai_url, skills_dir).await {
+            Ok(mut locked) => {
+                locked.source = SkillSource::Iwencai;
+                locked.slug = slug.to_owned();
+                return Ok(locked);
+            }
+            Err(e) => {
+                debug!(url = %iwencai_url, error = %e, "iwencai download failed");
+            }
+        }
+
+        bail!("skill `{spec}` not found on clawhub, skillhub, or iwencai")
     }
 
     /// Install a skill from skills.sh using their JSON file API.
@@ -528,26 +602,61 @@ impl ClawhubClient {
 
     /// Install a skill from a direct URL (tar.gz or zip).
     async fn install_from_url(&self, url: &str, skills_dir: &Path) -> Result<LockedSkill> {
-        // Derive dir name from URL: prefer ?slug= param, then path segment
-        let dir_name = url
+        // Derive dir name from URL.
+        //   1) `?slug=` (skillhub) or `?name=` (iwencai) query param.
+        //   2) Last non-query path segment, but skip generic terminators
+        //      that aren't real skill names. Without the skip,
+        //      skillhub COS URLs like `.../skills/<slug>/files` produced
+        //      `~/.rsclaw/skills/files/` empty dirs because `files` was
+        //      taken as the slug; iwencai pre-fix had the same issue
+        //      with `square`/`download`.
+        const GENERIC_TERMINATORS: &[&str] = &[
+            "files", "download", "archive", "latest", "main", "master",
+            "tarball", "zipball", "raw", "blob", "release",
+        ];
+        let trim_endings = |s: &str| -> String {
+            s.trim_end_matches(".tar.gz")
+                .trim_end_matches(".tgz")
+                .trim_end_matches(".zip")
+                .trim_end_matches(".tar")
+                .to_owned()
+        };
+        let from_query = url
             .split('?')
             .nth(1)
             .and_then(|qs| {
-                qs.split('&')
-                    .find_map(|p| p.strip_prefix("slug="))
-            })
-            .unwrap_or_else(|| {
-                url.rsplit('/')
-                    .find(|s| !s.is_empty() && !s.contains('?'))
-                    .unwrap_or("unknown-skill")
-            })
-            .trim_end_matches(".tar.gz")
-            .trim_end_matches(".tgz")
-            .trim_end_matches(".zip");
-        let install_dir = skills_dir.join(dir_name);
+                qs.split('&').find_map(|p| {
+                    p.strip_prefix("slug=")
+                        .or_else(|| p.strip_prefix("name="))
+                })
+            });
+        let dir_name = if let Some(s) = from_query {
+            trim_endings(s)
+        } else {
+            // Walk path segments from the right, skipping anything that
+            // looks like a generic terminator (e.g. `/skills/foo/files`
+            // → use `foo`, not `files`).
+            let segs: Vec<&str> = url
+                .split('?')
+                .next()
+                .unwrap_or("")
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect();
+            let mut chosen: &str = "unknown-skill";
+            for s in segs.iter().rev() {
+                let lower = s.to_lowercase();
+                if !GENERIC_TERMINATORS.iter().any(|t| *t == lower) {
+                    chosen = s;
+                    break;
+                }
+            }
+            trim_endings(chosen)
+        };
+        let install_dir = skills_dir.join(&dir_name);
 
         // Skip re-download if the skill is already installed and SKILL.md matches.
-        if let Some(existing) = Self::find_installed(skills_dir, dir_name) {
+        if let Some(existing) = Self::find_installed(skills_dir, &dir_name) {
             debug!(dir_name, "already installed and up to date, skipping");
             return Ok(existing);
         }
@@ -603,6 +712,7 @@ impl ClawhubClient {
         use crate::skill::registry::{Registry, search_concurrent};
 
         let sh = skillhub_urls();
+        let iw = iwencai_urls();
         let registries: Vec<Registry> = if self.is_cn() {
             vec![
                 Registry::Skillsh { client: self.client.clone() },
@@ -610,6 +720,10 @@ impl ClawhubClient {
                     client: self.client.clone(),
                     search_url: sh.search.clone(),
                     index_url: sh.index.clone(),
+                },
+                Registry::Iwencai {
+                    client: self.client.clone(),
+                    list_url: iw.list.clone(),
                 },
             ]
         } else {
@@ -619,6 +733,10 @@ impl ClawhubClient {
                     client: self.client.clone(),
                     api_base: self.base_url.clone(),
                     token: self.token.clone(),
+                },
+                Registry::Iwencai {
+                    client: self.client.clone(),
+                    list_url: iw.list.clone(),
                 },
             ]
         };

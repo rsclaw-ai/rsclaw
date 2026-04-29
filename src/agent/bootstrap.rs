@@ -400,23 +400,10 @@ pub fn seed_workspace_with_lang(workspace: &Path, lang: Option<&str>) -> Result<
         }
     }
 
-    // Seed site-rules (platform experience for organic evolution).
-    let rules_dir = workspace.join("site-rules");
-    let site_rules: &[(&str, &str)] = &[
-        ("douyin.md", SITE_DOUYIN),
-        ("kuaishou.md", SITE_KUAISHOU),
-        ("xiaohongshu.md", SITE_XIAOHONGSHU),
-        ("bilibili.md", SITE_BILIBILI),
-    ];
-    std::fs::create_dir_all(&rules_dir)?;
-    for (name, content) in site_rules {
-        let path = rules_dir.join(name);
-        if !path.exists() {
-            std::fs::write(&path, content)?;
-            info!(file = %path.display(), "seeded site rule");
-            created += 1;
-        }
-    }
+    // (Site-rules used to be seeded here per-workspace. Moved to
+    // base_dir/tools/web_browser/site-rules/ since the content is
+    // platform-wide UI knowledge for the web_browser tool, not user
+    // workspace data — see seed_tools below.)
 
     Ok(created)
 }
@@ -484,6 +471,27 @@ pub fn seed_tools(base_dir: &Path, lang: Option<&str>) -> Result<usize> {
             created += 1;
         }
     }
+
+    // Site-rules — platform-wide DOM/URL knowledge for web_browser.
+    // Lives under tools/web_browser/site-rules/ (shared across all
+    // agents; was per-workspace, see seed_workspace_with_lang).
+    let site_rules_dir = tools_dir.join("web_browser").join("site-rules");
+    let site_rules: &[(&str, &str)] = &[
+        ("douyin.md", SITE_DOUYIN),
+        ("kuaishou.md", SITE_KUAISHOU),
+        ("xiaohongshu.md", SITE_XIAOHONGSHU),
+        ("bilibili.md", SITE_BILIBILI),
+    ];
+    std::fs::create_dir_all(&site_rules_dir)?;
+    for (name, content) in site_rules {
+        let path = site_rules_dir.join(name);
+        if !path.exists() {
+            std::fs::write(&path, content)?;
+            info!(file = %path.display(), "seeded site rule");
+            created += 1;
+        }
+    }
+
     Ok(created)
 }
 
@@ -531,7 +539,8 @@ const ZH_TOOL_EXEC: &str = r#"# exec 使用指南
 
 - 只在用户明确要求时才执行命令
 - 执行前确认操作系统（macOS/Linux/Windows）
-- 命令失败时不要重复尝试同样的命令，换一种方式或告知用户
+- **不熟悉的 CLI 工具**：第一次用前先 `tool --help`（或 `tool subcommand --help`）看清楚 subcommand 名、flag 拼写和命名风格（kebab-case `--dep-date` vs camelCase `--depDate` 不同生态不一样，靠猜常错）
+- 命令失败时**不要重复同样的命令**：先看 stderr 里有没有 `tip:` / `Did you mean` 提示——返回结果里如果有 `hint` 字段就直接用它建议的版本；否则根据错误信息换一种方式
 - Windows 用 PowerShell，macOS/Linux 用 bash
 - 不要执行危险命令（rm -rf、格式化、关闭防火墙等）
 
@@ -584,9 +593,10 @@ const EN_TOOL_EXEC: &str = r#"# exec Usage Guide
 ## Tool Mastery — Choose the Right Tool
 | Task | Best Tool |
 |------|-----------|
+| HTTP requests, REST APIs, fetching pages | **`web_fetch`** (NOT curl/wget/exec) |
+| File downloads (images/videos/binaries) | **`web_download`** (NOT curl/wget/exec) |
 | File/text ops, pipes, system info | bash/zsh (macOS/Linux) or PowerShell (Windows) |
-| Data processing (CSV/JSON/API) | Python (`python3 -c "..."` or write script) |
-| Web API, quick HTTP, scraping | Node.js (`node -e "..."`) or Python |
+| Data processing (CSV/JSON local files) | Python (`python3 -c "..."` or write script) |
 | Package install | pip/npm, or `install_tool` for system tools |
 | Multi-line complex logic | Write to file first, then execute |
 
@@ -596,7 +606,8 @@ const EN_TOOL_EXEC: &str = r#"# exec Usage Guide
 - Use pip/npm for language-specific packages
 - Use `| head -n 20` or `| tail -n 20` to limit large output
 - Long tasks: use wait=false (background). Short tasks needing output: wait=true
-- If a command fails, do NOT retry same args — try a different approach
+- **Unfamiliar CLI tool? Run `tool --help` (or `tool subcommand --help`) FIRST** — guessing flag names is a common LLM failure (kebab-case `--dep-date` vs camelCase `--depDate` differ across ecosystems)
+- If a command fails: check stderr for `tip:` / `Did you mean` suggestions — the result JSON's `hint` field surfaces these on top. Use the suggestion or run `--help` to see real flags. Do NOT retry the same args.
 - Never run dangerous commands (rm -rf /, format, disable firewall)
 
 ## File Attachments from the User
@@ -621,15 +632,15 @@ eats the last character of the previous token. This is a classic trap.
 
 ## Node.js Quick Patterns
 - One-liner: `node -e "console.log(JSON.stringify({key:'val'}))"`
-- fetch (Node 18+): `node -e "fetch('https://api.example.com').then(r=>r.json()).then(console.log)"`
 - Packages: `npm install -g <pkg>` or `npx <pkg>`
+- For HTTP, use `web_fetch` instead of `node -e "fetch(...)"`.
 
 ## Shell Quick Patterns
 - Find files: `find . -name "*.py" -mtime -7`
 - Text processing: `grep -r "pattern" . | head -20`
-- JSON: `cat file.json | python3 -m json.tool`
-- Network: `curl -s https://api.example.com | python3 -m json.tool`
+- JSON file: `cat file.json | python3 -m json.tool`
 - Process: `ps aux | grep <name>`, `kill <pid>`
+- For HTTP/API requests, use `web_fetch` — NOT `curl`/`wget`.
 "#;
 
 // -- web_search / web_fetch prompts -----------------------------------------
@@ -643,15 +654,15 @@ const ZH_TOOL_WEB_SEARCH: &str = r#"# web_search 使用指南
 - 下载文件/图片/视频 → 用 `web_download`（支持续传、浏览器 cookie），不要用 curl/wget
 
 ## 优先走结构化 API
-以下类型用 `execute_command` + curl 直接打接口，比搜索 SEO 结果准得多：
+以下类型用 `web_fetch` 直接打接口，比搜索 SEO 结果准得多（JSON 会原样返回）。**不要用 curl/exec**：
 
-| 需求 | 命令 |
+| 需求 | URL |
 |---|---|
-| 天气 | `curl -s 'wttr.in/城市?lang=zh&format=j1'` |
-| IP 归属 | `curl -s 'ipinfo.io/8.8.8.8/json'` |
-| 汇率 | `curl -s 'https://api.exchangerate.host/latest?base=USD&symbols=CNY'` |
-| 维基摘要 | `curl -s 'https://zh.wikipedia.org/api/rest_v1/page/summary/主题'` |
-| GitHub | `curl -s 'https://api.github.com/repos/owner/name'` |
+| 天气 | `https://wttr.in/城市?lang=zh&format=j1` |
+| IP 归属 | `https://ipinfo.io/8.8.8.8/json` |
+| 汇率 | `https://api.exchangerate.host/latest?base=USD&symbols=CNY` |
+| 维基摘要 | `https://zh.wikipedia.org/api/rest_v1/page/summary/主题` |
+| GitHub | `https://api.github.com/repos/owner/name` |
 
 有直接 API 就用，web_search 留给开放性、非结构化问题。
 
@@ -681,15 +692,15 @@ const EN_TOOL_WEB_SEARCH: &str = r#"# web_search Usage Guide
 - Download files/images/videos -> use `web_download` (supports resume, browser cookies), do NOT use curl/wget
 
 ## Prefer direct APIs
-These are cleaner and faster than scraping SEO-polluted search results:
+These are cleaner and faster than scraping SEO-polluted search results. Use `web_fetch` (JSON is returned as-is). **Do NOT use curl/exec for these**:
 
-| Intent | Command |
+| Intent | URL |
 |---|---|
-| Weather | `curl -s 'wttr.in/City?format=j1'` |
-| IP geolocation | `curl -s 'ipinfo.io/8.8.8.8/json'` |
-| Currency rate | `curl -s 'https://api.exchangerate.host/latest?base=USD&symbols=CNY'` |
-| Wikipedia | `curl -s 'https://en.wikipedia.org/api/rest_v1/page/summary/TOPIC'` |
-| GitHub | `curl -s 'https://api.github.com/repos/owner/name'` |
+| Weather | `https://wttr.in/City?format=j1` |
+| IP geolocation | `https://ipinfo.io/8.8.8.8/json` |
+| Currency rate | `https://api.exchangerate.host/latest?base=USD&symbols=CNY` |
+| Wikipedia | `https://en.wikipedia.org/api/rest_v1/page/summary/TOPIC` |
+| GitHub | `https://api.github.com/repos/owner/name` |
 
 Use direct API first. web_search for open-ended or unstructured questions only.
 
@@ -712,9 +723,32 @@ Use direct API first. web_search for open-ended or unstructured questions only.
 
 const ZH_TOOL_WEB_FETCH: &str = r#"# web_fetch 使用指南
 
-- 抓取网页内容优先用 web_fetch，不要打开浏览器
-- 只能获取静态内容，需要交互（登录、点击）时用 web_browser
-- HTTP 失败或遇到验证码时会自动回退到浏览器抓取
+- **任何 HTTP 请求都优先用 web_fetch**——网页、JSON API、REST、文档、文章
+- **绝对不要**用 `execute_command` + `curl`/`wget`/`Invoke-WebRequest` 抓 HTTP，一律走 web_fetch
+- HTML 页面自动转成干净的 markdown
+- JSON / 纯文本 / 非 HTML 响应**原样返回 body**——wttr.in、openweather、github、ipinfo 这种 REST API 直接传 URL
+- 静态内容用 web_fetch；需要交互（登录、点击）才用 web_browser
+- GET 失败或遇到验证码时会自动回退到浏览器抓取
+
+## 完整 HTTP 能力
+- `method`: GET（默认）、POST、PUT、PATCH、DELETE
+- `headers`: 对象，可传 Authorization、X-API-Key、Cookie、自定义 Content-Type
+- `body`: 字符串（按原样发送）或 对象/数组（自动 JSON 序列化 + 设 Content-Type）
+
+例：调一个鉴权 POST API
+```json
+{
+  "url": "https://api.example.com/v1/items",
+  "method": "POST",
+  "headers": {"Authorization": "Bearer abc123"},
+  "body": {"name": "foo", "qty": 3}
+}
+```
+
+## 什么时候才退到 curl/exec
+- multipart 文件上传
+- SSE / chunked 流式响应（边收边处理）
+- 需要交互式登录（改用 web_browser）
 
 ## web_download
 - 下载文件/图片/视频用 `web_download`（支持续传、浏览器 cookie），不要用 curl/wget
@@ -725,9 +759,32 @@ const ZH_TOOL_WEB_FETCH: &str = r#"# web_fetch 使用指南
 
 const EN_TOOL_WEB_FETCH: &str = r#"# web_fetch Usage Guide
 
-- Use web_fetch to read web pages — do NOT open a browser for static content
-- Only use web_browser when interaction is needed (login, clicking, form filling)
-- Automatically falls back to browser on HTTP failure or CAPTCHA
+- **PREFERRED for any HTTP request** — web pages, JSON APIs, REST endpoints, documentation, articles
+- **Do NOT** use `execute_command` with `curl`/`wget`/`Invoke-WebRequest` for HTTP — use web_fetch
+- HTML pages are auto-converted to clean text/markdown
+- JSON / plain-text / non-HTML responses are returned **as-is (raw body)** — works for wttr.in, openweather, github, ipinfo, etc.
+- Use web_fetch for static content; only use web_browser when interaction is needed (login, clicking, form filling)
+- GET requests fall back to browser rendering on HTTP failure or CAPTCHA
+
+## Full HTTP capability
+- `method`: GET (default), POST, PUT, PATCH, DELETE
+- `headers`: object — Authorization, X-API-Key, Cookie, custom Content-Type, etc.
+- `body`: string (sent as-is) or object/array (JSON-serialized; Content-Type set automatically)
+
+Example — authenticated POST:
+```json
+{
+  "url": "https://api.example.com/v1/items",
+  "method": "POST",
+  "headers": {"Authorization": "Bearer abc123"},
+  "body": {"name": "foo", "qty": 3}
+}
+```
+
+## Only fall back to curl/exec for
+- multipart file upload
+- SSE / chunked streaming responses consumed incrementally
+- Sites behind interactive login (use web_browser instead)
 
 ## web_download
 - Download files/images/videos: use `web_download` (supports resume, browser cookies). Do NOT use curl/wget.

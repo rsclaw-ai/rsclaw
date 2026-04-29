@@ -8,7 +8,10 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
     match sub {
         CronCommand::List | CronCommand::Status => {
             banner(&format!("rsclaw cron v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
-            let jobs = crate::cron::load_cron_jobs();
+            let (jobs, parse_ok) = crate::cron::load_cron_jobs();
+            if !parse_ok {
+                warn_msg("cron.json5 has syntax errors - fix the file before modifying jobs");
+            }
             if jobs.is_empty() {
                 warn_msg("no cron jobs configured");
             } else {
@@ -42,7 +45,7 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
             // Manual trigger: POST to gateway API if running.
             let config = config::load()?;
             let port = config.gateway.port;
-            let jobs = crate::cron::load_cron_jobs();
+            let (jobs, _) = crate::cron::load_cron_jobs();
             let job = jobs
                 .iter()
                 .find(|j| j.id == id)
@@ -100,7 +103,10 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
         CronCommand::Add(args) => {
             validate_cron_schedule(&args.schedule)?;
 
-            let mut jobs = crate::cron::load_cron_jobs();
+            let (mut jobs, parse_ok) = crate::cron::load_cron_jobs();
+            if !parse_ok {
+                anyhow::bail!("cron.json5 has syntax errors - fix the file before adding jobs");
+            }
             let id = format!("job-{}", jobs.len() + 1);
 
             let job = crate::cron::CronJob {
@@ -116,6 +122,7 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
                 session_target: None,
                 wake_mode: None,
                 state: Some(crate::cron::CronJobState::default()),
+                iter: None,
                 created_at_ms: Some(chrono::Utc::now().timestamp_millis() as u64),
                 updated_at_ms: None,
             };
@@ -144,7 +151,7 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
             ));
         }
         CronCommand::Edit { id } => {
-            let jobs = crate::cron::load_cron_jobs();
+            let (jobs, _) = crate::cron::load_cron_jobs();
             jobs.iter()
                 .find(|j| j.id == id)
                 .ok_or_else(|| anyhow::anyhow!("cron job '{id}' not found"))?;
@@ -163,7 +170,10 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
         CronCommand::Enable { id } => cron_set_enabled(&id, true)?,
         CronCommand::Disable { id } => cron_set_enabled(&id, false)?,
         CronCommand::Rm { id } => {
-            let mut jobs = crate::cron::load_cron_jobs();
+            let (mut jobs, parse_ok) = crate::cron::load_cron_jobs();
+            if !parse_ok {
+                anyhow::bail!("cron.json5 has syntax errors - fix the file before removing jobs");
+            }
             let before = jobs.len();
             jobs.retain(|j| j.id != id);
             if jobs.len() == before {
@@ -278,7 +288,10 @@ fn validate_cron_part(part: &str, min: u32, max: u32) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 pub fn cron_set_enabled(id: &str, enabled: bool) -> Result<()> {
-    let mut jobs = crate::cron::load_cron_jobs();
+    let (mut jobs, parse_ok) = crate::cron::load_cron_jobs();
+    if !parse_ok {
+        anyhow::bail!("cron.json5 has syntax errors - fix the file before modifying jobs");
+    }
     let mut found = false;
     for job in &mut jobs {
         if job.id == id {

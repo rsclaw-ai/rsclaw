@@ -157,12 +157,12 @@ pub(crate) fn start_matrix_if_configured(
                     if is_group {
                         match group_policy.as_ref() {
                             crate::config::schema::GroupPolicy::Disabled => {
-                                debug!("matrix group message rejected: groupPolicy=disabled");
+                                warn!("matrix group message rejected: groupPolicy=disabled");
                                 return;
                             }
                             crate::config::schema::GroupPolicy::Allowlist => {
                                 if !group_allow.iter().any(|g| *g == room_id) {
-                                    debug!("matrix group message rejected: not in groupAllowFrom");
+                                    warn!("matrix group message rejected: not in groupAllowFrom");
                                     return;
                                 }
                             }
@@ -175,7 +175,7 @@ pub(crate) fn start_matrix_if_configured(
                         match enforcer.check(&sender).await {
                             PolicyResult::Allow => {}
                             PolicyResult::Deny => {
-                                debug!(peer_id = %sender, "matrix DM rejected by policy");
+                                warn!(peer_id = %sender, "matrix DM rejected by policy");
                                 return;
                             }
                             PolicyResult::SendPairingCode(code) => {

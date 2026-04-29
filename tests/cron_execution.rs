@@ -40,6 +40,7 @@ fn make_job(id: &str, schedule: &str, agent_id: &str, enabled: bool) -> CronJob 
         delivery: None,
         wake_mode: None,
         state: None,
+        iter: None,
         created_at_ms: None,
         updated_at_ms: None,
     }
@@ -101,6 +102,7 @@ fn runtime_with_agent(agent_id: &str) -> RuntimeConfig {
                 claudecode: None,
                 codex: None,
                 flash_model: None,
+                temperature: None,
             }],
             bindings: vec![],
             external: vec![],
@@ -162,7 +164,7 @@ async fn test_cron_job_runs() {
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
-                    was_preparse: false,
+                    needs_outer_done_emit: false,
                 });
             }
         });
@@ -208,7 +210,7 @@ async fn test_cron_enable_disable() {
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
-                    was_preparse: false,
+                    needs_outer_done_emit: false,
                 });
             }
         });

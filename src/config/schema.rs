@@ -38,6 +38,12 @@ pub struct Config {
     pub memory_search: Option<MemorySearchConfig>,
     pub memory: Option<MemoryTopConfig>,
     pub mcp: Option<McpConfig>,
+    /// Per-registry overrides keyed by registry name (`iwencai`, `clawhub`,
+    /// `skillhub`, ...). Lets users put `apiKey`/`baseUrl` for paid skill
+    /// registries into rsclaw.json5 instead of shell rc — at startup any
+    /// resolved key is exported into the gateway process env so spawned
+    /// skill subprocesses (python CLIs etc.) inherit it transparently.
+    pub skill_registries: Option<std::collections::HashMap<String, SkillRegistryEntry>>,
 
     // --- OpenClaw-compatible sections ---
     pub wizard: Option<Value>,
@@ -1549,6 +1555,24 @@ pub struct SkillEntryConfig {
 }
 
 // ---------------------------------------------------------------------------
+// skill_registries — per-registry credentials and overrides
+// ---------------------------------------------------------------------------
+
+/// Per-registry credential override. Both fields accept either a plain
+/// string (`"sk-..."`), `${VAR}` env expansion, or a `SecretRef` object.
+/// At gateway startup any resolved value is exported to the corresponding
+/// env var name from `defaults.toml` (e.g. `IWENCAI_API_KEY`,
+/// `IWENCAI_BASE_URL`) so spawned skill subprocesses inherit it without
+/// the user touching their shell rc.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRegistryEntry {
+    pub api_key: Option<SecretOrString>,
+    pub base_url: Option<SecretOrString>,
+    pub enabled: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
 // evolution — self-evolution thresholds for memory crystallization
 // ---------------------------------------------------------------------------
 
@@ -1565,6 +1589,10 @@ pub struct EvolutionConfig {
     pub cluster: Option<EvolutionClusterConfig>,
     pub promotion: Option<EvolutionPromotionConfig>,
     pub meditation: Option<EvolutionMeditationConfig>,
+    /// Workflow-style crystallization: distill complex/hard turns into
+    /// SKILL.md immediately rather than waiting for memory clusters to
+    /// form. Off by default — opt in via `enabled: true`.
+    pub workflow: Option<EvolutionWorkflowConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -1589,6 +1617,23 @@ pub struct EvolutionMeditationConfig {
     pub max_per_cycle: Option<usize>,
     pub dedup_threshold: Option<f32>,
     pub crystallized_ttl_days: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EvolutionWorkflowConfig {
+    /// Master kill-switch. Off by default.
+    pub enabled: Option<bool>,
+    /// Difficulty score threshold for distillation [0.0, 1.0]. Higher = stricter.
+    pub score_threshold: Option<f32>,
+    /// Floor on tool calls — turns simpler than this never crystallize.
+    pub min_tool_calls: Option<usize>,
+    /// Floor on tool errors — set to 0 to allow error-free complex turns
+    /// to crystallize anyway, or 1+ to require the agent had to recover
+    /// from at least one failure (the "踩坑" signal).
+    pub min_errors: Option<usize>,
+    /// Hard cap on workflow distillations per hour to bound cost.
+    pub max_per_hour: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------

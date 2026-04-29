@@ -131,7 +131,7 @@ pub async fn config_get(ctx: MethodCtx) -> MethodResult {
 }
 
 pub async fn cron_list(_ctx: MethodCtx) -> MethodResult {
-    let jobs = crate::cron::load_cron_jobs();
+    let (jobs, _) = crate::cron::load_cron_jobs();
     let list: Vec<serde_json::Value> = jobs
         .iter()
         .map(|j| {
@@ -177,7 +177,10 @@ pub async fn cron_add(ctx: MethodCtx) -> MethodResult {
     // Serialize RMW against concurrent cron.add/remove so writes don't clobber.
     let _guard = crate::cron::CRON_FILE_LOCK.lock().await;
 
-    let mut jobs = crate::cron::load_cron_jobs();
+    let (mut jobs, parse_ok) = crate::cron::load_cron_jobs();
+    if !parse_ok {
+        return Err(ErrorShape::internal("cron.json5 has syntax errors - fix the file before adding jobs"));
+    }
     // Use a UUID instead of `job-{count+1}` — the latter is unstable under
     // concurrent adds (two callers can both see the same count).
     let id = uuid::Uuid::new_v4().to_string();
@@ -195,6 +198,7 @@ pub async fn cron_add(ctx: MethodCtx) -> MethodResult {
         session_target: None,
         wake_mode: None,
         state: Some(crate::cron::CronJobState::default()),
+        iter: None,
         created_at_ms: Some(chrono::Utc::now().timestamp_millis() as u64),
         updated_at_ms: None,
     };
@@ -223,7 +227,10 @@ pub async fn cron_remove(ctx: MethodCtx) -> MethodResult {
         .ok_or_else(|| ErrorShape::bad_request("missing id"))?;
 
     let _guard = crate::cron::CRON_FILE_LOCK.lock().await;
-    let mut jobs = crate::cron::load_cron_jobs();
+    let (mut jobs, parse_ok) = crate::cron::load_cron_jobs();
+    if !parse_ok {
+        return Err(ErrorShape::internal("cron.json5 has syntax errors - fix the file before removing jobs"));
+    }
     let before = jobs.len();
     jobs.retain(|j| j.id != id);
 
@@ -529,7 +536,10 @@ pub async fn cron_update(ctx: MethodCtx) -> MethodResult {
 
     let _guard = crate::cron::CRON_FILE_LOCK.lock().await;
     // Load jobs from the openclaw-compatible jobs.json file
-    let mut jobs = crate::cron::load_cron_jobs();
+    let (mut jobs, parse_ok) = crate::cron::load_cron_jobs();
+    if !parse_ok {
+        return Err(ErrorShape::internal("cron.json5 has syntax errors - fix the file before patching jobs"));
+    }
 
     let job = jobs
         .iter_mut()

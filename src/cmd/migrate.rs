@@ -66,7 +66,7 @@ pub async fn cmd_migrate(args: MigrateArgs) -> Result<()> {
             handle_fresh(&rsclaw_dir, args.dry_run)?;
         }
         MigrateMode::Import => {
-            handle_import(&openclaw_dir, &rsclaw_dir, args.dry_run)?;
+            handle_import(&openclaw_dir, &rsclaw_dir, args.dry_run).await?;
         }
     }
 
@@ -93,7 +93,7 @@ fn handle_fresh(rsclaw_dir: &PathBuf, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn handle_import(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf, dry_run: bool) -> Result<()> {
+async fn handle_import(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf, dry_run: bool) -> Result<()> {
     if !openclaw_dir.is_dir() {
         err_msg("no OpenClaw data directory found to import from");
         err_msg("specify --openclaw-dir or ensure OpenClaw is installed");
@@ -132,7 +132,7 @@ fn handle_import(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf, dry_run: bool) ->
     }
 
     // Perform the actual import.
-    import_data(openclaw_dir, rsclaw_dir)?;
+    import_data(openclaw_dir, rsclaw_dir).await?;
 
     Ok(())
 }
@@ -168,11 +168,11 @@ fn show_scan_results(openclaw_dir: &PathBuf) -> Result<openclaw::OpenClawScanRes
 }
 
 /// Public entry point for setup.rs to call the unified import logic.
-pub fn import_data_from(openclaw_dir: &std::path::Path, rsclaw_dir: &std::path::Path) -> Result<()> {
-    import_data(&openclaw_dir.to_path_buf(), &rsclaw_dir.to_path_buf())
+pub async fn import_data_from(openclaw_dir: &std::path::Path, rsclaw_dir: &std::path::Path) -> Result<()> {
+    import_data(&openclaw_dir.to_path_buf(), &rsclaw_dir.to_path_buf()).await
 }
 
-fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()> {
+async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()> {
     use crate::store::redb_store::RedbStore;
 
     std::fs::create_dir_all(rsclaw_dir)?;
@@ -181,7 +181,102 @@ fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()> {
 
     let store = RedbStore::open(&redb_dir.join("data.redb"), crate::MemoryTier::Standard)?;
 
+    // Stage banners go through eprintln so they always appear, regardless
+    // of the CLI's RUST_LOG default (`warn` for non-gateway commands).
+    // Without these, the user sees only the BGE download progress bar and
+    // assumes migration finished when it ends, then waits in silence
+    // through the multi-minute embed phase.
+    eprintln!("  * Step 1/3: importing chat sessions...");
     let mut stats = openclaw::import_sessions_to_redb(openclaw_dir, &store)?;
+    eprintln!(
+        "  + sessions: {} sessions, {} messages",
+        stats.sessions, stats.messages
+    );
+
+    // Memory import: requires BGE model + async MemoryStore. Best-effort —
+    // log + warn on failure so a user without network can still complete the
+    // session import. They can re-run `rsclaw migrate` later to backfill.
+    let model_dir = rsclaw_dir.join("models/bge-small-zh");
+    let memory_data_dir = rsclaw_dir.join("var/data");
+    std::fs::create_dir_all(&memory_data_dir).ok();
+    eprintln!("  * Step 2/3: preparing embedding model...");
+    match crate::gateway::startup::ensure_bge_model_present(&model_dir, None).await {
+        Ok(()) => {
+            match crate::agent::memory::MemoryStore::open(
+                &memory_data_dir,
+                Some(&model_dir),
+                crate::MemoryTier::Standard,
+                None,
+            )
+            .await
+            {
+                Ok(mem) => {
+                    let mem_arc = std::sync::Arc::new(tokio::sync::Mutex::new(mem));
+                    eprintln!(
+                        "  * Step 3/3: indexing long-term memories (this may take a few minutes)..."
+                    );
+                    let mem_start = std::time::Instant::now();
+                    // Path 1: session-JSONL `memory_put` events (older
+                    // OpenClaw versions, pre-workspace-md storage).
+                    match openclaw::import_memories_to_store(openclaw_dir, &mem_arc).await {
+                        Ok(mstats) => {
+                            stats.memories += mstats.imported;
+                            if mstats.errors > 0 {
+                                stats.errors += mstats.errors;
+                            }
+                            if mstats.imported > 0 {
+                                eprintln!(
+                                    "  · session memories: {}/{} indexed",
+                                    mstats.imported, mstats.total
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "openclaw session memory import failed");
+                            stats.errors += 1;
+                        }
+                    }
+                    // Path 2: workspace MEMORY.md + memory/*.md (the actual
+                    // long-term memory store every modern OpenClaw user has).
+                    // Copies files onto disk AND ingests text via add_off_lock.
+                    match openclaw::import_workspace_memory(openclaw_dir, rsclaw_dir, &mem_arc)
+                        .await
+                    {
+                        Ok(mstats) => {
+                            stats.memories += mstats.imported;
+                            if mstats.errors > 0 {
+                                stats.errors += mstats.errors;
+                            }
+                            if mstats.imported > 0 {
+                                eprintln!(
+                                    "  · workspace memories: {}/{} indexed",
+                                    mstats.imported, mstats.total
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "openclaw workspace memory import failed");
+                            stats.errors += 1;
+                        }
+                    }
+                    eprintln!(
+                        "  + memory indexed in {:.1}s",
+                        mem_start.elapsed().as_secs_f32()
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not open MemoryStore for memory import; skipping");
+                    stats.errors += 1;
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "BGE model unavailable; skipping memory import. Re-run `rsclaw migrate` after fixing network or placing model files manually."
+            );
+        }
+    }
 
     // --- Import workspace files and skills ---
     let config_path = openclaw_dir.join("openclaw.json");
@@ -222,9 +317,15 @@ fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()> {
                 if let Some(obj) = defaults.as_object_mut() {
                     // Remove openclaw-specific fields.
                     obj.remove("memorySearch");
-                    // Set rsclaw defaults.
-                    obj.insert("workspace".to_owned(),
-                        serde_json::Value::String("~/.rsclaw/workspace".to_owned()));
+                    // Set rsclaw defaults. Use the actual rsclaw_dir so a
+                    // `--dev` migration writes paths into the dev profile,
+                    // not the prod ~/.rsclaw.
+                    obj.insert(
+                        "workspace".to_owned(),
+                        serde_json::Value::String(
+                            rsclaw_dir.join("workspace").to_string_lossy().into_owned(),
+                        ),
+                    );
                     obj.insert("compaction".to_owned(),
                         serde_json::json!({"mode": "layered"}));
                 }
@@ -258,8 +359,15 @@ fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()> {
                             .to_owned();
                         obj.remove("agentDir");
                         if obj.contains_key("workspace") {
-                            obj.insert("workspace".to_owned(),
-                                serde_json::Value::String(format!("~/.rsclaw/workspace-{agent_id}")));
+                            obj.insert(
+                                "workspace".to_owned(),
+                                serde_json::Value::String(
+                                    rsclaw_dir
+                                        .join(format!("workspace-{agent_id}"))
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                ),
+                            );
                         }
                         // Inject channels from bindings.
                         if let Some(chs) = agent_channels.get(&agent_id) {
@@ -464,15 +572,47 @@ fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()> {
         }
     }
 
-    // --- Migrate feishu allowFrom to channel config ---
-    let allow_from_path = openclaw_dir.join("credentials/feishu-main-bot-allowFrom.json");
-    if allow_from_path.is_file() {
-        if let Ok(data) = std::fs::read_to_string(&allow_from_path) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
-                if let Some(allow_from) = val.get("allowFrom").and_then(|v| v.as_array()) {
-                    if !allow_from.is_empty() {
-                        item("*", &format!("{} feishu allowFrom entries found (add to channels.feishu.allowFrom in config)", allow_from.len()));
-                    }
+    // --- Migrate per-channel allowFrom credential files. OpenClaw stores
+    // approved peers in `<openclaw>/credentials/<channel>-<account>-allowFrom.json`;
+    // rsclaw uses the same format under `<rsclaw>/credentials/`, so a
+    // straight file copy lights up the existing trust list on first run.
+    let oc_creds = openclaw_dir.join("credentials");
+    let rs_creds = rsclaw_dir.join("credentials");
+    if oc_creds.is_dir() {
+        if let Err(e) = std::fs::create_dir_all(&rs_creds) {
+            warn_msg(&format!("failed to create credentials dir: {e}"));
+        } else if let Ok(entries) = std::fs::read_dir(&oc_creds) {
+            for entry in entries.flatten() {
+                let src = entry.path();
+                let Some(name) = src.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !name.ends_with("-allowFrom.json") {
+                    continue;
+                }
+                let count = std::fs::read_to_string(&src)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| {
+                        v.get("allowFrom")
+                            .and_then(|a| a.as_array())
+                            .map(|a| a.len())
+                    })
+                    .unwrap_or(0);
+                if count == 0 {
+                    continue;
+                }
+                let dst = rs_creds.join(name);
+                if dst.exists() {
+                    item(
+                        " ",
+                        &format!("allowFrom: {name} already at target, skipping"),
+                    );
+                    continue;
+                }
+                match std::fs::copy(&src, &dst) {
+                    Ok(_) => item("*", &format!("allowFrom migrated: {name} ({count} entries)")),
+                    Err(e) => warn_msg(&format!("allowFrom copy failed for {name}: {e}")),
                 }
             }
         }

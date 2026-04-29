@@ -6305,7 +6305,7 @@ dependencies = [
 
 [[package]]
 name = "rsclaw"
-version = "2026.4.26"
+version = "2026.4.28"
 dependencies = [
  "aes",
  "anycli",
@@ -6339,6 +6339,7 @@ dependencies = [
  "hnsw_rs",
  "htmd",
  "image",
+ "indicatif",
  "json5",
  "lark-websocket-protobuf",
  "libc",
@@ -6356,6 +6357,7 @@ dependencies = [
  "qrcode",
  "rand 0.9.2",
  "ratatui",
+ "rayon",
  "redb",
  "regex",
  "reqwest",
@@ -6390,6 +6392,7 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "which 7.0.3",
+ "winapi",
  "wiremock",
  "xz2",
  "zip 2.4.2",

@@ -2552,8 +2552,38 @@ function _Chat() {
                   </span>
                   <button
                     className={styles["pending-queue-clear"]}
-                    onClick={() => setPendingQueue([])}
-                    title={getLang() === "cn" ? "清除队列" : "Clear queue"}
+                    onClick={() => {
+                      // Restore queued content back to the input area instead
+                      // of dropping it. Texts join with double-newlines;
+                      // images and file refs are merged into current
+                      // attachments. User can then edit, send, or discard.
+                      const queuedText = pendingQueue
+                        .map((q) => q.text)
+                        .filter((t) => t.trim().length > 0)
+                        .join("\n\n");
+                      const queuedImages = pendingQueue.flatMap((q) => q.images);
+                      const queuedRefs = pendingQueue.flatMap((q) => q.fileRefs);
+                      setUserInput((prev) =>
+                        prev
+                          ? queuedText
+                            ? `${prev}\n\n${queuedText}`
+                            : prev
+                          : queuedText,
+                      );
+                      if (queuedImages.length > 0) {
+                        setAttachImages((prev) => [...prev, ...queuedImages]);
+                      }
+                      if (queuedRefs.length > 0) {
+                        setFileRefs((prev) => [...prev, ...queuedRefs]);
+                      }
+                      setPendingQueue([]);
+                      if (!isMobileScreen) inputRef.current?.focus();
+                    }}
+                    title={
+                      getLang() === "cn"
+                        ? "取回队列内容到输入框"
+                        : "Restore queued content to input"
+                    }
                   >
                     <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
                       <path
@@ -2643,6 +2673,58 @@ function _Chat() {
                       );
                     })}
                   </div>
+                )}
+                {isStreaming && (
+                  <IconButton
+                    icon={<BreakIcon />}
+                    text={getLang() === "cn" ? "强制" : "Force"}
+                    className={styles["chat-input-send"]}
+                    type="danger"
+                    title={
+                      getLang() === "cn"
+                        ? "强制停止当前回复并立即发送"
+                        : "Abort current reply and force-send"
+                    }
+                    onClick={() => {
+                      // Force path: kill the (possibly stuck) in-flight turn
+                      // first, then submit the input directly without going
+                      // through the staging queue. Mirrors ChatActions.stopAll
+                      // since stopAll is scoped to the sibling component.
+                      ChatControllerPool.stopAll();
+                      try {
+                        const { rsclawWs } = require("../lib/rsclaw-ws");
+                        const agentId = (session as any).agentId || "main";
+                        const sessionKey = `desktop:${agentId}:${session.id}`;
+                        rsclawWs
+                          .send("chat.abort", { sessionKey })
+                          .catch(() => {});
+                      } catch {
+                        /* WS unavailable — local cleanup still runs below */
+                      }
+                      chatStore.updateTargetSession(session, (s) => {
+                        s.messages.forEach((m) => {
+                          if (m.streaming) m.streaming = false;
+                        });
+                      });
+                      // Defer one tick so the streaming flag flips before we
+                      // dispatch the new turn.
+                      setTimeout(() => {
+                        if (
+                          userInput.trim() === "" &&
+                          isEmpty(attachImages) &&
+                          fileRefs.length === 0
+                        )
+                          return;
+                        dispatchToStore(userInput, attachImages, fileRefs);
+                        setAttachImages([]);
+                        setFileRefs([]);
+                        setUserInput("");
+                        setPromptHints([]);
+                        if (!isMobileScreen) inputRef.current?.focus();
+                        setAutoScroll(true);
+                      }, 0);
+                    }}
+                  />
                 )}
                 <IconButton
                   icon={<SendWhiteIcon />}

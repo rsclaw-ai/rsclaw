@@ -1,6 +1,6 @@
 [package]
 name = "rsclaw"
-version = "2026.4.26"
+version = "2026.4.28"
 edition = "2024"
 rust-version = "1.91"
 description = "AI Agent Engine Compatible with OpenClaw"
@@ -75,6 +75,8 @@ dashmap = "6"
 dirs-next = "2"
 console = "0.16"
 tempfile  = "3"
+indicatif = "0.17"
+rayon     = "1"
 libc = "0.2"
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 futures = "0.3"
@@ -150,3 +152,6 @@ tokio-test = "0.4"
 tempfile   = "3"
 wiremock = "0.6"
 ctor = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["handleapi", "processthreadsapi", "winnt"] }

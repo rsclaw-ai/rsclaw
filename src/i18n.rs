@@ -264,6 +264,110 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "de" => "Binärdatei",
     );
 
+    msg!("session_cleared",
+        "en" => "Session cleared.",
+        "zh" => "会话已清除。",
+        "th" => "ล้างเซสชันแล้ว",
+        "vi" => "Phien lam viec da xoa.",
+        "ja" => "セッションをクリアしました。",
+        "es" => "Sesion borrada.",
+        "ko" => "세션이 삭제되었습니다.",
+        "ru" => "Сессия очищена.",
+        "fr" => "Session effacée.",
+        "de" => "Sitzung gelöscht.",
+    );
+
+    msg!("session_reset",
+        "en" => "Session reset.",
+        "zh" => "会话已重置。",
+        "th" => "รีเซ็ตเซสชันแล้ว",
+        "vi" => "Phien lam viec da dat lai.",
+        "ja" => "セッションをリセットしました。",
+        "es" => "Sesion restablecida.",
+        "ko" => "세션이 재설정되었습니다.",
+        "ru" => "Сессия сброшена.",
+        "fr" => "Session réinitialisée.",
+        "de" => "Sitzung zurückgesetzt.",
+    );
+
+    msg!("session_new",
+        "en" => "New session started.",
+        "zh" => "已开启新会话。",
+        "th" => "เริ่มเซสชันใหม่แล้ว",
+        "vi" => "Da bat dau phien moi.",
+        "ja" => "新しいセッションを開始しました。",
+        "es" => "Nueva sesion iniciada.",
+        "ko" => "새 세션이 시작되었습니다.",
+        "ru" => "Начата новая сессия.",
+        "fr" => "Nouvelle session démarrée.",
+        "de" => "Neue Sitzung gestartet.",
+    );
+
+    msg!("compact_done",
+        "en" => "✓ Session compacted and saved to memory.",
+        "zh" => "✓ 会话已压缩并保存到记忆。",
+        "th" => "✓ บีบอัดเซสชันและบันทึกลงหน่วยความจำแล้ว",
+        "vi" => "✓ Da nen phien va luu vao bo nho.",
+        "ja" => "✓ セッションを圧縮して記憶に保存しました。",
+        "es" => "✓ Sesion compactada y guardada en memoria.",
+        "ko" => "✓ 세션이 압축되어 메모리에 저장되었습니다.",
+        "ru" => "✓ Сессия сжата и сохранена в память.",
+        "fr" => "✓ Session compactée et sauvegardée en mémoire.",
+        "de" => "✓ Sitzung komprimiert und im Speicher gespeichert.",
+    );
+
+    msg!("compact_done_no_summary",
+        "en" => "✓ Session compacted (no summary to save).",
+        "zh" => "✓ 会话已压缩（无摘要可保存）。",
+        "th" => "✓ บีบอัดเซสชันแล้ว (ไม่มีสรุปให้บันทึก)",
+        "vi" => "✓ Da nen phien (khong co tom tat de luu).",
+        "ja" => "✓ セッションを圧縮しました（保存する要約なし）。",
+        "es" => "✓ Sesion compactada (sin resumen que guardar).",
+        "ko" => "✓ 세션이 압축되었습니다 (저장할 요약 없음).",
+        "ru" => "✓ Сессия сжата (нет резюме для сохранения).",
+        "fr" => "✓ Session compactée (aucun résumé à sauvegarder).",
+        "de" => "✓ Sitzung komprimiert (keine Zusammenfassung zu speichern).",
+    );
+
+    msg!("compact_nothing",
+        "en" => "Nothing to compact.",
+        "zh" => "无需压缩。",
+        "th" => "ไม่มีสิ่งที่ต้องบีบอัด",
+        "vi" => "Khong co gi de nen.",
+        "ja" => "圧縮するものはありません。",
+        "es" => "Nada que compactar.",
+        "ko" => "압축할 항목이 없습니다.",
+        "ru" => "Нечего сжимать.",
+        "fr" => "Rien à compacter.",
+        "de" => "Nichts zu komprimieren.",
+    );
+
+    msg!("screenshot_failed",
+        "en" => "screenshot failed",
+        "zh" => "截图失败",
+        "th" => "จับภาพหน้าจอล้มเหลว",
+        "vi" => "Chup man hinh that bai",
+        "ja" => "スクリーンショットに失敗しました",
+        "es" => "captura de pantalla fallida",
+        "ko" => "스크린샷 실패",
+        "ru" => "не удалось сделать снимок экрана",
+        "fr" => "échec de la capture d'écran",
+        "de" => "Bildschirmfoto fehlgeschlagen",
+    );
+
+    msg!("webshot_failed",
+        "en" => "webshot failed for {url}",
+        "zh" => "网页截图失败：{url}",
+        "th" => "เว็บช็อตล้มเหลวสำหรับ {url}",
+        "vi" => "Chup web that bai cho {url}",
+        "ja" => "{url} のウェブショットに失敗しました",
+        "es" => "captura web fallida para {url}",
+        "ko" => "{url}의 웹샷 실패",
+        "ru" => "не удалось сделать веб-снимок для {url}",
+        "fr" => "échec de la capture web pour {url}",
+        "de" => "Webshot fehlgeschlagen für {url}",
+    );
+
     msg!("analyzing",
         "en" => "Analyzing file content...",
         "zh" => "正在分析文件内容...",
@@ -2169,33 +2273,11 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "ru" => "ID сессии: {id}\nЗаголовок: {title}",
     );
 
-    // -- Tool / model auto-download notifications --
-    msg!("bge_model_downloaded",
-        "en" => "[system] BGE embedding model downloaded. Please restart gateway to enable semantic memory search.",
-        "zh" => "[系统] BGE 向量模型下载完成，请重启 gateway 以启用语义搜索。",
-        "ja" => "[システム] BGE埋め込みモデルのダウンロードが完了しました。セマンティック検索を有効にするにはゲートウェイを再起動してください。",
-    );
-    msg!("bge_model_download_failed",
-        "en" => "[system] BGE model download failed: {error}\nRun `rsclaw models download` or download from https://gitfast.io",
-        "zh" => "[系统] BGE 模型下载失败: {error}\n请运行 `rsclaw models download` 或从 https://gitfast.io 下载",
-        "ja" => "[システム] BGEモデルのダウンロードに失敗: {error}\n`rsclaw models download` を実行するか https://gitfast.io からダウンロードしてください",
-    );
-
     // -- Restart-required banner messages (shown to UI as RestartRequest) --
     msg!("restart_required_config_changed",
         "en" => "Configuration changed. Restart gateway to apply.",
         "zh" => "配置已更改，请重启 gateway 以生效。",
         "ja" => "設定が変更されました。ゲートウェイを再起動して適用してください。",
-    );
-    msg!("restart_required_model_downloaded",
-        "en" => "Embedding model downloaded. Restart gateway to enable semantic memory search.",
-        "zh" => "向量模型下载完成，请重启 gateway 以启用语义搜索。",
-        "ja" => "埋め込みモデルのダウンロードが完了しました。セマンティック検索を有効にするにはゲートウェイを再起動してください。",
-    );
-    msg!("restart_model_download_failed",
-        "en" => "Embedding model download failed: {error}",
-        "zh" => "向量模型下载失败: {error}",
-        "ja" => "埋め込みモデルのダウンロードに失敗: {error}",
     );
     msg!("tool_missing",
         "en" => "[system] {tool} not found. Run `rsclaw tools install {tool}`, or download from https://gitfast.io",

@@ -2793,11 +2793,11 @@ fn validate_file_id(file_id: &str) -> Result<(), Response> {
     Ok(())
 }
 
-/// Directory where uploaded files are stored.
+/// Directory where uploaded files are stored. Routes through
+/// `config::loader::base_dir()` so `--dev` / `--profile` / `RSCLAW_BASE_DIR`
+/// land uploads in the matching profile dir, not always `~/.rsclaw/`.
 fn files_dir() -> std::path::PathBuf {
-    dirs_next::home_dir()
-        .unwrap_or_default()
-        .join(".rsclaw/var/data/files")
+    crate::config::loader::base_dir().join("var/data/files")
 }
 
 /// File metadata stored alongside each uploaded file.
