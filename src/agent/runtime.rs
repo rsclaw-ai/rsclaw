@@ -291,6 +291,9 @@ pub struct RunContext {
     pub recalled_memory_ids: std::collections::HashSet<String>,
     /// Whether a loop-detection warning was triggered during this turn.
     pub loop_warning_triggered: bool,
+    /// Count of consecutive `python -c` inline execution failures.
+    /// Used to guide LLM to switch to file-based execution for easier debugging.
+    pub python_inline_streak: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,6 +1722,7 @@ impl AgentRuntime {
                             parse_error_count: 0,
                             recalled_memory_ids: std::collections::HashSet::new(),
                             loop_warning_triggered: false,
+                            python_inline_streak: 0,
                         },
                         "",
                         &tool,
@@ -2543,6 +2547,7 @@ impl AgentRuntime {
             parse_error_count: 0,
             recalled_memory_ids: auto_recalled_ids,
             loop_warning_triggered: false,
+            python_inline_streak: 0,
         };
 
         // --- Plugins & Skills: cached, frozen at session start ---
@@ -4453,6 +4458,14 @@ const MAX_ERROR_STREAK: usize = 5;
                 )
                 .await;
 
+                // [方案 E] Check python -c complexity BEFORE execution result processing
+                // Warn about complex inline Python to encourage file-based approach
+                let command_for_check = tool_input.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                let is_complex_python_inline = (command_for_check.starts_with("python -c")
+                    || command_for_check.starts_with("python3 -c")
+                    || command_for_check.starts_with("py -c"))
+                    && command_for_check.len() > 200;
+
                 let tool_input_str = tool_input.to_string();
                 let result = self
                     .dispatch_tool(ctx, &tool_id, &tool_name, tool_input)
@@ -4503,6 +4516,8 @@ const MAX_ERROR_STREAK: usize = 5;
                         } else {
                             error_streak = 0;
                             last_error_info = None;
+                            // Reset python_inline_streak on successful execution
+                            ctx.python_inline_streak = 0;
                         }
                         // Record result for progress-aware loop detection.
                         // Same args + different results = making progress, not a loop.
@@ -4569,6 +4584,16 @@ const MAX_ERROR_STREAK: usize = 5;
                             let stdout_text = v.get("stdout").and_then(|s| s.as_str()).unwrap_or("");
                             let command_text = v.get("command").and_then(|s| s.as_str()).unwrap_or("");
 
+                            // Detect python -c inline execution
+                            let is_python_inline = command_text.starts_with("python -c")
+                                || command_text.starts_with("python3 -c")
+                                || command_text.starts_with("py -c");
+
+                            // Track python_inline streak for better guidance
+                            if is_python_inline {
+                                ctx.python_inline_streak += 1;
+                            }
+
                             // Detect Python syntax errors
                             let is_python_syntax_error = stderr_text.contains("SyntaxError")
                                 || stderr_text.contains("IndentationError")
@@ -4593,10 +4618,99 @@ const MAX_ERROR_STREAK: usize = 5;
 
                             let remaining = MAX_ERROR_STREAK.saturating_sub(error_streak);
 
+                            // Enhanced Python error diagnosis - extract line number and context
+                            let (error_line, error_context) = if is_python_syntax_error {
+                                // Parse stderr for line number and error context
+                                let line_num = stderr_text.lines()
+                                    .find_map(|line| {
+                                        // Patterns: "line X" or "File "...", line X"
+                                        let patterns = ["line ", "Line ", "line:"];
+                                        for pat in patterns {
+                                            if line.contains(pat) {
+                                                if let Some(pos) = line.find(pat) {
+                                                    let after = &line[pos + pat.len()..];
+                                                    if let Some(num_str) = after.split(|c: char| !c.is_numeric()).next() {
+                                                        if let Ok(n) = num_str.parse::<u32>() {
+                                                            return Some(n);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        None
+                                    });
+                                // Extract error context line (the ^ pointer line)
+                                let context = stderr_text.lines()
+                                    .skip_while(|l| !l.trim().starts_with('^'))
+                                    .next()
+                                    .map(|l| l.trim())
+                                    .unwrap_or("");
+                                (line_num, context)
+                            } else {
+                                (None, "")
+                            };
+
                             let hint = if remaining == 0 {
                                 "[Warning] Tool execution failed consecutively. This session will end. Please summarize the methods you tried and the errors encountered.".to_owned()
+                            } else if is_python_inline && ctx.python_inline_streak >= 2 {
+                                // [方案 B] Guide LLM to use file-based execution after 2+ inline failures
+                                // [方案 C] Force reflection for repeated python -c attempts
+                                let base_hint = if is_python_syntax_error {
+                                    let error_type = if stderr_text.contains("SyntaxError") { "Syntax Error" }
+                                    else if stderr_text.contains("IndentationError") || stderr_text.contains("TabError") { "Indentation Error" }
+                                    else if stderr_text.contains("NameError") { "Name Error (undefined variable)" }
+                                    else if stderr_text.contains("ImportError") || stderr_text.contains("ModuleNotFoundError") { "Import Error (missing module)" }
+                                    else if stderr_text.contains("TypeError") { "Type Error" }
+                                    else if stderr_text.contains("ValueError") { "Value Error" }
+                                    else if stderr_text.contains("AttributeError") { "Attribute Error" }
+                                    else if stderr_text.contains("KeyError") { "Key Error" }
+                                    else if stderr_text.contains("IndexError") { "Index Error" }
+                                    else if stderr_text.contains("ZeroDivisionError") { "Zero Division Error" }
+                                    else { "Runtime Error" };
+
+                                    let line_info = error_line.map(|n| format!(" at line {}", n)).unwrap_or_default();
+                                    let pointer_info = if !error_context.is_empty() {
+                                        format!(" (error position: '{}')", error_context)
+                                    } else { String::new() };
+
+                                    format!(
+                                        "[Python Inline Execution Failed] {}{}\n\
+                                        Error type: {}{}\n\n\
+                                        [STOP AND REFLECT] You have tried 'python -c' {} times without success.\n\
+                                        Inline Python is hard to debug because you must rewrite the entire command.\n\n\
+                                        [RECOMMENDED APPROACH]\n\
+                                        1. Use write_file to save your code: write_file('debug.py', 'your code here')\n\
+                                        2. Run the file: execute_command('python debug.py')\n\
+                                        3. When errors occur, use read_file to view the code, then write_file to fix specific lines\n\
+                                        4. This is MUCH easier than rewriting python -c commands\n\n\
+                                        stderr:\n{}\n\n\
+                                        You have {} attempts left. Switch to file-based execution NOW.",
+                                        error_type, line_info, error_type, pointer_info,
+                                        ctx.python_inline_streak,
+                                        stderr_text.lines().take(8).collect::<Vec<_>>().join("\n"),
+                                        remaining
+                                    )
+                                } else {
+                                    format!(
+                                        "[Python Inline Execution Failed] (attempt {}/{})\n\
+                                        [STOP AND REFLECT] You have tried 'python -c' {} times without success.\n\
+                                        Inline Python debugging is difficult - you must rewrite the entire command each time.\n\n\
+                                        [RECOMMENDED APPROACH]\n\
+                                        1. Use write_file to save your code: write_file('script.py', 'your code here')\n\
+                                        2. Run the file: execute_command('python script.py')\n\
+                                        3. Fix errors by editing specific lines with write_file\n\
+                                        4. This approach is more stable and easier to iterate\n\n\
+                                        stderr:\n{}\n\n\
+                                        You have {} attempts left. Switch to file-based execution NOW.",
+                                        error_streak, MAX_ERROR_STREAK,
+                                        ctx.python_inline_streak,
+                                        stderr_text.lines().take(8).collect::<Vec<_>>().join("\n"),
+                                        remaining
+                                    )
+                                };
+                                base_hint
                             } else if is_python_syntax_error {
-                                // Python error - specific guidance
+                                // [方案 D] Enhanced Python error diagnosis
                                 let error_type = if stderr_text.contains("SyntaxError") { "Syntax Error" }
                                 else if stderr_text.contains("IndentationError") || stderr_text.contains("TabError") { "Indentation Error" }
                                 else if stderr_text.contains("NameError") { "Name Error (undefined variable)" }
@@ -4604,19 +4718,43 @@ const MAX_ERROR_STREAK: usize = 5;
                                 else if stderr_text.contains("TypeError") { "Type Error" }
                                 else if stderr_text.contains("ValueError") { "Value Error" }
                                 else if stderr_text.contains("AttributeError") { "Attribute Error" }
+                                else if stderr_text.contains("KeyError") { "Key Error" }
+                                else if stderr_text.contains("IndexError") { "Index Error" }
+                                else if stderr_text.contains("ZeroDivisionError") { "Zero Division Error" }
                                 else { "Runtime Error" };
 
+                                let line_info = error_line.map(|n| format!(" at line {}", n)).unwrap_or_default();
+                                let pointer_info = if !error_context.is_empty() {
+                                    format!(" (error position indicator: '{}')", error_context)
+                                } else { String::new() };
+
+                                let specific_fix = match error_type {
+                                    "Syntax Error" => "Check for: missing parentheses, quotes, commas, or invalid syntax around the error line.",
+                                    "Indentation Error" => "Check for: inconsistent indentation (mix of tabs/spaces) or missing indentation.",
+                                    "Name Error" => "Check for: undefined variable name. Did you misspell it or forget to define it?",
+                                    "Import Error" => "Check for: missing module. Install with pip or check module name spelling.",
+                                    "Type Error" => "Check for: wrong type passed to function (e.g. string to int operation).",
+                                    "Value Error" => "Check for: invalid value (e.g. int('abc'), negative index).",
+                                    "Attribute Error" => "Check for: method/property does not exist on object type.",
+                                    "Key Error" => "Check for: dictionary key does not exist. Use .get(key) for safe access.",
+                                    "Index Error" => "Check for: list index out of range. Verify list length before accessing.",
+                                    "Zero Division Error" => "Check for: division by zero. Add check before division.",
+                                    _ => "Read the error message carefully for the specific issue."
+                                };
+
                                 format!(
-                                    "[Python Error Fix Hint] Detected {} (attempt {}/{}).\n\
-                                    stderr shows: {}\n\n\
+                                    "[Python Error Fix Hint] Detected {}{}\n\
+                                    Error type: {}{}\n\
+                                    Specific fix: {}\n\n\
                                     [Required Fix Steps]\n\
-                                    1. Analyze error: Read stderr carefully, find the line number and cause\n\
-                                    2. Modify code: You MUST call write_file or edit command to fix the error\n\
-                                    3. Re-execute: After fixing, you MUST call execute_command to run the fixed code\n\
-                                    \n\
-                                    Do not claim 'fixed' without actually calling a tool. You have {} attempts left.",
-                                    error_type, error_streak, MAX_ERROR_STREAK,
-                                    stderr_text.lines().take(5).collect::<Vec<_>>().join("\n"),
+                                    1. Read stderr carefully - find line number and error type\n\
+                                    2. If using python -c: consider write_file + execute_command for easier debugging\n\
+                                    3. Fix the specific error at the indicated line\n\
+                                    4. Re-run the command after fix\n\n\
+                                    stderr:\n{}\n\n\
+                                    You have {} attempts left.",
+                                    error_type, line_info, error_type, pointer_info, specific_fix,
+                                    stderr_text.lines().take(6).collect::<Vec<_>>().join("\n"),
                                     remaining
                                 )
                             } else if is_shell_error {
@@ -4647,6 +4785,24 @@ const MAX_ERROR_STREAK: usize = 5;
                                 serde_json::Value::Object(obj) => {
                                     let mut modified = obj.clone();
                                     modified.insert("_error_hint".to_owned(), json!(hint));
+                                    serde_json::Value::Object(modified)
+                                }
+                                other => other.clone()
+                            }
+                        } else if is_complex_python_inline {
+                            // [方案 E] Warn about complex inline Python even on success
+                            // Encourage file-based approach for easier debugging in future
+                            let complexity_hint = "[Complex Inline Python Notice] Your 'python -c' command is over 200 characters.\n\
+                            For complex scripts, using file-based execution is recommended:\n\
+                            1. write_file('script.py', 'your code') - easier to view and modify\n\
+                            2. execute_command('python script.py') - clearer error messages with line numbers\n\
+                            3. read_file('script.py') + write_file('script.py', 'fixed code') - iterative debugging\n\
+                            \n\
+                            Inline Python is fine for simple one-liners, but files are much easier for debugging complex code.";
+                            match &v {
+                                serde_json::Value::Object(obj) => {
+                                    let mut modified = obj.clone();
+                                    modified.insert("_complexity_hint".to_owned(), json!(complexity_hint));
                                     serde_json::Value::Object(modified)
                                 }
                                 other => other.clone()
