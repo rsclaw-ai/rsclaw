@@ -37,16 +37,38 @@ pub struct SlackChannel {
     api_base: String,
     client: Client,
     retry: RetryConfig,
-    on_message: Arc<dyn Fn(String, String, String, bool) + Send + Sync>,
-    // (peer_id/user_id, text, channel_id, is_channel)
+    #[allow(clippy::type_complexity)]
+    on_message: Arc<
+        dyn Fn(
+                String,
+                String,
+                String,
+                bool,
+                Vec<crate::agent::registry::ImageAttachment>,
+                Vec<crate::agent::registry::FileAttachment>,
+            ) + Send
+            + Sync,
+    >,
+    // (user_id, text, channel_id, is_channel, images, files)
 }
 
 impl SlackChannel {
+    #[allow(clippy::type_complexity)]
     pub fn new(
         bot_token: impl Into<String>,
         app_token: Option<String>,
         api_base: Option<String>,
-        on_message: Arc<dyn Fn(String, String, String, bool) + Send + Sync>,
+        on_message: Arc<
+            dyn Fn(
+                    String,
+                    String,
+                    String,
+                    bool,
+                    Vec<crate::agent::registry::ImageAttachment>,
+                    Vec<crate::agent::registry::FileAttachment>,
+                ) + Send
+                + Sync,
+        >,
     ) -> Self {
         Self {
             bot_token: bot_token.into(),
@@ -157,13 +179,19 @@ impl SlackChannel {
             .ok_or_else(|| anyhow::anyhow!("getUploadURLExternal: no file_id"))?
             .to_owned();
 
-        // Step 2: PUT bytes (Slack accepts POST too) — no auth header, the
-        // upload_url is signed.
+        // Step 2: POST the file as multipart form — Slack's signed
+        // upload_url expects a `file=` field. Earlier raw-body POST
+        // returned HTTP 200 but produced a 0-byte attachment in the
+        // channel ("uploaded but blank" symptom).
+        let part = reqwest::multipart::Part::bytes(bytes.to_vec())
+            .file_name(filename.to_owned())
+            .mime_str(mime)
+            .map_err(|e| anyhow::anyhow!("build upload multipart: {e}"))?;
+        let form = reqwest::multipart::Form::new().part("file", part);
         let put = self
             .client
             .post(upload_url)
-            .header("content-type", mime)
-            .body(bytes.to_vec())
+            .multipart(form)
             .send()
             .await
             .context("upload_url POST")?;
@@ -172,6 +200,8 @@ impl SlackChannel {
             let b = put.text().await.unwrap_or_default();
             bail!("upload_url returned {s}: {b}");
         }
+        let put_body = put.text().await.unwrap_or_default();
+        info!(filename, len = bytes.len(), resp = %put_body, "slack: upload step 2 done");
 
         // Step 3: complete + share to channel.
         let payload = json!({
@@ -326,7 +356,13 @@ impl SlackChannel {
                             .map(|t| t == "channel" || t == "group")
                             .unwrap_or(false);
 
-                        // Process file attachments
+                        // Process file attachments. Images go into `images`
+                        // so the runtime hands them to the vision model AND
+                        // pending_files (analyze vs save) can fire. Other
+                        // files go into `file_attachments` for the same
+                        // reason. Audio/video still get inline-transcribed.
+                        let mut images: Vec<crate::agent::registry::ImageAttachment> = Vec::new();
+                        let mut file_attachments: Vec<crate::agent::registry::FileAttachment> = Vec::new();
                         if let Some(files) = event["files"].as_array() {
                             for file in files {
                                 let url = file["url_private_download"].as_str().unwrap_or("");
@@ -360,10 +396,25 @@ impl SlackChannel {
                                             }
                                         }
                                     } else if mimetype.starts_with("image/") {
-                                        if !text.is_empty() { text.push('\n'); }
-                                        text.push_str(&crate::i18n::t("image_file_received", crate::i18n::default_lang()));
+                                        use base64::Engine as _;
+                                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                        let mime = if mimetype.is_empty() { "image/png" } else { mimetype };
+                                        images.push(crate::agent::registry::ImageAttachment {
+                                            data: format!("data:{mime};base64,{b64}"),
+                                            mime_type: mime.to_owned(),
+                                        });
+                                        info!(size = bytes.len(), %filename, "Slack: image forwarded for vision");
                                     } else {
                                         let processed = slack_process_file(filename, &bytes);
+                                        file_attachments.push(crate::agent::registry::FileAttachment {
+                                            filename: filename.to_owned(),
+                                            data: bytes.clone(),
+                                            mime_type: if mimetype.is_empty() {
+                                                "application/octet-stream".to_owned()
+                                            } else {
+                                                mimetype.to_owned()
+                                            },
+                                        });
                                         if !text.is_empty() { text.push('\n'); }
                                         text.push_str(&processed);
                                     }
@@ -374,15 +425,17 @@ impl SlackChannel {
                             }
                         }
 
-                        if !user.is_empty() && !text.is_empty() {
+                        if !user.is_empty() && (!text.is_empty() || !images.is_empty() || !file_attachments.is_empty()) {
                             info!(
                                 user = %user,
                                 channel = %channel,
                                 etype = %etype,
                                 len = text.len(),
+                                imgs = images.len(),
+                                files = file_attachments.len(),
                                 "Slack: dispatching message"
                             );
-                            (self.on_message)(user, text, channel, is_channel);
+                            (self.on_message)(user, text, channel, is_channel, images, file_attachments);
                         } else {
                             warn!(
                                 user_empty = user.is_empty(),
@@ -619,7 +672,7 @@ mod tests {
     #[test]
     fn channel_name() {
         init_crypto();
-        let ch = SlackChannel::new("xoxb-token", None, None, Arc::new(|_, _, _, _| {}));
+        let ch = SlackChannel::new("xoxb-token", None, None, Arc::new(|_, _, _, _, _, _| {}));
         assert_eq!(ch.name(), "slack");
     }
 }

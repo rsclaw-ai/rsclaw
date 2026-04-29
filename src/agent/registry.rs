@@ -177,7 +177,7 @@ pub struct ImageAttachment {
 }
 
 /// A file attachment sent by the user (raw bytes, not yet processed).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileAttachment {
     pub filename: String,
     pub data: Vec<u8>,
