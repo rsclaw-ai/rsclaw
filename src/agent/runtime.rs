@@ -1300,7 +1300,7 @@ impl AgentRuntime {
                             };
                             self.sessions.insert(session_key.to_owned(), vec![msg]);
                         }
-                        "Session cleared.".to_owned()
+                        crate::i18n::t("session_cleared", crate::i18n::default_lang()).to_owned()
                     }
                     "__COMPACT__" => {
                         // Manual compaction: force compress + save summary to memory.
@@ -1349,12 +1349,12 @@ impl AgentRuntime {
                                         Err(e) => warn!("compact: failed to save to memory: {e}"),
                                     }
                                 }
-                                "✓ Session compacted and saved to memory.".to_owned()
+                                crate::i18n::t("compact_done", crate::i18n::default_lang()).to_owned()
                             } else {
-                                "✓ Session compacted (no summary to save).".to_owned()
+                                crate::i18n::t("compact_done_no_summary", crate::i18n::default_lang()).to_owned()
                             }
                         } else {
-                            "Nothing to compact.".to_owned()
+                            crate::i18n::t("compact_nothing", crate::i18n::default_lang()).to_owned()
                         }
                     }
                     "__ABORT__" => {
@@ -1375,7 +1375,7 @@ impl AgentRuntime {
                         let _ = self.store.db.delete_session(&key);
                         self.voice_mode_sessions.remove(&key);
                         self.handle.remove_session_tokens(&key);
-                        "Session reset.".to_owned()
+                        crate::i18n::t("session_reset", crate::i18n::default_lang()).to_owned()
                     }
                     "__TEXT_MODE__" => {
                         self.voice_mode_sessions.remove(session_key);

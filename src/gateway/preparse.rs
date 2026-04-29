@@ -88,7 +88,7 @@ pub(crate) async fn try_preparse_locally(
         drop(flags);
         // 2. Signal runtime to clear sessions at next opportunity
         handle.clear_signal.store(true, Ordering::SeqCst);
-        return Some(txt("Session cleared.".to_owned()));
+        return Some(txt(crate::i18n::t("session_cleared", crate::i18n::default_lang()).to_owned()));
     }
     // /new — start a fresh conversation (new generation, no summary)
     if lower == "/new" {
@@ -96,7 +96,7 @@ pub(crate) async fn try_preparse_locally(
         for f in flags.values() { f.store(true, Ordering::SeqCst); }
         drop(flags);
         handle.new_session_signal.store(true, Ordering::SeqCst);
-        return Some(txt("New session started.".to_owned()));
+        return Some(txt(crate::i18n::t("session_new", crate::i18n::default_lang()).to_owned()));
     }
     // /reset — reset current session (no summary, same generation)
     if lower == "/reset" {
@@ -104,7 +104,7 @@ pub(crate) async fn try_preparse_locally(
         for f in flags.values() { f.store(true, Ordering::SeqCst); }
         drop(flags);
         handle.reset_signal.store(true, Ordering::SeqCst);
-        return Some(txt("Session reset.".to_owned()));
+        return Some(txt(crate::i18n::t("session_reset", crate::i18n::default_lang()).to_owned()));
     }
     // /status
     if lower == "/status" {
@@ -188,7 +188,7 @@ $g.Dispose();$b.Dispose()"#
                 });
             }
         }
-        return Some(txt("screenshot failed".to_owned()));
+        return Some(txt(crate::i18n::t("screenshot_failed", crate::i18n::default_lang()).to_owned()));
     }
     // /webshot <url> — headless-Chrome screenshot of a web page. Distinct
     // from /ss (desktop) because the LLM's `web_browser action=screenshot`
@@ -266,7 +266,11 @@ $g.Dispose();$b.Dispose()"#
                 });
             }
         }
-        return Some(txt(format!("webshot failed for {url}")));
+        return Some(txt(crate::i18n::t_fmt(
+            "webshot_failed",
+            crate::i18n::default_lang(),
+            &[("url", &url)],
+        )));
     }
     // /skill list — list installed skills (system + agent workspace)
     if lower == "/skill list" {
