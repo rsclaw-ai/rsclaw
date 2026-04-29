@@ -127,3 +127,51 @@ async fn shell_plugin_legacy_hook_call_still_works() {
 
     plugin.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shell_plugin_concurrent_calls_demux_correctly() {
+    let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/shell_plugin_echo");
+
+    let manifest = rsclaw::plugin::load_manifest(&fixtures_dir).expect("parse manifest");
+
+    let browser: Arc<Mutex<Option<rsclaw::browser::BrowserSession>>> =
+        Arc::new(Mutex::new(None));
+    let host_dispatch = Arc::new(
+        rsclaw::plugin::host_methods::HostMethodRegistry::new(None, browser),
+    );
+
+    let plugin = Arc::new(
+        rsclaw::plugin::Plugin::spawn(manifest, host_dispatch)
+            .await
+            .expect("spawn plugin"),
+    );
+
+    // Fire 10 concurrent calls; each must see its own echo and not another
+    // call's response. If the pending-map demux has a bug, expect either a
+    // hang (oneshots never fulfilled) or a wrong-msg assertion (responses
+    // routed to the wrong waiter).
+    let mut handles = Vec::new();
+    for i in 0..10u32 {
+        let p = plugin.clone();
+        handles.push(tokio::spawn(async move {
+            let result = p
+                .call(
+                    "tool_call",
+                    serde_json::json!({
+                        "tool": "echo",
+                        "args": { "msg": format!("msg-{i}") },
+                        "_ctx": {}
+                    }),
+                )
+                .await
+                .expect("concurrent call");
+            assert_eq!(result["echoed"]["msg"], format!("msg-{i}"));
+        }));
+    }
+    for h in handles {
+        h.await.expect("task ok");
+    }
+
+    plugin.shutdown().await;
+}
