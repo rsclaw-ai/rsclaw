@@ -208,6 +208,7 @@ pub(crate) fn start_dingtalk_if_configured(
                                         images: vec![],
                                         channel: None,
 
+                                        account: None,
                     files: vec![],                                    })
                                     .await
                                 {
@@ -229,6 +230,7 @@ pub(crate) fn start_dingtalk_if_configured(
                                         images: vec![],
                                         channel: None,
 
+                                        account: None,
                     files: vec![],                                    })
                                     .await
                                 {
@@ -308,6 +310,7 @@ pub(crate) fn start_dingtalk_if_configured(
                                         timestamp: chrono::Utc::now().timestamp(),
                                         images: images.iter().map(|i| i.data.clone()).collect(),
                                         files: vec![],
+                                        account: None,
                                     };
                                     if let Err(e) = w_tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
                                         error!(user = %w_uid, "dingtalk: queue submit failed: {e:#}");
@@ -351,6 +354,7 @@ pub(crate) fn start_dingtalk_if_configured(
                                         images: vec![],
                                         channel: None,
 
+                                        account: None,
                     files: vec![],                                    })
                                     .await
                                 {
@@ -421,6 +425,7 @@ pub(crate) fn start_dingtalk_if_configured(
                                 extra_tools: vec![],
                                 images,
                                 files: vec![],
+                                account: None,
                             };
                             if handle.tx.send(msg).await.is_err() {
                                 return;
@@ -436,6 +441,7 @@ pub(crate) fn start_dingtalk_if_configured(
                                         images: r.images,
                                         files: r.files,
                                         channel: None,
+                                        account: None,
                                     }).await
                                     {
                                         tracing::warn!("failed to send message: {e}");

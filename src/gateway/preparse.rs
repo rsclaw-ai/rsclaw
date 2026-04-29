@@ -43,6 +43,7 @@ pub(crate) async fn try_preparse_locally(
         images: vec![],
         files: vec![],
         channel: None,
+        account: None,
     };
 
     // Workspace resolver (shared by /ls, /cat, shell cmds).
@@ -185,6 +186,7 @@ $g.Dispose();$b.Dispose()"#
                     images: vec![format!("data:image/png;base64,{b64}")],
                     files: vec![],
                     channel: None,
+                    account: None,
                 });
             }
         }
@@ -263,6 +265,7 @@ $g.Dispose();$b.Dispose()"#
                     images: vec![format!("data:image/png;base64,{b64}")],
                     files: vec![],
                     channel: None,
+                    account: None,
                 });
             }
         }

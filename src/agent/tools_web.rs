@@ -1554,6 +1554,7 @@ impl AgentRuntime {
                                 images: vec![],
                                 files: vec![],
                                 channel: Some(ctx.channel.clone()),
+                                account: None,
                             });
                         }
                         return Err(anyhow!(msg));

@@ -127,6 +127,7 @@ pub(crate) fn start_channels(
                     extra_tools: vec![],
                     images: vec![],
                     files: vec![],
+                    account: None,
                 };
                 if handle.tx.send(msg).await.is_err() {
                     return;
@@ -143,6 +144,7 @@ pub(crate) fn start_channels(
                                 images: reply.images,
                                 channel: None,
                                 files: reply.files,
+                                account: None,
                             })
                             .await
                         {
@@ -337,6 +339,7 @@ pub(crate) fn start_channels(
                                             images: vec![],
             channel: None,
 
+                                            account: None,
                     files: vec![],                                        })
                                         .await
                                     {
@@ -354,6 +357,7 @@ pub(crate) fn start_channels(
                                             images: vec![],
             channel: None,
 
+                                            account: None,
                     files: vec![],                                        })
                                         .await
                                     {
@@ -425,6 +429,7 @@ pub(crate) fn start_channels(
                                             files: file_attachments.iter().filter_map(|f| {
                                                 crate::gateway::task_queue::stage_file(&f.filename, &f.data, &f.mime_type).ok()
                                             }).collect(),
+                                            account: None,
                                         };
                                         if let Err(e) = w_tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
                                             error!(user = %w_uid, "telegram: queue submit failed: {e:#}");
@@ -471,6 +476,7 @@ pub(crate) fn start_channels(
                                         images: vec![],
             channel: None,
 
+                                        account: None,
                     files: vec![],                                    }).await
                                     {
                                         tracing::warn!("failed to send message: {e}");
@@ -540,6 +546,7 @@ pub(crate) fn start_channels(
                                     extra_tools: vec![],
                                     images,
                                     files: file_attachments,
+                                    account: None,
                                 };
                                 if handle.tx.send(msg).await.is_err() {
                                     return;
@@ -554,6 +561,7 @@ pub(crate) fn start_channels(
                                             images: r.images,
                                             files: r.files,
                                             channel: None,
+                                            account: None,
                                         }).await
                                         {
                                             tracing::warn!("failed to send message: {e}");

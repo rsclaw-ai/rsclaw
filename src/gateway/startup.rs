@@ -973,6 +973,7 @@ fn spawn_agent_tasks(
                     extra_tools,
                     images,
                     files,
+                    account: _,
                 } = msg;
                 let result = runtime
                     .run_turn(
@@ -1155,6 +1156,7 @@ pub(crate) async fn handle_pending_analysis(
         extra_tools: vec![],
         images: vec![],
         files: vec![],
+        account: None,
     };
     if handle.tx.send(msg).await.is_err() {
         // receiver may have been dropped
@@ -1167,6 +1169,7 @@ pub(crate) async fn handle_pending_analysis(
                 images: vec![],
                 channel: None,
 
+                account: None,
                     files: vec![],            })
             .await;
         return;
@@ -1182,6 +1185,7 @@ pub(crate) async fn handle_pending_analysis(
                     reply_to: None,
                     images: r.images,
                     files: r.files,
+                    account: None,
                     channel: None,                })
                 .await;
         }
@@ -1197,6 +1201,7 @@ pub(crate) async fn handle_pending_analysis(
                     images: vec![],
                     channel: None,
 
+                    account: None,
                     files: vec![],                })
                 .await;
         }
@@ -1211,6 +1216,7 @@ pub(crate) async fn handle_pending_analysis(
                     images: vec![],
                     channel: None,
 
+                    account: None,
                     files: vec![],                })
                 .await;
         }

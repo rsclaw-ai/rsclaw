@@ -419,6 +419,7 @@ async fn send_message(
         extra_tools: vec![],
         images: file_images,
         files: file_files,
+        account: None,
     };
 
     // Subscribe to event_bus BEFORE sending message so we don't miss early deltas.
@@ -611,6 +612,7 @@ async fn message_send(
         images: vec![],
         files: vec![],
         channel: Some(channel.to_string()),
+        account: None,
     };
 
     match state.notification_tx.send(out) {
@@ -710,6 +712,7 @@ async fn message_broadcast(
             images: vec![],
             files: vec![],
             channel: Some(channel.to_string()),
+            account: None,
         };
         match state.notification_tx.send(out) {
             Ok(_) => sent += 1,
@@ -1395,6 +1398,7 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
             extra_tools: vec![],
             images: vec![],
             files: vec![],
+            account: None,
         };
         if handle.tx.send(msg).await.is_ok() {
             // Deliver agent reply through the job's delivery config.
@@ -1430,6 +1434,7 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
                                 images: reply.images.clone(),
                                 files: reply.files.clone(),
                                 channel: Some(ch),
+                                account: None,
                             });
                             tracing::info!(job_id = %job_id, "cron trigger: delivered reply to channel");
                         }
@@ -1840,6 +1845,7 @@ async fn openai_chat_completions(
         extra_tools,
         images: file_images,
         files: file_files,
+        account: None,
     };
 
     // Subscribe to event_bus BEFORE sending message to agent,

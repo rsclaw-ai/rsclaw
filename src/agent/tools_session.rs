@@ -52,6 +52,7 @@ impl AgentRuntime {
             extra_tools: vec![],
             images: vec![],
             files: vec![],
+            account: None,
         };
 
         target

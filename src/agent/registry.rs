@@ -206,6 +206,9 @@ pub struct AgentMessage {
     pub text: String,
     /// Channel this message arrived on (e.g. "telegram", "discord").
     pub channel: String,
+    /// Multi-account tag (e.g. feishu account name) for outbound routing.
+    /// `None` for single-account channels.
+    pub account: Option<String>,
     /// Peer / user ID (used for session isolation).
     pub peer_id: String,
     /// Chat/conversation ID for replies (for platforms like Feishu where reply ID differs from user ID).

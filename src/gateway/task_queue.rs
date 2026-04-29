@@ -79,6 +79,11 @@ pub struct QueuedMessage {
     pub text: String,
     pub sender: String,
     pub channel: String,
+    /// Multi-account tag (e.g. feishu account name) so a queued task's reply
+    /// is sent back via the same account that received it. None = single-account
+    /// channel; the bare `{channel}` sender is used.
+    #[serde(default)]
+    pub account: Option<String>,
     /// Platform-specific chat/conversation ID (e.g. Telegram chat_id).
     pub chat_id: String,
     /// Whether this message originated from a group conversation.
@@ -352,12 +357,26 @@ pub fn get_task_queue() -> Option<Arc<TaskQueueManager>> {
 /// the channel is not registered (or `install_channel_senders` was never
 /// called).
 fn lookup_channel_sender(name: &str) -> Option<mpsc::Sender<OutboundMessage>> {
-    CHANNEL_SENDERS
-        .get()?
-        .read()
-        .ok()?
-        .get(name)
-        .cloned()
+    lookup_channel_sender_for(name, None)
+}
+
+/// Like `lookup_channel_sender` but prefers the account-suffixed key
+/// `{name}/{account}` first. Used by multi-account channels (feishu) so
+/// replies route back through the account that received the inbound
+/// message instead of whichever account happened to register the bare
+/// `{name}` key last.
+fn lookup_channel_sender_for(
+    name: &str,
+    account: Option<&str>,
+) -> Option<mpsc::Sender<OutboundMessage>> {
+    let map = CHANNEL_SENDERS.get()?.read().ok()?;
+    if let Some(acct) = account.filter(|s| !s.is_empty()) {
+        let key = format!("{name}/{acct}");
+        if let Some(tx) = map.get(&key).cloned() {
+            return Some(tx);
+        }
+    }
+    map.get(name).cloned()
 }
 
 /// Format a localized "task received" ack string.
@@ -387,7 +406,7 @@ fn task_ack_text(task_id: &str, max_turns: u32, ttl_secs: u64, lang: &str) -> St
 /// and a warning is logged.
 fn send_task_ack(task: &QueuedTask, max_turns: u32, ttl_secs: u64) {
     let Some(msg) = task.messages.first() else { return };
-    let Some(tx) = lookup_channel_sender(&msg.channel) else {
+    let Some(tx) = lookup_channel_sender_for(&msg.channel, msg.account.as_deref()) else {
         warn!(channel = %msg.channel, task_id = %task.id, "task_queue: channel sender not registered, ack dropped");
         return;
     };
@@ -400,6 +419,7 @@ fn send_task_ack(task: &QueuedTask, max_turns: u32, ttl_secs: u64) {
         images: vec![],
         files: vec![],
         channel: Some(msg.channel.clone()),
+        account: msg.account.clone(),
     };
     if let Err(e) = tx.try_send(ack) {
         warn!(channel = %msg.channel, task_id = %task.id, error = %e, "task_queue: ack send failed");
@@ -671,6 +691,7 @@ pub fn submit_to_queue(
         timestamp: chrono::Utc::now().timestamp(),
         images: vec![],
         files: vec![],
+        account: None,
     };
     manager.submit(session_key, message, priority)
 }
@@ -803,6 +824,31 @@ impl TaskQueueWorker {
         }
     }
 
+    /// Look up the outbound sender, preferring the account-suffixed key
+    /// `{channel}/{account}` when an account tag is present. Multi-account
+    /// channels (e.g. feishu) register both `feishu` (legacy) and
+    /// `feishu/<acct>` keys; without the account-aware lookup, the bare key
+    /// is overwritten by whichever account starts last and replies get sent
+    /// via the wrong app token (Feishu rejects with 230002).
+    fn channel_tx_for(
+        &self,
+        name: &str,
+        account: Option<&str>,
+    ) -> Option<mpsc::Sender<OutboundMessage>> {
+        if let Some(acct) = account.filter(|s| !s.is_empty()) {
+            let key = format!("{name}/{acct}");
+            if let Some(tx) = self
+                .channel_senders
+                .read()
+                .ok()
+                .and_then(|map| map.get(&key).cloned())
+            {
+                return Some(tx);
+            }
+        }
+        self.channel_tx(name)
+    }
+
     /// Look up the outbound sender for a channel by name.
     fn channel_tx(&self, name: &str) -> Option<mpsc::Sender<OutboundMessage>> {
         self.channel_senders
@@ -819,13 +865,14 @@ impl TaskQueueWorker {
     async fn notify_user_failure(
         &self,
         channel_name: &str,
+        account: Option<&str>,
         target: &str,
         is_group: bool,
         reply_to: Option<String>,
         turn: u32,
         reason: &str,
     ) {
-        let Some(tx) = self.channel_tx(channel_name) else {
+        let Some(tx) = self.channel_tx_for(channel_name, account) else {
             warn!(channel = %channel_name, "no channel sender registered, failure notice dropped");
             return;
         };
@@ -844,6 +891,7 @@ impl TaskQueueWorker {
             images: vec![],
             files: vec![],
             channel: Some(channel_name.to_owned()),
+            account: account.map(str::to_owned),
         };
         if let Err(e) = tx.send(out).await {
             error!(channel = %channel_name, "failure notice send failed: {e}");
@@ -927,6 +975,7 @@ impl TaskQueueWorker {
             return;
         };
         let channel_name = first_msg.channel.clone();
+        let account = first_msg.account.clone();
         let peer_id = first_msg.sender.clone();
         let chat_id = first_msg.chat_id.clone();
         let is_group = first_msg.is_group;
@@ -1004,6 +1053,7 @@ impl TaskQueueWorker {
                 extra_tools: vec![],
                 images: next_images,
                 files: next_files,
+                account: None,
             };
 
             info!(task_id = %task_id, turn, "task queue worker: agent turn");
@@ -1028,7 +1078,7 @@ impl TaskQueueWorker {
                 Ok(Ok(r)) => r,
                 Ok(Err(_)) => {
                     error!(task_id = %task_id, turn, "task queue worker: reply channel dropped");
-                    self.notify_user_failure(&channel_name, &target, is_group, reply_to.clone(), turn, "reply channel dropped").await;
+                    self.notify_user_failure(&channel_name, account.as_deref(), &target, is_group, reply_to.clone(), turn, "reply channel dropped").await;
                     match self.manager.fail(&task_id, "reply channel dropped", task.max_retries) {
                         Ok(TaskStatus::Dead) => cleanup_staged_files(&task),
                         Err(fe) => error!(task_id = %task_id, "fail() error: {fe:#}"),
@@ -1038,7 +1088,7 @@ impl TaskQueueWorker {
                 }
                 Err(_) => {
                     error!(task_id = %task_id, turn, "task queue worker: reply timeout (2700s)");
-                    self.notify_user_failure(&channel_name, &target, is_group, reply_to.clone(), turn, "reply timeout (45m)").await;
+                    self.notify_user_failure(&channel_name, account.as_deref(), &target, is_group, reply_to.clone(), turn, "reply timeout (45m)").await;
                     match self.manager.fail(&task_id, "reply timeout", task.max_retries) {
                         Ok(TaskStatus::Dead) => cleanup_staged_files(&task),
                         Err(fe) => error!(task_id = %task_id, "fail() error: {fe:#}"),
@@ -1089,8 +1139,9 @@ impl TaskQueueWorker {
                         images: reply.images.clone(),
                         files: reply.files.clone(),
                         channel: Some(channel_name.clone()),
+                        account: account.clone(),
                     };
-                    if let Some(tx) = self.channel_tx(&channel_name) {
+                    if let Some(tx) = self.channel_tx_for(&channel_name, account.as_deref()) {
                         match tx.send(out).await {
                             Ok(_) => {
                                 last_send_ok = true;
@@ -1116,7 +1167,7 @@ impl TaskQueueWorker {
 
             // Handle pending analysis.
             if let Some(analysis) = pending {
-                if let Some(tx) = self.channel_tx(&channel_name) {
+                if let Some(tx) = self.channel_tx_for(&channel_name, account.as_deref()) {
                     crate::gateway::startup::handle_pending_analysis(
                         analysis,
                         Arc::clone(&handle),

@@ -101,6 +101,7 @@ impl super::runtime::AgentRuntime {
                                     images: vec![],
                                     files: vec![],
                                     channel: Some(delivery_channel),
+                                    account: None,
                                 };
                                 if let Err(e) = tx.send(msg) {
                                     tracing::warn!(error = %e, "cron in-memory timer: notification_tx send failed");
