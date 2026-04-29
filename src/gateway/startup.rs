@@ -196,6 +196,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         &plugins_dir,
         config.ext.plugins.as_ref(),
         Arc::clone(&wasm_browser),
+        Some(notification_tx.clone()),
     )
     .await
     .unwrap_or_else(|e| {

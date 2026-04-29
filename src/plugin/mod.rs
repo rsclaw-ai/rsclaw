@@ -111,9 +111,15 @@ pub async fn load_all_plugins(
     plugins_dir: &std::path::Path,
     config: Option<&PluginsConfig>,
     wasm_browser: Arc<tokio::sync::Mutex<Option<crate::browser::BrowserSession>>>,
+    notify_tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
 ) -> Result<PluginRegistry> {
     let manifests = scan_plugins(plugins_dir)?;
     let mut registry = PluginRegistry::new();
+
+    let host_dispatch = Arc::new(host_methods::HostMethodRegistry::new(
+        notify_tx,
+        Arc::clone(&wasm_browser),
+    ));
 
     // Shared wasmtime engine for all WASM plugins.
     let wasm_engine = if manifests.iter().any(|m| m.is_wasm()) {
@@ -169,7 +175,7 @@ pub async fn load_all_plugins(
             }
         } else {
             // JS runtime (shell bridge)
-            match Plugin::spawn(manifest).await {
+            match Plugin::spawn(manifest, host_dispatch.clone()).await {
                 Ok(plugin) => {
                     info!(plugin = %plugin.manifest.name, "JS plugin started");
                     registry
