@@ -2292,17 +2292,17 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
     );
 
     msg!("agent_loop_detected",
-        "en" => "Detected repeated identical operation without progress. Trying a different approach.",
-        "zh" => "检测到重复执行相同操作但没有进展，尝试换一种方式处理。",
-        "cn" => "检测到重复执行相同操作但没有进展，尝试换一种方式处理。",
-        "ja" => "同じ操作の繰り返しを検出しました。別のアプローチを試みます。",
-        "ko" => "동일한 작업이 반복 감지되었습니다. 다른 접근 방식을 시도합니다.",
-        "de" => "Wiederholte identische Operation ohne Fortschritt erkannt. Versuche einen anderen Ansatz.",
-        "fr" => "Operation identique repetee sans progres detectee. Essai d'une autre approche.",
-        "es" => "Se detecto una operacion identica repetida sin progreso. Intentando un enfoque diferente.",
-        "ru" => "Обнаружено повторение одинаковой операции без прогресса. Пробую другой подход.",
-        "th" => "ตรวจพบการทำงานซ้ำโดยไม่มีความคืบหน้า กำลังลองวิธีอื่น",
-        "vi" => "Phat hien thao tac lap lai khong tien trien. Thu cach tiep can khac.",
+        "en" => "Task encountered a technical issue. Please try rephrasing your request or send /clear to start fresh.",
+        "zh" => "任务遇到技术问题，请尝试重新表述请求或发送 /clear 重新开始。",
+        "cn" => "任务遇到技术问题，请尝试重新表述请求或发送 /clear 重新开始。",
+        "ja" => "タスクで技術的な問題が発生しました。リクエストを再言語化するか、/clear で最初からやり直してください。",
+        "ko" => "작업에서 기술적 문제가 발생했습니다. 요청을 다시 표현하거나 /clear로 새로 시작하세요.",
+        "de" => "Technisches Problem bei der Aufgabe. Bitte formulieren Sie Ihre Anfrage anders oder senden Sie /clear.",
+        "fr" => "Probleme technique rencontre. Veuillez reformuler votre demande ou envoyer /clear.",
+        "es" => "Problema tecnico en la tarea. Reformule su solicitud o envie /clear para empezar de nuevo.",
+        "ru" => "Техническая проблема. Переформулируйте запрос или отправьте /clear.",
+        "th" => "เกิดปัญหาทางเทคนิค กรุณาอธิบายคำขอใหม่หรือส่ง /clear",
+        "vi" => "Van de ky phat hien. Vui long dinh nhap yeu cau theo cach khac hoac gui /clear.",
     );
 
     msg!("agent_tool_errors",

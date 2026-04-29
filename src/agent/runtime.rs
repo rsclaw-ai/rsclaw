@@ -4784,6 +4784,24 @@ const MAX_ERROR_STREAK: usize = 5;
                             match &v {
                                 serde_json::Value::Object(obj) => {
                                     let mut modified = obj.clone();
+                                    // [方案 1] Inject hint directly into stderr so LLM sees it prominently
+                                    // instead of hidden in a separate JSON field
+                                    if let Some(stderr) = modified.get("stderr").and_then(|s| s.as_str()) {
+                                        let enhanced_stderr = if stderr.is_empty() {
+                                            hint
+                                        } else {
+                                            format!(
+                                                "{}\n\n--- Original stderr ---\n{}",
+                                                hint,
+                                                stderr
+                                            )
+                                        };
+                                        modified.insert("stderr".to_owned(), json!(enhanced_stderr));
+                                    } else {
+                                        // No stderr field, add one with the hint
+                                        modified.insert("stderr".to_owned(), json!(hint));
+                                    }
+                                    // Keep _error_hint for logging/debugging purposes
                                     modified.insert("_error_hint".to_owned(), json!(hint));
                                     serde_json::Value::Object(modified)
                                 }
@@ -4802,6 +4820,21 @@ const MAX_ERROR_STREAK: usize = 5;
                             match &v {
                                 serde_json::Value::Object(obj) => {
                                     let mut modified = obj.clone();
+                                    // Inject into stdout so LLM sees it even on success
+                                    if let Some(stdout) = modified.get("stdout").and_then(|s| s.as_str()) {
+                                        let enhanced_stdout = if stdout.is_empty() {
+                                            complexity_hint
+                                        } else {
+                                            format!(
+                                                "{}\n\n--- Original output ---\n{}",
+                                                complexity_hint,
+                                                stdout
+                                            )
+                                        };
+                                        modified.insert("stdout".to_owned(), json!(enhanced_stdout));
+                                    } else {
+                                        modified.insert("stdout".to_owned(), json!(complexity_hint));
+                                    }
                                     modified.insert("_complexity_hint".to_owned(), json!(complexity_hint));
                                     serde_json::Value::Object(modified)
                                 }
