@@ -2,6 +2,172 @@
 
 All notable changes to RsClaw will be documented in this file.
 
+## [2026.4.28] - 2026-04-29
+
+### Skills
+
+- **iWenCai SkillHub** — added as a native skill registry alongside
+  clawhub.ai / skillhub / skills.sh. Surfaces only the 22 `hithink-*`
+  finance skills (market query, A股/港股/美股/ETF/期货/基金 selectors,
+  finance/macro/event/industry queries, etc.). Hides the 67 internal
+  devops skills. Install lands in `~/.rsclaw/skills/<slug>/`.
+- **`use_skill` function-call tool** — first-class entry the LLM can
+  pick alongside `web_fetch` / `execute_command`. Returns the full
+  SKILL.md untruncated (60KB cap) so the model sees the actual CLI
+  contract instead of inventing flag names.
+- **Lazy SKILL.md loading** — system prompt injects only frontmatter
+  description + dir path; full body loads on demand via `use_skill`.
+  Cuts a 22-skill install from ~264KB injected to ~4KB.
+- **`rsclaw skills update`** uses `install_with_fallback` so
+  iwencai/skillhub-installed skills re-resolve correctly (was
+  clawhub-only).
+- **`skillRegistries` config schema** — per-registry `apiKey` /
+  `baseUrl` overrides in `rsclaw.json5`; resolved values exported to
+  process env so spawned skill subprocesses (Python CLIs etc.) inherit
+  transparently.
+- **Site-rules** moved from per-workspace to
+  `~/.rsclaw/tools/web_browser/site-rules/`, shared across agents.
+
+### Channels
+
+- **Slack file upload V2** — `files.upload` v1 was disabled by Slack
+  (`{"ok":false,"error":"method_deprecated"}`). Rewrote to the
+  3-step `getUploadURLExternal` → multipart PUT →
+  `completeUploadExternal` flow.
+- **Discord/Slack inbound attachments** — images now reach the vision
+  model and PendingFile flow (was just a text marker
+  "image_attachment_received"). Files forwarded as `FileAttachment`
+  for analyze/save prompt.
+- **Discord image MIME** — handles webp/gif/bmp/svg via
+  `parse_data_url`; http URLs route through `embeds[].image.url`;
+  filename extension matches MIME for inline preview.
+- **Discord file MIME** — uses tool-supplied MIME instead of
+  hardcoded `application/octet-stream`, so video/audio/PDF render
+  inline in Discord.
+- **`\xxx → /xxx` alias** for Slack and Discord — clients eat a
+  leading `/` for native slash-command UI.
+- **Slack self-reply loop fix** — was processing its own messages as
+  new user input, replying again, infinite loop. Filters by `bot_id`
+  / `subtype == "bot_message"`.
+- **Slack `/ss` image-only reply** — chat.postMessage with empty text
+  returned `no_text` and `?` short-circuited the upload loop. Now
+  skips post when text is empty.
+- **Discord notification 404** — `chat_id` was always empty in
+  `RunContext`, falling back to `peer_id` (user id) which Discord
+  rejects with "Unknown Channel". `chat_id` now propagates from
+  `AgentMessage` through `run_turn` to `RunContext`.
+- **Shared attachment helpers** — `parse_data_url` / `mime_to_ext` /
+  `pick_file_mime` extracted to `channel/attachments.rs`.
+- **Policy rejection logs** — bumped from `debug` to `warn` across
+  all 13 channel handlers so `groupPolicy: allowlist` (the default)
+  silent drops are visible in the default log.
+
+### Browser
+
+- **`web_browser action=screenshot url=...`** — one-shot navigate
+  + capture, single tool call.
+- **`/webshot <url>`** preparse fast-path — headless-Chrome web-page
+  screenshot. Auto-detects Chrome / Chromium / Edge / Brave on
+  common install paths.
+- **`/ss` desktop screenshot** routed clearly; system prompt tells
+  agent NOT to call `web_browser screenshot` for plain "截图"
+  requests.
+- **Restart loop fix** — `restart()` now resets `last_activity` so
+  the very next `execute()` doesn't immediately re-trigger
+  idle-expiry on the pre-crash timestamp (was killing every
+  freshly-launched Chrome and surfacing as "Chrome exited without
+  printing DevTools URL" from jimeng / douyin plugins).
+
+### Memory
+
+- **Tier on insert** — high-importance docs (auto-capture phone
+  numbers / IDs / IPs at importance=0.85) reach Core on insert
+  instead of waiting for a search-touch. Crystallisation pipeline no
+  longer starves.
+- **Workflow crystallisation for hard turns** — meditation phase
+  distils Core memory clusters into reusable SKILL.md files via
+  `meditation_deps`.
+
+### Cron
+
+- **cron.json5 protected from being wiped** on parse failure — load
+  returns `(jobs, parse_ok)`, all save sites check the flag, reload
+  is also blocked. Prevents user customisations getting overwritten
+  with empty content after a syntax error.
+- **Saved-report file content in summarize** — when a script's stdout
+  contains `报告已保存: xxx.md` / `saved to: xxx` / etc., the file
+  content is read and fed to the summarise agent.
+- **Summarize prompt rewritten** with strict anti-fabrication rules
+  (English; per the new no-i18n-for-LLM-prompts convention).
+- **`summarize=false` returns saved file content** too (was
+  stdout-only).
+- **Path dedup** when multiple regex patterns match the same saved
+  file.
+
+### System prompt
+
+- **Workspace anchor** — agent now sees its own workspace path in
+  the prompt and stops globally searching `~/.rsclaw/` for "my
+  files".
+- **Skills priority directive** — explicit `plugins > skills > tools`
+  ordering, with a worked failure example (flight search → flyai,
+  not web_fetch ctrip).
+- **Screenshot routing** rules — `/ss` for desktop, `/webshot` for
+  web, `web_browser screenshot` only after `open` in same session.
+
+### i18n
+
+- Localised 8 channel-facing strings: `session_cleared`,
+  `session_reset`, `session_new`, `compact_done`,
+  `compact_done_no_summary`, `compact_nothing`, `screenshot_failed`,
+  `webshot_failed` — covering en/zh/th/vi/ja/es/ko/ru/fr/de.
+- **Documented convention**: LLM-facing prompts (system messages,
+  tool descriptions, summarize/analyze prompts) stay English-only,
+  no i18n. User-facing channel strings still go through i18n.
+  See `CLAUDE.md` / `AGENTS.md`.
+
+### OpenClaw migration
+
+- **Imports MEMORY.md + memory/*.md** workspace files (was
+  session-only).
+- **AGENT.md → AGENTS.md auto-promotion** when only the singular form
+  is present.
+- **Branding rewrite** of identity files: `OpenClaw → RsClaw`,
+  `🦞 → 🦀`.
+- **Staged progress display** — clear `Step 1/3 ...` banners during
+  migration so users don't think "BGE download finishing = migration
+  done".
+- **`allowFrom` credential files** are now actually copied (was just
+  printing a hint).
+- **SKILL.md frontmatter sanitisation** — strips backtick-wrapped
+  YAML values that yaml-rust rejected.
+
+### Runtime
+
+- **`SIGINT/SIGTERM` graceful drain** — gateway now installs a global
+  signal handler that funnels through `ShutdownCoordinator`. Cron's
+  own `ctrl_c` handler removed (it was eating SIGINT and the
+  gateway/channels/axum saw nothing).
+- **Per-agent context window** — resolved from
+  `agent.model.contextTokens` → `agents.defaults.contextTokens` →
+  64000 fallback. Used by both `/status` display AND pre-flight
+  emergency-compaction check.
+- **`chat_id` propagation** — `run_turn` accepts `chat_id`,
+  `RunContext.chat_id` is real (not always empty), so notifications
+  on group sessions land on the channel, not the user id.
+- **Skip intermediate-text notification** on ws/desktop channels
+  (those see the streaming text already).
+- **Build cleanup** — 4 latent warnings cleared.
+
+### UI / Tauri
+
+- **Config save** no longer eats single-account channel blocks
+  (Discord etc.) on save — zombie cleanup only deletes explicit
+  `accounts: {}`, not missing-`accounts` legacy schema.
+- **Async-task reply badge** in desktop chat (`[任务完成]` /
+  `[Task done]` etc.) so the user can tell async results from
+  in-band replies.
+
 ## [2026.4.26] - 2026-04-26
 
 ### Unified Task Queue (all 13 channels)
