@@ -4823,7 +4823,7 @@ const MAX_ERROR_STREAK: usize = 5;
                                     // Inject into stdout so LLM sees it even on success
                                     if let Some(stdout) = modified.get("stdout").and_then(|s| s.as_str()) {
                                         let enhanced_stdout = if stdout.is_empty() {
-                                            complexity_hint
+                                            complexity_hint.to_string()
                                         } else {
                                             format!(
                                                 "{}\n\n--- Original output ---\n{}",
