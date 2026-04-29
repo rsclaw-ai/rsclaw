@@ -5134,8 +5134,8 @@ impl AgentRuntime {
             return Err(anyhow!("MCP tool `{name}` not found"));
         }
 
-        // 4. WASM plugin tool: `<plugin>.<tool>` (must precede skill match
-        //    because plugins win the priority ladder).
+        // 4. Plugin tool: `<plugin>.<tool>` (must precede skill match because
+        //    plugins win the priority ladder). Wasm wins on collision.
         if let Some((plugin_name, tool_name)) = name.split_once('.') {
             if let Some(wp) = self.wasm_plugins.iter().find(|p| p.name == plugin_name) {
                 let notify_ctx = self.notification_tx.as_ref().map(|tx| {
@@ -5150,6 +5150,29 @@ impl AgentRuntime {
                     }
                 });
                 return wp.call_tool_with_ctx(tool_name, args, notify_ctx).await;
+            }
+            // 4-bis. Shell plugin tool — same `<plugin>.<tool>` namespace; wasm
+            //        wins on collision (above). The plugin spawns once at startup
+            //        and we hand it the per-call ctx so it can dispatch host
+            //        methods (notify, log, etc.) on the active conversation.
+            if let Some(reg) = self.plugins.as_ref()
+                && let Some(plugin) = reg.get_shell(plugin_name)
+            {
+                let target_id = if !ctx.chat_id.is_empty() {
+                    ctx.chat_id.clone()
+                } else {
+                    ctx.peer_id.clone()
+                };
+                let params = serde_json::json!({
+                    "tool": tool_name,
+                    "args": args,
+                    "_ctx": {
+                        "target_id":   target_id,
+                        "channel":     ctx.channel.clone(),
+                        "session_key": ctx.session_key.clone(),
+                    }
+                });
+                return plugin.call("tool_call", params).await;
             }
         }
 
