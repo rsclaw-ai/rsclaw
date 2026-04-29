@@ -2915,20 +2915,42 @@ impl AgentRuntime {
             .join("\n\n");
 
         let msg = format!(
-            "## Installed Skills\n\
-             When the user's request matches a skill's description, follow its \
-             instructions unless a plugin already handles the task.\n\
-             Priority: plugins > skills > built-in tools.\n\n\
-             IMPORTANT — only the skill's frontmatter description is shown \
-             below. The full SKILL.md body and any references/ files live on \
-             disk and are NOT auto-injected (would blow up context).\n\n\
-             BEFORE invoking a skill's CLI for the first time in a session:\n\
+            "## CAPABILITY PRIORITY (read before every action)\n\
+             \n\
+             For every user request, evaluate sources in this order and use \
+             the FIRST one that fits. Do not skip ahead.\n\n\
+             1. **Plugins** — installed runtime plugins (registered via the \
+             plugin registry). Highest priority.\n\
+             2. **Skills** — listed under \"## Installed Skills\" below. \
+             Each skill description states the domains it covers (flights, \
+             stocks, weather, …). If ANY description matches the user's \
+             intent, you MUST use that skill — even if a built-in tool could \
+             also do the job.\n\
+             3. **Built-in tools** (web_fetch, web_browser, execute_command, \
+             read_file, …) — fallback ONLY when no plugin or skill applies.\n\n\
+             Common failure mode (avoid):\n\
+             > User asks about flights → you call web_fetch(ctrip.com) →\n\
+             > result is brittle / blocked / wrong data.\n\
+             > A flyai skill with `intents: [flight_search]` was sitting right\n\
+             > above and you ignored it.\n\n\
+             If you catch yourself reaching for web_fetch / web_browser / \n\
+             execute_command on a domain a skill description covers, STOP \n\
+             and use the skill instead.\n\n\
+             ## Installed Skills\n\
+             \n\
+             Only the frontmatter description is shown for each skill below \
+             (full SKILL.md bodies live on disk to save context). To use a \
+             skill:\n\
              1. Pick the skill whose description matches the user's intent.\n\
-             2. read_file `<dir>/SKILL.md` to learn its commands + flags.\n\
+             2. Call the **`use_skill`** function tool with `name=<slug>` — \
+             returns the full SKILL.md.\n\
              3. If SKILL.md mentions `references/<command>.md`, read_file that too.\n\
-             4. Then invoke the CLI with the exact flags from SKILL.md.\n\n\
-             Guessing CLI flags from the description alone is the #1 failure \
-             mode — always read SKILL.md first.\n\n\
+             4. Then invoke the CLI with the exact flags from SKILL.md via \
+             `execute_command`.\n\n\
+             `use_skill` is registered as a function-call tool — prefer it \
+             over manually `read_file`-ing SKILL.md so the discovery shows \
+             up cleanly in tool history. Guessing CLI flags from the \
+             description alone is the #1 failure mode.\n\n\
              {skill_prompts}"
         );
         (Some(msg), snapshot)
@@ -4782,6 +4804,17 @@ impl AgentRuntime {
                             "read_file" | "read" => {
                                 limits.and_then(|l| l.default).unwrap_or(3000)
                             }
+                            // use_skill returns SKILL.md, which is a contract
+                            // document the LLM MUST see in full. Truncating
+                            // it caused the agent to hallucinate CLI
+                            // invocations (e.g. flyai's SKILL.md says
+                            // `npm i -g @fly-ai/flyai-cli` on line 60 — past
+                            // the 3000-char cut — so the agent saw only
+                            // `runtime: node` in frontmatter and made up
+                            // `node index.js` instead).
+                            "use_skill" => {
+                                limits.and_then(|l| l.default).unwrap_or(60_000)
+                            }
                             _ => limits.and_then(|l| l.default).unwrap_or(3000),
                         };
                         if result_text.len() > max_chars {
@@ -4998,6 +5031,7 @@ impl AgentRuntime {
             "read_file" | "read" => return self.tool_read(args).await,
             "write_file" | "write" => return self.tool_write(args).await,
             "execute_command" | "exec" => return self.tool_exec(ctx, _id, args).await,
+            "use_skill" => return self.tool_use_skill(args),
             "install_tool" | "tool_install" => return self.tool_install(args).await,
             "list_dir" => return self.tool_list_dir(args).await,
             "search_file" => return self.tool_search_file(args).await,
@@ -5285,6 +5319,42 @@ impl AgentRuntime {
             Some(d) => Ok(json!({"id": d.id, "scope": d.scope, "kind": d.kind, "text": d.text})),
             None => Ok(json!({"error": "not found", "id": id})),
         }
+    }
+
+    /// `use_skill` — first-class function-call tool that activates an
+    /// installed skill. The whole reason this exists is that the LLM
+    /// strongly prefers tools registered in the function-call API over
+    /// suggestions buried in the system prompt; without `use_skill` the
+    /// model would reach for `web_fetch`/`web_browser` even when a skill's
+    /// description matched the task. Returns the skill's full SKILL.md so
+    /// the LLM can derive the exact CLI invocation, then call
+    /// `execute_command` to run it.
+    pub(crate) fn tool_use_skill(&self, args: Value) -> Result<Value> {
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("use_skill: 'name' is required"))?;
+        let Some(skill) = self.skills.get(name) else {
+            let available: Vec<&str> = self.skills.all().map(|s| s.name.as_str()).collect();
+            return Ok(serde_json::json!({
+                "error": format!("skill '{name}' not installed"),
+                "available": available,
+            }));
+        };
+        let dir = skill.dir.display().to_string();
+        let skill_md_path = skill.dir.join("SKILL.md");
+        let skill_md = std::fs::read_to_string(&skill_md_path).unwrap_or_else(|e| {
+            format!("(failed to read SKILL.md: {e}; check {})", skill_md_path.display())
+        });
+        Ok(serde_json::json!({
+            "name": skill.name,
+            "dir": dir,
+            "skill_md": skill_md,
+            "next_step": "Read skill_md to find the exact CLI command and flags, \
+                          then call execute_command to run it. \
+                          Pass the user's actual question / parameters via the \
+                          flags documented in skill_md."
+        }))
     }
 
     pub(crate) async fn tool_memory_put(&self, ctx: &RunContext, args: Value) -> Result<Value> {
