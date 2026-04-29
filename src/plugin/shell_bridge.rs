@@ -15,10 +15,11 @@
 //! Supported runtimes: `node`, `bun`, `deno`.
 
 use std::{
+    collections::HashMap,
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicI64, Ordering},
     },
     time::Duration,
 };
@@ -28,10 +29,11 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Mutex,
+    sync::{Mutex, oneshot},
+    task::JoinHandle,
     time,
 };
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use super::manifest::PluginManifest;
 
@@ -42,13 +44,16 @@ const DEFAULT_CALL_TIMEOUT_SECS: u64 = 30;
 // ShellBridgePlugin
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct ShellBridgePlugin {
-    name: String,
+    pub name: String,
     stdin: Arc<Mutex<ChildStdin>>,
-    stdout: Arc<Mutex<BufReader<ChildStdout>>>,
     child: Arc<Mutex<Child>>,
-    next_id: Arc<AtomicU64>,
+    next_id: Arc<AtomicI64>,
     timeout: Duration,
+    pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>,
+    reader_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    host_dispatch: Arc<crate::plugin::host_methods::HostMethodRegistry>,
 }
 
 impl ShellBridgePlugin {
