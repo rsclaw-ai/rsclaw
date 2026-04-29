@@ -520,7 +520,11 @@ pub(crate) fn build_tool_list(
             Content: `content` — get full page HTML.\n\
             WaitForUrl: `waitforurl` url='dashboard' — wait for URL change (after login/redirect).\n\
             Other: type, select, check, scroll, screenshot, pdf, press, back, forward, reload, wait, evaluate, cookies, get_text, get_url, get_title, find, get_article, upload, new_tab, switch_tab, close_tab.\n\
-            IMPORTANT: Always snapshot BEFORE clicking/filling. Element refs change after page updates.".to_owned(),
+            IMPORTANT: Always snapshot BEFORE clicking/filling. Element refs change after page updates.\n\n\
+            DO NOT use this tool to take a screenshot when the user just says \"screenshot\" / \"截图\" / \"截屏\". Without a navigated page the result is a blank dark Chrome new-tab. Routing rules:\n\
+            - User says screenshot a webpage / specific URL → user should use `/webshot <url>` (preparse fast path).\n\
+            - User says screenshot / 截图 with no URL → user should use `/ss` or `/screenshot` (desktop screencapture).\n\
+            - `web_browser action=screenshot` is only meaningful AFTER you've already `open`-ed a URL in the same session for inspection during a multi-step browser flow.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {

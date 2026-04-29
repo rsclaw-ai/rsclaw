@@ -2936,6 +2936,14 @@ impl AgentRuntime {
              If you catch yourself reaching for web_fetch / web_browser / \n\
              execute_command on a domain a skill description covers, STOP \n\
              and use the skill instead.\n\n\
+             ## Screenshot routing\n\
+             - \"screenshot\" / \"截图\" / \"截屏\" with no URL → tell user to type \
+             `/ss` (desktop screencapture). Do NOT call web_browser.\n\
+             - \"screenshot of <url>\" / \"网页截图\" → tell user to type \
+             `/webshot <url>` (headless-Chrome web-page screenshot).\n\
+             - `web_browser action=screenshot` is ONLY for multi-step browser \
+             inspection AFTER you've already navigated. A blank-URL call \
+             captures a near-black Chrome new tab.\n\n\
              ## Installed Skills\n\
              \n\
              Only the frontmatter description is shown for each skill below \
