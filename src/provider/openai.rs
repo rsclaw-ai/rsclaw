@@ -251,9 +251,7 @@ impl LlmProvider for OpenAiProvider {
                 builder = builder.header("authorization", format!("Bearer {key}"));
             }
 
-            let resp = builder
-                .json(&body)
-                .send()
+            let resp = super::send_with_transport_retry(builder.json(&body))
                 .await
                 .context("OpenAI request failed")?;
 
@@ -461,14 +459,14 @@ impl OpenAiProvider {
             "ollama native: calling {url}"
         );
 
-        let resp = self
-            .client
-            .post(&url)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .context("ollama native request failed")?;
+        let resp = super::send_with_transport_retry(
+            self.client
+                .post(&url)
+                .header("content-type", "application/json")
+                .json(&body),
+        )
+        .await
+        .context("ollama native request failed")?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -697,9 +695,7 @@ impl OpenAiProvider {
             builder = builder.header("authorization", format!("Bearer {key}"));
         }
 
-        let resp = builder
-            .json(&body)
-            .send()
+        let resp = super::send_with_transport_retry(builder.json(&body))
             .await
             .context("OpenAI Responses request failed")?;
 
