@@ -930,11 +930,11 @@ impl BrowserSession {
             if user_chrome_is_running() {
                 // 4. User's chrome IS running, but without debug. Don't kill it.
                 bail!(
-                    "RSCLAW_CHROME_NEEDS_CDP: 你的 Chrome 正在运行但没启用调试模式 (CDP 端口未开)。\n\n\
-                     两个解决办法：\n\
-                     1) 退出 Chrome（cmd+Q），让 rsclaw 自动启动新进程（你的标签和登录态会被恢复）\n\
-                     2) 或者手动用以下命令重新启动：\n   {chrome_path} --remote-debugging-port=9222 &\n\n\
-                     完成后重试请求。"
+                    "RSCLAW_CHROME_NEEDS_CDP: Your Chrome is running but debug mode is disabled (CDP port not open).\n\n\
+                     Two solutions:\n\
+                     1) Quit Chrome (cmd+Q), let rsclaw auto-start a new process (your tabs and login state will be restored)\n\
+                     2) Or manually restart with this command:\n   {chrome_path} --remote-debugging-port=9222 &\n\n\
+                     Then retry the request."
                 );
             }
             // Always set "default" for system chrome — Chrome creates

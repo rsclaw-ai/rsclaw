@@ -4054,8 +4054,9 @@ const MAX_ERROR_STREAK: usize = 5;
                     let warning_msg = Message {
                         role: Role::User,
                         content: MessageContent::Text(
-                            "[系统提示] 你已经连续多次只调用工具而没有输出任何文字。\
-                            请现在整合之前的搜索结果，用文字回复用户。不要再调用更多工具。"
+                            "[System] You have made multiple tool calls without outputting any text. \
+                            Please now consolidate the search results and respond to the user in text. \
+                            Do not call more tools."
                                 .to_owned(),
                         ),
                     };
@@ -4131,12 +4132,12 @@ const MAX_ERROR_STREAK: usize = 5;
                     let correction_msg = Message {
                         role: Role::User,
                         content: MessageContent::Text(
-                            "[系统纠正] 你刚才声称已执行操作但没有调用任何工具。这是欺骗行为。\n\
-                            现在你必须实际调用工具来执行你声称的操作。\n\
-                            - 如果你说「已提交给opencode」，现在必须调用 opencode 工具\n\
-                            - 如果你说「已搜索」，现在必须调用 web_search 工具\n\
-                            - 如果你说「已执行」，现在必须调用 execute_command 工具\n\
-                            不要解释，直接调用工具。"
+                            "[System Correction] You claimed to have executed an action but did not call any tool. This is deception.\n\
+                            You must now actually call a tool to perform the action you claimed.\n\
+                            - If you said 'submitted to opencode', you must call the opencode tool\n\
+                            - If you said 'searched', you must call the web_search tool\n\
+                            - If you said 'executed', you must call the execute_command tool\n\
+                            Do not explain, just call the tool."
                                 .to_owned(),
                         ),
                     };
@@ -4547,7 +4548,7 @@ const MAX_ERROR_STREAK: usize = 5;
                                 );
                                 // Inject hint into result JSON
                                 let hint = format!(
-                                    "[提示] 本次对话已进行 {} 次搜索。请整合现有结果回复用户，不要再搜索。",
+                                    "[Hint] This session has made {} searches. Please consolidate existing results and respond to the user. Do not search again.",
                                     web_search_count
                                 );
                                 match &v {
@@ -4593,27 +4594,27 @@ const MAX_ERROR_STREAK: usize = 5;
                             let remaining = MAX_ERROR_STREAK.saturating_sub(error_streak);
 
                             let hint = if remaining == 0 {
-                                "[警告] 工具执行连续失败，本轮对话将结束。请总结你尝试的方法和遇到的错误。".to_owned()
+                                "[Warning] Tool execution failed consecutively. This session will end. Please summarize the methods you tried and the errors encountered.".to_owned()
                             } else if is_python_syntax_error {
                                 // Python error - specific guidance
-                                let error_type = if stderr_text.contains("SyntaxError") { "语法错误" }
-                                else if stderr_text.contains("IndentationError") || stderr_text.contains("TabError") { "缩进错误" }
-                                else if stderr_text.contains("NameError") { "变量名错误（未定义的变量）" }
-                                else if stderr_text.contains("ImportError") || stderr_text.contains("ModuleNotFoundError") { "导入错误（缺少模块）" }
-                                else if stderr_text.contains("TypeError") { "类型错误" }
-                                else if stderr_text.contains("ValueError") { "值错误" }
-                                else if stderr_text.contains("AttributeError") { "属性错误" }
-                                else { "运行时错误" };
+                                let error_type = if stderr_text.contains("SyntaxError") { "Syntax Error" }
+                                else if stderr_text.contains("IndentationError") || stderr_text.contains("TabError") { "Indentation Error" }
+                                else if stderr_text.contains("NameError") { "Name Error (undefined variable)" }
+                                else if stderr_text.contains("ImportError") || stderr_text.contains("ModuleNotFoundError") { "Import Error (missing module)" }
+                                else if stderr_text.contains("TypeError") { "Type Error" }
+                                else if stderr_text.contains("ValueError") { "Value Error" }
+                                else if stderr_text.contains("AttributeError") { "Attribute Error" }
+                                else { "Runtime Error" };
 
                                 format!(
-                                    "[Python错误修复提示] 检测到{} (第{}/{})。\n\
-                                    stderr显示：{}\n\n\
-                                    【必须执行的修复步骤】\n\
-                                    1. 分析错误：仔细阅读stderr中的错误信息，找到出错的行号和原因\n\
-                                    2. 修改代码：必须调用 write_file 或直接修改命令来修复错误\n\
-                                    3. 再次执行：修复后必须再次调用 execute_command 运行修复后的代码\n\
+                                    "[Python Error Fix Hint] Detected {} (attempt {}/{}).\n\
+                                    stderr shows: {}\n\n\
+                                    [Required Fix Steps]\n\
+                                    1. Analyze error: Read stderr carefully, find the line number and cause\n\
+                                    2. Modify code: You MUST call write_file or edit command to fix the error\n\
+                                    3. Re-execute: After fixing, you MUST call execute_command to run the fixed code\n\
                                     \n\
-                                    不要声称「已修复」而不实际调用工具。你还有{}次机会。",
+                                    Do not claim 'fixed' without actually calling a tool. You have {} attempts left.",
                                     error_type, error_streak, MAX_ERROR_STREAK,
                                     stderr_text.lines().take(5).collect::<Vec<_>>().join("\n"),
                                     remaining
@@ -4621,14 +4622,14 @@ const MAX_ERROR_STREAK: usize = 5;
                             } else if is_shell_error {
                                 // Shell error - specific guidance
                                 format!(
-                                    "[命令执行错误提示] 命令执行失败 (第{}/{})。\n\
-                                    stderr显示：{}\n\n\
-                                    【常见原因和修复方法】\n\
-                                    - \"command not found\": 命令不存在，检查拼写或安装对应工具\n\
-                                    - \"No such file\": 文件不存在，检查路径是否正确\n\
-                                    - \"Permission denied\": 权限不足，检查文件权限\n\
+                                    "[Command Execution Error Hint] Command failed (attempt {}/{}).\n\
+                                    stderr shows: {}\n\n\
+                                    [Common Causes and Fixes]\n\
+                                    - \"command not found\": Command does not exist, check spelling or install the tool\n\
+                                    - \"No such file\": File does not exist, check if path is correct\n\
+                                    - \"Permission denied\": Permission insufficient, check file permissions\n\
                                     \n\
-                                    请修正命令后再次执行。你还有{}次机会。",
+                                    Please fix the command and try again. You have {} attempts left.",
                                     error_streak, MAX_ERROR_STREAK,
                                     stderr_text.lines().take(3).collect::<Vec<_>>().join("\n"),
                                     remaining
@@ -4636,8 +4637,8 @@ const MAX_ERROR_STREAK: usize = 5;
                             } else {
                                 // Generic error
                                 format!(
-                                    "[提示] 工具执行失败 (第 {}/{}) 次。请检查错误信息并尝试修正。\
-                                    你还有 {} 次机会。常见修正方法：检查路径是否正确、修正命令语法、或尝试其他方法。",
+                                    "[Hint] Tool execution failed (attempt {}/{}). Please check the error and try to fix.\
+                                    You have {} attempts left. Common fixes: check if path is correct, fix command syntax, or try other methods.",
                                     error_streak, MAX_ERROR_STREAK, remaining
                                 )
                             };
