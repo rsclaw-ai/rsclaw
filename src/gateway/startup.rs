@@ -569,8 +569,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
         // Load jobs from openclaw-compatible path
         let cron_file = crate::cron::resolve_cron_store_path();
-        let jobs = crate::cron::load_cron_jobs();
-        if !jobs.is_empty() {
+        let (jobs, parse_ok) = crate::cron::load_cron_jobs();
+        if !parse_ok {
+            error!(file = %cron_file.display(), "cron.json5 has syntax errors - jobs will NOT run until file is fixed");
+        } else if !jobs.is_empty() {
             info!(file = %cron_file.display(), count = jobs.len(), "loaded cron jobs");
         }
 
@@ -579,6 +581,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             let runner = CronRunner::new_with_shutdown(
                 &cron_cfg,
                 jobs,
+                !parse_ok, // skip_initial_save if parse failed
                 Arc::clone(&registry),
                 Arc::clone(&channel_manager),
                 cron_data_dir,

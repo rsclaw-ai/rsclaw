@@ -319,8 +319,14 @@ fn read_workspace_file(agent_id: String, file_name: String) -> Result<String, St
 }
 
 /// Write config file to ~/.rsclaw/rsclaw.json5
+/// Validates the content parses as JSON5 before writing.
 #[tauri::command]
 fn write_config(content: String) -> Result<String, String> {
+    // Validate content parses before writing
+    if json5::from_str::<serde_json::Value>(&content).is_err() {
+        return Err("invalid JSON5 syntax - fix errors before saving".to_string());
+    }
+
     let home = dirs::home_dir().ok_or("no home dir")?;
     let config_path = home.join(".rsclaw").join("rsclaw.json5");
     // Create dir if needed.

@@ -152,3 +152,6 @@ tokio-test = "0.4"
 tempfile   = "3"
 wiremock = "0.6"
 ctor = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["handleapi", "processthreadsapi", "winnt"] }
