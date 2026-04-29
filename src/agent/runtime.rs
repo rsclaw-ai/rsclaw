@@ -4786,20 +4786,21 @@ const MAX_ERROR_STREAK: usize = 5;
                                     let mut modified = obj.clone();
                                     // [方案 1] Inject hint directly into stderr so LLM sees it prominently
                                     // instead of hidden in a separate JSON field
+                                    let hint_for_stderr = hint.clone();
                                     if let Some(stderr) = modified.get("stderr").and_then(|s| s.as_str()) {
                                         let enhanced_stderr = if stderr.is_empty() {
-                                            hint
+                                            hint_for_stderr
                                         } else {
                                             format!(
                                                 "{}\n\n--- Original stderr ---\n{}",
-                                                hint,
+                                                hint_for_stderr,
                                                 stderr
                                             )
                                         };
                                         modified.insert("stderr".to_owned(), json!(enhanced_stderr));
                                     } else {
                                         // No stderr field, add one with the hint
-                                        modified.insert("stderr".to_owned(), json!(hint));
+                                        modified.insert("stderr".to_owned(), json!(hint_for_stderr));
                                     }
                                     // Keep _error_hint for logging/debugging purposes
                                     modified.insert("_error_hint".to_owned(), json!(hint));
