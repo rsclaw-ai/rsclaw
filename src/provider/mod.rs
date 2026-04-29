@@ -24,12 +24,77 @@ pub(crate) fn http_client() -> reqwest::Client {
     http_client_with_ua(None)
 }
 
+/// Send a `reqwest::RequestBuilder` once, and retry exactly one time on
+/// transport-level errors (connection refused, reset, or "closed before
+/// message completed"). Uses `try_clone` to rebuild the request for the
+/// retry — falls back to a single attempt if the body is non-cloneable
+/// (e.g. multipart with a streaming file part).
+///
+/// Why: local OpenAI-compatible servers (llama-server, vLLM, ollama) cycle
+/// HTTP keepalive on shorter timers than reqwest's connection pool, so the
+/// first request after an idle gap intermittently lands on a half-closed
+/// pooled connection. One retry papers over that race without masking
+/// genuine 4xx/5xx responses, which arrive as a successful `send().await`
+/// and are inspected by the caller.
+pub(crate) async fn send_with_transport_retry(
+    builder: reqwest::RequestBuilder,
+) -> reqwest::Result<reqwest::Response> {
+    let retryable = |e: &reqwest::Error| -> bool {
+        use std::error::Error;
+        if e.is_connect() {
+            return true;
+        }
+        // Walk the source chain — the "closed before message completed"
+        // and "Connection reset" / "Connection refused" texts live in the
+        // hyper / std::io::Error layer underneath.
+        let mut src: Option<&dyn Error> = e.source();
+        while let Some(s) = src {
+            let msg = s.to_string();
+            if msg.contains("closed before message completed")
+                || msg.contains("Connection reset")
+                || msg.contains("Connection refused")
+                || msg.contains("connection closed")
+            {
+                return true;
+            }
+            src = s.source();
+        }
+        false
+    };
+
+    let Some(retry_builder) = builder.try_clone() else {
+        // Non-cloneable body (e.g. multipart with file stream). One shot.
+        return builder.send().await;
+    };
+
+    match builder.send().await {
+        Ok(resp) => Ok(resp),
+        Err(e) if retryable(&e) => {
+            tracing::debug!(error = %e, "http: retrying once after transport error");
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            retry_builder.send().await
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Build a `reqwest::Client` with a custom or default User-Agent.
+///
+/// Tuning notes:
+/// - `pool_idle_timeout` set to 10s (down from 60s). llama-server / vLLM /
+///   most local OpenAI-compatible servers default their HTTP keep-alive to
+///   ~5-15s. With a 60s pool-idle window the client kept reusing pooled
+///   connections that the server had already half-closed, surfacing as
+///   "connection closed before message completed" on the next request.
+/// - `tcp_keepalive(30s)` keeps long-prefill streaming connections alive
+///   through any intermediate timeouts during a 20+ second prefill on
+///   large prompts.
 pub(crate) fn http_client_with_ua(user_agent: Option<&str>) -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(user_agent.unwrap_or(DEFAULT_USER_AGENT))
         .connect_timeout(std::time::Duration::from_secs(20))
-        .pool_idle_timeout(std::time::Duration::from_secs(60))
+        .pool_idle_timeout(std::time::Duration::from_secs(10))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
         .build()
         .expect("failed to build HTTP client")
 }
