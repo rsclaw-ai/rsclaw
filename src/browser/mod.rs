@@ -1011,6 +1011,11 @@ impl BrowserSession {
 
     /// Restart the Chrome process (e.g. after crash or idle expiry).
     /// For external Chrome (chrome is None), only reconnects CDP.
+    /// Resets `last_activity` to "now" before returning so the very next
+    /// execute() doesn't immediately re-trigger idle-expiry on the same
+    /// stale timestamp (caused a tight restart loop that ended in
+    /// "Chrome exited without printing DevTools URL" — see
+    /// browser/mod.rs::execute checks 1 and 2).
     async fn restart(&mut self) -> Result<()> {
         warn!("restarting Chrome browser session");
         if self.chrome.is_some() {
@@ -1067,6 +1072,10 @@ impl BrowserSession {
         }
         self.refs.clear();
         self.ref_counter = 0;
+        // Reset the idle clock — without this, the very next execute()
+        // re-evaluates is_idle_expired against the pre-restart timestamp
+        // and triggers another restart, looping until plugin times out.
+        self.touch_activity();
         Ok(())
     }
 
