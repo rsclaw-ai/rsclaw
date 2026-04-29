@@ -115,11 +115,7 @@ pub fn openclaw_dir_exists() -> bool {
 
 /// Check whether the rsclaw data directory already exists.
 pub fn rsclaw_dir_exists() -> bool {
-    if let Some(home) = dirs_next::home_dir() {
-        home.join(".rsclaw").is_dir()
-    } else {
-        false
-    }
+    crate::config::loader::base_dir().is_dir()
 }
 
 /// Print a one-line notice when OpenClaw is detected but rsclaw is not yet set up.

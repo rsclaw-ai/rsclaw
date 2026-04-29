@@ -621,6 +621,7 @@ async fn cmd_gateway_install() -> Result<()> {
     std::fs::create_dir_all(&plist_dir)?;
     let plist_path = plist_dir.join("ai.rsclaw.gateway.plist");
 
+    let log_path = crate::config::loader::log_file();
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -640,14 +641,14 @@ async fn cmd_gateway_install() -> Result<()> {
   <key>RunAtLoad</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>{home}/.rsclaw/var/logs/gateway.log</string>
+  <string>{log}</string>
   <key>StandardErrorPath</key>
-  <string>{home}/.rsclaw/var/logs/gateway.log</string>
+  <string>{log}</string>
 </dict>
 </plist>
 "#,
         binary = binary.display(),
-        home = home.display(),
+        log = log_path.display(),
     );
 
     std::fs::write(&plist_path, &plist)?;
@@ -693,6 +694,7 @@ async fn cmd_gateway_install() -> Result<()> {
     let user = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
     let home = dirs_next::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home dir"))?;
 
+    let log_path = crate::config::loader::log_file();
     let unit = format!(
         "[Unit]\n\
          Description=rsclaw AI gateway\n\
@@ -704,13 +706,13 @@ async fn cmd_gateway_install() -> Result<()> {
          ExecStart={binary} gateway run\n\
          Restart=on-failure\n\
          RestartSec=5\n\
-         StandardOutput=append:{home}/.rsclaw/var/logs/gateway.log\n\
-         StandardError=append:{home}/.rsclaw/var/logs/gateway.log\n\
+         StandardOutput=append:{log}\n\
+         StandardError=append:{log}\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
         binary = binary.display(),
-        home = home.display(),
+        log = log_path.display(),
     );
 
     let unit_dir = home.join(".config/systemd/user");

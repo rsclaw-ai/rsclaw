@@ -38,6 +38,25 @@ fn hide_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
     cmd
 }
 
+/// Resolve the rsclaw base data dir.
+///
+/// Mirrors the gateway-side `rsclaw::config::loader::base_dir` priority:
+/// `RSCLAW_BASE_DIR` env override > `~/.rsclaw` default. Tilde expansion
+/// is supported on the env value so users can set `RSCLAW_BASE_DIR=~/foo`.
+fn rsclaw_base_dir() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("RSCLAW_BASE_DIR") {
+        if let Some(rest) = p.strip_prefix("~/") {
+            if let Some(home) = dirs::home_dir() {
+                return home.join(rest);
+            }
+        }
+        if !p.is_empty() {
+            return std::path::PathBuf::from(p);
+        }
+    }
+    dirs::home_dir().unwrap_or_default().join(".rsclaw")
+}
+
 fn run_rsclaw_command(args: &[&str]) -> Result<String, String> {
     // Try sidecar binary next to the executable first, then fall back to PATH.
     let exe_dir = std::env::current_exe()
@@ -183,12 +202,7 @@ fn gateway_status() -> Result<String, String> {
 
 #[tauri::command]
 fn get_config_path() -> Result<String, String> {
-    if let Some(home) = dirs::home_dir() {
-        let rsclaw_dir = home.join(".rsclaw");
-        Ok(rsclaw_dir.to_string_lossy().to_string())
-    } else {
-        Err("Could not determine home directory".to_string())
-    }
+    Ok(rsclaw_base_dir().to_string_lossy().to_string())
 }
 
 /// Run initial setup: create directories + seed workspace.
@@ -216,9 +230,7 @@ fn seed_bundled_bge_model<R: tauri::Runtime>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use tauri::Manager;
 
-    let target = dirs::home_dir()
-        .ok_or("no home directory")?
-        .join(".rsclaw/models/bge-small-zh");
+    let target = rsclaw_base_dir().join("models").join("bge-small-zh");
     if target.join("model.safetensors").exists() {
         return Ok(());
     }
@@ -301,8 +313,7 @@ fn seed_bundled_bge_model<R: tauri::Runtime>(
 /// Write a file to an agent's workspace directory (~/.rsclaw/workspace-{agentId}/{fileName})
 #[tauri::command]
 fn write_workspace_file(agent_id: String, file_name: String, content: String) -> Result<String, String> {
-    let home = dirs::home_dir().ok_or("no home dir")?;
-    let ws_dir = home.join(".rsclaw").join(format!("workspace-{}", agent_id));
+    let ws_dir = rsclaw_base_dir().join(format!("workspace-{}", agent_id));
     let _ = std::fs::create_dir_all(&ws_dir);
     let file_path = ws_dir.join(&file_name);
     std::fs::write(&file_path, &content)
@@ -313,8 +324,7 @@ fn write_workspace_file(agent_id: String, file_name: String, content: String) ->
 /// Read a file from an agent's workspace directory
 #[tauri::command]
 fn read_workspace_file(agent_id: String, file_name: String) -> Result<String, String> {
-    let home = dirs::home_dir().ok_or("no home dir")?;
-    let file_path = home.join(".rsclaw").join(format!("workspace-{}", agent_id)).join(&file_name);
+    let file_path = rsclaw_base_dir().join(format!("workspace-{}", agent_id)).join(&file_name);
     std::fs::read_to_string(&file_path).map_err(|e| format!("read failed: {e}"))
 }
 
@@ -327,8 +337,7 @@ fn write_config(content: String) -> Result<String, String> {
         return Err("invalid JSON5 syntax - fix errors before saving".to_string());
     }
 
-    let home = dirs::home_dir().ok_or("no home dir")?;
-    let config_path = home.join(".rsclaw").join("rsclaw.json5");
+    let config_path = rsclaw_base_dir().join("rsclaw.json5");
     // Create dir if needed.
     if let Some(parent) = config_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -341,8 +350,7 @@ fn write_config(content: String) -> Result<String, String> {
 /// Read gateway URL and auth token from config file.
 #[tauri::command]
 fn get_gateway_port() -> Result<serde_json::Value, String> {
-    let home = dirs::home_dir().ok_or("no home dir")?;
-    let config_path = home.join(".rsclaw").join("rsclaw.json5");
+    let config_path = rsclaw_base_dir().join("rsclaw.json5");
     if !config_path.exists() {
         return Ok(serde_json::json!({ "url": "http://localhost:18888", "token": "" }));
     }
@@ -381,8 +389,7 @@ fn get_gateway_port() -> Result<serde_json::Value, String> {
 /// Read channel accounts from config (channels.xxx.accounts keys).
 #[tauri::command]
 fn get_channel_accounts() -> Result<serde_json::Value, String> {
-    let home = dirs::home_dir().ok_or("no home dir")?;
-    let config_path = home.join(".rsclaw").join("rsclaw.json5");
+    let config_path = rsclaw_base_dir().join("rsclaw.json5");
     if !config_path.exists() {
         return Ok(serde_json::json!({}));
     }
@@ -408,8 +415,7 @@ fn get_channel_accounts() -> Result<serde_json::Value, String> {
 /// Read the raw config file content.
 #[tauri::command]
 fn read_config_file() -> Result<String, String> {
-    let home = dirs::home_dir().ok_or("no home dir")?;
-    let config_path = home.join(".rsclaw").join("rsclaw.json5");
+    let config_path = rsclaw_base_dir().join("rsclaw.json5");
     if !config_path.exists() {
         return Ok(String::new());
     }
@@ -419,8 +425,7 @@ fn read_config_file() -> Result<String, String> {
 /// Check if rsclaw is already set up (config file exists).
 #[tauri::command]
 fn check_setup() -> Result<bool, String> {
-    let home = dirs::home_dir().ok_or("no home dir")?;
-    let config_path = home.join(".rsclaw").join("rsclaw.json5");
+    let config_path = rsclaw_base_dir().join("rsclaw.json5");
     Ok(config_path.exists())
 }
 
@@ -519,8 +524,7 @@ fn channel_login_start(channel: String) -> Result<String, String> {
     let _ = std::fs::remove_file(&qr_path);
 
     // Record config mtime for login completion detection
-    let home = dirs::home_dir().unwrap_or_default();
-    let config_path = home.join(".rsclaw").join("rsclaw.json5");
+    let config_path = rsclaw_base_dir().join("rsclaw.json5");
     let mtime = std::fs::metadata(&config_path).ok().and_then(|m| m.modified().ok());
     *LOGIN_START_MTIME.lock().unwrap() = mtime.or(Some(std::time::SystemTime::now()));
 
@@ -568,8 +572,7 @@ static LOGIN_START_MTIME: std::sync::Mutex<Option<std::time::SystemTime>> = std:
 #[tauri::command]
 fn channel_login_status() -> Result<String, String> {
     let qr_path = std::env::temp_dir().join("rsclaw_qr.png");
-    let home = dirs::home_dir().ok_or("no home dir")?;
-    let config_path = home.join(".rsclaw").join("rsclaw.json5");
+    let config_path = rsclaw_base_dir().join("rsclaw.json5");
 
     let start_mtime = LOGIN_START_MTIME.lock().unwrap().clone();
     if let Some(start) = start_mtime {
@@ -618,8 +621,7 @@ fn channel_login_qr() -> Result<Option<String>, String> {
 /// Write cron jobs to ~/.rsclaw/cron.json5
 #[tauri::command]
 fn save_cron_jobs(content: String) -> Result<(), String> {
-    let home = dirs::home_dir().ok_or("no home dir")?;
-    let path = home.join(".rsclaw").join("cron.json5");
+    let path = rsclaw_base_dir().join("cron.json5");
     std::fs::write(&path, &content).map_err(|e| e.to_string())?;
 
     // Notify running gateway to reload cron jobs (non-blocking, no deps).
@@ -641,8 +643,7 @@ fn save_cron_jobs(content: String) -> Result<(), String> {
 
 /// Get gateway port number (default 18888)
 fn get_gateway_port_number() -> u64 {
-    let home = dirs::home_dir().unwrap_or_default();
-    let config_path = home.join(".rsclaw").join("rsclaw.json5");
+    let config_path = rsclaw_base_dir().join("rsclaw.json5");
     if !config_path.exists() {
         return 18888;
     }
@@ -679,8 +680,7 @@ fn http_shutdown_gateway() -> Result<(), String> {
 /// Read cron jobs from ~/.rsclaw/cron.json5
 #[tauri::command]
 fn get_cron_jobs() -> Result<serde_json::Value, String> {
-    let home = dirs::home_dir().ok_or("no home dir")?;
-    let path = home.join(".rsclaw").join("cron.json5");
+    let path = rsclaw_base_dir().join("cron.json5");
     if !path.exists() {
         return Ok(serde_json::json!({ "jobs": [] }));
     }
@@ -692,8 +692,7 @@ fn get_cron_jobs() -> Result<serde_json::Value, String> {
 /// List installed skills by reading ~/.rsclaw/skills/ directory
 #[tauri::command]
 fn get_skills() -> Result<serde_json::Value, String> {
-    let home = dirs::home_dir().ok_or("no home dir")?;
-    let skills_dir = home.join(".rsclaw").join("skills");
+    let skills_dir = rsclaw_base_dir().join("skills");
     let mut skills = Vec::new();
     if skills_dir.is_dir() {
         if let Ok(entries) = std::fs::read_dir(&skills_dir) {
