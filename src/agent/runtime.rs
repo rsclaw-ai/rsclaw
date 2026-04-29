@@ -2237,6 +2237,29 @@ impl AgentRuntime {
             dynamic_ctx.push(btw_block);
         }
 
+        // [Cron Session Hard Rules] Prevent agent from claiming dispatched tasks
+        // without actual tool calls. This fixes the deception problem where agent
+        // returns "task dispatched, task_id: xxx" but never actually executes anything.
+        if session_key.starts_with("cron:") {
+            dynamic_ctx.push(
+                "[CRON SESSION — HARD RULES]\n\
+                1. You MUST execute the task yourself. DO NOT use `agent` tool action=task to delegate.\n\
+                2. DO NOT claim \"已派发\" / \"dispatched\" / \"task_id: xxx\" without an ACTUAL tool call.\n\
+                3. If you say you are running a script, there MUST be an `execute_command` tool call.\n\
+                4. If you say you are analyzing data, there MUST be `read_file` or `search_content` tool calls.\n\
+                5. The cron scheduler expects your reply text as the result. Background tasks will NOT deliver.\n\
+                6. Claiming actions without tool calls is DECEPTION. This will be detected and reported.\n\
+                \n\
+                Example of CORRECT behavior:\n\
+                - User: \"run script X\"\n\
+                - You: call execute_command(\"python X.py\"), wait for result, summarize output\n\
+                \n\
+                Example of WRONG behavior:\n\
+                - User: \"run script X\"\n\
+                - You: \"任务已派发，task_id: xxx\" (NO tool call — this is LYING)".to_owned()
+            );
+        }
+
         // Plugin hook: before_prompt_build (AGENTS.md §20).
         self.fire_hook(
             "before_prompt_build",
@@ -4078,11 +4101,14 @@ const MAX_ERROR_STREAK: usize = 5;
                 // IMPORTANT: Check turn_scratchpad for tool calls from earlier iterations,
                 // not just current iteration's tool_calls (which is empty at this point).
                 //
-                // Skip deception detection for internal/summarize sessions.
-                // - Internal (heartbeat/cron/system): may legitimately report without tools
+                // Skip deception detection for heartbeat/system/summarize sessions.
+                // - heartbeat/system: may legitimately report status without tools
                 // - Summarize: pure summary task with NO tools available by design
-                let is_internal = is_internal_session(&ctx.session_key);
-                let skip_deception_check = is_internal || ctx.session_key.starts_with("summarize:");
+                // - CRON SESSIONS are NOT skipped: they carry real user instructions
+                //   and MUST call tools when claiming actions (deception is serious here)
+                let skip_deception_check = ctx.session_key.starts_with("heartbeat:")
+                    || ctx.session_key.starts_with("system:")
+                    || ctx.session_key.starts_with("summarize:");
                 let deception_keywords = [
                     // Chinese - claiming delegation/execution (NOT generic "已完成")
                     "已委托", "已提交", "已用opencode", "已让opencode", "委托给opencode",
@@ -4092,12 +4118,16 @@ const MAX_ERROR_STREAK: usize = 5;
                     "正在执行", "正在运行", "正在检查", "正在搜索",
                     "我来执行", "我来运行", "我来检查", "我来搜索",
                     "帮你执行", "帮你运行", "帮你检查", "帮你搜索",
+                    // CRON-specific: claiming task dispatch without actual tool call
+                    "已派发", "任务已派发", "派发到", "派发给了",
                     // English - claiming delegation/execution (NOT generic "I completed")
                     "I delegated", "I submitted", "I asked opencode", "opencode is", "I ran",
                     "I checked", "I searched", "I executed", "I visited",
                     "I will", "I'm running", "I'm executing", "I'm checking",
                     "using browser", "used browser", "using cdp", "used cdp",
                     "let me", "help you",
+                    // CRON-specific: claiming task dispatch without actual tool call
+                    "dispatched", "task dispatched", "task_id:", "task id:",
                 ];
                 let lower_text = text_buf.to_lowercase();
                 let claims_action = deception_keywords.iter().any(|kw| {
