@@ -102,6 +102,13 @@ Rust
   - No unwrap(). Use ? or .expect("reason").
   - No emojis in code, comments, logs, or commit messages.
   - All user-facing strings through src/i18n.rs.
+  - System prompts and prompt-engineering strings sent to the LLM are
+    ALWAYS English. Do not localise them via i18n. The LLM understands
+    English instructions most reliably across providers and the codebase
+    standardises on one language to avoid drift between zh/en variants.
+    User-facing UI strings still go through i18n; this rule covers
+    LLM-facing prompts only (system messages, tool descriptions, agent
+    instructions, summarize/analyze prompts, etc.).
   - All pub fn must have a doc comment.
   - New WebSocket events must be registered in events.rs before use.
   - No silent error discard (let _ = ...).

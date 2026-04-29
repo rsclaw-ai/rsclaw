@@ -77,7 +77,7 @@ Your `~/.openclaw/` is never modified. See [Migrate from OpenClaw](#migrate-from
 
 ### Other install options
 
-- **Desktop app** — `.dmg` / `.msi` / `.deb` from [Releases](https://github.com/rsclaw-ai/rsclaw/releases)
+- **Desktop app** — `.dmg` / `.exe` / `.deb` from [Releases](https://github.com/rsclaw-ai/rsclaw/releases)
 - **Via Cargo** — `cargo install rsclaw`
 - **From source** — `git clone https://github.com/rsclaw-ai/rsclaw.git && cd rsclaw && cargo build --release`
 

@@ -252,7 +252,12 @@ pub async fn cmd_doctor(args: DoctorArgs) -> Result<()> {
             Ok(plugins) if !plugins.is_empty() => {
                 let mut broken = Vec::new();
                 for p in &plugins {
-                    if !which::which(&p.runtime).is_ok() {
+                    // WASM plugins use the embedded wasmtime runtime — no
+                    // external binary on PATH. Mirrors `plugins doctor`.
+                    if p.is_wasm() {
+                        continue;
+                    }
+                    if which::which(&p.runtime).is_err() {
                         broken.push(format!("{} (runtime `{}` not found)", p.name, p.runtime));
                     }
                 }

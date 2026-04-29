@@ -1957,14 +1957,15 @@ async fn run_exec_command(
         "command succeeded with no output".to_string()
     };
 
-    // Detect saved file paths in output and read their content
-    // Common patterns: "报告已保存: xxx", "saved to: xxx", "文件已保存: xxx"
+// Detect saved file paths in output and read their content.
+    // Common patterns: "report saved: xxx", "saved to: xxx", "file saved: xxx"
+    // (and the Chinese equivalents — see extract_saved_files_content).
     let saved_files_content = extract_saved_files_content(&raw_output);
     let full_output = if saved_files_content.is_empty() {
         raw_output.clone()
     } else {
         format!(
-            "{}\n\n---\n\n[Saved Report File Content]\n{}\n\n[Note] The above is the complete report saved by the script. Summarize based on this content without missing key information.",
+            "{}\n\n---\n\n[FULL CONTENT OF SAVED REPORT FILES]\n{}\n\n[NOTE] The above is the full report the script saved. Base your summary on this content; don't omit key information.",
             raw_output,
             saved_files_content
         )
@@ -1989,28 +1990,27 @@ async fn run_exec_command(
             .get(summarize_agent_id)
             .with_context(|| format!("agent not found: {}", summarize_agent_id))?;
 
-        // Create summarize prompt with real output
-        // CRITICAL: Tell the LLM that the output MUST be summarized and returned.
-        // The summary will be sent to the user. Do NOT just call memory tool.
-        // Use "summarize:" prefix to disable all tools (internal channels have memory tool).
-        // STRICT RULE: model must ONLY use content from raw_output, no fabrication.
+        // Create summarize prompt with real output. Strict anti-fabrication
+        // rules so LLM only summarizes what's actually in raw_output (and
+        // any saved report file pulled in below by the include-saved-file
+        // logic — that lands in `full_output`).
         let summarize_prompt = format!(
-            "[Cron Task Output - No Fabrication]\n\
-            Below is the real output from a script execution.\n\
+            "[CRON TASK EXECUTION RESULT — NO FABRICATION]\n\
+            Below is the real output of a script execution.\n\
             \n\
-            [Strict Rules - Must Follow]\n\
-            1. Only summarize information that exists in the output below. Never add content not present.\n\
-            2. If output contains \"[Saved Report File Content]\", summarize based on that full content without omission.\n\
-            3. If output lacks specific data (stock counts, prices), do not fabricate numbers.\n\
-            4. If output is empty or only errors, report \"script failed\" or \"no output\" truthfully.\n\
-            5. Do not claim \"completed\" \"found\" \"executed\" - you are only summarizing, not performing actions.\n\
-            6. Return summary text directly, not HEARTBEAT_OK.\n\
+            [HARD RULES — MUST FOLLOW]\n\
+            1. You may ONLY summarize information that is already in the output below; do not add anything not present.\n\
+            2. If the output contains a \"FULL CONTENT OF SAVED REPORT FILES\" section, base your summary on that full content and do not omit key information.\n\
+            3. If the output has no concrete data (e.g. stock counts, prices), do not invent numbers.\n\
+            4. If the output is empty or only contains errors, honestly report \"script execution failed\" or \"no output\".\n\
+            5. Do not claim actions like \"done\", \"found\", \"executed\" — you only summarize, you did not execute anything.\n\
+            6. Return the summary text directly; do not return HEARTBEAT_OK.\n\
             \n\
-            [Output Content]\n\
+            [OUTPUT]\n\
             ```\n{}\n\
             ```\n\
             \n\
-            Follow these rules strictly. Violation is considered deception.",
+            Summarize strictly per the rules above. Violating any rule counts as deception.",
             full_output
         );
 
@@ -2290,7 +2290,7 @@ fn extract_saved_files_content(output: &str) -> String {
             seen_paths.insert(path.to_string());
             // Try to read the file
             if let Ok(content) = std::fs::read_to_string(path) {
-                contents.push(format!("[File: {}]\n{}", path, content));
+                contents.push(format!("[FILE: {}]\n{}", path, content));
             }
         }
     }

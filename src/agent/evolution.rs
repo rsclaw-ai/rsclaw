@@ -18,6 +18,24 @@ pub struct EvolutionConfig {
     pub cluster: ClusterConfig,
     pub promotion: PromotionConfig,
     pub meditation: MeditationParams,
+    pub workflow: WorkflowConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkflowConfig {
+    /// Master kill-switch for workflow crystallization. Off by default —
+    /// users must explicitly opt in.
+    pub enabled: bool,
+    /// Difficulty score threshold (0.0-1.0) above which a turn is eligible.
+    pub score_threshold: f32,
+    /// Minimum tool calls — easier turns don't qualify even with high score.
+    pub min_tool_calls: usize,
+    /// Minimum tool errors — 0 allows clean-but-complex turns; 1+ requires
+    /// the agent had to recover from a failure (the "stepped on a landmine"
+    /// signal).
+    pub min_errors: usize,
+    /// Cap on workflow distillations per hour, process-wide.
+    pub max_per_hour: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +87,13 @@ impl Default for EvolutionConfig {
                 dedup_threshold: 0.92,
                 crystallized_ttl_days: 7,
             },
+            workflow: WorkflowConfig {
+                enabled: false,
+                score_threshold: 0.7,
+                min_tool_calls: 5,
+                min_errors: 1,
+                max_per_hour: 3,
+            },
         }
     }
 }
@@ -93,6 +118,13 @@ impl EvolutionConfig {
                 max_per_cycle: 1,
                 dedup_threshold: 0.92,
                 crystallized_ttl_days: 7,
+            },
+            workflow: WorkflowConfig {
+                enabled: true,
+                score_threshold: 0.4,
+                min_tool_calls: 2,
+                min_errors: 0,
+                max_per_hour: 5,
             },
         }
     }
@@ -144,6 +176,23 @@ impl EvolutionConfig {
             }
             if let Some(v) = m.crystallized_ttl_days {
                 cfg.meditation.crystallized_ttl_days = v;
+            }
+        }
+        if let Some(w) = &raw.workflow {
+            if let Some(v) = w.enabled {
+                cfg.workflow.enabled = v;
+            }
+            if let Some(v) = w.score_threshold {
+                cfg.workflow.score_threshold = v;
+            }
+            if let Some(v) = w.min_tool_calls {
+                cfg.workflow.min_tool_calls = v;
+            }
+            if let Some(v) = w.min_errors {
+                cfg.workflow.min_errors = v;
+            }
+            if let Some(v) = w.max_per_hour {
+                cfg.workflow.max_per_hour = v;
             }
         }
         cfg
@@ -217,6 +266,7 @@ mod tests {
             }),
             promotion: None,
             meditation: None,
+            workflow: None,
         };
         let cfg = EvolutionConfig::from_raw(Some(&raw));
         assert_eq!(cfg.cluster.min_size, 7); // explicit override wins

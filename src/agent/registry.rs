@@ -83,6 +83,13 @@ pub struct AgentHandle {
     pub reset_signal: Arc<AtomicBool>,
     /// Shared memory store for this agent (used by meditation heartbeat).
     pub memory: Option<Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>>,
+    /// Context window in tokens for this agent's primary model. Resolved
+    /// at construction time by looking up the model name (e.g.
+    /// `brain/brain-model`) in the provider config's `contextWindow`
+    /// field, with `agent.model.contextTokens` overriding when set.
+    /// Used by /status; 0 when nothing matched and the caller should
+    /// fall back to its own default.
+    pub context_window: usize,
 }
 
 /// Per-session context token statistics.
@@ -129,9 +136,15 @@ impl AgentHandle {
             else if cfg!(target_os = "windows") { "Windows" }
             else if cfg!(target_os = "ios") { "iOS" }
             else { "Unknown" };
-        let ctx_limit = self.config.model.as_ref()
-            .and_then(|m| m.context_tokens)
-            .unwrap_or(64000) as usize;
+        // Resolution chain (already done at AgentHandle construction):
+        //   1. agent.model.contextTokens
+        //   2. agents.defaults.contextTokens
+        //   3. fallback 64000 below when both are unset (handle.context_window == 0).
+        let ctx_limit = if self.context_window > 0 {
+            self.context_window
+        } else {
+            64000
+        };
 
         let mut ctx_lines = String::new();
         if let Ok(map) = self.session_tokens.read() {
@@ -431,6 +444,15 @@ impl AgentRegistry {
                 } else {
                     AgentKind::Named
                 };
+                // Context window resolution: per-agent model.contextTokens
+                // wins, then agents.defaults.contextTokens. 0 = unset, the
+                // /status formatter falls back to its own default.
+                let context_window = entry
+                    .model
+                    .as_ref()
+                    .and_then(|m| m.context_tokens)
+                    .or(cfg.agents.defaults.context_tokens)
+                    .unwrap_or(0) as usize;
                 let handle = Arc::new(AgentHandle {
                     id: entry.id.clone(),
                     kind,
@@ -453,6 +475,7 @@ impl AgentRegistry {
                     new_session_signal: Arc::new(AtomicBool::new(false)),
                     reset_signal: Arc::new(AtomicBool::new(false)),
                     memory: None, // populated by agent runtime after memory store opens
+                    context_window,
                 });
                 inner.agents.insert(entry.id.clone(), handle);
                 receivers.insert(entry.id.clone(), rx);

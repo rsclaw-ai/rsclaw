@@ -294,6 +294,12 @@ pub struct RunContext {
     /// Count of consecutive `python -c` inline execution failures.
     /// Used to guide LLM to switch to file-based execution for easier debugging.
     pub python_inline_streak: usize,
+    /// Per-turn difficulty counters for workflow crystallization.
+    pub turn_metrics: super::turn_metrics::TurnMetrics,
+    /// The original user request text for this turn — saved on RunContext
+    /// so the workflow distiller has the verbatim ask without re-walking
+    /// session history.
+    pub user_text: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1723,6 +1729,8 @@ impl AgentRuntime {
                             recalled_memory_ids: std::collections::HashSet::new(),
                             loop_warning_triggered: false,
                             python_inline_streak: 0,
+                            turn_metrics: super::turn_metrics::TurnMetrics::new(),
+                            user_text: String::new(),
                         },
                         "",
                         &tool,
@@ -2571,6 +2579,8 @@ impl AgentRuntime {
             recalled_memory_ids: auto_recalled_ids,
             loop_warning_triggered: false,
             python_inline_streak: 0,
+            turn_metrics: super::turn_metrics::TurnMetrics::new(),
+            user_text: text.to_owned(),
         };
 
         // --- Plugins & Skills: cached, frozen at session start ---
@@ -3029,6 +3039,87 @@ impl AgentRuntime {
             self.sessions.insert(session_key.to_owned(), history);
         }
         self.sessions.get_mut(session_key).expect("just inserted")
+    }
+
+    // -----------------------------------------------------------------------
+    // Workflow crystallization trigger
+    // -----------------------------------------------------------------------
+
+    /// Inspect this turn's metrics and, if the difficulty score crosses
+    /// the configured threshold, spawn a background workflow distillation.
+    /// Skipped silently when:
+    ///   - `[ext.evolution.workflow]` is disabled
+    ///   - tool_calls below `min_tool_calls`
+    ///   - tool_errors below `min_errors`
+    ///   - difficulty score below threshold
+    ///   - rate limit exceeded OR signature already crystallized this run
+    fn maybe_crystallize_workflow(&self, ctx: &RunContext, final_text: &str) {
+        let evo = crate::agent::evolution::evolution_config();
+        if !evo.enabled || !evo.workflow.enabled {
+            return;
+        }
+        let m = &ctx.turn_metrics;
+        if m.tool_calls < evo.workflow.min_tool_calls {
+            return;
+        }
+        if m.tool_errors < evo.workflow.min_errors {
+            return;
+        }
+        let score = m.difficulty_score();
+        if score < evo.workflow.score_threshold {
+            return;
+        }
+        let signature = m.signature();
+        if !crate::agent::turn_metrics::try_admit_workflow(signature, evo.workflow.max_per_hour) {
+            tracing::debug!(
+                signature,
+                score,
+                "workflow crystallization: dedup or rate-limit, skipping"
+            );
+            return;
+        }
+
+        // Snapshot the data the background task needs — agent_loop's stack
+        // frame goes away as soon as we return.
+        let providers = Arc::clone(&self.providers);
+        let flash_model = self.resolve_flash_model_name();
+        let skills_dir = crate::skill::default_global_skills_dir()
+            .unwrap_or_else(|| crate::config::loader::base_dir().join("skills"));
+        let user_text = ctx.user_text.clone();
+        let reply_text = final_text.to_owned();
+        let metrics = ctx.turn_metrics.clone();
+
+        tracing::info!(
+            score,
+            tool_calls = m.tool_calls,
+            tool_errors = m.tool_errors,
+            distinct_tools = m.distinct_tools.len(),
+            "spawning workflow crystallization"
+        );
+        tokio::spawn(async move {
+            match crate::skill::workflow_distill::crystallize_workflow(
+                &user_text,
+                &reply_text,
+                &metrics,
+                &providers,
+                &flash_model,
+                &skills_dir,
+            )
+            .await
+            {
+                Ok(Some(_path)) => { /* logged inside crystallize_workflow */ }
+                Ok(None) => {
+                    // Distillation skipped (kill-switch / model issue / LLM
+                    // error / validation failure). Roll the signature back
+                    // so a future retry isn't blocked by the dedup set.
+                    crate::agent::turn_metrics::release_signature(signature);
+                }
+                Err(e) => {
+                    tracing::warn!("workflow crystallization hard failure: {e:#}");
+                    crate::agent::turn_metrics::release_signature(signature);
+                }
+            }
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -3623,7 +3714,22 @@ const MAX_ERROR_STREAK: usize = 5;
             };
 
 // Pre-flight check: emergency compact if we'd exceed context.
-            let context_limit = self.live.agents.read().await.defaults.context_tokens.unwrap_or(64_000) as usize;
+            // Same resolution chain as AgentHandle.context_window (the
+            // value /status displays): per-agent model.contextTokens →
+            // agents.defaults.contextTokens → 64000. Previously this only
+            // read defaults, so a per-agent override of 200_000 was
+            // ignored here and emergency compaction kicked in too early.
+            let context_limit = {
+                let agents_live = self.live.agents.read().await;
+                let per_agent = agents_live
+                    .list
+                    .iter()
+                    .find(|a| a.id == self.handle.id)
+                    .and_then(|a| a.model.as_ref().and_then(|m| m.context_tokens));
+                per_agent
+                    .or(agents_live.defaults.context_tokens)
+                    .unwrap_or(64_000) as usize
+            };
             let overhead = self.estimate_fixed_overhead();
             let session_tokens: usize = self.sessions
                 .get(&ctx.session_key)
@@ -4243,6 +4349,12 @@ const MAX_ERROR_STREAK: usize = 5;
                     text_buf
                 };
 
+                // Workflow crystallization trigger — only on the normal
+                // (non-error_streak / non-max-iter / non-abort) completion
+                // path so we never persist failed workflows as skills.
+                ctx.turn_metrics.final_text_len = final_text.len();
+                self.maybe_crystallize_workflow(&ctx, &final_text);
+
                 if !tool_images.is_empty() {
                     info!("AgentReply returning with {} image(s), first {} bytes", tool_images.len(), tool_images.first().map(|s| s.len()).unwrap_or(0));
                 }
@@ -4422,6 +4534,8 @@ const MAX_ERROR_STREAK: usize = 5;
                 let call_key = crate::agent::loop_detection::hash_tool_call(&tool_name, &tool_input);
                 if call_key == last_tool_key {
                     same_call_streak += 1;
+                    ctx.turn_metrics.same_call_streak_max =
+                        ctx.turn_metrics.same_call_streak_max.max(same_call_streak);
                     if same_call_streak >= MAX_SAME_CALL_STREAK {
                         warn!(
                             tool = %tool_name,
@@ -4497,6 +4611,9 @@ const MAX_ERROR_STREAK: usize = 5;
                     && command_for_check.len() > 200;
 
                 let tool_input_str = tool_input.to_string();
+                // Clone for the per-turn metrics record (after dispatch
+                // moves the value).
+                let tool_input_for_metrics = tool_input.clone();
                 let result = self
                     .dispatch_tool(ctx, &tool_id, &tool_name, tool_input)
                     .await;
@@ -4549,6 +4666,24 @@ const MAX_ERROR_STREAK: usize = 5;
                             // Reset python_inline_streak on successful execution
                             ctx.python_inline_streak = 0;
                         }
+                        // Record into per-turn metrics for workflow
+                        // crystallization. Truncate args/result so we don't
+                        // hold megabytes of base64 screenshots in RAM.
+                        const SUMMARY_CHARS: usize = 400;
+                        let args_summary: String =
+                            serde_json::to_string(&tool_input_for_metrics)
+                                .unwrap_or_default()
+                                .chars()
+                                .take(SUMMARY_CHARS)
+                                .collect();
+                        let result_summary: String =
+                            v.to_string().chars().take(SUMMARY_CHARS).collect();
+                        ctx.turn_metrics.record_tool(
+                            &tool_name,
+                            args_summary,
+                            result_summary,
+                            has_error,
+                        );
                         // Record result for progress-aware loop detection.
                         // Same args + different results = making progress, not a loop.
                         // For exec tool: exclude task_id (uuid changes each call) to properly detect loops.
