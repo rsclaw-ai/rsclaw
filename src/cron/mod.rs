@@ -2260,7 +2260,7 @@ pub fn trigger_reload() -> bool {
 /// - "文件已保存: /path/to/file"
 /// - "output saved: /path/to/file"
 fn extract_saved_files_content(output: &str) -> String {
-    use regex::Regex;
+    use std::collections::HashSet;
 
     // Pattern: "报告已保存: path" or "saved to: path" etc.
     let patterns = [
@@ -2269,17 +2269,20 @@ fn extract_saved_files_content(output: &str) -> String {
         r"saved to[:\s]+([^\n]+)",
         r"output saved[:\s]+([^\n]+)",
         r"保存到[:\s]+([^\n]+)",
-        r"已保存[:\s]+(.+\.md)",
-        r"已保存[:\s]+(.+\.json)",
-        r"已保存[:\s]+(.+\.txt)",
     ];
 
-    let mut contents = Vec::new();
+    let mut seen_paths: HashSet<String> = HashSet::new();
+    let mut contents: Vec<String> = Vec::new();
 
     for pattern in &patterns {
-        let re = Regex::new(pattern).unwrap();
+        let re = regex::Regex::new(pattern).unwrap();
         for cap in re.captures_iter(output) {
             let path = cap[1].trim();
+            // Skip if already processed this path
+            if seen_paths.contains(path) {
+                continue;
+            }
+            seen_paths.insert(path.to_string());
             // Try to read the file
             if let Ok(content) = std::fs::read_to_string(path) {
                 contents.push(format!("【文件: {}】\n{}", path, content));
