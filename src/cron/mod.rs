@@ -740,7 +740,14 @@ impl CronRunner {
             if reload_triggered {
                 // Reload jobs from file
                 let old_count = jobs.len();
-                let (new_jobs, _) = crate::cron::load_cron_jobs();
+                let (new_jobs, parse_ok) = crate::cron::load_cron_jobs();
+
+                if !parse_ok {
+                    // File has syntax errors - don't replace jobs, don't save
+                    warn!(old_count, "cron: reload skipped - cron.json5 has syntax errors, fix before modifying");
+                    continue;
+                }
+
                 let file_count = new_jobs.len();
 
                 // Debug: check if disabled job is in new_jobs
