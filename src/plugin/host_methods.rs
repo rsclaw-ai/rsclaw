@@ -215,11 +215,24 @@ impl HostMethodRegistry {
             .ok_or_else(|| anyhow::anyhow!("browser_click_at: `y` required"))?;
         self.browser_call("click_at", json!({"x": x, "y": y})).await
     }
-    async fn host_browser_fill(&self, _params: Value) -> Result<Value> {
-        unimplemented!("filled in Task 13")
+    /// Fill a form field by accessibility ref in the shared browser session.
+    ///
+    /// Params: `{ "ref": "<element ref>", "text": "<value>" }`. Mirrors wasm `browser_fill`.
+    async fn host_browser_fill(&self, params: Value) -> Result<Value> {
+        let element_ref = params["ref"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("browser_fill: `ref` required"))?;
+        let text = params["text"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("browser_fill: `text` required"))?;
+        self.browser_call("fill", json!({"ref": element_ref, "text": text})).await
     }
+
+    /// Capture an accessibility snapshot of the current page in the shared browser session.
+    ///
+    /// Params: `{}` (none required). Mirrors wasm `browser_snapshot`.
     async fn host_browser_snapshot(&self, _params: Value) -> Result<Value> {
-        unimplemented!("filled in Task 13")
+        self.browser_call("snapshot", json!({})).await
     }
     async fn host_browser_download(&self, _params: Value) -> Result<Value> {
         unimplemented!("filled in Task 14")
