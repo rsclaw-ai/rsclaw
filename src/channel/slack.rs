@@ -474,8 +474,16 @@ impl Channel for SlackChannel {
                 min_chars: 1,
                 break_preference: BreakPreference::Paragraph,
             };
-            for chunk in &chunk_text(&msg.text, &cfg) {
-                self.post_message(&msg.target_id, chunk).await?;
+            // Only post text when there's actual text. Slack's
+            // chat.postMessage rejects empty bodies with `no_text`, and
+            // the `?` here used to short-circuit the entire send — so an
+            // image-only reply (e.g. `/ss` returns OutboundMessage with
+            // text="" + 1 image) silently dropped the image because we
+            // never reached the upload loop below.
+            if !msg.text.trim().is_empty() {
+                for chunk in &chunk_text(&msg.text, &cfg) {
+                    self.post_message(&msg.target_id, chunk).await?;
+                }
             }
             if !msg.images.is_empty() {
                 info!(count = msg.images.len(), "slack: sending images");

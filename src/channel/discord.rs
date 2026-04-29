@@ -546,6 +546,16 @@ impl DiscordChannel {
                             if let Some(bid) = bot_id.as_deref() {
                                 content = strip_bot_mention(&content, bid);
                             }
+                            // Allow `\xxx` as an alias for `/xxx` — Discord
+                            // intercepts a leading `/` for native slash
+                            // commands so users sometimes can't easily type
+                            // /ss / /webshot / /help. Mirrors the Slack
+                            // alias added earlier.
+                            if let Some(rest) = content.strip_prefix('\\') {
+                                if rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+                                    content = format!("/{rest}");
+                                }
+                            }
 
                             if content.is_empty() { continue; }
                             debug!(peer = %peer_id, channel = %channel_id, "Discord: MESSAGE_CREATE");
