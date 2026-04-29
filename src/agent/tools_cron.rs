@@ -23,6 +23,7 @@ impl super::runtime::AgentRuntime {
         match action {
             "list" => {
                 let jobs = read_cron_jobs(&cron_path).await;
+                tracing::info!(path = %cron_path.display(), count = jobs.len(), "cron list: read jobs");
                 // Add 1-based index to each job for easier reference by LLMs
                 let jobs_with_index: Vec<Value> = jobs
                     .iter()

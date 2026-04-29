@@ -4226,6 +4226,9 @@ const MAX_ERROR_STREAK: usize = 5;
                     "帮你执行", "帮你运行", "帮你检查", "帮你搜索",
                     // CRON-specific: claiming task dispatch without actual tool call
                     "已派发", "任务已派发", "派发到", "派发给了",
+                    // Chinese: claiming to have called/used/checked something
+                    "我通过", "我调用", "我查询", "我检查", "我搜索", "我运行", "我执行",
+                    "命令查询", "命令检查", "通过命令", "调用了", "查询了", "检查了",
                     // English - claiming delegation/execution (NOT generic "I completed")
                     "I delegated", "I submitted", "I asked opencode", "opencode is", "I ran",
                     "I checked", "I searched", "I executed", "I visited",
@@ -4234,6 +4237,8 @@ const MAX_ERROR_STREAK: usize = 5;
                     "let me", "help you",
                     // CRON-specific: claiming task dispatch without actual tool call
                     "dispatched", "task dispatched", "task_id:", "task id:",
+                    // English: claiming to have called/used something
+                    "I called", "I used", "I ran", "via command", "through",
                 ];
                 let lower_text = text_buf.to_lowercase();
                 let claims_action = deception_keywords.iter().any(|kw| {
@@ -4247,7 +4252,8 @@ const MAX_ERROR_STREAK: usize = 5;
                             matches!(p, crate::provider::ContentPart::ToolUse { name, .. }
                                 if name == "opencode" || name == "claudecode" || name == "codex"
                                     || name == "web_search" || name == "execute_command"
-                                    || name == "web_browser" || name == "web_fetch")
+                                    || name == "web_browser" || name == "web_fetch"
+                                    || name == "cron" || name == "read_file" || name == "write_file")
                         })
                     } else {
                         false
