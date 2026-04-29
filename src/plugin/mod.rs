@@ -24,11 +24,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-pub use manifest::{LEGACY_MANIFEST_FILE, MANIFEST_FILE, PluginManifest, PluginToolDef, load_manifest, scan_plugins};
+pub use manifest::{
+    LEGACY_MANIFEST_FILE, MANIFEST_FILE, PluginManifest, PluginToolDef, load_manifest, scan_plugins,
+};
 pub use shell_bridge::Plugin;
 pub use slots::{ContextEngineSlot, MemoryItem, MemorySlot, MemoryStoreSlot, SlotRegistry};
-pub use wasm_runtime::{WasmPlugin, WasmToolDef, load_wasm_plugin};
 use tracing::{info, warn};
+pub use wasm_runtime::{WasmPlugin, WasmToolDef, load_wasm_plugin};
 
 use crate::config::schema::PluginsConfig;
 

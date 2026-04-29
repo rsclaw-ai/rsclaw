@@ -28,7 +28,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
+    process::{Child, ChildStdin, Command},
     sync::{Mutex, oneshot},
     task::JoinHandle,
     time,
@@ -52,8 +52,10 @@ pub struct ShellBridgePlugin {
     next_id: Arc<AtomicI64>,
     timeout: Duration,
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>,
+    /// Reader task handle. `take()`d in `shutdown` so we can `await` the
+    /// task to completion after killing the subprocess (lets the reader
+    /// drain any in-flight responses cleanly before we drop pending).
     reader_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
-    host_dispatch: Arc<crate::plugin::host_methods::HostMethodRegistry>,
 }
 
 impl ShellBridgePlugin {
@@ -142,7 +144,6 @@ impl ShellBridgePlugin {
             timeout: Duration::from_secs(DEFAULT_CALL_TIMEOUT_SECS),
             pending,
             reader_handle: Arc::new(Mutex::new(Some(reader_handle))),
-            host_dispatch,
         })
     }
 
@@ -171,7 +172,10 @@ impl ShellBridgePlugin {
         let write_result: Result<()> = {
             let mut stdin = self.stdin.lock().await;
             async {
-                stdin.write_all(line.as_bytes()).await.context("write request")?;
+                stdin
+                    .write_all(line.as_bytes())
+                    .await
+                    .context("write request")?;
                 stdin.write_all(b"\n").await.context("write newline")?;
                 stdin.flush().await.context("flush stdin")?;
                 Ok(())
@@ -185,7 +189,7 @@ impl ShellBridgePlugin {
 
         // Wait for response with timeout.
         match time::timeout(self.timeout, rx).await {
-            Ok(Ok(Ok(v)))  => Ok(v),
+            Ok(Ok(Ok(v))) => Ok(v),
             Ok(Ok(Err(e))) => bail!("plugin `{}` error: {e}", self.name),
             Ok(Err(_canceled)) => {
                 // Sender was dropped — reader task ended (EOF or read error).
@@ -205,10 +209,20 @@ impl ShellBridgePlugin {
         }
     }
 
-    /// Kill the subprocess gracefully.
+    /// Kill the subprocess and wait for the reader task to drain.
+    ///
+    /// Killing the child closes its stdout, the reader task observes EOF and
+    /// exits, and `await`-ing its handle here ensures any final pending
+    /// responses are processed before this function returns. Skipping the
+    /// await would leave a detached task that the runtime cleans up only at
+    /// shutdown — fine in practice but noisy under tracing and test reports.
     pub async fn shutdown(&self) {
         let mut child = self.child.lock().await;
         let _ = child.kill().await;
+        drop(child);
+        if let Some(handle) = self.reader_handle.lock().await.take() {
+            let _ = handle.await;
+        }
         debug!(plugin = %self.name, "plugin subprocess terminated");
     }
 }

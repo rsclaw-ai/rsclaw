@@ -22,14 +22,14 @@ use crate::channel::OutboundMessage;
 #[derive(Clone)]
 pub struct HostMethodRegistry {
     pub notify_tx: Option<broadcast::Sender<OutboundMessage>>,
-    pub browser:   Arc<Mutex<Option<BrowserSession>>>,
+    pub browser: Arc<Mutex<Option<BrowserSession>>>,
 }
 
 impl HostMethodRegistry {
     /// Create a new registry with the given notification sender and browser session.
     pub fn new(
         notify_tx: Option<broadcast::Sender<OutboundMessage>>,
-        browser:   Arc<Mutex<Option<BrowserSession>>>,
+        browser: Arc<Mutex<Option<BrowserSession>>>,
     ) -> Self {
         Self { notify_tx, browser }
     }
@@ -38,17 +38,17 @@ impl HostMethodRegistry {
     pub async fn handle(&self, method: &str, params: Value) -> Result<Value> {
         debug!(method, "host method dispatch");
         match method {
-            "notify"                    => self.host_notify(params).await,
-            "log"                       => self.host_log(params).await,
-            "browser_open"              => self.host_browser_open(params).await,
-            "browser_eval"              => self.host_browser_eval(params).await,
-            "browser_eval_with_args"    => self.host_browser_eval_with_args(params).await,
-            "browser_click"             => self.host_browser_click(params).await,
-            "browser_click_at"          => self.host_browser_click_at(params).await,
-            "browser_fill"              => self.host_browser_fill(params).await,
-            "browser_snapshot"          => self.host_browser_snapshot(params).await,
-            "browser_download"          => self.host_browser_download(params).await,
-            "sleep"                     => self.host_sleep(params).await,
+            "notify" => self.host_notify(params).await,
+            "log" => self.host_log(params).await,
+            "browser_open" => self.host_browser_open(params).await,
+            "browser_eval" => self.host_browser_eval(params).await,
+            "browser_eval_with_args" => self.host_browser_eval_with_args(params).await,
+            "browser_click" => self.host_browser_click(params).await,
+            "browser_click_at" => self.host_browser_click_at(params).await,
+            "browser_fill" => self.host_browser_fill(params).await,
+            "browser_snapshot" => self.host_browser_snapshot(params).await,
+            "browser_download" => self.host_browser_download(params).await,
+            "sleep" => self.host_sleep(params).await,
             "storage_allocate_artifact" => self.host_storage_allocate_artifact(params).await,
             other => bail!("unknown host method: {other}"),
         }
@@ -65,26 +65,33 @@ impl HostMethodRegistry {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("notify: `text` required"))?
             .to_owned();
-        let ctx = params.get("_ctx")
+        let ctx = params
+            .get("_ctx")
             .ok_or_else(|| anyhow::anyhow!("notify: `_ctx` required"))?;
         let target_id = ctx["target_id"].as_str().unwrap_or("").to_owned();
-        let channel   = ctx["channel"].as_str().unwrap_or("").to_owned();
+        let channel = ctx["channel"].as_str().unwrap_or("").to_owned();
 
         tracing::info!(target: "shell_plugin_notify", "{text}");
 
         let Some(tx) = &self.notify_tx else {
-            warn!("notify called but notify_tx is not configured (plugin not in agent ctx); logged only");
+            warn!(
+                "notify called but notify_tx is not configured (plugin not in agent ctx); logged only"
+            );
             return Ok(json!({ "status": "logged_only" }));
         };
 
         let msg = OutboundMessage {
             target_id,
             text,
-            channel: if channel.is_empty() { None } else { Some(channel) },
+            channel: if channel.is_empty() {
+                None
+            } else {
+                Some(channel)
+            },
             ..Default::default()
         };
         match tx.send(msg) {
-            Ok(_)  => Ok(json!({ "status": "dispatched" })),
+            Ok(_) => Ok(json!({ "status": "dispatched" })),
             Err(_) => Ok(json!({ "status": "no_receivers" })),
         }
     }
@@ -96,12 +103,12 @@ impl HostMethodRegistry {
     /// output from gateway logs — mirrors the wasm side's pattern.
     async fn host_log(&self, params: Value) -> Result<Value> {
         let level = params["level"].as_str().unwrap_or("info");
-        let text  = params["text"].as_str().unwrap_or("");
+        let text = params["text"].as_str().unwrap_or("");
         match level {
             "error" => tracing::error!(target: "shell_plugin", plugin_log = true, "{text}"),
-            "warn"  => tracing::warn!(target: "shell_plugin",  plugin_log = true, "{text}"),
+            "warn" => tracing::warn!(target: "shell_plugin",  plugin_log = true, "{text}"),
             "debug" => tracing::debug!(target: "shell_plugin", plugin_log = true, "{text}"),
-            _       => tracing::info!(target: "shell_plugin",  plugin_log = true, "{text}"),
+            _ => tracing::info!(target: "shell_plugin",  plugin_log = true, "{text}"),
         }
         Ok(Value::Null)
     }
@@ -200,7 +207,8 @@ impl HostMethodRegistry {
         let element_ref = params["ref"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("browser_click: `ref` required"))?;
-        self.browser_call("click", json!({"ref": element_ref})).await
+        self.browser_call("click", json!({"ref": element_ref}))
+            .await
     }
 
     /// Click at a specific viewport coordinate in the shared browser session.
@@ -225,7 +233,8 @@ impl HostMethodRegistry {
         let text = params["text"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("browser_fill: `text` required"))?;
-        self.browser_call("fill", json!({"ref": element_ref, "text": text})).await
+        self.browser_call("fill", json!({"ref": element_ref, "text": text}))
+            .await
     }
 
     /// Capture an accessibility snapshot of the current page in the shared browser session.

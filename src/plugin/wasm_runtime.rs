@@ -198,7 +198,9 @@ impl rsclaw::plugin::host_browser::Host for HostState {
     }
 
     async fn browser_click_at(&mut self, x: u32, y: u32) -> Result<Result<String, String>> {
-        Ok(self.browser_action("click_at", json!({"x": x, "y": y})).await)
+        Ok(self
+            .browser_action("click_at", json!({"x": x, "y": y}))
+            .await)
     }
 
     async fn browser_fill(
@@ -206,7 +208,9 @@ impl rsclaw::plugin::host_browser::Host for HostState {
         ref_str: String,
         text: String,
     ) -> Result<Result<String, String>> {
-        Ok(self.browser_action("fill", json!({"ref": ref_str, "text": text})).await)
+        Ok(self
+            .browser_action("fill", json!({"ref": ref_str, "text": text}))
+            .await)
     }
 
     async fn browser_press(&mut self, key: String) -> Result<Result<String, String>> {
@@ -247,10 +251,7 @@ impl rsclaw::plugin::host_browser::Host for HostState {
             .map(|_| "ok".to_string()))
     }
 
-    async fn wait_for_network_idle(
-        &mut self,
-        timeout_ms: u32,
-    ) -> Result<Result<String, String>> {
+    async fn wait_for_network_idle(&mut self, timeout_ms: u32) -> Result<Result<String, String>> {
         let timeout_secs = u64::from(timeout_ms / 1000).max(1);
         Ok(self
             .browser_action(
@@ -309,7 +310,10 @@ impl rsclaw::plugin::host_browser::Host for HostState {
             None => return Ok(Err("last tab has no id".to_string())),
         };
         let url = last.get("url").and_then(|u| u.as_str()).unwrap_or("?");
-        match session.execute("switch_tab", &json!({"target_id": tid})).await {
+        match session
+            .execute("switch_tab", &json!({"target_id": tid}))
+            .await
+        {
             Ok(_) => Ok(Ok(format!("switched to tab: {url}"))),
             Err(e) => Ok(Err(format!("switch_tab failed: {e:#}"))),
         }
@@ -488,11 +492,9 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
 }
 
 impl rsclaw::plugin::host_storage::Host for HostState {
-    async fn allocate_artifact(
-        &mut self,
-        filename: String,
-    ) -> Result<Result<String, String>> {
-        Ok(allocate_dl_paths(&filename, 1).map(|paths| paths.into_iter().next().unwrap_or_default()))
+    async fn allocate_artifact(&mut self, filename: String) -> Result<Result<String, String>> {
+        Ok(allocate_dl_paths(&filename, 1)
+            .map(|paths| paths.into_iter().next().unwrap_or_default()))
     }
 
     async fn allocate_artifact_group(
@@ -747,14 +749,11 @@ impl WasmPlugin {
             .with_context(|| "handle-tool export not found")?;
 
         let handle_tool_fn = instance
-            .get_typed_func::<(&str, &str), (Result<String, String>,)>(
-                &mut store,
-                &handle_tool_idx,
-            )
+            .get_typed_func::<(&str, &str), (Result<String, String>,)>(&mut store, &handle_tool_idx)
             .with_context(|| "handle-tool has unexpected type")?;
 
-        let args_json = serde_json::to_string(&args)
-            .context("failed to serialize tool arguments")?;
+        let args_json =
+            serde_json::to_string(&args).context("failed to serialize tool arguments")?;
 
         let (result,) = handle_tool_fn
             .call_async(&mut store, (tool_name, &args_json))
@@ -768,14 +767,19 @@ impl WasmPlugin {
 
         match result {
             Ok(json_str) => {
-                let value: serde_json::Value = serde_json::from_str(&json_str)
-                    .with_context(|| {
+                let value: serde_json::Value =
+                    serde_json::from_str(&json_str).with_context(|| {
                         format!("invalid JSON result from tool '{tool_name}': {json_str}")
                     })?;
                 Ok(value)
             }
             Err(err_str) => {
-                bail!("WASM plugin '{}' tool '{}' returned error: {}", self.name, tool_name, err_str)
+                bail!(
+                    "WASM plugin '{}' tool '{}' returned error: {}",
+                    self.name,
+                    tool_name,
+                    err_str
+                )
             }
         }
     }

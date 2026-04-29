@@ -8,16 +8,15 @@ use tokio::sync::Mutex;
 
 #[tokio::test(flavor = "current_thread")]
 async fn shell_plugin_echo_tool_dispatches() {
-    let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/shell_plugin_echo");
+    let fixtures_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shell_plugin_echo");
 
     let manifest = rsclaw::plugin::load_manifest(&fixtures_dir).expect("parse manifest");
 
-    let browser: Arc<Mutex<Option<rsclaw::browser::BrowserSession>>> =
-        Arc::new(Mutex::new(None));
-    let host_dispatch = Arc::new(
-        rsclaw::plugin::host_methods::HostMethodRegistry::new(None, browser),
-    );
+    let browser: Arc<Mutex<Option<rsclaw::browser::BrowserSession>>> = Arc::new(Mutex::new(None));
+    let host_dispatch = Arc::new(rsclaw::plugin::host_methods::HostMethodRegistry::new(
+        None, browser,
+    ));
 
     let plugin = rsclaw::plugin::Plugin::spawn(manifest, host_dispatch)
         .await
@@ -42,19 +41,19 @@ async fn shell_plugin_echo_tool_dispatches() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn shell_plugin_notify_reaches_host() {
-    let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/shell_plugin_echo");
+    let fixtures_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shell_plugin_echo");
 
     let manifest = rsclaw::plugin::load_manifest(&fixtures_dir).expect("parse manifest");
 
-    let browser: Arc<Mutex<Option<rsclaw::browser::BrowserSession>>> =
-        Arc::new(Mutex::new(None));
+    let browser: Arc<Mutex<Option<rsclaw::browser::BrowserSession>>> = Arc::new(Mutex::new(None));
     let (notify_tx, mut notify_rx) =
         tokio::sync::broadcast::channel::<rsclaw::channel::OutboundMessage>(16);
 
-    let host_dispatch = Arc::new(
-        rsclaw::plugin::host_methods::HostMethodRegistry::new(Some(notify_tx), browser),
-    );
+    let host_dispatch = Arc::new(rsclaw::plugin::host_methods::HostMethodRegistry::new(
+        Some(notify_tx),
+        browser,
+    ));
 
     let plugin = rsclaw::plugin::Plugin::spawn(manifest, host_dispatch)
         .await
@@ -94,13 +93,12 @@ async fn shell_plugin_notify_reaches_host() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn shell_plugin_legacy_hook_call_still_works() {
-    let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/shell_plugin_echo");
+    let fixtures_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shell_plugin_echo");
 
     let manifest = rsclaw::plugin::load_manifest(&fixtures_dir).expect("parse manifest");
 
-    let browser: Arc<Mutex<Option<rsclaw::browser::BrowserSession>>> =
-        Arc::new(Mutex::new(None));
+    let browser: Arc<Mutex<Option<rsclaw::browser::BrowserSession>>> = Arc::new(Mutex::new(None));
     let host_dispatch = Arc::new(
         // No notify_tx — simulates the pre-bidirectional hook context where
         // shell plugins were one-way callers only.
@@ -130,16 +128,15 @@ async fn shell_plugin_legacy_hook_call_still_works() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shell_plugin_concurrent_calls_demux_correctly() {
-    let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/shell_plugin_echo");
+    let fixtures_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shell_plugin_echo");
 
     let manifest = rsclaw::plugin::load_manifest(&fixtures_dir).expect("parse manifest");
 
-    let browser: Arc<Mutex<Option<rsclaw::browser::BrowserSession>>> =
-        Arc::new(Mutex::new(None));
-    let host_dispatch = Arc::new(
-        rsclaw::plugin::host_methods::HostMethodRegistry::new(None, browser),
-    );
+    let browser: Arc<Mutex<Option<rsclaw::browser::BrowserSession>>> = Arc::new(Mutex::new(None));
+    let host_dispatch = Arc::new(rsclaw::plugin::host_methods::HostMethodRegistry::new(
+        None, browser,
+    ));
 
     let plugin = Arc::new(
         rsclaw::plugin::Plugin::spawn(manifest, host_dispatch)

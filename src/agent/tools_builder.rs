@@ -5,13 +5,13 @@
 
 use serde_json::{Value, json};
 
+use super::registry::AgentRegistry;
 use crate::{
     config::schema::ExternalAgentConfig,
     plugin::{PluginRegistry, WasmPlugin},
     provider::ToolDef,
     skill::SkillRegistry,
 };
-use super::registry::AgentRegistry;
 
 /// Build a `Vec<ToolDef>` advertising every tool exported by every loaded
 /// WASM plugin. Tool names are namespaced as `<plugin>.<tool>` so the
@@ -42,10 +42,12 @@ pub(crate) fn build_shell_tool_defs(plugins: &PluginRegistry) -> Vec<ToolDef> {
             plugin.manifest.tools.iter().map(move |t| ToolDef {
                 name: format!("{plugin_name}.{}", t.name),
                 description: t.description.clone(),
-                parameters: t.input_schema.clone().unwrap_or_else(|| serde_json::json!({
-                    "type": "object",
-                    "properties": {}
-                })),
+                parameters: t.input_schema.clone().unwrap_or_else(|| {
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {}
+                    })
+                }),
             })
         })
         .collect()
@@ -130,9 +132,42 @@ pub(crate) fn toolset_allowed_names(
     toolset: &str,
     custom_tools: Option<&Vec<String>>,
 ) -> Option<std::collections::HashSet<String>> {
-    const MINIMAL: &[&str] = &["execute_command", "read_file", "write_file", "send_file", "list_dir", "search_file", "search_content", "web_search", "web_fetch", "memory", "clarify", "anycli", "use_skill"];
-    const WEB: &[&str] = &["web_search", "web_fetch", "web_download", "read_file", "write_file", "list_dir", "search_file", "memory", "use_skill"];
-    const CODE: &[&str] = &["execute_command", "read_file", "write_file", "list_dir", "search_file", "search_content", "memory", "use_skill"];
+    const MINIMAL: &[&str] = &[
+        "execute_command",
+        "read_file",
+        "write_file",
+        "send_file",
+        "list_dir",
+        "search_file",
+        "search_content",
+        "web_search",
+        "web_fetch",
+        "memory",
+        "clarify",
+        "anycli",
+        "use_skill",
+    ];
+    const WEB: &[&str] = &[
+        "web_search",
+        "web_fetch",
+        "web_download",
+        "read_file",
+        "write_file",
+        "list_dir",
+        "search_file",
+        "memory",
+        "use_skill",
+    ];
+    const CODE: &[&str] = &[
+        "execute_command",
+        "read_file",
+        "write_file",
+        "list_dir",
+        "search_file",
+        "search_content",
+        "memory",
+        "use_skill",
+    ];
     const STANDARD: &[&str] = &[
         "execute_command",
         "read_file",
@@ -1181,7 +1216,8 @@ pub(crate) fn build_tool_list(
     for tool in &mut tools {
         if let Some(obj) = tool.parameters.as_object_mut() {
             obj.entry("additionalProperties").or_insert(json!(false));
-            obj.entry("$schema").or_insert(json!("http://json-schema.org/draft-07/schema#"));
+            obj.entry("$schema")
+                .or_insert(json!("http://json-schema.org/draft-07/schema#"));
         }
     }
 
