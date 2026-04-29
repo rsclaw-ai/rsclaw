@@ -880,6 +880,7 @@ pub async fn import_memories_to_store(
 
     let mut imported = 0usize;
     let mut errors = 0usize;
+    let show_progress = total > BATCH;
     for chunk in all_memories.chunks(BATCH) {
         // Snapshot the embedders under a brief lock.
         let (primary, secondary) = {
@@ -935,6 +936,9 @@ pub async fn import_memories_to_store(
             elapsed_secs = started.elapsed().as_secs(),
             "openclaw memory import: batch complete"
         );
+        if show_progress {
+            eprintln!("    · embedded {imported}/{total}");
+        }
     }
 
     info!(
@@ -1050,10 +1054,13 @@ pub async fn import_workspace_memory(
     }
 
     // Ingest into MemoryStore — same parallel-embed-then-brief-lock-insert
-    // pattern as `import_memories_to_store`.
+    // pattern as `import_memories_to_store`. Print a per-batch tick to
+    // stderr when the dataset is large enough to span multiple batches —
+    // gives the user visible progress during the longest migration phase.
     const BATCH: usize = 50;
     let mut imported = 0usize;
     let mut embed_errors = 0usize;
+    let show_progress = sources.len() > BATCH;
     for chunk in sources.chunks(BATCH) {
         let (primary, secondary) = {
             let mem = mem_arc.lock().await;
@@ -1102,6 +1109,9 @@ pub async fn import_workspace_memory(
                 }
             }
         }
+        if show_progress {
+            eprintln!("    · embedded {imported}/{total}");
+        }
     }
 
     info!(
@@ -1133,14 +1143,70 @@ fn sha256_short(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Workspace .md files to copy (MEMORY.md is also copied as-is for system prompt,
-/// AND parsed into memory store for vector search).
+/// AND parsed into memory store for vector search). AGENT.md and SYSTEM.md are
+/// user-customised extras some OpenClaw setups carry alongside the canonical
+/// AGENTS.md.
 const WORKSPACE_FILES: &[&str] = &[
     "SOUL.md",
     "IDENTITY.md",
+    "AGENT.md",
     "AGENTS.md",
+    "SYSTEM.md",
     "USER.md",
     "MEMORY.md",
 ];
+
+/// Subset of workspace files that should have OpenClaw → rsclaw branding
+/// rewritten on copy. These are the agent-identity files where leftover
+/// "OpenClaw" / "🦞" / "龙虾" references would confuse a freshly migrated
+/// agent's self-concept. User data (USER.md, MEMORY.md) is left verbatim.
+const REBRAND_FILES: &[&str] = &[
+    "SOUL.md",
+    "IDENTITY.md",
+    "AGENT.md",
+    "AGENTS.md",
+    "SYSTEM.md",
+];
+
+/// Apply OpenClaw → rsclaw branding rewrites in-place.
+///
+/// Order matters: the exact `OpenClaw → RsClaw` pass runs first so the
+/// CamelCase form is preserved, then a case-insensitive sweep catches any
+/// remaining `openclaw` / `OPENCLAW` / mixed-case occurrences.
+fn rebrand_content(input: &str) -> String {
+    // 1. Exact CamelCase first.
+    let step1 = input.replace("OpenClaw", "RsClaw");
+    // 2. Case-insensitive sweep for the lowercase form.
+    //    Done by scanning byte-by-byte to avoid pulling in the regex crate
+    //    just for one literal pattern.
+    let needle = "openclaw";
+    let mut out = String::with_capacity(step1.len());
+    let bytes = step1.as_bytes();
+    let n = needle.len();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + n <= bytes.len() && bytes[i..i + n].eq_ignore_ascii_case(needle.as_bytes()) {
+            out.push_str("rsclaw");
+            i += n;
+        } else {
+            // Push the current char (handles multi-byte UTF-8 correctly).
+            let ch_start = i;
+            // Advance by one full UTF-8 char.
+            let ch_len = match bytes[i] {
+                b if b < 0x80 => 1,
+                b if b < 0xC0 => 1, // continuation byte (shouldn't happen at boundary)
+                b if b < 0xE0 => 2,
+                b if b < 0xF0 => 3,
+                _ => 4,
+            };
+            let end = (ch_start + ch_len).min(bytes.len());
+            out.push_str(&step1[ch_start..end]);
+            i = end;
+        }
+    }
+    // 3. Mascot rewrite — lobster → crab.
+    out.replace("龙虾", "螃蟹").replace("🦞", "🦀")
+}
 
 /// Copy workspace .md files from an OpenClaw workspace dir to rsclaw workspace.
 pub fn copy_workspace_files(
@@ -1153,20 +1219,164 @@ pub fn copy_workspace_files(
     std::fs::create_dir_all(dst_workspace)?;
     let mut count = 0;
 
+    // Promote AGENT.md → AGENTS.md when only the singular form exists.
+    // AGENTS.md is the canonical name the runtime reads; AGENT.md is a
+    // user-customised variant that would otherwise be ignored at runtime.
+    // We still preserve a copy under the original name so the user's mental
+    // model isn't broken, but the canonical slot gets filled too.
+    let has_agents = src_workspace.join("AGENTS.md").is_file();
+    let has_agent = src_workspace.join("AGENT.md").is_file();
+    let promote_agent = has_agent && !has_agents;
+
     for filename in WORKSPACE_FILES {
         let src = src_workspace.join(filename);
-        if src.is_file() {
-            let dst = dst_workspace.join(filename);
-            if !dst.exists() {
-                std::fs::copy(&src, &dst)?;
-                debug!(file = %filename, "copied workspace file");
-                count += 1;
-            } else {
-                debug!(file = %filename, "skipped (already exists)");
+        if !src.is_file() {
+            continue;
+        }
+        // Targets to write for this source: usually one (same name), but
+        // AGENT.md → [AGENT.md, AGENTS.md] when promotion applies.
+        let targets: &[&str] = if *filename == "AGENT.md" && promote_agent {
+            &["AGENT.md", "AGENTS.md"]
+        } else {
+            std::slice::from_ref(filename)
+        };
+
+        for &target_name in targets {
+            let dst = dst_workspace.join(target_name);
+            if dst.exists() {
+                debug!(file = %target_name, "skipped (already exists)");
+                continue;
             }
+            // Rebrand if EITHER the source name OR the target name is in
+            // the rebrand list (covers the AGENT.md → AGENTS.md promotion).
+            let needs_rebrand =
+                REBRAND_FILES.contains(filename) || REBRAND_FILES.contains(&target_name);
+            if needs_rebrand {
+                let raw = std::fs::read_to_string(&src)?;
+                let rebranded = rebrand_content(&raw);
+                std::fs::write(&dst, rebranded)?;
+                debug!(file = %target_name, src = %filename, "copied workspace file (rebranded)");
+            } else {
+                std::fs::copy(&src, &dst)?;
+                debug!(file = %target_name, src = %filename, "copied workspace file");
+            }
+            count += 1;
         }
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod rebrand_tests {
+    use super::rebrand_content;
+
+    #[test]
+    fn camelcase_preserved() {
+        assert_eq!(rebrand_content("OpenClaw runs"), "RsClaw runs");
+    }
+
+    #[test]
+    fn lowercase_swapped() {
+        assert_eq!(rebrand_content("openclaw runs"), "rsclaw runs");
+    }
+
+    #[test]
+    fn uppercase_swapped() {
+        // Step 2 produces lowercase regardless of source casing — that
+        // matches the user's spec ("openclaw → rsclaw, case-insensitive").
+        assert_eq!(rebrand_content("OPENCLAW"), "rsclaw");
+    }
+
+    #[test]
+    fn mixed_in_one_doc() {
+        let src = "OpenClaw is built on top of openclaw — see openClaw.json";
+        let out = rebrand_content(src);
+        assert_eq!(out, "RsClaw is built on top of rsclaw — see rsclaw.json");
+    }
+
+    #[test]
+    fn lobster_to_crab() {
+        assert_eq!(rebrand_content("我是 🦞 龙虾"), "我是 🦀 螃蟹");
+    }
+
+    #[test]
+    fn untouched_when_absent() {
+        let s = "no branding here, just regular text 中文 also fine";
+        assert_eq!(rebrand_content(s), s);
+    }
+
+    #[test]
+    fn does_not_corrupt_utf8() {
+        // Mix of ASCII branding and multi-byte chars on either side.
+        let src = "前置中文OpenClaw后置🦞结尾";
+        assert_eq!(rebrand_content(src), "前置中文RsClaw后置🦀结尾");
+    }
+}
+
+#[cfg(test)]
+mod copy_workspace_tests {
+    use super::copy_workspace_files;
+    use std::fs;
+
+    fn write(p: &std::path::Path, body: &str) {
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, body).unwrap();
+    }
+
+    #[test]
+    fn promotes_singular_agent_to_canonical_when_only_one_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        write(&src.join("AGENT.md"), "rules from OpenClaw user");
+
+        let n = copy_workspace_files(&src, &dst).unwrap();
+        // Two writes: AGENT.md (preserved) + AGENTS.md (promoted).
+        assert_eq!(n, 2);
+        assert!(dst.join("AGENT.md").is_file());
+        assert!(dst.join("AGENTS.md").is_file());
+        // Both should have rebranded content.
+        let agents = fs::read_to_string(dst.join("AGENTS.md")).unwrap();
+        assert!(agents.contains("RsClaw"), "expected rebrand: {agents}");
+        assert!(!agents.contains("OpenClaw"));
+    }
+
+    #[test]
+    fn does_not_promote_when_canonical_already_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        write(&src.join("AGENT.md"), "user singular content");
+        write(&src.join("AGENTS.md"), "canonical content");
+
+        copy_workspace_files(&src, &dst).unwrap();
+        // Both files copy verbatim (rebranded since both are identity files),
+        // but AGENT.md content does NOT overwrite the canonical AGENTS.md.
+        assert_eq!(
+            fs::read_to_string(dst.join("AGENTS.md")).unwrap(),
+            "canonical content"
+        );
+        assert_eq!(
+            fs::read_to_string(dst.join("AGENT.md")).unwrap(),
+            "user singular content"
+        );
+    }
+
+    #[test]
+    fn skips_targets_that_already_exist_at_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        write(&src.join("AGENT.md"), "incoming");
+        // Pre-seed AGENTS.md at destination — promotion must NOT overwrite.
+        write(&dst.join("AGENTS.md"), "pre-existing canonical");
+
+        copy_workspace_files(&src, &dst).unwrap();
+        assert_eq!(
+            fs::read_to_string(dst.join("AGENTS.md")).unwrap(),
+            "pre-existing canonical"
+        );
+    }
 }
 
 /// Convert OpenClaw's free-form HEARTBEAT.md to rsclaw's frontmatter format.

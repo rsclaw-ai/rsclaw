@@ -379,16 +379,46 @@ pub(crate) fn build_system_prompt(
         parts.push(ws_segment);
     }
 
-    // Available skills — name + short description. Full prompts injected on-demand.
+    // Available skills — name + description + on-disk path. The full SKILL.md
+    // (and any references/) stays on disk so the prompt budget isn't blown
+    // by every installed skill, but the LLM gets enough metadata to know
+    // when to invoke each one. Includes the explicit "read SKILL.md and
+    // references/ first" instruction so agents stop guessing CLI flags
+    // (e.g. flyai shipped --origin / --dep-date but agents kept inventing
+    // --depCity / --depDate from intuition).
     if !skills.is_empty() {
         let lines: Vec<_> = skills
             .all()
             .map(|s| {
-                format!("- {}", s.name)
+                let desc = s
+                    .description
+                    .as_deref()
+                    .map(|d| {
+                        // Compact to one line, cap so a verbose skill can't
+                        // monopolise the prompt.
+                        let oneline = d.replace('\n', " ");
+                        let trimmed = oneline.trim();
+                        if trimmed.chars().count() > 200 {
+                            let cut: String =
+                                trimmed.chars().take(200).collect();
+                            format!(" — {cut}…")
+                        } else if trimmed.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" — {trimmed}")
+                        }
+                    })
+                    .unwrap_or_default();
+                format!("- {}{desc}\n  dir: {}", s.name, s.dir.display())
             })
             .collect();
         if !lines.is_empty() {
-            parts.push(format!("Available skills:\n{}", lines.join("\n")));
+            parts.push(format!(
+                "Available skills (read each skill's SKILL.md and any references/*.md \
+                 BEFORE invoking its CLI for the first time — exact flag names live \
+                 there, guessing them is the #1 failure mode):\n{}",
+                lines.join("\n")
+            ));
         }
     }
 

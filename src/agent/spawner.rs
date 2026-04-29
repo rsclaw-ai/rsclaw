@@ -149,7 +149,7 @@ impl AgentSpawner {
                     extra_tools,
                     images,
                     files,
-                    chat_id: _,
+                    chat_id,
                 } = msg;
                 let result = runtime
                     .run_turn(
@@ -157,6 +157,7 @@ impl AgentSpawner {
                         &text,
                         &channel,
                         &peer_id,
+                        &chat_id,
                         extra_tools,
                         images,
                         files,
@@ -171,7 +172,7 @@ impl AgentSpawner {
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
-                        was_preparse: false,
+                        needs_outer_done_emit: false,
                     }
                 });
                 let _ = reply_tx.send(reply);

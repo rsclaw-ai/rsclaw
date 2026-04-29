@@ -693,6 +693,49 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         }
     });
 
+    // Global signal handler: a single SIGINT or SIGTERM triggers the
+    // shared graceful drain (same path as POST /api/v1/shutdown). Without
+    // this, no component listens for OS signals — Ctrl-C would be silently
+    // absorbed by tokio's signal subsystem and the gateway would only
+    // exit via HTTP or kill -9.
+    {
+        let sd = shutdown.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm = match signal(SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("failed to install SIGTERM handler: {e:#}");
+                        return;
+                    }
+                };
+                tokio::select! {
+                    res = tokio::signal::ctrl_c() => {
+                        if let Err(e) = res {
+                            warn!("ctrl_c handler error: {e:#}");
+                            return;
+                        }
+                        info!("SIGINT received, beginning graceful shutdown");
+                    }
+                    _ = sigterm.recv() => {
+                        info!("SIGTERM received, beginning graceful shutdown");
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                if let Err(e) = tokio::signal::ctrl_c().await {
+                    warn!("ctrl_c handler error: {e:#}");
+                    return;
+                }
+                info!("Ctrl-C received, beginning graceful shutdown");
+            }
+            sd.begin_drain();
+        });
+    }
+
     let result = serve(state, bind_addr).await;
 
     // At this point `axum::serve` has returned, which means the listener has
@@ -870,7 +913,7 @@ fn spawn_agent_tasks(
                     text,
                     channel,
                     peer_id,
-                    chat_id: _,
+                    chat_id,
                     reply_tx,
                     extra_tools,
                     images,
@@ -882,6 +925,7 @@ fn spawn_agent_tasks(
                         &text,
                         &channel,
                         &peer_id,
+                        &chat_id,
                         extra_tools,
                         images,
                         files,
@@ -897,16 +941,18 @@ fn spawn_agent_tasks(
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
-                        was_preparse: false,
+                        needs_outer_done_emit: false,
                     }
                 });
-                // Emit to event_bus for preparse turns (agent_loop already
-                // emits streaming deltas + done for LLM turns, so a second
-                // emit would duplicate the done frame) *and* for turns that
+                // Emit to event_bus for any reply path that bypassed
+                // agent_loop (preparse, file-attach short-circuits, /btw,
+                // disk-low, __DIRECT_REPLY__, etc.) *and* for turns that
                 // failed with Err (agent_loop returns early via `?` on LLM
                 // errors and never gets to emit done — WS clients would hang
-                // waiting for the terminator forever).
-                if reply.was_preparse || turn_errored {
+                // waiting for the terminator forever). Normal LLM turns
+                // already emit deltas + done from inside agent_loop, so a
+                // second emit would duplicate the done frame.
+                if reply.needs_outer_done_emit || turn_errored {
                     if !reply.text.is_empty() {
                         // receiver may have been dropped
                         let _ = event_tx_task.send(crate::events::AgentEvent {

@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 
 use super::{Channel, OutboundMessage};
 use crate::channel::{
+    attachments::{mime_to_ext, parse_data_url, pick_file_mime},
     chunker::{BreakPreference, ChunkConfig, chunk_text, platform_chunk_limit},
     telegram::RetryConfig,
 };
@@ -194,7 +195,30 @@ impl SlackChannel {
                     }
                     let event = &payload["payload"]["event"];
                     let etype = event["type"].as_str().unwrap_or("");
-                    if etype == "message" {
+                    info!("Slack: events_api type={etype}");
+                    // app_mention fires when the bot is @-mentioned in a
+                    // channel; the payload shape is identical to message
+                    // for our purposes (user/text/channel/files), so treat
+                    // both the same. Without this branch, mentions in
+                    // channels were silently dropped because the default
+                    // arm only logged at debug level.
+                    if etype == "message" || etype == "app_mention" {
+                        // Skip messages the bot itself sent — Slack pushes
+                        // every message in subscribed channels including
+                        // the bot's own replies, which without this guard
+                        // produces an infinite self-reply loop:
+                        //   bot replies → Slack pushes the reply →
+                        //   on_message → agent treats it as a user msg →
+                        //   replies again → loop forever.
+                        // Slack marks bot-sent messages with either a
+                        // `bot_id` field or a `subtype == "bot_message"`.
+                        let is_bot_msg = event.get("bot_id").is_some()
+                            || event.get("subtype").and_then(|v| v.as_str())
+                                == Some("bot_message");
+                        if is_bot_msg {
+                            info!("Slack: skipping bot's own message");
+                            continue;
+                        }
                         let user = event["user"].as_str().unwrap_or("").to_owned();
                         let mut text = event["text"].as_str().unwrap_or("").to_owned();
                         let channel = event["channel"].as_str().unwrap_or("").to_owned();
@@ -252,8 +276,21 @@ impl SlackChannel {
                         }
 
                         if !user.is_empty() && !text.is_empty() {
-                            debug!(user = %user, channel = %channel, "Slack: message event");
+                            info!(
+                                user = %user,
+                                channel = %channel,
+                                etype = %etype,
+                                len = text.len(),
+                                "Slack: dispatching message"
+                            );
                             (self.on_message)(user, text, channel, is_channel);
+                        } else {
+                            warn!(
+                                user_empty = user.is_empty(),
+                                text_empty = text.is_empty(),
+                                etype = %etype,
+                                "Slack: event ignored — empty user or text"
+                            );
                         }
                     }
                 }
@@ -262,7 +299,10 @@ impl SlackChannel {
                     bail!("Slack: server disconnect");
                 }
                 _ => {
-                    debug!("Slack: event type {msg_type}");
+                    // Other Socket Mode envelopes: slash_commands, interactive,
+                    // etc. We don't act on them but log so the user can see
+                    // *something* arrived if the message handler stays silent.
+                    info!("Slack: ignored envelope type={msg_type}");
                 }
             }
         }
@@ -289,10 +329,39 @@ impl Channel for SlackChannel {
                 info!(count = msg.images.len(), "slack: sending images");
             }
             for (idx, image_data) in msg.images.iter().enumerate() {
-                let b64 = image_data
-                    .strip_prefix("data:image/png;base64,")
-                    .or_else(|| image_data.strip_prefix("data:image/jpeg;base64,"))
-                    .unwrap_or(image_data);
+                // http(s):// — let Slack unfurl via an image block instead
+                // of mis-decoding the URL string as base64.
+                if image_data.starts_with("http://") || image_data.starts_with("https://") {
+                    let payload = json!({
+                        "channel": msg.target_id,
+                        "blocks": [{
+                            "type": "image",
+                            "image_url": image_data,
+                            "alt_text": "image",
+                        }],
+                    });
+                    match self
+                        .client
+                        .post(format!("{}/chat.postMessage", self.api_base))
+                        .bearer_auth(&self.bot_token)
+                        .header("content-type", "application/json")
+                        .body(payload.to_string())
+                        .send()
+                        .await
+                    {
+                        Ok(resp) if !resp.status().is_success() => {
+                            let status = resp.status();
+                            let body = resp.text().await.unwrap_or_default();
+                            warn!(idx, %status, "slack: image block post failed: {body}");
+                        }
+                        Err(e) => warn!(idx, "slack: image block request failed: {e}"),
+                        Ok(_) => {}
+                    }
+                    continue;
+                }
+
+                let (mime, b64) = parse_data_url(image_data)
+                    .unwrap_or(("image/png", image_data.as_str()));
                 use base64::Engine;
                 let bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
                     Ok(b) if !b.is_empty() => b,
@@ -305,9 +374,11 @@ impl Channel for SlackChannel {
                         continue;
                     }
                 };
+                let ext = mime_to_ext(mime);
+                let filename = format!("image.{ext}");
                 let part = match reqwest::multipart::Part::bytes(bytes)
-                    .file_name("image.png")
-                    .mime_str("image/png")
+                    .file_name(filename.clone())
+                    .mime_str(mime)
                 {
                     Ok(p) => p,
                     Err(e) => {
@@ -317,7 +388,7 @@ impl Channel for SlackChannel {
                 };
                 let form = reqwest::multipart::Form::new()
                     .text("channels", msg.target_id.clone())
-                    .text("filename", "image.png")
+                    .text("filename", filename.clone())
                     .text("title", "Image")
                     .part("file", part);
                 match self.client.post(format!("{}/files.upload", self.api_base))
@@ -331,6 +402,52 @@ impl Channel for SlackChannel {
                     }
                     Err(e) => warn!(idx, "slack: files.upload request failed: {e}"),
                     Ok(_) => {}
+                }
+            }
+
+            // Send file attachments via files.upload. Slack's V1 endpoint
+            // is deprecated but still functional through 2025; migrating
+            // to files.getUploadURLExternal + files.completeUploadExternal
+            // can come later.
+            if !msg.files.is_empty() {
+                info!(count = msg.files.len(), "slack: sending files");
+            }
+            for (idx, (filename, mime, path)) in msg.files.iter().enumerate() {
+                let bytes = match std::fs::read(path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(idx, %filename, "slack: file read failed: {e}");
+                        continue;
+                    }
+                };
+                let mime_str = pick_file_mime(mime, filename);
+                let part = match reqwest::multipart::Part::bytes(bytes)
+                    .file_name(filename.clone())
+                    .mime_str(mime_str)
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(idx, "slack: build file multipart failed: {e}");
+                        continue;
+                    }
+                };
+                let form = reqwest::multipart::Form::new()
+                    .text("channels", msg.target_id.clone())
+                    .text("filename", filename.clone())
+                    .text("title", filename.clone())
+                    .part("file", part);
+                match self.client.post(format!("{}/files.upload", self.api_base))
+                    .header("Authorization", format!("Bearer {}", self.bot_token))
+                    .multipart(form)
+                    .send().await
+                {
+                    Ok(resp) if !resp.status().is_success() => {
+                        let status = resp.status();
+                        let body = resp.text().await.unwrap_or_default();
+                        warn!(idx, %filename, %status, "slack: file upload failed: {body}");
+                    }
+                    Err(e) => warn!(idx, %filename, "slack: file upload request failed: {e}"),
+                    Ok(_) => info!(idx, %filename, "slack: file sent"),
                 }
             }
             Ok(())

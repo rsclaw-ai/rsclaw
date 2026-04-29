@@ -181,7 +181,17 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
 
     let store = RedbStore::open(&redb_dir.join("data.redb"), crate::MemoryTier::Standard)?;
 
+    // Stage banners go through eprintln so they always appear, regardless
+    // of the CLI's RUST_LOG default (`warn` for non-gateway commands).
+    // Without these, the user sees only the BGE download progress bar and
+    // assumes migration finished when it ends, then waits in silence
+    // through the multi-minute embed phase.
+    eprintln!("  * Step 1/3: importing chat sessions...");
     let mut stats = openclaw::import_sessions_to_redb(openclaw_dir, &store)?;
+    eprintln!(
+        "  + sessions: {} sessions, {} messages",
+        stats.sessions, stats.messages
+    );
 
     // Memory import: requires BGE model + async MemoryStore. Best-effort —
     // log + warn on failure so a user without network can still complete the
@@ -189,6 +199,7 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
     let model_dir = rsclaw_dir.join("models/bge-small-zh");
     let memory_data_dir = rsclaw_dir.join("var/data");
     std::fs::create_dir_all(&memory_data_dir).ok();
+    eprintln!("  * Step 2/3: preparing embedding model...");
     match crate::gateway::startup::ensure_bge_model_present(&model_dir, None).await {
         Ok(()) => {
             match crate::agent::memory::MemoryStore::open(
@@ -201,6 +212,10 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
             {
                 Ok(mem) => {
                     let mem_arc = std::sync::Arc::new(tokio::sync::Mutex::new(mem));
+                    eprintln!(
+                        "  * Step 3/3: indexing long-term memories (this may take a few minutes)..."
+                    );
+                    let mem_start = std::time::Instant::now();
                     // Path 1: session-JSONL `memory_put` events (older
                     // OpenClaw versions, pre-workspace-md storage).
                     match openclaw::import_memories_to_store(openclaw_dir, &mem_arc).await {
@@ -208,6 +223,12 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
                             stats.memories += mstats.imported;
                             if mstats.errors > 0 {
                                 stats.errors += mstats.errors;
+                            }
+                            if mstats.imported > 0 {
+                                eprintln!(
+                                    "  · session memories: {}/{} indexed",
+                                    mstats.imported, mstats.total
+                                );
                             }
                         }
                         Err(e) => {
@@ -226,12 +247,22 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
                             if mstats.errors > 0 {
                                 stats.errors += mstats.errors;
                             }
+                            if mstats.imported > 0 {
+                                eprintln!(
+                                    "  · workspace memories: {}/{} indexed",
+                                    mstats.imported, mstats.total
+                                );
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "openclaw workspace memory import failed");
                             stats.errors += 1;
                         }
                     }
+                    eprintln!(
+                        "  + memory indexed in {:.1}s",
+                        mem_start.elapsed().as_secs_f32()
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "could not open MemoryStore for memory import; skipping");
@@ -286,9 +317,15 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
                 if let Some(obj) = defaults.as_object_mut() {
                     // Remove openclaw-specific fields.
                     obj.remove("memorySearch");
-                    // Set rsclaw defaults.
-                    obj.insert("workspace".to_owned(),
-                        serde_json::Value::String("~/.rsclaw/workspace".to_owned()));
+                    // Set rsclaw defaults. Use the actual rsclaw_dir so a
+                    // `--dev` migration writes paths into the dev profile,
+                    // not the prod ~/.rsclaw.
+                    obj.insert(
+                        "workspace".to_owned(),
+                        serde_json::Value::String(
+                            rsclaw_dir.join("workspace").to_string_lossy().into_owned(),
+                        ),
+                    );
                     obj.insert("compaction".to_owned(),
                         serde_json::json!({"mode": "layered"}));
                 }
@@ -322,8 +359,15 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
                             .to_owned();
                         obj.remove("agentDir");
                         if obj.contains_key("workspace") {
-                            obj.insert("workspace".to_owned(),
-                                serde_json::Value::String(format!("~/.rsclaw/workspace-{agent_id}")));
+                            obj.insert(
+                                "workspace".to_owned(),
+                                serde_json::Value::String(
+                                    rsclaw_dir
+                                        .join(format!("workspace-{agent_id}"))
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                ),
+                            );
                         }
                         // Inject channels from bindings.
                         if let Some(chs) = agent_channels.get(&agent_id) {

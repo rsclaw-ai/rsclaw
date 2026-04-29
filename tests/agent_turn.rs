@@ -133,7 +133,7 @@ async fn start_echo_server(addr: SocketAddr) {
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
-                    was_preparse: false,
+                    needs_outer_done_emit: false,
                 });
             }
         });

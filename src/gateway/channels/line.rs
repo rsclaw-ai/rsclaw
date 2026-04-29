@@ -137,12 +137,12 @@ pub(crate) fn start_line_if_configured(
                     if is_group {
                         match group_policy.as_ref() {
                             crate::config::schema::GroupPolicy::Disabled => {
-                                debug!("line group message rejected: groupPolicy=disabled");
+                                warn!("line group message rejected: groupPolicy=disabled");
                                 return;
                             }
                             crate::config::schema::GroupPolicy::Allowlist => {
                                 if !group_allow.iter().any(|g| *g == user_id) {
-                                    debug!("line group message rejected: not in groupAllowFrom");
+                                    warn!("line group message rejected: not in groupAllowFrom");
                                     return;
                                 }
                             }
@@ -155,7 +155,7 @@ pub(crate) fn start_line_if_configured(
                         match enforcer.check(&user_id).await {
                             PolicyResult::Allow => {}
                             PolicyResult::Deny => {
-                                debug!(peer_id = %user_id, "line DM rejected by policy");
+                                warn!(peer_id = %user_id, "line DM rejected by policy");
                                 return;
                             }
                             PolicyResult::SendPairingCode(code) => {

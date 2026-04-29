@@ -694,7 +694,8 @@ impl AgentRuntime {
             images: vec![],
             files: vec![],
             pending_analysis: None,
-            was_preparse: false,
+            // /btw bypasses agent_loop — outer must emit done.
+            needs_outer_done_emit: true,
         })
     }
 
@@ -810,6 +811,7 @@ impl AgentRuntime {
         text: &str,
         channel: &str,
         peer_id: &str,
+        chat_id: &str,
         extra_tools: Vec<ToolDef>,
         images: Vec<super::registry::ImageAttachment>,
         files: Vec<super::registry::FileAttachment>,
@@ -1056,7 +1058,8 @@ impl AgentRuntime {
                             images: vec![],
                             files: vec![],
                             pending_analysis: None,
-                            was_preparse: false,
+                            // File-handling short-circuit bypasses agent_loop.
+                            needs_outer_done_emit: true,
                         });
                     }
                     // Has extractable text: return "analyzing..." immediately,
@@ -1073,7 +1076,8 @@ impl AgentRuntime {
                             channel: channel.to_owned(),
                             peer_id: peer_id.to_owned(),
                         }),
-                        was_preparse: false,
+                        // pending_analysis short-circuit bypasses agent_loop.
+                        needs_outer_done_emit: true,
                     });
                 }
                 "2" => {
@@ -1131,7 +1135,8 @@ impl AgentRuntime {
                             images: vec![],
                             files: vec![],
                             pending_analysis: None,
-                            was_preparse: false,
+                            // File-handling short-circuit bypasses agent_loop.
+                            needs_outer_done_emit: true,
                         });
                     }
                     // Has extractable text: return "analyzing..." immediately,
@@ -1154,7 +1159,8 @@ impl AgentRuntime {
                             channel: channel.to_owned(),
                             peer_id: peer_id.to_owned(),
                         }),
-                        was_preparse: false,
+                        // pending_analysis short-circuit bypasses agent_loop.
+                        needs_outer_done_emit: true,
                     });
                 }
                 _ => {
@@ -1170,7 +1176,8 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
-                        was_preparse: false,
+                        // File-handling short-circuit bypasses agent_loop.
+                        needs_outer_done_emit: true,
                     });
                 }
             }
@@ -1653,7 +1660,7 @@ impl AgentRuntime {
                             images: vec![],
                             files: vec![],
                             pending_analysis: None,
-                            was_preparse: true,
+                            needs_outer_done_emit: true,
                         });
                     }
                     other => other.to_owned(),
@@ -1666,7 +1673,7 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
-                        was_preparse: true,
+                        needs_outer_done_emit: true,
                     });
                 }
                 // Fall through to LLM for unhandled directives
@@ -1684,7 +1691,7 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
-                        was_preparse: true,
+                        needs_outer_done_emit: true,
                     });
                 }
                 info!(tool = %tool, "pre-parse: executing tool directly");
@@ -1735,7 +1742,7 @@ impl AgentRuntime {
                             images: reply_images,
                             files: vec![],
                             pending_analysis: None,
-                            was_preparse: true,
+                            needs_outer_done_emit: true,
                         });
                     }
                     Err(e) => {
@@ -1746,7 +1753,7 @@ impl AgentRuntime {
                             images: vec![],
                             files: vec![],
                             pending_analysis: None,
-                            was_preparse: true,
+                            needs_outer_done_emit: true,
                         });
                     }
                 }
@@ -1769,7 +1776,7 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
-                        was_preparse: true,
+                        needs_outer_done_emit: true,
                     });
                 }
                 // Safety off: fall through to execute anyway
@@ -1793,7 +1800,7 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         pending_analysis: None,
-                        was_preparse: true,
+                        needs_outer_done_emit: true,
                     });
                 }
                 // Safety off: fall through to execute anyway
@@ -1809,7 +1816,7 @@ impl AgentRuntime {
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
-                    was_preparse: true,
+                    needs_outer_done_emit: true,
                 });
             }
         }
@@ -1826,7 +1833,8 @@ impl AgentRuntime {
                 images: vec![],
                 files: vec![],
                 pending_analysis: None,
-                was_preparse: false,
+                // __DIRECT_REPLY__ bypasses agent_loop.
+                needs_outer_done_emit: true,
             });
         }
 
@@ -1911,6 +1919,7 @@ impl AgentRuntime {
                     &full_text,
                     channel,
                     peer_id,
+                    chat_id,
                     extra_tools,
                     images,
                     vec![],
@@ -1928,6 +1937,7 @@ impl AgentRuntime {
                     &full_text,
                     channel,
                     peer_id,
+                    chat_id,
                     extra_tools,
                     images,
                     files,
@@ -1985,7 +1995,8 @@ impl AgentRuntime {
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
-                    was_preparse: false,
+                    // File-size-exceeded short-circuit bypasses agent_loop.
+                    needs_outer_done_emit: true,
                 });
             }
             let files = accepted;
@@ -2011,7 +2022,8 @@ impl AgentRuntime {
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
-                    was_preparse: false,
+                    // Disk-low short-circuit bypasses agent_loop.
+                    needs_outer_done_emit: true,
                 });
             }
 
@@ -2124,7 +2136,8 @@ impl AgentRuntime {
                 images: vec![],
                 files: vec![],
                 pending_analysis: None,
-                was_preparse: false,
+                // File-saved short-circuit bypasses agent_loop.
+                needs_outer_done_emit: true,
             });
         }
 
@@ -2462,7 +2475,8 @@ impl AgentRuntime {
                 images: vec![],
                 files: vec![],
                 pending_analysis: None,
-                was_preparse: false,
+                // Pre-loop abort bypasses agent_loop.
+                needs_outer_done_emit: true,
             });
         }
 
@@ -2471,7 +2485,11 @@ impl AgentRuntime {
             session_key: session_key.to_owned(),
             channel: channel.to_owned(),
             peer_id: peer_id.to_owned(),
-            chat_id: String::new(),
+            // Channel/group ID for the inbound message. Notification routing
+            // and tool callbacks fall back to peer_id when this is empty,
+            // which on Discord groups produces a 404 (Discord rejects POST
+            // to /channels/<user_id>/messages — DMs need a created channel).
+            chat_id: chat_id.to_owned(),
             exec_pool: Arc::clone(&self.exec_pool),
             loop_detector: {
                 let ld_cfg_owned = self
@@ -2762,7 +2780,7 @@ impl AgentRuntime {
         if self.voice_mode_sessions.contains(session_key)
             && !reply.text.is_empty()
             && !reply.is_empty
-            && !reply.was_preparse
+            && !reply.needs_outer_done_emit
         {
             match self.generate_tts_audio(&reply.text).await {
                 Ok(audio_path) => {
@@ -2897,6 +2915,16 @@ impl AgentRuntime {
              When the user's request matches a skill, follow its instructions \
              unless a plugin already handles the task.\n\
              Priority: plugins > skills > built-in tools.\n\n\
+             IMPORTANT — read references/ BEFORE calling any skill CLI:\n\
+             - Each skill's SKILL.md (below) is the entry point. Per-command \
+             schemas live in that skill's `references/*.md` files on disk.\n\
+             - BEFORE invoking a skill's CLI for the first time in a session, \
+             read the matching `references/<command>.md` so you use the real \
+             flag names. Guessing flags from intuition is the #1 failure mode \
+             (e.g. inventing `--depCity` when the actual flag is `--origin`).\n\
+             - The references/ files are NOT included below to save context — \
+             use the read_file tool with the path shown in each skill's \
+             References section.\n\n\
              {skill_prompts}"
         );
         (Some(msg), snapshot)
@@ -3159,7 +3187,7 @@ const MAX_ERROR_STREAK: usize = 5;
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
-                    was_preparse: false,
+                    needs_outer_done_emit: false,
                 });
             }
             // Check abort flag at start of each iteration (allows /abort to
@@ -3186,7 +3214,7 @@ const MAX_ERROR_STREAK: usize = 5;
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
-                    was_preparse: false,
+                    needs_outer_done_emit: false,
                 });
             }
             if iteration > max_iterations {
@@ -3221,7 +3249,7 @@ const MAX_ERROR_STREAK: usize = 5;
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
-                    was_preparse: false,
+                    needs_outer_done_emit: false,
                 });
             }
             // Check consecutive tool errors — stop early when tools keep failing.
@@ -3259,7 +3287,7 @@ const MAX_ERROR_STREAK: usize = 5;
                     images: vec![],
                     files: tool_files,
                     pending_analysis: None,
-                    was_preparse: false,
+                    needs_outer_done_emit: false,
                 });
             }
             // Apply legacy context pruning (hard clear / soft trim) as fallback.
@@ -4161,15 +4189,29 @@ const MAX_ERROR_STREAK: usize = 5;
                     images: reply_images,
                     files: tool_files,
                     pending_analysis: None,
-                    was_preparse: false,
+                    needs_outer_done_emit: false,
                 });
             }
 
             // Send intermediate text to user immediately (progress feedback).
             // Model often says "好的，我来帮你搜索" before calling tools — send it now
             // instead of waiting for the entire turn to complete.
+            //
+            // SKIP for ws/desktop channels: WS clients already receive
+            // streaming `delta` events through the event_bus pipeline that
+            // render progressively into the main reply bubble. Sending the
+            // same text via notification_tx would surface as a duplicate
+            // standalone bubble (the "ws" alias in startup.rs bridges
+            // notification_tx to the desktop channel, so it lands in chat
+            // alongside the streaming bubble).
+            let is_streaming_channel =
+                ctx.channel == "ws" || ctx.channel == "desktop";
             let intermediate_enabled = self.live.agents.read().await.defaults.intermediate_output.unwrap_or(true);
-            if intermediate_enabled && !text_buf.is_empty() && !tool_calls.is_empty() {
+            if intermediate_enabled
+                && !is_streaming_channel
+                && !text_buf.is_empty()
+                && !tool_calls.is_empty()
+            {
                 if let Some(ref ntx) = self.notification_tx {
                     let notif_target = if !ctx.chat_id.is_empty() {
                         ctx.chat_id.clone()
@@ -4247,7 +4289,7 @@ const MAX_ERROR_STREAK: usize = 5;
                     images: vec![],
                     files: vec![],
                     pending_analysis: None,
-                    was_preparse: false,
+                    needs_outer_done_emit: false,
                 });
             }
 
@@ -4311,14 +4353,34 @@ const MAX_ERROR_STREAK: usize = 5;
                             "agent_loop: identical tool call repeated {} times, breaking loop",
                             same_call_streak
                         );
+                        let terminal_text = crate::i18n::t(
+                            "agent_loop_detected",
+                            crate::i18n::default_lang(),
+                        )
+                        .to_owned();
+                        // Emit done=true so WS subscribers (desktop chat) see
+                        // the terminal text and the terminator frame together.
+                        // Same fix pattern as the clear_signal / abort /
+                        // max_iterations / error_streak paths.
+                        if let Some(ref bus) = self.event_bus {
+                            let _ = bus.send(AgentEvent {
+                                session_id: ctx.session_key.clone(),
+                                agent_id: ctx.agent_id.clone(),
+                                delta: terminal_text.clone(),
+                                done: true,
+                                files: tool_files.clone(),
+                                images: tool_images.clone(),
+                                tool_log: tool_log.clone(),
+                            });
+                        }
                         return Ok(AgentReply {
-                            text: crate::i18n::t("agent_loop_detected", crate::i18n::default_lang()).to_owned(),
+                            text: terminal_text,
                             is_empty: false,
                             tool_calls: None,
                             images: vec![],
                             files: vec![],
                             pending_analysis: None,
-                            was_preparse: false,
+                            needs_outer_done_emit: false,
                         });
                     }
                 } else {
@@ -5476,7 +5538,12 @@ const MAX_ERROR_STREAK: usize = 5;
             .workspace
             .clone()
             .or(default_workspace)
-            .unwrap_or_else(|| "~/.rsclaw/workspace".to_owned());
+            .unwrap_or_else(|| {
+                crate::config::loader::base_dir()
+                    .join("workspace")
+                    .to_string_lossy()
+                    .into_owned()
+            });
         let ws = if ws_str.starts_with('~') {
             dirs_next::home_dir().unwrap_or_default().join(&ws_str[2..])
         } else {

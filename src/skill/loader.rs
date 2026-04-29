@@ -141,9 +141,13 @@ fn scan_dir(dir: &Path, registry: &mut SkillRegistry) -> Result<()> {
 // Path helpers
 // ---------------------------------------------------------------------------
 
-/// Default global skill directory: `~/.rsclaw/skills/`.
+/// Default global skill directory: `<base_dir>/skills/`.
+///
+/// Resolves through `crate::config::loader::base_dir()` so `--dev`,
+/// `--profile`, and `RSCLAW_BASE_DIR` all route skill installs into the
+/// matching profile dir instead of always landing in `~/.rsclaw/skills/`.
 pub fn default_global_skills_dir() -> Option<PathBuf> {
-    dirs_next::home_dir().map(|h| h.join(".rsclaw/skills"))
+    Some(crate::config::loader::base_dir().join("skills"))
 }
 
 // ---------------------------------------------------------------------------
