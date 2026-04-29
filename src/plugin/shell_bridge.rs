@@ -147,61 +147,58 @@ impl ShellBridgePlugin {
     }
 
     /// Call a plugin method and return the result.
+    ///
+    /// Host-initiated: assigns a positive id, writes the request, registers a
+    /// oneshot waiter in `pending`, and awaits the response from the reader task.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+
+        // Register pending oneshot BEFORE writing to avoid a race where the reader
+        // sees the response before we've recorded our waiter.
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
 
         let request = json!({
             "id":     id,
             "method": method,
             "params": params,
         });
-
         let line = serde_json::to_string(&request).context("serialize request")?;
 
-        // Send request.
+        // Send request. On any write error, drop the pending entry to free memory.
         {
             let mut stdin = self.stdin.lock().await;
-            stdin
-                .write_all(line.as_bytes())
-                .await
-                .with_context(|| format!("write to plugin `{}`", self.name))?;
-            stdin.write_all(b"\n").await.context("write newline")?;
-            stdin.flush().await.context("flush stdin")?;
+            let write_result: Result<()> = async {
+                stdin.write_all(line.as_bytes()).await.context("write request")?;
+                stdin.write_all(b"\n").await.context("write newline")?;
+                stdin.flush().await.context("flush stdin")?;
+                Ok(())
+            }
+            .await;
+            if let Err(e) = write_result {
+                self.pending.lock().await.remove(&id);
+                return Err(e).with_context(|| format!("write to plugin `{}`", self.name));
+            }
         }
 
         // Wait for response with timeout.
-        let response_line = time::timeout(self.timeout, self.read_line()).await;
-
-        let line = match response_line {
-            Ok(Ok(l)) => l,
-            Ok(Err(e)) => {
-                bail!("plugin `{}` read error: {e:#}", self.name)
+        match time::timeout(self.timeout, rx).await {
+            Ok(Ok(Ok(v)))  => Ok(v),
+            Ok(Ok(Err(e))) => bail!("plugin `{}` error: {e}", self.name),
+            Ok(Err(_canceled)) => {
+                // Sender was dropped — reader task ended (EOF or read error).
+                bail!("plugin `{}` reader task ended unexpectedly", self.name);
             }
-            Err(_) => bail!(
-                "plugin `{}` call `{method}` timed out after {}s",
-                self.name,
-                self.timeout.as_secs()
-            ),
-        };
-
-        let resp: Value = serde_json::from_str(&line)
-            .with_context(|| format!("plugin `{}` returned invalid JSON: {line}", self.name))?;
-
-        // Validate ID matches.
-        if resp["id"] != id {
-            warn!(
-                plugin = %self.name,
-                expected = id,
-                got = ?resp["id"],
-                "response ID mismatch"
-            );
+            Err(_timeout) => {
+                // Remove pending entry so a late response is dropped cleanly.
+                self.pending.lock().await.remove(&id);
+                bail!(
+                    "plugin `{}` call `{method}` timed out after {}s",
+                    self.name,
+                    self.timeout.as_secs()
+                );
+            }
         }
-
-        if let Some(err) = resp.get("error") {
-            bail!("plugin `{}` error: {err}", self.name);
-        }
-
-        Ok(resp["result"].clone())
     }
 
     /// Kill the subprocess gracefully.
@@ -209,16 +206,6 @@ impl ShellBridgePlugin {
         let mut child = self.child.lock().await;
         let _ = child.kill().await;
         debug!(plugin = %self.name, "plugin subprocess terminated");
-    }
-
-    async fn read_line(&self) -> Result<String> {
-        let mut line = String::new();
-        let mut stdout = self.stdout.lock().await;
-        stdout
-            .read_line(&mut line)
-            .await
-            .with_context(|| format!("read from plugin `{}`", self.name))?;
-        Ok(line.trim_end_matches('\n').to_owned())
     }
 }
 
