@@ -24,13 +24,25 @@ export function useNotificationWs() {
 
     rsclawWs.connect();
 
-    const unsub = rsclawWs.onNotification((text) => {
+    const unsub = rsclawWs.onNotification((text, kind) => {
+      // Resolve a human-readable label for the kind tag.
+      // task_complete   = async /task agent finished
+      // async_send      = async /send agent finished
+      // (undefined)     = ordinary notification (cron, system alert, etc.)
+      const badge =
+        kind === "task_complete"
+          ? "[任务完成] "
+          : kind === "async_send"
+            ? "[异步发送] "
+            : "";
+      const labeled = badge ? `${badge}${text}` : text;
+
       // Toast
-      showToast(text, undefined, 10000);
+      showToast(labeled, undefined, 10000);
 
       // Native notification
       if (Notification?.permission === "granted") {
-        new Notification("RsClaw", { body: text });
+        new Notification("RsClaw", { body: labeled });
       }
 
       // Also add to current chat session so it's visible inline.
@@ -43,7 +55,7 @@ export function useNotificationWs() {
         s.messages.push(
           createMessage({
             role: "assistant",
-            content: text,
+            content: labeled,
             isIntermediate: true,
           }),
         );

@@ -15,7 +15,7 @@ use reqwest::Client;
 use serde_json::{Value, json};
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use super::{Channel, OutboundMessage};
 use crate::channel::{
@@ -37,16 +37,38 @@ pub struct SlackChannel {
     api_base: String,
     client: Client,
     retry: RetryConfig,
-    on_message: Arc<dyn Fn(String, String, String, bool) + Send + Sync>,
-    // (peer_id/user_id, text, channel_id, is_channel)
+    #[allow(clippy::type_complexity)]
+    on_message: Arc<
+        dyn Fn(
+                String,
+                String,
+                String,
+                bool,
+                Vec<crate::agent::registry::ImageAttachment>,
+                Vec<crate::agent::registry::FileAttachment>,
+            ) + Send
+            + Sync,
+    >,
+    // (user_id, text, channel_id, is_channel, images, files)
 }
 
 impl SlackChannel {
+    #[allow(clippy::type_complexity)]
     pub fn new(
         bot_token: impl Into<String>,
         app_token: Option<String>,
         api_base: Option<String>,
-        on_message: Arc<dyn Fn(String, String, String, bool) + Send + Sync>,
+        on_message: Arc<
+            dyn Fn(
+                    String,
+                    String,
+                    String,
+                    bool,
+                    Vec<crate::agent::registry::ImageAttachment>,
+                    Vec<crate::agent::registry::FileAttachment>,
+                ) + Send
+                + Sync,
+        >,
     ) -> Self {
         Self {
             bot_token: bot_token.into(),
@@ -110,6 +132,102 @@ impl SlackChannel {
             "Slack postMessage failed after {} attempts",
             self.retry.attempts
         )
+    }
+
+    /// Upload a file or image via Slack's V2 external upload flow:
+    ///   1. POST `files.getUploadURLExternal` (form: filename, length) →
+    ///      `{ ok, upload_url, file_id }`
+    ///   2. POST raw bytes to `upload_url` (no auth, content-type from mime)
+    ///   3. POST `files.completeUploadExternal` (json: files, channel_id) →
+    ///      `{ ok, files }`
+    /// V1 `files.upload` was disabled in March 2025 with
+    /// `{"ok":false,"error":"method_deprecated"}`.
+    async fn upload_v2(
+        &self,
+        channel_id: &str,
+        filename: &str,
+        mime: &str,
+        bytes: &[u8],
+        title: &str,
+    ) -> Result<()> {
+        // Step 1: get upload URL.
+        let step1 = self
+            .client
+            .post(format!("{}/files.getUploadURLExternal", self.api_base))
+            .bearer_auth(&self.bot_token)
+            .form(&[("filename", filename), ("length", &bytes.len().to_string())])
+            .send()
+            .await
+            .context("getUploadURLExternal request")?;
+        let body1: Value = step1
+            .json()
+            .await
+            .context("getUploadURLExternal parse")?;
+        if body1.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            bail!(
+                "getUploadURLExternal: {}",
+                body1.get("error").and_then(|e| e.as_str()).unwrap_or("?")
+            );
+        }
+        let upload_url = body1
+            .get("upload_url")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("getUploadURLExternal: no upload_url"))?;
+        let file_id = body1
+            .get("file_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("getUploadURLExternal: no file_id"))?
+            .to_owned();
+
+        // Step 2: POST the file as multipart form — Slack's signed
+        // upload_url expects a `file=` field. Earlier raw-body POST
+        // returned HTTP 200 but produced a 0-byte attachment in the
+        // channel ("uploaded but blank" symptom).
+        let part = reqwest::multipart::Part::bytes(bytes.to_vec())
+            .file_name(filename.to_owned())
+            .mime_str(mime)
+            .map_err(|e| anyhow::anyhow!("build upload multipart: {e}"))?;
+        let form = reqwest::multipart::Form::new().part("file", part);
+        let put = self
+            .client
+            .post(upload_url)
+            .multipart(form)
+            .send()
+            .await
+            .context("upload_url POST")?;
+        if !put.status().is_success() {
+            let s = put.status();
+            let b = put.text().await.unwrap_or_default();
+            bail!("upload_url returned {s}: {b}");
+        }
+        let put_body = put.text().await.unwrap_or_default();
+        info!(filename, len = bytes.len(), resp = %put_body, "slack: upload step 2 done");
+
+        // Step 3: complete + share to channel.
+        let payload = json!({
+            "files": [{ "id": file_id, "title": title }],
+            "channel_id": channel_id,
+        });
+        let step3 = self
+            .client
+            .post(format!("{}/files.completeUploadExternal", self.api_base))
+            .bearer_auth(&self.bot_token)
+            .header("content-type", "application/json")
+            .body(payload.to_string())
+            .send()
+            .await
+            .context("completeUploadExternal request")?;
+        let body3: Value = step3
+            .json()
+            .await
+            .context("completeUploadExternal parse")?;
+        if body3.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            bail!(
+                "completeUploadExternal: {}",
+                body3.get("error").and_then(|e| e.as_str()).unwrap_or("?")
+            );
+        }
+        Ok(())
     }
 
     /// Open a Socket Mode WebSocket connection URL.
@@ -221,13 +339,30 @@ impl SlackChannel {
                         }
                         let user = event["user"].as_str().unwrap_or("").to_owned();
                         let mut text = event["text"].as_str().unwrap_or("").to_owned();
+                        // Slack intercepts a leading `/` as a native slash
+                        // command UI and never delivers it to the bot, so
+                        // rewrite a leading `\xxx` to `/xxx` as a Slack-only
+                        // alias. Users discover it from /help (which they
+                        // can't actually type, hence \help works as the
+                        // discovery escape hatch).
+                        if let Some(rest) = text.strip_prefix('\\') {
+                            if rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+                                text = format!("/{rest}");
+                            }
+                        }
                         let channel = event["channel"].as_str().unwrap_or("").to_owned();
                         let is_channel = event["channel_type"]
                             .as_str()
                             .map(|t| t == "channel" || t == "group")
                             .unwrap_or(false);
 
-                        // Process file attachments
+                        // Process file attachments. Images go into `images`
+                        // so the runtime hands them to the vision model AND
+                        // pending_files (analyze vs save) can fire. Other
+                        // files go into `file_attachments` for the same
+                        // reason. Audio/video still get inline-transcribed.
+                        let mut images: Vec<crate::agent::registry::ImageAttachment> = Vec::new();
+                        let mut file_attachments: Vec<crate::agent::registry::FileAttachment> = Vec::new();
                         if let Some(files) = event["files"].as_array() {
                             for file in files {
                                 let url = file["url_private_download"].as_str().unwrap_or("");
@@ -261,10 +396,25 @@ impl SlackChannel {
                                             }
                                         }
                                     } else if mimetype.starts_with("image/") {
-                                        if !text.is_empty() { text.push('\n'); }
-                                        text.push_str(&crate::i18n::t("image_file_received", crate::i18n::default_lang()));
+                                        use base64::Engine as _;
+                                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                        let mime = if mimetype.is_empty() { "image/png" } else { mimetype };
+                                        images.push(crate::agent::registry::ImageAttachment {
+                                            data: format!("data:{mime};base64,{b64}"),
+                                            mime_type: mime.to_owned(),
+                                        });
+                                        info!(size = bytes.len(), %filename, "Slack: image forwarded for vision");
                                     } else {
                                         let processed = slack_process_file(filename, &bytes);
+                                        file_attachments.push(crate::agent::registry::FileAttachment {
+                                            filename: filename.to_owned(),
+                                            data: bytes.clone(),
+                                            mime_type: if mimetype.is_empty() {
+                                                "application/octet-stream".to_owned()
+                                            } else {
+                                                mimetype.to_owned()
+                                            },
+                                        });
                                         if !text.is_empty() { text.push('\n'); }
                                         text.push_str(&processed);
                                     }
@@ -275,15 +425,17 @@ impl SlackChannel {
                             }
                         }
 
-                        if !user.is_empty() && !text.is_empty() {
+                        if !user.is_empty() && (!text.is_empty() || !images.is_empty() || !file_attachments.is_empty()) {
                             info!(
                                 user = %user,
                                 channel = %channel,
                                 etype = %etype,
                                 len = text.len(),
+                                imgs = images.len(),
+                                files = file_attachments.len(),
                                 "Slack: dispatching message"
                             );
-                            (self.on_message)(user, text, channel, is_channel);
+                            (self.on_message)(user, text, channel, is_channel, images, file_attachments);
                         } else {
                             warn!(
                                 user_empty = user.is_empty(),
@@ -322,8 +474,16 @@ impl Channel for SlackChannel {
                 min_chars: 1,
                 break_preference: BreakPreference::Paragraph,
             };
-            for chunk in &chunk_text(&msg.text, &cfg) {
-                self.post_message(&msg.target_id, chunk).await?;
+            // Only post text when there's actual text. Slack's
+            // chat.postMessage rejects empty bodies with `no_text`, and
+            // the `?` here used to short-circuit the entire send — so an
+            // image-only reply (e.g. `/ss` returns OutboundMessage with
+            // text="" + 1 image) silently dropped the image because we
+            // never reached the upload loop below.
+            if !msg.text.trim().is_empty() {
+                for chunk in &chunk_text(&msg.text, &cfg) {
+                    self.post_message(&msg.target_id, chunk).await?;
+                }
             }
             if !msg.images.is_empty() {
                 info!(count = msg.images.len(), "slack: sending images");
@@ -376,39 +536,23 @@ impl Channel for SlackChannel {
                 };
                 let ext = mime_to_ext(mime);
                 let filename = format!("image.{ext}");
-                let part = match reqwest::multipart::Part::bytes(bytes)
-                    .file_name(filename.clone())
-                    .mime_str(mime)
+                if let Err(e) = self
+                    .upload_v2(&msg.target_id, &filename, mime, &bytes, "Image")
+                    .await
                 {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!(idx, "slack: build multipart failed: {e}");
-                        continue;
-                    }
-                };
-                let form = reqwest::multipart::Form::new()
-                    .text("channels", msg.target_id.clone())
-                    .text("filename", filename.clone())
-                    .text("title", "Image")
-                    .part("file", part);
-                match self.client.post(format!("{}/files.upload", self.api_base))
-                    .header("Authorization", format!("Bearer {}", self.bot_token))
-                    .multipart(form)
-                    .send().await
-                {
-                    Ok(resp) if !resp.status().is_success() => {
-                        let status = resp.status();
-                        warn!(idx, %status, "slack: files.upload failed");
-                    }
-                    Err(e) => warn!(idx, "slack: files.upload request failed: {e}"),
-                    Ok(_) => {}
+                    warn!(idx, "slack: image upload (v2) failed: {e:#}");
+                } else {
+                    info!(idx, "slack: image uploaded (v2)");
                 }
             }
 
-            // Send file attachments via files.upload. Slack's V1 endpoint
-            // is deprecated but still functional through 2025; migrating
-            // to files.getUploadURLExternal + files.completeUploadExternal
-            // can come later.
+            // Send file attachments via the v2 flow:
+            //   1) files.getUploadURLExternal -> upload_url + file_id
+            //   2) POST raw bytes to upload_url
+            //   3) files.completeUploadExternal -> link to channel
+            // The legacy files.upload returns
+            // {"ok":false,"error":"method_deprecated"} as of 2025-03 for new
+            // apps and is being phased out for existing apps.
             if !msg.files.is_empty() {
                 info!(count = msg.files.len(), "slack: sending files");
             }
@@ -421,33 +565,13 @@ impl Channel for SlackChannel {
                     }
                 };
                 let mime_str = pick_file_mime(mime, filename);
-                let part = match reqwest::multipart::Part::bytes(bytes)
-                    .file_name(filename.clone())
-                    .mime_str(mime_str)
+                if let Err(e) = self
+                    .upload_v2(&msg.target_id, filename, mime_str, &bytes, filename)
+                    .await
                 {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!(idx, "slack: build file multipart failed: {e}");
-                        continue;
-                    }
-                };
-                let form = reqwest::multipart::Form::new()
-                    .text("channels", msg.target_id.clone())
-                    .text("filename", filename.clone())
-                    .text("title", filename.clone())
-                    .part("file", part);
-                match self.client.post(format!("{}/files.upload", self.api_base))
-                    .header("Authorization", format!("Bearer {}", self.bot_token))
-                    .multipart(form)
-                    .send().await
-                {
-                    Ok(resp) if !resp.status().is_success() => {
-                        let status = resp.status();
-                        let body = resp.text().await.unwrap_or_default();
-                        warn!(idx, %filename, %status, "slack: file upload failed: {body}");
-                    }
-                    Err(e) => warn!(idx, %filename, "slack: file upload request failed: {e}"),
-                    Ok(_) => info!(idx, %filename, "slack: file sent"),
+                    warn!(idx, %filename, "slack: file upload (v2) failed: {e:#}");
+                } else {
+                    info!(idx, %filename, "slack: file sent (v2)");
                 }
             }
             Ok(())
@@ -556,7 +680,7 @@ mod tests {
     #[test]
     fn channel_name() {
         init_crypto();
-        let ch = SlackChannel::new("xoxb-token", None, None, Arc::new(|_, _, _, _| {}));
+        let ch = SlackChannel::new("xoxb-token", None, None, Arc::new(|_, _, _, _, _, _| {}));
         assert_eq!(ch.name(), "slack");
     }
 }

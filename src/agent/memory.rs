@@ -963,6 +963,14 @@ impl MemoryStore {
             doc.importance = 0.5;
         }
 
+        // Evaluate tier on insert so freshly-added high-importance docs
+        // (e.g. auto-capture importance=0.85 from messages with phone
+        // numbers / IDs) go straight to Core without waiting for a
+        // subsequent search-touch. Without this, the crystallization
+        // pipeline starves because nothing ever leaves Working tier
+        // until it's queried back via the memory tool.
+        doc.evaluate_tier_transition();
+
         // P3: Generate L0/L1 text summaries if not already set.
         if doc.abstract_text.is_none() {
             doc.abstract_text = extract_abstract(&doc.text);

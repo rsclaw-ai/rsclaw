@@ -400,23 +400,10 @@ pub fn seed_workspace_with_lang(workspace: &Path, lang: Option<&str>) -> Result<
         }
     }
 
-    // Seed site-rules (platform experience for organic evolution).
-    let rules_dir = workspace.join("site-rules");
-    let site_rules: &[(&str, &str)] = &[
-        ("douyin.md", SITE_DOUYIN),
-        ("kuaishou.md", SITE_KUAISHOU),
-        ("xiaohongshu.md", SITE_XIAOHONGSHU),
-        ("bilibili.md", SITE_BILIBILI),
-    ];
-    std::fs::create_dir_all(&rules_dir)?;
-    for (name, content) in site_rules {
-        let path = rules_dir.join(name);
-        if !path.exists() {
-            std::fs::write(&path, content)?;
-            info!(file = %path.display(), "seeded site rule");
-            created += 1;
-        }
-    }
+    // (Site-rules used to be seeded here per-workspace. Moved to
+    // base_dir/tools/web_browser/site-rules/ since the content is
+    // platform-wide UI knowledge for the web_browser tool, not user
+    // workspace data — see seed_tools below.)
 
     Ok(created)
 }
@@ -484,6 +471,27 @@ pub fn seed_tools(base_dir: &Path, lang: Option<&str>) -> Result<usize> {
             created += 1;
         }
     }
+
+    // Site-rules — platform-wide DOM/URL knowledge for web_browser.
+    // Lives under tools/web_browser/site-rules/ (shared across all
+    // agents; was per-workspace, see seed_workspace_with_lang).
+    let site_rules_dir = tools_dir.join("web_browser").join("site-rules");
+    let site_rules: &[(&str, &str)] = &[
+        ("douyin.md", SITE_DOUYIN),
+        ("kuaishou.md", SITE_KUAISHOU),
+        ("xiaohongshu.md", SITE_XIAOHONGSHU),
+        ("bilibili.md", SITE_BILIBILI),
+    ];
+    std::fs::create_dir_all(&site_rules_dir)?;
+    for (name, content) in site_rules {
+        let path = site_rules_dir.join(name);
+        if !path.exists() {
+            std::fs::write(&path, content)?;
+            info!(file = %path.display(), "seeded site rule");
+            created += 1;
+        }
+    }
+
     Ok(created)
 }
 

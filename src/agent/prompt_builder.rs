@@ -373,6 +373,22 @@ pub(crate) fn build_system_prompt(
         );
     }
 
+    // Workspace path anchor. Without this the agent has no idea which
+    // directory is "yours" and tends to globally search the rsclaw base
+    // dir (~/.rsclaw) when the user says "look at my .md files",
+    // sweeping up `tools/`, `skills/`, `models/`, `var/data/` etc.
+    parts.push(format!(
+        "## Workspace\n\
+         Your workspace is `{ws}`. ALL relative paths in tool calls (read_file, \
+         write_file, list_dir, search_file, execute_command cwd) resolve against \
+         this directory. When the user says \"my files\" / \"my .md files\" / \
+         \"the workspace\", they mean files inside this directory — NOT the \
+         rsclaw base dir at `~/.rsclaw/` which contains internal state \
+         (skills, plugins, models, credentials, var/data, tools/) that you \
+         must not modify.",
+        ws = ws_ctx.workspace_dir.display()
+    ));
+
     // Workspace files segment.
     let ws_segment = ws_ctx.to_prompt_segment();
     if !ws_segment.is_empty() {

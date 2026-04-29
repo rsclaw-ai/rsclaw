@@ -75,8 +75,19 @@ pub struct DiscordChannel {
     client: Client,
     retry: RetryConfig,
     allow_bots: bool,
-    on_message: Arc<dyn Fn(String, String, String, bool) + Send + Sync>,
-    // (peer_id, text, channel_id, is_guild)
+    #[allow(clippy::type_complexity)]
+    on_message: Arc<
+        dyn Fn(
+                String,
+                String,
+                String,
+                bool,
+                Vec<crate::agent::registry::ImageAttachment>,
+                Vec<crate::agent::registry::FileAttachment>,
+            ) + Send
+            + Sync,
+    >,
+    // (peer_id, text, channel_id, is_guild, images, files)
     /// HTTP API base URL (overridable for testing).
     api_base: String,
     /// Gateway WebSocket URL override. When set, skip the /gateway/bot fetch.
@@ -89,10 +100,21 @@ pub struct DiscordChannel {
 }
 
 impl DiscordChannel {
+    #[allow(clippy::type_complexity)]
     pub fn new(
         token: impl Into<String>,
         allow_bots: bool,
-        on_message: Arc<dyn Fn(String, String, String, bool) + Send + Sync>,
+        on_message: Arc<
+            dyn Fn(
+                    String,
+                    String,
+                    String,
+                    bool,
+                    Vec<crate::agent::registry::ImageAttachment>,
+                    Vec<crate::agent::registry::FileAttachment>,
+                ) + Send
+                + Sync,
+        >,
         api_base: Option<String>,
         gateway_url: Option<String>,
     ) -> Self {
@@ -432,7 +454,16 @@ impl DiscordChannel {
                             let peer_id = d["author"]["id"].as_str().unwrap_or("").to_owned();
                             let is_guild = d["guild_id"].is_string();
 
-                            // Process attachments (images, audio, video, files)
+                            // Process attachments (images, audio, video, files).
+                            // Images go into `images` so the runtime can hand
+                            // them to the vision model AND so `pending_files`
+                            // gets a chance to fire (analyze vs save prompt).
+                            // Other files go into `files` for the same reason.
+                            // Audio/video still get auto-transcribed inline.
+                            let mut images: Vec<crate::agent::registry::ImageAttachment> =
+                                Vec::new();
+                            let mut files: Vec<crate::agent::registry::FileAttachment> =
+                                Vec::new();
                             if let Some(attachments) = d["attachments"].as_array() {
                                 for att in attachments {
                                     let url = att["url"].as_str().unwrap_or("");
@@ -464,11 +495,41 @@ impl DiscordChannel {
                                                 }
                                             }
                                         } else if content_type.starts_with("image/") {
-                                            // Image: note it for now (no vision vec in Discord callback)
-                                            if !content.is_empty() { content.push('\n'); }
-                                            content.push_str(&crate::i18n::t("image_attachment_received", crate::i18n::default_lang()));
+                                            use base64::Engine as _;
+                                            let b64 = base64::engine::general_purpose::STANDARD
+                                                .encode(&bytes);
+                                            let mime = if content_type.is_empty() {
+                                                "image/png"
+                                            } else {
+                                                content_type
+                                            };
+                                            images.push(crate::agent::registry::ImageAttachment {
+                                                data: format!("data:{mime};base64,{b64}"),
+                                                mime_type: mime.to_owned(),
+                                            });
+                                            info!(
+                                                size = bytes.len(),
+                                                %filename,
+                                                "Discord: image attachment forwarded for vision"
+                                            );
                                         } else {
-                                            let processed = discord_process_file(filename, &bytes);
+                                            // Forward as a FileAttachment so
+                                            // the runtime's PendingFile flow
+                                            // can prompt analyze/save. Also
+                                            // keep the inline text extraction
+                                            // (PDF/Office/text) so plain Q&A
+                                            // works without two roundtrips.
+                                            let processed =
+                                                discord_process_file(filename, &bytes);
+                                            files.push(crate::agent::registry::FileAttachment {
+                                                filename: filename.to_owned(),
+                                                data: bytes.clone(),
+                                                mime_type: if content_type.is_empty() {
+                                                    "application/octet-stream".to_owned()
+                                                } else {
+                                                    content_type.to_owned()
+                                                },
+                                            });
                                             if !content.is_empty() { content.push('\n'); }
                                             content.push_str(&processed);
                                         }
@@ -485,10 +546,20 @@ impl DiscordChannel {
                             if let Some(bid) = bot_id.as_deref() {
                                 content = strip_bot_mention(&content, bid);
                             }
+                            // Allow `\xxx` as an alias for `/xxx` — Discord
+                            // intercepts a leading `/` for native slash
+                            // commands so users sometimes can't easily type
+                            // /ss / /webshot / /help. Mirrors the Slack
+                            // alias added earlier.
+                            if let Some(rest) = content.strip_prefix('\\') {
+                                if rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+                                    content = format!("/{rest}");
+                                }
+                            }
 
                             if content.is_empty() { continue; }
                             debug!(peer = %peer_id, channel = %channel_id, "Discord: MESSAGE_CREATE");
-                            (self.on_message)(peer_id, content, channel_id, is_guild);
+                            (self.on_message)(peer_id, content, channel_id, is_guild, images, files);
                         }
                         _ => {
                             debug!("Discord: event {event_type}");
@@ -782,14 +853,14 @@ mod tests {
     #[test]
     fn channel_name() {
         init_crypto();
-        let ch = DiscordChannel::new("token", false, Arc::new(|_, _, _, _| {}), None, None);
+        let ch = DiscordChannel::new("token", false, Arc::new(|_, _, _, _, _, _| {}), None, None);
         assert_eq!(ch.name(), "discord");
     }
 
     #[test]
     fn auth_header_format() {
         init_crypto();
-        let ch = DiscordChannel::new("my-token", false, Arc::new(|_, _, _, _| {}), None, None);
+        let ch = DiscordChannel::new("my-token", false, Arc::new(|_, _, _, _, _, _| {}), None, None);
         assert_eq!(ch.auth_header(), "Bot my-token");
     }
 

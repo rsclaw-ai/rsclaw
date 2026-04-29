@@ -1340,7 +1340,7 @@ async fn run_subprocess(
     tracing::info!("ACP subprocess started: {} {:?}", command, args);
 
     // Spawn a task to continuously read stderr
-    let stderr_task = tokio::spawn(async move {
+    let _stderr_task = tokio::spawn(async move {
         let mut stderr_buf = Vec::new();
         loop {
             stderr_buf.clear();

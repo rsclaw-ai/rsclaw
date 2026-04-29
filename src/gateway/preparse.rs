@@ -88,7 +88,7 @@ pub(crate) async fn try_preparse_locally(
         drop(flags);
         // 2. Signal runtime to clear sessions at next opportunity
         handle.clear_signal.store(true, Ordering::SeqCst);
-        return Some(txt("Session cleared.".to_owned()));
+        return Some(txt(crate::i18n::t("session_cleared", crate::i18n::default_lang()).to_owned()));
     }
     // /new — start a fresh conversation (new generation, no summary)
     if lower == "/new" {
@@ -96,7 +96,7 @@ pub(crate) async fn try_preparse_locally(
         for f in flags.values() { f.store(true, Ordering::SeqCst); }
         drop(flags);
         handle.new_session_signal.store(true, Ordering::SeqCst);
-        return Some(txt("New session started.".to_owned()));
+        return Some(txt(crate::i18n::t("session_new", crate::i18n::default_lang()).to_owned()));
     }
     // /reset — reset current session (no summary, same generation)
     if lower == "/reset" {
@@ -104,7 +104,7 @@ pub(crate) async fn try_preparse_locally(
         for f in flags.values() { f.store(true, Ordering::SeqCst); }
         drop(flags);
         handle.reset_signal.store(true, Ordering::SeqCst);
-        return Some(txt("Session reset.".to_owned()));
+        return Some(txt(crate::i18n::t("session_reset", crate::i18n::default_lang()).to_owned()));
     }
     // /status
     if lower == "/status" {
@@ -188,7 +188,89 @@ $g.Dispose();$b.Dispose()"#
                 });
             }
         }
-        return Some(txt("screenshot failed".to_owned()));
+        return Some(txt(crate::i18n::t("screenshot_failed", crate::i18n::default_lang()).to_owned()));
+    }
+    // /webshot <url> — headless-Chrome screenshot of a web page. Distinct
+    // from /ss (desktop) because the LLM's `web_browser action=screenshot`
+    // path requires a navigated page and otherwise captures a blank dark
+    // chrome new-tab — when the user wanted a website screenshot, that's
+    // a blank image. /webshot is the explicit "screenshot a URL" command.
+    if lower.starts_with("/webshot ") || lower == "/webshot" {
+        let arg = t.get(9..).unwrap_or("").trim();
+        if arg.is_empty() {
+            return Some(txt(
+                "/webshot <url> — screenshot a web page. Example: /webshot https://example.com".to_owned(),
+            ));
+        }
+        let url = if arg.starts_with("http://") || arg.starts_with("https://") {
+            arg.to_owned()
+        } else {
+            format!("https://{arg}")
+        };
+        let tmp_path = std::env::temp_dir().join("rsclaw_webshot.png");
+        // Find a usable chromium binary. Order: $CHROME, common macOS
+        // app bundle, common linux/bin names, common windows path.
+        let chrome = std::env::var("CHROME")
+            .ok()
+            .filter(|p| std::path::Path::new(p).exists())
+            .or_else(|| {
+                for cand in [
+                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+                    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+                    "/usr/bin/google-chrome",
+                    "/usr/bin/chromium",
+                    "/usr/bin/chromium-browser",
+                    "/snap/bin/chromium",
+                    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+                ] {
+                    if std::path::Path::new(cand).exists() {
+                        return Some(cand.to_owned());
+                    }
+                }
+                None
+            });
+        let Some(chrome) = chrome else {
+            return Some(txt(
+                "/webshot: no Chrome / Chromium found. Install Google Chrome or set $CHROME=/path/to/chrome.".to_owned(),
+            ));
+        };
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        let ok = tokio::process::Command::new(&chrome)
+            .args([
+                "--headless=new",
+                "--disable-gpu",
+                "--no-sandbox",
+                "--hide-scrollbars",
+                "--window-size=1280,800",
+                &format!("--screenshot={}", tmp_path.display()),
+                &url,
+            ])
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok && tmp_path.exists() {
+            if let Ok(bytes) = tokio::fs::read(&tmp_path).await {
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                return Some(OutboundMessage {
+                    target_id: String::new(),
+                    is_group: false,
+                    text: format!("[webshot] {url}"),
+                    reply_to: None,
+                    images: vec![format!("data:image/png;base64,{b64}")],
+                    files: vec![],
+                    channel: None,
+                });
+            }
+        }
+        return Some(txt(crate::i18n::t_fmt(
+            "webshot_failed",
+            crate::i18n::default_lang(),
+            &[("url", &url)],
+        )));
     }
     // /skill list — list installed skills (system + agent workspace)
     if lower == "/skill list" {
@@ -385,6 +467,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
     || lower.starts_with("/ls ")
     || lower.starts_with("/cat ")
     || lower.starts_with("/ss")
+    || lower.starts_with("/webshot")
     || lower.starts_with("/remember ")
     || lower.starts_with("/recall ")
     || lower.starts_with("/cron ")

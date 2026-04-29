@@ -72,9 +72,9 @@ pub(crate) fn toolset_allowed_names(
     toolset: &str,
     custom_tools: Option<&Vec<String>>,
 ) -> Option<std::collections::HashSet<String>> {
-    const MINIMAL: &[&str] = &["execute_command", "read_file", "write_file", "send_file", "list_dir", "search_file", "search_content", "web_search", "web_fetch", "memory", "clarify", "anycli"];
-    const WEB: &[&str] = &["web_search", "web_fetch", "web_download", "read_file", "write_file", "list_dir", "search_file", "memory"];
-    const CODE: &[&str] = &["execute_command", "read_file", "write_file", "list_dir", "search_file", "search_content", "memory"];
+    const MINIMAL: &[&str] = &["execute_command", "read_file", "write_file", "send_file", "list_dir", "search_file", "search_content", "web_search", "web_fetch", "memory", "clarify", "anycli", "use_skill"];
+    const WEB: &[&str] = &["web_search", "web_fetch", "web_download", "read_file", "write_file", "list_dir", "search_file", "memory", "use_skill"];
+    const CODE: &[&str] = &["execute_command", "read_file", "write_file", "list_dir", "search_file", "search_content", "memory", "use_skill"];
     const STANDARD: &[&str] = &[
         "execute_command",
         "read_file",
@@ -93,6 +93,7 @@ pub(crate) fn toolset_allowed_names(
         "computer_use",
         "clarify",
         "anycli",
+        "use_skill",
     ];
 
     let base: Option<&[&str]> = match toolset {
@@ -157,6 +158,43 @@ pub(crate) fn build_tool_list(
             "required": ["action"]
         }),
     });
+    // `use_skill` — first-class entry point for installed skills. Listed
+    // EARLY in the tool list so the LLM notices it before web_fetch /
+    // web_browser / execute_command. Only registered when at least one
+    // skill is installed; otherwise it'd be dead surface area.
+    if skills.all().next().is_some() {
+        let skill_names: Vec<String> = skills.all().map(|s| s.name.clone()).collect();
+        let names_hint = if skill_names.is_empty() {
+            String::new()
+        } else {
+            format!(" Installed skill names: {}.", skill_names.join(", "))
+        };
+        tools.push(ToolDef {
+            name: "use_skill".to_owned(),
+            description: format!(
+                "ACTIVATE an installed skill. Use this BEFORE web_fetch / web_browser / \
+                execute_command whenever the user's task matches any skill description \
+                shown in the system prompt under '## Installed Skills' (flights, hotels, \
+                stocks, weather, finance data, etc.).\n\n\
+                Returns the full SKILL.md so you know the exact CLI command and flags. \
+                After calling use_skill you typically call execute_command with the CLI \
+                from skill_md.\n\n\
+                Common failure to avoid: defaulting to web_fetch on a domain a skill \
+                already covers. If a skill description matches, you MUST use_skill \
+                first.{names_hint}"
+            ),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Exact skill name from the Installed Skills list (e.g. 'flyai', 'hithink-market-query'). Case-sensitive."
+                    }
+                },
+                "required": ["name"]
+            }),
+        });
+    }
     tools.push(ToolDef {
         name: "read_file".to_owned(),
         description: "Read a file from the agent workspace.\n\
@@ -482,7 +520,25 @@ pub(crate) fn build_tool_list(
             Content: `content` — get full page HTML.\n\
             WaitForUrl: `waitforurl` url='dashboard' — wait for URL change (after login/redirect).\n\
             Other: type, select, check, scroll, screenshot, pdf, press, back, forward, reload, wait, evaluate, cookies, get_text, get_url, get_title, find, get_article, upload, new_tab, switch_tab, close_tab.\n\
-            IMPORTANT: Always snapshot BEFORE clicking/filling. Element refs change after page updates.".to_owned(),
+            IMPORTANT: Always snapshot BEFORE clicking/filling. Element refs change after page updates.\n\n\
+            Site-rules — platform-specific DOM selectors, URL routes, and gotchas live under \
+            `~/.rsclaw/tools/web_browser/site-rules/<domain>.md` (e.g. `douyin.md`, `kuaishou.md`, \
+            `xiaohongshu.md`, `bilibili.md`). When you `open` a URL whose host matches one of \
+            those filenames, read_file that rule file FIRST so you use the verified selectors \
+            instead of guessing them per-session. Saves 5+ snapshot/click iterations and avoids \
+            stale-selector breakage.\n\n\
+            Screenshot routing — do NOT call `action=screenshot` without a target:\n\
+            - Web page screenshot (user gave a URL): pass it inline,\n\
+              `action=screenshot url=https://example.com` — this navigates\n\
+              first then captures, single call. This is the one-shot equivalent\n\
+              of `/webshot`.\n\
+            - Desktop / system screenshot (no URL, user just says \"screenshot\"\n\
+              or \"截图\"): you cannot do this from web_browser. Tell the user\n\
+              to type `/ss` or `/screenshot` (preparse fast path → macOS\n\
+              `screencapture` / Windows / Linux equivalent).\n\
+            - Plain `action=screenshot` (no url) only captures what's already\n\
+              in the persistent browser session — usually a blank Chrome new\n\
+              tab → near-black PNG. Don't do this.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {

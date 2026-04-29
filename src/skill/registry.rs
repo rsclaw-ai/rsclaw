@@ -49,6 +49,13 @@ pub enum Registry {
     Skillsh {
         client: Client,
     },
+    /// iWenCai SkillHub (同花顺金融技能库). The upstream gateway returns the
+    /// full skill list at one endpoint; we filter client-side because there
+    /// is no public keyword-search API.
+    Iwencai {
+        client: Client,
+        list_url: String,
+    },
 }
 
 impl Registry {
@@ -58,6 +65,7 @@ impl Registry {
             Registry::Clawhub { .. } => "clawhub.ai",
             Registry::Skillhub { .. } => "skillhub",
             Registry::Skillsh { .. } => "skills.sh",
+            Registry::Iwencai { .. } => "iwencai",
         }
     }
 
@@ -72,6 +80,9 @@ impl Registry {
             }
             Registry::Skillsh { client } => {
                 search_skillsh(client, query).await
+            }
+            Registry::Iwencai { client, list_url } => {
+                search_iwencai(client, list_url, query).await
             }
         }
     }
@@ -195,6 +206,71 @@ async fn search_skillhub(
                 installs: item["installs"].as_u64(),
                 stars: item["stars"].as_u64(),
                 registry: "skillhub".to_owned(),
+            }
+        })
+        .collect()
+}
+
+/// Search iwencai's skill square. The upstream endpoint
+/// `GET /skills/square?pageSize=N&page=1` returns the entire catalogue as
+/// `{ data: { records: [{name, cn_name, description, download_count, ...}] } }`.
+/// There is no `keyword=` parameter — we paginate-and-filter client-side.
+/// An empty query returns the full first page so callers like the agent's
+/// "show me everything" flow work without special-casing.
+async fn search_iwencai(client: &Client, list_url: &str, query: &str) -> Vec<SearchResult> {
+    // iwencai's gateway uses `size` (not `pageSize`/`page_size`) and caps
+    // somewhere between 100 and 150 — `size=100` returns the full catalogue
+    // (~89 skills) in one shot, `size=150` 500's. Pull everything once and
+    // filter client-side; expand to true pagination if the catalogue grows.
+    let url = if list_url.contains('?') {
+        format!("{list_url}&size=100&page=1")
+    } else {
+        format!("{list_url}?size=100&page=1")
+    };
+    let Ok(resp) = client.get(&url).send().await else { return vec![] };
+    if !resp.status().is_success() { return vec![]; }
+    let Ok(body) = resp.json::<serde_json::Value>().await else { return vec![] };
+
+    let q = query.trim().to_lowercase();
+    let arr = body
+        .get("data")
+        .and_then(|d| d.get("records"))
+        .and_then(|v| v.as_array());
+    let Some(arr) = arr else { return vec![] };
+
+    arr.iter()
+        .filter(|item| {
+            // Hide 同花顺 internal tooling (sunmao-*, hxkline-*, ths-*,
+            // hexin-*, cmdb, alert-analyzer, ...) — only the `hithink-*`
+            // line is the curated public finance API surface. Without
+            // this filter ~67 of 89 skills are 同花顺 devops/scaffolding
+            // that nobody outside the company should be installing.
+            let name = item["name"].as_str().unwrap_or("");
+            if !name.starts_with("hithink-") { return false; }
+            if q.is_empty() { return true; }
+            let q_lc = q.as_str();
+            let cn_name = item["cn_name"].as_str().unwrap_or("").to_lowercase();
+            let desc = item["description"].as_str().unwrap_or("").to_lowercase();
+            name.to_lowercase().contains(q_lc) || cn_name.contains(q_lc) || desc.contains(q_lc)
+        })
+        .map(|item| {
+            // iwencai's `cn_name` is more user-friendly than `name`; surface
+            // it in the description so users see what each slug is.
+            let raw_desc = item["description"].as_str().unwrap_or("");
+            let cn_name = item["cn_name"].as_str().unwrap_or("");
+            let desc = if !cn_name.is_empty() {
+                format!("{cn_name} — {raw_desc}")
+            } else {
+                raw_desc.to_owned()
+            };
+            SearchResult {
+                slug: item["name"].as_str().unwrap_or("unknown").to_owned(),
+                version: item["version"].as_str().map(|s| s.to_owned()),
+                description: if desc.is_empty() { None } else { Some(desc) },
+                downloads: item["download_count"].as_u64(),
+                installs: item["download_success_count"].as_u64(),
+                stars: item["star_count"].as_u64(),
+                registry: "iwencai".to_owned(),
             }
         })
         .collect()
