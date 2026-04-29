@@ -123,6 +123,8 @@ pub struct AppState {
     pub notification_tx: broadcast::Sender<crate::channel::OutboundMessage>,
     /// WASM plugins for direct tool execution via API.
     pub wasm_plugins: Arc<Vec<crate::plugin::WasmPlugin>>,
+    /// Shell-bridge plugin registry for direct tool execution via API.
+    pub plugins: Arc<crate::plugin::PluginRegistry>,
     /// Broadcast channel for restart-required events
     /// (config changed, model downloaded, etc.). Multi-source, single sink.
     pub restart_request_tx: broadcast::Sender<crate::events::RestartRequest>,
@@ -893,7 +895,7 @@ async fn execute_tool(
         return Json(serde_json::json!({"error": "tool name required"}));
     }
 
-    // Check WASM plugins
+    // Check WASM plugins first; wasm wins on collision (matches agent dispatch).
     if let Some((plugin_name, tool_inner)) = tool_name.split_once('.') {
         for wp in state.wasm_plugins.iter() {
             if wp.name == plugin_name {
@@ -902,6 +904,20 @@ async fn execute_tool(
                     Err(e) => return Json(serde_json::json!({"ok": false, "error": format!("{e:#}")})),
                 }
             }
+        }
+        // Fall through to shell plugins. The REST endpoint has no IM session
+        // context, so _ctx fields are empty — host.notify will return
+        // logged_only rather than dispatching.
+        if let Some(plugin) = state.plugins.get_shell(plugin_name) {
+            let params = serde_json::json!({
+                "tool": tool_inner,
+                "args": args,
+                "_ctx": { "target_id": "", "channel": "", "session_key": "" }
+            });
+            return match plugin.call("tool_call", params).await {
+                Ok(result) => Json(serde_json::json!({"ok": true, "result": result})),
+                Err(e) => Json(serde_json::json!({"ok": false, "error": format!("{e:#}")})),
+            };
         }
         return Json(serde_json::json!({"error": format!("plugin '{}' not found", plugin_name)}));
     }
