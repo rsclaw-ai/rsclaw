@@ -2292,6 +2292,22 @@ impl BrowserSession {
         let full_page = args.get("full_page").and_then(|v| v.as_bool()).unwrap_or(false);
         let annotate = args.get("annotate").and_then(|v| v.as_bool()).unwrap_or(false);
 
+        // One-shot mode: when `url` is given, navigate to it first so a
+        // bare `action=screenshot url=...` call returns the page instead
+        // of whatever the persistent session was last showing (often a
+        // blank dark new-tab → near-black PNG that channels happily
+        // forwarded as a "blank image").
+        if let Some(url) = args.get("url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            let normalised = if url.starts_with("http://") || url.starts_with("https://") {
+                url.to_owned()
+            } else {
+                format!("https://{url}")
+            };
+            self.cmd_open(&json!({ "url": normalised })).await?;
+            // Brief settle so SPA frameworks have a chance to paint.
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        }
+
         let mut params = json!({ "format": format });
         if let Some(q) = quality {
             params["quality"] = json!(q);
