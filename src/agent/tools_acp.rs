@@ -55,6 +55,7 @@ impl NotificationSink for ChannelNotifier {
             images: vec![],
             files: vec![],
             channel: Some(self.channel.clone()),
+            account: None,
         };
         let tx = self.tx.clone();
         Box::pin(async move {
@@ -222,6 +223,7 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         channel: Some(channel_name.clone()),
+                        account: None,
                     });
                 }
                 return Err(e);
@@ -251,6 +253,7 @@ impl AgentRuntime {
                 images: vec![],
                 files: vec![],
                 channel: Some(channel_name.clone()),
+                account: None,
             });
         } else {
             tracing::warn!("tool_opencode: no notification_tx for initial notification");
@@ -480,6 +483,7 @@ impl AgentRuntime {
                             images: vec![],
                             files: notif_files,
                             channel: Some(channel_bg.clone()),
+                            account: None,
                         }) {
                             Ok(_) => {
                                 tracing::info!("tool_opencode: notification sent successfully to {}", target_id_bg);
@@ -504,6 +508,7 @@ impl AgentRuntime {
                             images: vec![],
                             files: vec![],
                             channel: Some(channel_bg.clone()),
+                            account: None,
                         });
                     }
                 }
@@ -533,6 +538,7 @@ impl AgentRuntime {
                 extra_tools: vec![],
                 images: vec![],
                 files: vec![],
+                account: None,
             };
             if self_tx.send(inject_msg).await.is_err() {
                 tracing::warn!("tool_opencode: failed to inject result back to agent inbox");
@@ -551,6 +557,7 @@ impl AgentRuntime {
                                     images: reply.images,
                                     files: reply.files,
                                     channel: Some(self_channel),
+                                    account: None,
                                 });
                                 tracing::info!("tool_opencode: forwarded agent reply to user");
                             }
@@ -797,6 +804,7 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         channel: Some(channel_name.clone()),
+                        account: None,
                     });
                 }
                 return Err(e);
@@ -826,6 +834,7 @@ impl AgentRuntime {
                 images: vec![],
                 files: vec![],
                 channel: Some(channel_name.clone()),
+                account: None,
             });
         } else {
             tracing::warn!("tool_claudecode: no notification_tx for initial notification");
@@ -1036,6 +1045,7 @@ impl AgentRuntime {
                             images: vec![],
                             files: notif_files,
                             channel: Some(channel_bg.clone()),
+                            account: None,
                         }) {
                             Ok(_) => {
                                 tracing::info!("tool_claudecode: notification sent successfully to {}", target_id_bg)
@@ -1060,6 +1070,7 @@ impl AgentRuntime {
                             images: vec![],
                             files: vec![],
                             channel: Some(channel_bg.clone()),
+                            account: None,
                         });
                     }
                 }
@@ -1187,6 +1198,7 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         channel: Some(channel_name.clone()),
+                        account: None,
                     });
                 }
                 return Err(e);
@@ -1205,6 +1217,7 @@ impl AgentRuntime {
                 images: vec![],
                 files: vec![],
                 channel: Some(channel_name.clone()),
+                account: None,
             });
         }
 
@@ -1258,6 +1271,7 @@ impl AgentRuntime {
                             images: vec![],
                             files: vec![],
                             channel: Some(channel_bg.clone()),
+                            account: None,
                         });
                     }
                 }
@@ -1272,6 +1286,7 @@ impl AgentRuntime {
                             images: vec![],
                             files: vec![],
                             channel: Some(channel_bg.clone()),
+                            account: None,
                         });
                     }
                 }

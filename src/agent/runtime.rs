@@ -4329,7 +4329,7 @@ const MAX_ERROR_STREAK: usize = 5;
                         has_tool_in_turn = has_tool_in_turn,
                         "DECEPTION DETECTED: model claims action but no tool_call in turn"
                     );
-                    // CRITICAL: Do NOT return the deceptive text to user.
+// CRITICAL: Do NOT return the deceptive text to user.
                     // Instead, inject a correction message and continue the loop.
                     // Clear the deceptive text and add a forced user message.
                     text_buf.clear();
@@ -4477,6 +4477,7 @@ const MAX_ERROR_STREAK: usize = 5;
                         images: vec![],
                         files: vec![],
                         channel: Some(ctx.channel.clone()),
+                        account: None,
                     });
                     tracing::debug!(text_len = text_buf.len(), "agent_loop: sent intermediate text to user");
                 }
@@ -5663,6 +5664,7 @@ const MAX_ERROR_STREAK: usize = 5;
             "write_file" | "write" => return self.tool_write(args).await,
             "execute_command" | "exec" => return self.tool_exec(ctx, _id, args).await,
             "use_skill" => return self.tool_use_skill(args),
+            "task" => return self.tool_task(ctx, args).await,
             "install_tool" | "tool_install" => return self.tool_install(args).await,
             "list_dir" => return self.tool_list_dir(args).await,
             "search_file" => return self.tool_search_file(args).await,
@@ -5816,6 +5818,7 @@ const MAX_ERROR_STREAK: usize = 5;
                 extra_tools: vec![],
                 images: vec![],
                 files: vec![],
+                account: None,
             };
 
             target
@@ -5960,6 +5963,71 @@ const MAX_ERROR_STREAK: usize = 5;
     /// description matched the task. Returns the skill's full SKILL.md so
     /// the LLM can derive the exact CLI invocation, then call
     /// `execute_command` to run it.
+    /// Escalate the user's current request into a multi-turn background
+    /// task. The LLM is the one judging when this is warranted (see the
+    /// `task` ToolDef description). The original `looks_like_task`
+    /// keyword heuristic regularly mis-classified short Chinese
+    /// questions like "你可以帮我做啥？", so the decision moved here.
+    pub(crate) async fn tool_task(&self, ctx: &RunContext, args: Value) -> Result<Value> {
+        use crate::gateway::task_queue::{
+            self, Priority, QueuedMessage, TASK_DEFAULT_MAX_TURNS, TASK_DEFAULT_TTL_SECS,
+        };
+        let task_text = args
+            .get("task_text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if task_text.is_empty() {
+            return Ok(json!({
+                "error": "task_text is required and must be non-empty"
+            }));
+        }
+        let max_turns = args
+            .get("max_turns")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(TASK_DEFAULT_MAX_TURNS);
+        let ttl_secs = args
+            .get("ttl_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(TASK_DEFAULT_TTL_SECS);
+
+        let Some(manager) = task_queue::get_task_queue() else {
+            return Ok(json!({
+                "error": "task queue not available (gateway not fully started?)"
+            }));
+        };
+
+        let message = QueuedMessage {
+            text: task_text.clone(),
+            sender: ctx.peer_id.clone(),
+            channel: ctx.channel.clone(),
+            chat_id: ctx.chat_id.clone(),
+            is_group: false,
+            reply_to: None,
+            timestamp: chrono::Utc::now().timestamp(),
+            images: Vec::new(),
+            files: Vec::new(),
+            account: None,
+        };
+
+        let (task_id, merged) = manager
+            .submit_task(&ctx.session_key, message, Priority::User, max_turns, ttl_secs)
+            .map_err(|e| anyhow!("failed to submit task: {e:#}"))?;
+
+        Ok(json!({
+            "task_id": task_id,
+            "merged": merged,
+            "max_turns": max_turns,
+            "ttl_secs": ttl_secs,
+            "next_step": "Reply to the user with a brief acknowledgement only \
+                          (e.g. 'Started, will report progress'). The actual \
+                          work runs in the background and posts updates as \
+                          turns complete."
+        }))
+    }
+
     pub(crate) fn tool_use_skill(&self, args: Value) -> Result<Value> {
         let name = args
             .get("name")

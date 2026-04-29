@@ -121,6 +121,7 @@ fn start_custom_webhook(
                 extra_tools: vec![],
                 images: vec![],
                 files: vec![],
+                account: None,
             };
             if handle.tx.send(msg).await.is_err() {
                 return;
@@ -136,6 +137,7 @@ fn start_custom_webhook(
                             reply_to: None,
                             images: r.images,
                             files: r.files,
+                            account: None,
                             channel: None,                        })
                         .await
                     {
@@ -237,6 +239,7 @@ fn start_custom_websocket(
                 extra_tools: vec![],
                 images: vec![],
                 files: vec![],
+                account: None,
             };
             if handle.tx.send(msg).await.is_err() {
                 return;
@@ -252,6 +255,7 @@ fn start_custom_websocket(
                             reply_to: None,
                             images: r.images,
                             files: r.files,
+                            account: None,
                             channel: None,                        })
                         .await
                     {

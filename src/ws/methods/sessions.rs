@@ -160,6 +160,7 @@ pub async fn sessions_send(ctx: MethodCtx) -> MethodResult {
         extra_tools: vec![],
         images: vec![],
         files: vec![],
+        account: None,
     };
 
     agent

@@ -309,6 +309,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let task_queue_mgr = Arc::new(
         super::task_queue::TaskQueueManager::new(Arc::clone(&store.db)),
     );
+    // Publish a global handle so the agent's `task` function-call tool can
+    // submit follow-up tasks without threading the manager through every
+    // tool-dispatch surface.
+    super::task_queue::install_task_queue(Arc::clone(&task_queue_mgr));
 
     start_channels(
         &config,
@@ -969,6 +973,7 @@ fn spawn_agent_tasks(
                     extra_tools,
                     images,
                     files,
+                    account: _,
                 } = msg;
                 let result = runtime
                     .run_turn(
@@ -1151,6 +1156,7 @@ pub(crate) async fn handle_pending_analysis(
         extra_tools: vec![],
         images: vec![],
         files: vec![],
+        account: None,
     };
     if handle.tx.send(msg).await.is_err() {
         // receiver may have been dropped
@@ -1163,6 +1169,7 @@ pub(crate) async fn handle_pending_analysis(
                 images: vec![],
                 channel: None,
 
+                account: None,
                     files: vec![],            })
             .await;
         return;
@@ -1178,6 +1185,7 @@ pub(crate) async fn handle_pending_analysis(
                     reply_to: None,
                     images: r.images,
                     files: r.files,
+                    account: None,
                     channel: None,                })
                 .await;
         }
@@ -1193,6 +1201,7 @@ pub(crate) async fn handle_pending_analysis(
                     images: vec![],
                     channel: None,
 
+                    account: None,
                     files: vec![],                })
                 .await;
         }
@@ -1207,6 +1216,7 @@ pub(crate) async fn handle_pending_analysis(
                     images: vec![],
                     channel: None,
 
+                    account: None,
                     files: vec![],                })
                 .await;
         }

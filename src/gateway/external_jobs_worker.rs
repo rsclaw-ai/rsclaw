@@ -377,6 +377,7 @@ impl ExternalJobsWorker {
             images: vec![],
             files: vec![(filename.to_string(), mime.to_string(), path.to_string())],
             channel: Some(job.delivery.channel.clone()),
+            account: None,
         };
         match self.notification_tx.send(out) {
             Ok(_) => true,
@@ -402,6 +403,7 @@ impl ExternalJobsWorker {
             images: vec![],
             files: vec![],
             channel: Some(job.delivery.channel.clone()),
+            account: None,
         };
         match self.notification_tx.send(out) {
             Ok(_) => true,

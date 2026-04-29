@@ -1650,6 +1650,7 @@ CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
         extra_tools: vec![],
         images: vec![],
         files: vec![],
+        account: None,
     };
 
     handle.tx.send(msg).await.context("agent inbox closed")?;
@@ -1823,6 +1824,7 @@ async fn send_delivery(
         images: vec![],
         files: vec![],
         channel: Some(resolved_channel.to_owned()),
+        account: None,
     };
 
     match channel.send(msg).await {
@@ -2030,6 +2032,7 @@ async fn run_exec_command(
             extra_tools: vec![], // No tools - only summarize
             images: vec![],
             files: vec![],
+            account: None,
         };
 
         handle.tx.send(msg).await.context("agent inbox closed")?;

@@ -310,6 +310,16 @@ pub(crate) fn build_system_prompt(
              - Independent tasks -> dispatch ALL at once in parallel.\n\
              - Trivial tasks (simple answers, one read) -> do yourself.\n\
              - Pipeline: dispatch parallel -> collect results -> dispatch dependent tasks -> synthesize.\n\
+             ### When to call the `task` tool (escalate to background)\n\
+             Default to answering the user directly in this turn. Only call `task` when ALL of:\n\
+             1. The work obviously needs many tool calls or many minutes (e.g. multi-file \
+             implementation, deep multi-source research, end-to-end deploys, long debugging).\n\
+             2. There is nothing useful you can answer right now in one turn.\n\
+             3. The user clearly wants the work done, not just discussed.\n\
+             Do NOT call `task` for: greetings ('你好', 'hi'), questions about your capabilities \
+             ('你能帮我做什么？', 'what can you do?'), single tool calls (one search, one file \
+             read, one calc), explanations, opinions, or anything you can finish in this turn. \
+             When in doubt, just answer — the user can type `/task <request>` to escalate manually.\n\
              ### Other\n\
              - Cron jobs: `cron` tool (action=list/add/remove).\n\
              - Install tools (python, node, ffmpeg, chrome, etc.): `install_tool`. Do NOT download manually.\n\

@@ -143,12 +143,18 @@ pub(crate) fn start_feishu_if_configured(
         let tq = Arc::clone(&task_queue);
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
-        // Register channel sender for notification routing (ACP tools like OpenCode, ClaudeCode)
+        // Register channel sender for notification routing (ACP tools like OpenCode, ClaudeCode).
+        // - "feishu/{account}" is the canonical key — multi-account-aware callers use it.
+        // - bare "feishu" is registered ONLY by the first account so legacy single-
+        //   account callers still find a sender. Without this guard each account
+        //   overwrote the bare key, leaving the last-registered account routing
+        //   replies for messages received via every other account → Feishu 230002
+        //   "Bot/User can NOT be out of the chat" because that bot wasn't actually
+        //   in the originating chat.
         {
             let mut senders = _channel_senders.write().expect("channel_senders lock poisoned");
-            // Register both "feishu" (for legacy/simple routing) and "feishu/{account}" (for multi-account)
-            senders.insert("feishu".to_string(), out_tx.clone());
             senders.insert(format!("feishu/{}", acct_name), out_tx.clone());
+            senders.entry("feishu".to_string()).or_insert_with(|| out_tx.clone());
         }
 
         // Find binding for this account to determine which agent handles it.
@@ -163,6 +169,9 @@ pub(crate) fn start_feishu_if_configured(
             .map(|b| b.agent_id.clone());
         let bound = bound_agent.clone();
         let _acct_for_route = acct_name.clone();
+        // Capture acct_name for the on_message closure → per-user worker;
+        // the inner spawn only sees what's been moved into the closure.
+        let w_acct_outer = acct_name.clone();
 
         // Per-user inbound queue for Feishu.
         type FsItem = (
@@ -194,6 +203,7 @@ pub(crate) fn start_feishu_if_configured(
                 let group_allow = Arc::clone(&ga);
                 let queues = Arc::clone(&fs_user_queues);
                 let tq = Arc::clone(&tq);
+                let w_acct_outer = w_acct_outer.clone();
                 tokio::spawn(async move {
                     // Group policy check.
                     if is_group {
@@ -234,6 +244,7 @@ pub(crate) fn start_feishu_if_configured(
                                         images: vec![],
                                         channel: None,
 
+                                        account: None,
                     files: vec![],                                    })
                                     .await
                                 {
@@ -255,6 +266,7 @@ pub(crate) fn start_feishu_if_configured(
                                         images: vec![],
                                         channel: None,
 
+                                        account: None,
                     files: vec![],                                    })
                                     .await
                                 {
@@ -313,6 +325,7 @@ pub(crate) fn start_feishu_if_configured(
                             let w_cfg = cfg.clone();
                             let w_uid = sender_id.clone();
                             let w_tq = Arc::clone(&tq);
+                            let w_acct = w_acct_outer.clone();
                             tokio::spawn(async move {
                                 while let Some((
                                     text,
@@ -358,10 +371,14 @@ pub(crate) fn start_feishu_if_configured(
                                         dm_scope,
                                     });
                                     // Submit to persistent task queue (worker handles dispatch + reply).
+                                    // `account` carries the originating Feishu app name so the
+                                    // task worker can route the reply via the same app's API
+                                    // token (multi-account routing fix for 230002).
                                     let qmsg = crate::gateway::task_queue::QueuedMessage {
                                         text,
                                         sender: sender_id.clone(),
                                         channel: "feishu".to_string(),
+                                        account: Some(w_acct.clone()),
                                         chat_id: chat_id.clone(),
                                         is_group,
                                         reply_to: None,
@@ -411,6 +428,7 @@ pub(crate) fn start_feishu_if_configured(
                                         images: vec![],
                                         channel: None,
 
+                                        account: None,
                     files: vec![],                                    })
                                     .await
                                 {
@@ -482,6 +500,7 @@ pub(crate) fn start_feishu_if_configured(
                                 extra_tools: vec![],
                                 images,
                                 files: file_attachments,
+                                account: None,
                             };
                             if handle.tx.send(msg).await.is_err() {
                                 return;
@@ -496,6 +515,7 @@ pub(crate) fn start_feishu_if_configured(
                                         images: r.images,
                                         files: r.files,
                                         channel: None,
+                                        account: None,
                                     }).await
                                     {
                                         tracing::warn!("failed to send message: {e}");

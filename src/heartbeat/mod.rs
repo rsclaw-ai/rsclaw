@@ -504,6 +504,7 @@ impl HeartbeatRunner {
             extra_tools: vec![],
             images: vec![],
             files: vec![],
+            account: None,
         };
 
         handle

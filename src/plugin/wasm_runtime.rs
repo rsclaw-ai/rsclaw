@@ -401,6 +401,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
                 images: vec![],
                 files: vec![],
                 channel: Some(ctx.channel.clone()),
+                account: None,
             });
             Ok(Ok("dispatched".to_string()))
         } else {
@@ -423,6 +424,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
                 images: vec![image_data_uri],
                 files: vec![],
                 channel: Some(ctx.channel.clone()),
+                account: None,
             }) {
                 Ok(_) => Ok(Ok("dispatched".to_string())),
                 Err(_) => Ok(Ok("no_receivers".to_string())),
@@ -466,6 +468,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
                 images: vec![],
                 files: vec![(filename, mime, path_str)],
                 channel: Some(ctx.channel.clone()),
+                account: None,
             }) {
                 Ok(_) => Ok(Ok("dispatched".to_string())),
                 Err(_) => Ok(Ok("no_receivers".to_string())),
