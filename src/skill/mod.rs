@@ -16,6 +16,7 @@ pub mod loader;
 pub mod manifest;
 pub mod registry;
 pub mod runner;
+pub mod workflow_distill;
 
 pub use clawhub::{ClawhubClient, LockFile, LockedSkill, SearchResult, SkillSource};
 pub use loader::{SkillRegistry, default_global_skills_dir, load_skills};
