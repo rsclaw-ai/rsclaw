@@ -2289,6 +2289,9 @@ impl AgentRuntime {
             );
             all.extend(extra_tools.iter().cloned());
             all.extend(super::tools_builder::build_wasm_tool_defs(&self.wasm_plugins));
+            if let Some(ref reg) = self.plugins {
+                all.extend(super::tools_builder::build_shell_tool_defs(reg));
+            }
             if let Some(ref mcp) = self.mcp {
                 all.extend(mcp.all_tool_defs().await);
             }

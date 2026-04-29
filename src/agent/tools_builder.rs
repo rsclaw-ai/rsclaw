@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use crate::{
     config::schema::ExternalAgentConfig,
-    plugin::WasmPlugin,
+    plugin::{PluginRegistry, WasmPlugin},
     provider::ToolDef,
     skill::SkillRegistry,
 };
@@ -25,6 +25,27 @@ pub(crate) fn build_wasm_tool_defs(plugins: &[WasmPlugin]) -> Vec<ToolDef> {
                 name: format!("{}.{}", plugin_name, t.name),
                 description: t.description.clone(),
                 parameters: t.parameters.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Build a `Vec<ToolDef>` for every tool exported by every loaded
+/// shell-bridge plugin. Tool names are `<plugin>.<tool>`, mirroring the
+/// wasm-plugin convention so the dispatcher in `runtime.rs` can route
+/// either with the same `split_once('.')` pattern.
+pub(crate) fn build_shell_tool_defs(plugins: &PluginRegistry) -> Vec<ToolDef> {
+    plugins
+        .shell_plugins_iter()
+        .flat_map(|(plugin_name, plugin)| {
+            let plugin_name = plugin_name.clone();
+            plugin.manifest.tools.iter().map(move |t| ToolDef {
+                name: format!("{plugin_name}.{}", t.name),
+                description: t.description.clone(),
+                parameters: t.input_schema.clone().unwrap_or_else(|| serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                })),
             })
         })
         .collect()

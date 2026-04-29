@@ -60,6 +60,13 @@ impl PluginRegistry {
         self.plugins.get(name)
     }
 
+    /// Iterate over all loaded shell-bridge plugins as (name, plugin) pairs.
+    /// Used by the agent runtime to build LLM tool definitions and the
+    /// plugins system message.
+    pub fn shell_plugins_iter(&self) -> impl Iterator<Item = (&String, &Plugin)> {
+        self.plugins.iter()
+    }
+
     pub fn all(&self) -> impl Iterator<Item = &Plugin> {
         self.plugins.values()
     }
