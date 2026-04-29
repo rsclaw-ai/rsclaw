@@ -1845,7 +1845,6 @@ impl AgentRuntime {
         // longer wrap videos as ImageAttachments — they would be rejected
         // with "Invalid base64 image_url".
         // ---------------------------------------------------------------
-        let mut files = files;
         let mut images = images;
         let (media_files, regular_files): (Vec<_>, Vec<_>) = files.into_iter().partition(|f| {
             crate::channel::is_audio_attachment(&f.mime_type, &f.filename)
@@ -2370,7 +2369,7 @@ impl AgentRuntime {
         // Session stores ONLY text — no base64, no binary blobs.
         // This preserves KV cache and prevents context bloat.
         // ---------------------------------------------------------------
-        let mut media_descriptions = Vec::<String>::new();
+        let media_descriptions: Vec<String> = Vec::new();
         let mut vision_images_for_current_turn = Vec::<String>::new(); // base64 URIs for vision model
 
         // @-referenced images go directly to vision (already saved, no re-save).

@@ -15,7 +15,7 @@ use reqwest::Client;
 use serde_json::{Value, json};
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use super::{Channel, OutboundMessage};
 use crate::channel::{
