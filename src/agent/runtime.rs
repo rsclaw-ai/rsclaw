@@ -2893,32 +2893,43 @@ impl AgentRuntime {
             return (None, snapshot);
         }
 
+        // Inject only `name + version + description + dir`, NOT the full
+        // SKILL.md body. With ~22 hithink-* skills installed the bodies
+        // sum to ~260KB which torpedoes the prompt budget. The agent
+        // discovers the full SKILL.md on demand via read_file when it
+        // matches a description and decides to invoke a skill.
         let skill_prompts: String = all_skills
             .iter()
-            .map(|s| format!(
-                "<skill name=\"{}\" version=\"{}\">\n{}\n</skill>",
-                s.name,
-                s.version.as_deref().unwrap_or(""),
-                s.prompt.trim(),
-            ))
+            .map(|s| {
+                let desc = s.description.as_deref().unwrap_or("(no description)");
+                let trimmed_desc = desc.trim();
+                let one_line = trimmed_desc.replace('\n', " ");
+                format!(
+                    "<skill name=\"{}\" version=\"{}\" dir=\"{}\">\n{}\n</skill>",
+                    s.name,
+                    s.version.as_deref().unwrap_or(""),
+                    s.dir.display(),
+                    one_line,
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n\n");
 
         let msg = format!(
             "## Installed Skills\n\
-             When the user's request matches a skill, follow its instructions \
-             unless a plugin already handles the task.\n\
+             When the user's request matches a skill's description, follow its \
+             instructions unless a plugin already handles the task.\n\
              Priority: plugins > skills > built-in tools.\n\n\
-             IMPORTANT — read references/ BEFORE calling any skill CLI:\n\
-             - Each skill's SKILL.md (below) is the entry point. Per-command \
-             schemas live in that skill's `references/*.md` files on disk.\n\
-             - BEFORE invoking a skill's CLI for the first time in a session, \
-             read the matching `references/<command>.md` so you use the real \
-             flag names. Guessing flags from intuition is the #1 failure mode \
-             (e.g. inventing `--depCity` when the actual flag is `--origin`).\n\
-             - The references/ files are NOT included below to save context — \
-             use the read_file tool with the path shown in each skill's \
-             References section.\n\n\
+             IMPORTANT — only the skill's frontmatter description is shown \
+             below. The full SKILL.md body and any references/ files live on \
+             disk and are NOT auto-injected (would blow up context).\n\n\
+             BEFORE invoking a skill's CLI for the first time in a session:\n\
+             1. Pick the skill whose description matches the user's intent.\n\
+             2. read_file `<dir>/SKILL.md` to learn its commands + flags.\n\
+             3. If SKILL.md mentions `references/<command>.md`, read_file that too.\n\
+             4. Then invoke the CLI with the exact flags from SKILL.md.\n\n\
+             Guessing CLI flags from the description alone is the #1 failure \
+             mode — always read SKILL.md first.\n\n\
              {skill_prompts}"
         );
         (Some(msg), snapshot)
