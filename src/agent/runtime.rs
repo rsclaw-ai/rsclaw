@@ -4678,11 +4678,13 @@ const MAX_ERROR_STREAK: usize = 5;
                                         Error type: {}{}\n\n\
                                         [STOP AND REFLECT] You have tried 'python -c' {} times without success.\n\
                                         Inline Python is hard to debug because you must rewrite the entire command.\n\n\
-                                        [RECOMMENDED APPROACH]\n\
-                                        1. Use write_file to save your code: write_file('debug.py', 'your code here')\n\
-                                        2. Run the file: execute_command('python debug.py')\n\
-                                        3. When errors occur, use read_file to view the code, then write_file to fix specific lines\n\
-                                        4. This is MUCH easier than rewriting python -c commands\n\n\
+                                        [RECOMMENDED APPROACH - Use _tmp/ directory]\n\
+                                        1. write_file('_tmp/debug.py', 'your code here') - temp scripts go in _tmp/\n\
+                                        2. execute_command('python _tmp/debug.py') - run the script\n\
+                                        3. read_file('_tmp/debug.py') + write_file to fix errors\n\
+                                        4. After success, clean up: execute_command('rm _tmp/debug.py')\n\
+                                        \n\
+                                        The _tmp/ directory is for disposable scripts. Clean them after use.\n\n\
                                         stderr:\n{}\n\n\
                                         You have {} attempts left. Switch to file-based execution NOW.",
                                         error_type, line_info, error_type, pointer_info,
@@ -4695,11 +4697,12 @@ const MAX_ERROR_STREAK: usize = 5;
                                         "[Python Inline Execution Failed] (attempt {}/{})\n\
                                         [STOP AND REFLECT] You have tried 'python -c' {} times without success.\n\
                                         Inline Python debugging is difficult - you must rewrite the entire command each time.\n\n\
-                                        [RECOMMENDED APPROACH]\n\
-                                        1. Use write_file to save your code: write_file('script.py', 'your code here')\n\
-                                        2. Run the file: execute_command('python script.py')\n\
-                                        3. Fix errors by editing specific lines with write_file\n\
-                                        4. This approach is more stable and easier to iterate\n\n\
+                                        [RECOMMENDED APPROACH - Use _tmp/ directory]\n\
+                                        1. write_file('_tmp/script.py', 'your code') - temp scripts in _tmp/\n\
+                                        2. execute_command('python _tmp/script.py') - run and iterate\n\
+                                        3. After success, clean up: execute_command('rm _tmp/script.py')\n\
+                                        \n\
+                                        The _tmp/ directory keeps your workspace clean. Delete temp files after use.\n\n\
                                         stderr:\n{}\n\n\
                                         You have {} attempts left. Switch to file-based execution NOW.",
                                         error_streak, MAX_ERROR_STREAK,
@@ -4746,11 +4749,12 @@ const MAX_ERROR_STREAK: usize = 5;
                                     "[Python Error Fix Hint] Detected {}{}\n\
                                     Error type: {}{}\n\
                                     Specific fix: {}\n\n\
-                                    [Required Fix Steps]\n\
+                                    [Recommended Fix Steps]\n\
                                     1. Read stderr carefully - find line number and error type\n\
-                                    2. If using python -c: consider write_file + execute_command for easier debugging\n\
+                                    2. If using python -c: write_file('_tmp/debug.py', 'your code') then execute_command('python _tmp/debug.py')\n\
                                     3. Fix the specific error at the indicated line\n\
-                                    4. Re-run the command after fix\n\n\
+                                    4. After success, clean up: execute_command('rm _tmp/debug.py')\n\n\
+                                    The _tmp/ directory is for disposable temp scripts.\n\n\
                                     stderr:\n{}\n\n\
                                     You have {} attempts left.",
                                     error_type, line_info, error_type, pointer_info, specific_fix,
@@ -4812,12 +4816,14 @@ const MAX_ERROR_STREAK: usize = 5;
                             // [方案 E] Warn about complex inline Python even on success
                             // Encourage file-based approach for easier debugging in future
                             let complexity_hint = "[Complex Inline Python Notice] Your 'python -c' command is over 200 characters.\n\
-                            For complex scripts, using file-based execution is recommended:\n\
-                            1. write_file('script.py', 'your code') - easier to view and modify\n\
-                            2. execute_command('python script.py') - clearer error messages with line numbers\n\
-                            3. read_file('script.py') + write_file('script.py', 'fixed code') - iterative debugging\n\
+                            For complex scripts, using file-based execution in _tmp/ is recommended:\n\
+                            1. write_file('_tmp/script.py', 'your code') - easier to view and modify\n\
+                            2. execute_command('python _tmp/script.py') - clearer error messages with line numbers\n\
+                            3. read_file('_tmp/script.py') + write_file('_tmp/script.py', 'fixed code') - iterative debugging\n\
+                            4. After success, clean up: execute_command('rm _tmp/script.py')\n\
                             \n\
-                            Inline Python is fine for simple one-liners, but files are much easier for debugging complex code.";
+                            Inline Python is fine for simple one-liners, but _tmp/ files are much easier for debugging complex code.\n\
+                            The _tmp/ directory is for disposable temp scripts - clean them after use.";
                             match &v {
                                 serde_json::Value::Object(obj) => {
                                     let mut modified = obj.clone();
