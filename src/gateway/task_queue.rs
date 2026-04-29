@@ -216,11 +216,12 @@ fn parse_task_prefix(text: &mut String) -> (u32, u64) {
         .replace('\u{2015}', "--"); // HORIZONTAL BAR
     let trimmed = normalized.trim();
     if !trimmed.starts_with("/task ") && trimmed != "/task" {
-        // Natural language detection: if it looks like a task, auto-enable.
-        if looks_like_task(trimmed) {
-            *text = normalized;
-            return (TASK_DEFAULT_MAX_TURNS, TASK_DEFAULT_TTL_SECS);
-        }
+        // No keyword auto-detection here — that path mistook short Chinese
+        // questions like "你可以帮我做啥？" for task requests because
+        // `text.len() < 15` was a byte length and "帮我" matched. Decision
+        // is now delegated to the LLM via the `task` function-call tool;
+        // see agent::tools_builder. Only the explicit `/task` prefix
+        // bypasses the LLM judgement.
         *text = normalized;
         return (0, TASK_DEFAULT_TTL_SECS);
     }
@@ -282,46 +283,6 @@ fn parse_duration_str(s: &str) -> Option<u64> {
     if total > 0 { Some(total) } else { None }
 }
 
-/// Heuristic check: does this message look like a task (vs. casual chat)?
-///
-/// Returns true when the text contains action-oriented patterns that
-/// suggest the user wants sustained work, not a quick Q&A.
-fn looks_like_task(text: &str) -> bool {
-    // Too short — likely a greeting or quick question.
-    if text.len() < 15 {
-        return false;
-    }
-
-    let lower = text.to_lowercase();
-
-    // Chinese task indicators.
-    for pat in [
-        "帮我", "帮忙", "请你", "麻烦", "实现", "开发", "编写", "修复",
-        "重构", "优化", "部署", "测试", "写一个", "搞一个", "做一个",
-        "创建", "生成", "分析", "调研", "设计", "搭建", "迁移",
-    ] {
-        if lower.contains(pat) {
-            return true;
-        }
-    }
-
-    // English task indicators.
-    for pat in [
-        "implement", "develop", "build", "create", "write a",
-        "fix the", "fix this", "refactor", "optimize", "deploy",
-        "set up", "migrate", "design", "analyze", "generate",
-        "please write", "please create", "please fix", "please implement",
-        "can you write", "can you create", "can you fix",
-        "i need you to", "i want you to",
-    ] {
-        if lower.contains(pat) {
-            return true;
-        }
-    }
-
-    false
-}
-
 /// Compute an MD5 hex digest of `text` (for content dedup, not security).
 fn compute_hash(text: &str) -> String {
     let hash = Md5::digest(text.as_bytes());
@@ -363,6 +324,7 @@ pub struct TaskQueueManager {
 
 type ChannelSendersMap = Arc<RwLock<HashMap<String, mpsc::Sender<OutboundMessage>>>>;
 static CHANNEL_SENDERS: OnceLock<ChannelSendersMap> = OnceLock::new();
+static TASK_QUEUE: OnceLock<Arc<TaskQueueManager>> = OnceLock::new();
 
 /// Install the channel senders map. Called once at gateway startup.
 /// Subsequent installs are silently ignored (idempotent).
@@ -370,6 +332,20 @@ pub fn install_channel_senders(senders: ChannelSendersMap) {
     if CHANNEL_SENDERS.set(senders).is_err() {
         warn!("task_queue: channel senders already installed, ignoring duplicate install");
     }
+}
+
+/// Install the global TaskQueueManager handle. Lets the agent runtime's
+/// `task` function-call tool submit new tasks without threading the
+/// manager Arc through every tool-dispatch surface.
+pub fn install_task_queue(manager: Arc<TaskQueueManager>) {
+    if TASK_QUEUE.set(manager).is_err() {
+        warn!("task_queue: manager already installed, ignoring duplicate install");
+    }
+}
+
+/// Get the installed TaskQueueManager Arc, if any.
+pub fn get_task_queue() -> Option<Arc<TaskQueueManager>> {
+    TASK_QUEUE.get().cloned()
 }
 
 /// Look up the outbound mpsc sender for a channel by name. Returns None if
