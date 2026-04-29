@@ -54,7 +54,9 @@ impl PluginRegistry {
         }
     }
 
-    pub fn get(&self, name: &str) -> Option<&Plugin> {
+    /// Look up a shell-bridge plugin by name. Returns None if no such plugin
+    /// is loaded or the plugin uses the wasm runtime.
+    pub fn get_shell(&self, name: &str) -> Option<&Plugin> {
         self.plugins.get(name)
     }
 
