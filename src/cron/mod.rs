@@ -2061,7 +2061,12 @@ async fn run_exec_command(
             }
         }
     } else {
-        Ok(raw_output)
+        // summarize=false: return full report if file was saved
+        if saved_files_content.is_empty() {
+            Ok(raw_output)
+        } else {
+            Ok(saved_files_content)
+        }
     }
 }
 
