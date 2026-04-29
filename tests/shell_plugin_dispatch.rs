@@ -91,3 +91,39 @@ async fn shell_plugin_notify_reaches_host() {
 
     plugin.shutdown().await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn shell_plugin_legacy_hook_call_still_works() {
+    let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/shell_plugin_echo");
+
+    let manifest = rsclaw::plugin::load_manifest(&fixtures_dir).expect("parse manifest");
+
+    let browser: Arc<Mutex<Option<rsclaw::browser::BrowserSession>>> =
+        Arc::new(Mutex::new(None));
+    let host_dispatch = Arc::new(
+        // No notify_tx — simulates the pre-bidirectional hook context where
+        // shell plugins were one-way callers only.
+        rsclaw::plugin::host_methods::HostMethodRegistry::new(None, browser),
+    );
+
+    let plugin = rsclaw::plugin::Plugin::spawn(manifest, host_dispatch)
+        .await
+        .expect("spawn plugin");
+
+    let result = plugin
+        .call(
+            "tool_call",
+            serde_json::json!({
+                "tool": "echo",
+                "args": { "msg": "legacy" },
+                "_ctx": {}
+            }),
+        )
+        .await
+        .expect("legacy call");
+
+    assert_eq!(result["echoed"]["msg"], "legacy");
+
+    plugin.shutdown().await;
+}
