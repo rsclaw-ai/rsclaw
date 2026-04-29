@@ -245,6 +245,10 @@ async fn handle_incoming(
         .as_i64()
         .ok_or_else(|| anyhow::anyhow!("plugin `{plugin_name}` message has no integer id"))?;
 
+    if id == 0 {
+        bail!("plugin `{plugin_name}` sent id=0, which is reserved");
+    }
+
     if id > 0 {
         // Host-initiated response.
         let mut map = pending.lock().await;
@@ -254,6 +258,7 @@ async fn handle_incoming(
             } else {
                 Ok(msg.get("result").cloned().unwrap_or(Value::Null))
             };
+            // receiver dropped if call() timed out — intentional best-effort
             let _ = tx.send(result);
         } else {
             warn!(
@@ -264,10 +269,7 @@ async fn handle_incoming(
         }
         Ok(())
     } else {
-        // Plugin-initiated request (id < 0). id == 0 is reserved.
-        if id == 0 {
-            bail!("plugin `{plugin_name}` sent id=0, which is reserved");
-        }
+        // Plugin-initiated request (id < 0).
         let method = msg["method"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("plugin `{plugin_name}` request id={id} has no method"))?
