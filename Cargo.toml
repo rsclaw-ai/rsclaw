@@ -120,6 +120,9 @@ lopdf = "0.34"
 glob = "0.3.3"
 encoding_rs = "0.8.35"
 
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["handleapi", "processthreadsapi", "winnt"] }
+
 [features]
 default = ["openclaw-migrate"]
 channel-matrix = ["dep:matrix-sdk"]
@@ -152,6 +155,3 @@ tokio-test = "0.4"
 tempfile   = "3"
 wiremock = "0.6"
 ctor = "0.4"
-
-[target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["handleapi", "processthreadsapi", "winnt"] }
