@@ -221,6 +221,17 @@ impl SlackChannel {
                         }
                         let user = event["user"].as_str().unwrap_or("").to_owned();
                         let mut text = event["text"].as_str().unwrap_or("").to_owned();
+                        // Slack intercepts a leading `/` as a native slash
+                        // command UI and never delivers it to the bot, so
+                        // rewrite a leading `\xxx` to `/xxx` as a Slack-only
+                        // alias. Users discover it from /help (which they
+                        // can't actually type, hence \help works as the
+                        // discovery escape hatch).
+                        if let Some(rest) = text.strip_prefix('\\') {
+                            if rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+                                text = format!("/{rest}");
+                            }
+                        }
                         let channel = event["channel"].as_str().unwrap_or("").to_owned();
                         let is_channel = event["channel_type"]
                             .as_str()
@@ -398,10 +409,29 @@ impl Channel for SlackChannel {
                 {
                     Ok(resp) if !resp.status().is_success() => {
                         let status = resp.status();
-                        warn!(idx, %status, "slack: files.upload failed");
+                        let body = resp.text().await.unwrap_or_default();
+                        warn!(idx, %status, "slack: files.upload http failed: {body}");
                     }
                     Err(e) => warn!(idx, "slack: files.upload request failed: {e}"),
-                    Ok(_) => {}
+                    Ok(resp) => {
+                        // Slack returns HTTP 200 with `ok: false` on logical
+                        // errors (invalid_auth, file_uploads_disabled, scope
+                        // missing, method_deprecated, ...). Without parsing
+                        // the body these failures vanished into the void —
+                        // user sees no image and the only log was that we
+                        // tried.
+                        let body = resp.text().await.unwrap_or_default();
+                        match serde_json::from_str::<Value>(&body) {
+                            Ok(v) if v.get("ok").and_then(|b| b.as_bool()) == Some(true) => {
+                                info!(idx, "slack: image uploaded");
+                            }
+                            Ok(v) => {
+                                let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("?");
+                                warn!(idx, error = %err, "slack: image upload api error: {body}");
+                            }
+                            Err(_) => warn!(idx, "slack: image upload non-json response: {body}"),
+                        }
+                    }
                 }
             }
 
@@ -444,10 +474,24 @@ impl Channel for SlackChannel {
                     Ok(resp) if !resp.status().is_success() => {
                         let status = resp.status();
                         let body = resp.text().await.unwrap_or_default();
-                        warn!(idx, %filename, %status, "slack: file upload failed: {body}");
+                        warn!(idx, %filename, %status, "slack: file upload http failed: {body}");
                     }
                     Err(e) => warn!(idx, %filename, "slack: file upload request failed: {e}"),
-                    Ok(_) => info!(idx, %filename, "slack: file sent"),
+                    Ok(resp) => {
+                        // Same logic as the image branch — Slack returns 200
+                        // with `ok: false` on permission/scope errors.
+                        let body = resp.text().await.unwrap_or_default();
+                        match serde_json::from_str::<Value>(&body) {
+                            Ok(v) if v.get("ok").and_then(|b| b.as_bool()) == Some(true) => {
+                                info!(idx, %filename, "slack: file sent");
+                            }
+                            Ok(v) => {
+                                let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("?");
+                                warn!(idx, %filename, error = %err, "slack: file upload api error: {body}");
+                            }
+                            Err(_) => warn!(idx, %filename, "slack: file upload non-json response: {body}"),
+                        }
+                    }
                 }
             }
             Ok(())
