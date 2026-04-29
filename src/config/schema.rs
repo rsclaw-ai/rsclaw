@@ -38,6 +38,12 @@ pub struct Config {
     pub memory_search: Option<MemorySearchConfig>,
     pub memory: Option<MemoryTopConfig>,
     pub mcp: Option<McpConfig>,
+    /// Per-registry overrides keyed by registry name (`iwencai`, `clawhub`,
+    /// `skillhub`, ...). Lets users put `apiKey`/`baseUrl` for paid skill
+    /// registries into rsclaw.json5 instead of shell rc — at startup any
+    /// resolved key is exported into the gateway process env so spawned
+    /// skill subprocesses (python CLIs etc.) inherit it transparently.
+    pub skill_registries: Option<std::collections::HashMap<String, SkillRegistryEntry>>,
 
     // --- OpenClaw-compatible sections ---
     pub wizard: Option<Value>,
@@ -1546,6 +1552,24 @@ pub struct SkillEntryConfig {
     pub enabled: Option<bool>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
+}
+
+// ---------------------------------------------------------------------------
+// skill_registries — per-registry credentials and overrides
+// ---------------------------------------------------------------------------
+
+/// Per-registry credential override. Both fields accept either a plain
+/// string (`"sk-..."`), `${VAR}` env expansion, or a `SecretRef` object.
+/// At gateway startup any resolved value is exported to the corresponding
+/// env var name from `defaults.toml` (e.g. `IWENCAI_API_KEY`,
+/// `IWENCAI_BASE_URL`) so spawned skill subprocesses inherit it without
+/// the user touching their shell rc.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRegistryEntry {
+    pub api_key: Option<SecretOrString>,
+    pub base_url: Option<SecretOrString>,
+    pub enabled: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------

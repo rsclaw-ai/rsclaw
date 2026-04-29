@@ -52,6 +52,13 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         crate::agent::evolution::EvolutionConfig::from_raw(config.ext.evolution.as_ref()),
     );
 
+    // 0b. Propagate skill-registry credentials from rsclaw.json5 into
+    //     process env. Spawned skill subprocesses (python CLIs etc.)
+    //     inherit env, so this is the bridge that lets users keep keys
+    //     in the config file instead of shell rc / launchctl. Done here,
+    //     pre-runtime, while the process is still single-threaded.
+    propagate_skill_registry_env(&config);
+
     // 1. Resolve data directory — respects RSCLAW_BASE_DIR for --dev/--profile.
     let base_dir = crate::config::loader::base_dir();
     let data_dir = base_dir.join("var/data");
@@ -837,6 +844,47 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
+/// Map a registry name to the env vars it cares about: `(api_key_var,
+/// base_url_var)`. Hard-coded here because the env name is part of each
+/// registry's published contract — we don't want users renaming their
+/// existing env vars by editing defaults.toml.
+fn registry_env_names(name: &str) -> Option<(&'static str, &'static str)> {
+    match name {
+        "iwencai" => Some(("IWENCAI_API_KEY", "IWENCAI_BASE_URL")),
+        // Future registries with paid keys go here.
+        _ => None,
+    }
+}
+
+/// Read `skill_registries.<name>.{apiKey,baseUrl}` from the resolved
+/// config and export each non-empty value to the corresponding env var.
+/// SAFETY: called once during single-threaded gateway startup, before any
+/// async runtime tasks spawn — matches the existing precedent in
+/// `apply_proxy_env`.
+fn propagate_skill_registry_env(config: &RuntimeConfig) {
+    let Some(map) = config.raw.skill_registries.as_ref() else { return };
+    for (name, entry) in map {
+        let Some((api_key_var, base_url_var)) = registry_env_names(name) else { continue };
+        if let Some(key_field) = entry.api_key.as_ref() {
+            if let Some(val) = key_field.resolve_early().filter(|s| !s.is_empty()) {
+                if std::env::var(api_key_var).is_err() {
+                    // SAFETY: pre-async-runtime, single-threaded.
+                    unsafe { std::env::set_var(api_key_var, &val) };
+                    info!(registry = %name, env = api_key_var, "exported registry api key to env");
+                }
+            }
+        }
+        if let Some(url_field) = entry.base_url.as_ref() {
+            if let Some(val) = url_field.resolve_early().filter(|s| !s.is_empty()) {
+                if std::env::var(base_url_var).is_err() {
+                    unsafe { std::env::set_var(base_url_var, &val) };
+                    info!(registry = %name, env = base_url_var, "exported registry base url to env");
+                }
+            }
+        }
+    }
+}
+
 fn spawn_agent_tasks(
     receivers: HashMap<String, mpsc::Receiver<AgentMessage>>,
     registry: Arc<AgentRegistry>,

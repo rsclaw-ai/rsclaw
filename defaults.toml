@@ -322,6 +322,22 @@ download_url = "https://api.skillhub.cn/api/v1/skills/{slug}/files"
 index_url    = "https://api.skillhub.cn/api/skills?pageSize=200"
 primary_download_url = "https://api.skillhub.cn/api/v1/skills"
 
+# 同花顺 iWenCai 金融技能库 (curated finance/quant skills).
+# Endpoints filled in once iwencai publishes the public API contract.
+# `base_url` is overridable via IWENCAI_BASE_URL env var; the API key
+# itself never lives in defaults.toml — it's read from IWENCAI_API_KEY
+# at request time (matches the [[providers]] env_var pattern).
+[skill_registries.iwencai]
+label                = "iWenCai SkillHub (同花顺金融技能库)"
+list_url             = "http://ms.10jqka.com.cn/gateway/market/api/v1/skills/square"
+install_url_template = "http://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name={slug}"
+# `IWENCAI_BASE_URL` env can rebase scheme+host of both URLs above (path
+# kept). API key is per-skill at runtime — read from `IWENCAI_API_KEY` env
+# by the installed skill itself, not the registry adapter.
+base_url_env         = "IWENCAI_BASE_URL"
+env_var              = "IWENCAI_API_KEY"
+needs_key            = false
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Exec Safety Rules
 # ──────────────────────────────────────────────────────────────────────────────
