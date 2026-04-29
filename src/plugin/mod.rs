@@ -14,6 +14,7 @@
 //!   - `WasmPlugin`     — live WASM plugin handle (wasmtime)
 //!   - `load_all_plugins()` — unified loader that dispatches by runtime
 
+pub mod host_methods;
 pub mod manifest;
 pub mod shell_bridge;
 pub mod slots;
