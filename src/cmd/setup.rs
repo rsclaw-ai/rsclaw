@@ -134,6 +134,7 @@ fn confirm_step(prompt: &str, default: bool) -> StepResult<bool> {
 
 fn default_config(lang: &str) -> String {
     let lang_name = lang_code_to_name(lang);
+    let auth_token = generate_auth_token();
     format!(
         r#"// rsclaw configuration (JSON5)
 // Docs: https://github.com/rsclaw-ai/rsclaw
@@ -142,6 +143,7 @@ fn default_config(lang: &str) -> String {
     port: 18888,
     bind: "loopback",
     language: "{lang_name}",
+    auth: {{ token: "{auth_token}" }},
   }},
   models: {{
     providers: {{
@@ -209,6 +211,7 @@ fn default_config(lang: &str) -> String {
 }}
 "#,
         lang_name = lang_name,
+        auth_token = auth_token,
         model_download_url = r#"// modelDownloadUrl: "https://gitfast.org/tools/models/bge-small-zh-v1.5.zip","#,
     )
 }
@@ -630,13 +633,21 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         return cmd_onboard(OnboardArgs::default()).await;
     }
 
-    // Non-interactive: create directory structure and empty config, then exit.
+    // Non-interactive: create directory structure and minimal config with
+    // an auto-generated gateway.auth.token, then exit. Without the token,
+    // every WS/REST client would land on an unauthenticated gateway —
+    // we'd rather generate one and let the user rotate it than ship an
+    // open one by default.
     if args.non_interactive {
         let base = crate::config::loader::base_dir();
         std::fs::create_dir_all(&base)?;
         let config_path = base.join("rsclaw.json5");
         if !config_path.exists() {
-            std::fs::write(&config_path, "{}\n")?;
+            let token = generate_auth_token();
+            let body = format!(
+                "{{\n  gateway: {{\n    auth: {{ token: \"{token}\" }},\n  }},\n}}\n"
+            );
+            std::fs::write(&config_path, body)?;
         }
         for dir in &[
             "var/data/redb", "var/data/search", "var/data/memory", "var/data/cron",
