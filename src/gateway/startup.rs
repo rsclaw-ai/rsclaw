@@ -1322,8 +1322,14 @@ fn pid_alive(pid: u32) -> bool {
     {
         // kill(pid, 0) returns 0 if the process exists (any state, incl
         // zombie); ESRCH means no such process. EPERM means it exists but
-        // we can't signal it — still alive.
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 || *libc::__error() == libc::EPERM }
+        // we can't signal it — still alive. Use std's portable errno read
+        // (libc::__error is macOS, __errno_location is Linux — std hides
+        // the difference).
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if rc == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
     #[cfg(windows)]
     {
