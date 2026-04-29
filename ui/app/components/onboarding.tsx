@@ -852,6 +852,10 @@ export const MODELS: Record<string, ModelDef[]> = {
     { id: "llama3.2:3b", tag: "\u5DF2\u5B89\u88C5", tagEn: "Installed", rec: true },
     { id: "qwen2.5:7b", tag: "\u5DF2\u5B89\u88C5", tagEn: "Installed", rec: false },
   ],
+  minimax: [
+    { id: "MiniMax-M2.7", tag: "\u6700\u65B0", tagEn: "Latest", rec: true },
+    { id: "MiniMax-M2.5", tag: "\u63A8\u8350", tagEn: "Recommended", rec: false },
+  ],
 };
 
 export interface ChannelDef {

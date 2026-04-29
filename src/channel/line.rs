@@ -300,7 +300,16 @@ impl Channel for LineChannel {
                 min_chars: 1,
                 break_preference: BreakPreference::Paragraph,
             };
+            // LINE rejects pushes with empty `messages[0].text` (400
+            // "May not be empty"). Tool-call notifications and other
+            // status pings sometimes flow through here with whitespace-
+            // only or empty text — guard the chunk loop so we only push
+            // chunks that actually have non-whitespace content. Images
+            // / files below run regardless.
             for chunk in &chunk_text(&msg.text, &cfg) {
+                if chunk.trim().is_empty() {
+                    continue;
+                }
                 self.send_push(&msg.target_id, chunk).await?;
             }
 
