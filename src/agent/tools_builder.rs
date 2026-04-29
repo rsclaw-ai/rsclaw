@@ -51,14 +51,21 @@ pub(crate) fn build_shell_tool_defs(plugins: &PluginRegistry) -> Vec<ToolDef> {
         .collect()
 }
 
-/// Build a system-prompt section that lists installed WASM plugins. Helps
-/// the model decide *to use* the plugin instead of falling back to a
-/// generic browser-automation flow.
-pub(crate) fn build_plugins_system(plugins: &[WasmPlugin]) -> Option<String> {
-    if plugins.is_empty() {
+/// Build a system-prompt section that lists installed plugins (wasm + shell).
+/// Helps the model decide *to use* the plugin instead of falling back to a
+/// generic browser-automation flow. Sorted by name for byte-stable output.
+pub(crate) fn build_plugins_system(
+    wasm_plugins: &[WasmPlugin],
+    shell_plugins: Option<&PluginRegistry>,
+) -> Option<String> {
+    let no_shell = shell_plugins
+        .map(|r| r.shell_plugins_iter().next().is_none())
+        .unwrap_or(true);
+    if wasm_plugins.is_empty() && no_shell {
         return None;
     }
-    let blocks: Vec<String> = plugins
+
+    let mut blocks: Vec<(String, String)> = wasm_plugins
         .iter()
         .map(|p| {
             let tools_lines: Vec<String> = p
@@ -66,15 +73,45 @@ pub(crate) fn build_plugins_system(plugins: &[WasmPlugin]) -> Option<String> {
                 .iter()
                 .map(|t| format!("  - {}.{}: {}", p.name, t.name, t.description))
                 .collect();
-            format!(
-                "<plugin name=\"{}\" version=\"{}\">\n{}\n\nTools:\n{}\n</plugin>",
-                p.name,
-                p.version.as_deref().unwrap_or(""),
-                p.description.as_deref().unwrap_or(""),
-                tools_lines.join("\n"),
+            (
+                p.name.clone(),
+                format!(
+                    "<plugin name=\"{}\" version=\"{}\">\n{}\n\nTools:\n{}\n</plugin>",
+                    p.name,
+                    p.version.as_deref().unwrap_or(""),
+                    p.description.as_deref().unwrap_or(""),
+                    tools_lines.join("\n"),
+                ),
             )
         })
         .collect();
+
+    if let Some(reg) = shell_plugins {
+        for (plugin_name, plugin) in reg.shell_plugins_iter() {
+            let tools_lines: Vec<String> = plugin
+                .manifest
+                .tools
+                .iter()
+                .map(|t| format!("  - {}.{}: {}", plugin_name, t.name, t.description))
+                .collect();
+            blocks.push((
+                plugin_name.clone(),
+                format!(
+                    "<plugin name=\"{}\" version=\"{}\">\n{}\n\nTools:\n{}\n</plugin>",
+                    plugin_name,
+                    plugin.manifest.version.as_deref().unwrap_or(""),
+                    plugin.manifest.description.as_deref().unwrap_or(""),
+                    tools_lines.join("\n"),
+                ),
+            ));
+        }
+    }
+
+    // Sort by name for byte-stable output (HashMap iteration order is
+    // nondeterministic; this matters because the system prompt feeds the
+    // LLM's KV cache, and unstable ordering invalidates the cache).
+    blocks.sort_by(|a, b| a.0.cmp(&b.0));
+    let blocks_text: Vec<String> = blocks.into_iter().map(|(_, b)| b).collect();
 
     Some(format!(
         "## Installed Plugins\n\
@@ -83,7 +120,7 @@ pub(crate) fn build_plugins_system(plugins: &[WasmPlugin]) -> Option<String> {
          it over a generic browser-automation flow.\n\
          Priority: plugins > skills > built-in tools.\n\n\
          {}",
-        blocks.join("\n\n"),
+        blocks_text.join("\n\n"),
     ))
 }
 

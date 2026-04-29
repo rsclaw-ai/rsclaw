@@ -2548,10 +2548,11 @@ impl AgentRuntime {
         // rebuild (handled by invalidate_plugins_skills_cache()).
 
         // Build/cache plugins system message.
-        // TODO: populate from self.plugins when plugin system is merged.
         if self.cached_plugins_system.is_none() {
-            self.cached_plugins_system =
-                super::tools_builder::build_plugins_system(&self.wasm_plugins);
+            self.cached_plugins_system = super::tools_builder::build_plugins_system(
+                &self.wasm_plugins,
+                self.plugins.as_deref(),
+            );
         }
 
         // Build/cache skills system message.
