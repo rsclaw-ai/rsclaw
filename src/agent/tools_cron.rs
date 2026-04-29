@@ -288,6 +288,34 @@ impl super::runtime::AgentRuntime {
 
                 Ok(json!({"removed": removed_job}))
             }
+            "get" => {
+                // Query a specific job by ID or index
+                let jobs = read_cron_jobs(&cron_path).await;
+
+                let job = if let Some(index) = args["index"].as_u64() {
+                    let idx = index as usize;
+                    if idx == 0 || idx > jobs.len() {
+                        return Err(anyhow!(
+                            "cron get: invalid index {} (valid: 1-{})",
+                            index,
+                            jobs.len()
+                        ));
+                    }
+                    &jobs[idx - 1]
+                } else if let Some(id) = args["id"].as_str() {
+                    match jobs.iter().find(|j| j["id"].as_str() == Some(id)) {
+                        Some(j) => j,
+                        None => return Err(anyhow!("cron get: job not found with id={}", id)),
+                    }
+                } else {
+                    return Err(anyhow!(
+                        "cron get: `index` or `id` required"
+                    ));
+                };
+
+                // Return the full job config as JSON
+                Ok(job.clone())
+            }
             "enable" | "disable" => {
                 let enabled = action == "enable";
                 let mut jobs = read_cron_jobs(&cron_path).await;
@@ -439,7 +467,7 @@ impl super::runtime::AgentRuntime {
                 Ok(json!({"edited": id}))
             }
             other => Err(anyhow!(
-                "cron: unsupported action `{other}` (list, add, edit, remove, enable, disable)"
+                "cron: unsupported action `{other}` (list, get, add, edit, remove, enable, disable)"
             )),
         }
     }
@@ -460,13 +488,12 @@ pub(crate) fn format_cron_jobs(jobs: &[Value]) -> String {
     if jobs.is_empty() {
         return "No cron jobs configured.".to_owned();
     }
-    let mut lines = vec!["Cron jobs:".to_owned()];
+    let mut lines = vec![format!("Cron jobs ({}):", jobs.len())];
     for (i, job) in jobs.iter().enumerate() {
         let id = job.get("id").and_then(|v| v.as_str()).unwrap_or("?");
         let enabled = job.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
-        let status = if enabled { "" } else { " (disabled)" };
-        let agent = job.get("agentId").and_then(|v| v.as_str()).unwrap_or("main");
-        let name = job.get("name").and_then(|v| v.as_str());
+        let status = if enabled { "" } else { " (off)" };
+        let name = job.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
         let schedule = match job.get("schedule") {
             Some(s) if s.is_object() => {
                 if let Some(expr) = s.get("expr").and_then(|v| v.as_str()) {
@@ -474,39 +501,15 @@ pub(crate) fn format_cron_jobs(jobs: &[Value]) -> String {
                 } else if let Some(at) = s.get("atMs").and_then(|v| v.as_u64()) {
                     format!("once@{at}")
                 } else {
-                    s.to_string()
+                    s.get("kind").and_then(|v| v.as_str()).unwrap_or("?").to_owned()
                 }
             }
             Some(s) if s.is_string() => s.as_str().unwrap_or("?").to_owned(),
             _ => "?".to_owned(),
         };
-        let message = job
-            .get("payload")
-            .and_then(|p| p.get("text").or_else(|| p.get("message")).or_else(|| p.get("kind")))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let msg_preview = if message.chars().count() > 50 {
-            let end = message
-                .char_indices()
-                .nth(47)
-                .map(|(idx, _)| idx)
-                .unwrap_or(message.len());
-            format!("{}...", &message[..end])
-        } else {
-            message.to_owned()
-        };
-        let label = name.map(|n| format!(" {n}")).unwrap_or_default();
-        lines.push(format!(
-            "  #{} [{}] {} -> {}{} \"{}\"{}",
-            i + 1,
-            id,
-            schedule,
-            agent,
-            label,
-            msg_preview,
-            status
-        ));
+        lines.push(format!("  #{} {}{} [{}]{}", i + 1, schedule, name, id, status));
     }
+    lines.push("\nUse /cron remove <id> to delete a job.".to_owned());
     lines.join("\n")
 }
 
