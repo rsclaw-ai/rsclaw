@@ -482,7 +482,7 @@ pub(crate) fn format_cron_jobs(jobs: &[Value]) -> String {
         };
         let message = job
             .get("payload")
-            .and_then(|p| p.get("text"))
+            .and_then(|p| p.get("text").or_else(|| p.get("message")).or_else(|| p.get("kind")))
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let msg_preview = if message.chars().count() > 50 {
