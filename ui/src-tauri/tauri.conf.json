@@ -4,7 +4,7 @@
   "version": "2026.4.28",
   "identifier": "ai.rsclaw.app",
   "build": {
-    "beforeBuildCommand": "yarn export && bash ../../scripts/fetch-bundled-model.sh",
+    "beforeBuildCommand": "yarn export && node ../scripts/fetch-bundled-model.mjs",
     "beforeDevCommand": "yarn export:dev",
     "devUrl": "http://localhost:3000",
     "frontendDist": "../out"
