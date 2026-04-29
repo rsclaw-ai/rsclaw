@@ -439,6 +439,10 @@ pub struct CronRunner {
     /// loop exits at the next iteration without firing further jobs. Tests
     /// that don't care about graceful shutdown can pass `None`.
     shutdown: Option<crate::gateway::ShutdownCoordinator>,
+    /// If true, the cron.json5 file failed to parse. Skip initial save to
+    /// avoid wiping user's config. The runner will still operate with an
+    /// empty job list, but won't overwrite the corrupted file.
+    skip_initial_save: bool,
 }
 
 impl CronRunner {
@@ -454,15 +458,20 @@ impl CronRunner {
         ws_conns: Arc<crate::ws::ConnRegistry>,
     ) -> Self {
         Self::new_with_shutdown(
-            config, jobs, agents, channels, data_dir, reload_tx, ws_conns, None,
+            config, jobs, false, agents, channels, data_dir, reload_tx, ws_conns, None,
         )
     }
 
     /// Construct a new cron runner with an explicit shutdown coordinator.
     /// The runtime uses this constructor; tests typically use [`new`].
+    ///
+    /// # Arguments
+    /// * `skip_initial_save` - If true, skip persisting the initial job list.
+    ///   Set to true when cron.json5 failed to parse, to avoid wiping user's config.
     pub fn new_with_shutdown(
         config: &CronConfig,
         jobs: Vec<CronJob>,
+        skip_initial_save: bool,
         agents: Arc<AgentRegistry>,
         channels: Arc<ChannelManager>,
         data_dir: PathBuf,
@@ -492,6 +501,7 @@ impl CronRunner {
             reload_tx,
             ws_conns,
             shutdown,
+            skip_initial_save,
         }
     }
 
@@ -552,9 +562,13 @@ impl CronRunner {
             );
         }
 
-        // Persist initial state
-        if let Err(e) = self.save_store(&jobs).await {
-            warn!(err = %e, "cron: failed to save initial store");
+        // Persist initial state (skip if file failed to parse - don't wipe user's config)
+        if !self.skip_initial_save {
+            if let Err(e) = self.save_store(&jobs).await {
+                warn!(err = %e, "cron: failed to save initial store");
+            }
+        } else {
+            warn!("cron: skipping initial save due to parse failure - fix cron.json5 syntax errors and restart");
         }
 
         let enabled_count = jobs.iter().filter(|j| j.enabled).count();
@@ -726,7 +740,7 @@ impl CronRunner {
             if reload_triggered {
                 // Reload jobs from file
                 let old_count = jobs.len();
-                let new_jobs = crate::cron::load_cron_jobs();
+                let (new_jobs, _) = crate::cron::load_cron_jobs();
                 let file_count = new_jobs.len();
 
                 // Debug: check if disabled job is in new_jobs
@@ -1369,6 +1383,7 @@ impl Clone for CronRunner {
             reload_tx: self.reload_tx.clone(),
             ws_conns: Arc::clone(&self.ws_conns),
             shutdown: self.shutdown.clone(),
+            skip_initial_save: self.skip_initial_save,
         }
     }
 }
@@ -2056,8 +2071,9 @@ pub fn resolve_cron_store_path() -> PathBuf {
 
 /// Load cron jobs from the cron store file.
 /// Auto-migrates legacy `cron/jobs.json` to `cron.json5` if needed.
-/// Returns an empty list if no file exists.
-pub fn load_cron_jobs() -> Vec<CronJob> {
+/// Returns a tuple of (jobs, parse_success). If the file exists but fails to
+/// parse, returns (empty_vec, false) so callers know NOT to overwrite the file.
+pub fn load_cron_jobs() -> (Vec<CronJob>, bool) {
     let source = resolve_cron_store_path();
 
     // Auto-migrate legacy cron/jobs.json -> cron.json5
@@ -2081,15 +2097,26 @@ pub fn load_cron_jobs() -> Vec<CronJob> {
     }
 
     if !source.exists() {
-        return Vec::new();
+        return (Vec::new(), true); // No file = success, empty list is valid
     }
 
     let raw = match std::fs::read_to_string(&source) {
         Ok(raw) => raw,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), true), // Can't read = treat as no file
     };
 
-    let parsed: serde_json::Value = json5::from_str(&raw).or_else(|_| serde_json::from_str(&raw)).unwrap_or_default();
+    // Empty file is valid (no jobs)
+    if raw.trim().is_empty() {
+        return (Vec::new(), true);
+    }
+
+    let parsed_result: Result<serde_json::Value, _> = json5::from_str(&raw).or_else(|_| serde_json::from_str(&raw));
+    if parsed_result.is_err() {
+        // File exists with content but failed to parse - DO NOT overwrite!
+        warn!(file = %source.display(), "cron.json5 parse failed - keeping original file, fix syntax errors manually");
+        return (Vec::new(), false);
+    }
+    let parsed = parsed_result.unwrap();
 
     let jobs_array = if let Some(arr) = parsed.get("jobs").and_then(|v| v.as_array()) {
         arr.clone()
@@ -2111,11 +2138,14 @@ pub fn load_cron_jobs() -> Vec<CronJob> {
         })
         .collect();
     let loaded = jobs.len();
+    // If any job failed to parse, return false so the file won't be overwritten
+    // (we'd lose the unparsable jobs that user needs to fix manually)
     if loaded < total {
-        warn!(file = %source.display(), total, loaded, "some cron jobs failed to parse");
+        warn!(file = %source.display(), total, loaded, "some cron jobs have invalid fields - keeping original file, fix errors manually");
+        return (jobs, false);
     }
 
-    jobs
+    (jobs, true)
 }
 
 /// Save cron jobs to the cron store file (openclaw-compatible path).
