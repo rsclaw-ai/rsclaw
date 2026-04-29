@@ -303,10 +303,22 @@ impl AgentRuntime {
                         if let Some(ref ntx) = notification_tx {
                             let target = if !chat_id.is_empty() { chat_id } else { peer_id };
                             if !target.is_empty() && !channel.is_empty() && channel != "system" && channel != "cron" {
+                                // For ws/desktop, tag with kind so UI can
+                                // badge the bubble as "[任务完成]". Other
+                                // channels (telegram/feishu/...) get plain
+                                // text — they don't render badges anyway.
+                                let body = if channel == "ws" || channel == "desktop" {
+                                    crate::channel::outbound_with_kind(
+                                        crate::channel::outbound_kind::TASK_COMPLETE,
+                                        reply.text,
+                                    )
+                                } else {
+                                    reply.text
+                                };
                                 let _ = ntx.send(crate::channel::OutboundMessage {
                                     target_id: target,
                                     is_group: false,
-                                    text: reply.text,
+                                    text: body,
                                     reply_to: None,
                                     images: reply.images.clone(),
                                     files: reply.files.clone(),
@@ -421,10 +433,18 @@ impl AgentRuntime {
                     if let Some(ref ntx) = notification_tx {
                         let target = if !chat_id.is_empty() { chat_id } else { peer_id };
                         if !target.is_empty() && !channel.is_empty() && channel != "system" && channel != "cron" {
+                            let body = if channel == "ws" || channel == "desktop" {
+                                crate::channel::outbound_with_kind(
+                                    crate::channel::outbound_kind::ASYNC_SEND,
+                                    reply.text,
+                                )
+                            } else {
+                                reply.text
+                            };
                             let _ = ntx.send(crate::channel::OutboundMessage {
                                 target_id: target,
                                 is_group: false,
-                                text: reply.text,
+                                text: body,
                                 reply_to: None,
                                 images: reply.images.clone(),
                                 files: reply.files.clone(),

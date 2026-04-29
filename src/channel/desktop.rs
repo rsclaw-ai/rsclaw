@@ -32,14 +32,44 @@ impl Channel for DesktopChannel {
 
     fn send(&self, msg: OutboundMessage) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            let payload = serde_json::json!({
+            // Detect optional kind marker. Other channel impls don't see this
+            // because routing only sends desktop-targeted messages here. The
+            // marker is a structural prefix the sender embeds when the
+            // notification represents a non-conversational event (async
+            // /task completion, async /send delivery) so the UI can badge
+            // it visually instead of confusing the user with a duplicate
+            // chat-style bubble.
+            const KIND_PREFIX: &str = "\u{e000}rsclaw:kind=";
+            const KIND_PAYLOAD_SEP: char = '\u{e001}';
+            let (kind, body) = if let Some(rest) = msg.text.strip_prefix(KIND_PREFIX) {
+                if let Some(sep_idx) = rest.find(KIND_PAYLOAD_SEP) {
+                    let (k, b) = rest.split_at(sep_idx);
+                    (Some(k.to_owned()), b[KIND_PAYLOAD_SEP.len_utf8()..].to_owned())
+                } else {
+                    (None, msg.text.clone())
+                }
+            } else {
+                (None, msg.text.clone())
+            };
+
+            let mut payload = serde_json::json!({
                 "type": "notification",
                 "channel": "desktop",
                 "to": msg.target_id,
-                "text": msg.text,
+                "text": body,
             });
+            if let Some(k) = kind.as_ref() {
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("kind".to_string(), serde_json::Value::String(k.clone()));
+                }
+            }
             let frame = EventFrame::new("notification", payload, 0);
-            debug!(target_id = %msg.target_id, text_len = msg.text.len(), "desktop: broadcasting notification");
+            debug!(
+                target_id = %msg.target_id,
+                text_len = msg.text.len(),
+                kind = ?kind,
+                "desktop: broadcasting notification"
+            );
             self.conns.broadcast_all(frame).await;
             Ok(())
         })

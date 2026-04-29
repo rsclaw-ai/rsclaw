@@ -67,6 +67,25 @@ use crate::{
 // OutboundMessage
 // ---------------------------------------------------------------------------
 
+/// Build a desktop-only notification text annotated with a kind tag.
+///
+/// The desktop channel detects the prefix and lifts `kind` into the
+/// notification payload so the UI can render the bubble with a badge
+/// (e.g. `[任务完成]`). Other channel impls never see the prefix because
+/// routing only sends desktop-targeted messages to `DesktopChannel`.
+///
+/// Use the kind constants in [`outbound_kind`] for known values.
+pub fn outbound_with_kind(kind: &str, text: impl Into<String>) -> String {
+    format!("\u{e000}rsclaw:kind={kind}\u{e001}{}", text.into())
+}
+
+/// Known kind tags for [`outbound_with_kind`]. Keep in sync with the desktop
+/// UI's notification renderer.
+pub mod outbound_kind {
+    pub const TASK_COMPLETE: &str = "task_complete";
+    pub const ASYNC_SEND: &str = "async_send";
+}
+
 /// A reply message ready to be sent to a channel.
 #[derive(Debug, Clone, Default)]
 pub struct OutboundMessage {
