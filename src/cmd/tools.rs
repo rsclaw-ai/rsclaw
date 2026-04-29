@@ -22,7 +22,10 @@ struct ToolDef {
     name: &'static str,
     display: &'static str,
     detect_cmd: &'static [&'static str],
-    local_bin: &'static str, // relative to tools_dir(), e.g. "chromium/chrome"
+    local_bin: &'static str, // relative to tools_dir(), e.g. "chrome/chrome"
+    /// Optional tools are still listed by `tools status` but excluded from
+    /// the missing/required tally (no warn from `rsclaw doctor`).
+    optional: bool,
 }
 
 const TOOLS: &[ToolDef] = &[
@@ -31,42 +34,49 @@ const TOOLS: &[ToolDef] = &[
         display: "Chrome for Testing (browser automation)",
         detect_cmd: &["google-chrome", "chromium", "chromium-browser", "chrome"],
         local_bin: "chrome",
+        optional: false,
     },
     ToolDef {
         name: "ffmpeg",
         display: "ffmpeg (audio/video processing)",
         detect_cmd: &["ffmpeg"],
         local_bin: "ffmpeg",
+        optional: false,
     },
     ToolDef {
         name: "node",
         display: "Node.js (plugin runtime)",
         detect_cmd: &["node"],
         local_bin: "node",
+        optional: false,
     },
     ToolDef {
         name: "python",
         display: "Python 3 (skill/plugin runtime)",
         detect_cmd: &["python3", "python"],
         local_bin: "python",
+        optional: false,
     },
     ToolDef {
         name: "sherpa-onnx",
         display: "sherpa-onnx (STT + TTS engine)",
         detect_cmd: &["sherpa-onnx-offline-tts", "sherpa-onnx-offline", "sherpa-onnx"],
         local_bin: "sherpa-onnx",
+        optional: false,
     },
     ToolDef {
         name: "opencode",
         display: "OpenCode (AI coding agent)",
         detect_cmd: &["opencode"],
         local_bin: "opencode",
+        optional: false,
     },
     ToolDef {
         name: "claude-code",
-        display: "Claude Code (AI coding agent)",
+        display: "Claude Code (AI coding agent, optional)",
         detect_cmd: &["claude"],
         local_bin: "claude-code",
+        optional: true,
     },
 ];
 
@@ -110,27 +120,39 @@ fn tool_status(def: &ToolDef) -> &'static str {
 // Public: tools summary for `rsclaw status`
 // ---------------------------------------------------------------------------
 
-/// Returns a one-line tools summary, e.g. "chromium ✓  ffmpeg ✓  node ✓  python ✓  sherpa-onnx ✗"
+/// Returns a one-line tools summary, e.g. "chrome ✓  ffmpeg ✓  node ✓  python ✓  sherpa-onnx ✗"
+/// Optional tools that are missing render as "·" so they don't look like a failure.
 pub fn tools_summary_line() -> String {
     TOOLS
         .iter()
         .map(|def| {
-            let icon = if tool_status(def) == "missing" { "✗" } else { "✓" };
+            let status = tool_status(def);
+            let icon = match (status, def.optional) {
+                ("missing", true) => "·",
+                ("missing", false) => "✗",
+                _ => "✓",
+            };
             format!("{} {}", def.name, icon)
         })
         .collect::<Vec<_>>()
         .join("  ")
 }
 
-/// Returns count of (available, total) tools
+/// Returns count of (available, required-total) tools — optional tools are
+/// excluded from the denominator so a missing optional never trips a warn.
 pub fn tools_count() -> (usize, usize) {
-    let available = TOOLS.iter().filter(|d| tool_status(d) != "missing").count();
-    (available, TOOLS.len())
+    let required = TOOLS.iter().filter(|d| !d.optional);
+    let total = required.clone().count();
+    let available = required.filter(|d| tool_status(d) != "missing").count();
+    (available, total)
 }
 
-/// Returns names of missing tools
+/// Returns names of missing required tools (optional tools never reported missing).
 pub fn tools_missing() -> Vec<&'static str> {
-    TOOLS.iter().filter(|d| tool_status(d) == "missing").map(|d| d.name).collect()
+    TOOLS.iter()
+        .filter(|d| !d.optional && tool_status(d) == "missing")
+        .map(|d| d.name)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -181,16 +203,17 @@ fn cmd_status() {
 
     for def in TOOLS {
         let status = tool_status(def);
-        let (icon, label) = match status {
-            "system" => (green("✓"), green("system PATH")),
-            "installed" => (green("✓"), cyan("~/.rsclaw/tools")),
+        let (icon, label) = match (status, def.optional) {
+            ("system", _) => (green("✓"), green("system PATH")),
+            ("installed", _) => (green("✓"), cyan("~/.rsclaw/tools")),
+            ("missing", true) => (dim("·"), dim("not installed (optional)")),
             _ => (red("✗"), red("not found")),
         };
         println!("  {} {:<14} {}  {}", icon, bold(def.name), label, dim(def.display));
     }
 
-    // Check if any missing
-    let missing: Vec<_> = TOOLS.iter().filter(|d| tool_status(d) == "missing").collect();
+    // Hint only when REQUIRED tools are missing (optional ones never warn).
+    let missing: Vec<&str> = tools_missing();
     if !missing.is_empty() {
         println!();
         println!(
@@ -386,7 +409,7 @@ fn resolve_download_url(
     let section = manifest.get(&manifest_key).or_else(|| manifest.get(tool))?;
 
     match tool {
-        "chrome" | "chromium" => {
+        "chrome" => {
             let ver = section.get("version")?.as_str()?;
             let filename = match platform {
                 "linux-x64" => "chrome-linux64.zip",

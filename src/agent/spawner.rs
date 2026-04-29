@@ -151,6 +151,7 @@ impl AgentSpawner {
                     session_key,
                     text,
                     channel,
+                    account: _,
                     peer_id,
                     reply_tx,
                     extra_tools,

@@ -105,6 +105,12 @@ pub struct OutboundMessage {
     /// Channel name to use for sending (e.g., "feishu", "telegram").
     /// Used by background tasks (opencode, claudecode) to route notifications.
     pub channel: Option<String>,
+    /// Multi-account routing tag — which account in this channel received
+    /// the inbound message that produced this reply. Set by inbound parsers
+    /// that support multiple credentials (e.g. feishu accounts.<name>) so
+    /// the outbound dispatcher can send via the same account's API token.
+    /// `None` = single-account / bare `{channel}` lookup.
+    pub account: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

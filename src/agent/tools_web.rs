@@ -101,18 +101,20 @@ impl AgentRuntime {
             "SERPER_API_KEY",
         );
 
-        // Auto-detect provider: explicit arg > config default > keyed provider >
-        // DuckDuckGo
+        // Auto-detect provider priority:
+        //   explicit arg > config default
+        //   > serper > google(+cx) > brave > bing
+        //   > free scraping (bing-free; later expanded to parallel pair)
         let chosen = if !provider.is_empty() {
             provider.to_owned()
         } else if let Some(default) = ws_cfg.and_then(|c| c.provider.as_deref()) {
             default.to_owned()
         } else if serper_key.is_some() {
             "serper".to_owned()
-        } else if brave_key.is_some() {
-            "brave".to_owned()
         } else if google_key.is_some() && google_cx.is_some() {
             "google".to_owned()
+        } else if brave_key.is_some() {
+            "brave".to_owned()
         } else if bing_key.is_some() {
             "bing".to_owned()
         } else {
@@ -400,8 +402,8 @@ impl AgentRuntime {
         // --- Multi-provider parallel merge (free providers only) ---
         // When no API key is configured (free scraping mode), run 2 providers
         // concurrently for better coverage. Provider pair selected by language:
-        //   zh → random 2 from [bing-free, baidu, sogou, 360]
-        //   other → bing-free + duckduckgo
+        //   zh → random 2 from [bing-free, baidu-free, sogou-free]
+        //   other → bing-free + duckduckgo-free
         let free_providers = ["duckduckgo-free", "bing-free", "baidu-free", "sogou-free"];
         let is_free_mode = free_providers.contains(&chosen.as_str());
         if is_free_mode {
@@ -412,7 +414,8 @@ impl AgentRuntime {
                 || std::env::var("LANG").unwrap_or_default().to_lowercase().contains("zh");
 
             let pair: [&str; 2] = if is_zh {
-                // Chinese: random 2 from 4 free Chinese-friendly providers.
+                // Chinese: random 2 from 3 free Chinese-friendly providers
+                // (360 excluded — quality too low to merge usefully).
                 #[allow(clippy::useless_vec)]
                 let mut pool = vec!["bing-free", "baidu-free", "sogou-free"];
                 use rand::seq::SliceRandom;
@@ -928,15 +931,14 @@ impl AgentRuntime {
         let mut engines: Vec<(&str, String, &str, &str)> = if is_zh {
             vec![
                 ("baidu", format!("https://www.baidu.com/s?wd={q}"), ".result.c-container", "p, .c-abstract"),
-                ("sogou", format!("https://www.sogou.com/web?query={q}"), ".vrwrap, .rb", "p, .ft"),
                 ("bing", format!("https://cn.bing.com/search?q={q}"), ".b_algo", "p"),
-                ("google", format!("https://www.google.com/search?q={q}"), "div.g", "span.st, div[data-sncf]"),
+                ("sogou", format!("https://www.sogou.com/web?query={q}"), ".vrwrap, .rb", "p, .ft"),
             ]
         } else {
             vec![
                 ("google", format!("https://www.google.com/search?q={q}"), "div.g", "span.st, div[data-sncf]"),
+                ("brave", format!("https://search.brave.com/search?q={q}"), "[data-type='web'], .snippet", ".snippet-description, .snippet-content"),
                 ("bing", format!("https://www.bing.com/search?q={q}"), ".b_algo", "p"),
-                ("duckduckgo", format!("https://html.duckduckgo.com/html/?q={q}"), ".result", ".result__snippet"),
             ]
         };
         let rotation = crate::browser::pool::BrowserPool::global().next_engine_index() as usize;
@@ -1543,7 +1545,7 @@ impl AgentRuntime {
                     Some(p) => p,
                     None => {
                         let lang = crate::i18n::default_lang();
-                        let msg = crate::i18n::t_fmt("tool_missing", lang, &[("tool", "chromium")]);
+                        let msg = crate::i18n::t_fmt("tool_missing", lang, &[("tool", "chrome")]);
                         warn!("{}", msg);
                         if let Some(ref tx) = self.notification_tx {
                             let _ = tx.send(crate::channel::OutboundMessage {
@@ -1554,6 +1556,7 @@ impl AgentRuntime {
                                 images: vec![],
                                 files: vec![],
                                 channel: Some(ctx.channel.clone()),
+                                account: None,
                             });
                         }
                         return Err(anyhow!(msg));

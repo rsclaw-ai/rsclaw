@@ -242,6 +242,7 @@ impl AgentRuntime {
             extra_tools: vec![],
             images: vec![],
             files: vec![],
+            account: None,
         };
         target.tx.send(msg).await.map_err(|_| anyhow!("agent_task: agent inbox closed"))?;
 
@@ -293,6 +294,7 @@ impl AgentRuntime {
                 extra_tools: vec![],
                 images: vec![],
                 files: vec![],
+                account: None,
             };
             if let Err(e) = self_handle.tx.send(wake_msg).await {
                 warn!(task_id, "failed to wake parent agent: {e}");
@@ -323,6 +325,7 @@ impl AgentRuntime {
                                     images: reply.images.clone(),
                                     files: reply.files.clone(),
                                     channel: Some(channel),
+                                    account: None,
                                 });
                             }
                         }
@@ -378,6 +381,7 @@ impl AgentRuntime {
             extra_tools: vec![],
             images: vec![],
             files: vec![],
+            account: None,
         };
         target.tx.send(msg).await.map_err(|_| anyhow!("agent_send: agent '{target_id}' inbox closed"))?;
 
@@ -425,6 +429,7 @@ impl AgentRuntime {
                 extra_tools: vec![],
                 images: vec![],
                 files: vec![],
+                account: None,
             };
             if let Err(e) = self_handle.tx.send(wake_msg).await {
                 warn!(send_id = %send_id_bg, "failed to wake parent agent: {e}");
@@ -449,6 +454,7 @@ impl AgentRuntime {
                                 images: reply.images.clone(),
                                 files: reply.files.clone(),
                                 channel: Some(channel),
+                                account: None,
                             });
                         }
                     }

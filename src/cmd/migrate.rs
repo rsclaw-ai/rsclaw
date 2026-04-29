@@ -50,9 +50,7 @@ pub async fn cmd_migrate(args: MigrateArgs) -> Result<()> {
 
     let home = dirs_next::home_dir().unwrap_or_default();
     let openclaw_dir = oc_dir.unwrap_or_else(|| home.join(".openclaw"));
-    let rsclaw_dir = std::env::var("RSCLAW_BASE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| home.join(".rsclaw"));
+    let rsclaw_dir = crate::config::loader::base_dir();
 
     println!();
 

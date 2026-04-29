@@ -666,12 +666,13 @@ fn user_chrome_is_running() -> bool {
 }
 
 /// Whether `chrome_path` points at the user's system Chrome (vs the
-/// rsclaw-managed Chrome for Testing under `~/.rsclaw/tools/chrome/`).
+/// rsclaw-managed Chrome for Testing under `<base_dir>/tools/chrome/`).
 /// Only system Chrome is a candidate for "use the user's profile" —
 /// our self-managed Testing build doesn't have the user's cookies
 /// anyway, so reusing its profile defeats the purpose.
 fn is_system_chrome(chrome_path: &str) -> bool {
-    !chrome_path.contains(".rsclaw/tools/")
+    let managed_prefix = crate::config::loader::base_dir().join("tools");
+    !chrome_path.starts_with(&*managed_prefix.to_string_lossy())
 }
 
 /// Look up an already-running Chrome on the named profile by reading its

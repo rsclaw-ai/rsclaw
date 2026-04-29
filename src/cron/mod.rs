@@ -736,7 +736,7 @@ impl CronRunner {
             };
 
             // Use tokio::select! to wait for either timer or reload signal
-            let reload_triggered = tokio::select! {
+            let mut reload_triggered = tokio::select! {
                 _ = sleep(Duration::from_millis(delay_ms)) => {
                     false
                 }
@@ -754,6 +754,19 @@ impl CronRunner {
                     }
                 }
             };
+
+            // Close the select! wake-up race: if the sleep branch won the
+            // race, a reload signal that arrived just before could be sitting
+            // in the broadcast buffer.  Drain it now so we apply the new
+            // file before computing due jobs — otherwise a freshly-deleted
+            // cron could fire one extra time on this iteration.
+            loop {
+                match reload_rx.try_recv() {
+                    Ok(()) => reload_triggered = true,
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => reload_triggered = true,
+                    Err(_) => break,
+                }
+            }
 
             if !running.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
@@ -1646,6 +1659,7 @@ CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
         extra_tools: vec![],
         images: vec![],
         files: vec![],
+        account: None,
     };
 
     handle.tx.send(msg).await.context("agent inbox closed")?;
@@ -1819,6 +1833,7 @@ async fn send_delivery(
         images: vec![],
         files: vec![],
         channel: Some(resolved_channel.to_owned()),
+        account: None,
     };
 
     match channel.send(msg).await {
@@ -2026,6 +2041,7 @@ async fn run_exec_command(
             extra_tools: vec![], // No tools - only summarize
             images: vec![],
             files: vec![],
+            account: None,
         };
 
         handle.tx.send(msg).await.context("agent inbox closed")?;

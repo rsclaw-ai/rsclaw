@@ -206,6 +206,7 @@ pub(crate) fn start_slack_if_configured(
                                         images: vec![],
                                         channel: None,
 
+                                        account: None,
                     files: vec![],                                    })
                                     .await
                                 {
@@ -227,6 +228,7 @@ pub(crate) fn start_slack_if_configured(
                                         images: vec![],
                                         channel: None,
 
+                                        account: None,
                     files: vec![],                                    })
                                     .await
                                 {
@@ -301,6 +303,7 @@ pub(crate) fn start_slack_if_configured(
                                         files: file_attachments.iter().filter_map(|f| {
                                             crate::gateway::task_queue::stage_file(&f.filename, &f.data, &f.mime_type).ok()
                                         }).collect(),
+                                        account: None,
                                     };
                                     if let Err(e) = w_tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
                                         error!(user = %w_uid, "slack: queue submit failed: {e:#}");
@@ -342,6 +345,7 @@ pub(crate) fn start_slack_if_configured(
                                         images: vec![],
                                         channel: None,
 
+                                        account: None,
                     files: vec![],                                    })
                                     .await
                                 {
@@ -412,6 +416,7 @@ pub(crate) fn start_slack_if_configured(
                                 extra_tools: vec![],
                                 images,
                                 files,
+                                account: None,
                             };
                             if handle.tx.send(msg).await.is_err() {
                                 return;
@@ -426,6 +431,7 @@ pub(crate) fn start_slack_if_configured(
                                         images: r.images,
                                         files: r.files,
                                         channel: None,
+                                        account: None,
                                     }).await
                                     {
                                         tracing::warn!("failed to send message: {e}");

@@ -4187,6 +4187,7 @@ impl AgentRuntime {
                             images: vec![],
                             files: vec![],
                             channel: Some(ctx.channel.clone()),
+                            account: None,
                         });
                     }
                 }
@@ -4312,6 +4313,7 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         channel: Some(ctx.channel.clone()),
+                        account: None,
                     });
                     tracing::debug!(text_len = text_buf.len(), "agent_loop: sent intermediate text to user");
                 }
@@ -5329,6 +5331,7 @@ impl AgentRuntime {
                 extra_tools: vec![],
                 images: vec![],
                 files: vec![],
+                account: None,
             };
 
             target
@@ -5519,6 +5522,7 @@ impl AgentRuntime {
             timestamp: chrono::Utc::now().timestamp(),
             images: Vec::new(),
             files: Vec::new(),
+            account: None,
         };
 
         let (task_id, merged) = manager

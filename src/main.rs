@@ -77,7 +77,7 @@ fn resolve_instance(cli: &Cli) -> (std::path::PathBuf, u16) {
         .base_dir
         .as_ref()
         .map(|p| rsclaw::config::loader::expand_tilde_path_pub(p))
-        .unwrap_or_else(|| home.join(".rsclaw"));
+        .unwrap_or_else(rsclaw::config::loader::base_dir);
 
     if cli.dev {
         let dir = if cli.base_dir.is_some() {
