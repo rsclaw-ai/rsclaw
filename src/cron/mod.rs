@@ -439,10 +439,10 @@ pub struct CronRunner {
     /// loop exits at the next iteration without firing further jobs. Tests
     /// that don't care about graceful shutdown can pass `None`.
     shutdown: Option<crate::gateway::ShutdownCoordinator>,
-    /// If true, the cron.json5 file failed to parse. Skip initial save to
-    /// avoid wiping user's config. The runner will still operate with an
-    /// empty job list, but won't overwrite the corrupted file.
-    skip_initial_save: bool,
+    /// If true, the cron.json5 file failed to parse. Skip ALL saves to
+    /// avoid wiping user's config. The runner will still operate with
+    /// whatever jobs it could parse, but won't overwrite the file.
+    parse_failed: bool,
 }
 
 impl CronRunner {
@@ -466,12 +466,12 @@ impl CronRunner {
     /// The runtime uses this constructor; tests typically use [`new`].
     ///
     /// # Arguments
-    /// * `skip_initial_save` - If true, skip persisting the initial job list.
+    /// * `parse_failed` - If true, skip ALL saves (including after job execution).
     ///   Set to true when cron.json5 failed to parse, to avoid wiping user's config.
     pub fn new_with_shutdown(
         config: &CronConfig,
         jobs: Vec<CronJob>,
-        skip_initial_save: bool,
+        parse_failed: bool,
         agents: Arc<AgentRegistry>,
         channels: Arc<ChannelManager>,
         data_dir: PathBuf,
@@ -501,12 +501,34 @@ impl CronRunner {
             reload_tx,
             ws_conns,
             shutdown,
-            skip_initial_save,
+            parse_failed,
         }
     }
 
     pub fn jobs(&self) -> &[CronJob] {
         &self.jobs
+    }
+
+    /// Check if file parsing failed - callers should avoid saving to disk
+    pub fn parse_failed(&self) -> bool {
+        self.parse_failed
+    }
+
+    /// Save jobs to store file. Returns early without saving if parse_failed is true.
+    pub(crate) async fn save_store(&self, jobs: &[CronJob]) -> Result<()> {
+        if self.parse_failed {
+            // Don't save - file has syntax errors that user needs to fix
+            return Ok(());
+        }
+        let store = CronStore {
+            version: 1,
+            jobs: jobs.to_vec(),
+        };
+        let json = serde_json::to_string_pretty(&store)?;
+        let tmp = format!("{}.tmp", self.store_path.display());
+        tokio::fs::write(&tmp, &json).await?;
+        tokio::fs::rename(&tmp, &self.store_path).await?;
+        Ok(())
     }
 
     /// Start all enabled cron jobs and block until shutdown is signalled.
@@ -563,12 +585,12 @@ impl CronRunner {
         }
 
         // Persist initial state (skip if file failed to parse - don't wipe user's config)
-        if !self.skip_initial_save {
+        if !self.parse_failed {
             if let Err(e) = self.save_store(&jobs).await {
                 warn!(err = %e, "cron: failed to save initial store");
             }
         } else {
-            warn!("cron: skipping initial save due to parse failure - fix cron.json5 syntax errors and restart");
+            warn!("cron: parse failed - all saves disabled until cron.json5 syntax errors are fixed");
         }
 
         let enabled_count = jobs.iter().filter(|j| j.enabled).count();
@@ -1364,21 +1386,6 @@ impl CronRunner {
 
         (result, modified)
     }
-
-    /// Persist `jobs` to `store_path` atomically. Public to the crate so the
-    /// dispatcher can flush iter-cursor advances before spawn, and so tests
-    /// can assert the on-disk shape after a known mutation.
-    pub(crate) async fn save_store(&self, jobs: &[CronJob]) -> Result<()> {
-        let store = CronStore {
-            version: 1,
-            jobs: jobs.to_vec(),
-        };
-        let json = serde_json::to_string_pretty(&store)?;
-        let tmp = format!("{}.tmp", self.store_path.display());
-        tokio::fs::write(&tmp, &json).await?;
-        tokio::fs::rename(&tmp, &self.store_path).await?;
-        Ok(())
-    }
 }
 
 impl Clone for CronRunner {
@@ -1394,7 +1401,7 @@ impl Clone for CronRunner {
             reload_tx: self.reload_tx.clone(),
             ws_conns: Arc::clone(&self.ws_conns),
             shutdown: self.shutdown.clone(),
-            skip_initial_save: self.skip_initial_save,
+            parse_failed: self.parse_failed,
         }
     }
 }
