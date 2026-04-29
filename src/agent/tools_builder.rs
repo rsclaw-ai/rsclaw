@@ -72,9 +72,9 @@ pub(crate) fn toolset_allowed_names(
     toolset: &str,
     custom_tools: Option<&Vec<String>>,
 ) -> Option<std::collections::HashSet<String>> {
-    const MINIMAL: &[&str] = &["execute_command", "read_file", "write_file", "send_file", "list_dir", "search_file", "search_content", "web_search", "web_fetch", "memory", "clarify", "anycli", "use_skill"];
-    const WEB: &[&str] = &["web_search", "web_fetch", "web_download", "read_file", "write_file", "list_dir", "search_file", "memory", "use_skill"];
-    const CODE: &[&str] = &["execute_command", "read_file", "write_file", "list_dir", "search_file", "search_content", "memory", "use_skill"];
+    const MINIMAL: &[&str] = &["execute_command", "read_file", "write_file", "send_file", "list_dir", "search_file", "search_content", "web_search", "web_fetch", "memory", "clarify", "anycli", "use_skill", "task"];
+    const WEB: &[&str] = &["web_search", "web_fetch", "web_download", "read_file", "write_file", "list_dir", "search_file", "memory", "use_skill", "task"];
+    const CODE: &[&str] = &["execute_command", "read_file", "write_file", "list_dir", "search_file", "search_content", "memory", "use_skill", "task"];
     const STANDARD: &[&str] = &[
         "execute_command",
         "read_file",
@@ -94,6 +94,7 @@ pub(crate) fn toolset_allowed_names(
         "clarify",
         "anycli",
         "use_skill",
+        "task",
     ];
 
     let base: Option<&[&str]> = match toolset {
@@ -195,6 +196,43 @@ pub(crate) fn build_tool_list(
             }),
         });
     }
+    // `task` — escalate the current chat into a multi-turn background task.
+    // The LLM decides when sustained work is warranted (implementation
+    // spanning many tool calls, multi-file refactor, deep research). For
+    // short Q&A, jokes, greetings, and one-shot tool calls the LLM should
+    // just answer directly without calling this tool.
+    tools.push(ToolDef {
+        name: "task".to_owned(),
+        description: "Escalate the user's current request into a multi-turn background task. \
+            Call this ONLY when the work clearly needs sustained execution: implementation \
+            across multiple files, multi-step debugging, deep research with many web fetches, \
+            data pipelines, end-to-end deployments. \
+            Do NOT call for: greetings, casual questions, single tool calls (one web_search, \
+            one read_file, one calculation), explanations, or anything you can answer in this \
+            same turn. When in doubt, just answer directly — the user can always send \
+            `/task <request>` to escalate manually.\n\n\
+            Returns a task ID; the gateway then runs the work in the background and posts \
+            replies as turns complete. After calling task, your reply to the user should be a \
+            short acknowledgement only — the actual work happens in the background turns.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "task_text": {
+                    "type": "string",
+                    "description": "The task instruction for the background runner. Usually the user's original request, optionally clarified."
+                },
+                "max_turns": {
+                    "type": "integer",
+                    "description": "Optional cap on agent turns. Default 10. Raise for big jobs (e.g. 30 for full feature implementation)."
+                },
+                "ttl_secs": {
+                    "type": "integer",
+                    "description": "Optional wall-clock deadline in seconds. Default 3600 (1h)."
+                }
+            },
+            "required": ["task_text"]
+        }),
+    });
     tools.push(ToolDef {
         name: "read_file".to_owned(),
         description: "Read a file from the agent workspace.\n\
