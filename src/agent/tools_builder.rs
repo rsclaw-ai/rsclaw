@@ -521,6 +521,12 @@ pub(crate) fn build_tool_list(
             WaitForUrl: `waitforurl` url='dashboard' — wait for URL change (after login/redirect).\n\
             Other: type, select, check, scroll, screenshot, pdf, press, back, forward, reload, wait, evaluate, cookies, get_text, get_url, get_title, find, get_article, upload, new_tab, switch_tab, close_tab.\n\
             IMPORTANT: Always snapshot BEFORE clicking/filling. Element refs change after page updates.\n\n\
+            Site-rules — platform-specific DOM selectors, URL routes, and gotchas live under \
+            `~/.rsclaw/tools/web_browser/site-rules/<domain>.md` (e.g. `douyin.md`, `kuaishou.md`, \
+            `xiaohongshu.md`, `bilibili.md`). When you `open` a URL whose host matches one of \
+            those filenames, read_file that rule file FIRST so you use the verified selectors \
+            instead of guessing them per-session. Saves 5+ snapshot/click iterations and avoids \
+            stale-selector breakage.\n\n\
             Screenshot routing — do NOT call `action=screenshot` without a target:\n\
             - Web page screenshot (user gave a URL): pass it inline,\n\
               `action=screenshot url=https://example.com` — this navigates\n\
