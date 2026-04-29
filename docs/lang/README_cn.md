@@ -305,7 +305,7 @@ irm https://app.rsclaw.ai/scripts/install.ps1 | iex
 
 ### 桌面客户端
 
-从 [Releases](https://github.com/rsclaw-ai/rsclaw/releases) 下载：`.dmg` (macOS)、`.msi` (Windows)、`.deb` (Linux)。
+从 [Releases](https://github.com/rsclaw-ai/rsclaw/releases) 下载：`.dmg` (macOS)、`.exe` (Windows，NSIS 安装包)、`.deb` (Linux)。
 
 **macOS 安全提示：** 应用尚未签名，安装后需要执行：
 
