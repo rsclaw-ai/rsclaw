@@ -3429,20 +3429,25 @@ function TauriConfigPageInner() {
   const handleSave = async () => {
     let parsed: any;
     try { parsed = JSON5.parse(raw); } catch { toast.error(zh ? "JSON5 格式错误" : "Invalid JSON5"); return; }
-    // Strip zombie channel blocks (channels whose accounts is missing or
-    // an empty object). Heals configs left dirty by older versions of
-    // removeAccount that only deleted the inner accounts entry.
+    // Strip zombie channel blocks: only blocks whose `accounts` field is
+    // explicitly an empty object {} count as zombies (left over from older
+    // removeAccount calls that deleted the inner entry but not the outer
+    // shell). Channels using the single-account legacy schema (Discord
+    // top-level `token`, etc.) have NO `accounts` field at all and must
+    // be preserved — previously the missing-field branch was deleting them.
     let cleanedContent = raw;
     if (parsed && parsed.channels && typeof parsed.channels === "object") {
       let changed = false;
       for (const chId of Object.keys(parsed.channels)) {
         const ch = parsed.channels[chId];
         const accounts = ch && typeof ch === "object" ? ch.accounts : undefined;
-        const isEmptyAccounts =
-          accounts === undefined ||
-          accounts === null ||
-          (typeof accounts === "object" && !Array.isArray(accounts) && Object.keys(accounts).length === 0);
-        if (isEmptyAccounts) {
+        const isExplicitEmptyAccounts =
+          accounts !== undefined &&
+          accounts !== null &&
+          typeof accounts === "object" &&
+          !Array.isArray(accounts) &&
+          Object.keys(accounts).length === 0;
+        if (isExplicitEmptyAccounts) {
           delete parsed.channels[chId];
           changed = true;
         }
