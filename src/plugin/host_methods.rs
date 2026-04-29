@@ -106,16 +106,92 @@ impl HostMethodRegistry {
         Ok(Value::Null)
     }
 
+    // ---- A2 browser helper ----
+
+    /// Lock the shared browser session, auto-starting Chrome on first use,
+    /// dispatch the action via `BrowserSession::execute`, and extract a
+    /// payload string the way wasm plugins see results.
+    ///
+    /// Mirrors `wasm_runtime.rs::HostState::browser_action`. The two runtimes
+    /// MUST share this code path so a shell plugin and a wasm plugin see
+    /// byte-identical browser results.
+    async fn browser_call(&self, action: &str, args: Value) -> Result<Value> {
+        // The profile name MUST match `SHARED_BROWSER_PROFILE` in
+        // `wasm_runtime.rs` (currently "jimeng"). Both runtimes share the
+        // same Chrome profile so login state persists across runtimes.
+        // Making that constant `pub` would couple wasm_runtime to this
+        // module; a future cleanup task can do that if the value ever changes.
+        const PROFILE: &str = "jimeng"; // MUST match wasm_runtime.rs::SHARED_BROWSER_PROFILE
+
+        let mut guard = self.browser.lock().await;
+
+        if guard.is_none() {
+            tracing::info!("shell plugin: auto-starting browser session");
+            let chrome_path = crate::agent::platform::ensure_chrome()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to obtain Chrome: {e:#}"))?;
+            let session = BrowserSession::start(&chrome_path, true, Some(PROFILE))
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to start Chrome: {e:#}"))?;
+            *guard = Some(session);
+        }
+
+        let session = guard.as_mut().expect("browser session just initialized");
+        match session.execute(action, &args).await {
+            Ok(val) => {
+                for field in &["text", "image", "data", "url", "result"] {
+                    if let Some(s) = val.get(field).and_then(|v| v.as_str()) {
+                        return Ok(Value::String(s.to_string()));
+                    }
+                }
+                Ok(val)
+            }
+            Err(e) => Err(anyhow::anyhow!("{e:#}")),
+        }
+    }
+
     // ---- A2 stubs (filled in Tasks 11–15) ----
 
-    async fn host_browser_open(&self, _params: Value) -> Result<Value> {
-        unimplemented!("filled in Task 11")
+    /// Open a URL in the shared browser session.
+    ///
+    /// Params: `{ "url": "<url>" }`. Mirrors wasm `browser_open`.
+    async fn host_browser_open(&self, params: Value) -> Result<Value> {
+        let url = params["url"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("browser_open: `url` required"))?;
+        self.browser_call("open", json!({"url": url})).await
     }
-    async fn host_browser_eval(&self, _params: Value) -> Result<Value> {
-        unimplemented!("filled in Task 11")
+
+    /// Evaluate a JavaScript snippet in the shared browser session.
+    ///
+    /// Params: `{ "script": "<js>" }`. Mirrors wasm `browser_eval`.
+    async fn host_browser_eval(&self, params: Value) -> Result<Value> {
+        let code = params["script"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("browser_eval: `script` required"))?;
+        self.browser_call("evaluate", json!({"js": code})).await
     }
-    async fn host_browser_eval_with_args(&self, _params: Value) -> Result<Value> {
-        unimplemented!("filled in Task 11")
+
+    /// Evaluate a JavaScript function with arguments in the shared browser session.
+    ///
+    /// Params: `{ "fn": "<async fn source>", "args": <any JSON value> }`.
+    /// The function is wrapped in an IIFE matching the wasm `eval_with_args`
+    /// wrapper exactly so results are byte-identical between runtimes.
+    async fn host_browser_eval_with_args(&self, params: Value) -> Result<Value> {
+        let code = params["fn"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("browser_eval_with_args: `fn` required"))?;
+        let args = params.get("args").cloned().unwrap_or(Value::Null);
+        let args_literal = serde_json::to_string(&args).unwrap_or_else(|_| "null".to_string());
+        let wrapped = format!(
+            r#"(async function() {{
+            const __args = ({args_literal});
+            const __fn = ({code});
+            const __out = await __fn(__args);
+            return typeof __out === "string" ? __out : JSON.stringify(__out);
+        }})()"#
+        );
+        self.browser_call("evaluate", json!({"js": wrapped})).await
     }
     async fn host_browser_click(&self, _params: Value) -> Result<Value> {
         unimplemented!("filled in Task 12")
