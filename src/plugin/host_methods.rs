@@ -255,10 +255,32 @@ impl HostMethodRegistry {
         }
         self.browser_call("download", args).await
     }
-    async fn host_sleep(&self, _params: Value) -> Result<Value> {
-        unimplemented!("filled in Task 15")
+    async fn host_sleep(&self, params: Value) -> Result<Value> {
+        let ms = params["ms"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("sleep: `ms` required"))?;
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        Ok(Value::Null)
     }
-    async fn host_storage_allocate_artifact(&self, _params: Value) -> Result<Value> {
-        unimplemented!("filled in Task 15")
+    async fn host_storage_allocate_artifact(&self, params: Value) -> Result<Value> {
+        let filename = params["filename"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("storage_allocate_artifact: `filename` required"))?;
+        // Optional: count > 1 → allocate a group of paths sharing one base.
+        let count = params
+            .get("count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .max(1) as usize;
+        match crate::plugin::wasm_runtime::allocate_dl_paths(filename, count) {
+            Ok(paths) => {
+                if count == 1 {
+                    Ok(serde_json::json!({ "path": paths.into_iter().next().unwrap_or_default() }))
+                } else {
+                    Ok(serde_json::json!({ "paths": paths }))
+                }
+            }
+            Err(e) => Err(anyhow::anyhow!("{e}")),
+        }
     }
 }

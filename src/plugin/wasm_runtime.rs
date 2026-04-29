@@ -511,7 +511,7 @@ impl rsclaw::plugin::host_storage::Host for HostState {
 /// Layout: `~/Downloads/rsclaw/<category>/<dl_kind_TS_abc[_N]>.<ext>`.
 /// The host owns the on-disk shape; plugins only pass a hint filename
 /// whose extension drives the category and ext.
-fn allocate_dl_paths(filename: &str, count: usize) -> Result<Vec<String>, String> {
+pub(crate) fn allocate_dl_paths(filename: &str, count: usize) -> Result<Vec<String>, String> {
     if filename.contains('/') || filename.contains('\\') {
         return Err(format!(
             "allocate_artifact: filename must not contain path separators: {filename}"
