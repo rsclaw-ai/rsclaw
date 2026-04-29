@@ -223,6 +223,91 @@ impl ShellBridgePlugin {
 }
 
 // ---------------------------------------------------------------------------
+// Protocol demux
+// ---------------------------------------------------------------------------
+
+/// Demultiplex one stdout line from a plugin subprocess:
+/// - `{"id": <pos>, "result"|"error": ...}` → response to a host-initiated call;
+///   look up `id` in pending and fulfill its oneshot.
+/// - `{"id": <neg>, "method": ..., "params": ...}` → plugin-initiated request;
+///   dispatch to host_methods on a fresh task and write the response back to stdin.
+async fn handle_incoming(
+    line: &str,
+    pending: &Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>,
+    stdin: Arc<Mutex<ChildStdin>>,
+    host_dispatch: &Arc<crate::plugin::host_methods::HostMethodRegistry>,
+    plugin_name: &str,
+) -> Result<()> {
+    let msg: Value = serde_json::from_str(line)
+        .with_context(|| format!("plugin `{plugin_name}` invalid JSON: {line}"))?;
+
+    let id = msg["id"]
+        .as_i64()
+        .ok_or_else(|| anyhow::anyhow!("plugin `{plugin_name}` message has no integer id"))?;
+
+    if id > 0 {
+        // Host-initiated response.
+        let mut map = pending.lock().await;
+        if let Some(tx) = map.remove(&id) {
+            let result = if let Some(err) = msg.get("error") {
+                Err(err.to_string())
+            } else {
+                Ok(msg.get("result").cloned().unwrap_or(Value::Null))
+            };
+            let _ = tx.send(result);
+        } else {
+            warn!(
+                plugin = %plugin_name,
+                id,
+                "response with no pending request — dropping"
+            );
+        }
+        Ok(())
+    } else {
+        // Plugin-initiated request (id < 0). id == 0 is reserved.
+        if id == 0 {
+            bail!("plugin `{plugin_name}` sent id=0, which is reserved");
+        }
+        let method = msg["method"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("plugin `{plugin_name}` request id={id} has no method"))?
+            .to_owned();
+        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+
+        // Run the host method on a separate task so the reader loop is not blocked.
+        let dispatch = host_dispatch.clone();
+        let name = plugin_name.to_owned();
+        tokio::spawn(async move {
+            let result = dispatch.handle(&method, params).await;
+            let response = match result {
+                Ok(v) => json!({ "id": id, "result": v }),
+                Err(e) => json!({ "id": id, "error": e.to_string() }),
+            };
+            match serde_json::to_string(&response) {
+                Ok(line) => {
+                    let mut sin = stdin.lock().await;
+                    if let Err(e) = sin.write_all(line.as_bytes()).await {
+                        warn!(plugin = %name, "failed to write response: {e}");
+                        return;
+                    }
+                    if let Err(e) = sin.write_all(b"\n").await {
+                        warn!(plugin = %name, "failed to write newline: {e}");
+                        return;
+                    }
+                    if let Err(e) = sin.flush().await {
+                        warn!(plugin = %name, "failed to flush: {e}");
+                    }
+                }
+                Err(e) => {
+                    warn!(plugin = %name, "failed to serialize response: {e}");
+                }
+            }
+        });
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Runtime resolver
 // ---------------------------------------------------------------------------
 
