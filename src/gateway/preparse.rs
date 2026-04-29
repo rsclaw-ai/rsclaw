@@ -54,6 +54,15 @@ pub(crate) async fn try_preparse_locally(
             .unwrap_or_else(|| base.join("workspace"))
     };
 
+    // /help · /?
+    // /help was previously in `is_fast_preparse` whitelist but had no
+    // match arm here → fell through to the agent runtime, which on
+    // channels with a 10s fast-path timeout (LINE) silently dropped
+    // the reply. Make it a local fast response listing all preparse
+    // slash commands, so it lands within milliseconds on every channel.
+    if lower == "/help" || lower == "/?" {
+        return Some(txt(help_text(crate::i18n::default_lang())));
+    }
     // /version
     if lower == "/version" {
         return Some(txt(format!("rsclaw v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"))));
@@ -542,6 +551,73 @@ fn format_interval_ms(ms: u64) -> String {
     if m > 0 { parts.push(format!("{m}m")); }
     if s > 0 { parts.push(format!("{s}s")); }
     if parts.is_empty() { "0s".to_owned() } else { parts.join("") }
+}
+
+/// Top-level /help text — one-screen overview of all preparse slash
+/// commands. Per-command details live in `<cmd> -h` sub-helps where the
+/// command supports flags (currently /loop, /task).
+fn help_text(lang: &str) -> String {
+    if lang == "zh" {
+        "RsClaw 命令\n\n\
+         状态/版本\n\
+         \u{0020}\u{0020}/version  /uptime  /status  /health\n\n\
+         会话\n\
+         \u{0020}\u{0020}/new      新会话\n\
+         \u{0020}\u{0020}/clear    清当前会话历史\n\
+         \u{0020}\u{0020}/reset    重置会话（含中止）\n\
+         \u{0020}\u{0020}/abort    中止当前/所有运行中的回合\n\
+         \u{0020}\u{0020}/sessions 列出会话\n\n\
+         模型\n\
+         \u{0020}\u{0020}/model           显示当前模型\n\
+         \u{0020}\u{0020}/models          列出可用模型\n\
+         \u{0020}\u{0020}/model <name>    切换主模型\n\n\
+         任务/调度\n\
+         \u{0020}\u{0020}/task -h         多轮任务（详见 -h）\n\
+         \u{0020}\u{0020}/loop -h         定时循环（详见 -h）\n\
+         \u{0020}\u{0020}/cron list       查看定时任务\n\n\
+         文件/截图\n\
+         \u{0020}\u{0020}/ls [path]       列出工作区目录\n\
+         \u{0020}\u{0020}/cat <file>      查看文件内容\n\
+         \u{0020}\u{0020}/ss              桌面截图\n\
+         \u{0020}\u{0020}/webshot <url>   网页截图\n\n\
+         技能/插件\n\
+         \u{0020}\u{0020}/skill list      已安装技能\n\n\
+         其他\n\
+         \u{0020}\u{0020}/btw <问题>      旁路一次性提问，不写入会话\n\
+         \u{0020}\u{0020}!cmd  /  $cmd    在工作区执行一行 shell 命令\n\
+         \u{0020}\u{0020}/help  /  /?     本帮助"
+            .to_owned()
+    } else {
+        "RsClaw commands\n\n\
+         Status / version\n\
+         \u{0020}\u{0020}/version  /uptime  /status  /health\n\n\
+         Session\n\
+         \u{0020}\u{0020}/new      start a new session\n\
+         \u{0020}\u{0020}/clear    wipe current session history\n\
+         \u{0020}\u{0020}/reset    full reset (incl. abort)\n\
+         \u{0020}\u{0020}/abort    abort the current / all running turns\n\
+         \u{0020}\u{0020}/sessions list sessions\n\n\
+         Model\n\
+         \u{0020}\u{0020}/model           show current model\n\
+         \u{0020}\u{0020}/models          list available models\n\
+         \u{0020}\u{0020}/model <name>    switch primary model\n\n\
+         Task / schedule\n\
+         \u{0020}\u{0020}/task -h         multi-turn task (see -h)\n\
+         \u{0020}\u{0020}/loop -h         repeat on a schedule (see -h)\n\
+         \u{0020}\u{0020}/cron list       view cron jobs\n\n\
+         File / screenshot\n\
+         \u{0020}\u{0020}/ls [path]       list workspace directory\n\
+         \u{0020}\u{0020}/cat <file>      view file contents\n\
+         \u{0020}\u{0020}/ss              desktop screenshot\n\
+         \u{0020}\u{0020}/webshot <url>   web-page screenshot\n\n\
+         Skills / plugins\n\
+         \u{0020}\u{0020}/skill list      installed skills\n\n\
+         Other\n\
+         \u{0020}\u{0020}/btw <q>         side-channel ask, not added to session\n\
+         \u{0020}\u{0020}!cmd  /  $cmd    run a one-line shell command in the workspace\n\
+         \u{0020}\u{0020}/help  /  /?     this help"
+            .to_owned()
+    }
 }
 
 /// Help text for /loop. Localized en/zh.
