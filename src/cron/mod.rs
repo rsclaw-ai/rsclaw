@@ -1957,6 +1957,19 @@ async fn run_exec_command(
         "command succeeded with no output".to_string()
     };
 
+    // Detect saved file paths in output and read their content
+    // Common patterns: "报告已保存: xxx", "saved to: xxx", "文件已保存: xxx"
+    let saved_files_content = extract_saved_files_content(&raw_output);
+    let full_output = if saved_files_content.is_empty() {
+        raw_output.clone()
+    } else {
+        format!(
+            "{}\n\n---\n\n【已保存的完整报告文件内容】\n{}\n\n【提示】以上是脚本保存的完整报告，请基于此内容进行总结，不要遗漏关键信息。",
+            raw_output,
+            saved_files_content
+        )
+    };
+
     // If summarize=true, send output to agent for summarization
     if summarize {
         // Try to use a dedicated summarizer agent first to avoid queue conflicts
@@ -1987,17 +2000,18 @@ async fn run_exec_command(
             \n\
             【硬性规则 - 必须遵守】\n\
             1. 你只能总结下面输出内容中已有的信息，绝不能添加任何不在输出中的内容\n\
-            2. 如果输出中没有具体数据（如股票数量、价格），不要自己编造数字\n\
-            3. 如果输出为空或只有错误信息，如实报告\"脚本执行失败\"或\"无输出\"\n\
-            4. 不要声称\"已完成\"\"已发现\"\"已执行\"等动作 - 你只是总结，没有执行任何操作\n\
-            5. 直接返回摘要文本，不要返回 HEARTBEAT_OK\n\
+            2. 如果输出中有\"已保存的完整报告文件内容\"，请基于该完整内容总结，不要遗漏关键信息\n\
+            3. 如果输出中没有具体数据（如股票数量、价格），不要自己编造数字\n\
+            4. 如果输出为空或只有错误信息，如实报告\"脚本执行失败\"或\"无输出\"\n\
+            5. 不要声称\"已完成\"\"已发现\"\"已执行\"等动作 - 你只是总结，没有执行任何操作\n\
+            6. 直接返回摘要文本，不要返回 HEARTBEAT_OK\n\
             \n\
             【输出内容】\n\
             ```\n{}\n\
             ```\n\
             \n\
             请严格按上述规则总结，违反规则将被视为欺骗。",
-            raw_output
+            full_output
         );
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -2237,6 +2251,43 @@ pub fn trigger_reload() -> bool {
         Some(tx) => tx.send(()).is_ok(),
         None => false,
     }
+}
+
+/// Extract saved file paths from command output and read their content.
+/// Common patterns in Chinese/English:
+/// - "报告已保存: /path/to/file.md"
+/// - "saved to: /path/to/file"
+/// - "文件已保存: /path/to/file"
+/// - "output saved: /path/to/file"
+fn extract_saved_files_content(output: &str) -> String {
+    use regex::Regex;
+
+    // Pattern: "报告已保存: path" or "saved to: path" etc.
+    let patterns = [
+        r"报告已保存[:\s]+([^\n]+)",
+        r"文件已保存[:\s]+([^\n]+)",
+        r"saved to[:\s]+([^\n]+)",
+        r"output saved[:\s]+([^\n]+)",
+        r"保存到[:\s]+([^\n]+)",
+        r"已保存[:\s]+(.+\.md)",
+        r"已保存[:\s]+(.+\.json)",
+        r"已保存[:\s]+(.+\.txt)",
+    ];
+
+    let mut contents = Vec::new();
+
+    for pattern in &patterns {
+        let re = Regex::new(pattern).unwrap();
+        for cap in re.captures_iter(output) {
+            let path = cap[1].trim();
+            // Try to read the file
+            if let Ok(content) = std::fs::read_to_string(path) {
+                contents.push(format!("【文件: {}】\n{}", path, content));
+            }
+        }
+    }
+
+    contents.join("\n\n---\n\n")
 }
 
 #[cfg(test)]
