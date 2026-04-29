@@ -193,11 +193,27 @@ impl HostMethodRegistry {
         );
         self.browser_call("evaluate", json!({"js": wrapped})).await
     }
-    async fn host_browser_click(&self, _params: Value) -> Result<Value> {
-        unimplemented!("filled in Task 12")
+    /// Click on a DOM element by accessibility ref in the shared browser session.
+    ///
+    /// Params: `{ "ref": "<element ref>" }`. Mirrors wasm `browser_click`.
+    async fn host_browser_click(&self, params: Value) -> Result<Value> {
+        let element_ref = params["ref"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("browser_click: `ref` required"))?;
+        self.browser_call("click", json!({"ref": element_ref})).await
     }
-    async fn host_browser_click_at(&self, _params: Value) -> Result<Value> {
-        unimplemented!("filled in Task 12")
+
+    /// Click at a specific viewport coordinate in the shared browser session.
+    ///
+    /// Params: `{ "x": <u64>, "y": <u64> }`. Mirrors wasm `browser_click_at`.
+    async fn host_browser_click_at(&self, params: Value) -> Result<Value> {
+        let x = params["x"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("browser_click_at: `x` required"))?;
+        let y = params["y"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("browser_click_at: `y` required"))?;
+        self.browser_call("click_at", json!({"x": x, "y": y})).await
     }
     async fn host_browser_fill(&self, _params: Value) -> Result<Value> {
         unimplemented!("filled in Task 13")
