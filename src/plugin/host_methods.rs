@@ -234,8 +234,26 @@ impl HostMethodRegistry {
     async fn host_browser_snapshot(&self, _params: Value) -> Result<Value> {
         self.browser_call("snapshot", json!({})).await
     }
-    async fn host_browser_download(&self, _params: Value) -> Result<Value> {
-        unimplemented!("filled in Task 14")
+    /// Download a resource (URL or element ref) to a local path in the shared browser session.
+    ///
+    /// Params: `{ "url": "<url or element ref>", "dest_path": "<local path>" }`.
+    /// Optional `"referer"` may be supplied for sites that require it; on the wasm side
+    /// referer attachment is automatic via per-plugin CDN rules — Node plugins pass it
+    /// explicitly instead.
+    /// Mirrors wasm `browser_download`.
+    async fn host_browser_download(&self, params: Value) -> Result<Value> {
+        let url = params["url"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("browser_download: `url` required"))?;
+        let dest = params["dest_path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("browser_download: `dest_path` required"))?;
+        let mut args = json!({"ref": url, "path": dest});
+        // Optional: plugin can pre-supply a referer for sites that require it.
+        if let Some(referer) = params.get("referer").and_then(|v| v.as_str()) {
+            args["referer"] = json!(referer);
+        }
+        self.browser_call("download", args).await
     }
     async fn host_sleep(&self, _params: Value) -> Result<Value> {
         unimplemented!("filled in Task 15")
