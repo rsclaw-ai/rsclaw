@@ -3675,7 +3675,22 @@ impl AgentRuntime {
             };
 
 // Pre-flight check: emergency compact if we'd exceed context.
-            let context_limit = self.live.agents.read().await.defaults.context_tokens.unwrap_or(64_000) as usize;
+            // Same resolution chain as AgentHandle.context_window (the
+            // value /status displays): per-agent model.contextTokens →
+            // agents.defaults.contextTokens → 64000. Previously this only
+            // read defaults, so a per-agent override of 200_000 was
+            // ignored here and emergency compaction kicked in too early.
+            let context_limit = {
+                let agents_live = self.live.agents.read().await;
+                let per_agent = agents_live
+                    .list
+                    .iter()
+                    .find(|a| a.id == self.handle.id)
+                    .and_then(|a| a.model.as_ref().and_then(|m| m.context_tokens));
+                per_agent
+                    .or(agents_live.defaults.context_tokens)
+                    .unwrap_or(64_000) as usize
+            };
             let overhead = self.estimate_fixed_overhead();
             let session_tokens: usize = self.sessions
                 .get(&ctx.session_key)
