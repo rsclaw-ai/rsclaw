@@ -22,7 +22,7 @@ struct ToolDef {
     name: &'static str,
     display: &'static str,
     detect_cmd: &'static [&'static str],
-    local_bin: &'static str, // relative to tools_dir(), e.g. "chromium/chrome"
+    local_bin: &'static str, // relative to tools_dir(), e.g. "chrome/chrome"
 }
 
 const TOOLS: &[ToolDef] = &[
@@ -110,7 +110,7 @@ fn tool_status(def: &ToolDef) -> &'static str {
 // Public: tools summary for `rsclaw status`
 // ---------------------------------------------------------------------------
 
-/// Returns a one-line tools summary, e.g. "chromium ✓  ffmpeg ✓  node ✓  python ✓  sherpa-onnx ✗"
+/// Returns a one-line tools summary, e.g. "chrome ✓  ffmpeg ✓  node ✓  python ✓  sherpa-onnx ✗"
 pub fn tools_summary_line() -> String {
     TOOLS
         .iter()
@@ -386,7 +386,7 @@ fn resolve_download_url(
     let section = manifest.get(&manifest_key).or_else(|| manifest.get(tool))?;
 
     match tool {
-        "chrome" | "chromium" => {
+        "chrome" => {
             let ver = section.get("version")?.as_str()?;
             let filename = match platform {
                 "linux-x64" => "chrome-linux64.zip",

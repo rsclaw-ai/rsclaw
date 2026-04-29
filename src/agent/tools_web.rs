@@ -1543,7 +1543,7 @@ impl AgentRuntime {
                     Some(p) => p,
                     None => {
                         let lang = crate::i18n::default_lang();
-                        let msg = crate::i18n::t_fmt("tool_missing", lang, &[("tool", "chromium")]);
+                        let msg = crate::i18n::t_fmt("tool_missing", lang, &[("tool", "chrome")]);
                         warn!("{}", msg);
                         if let Some(ref tx) = self.notification_tx {
                             let _ = tx.send(crate::channel::OutboundMessage {
