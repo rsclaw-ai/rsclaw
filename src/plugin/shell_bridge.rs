@@ -57,8 +57,12 @@ pub struct ShellBridgePlugin {
 }
 
 impl ShellBridgePlugin {
-    /// Spawn the plugin subprocess.
-    pub async fn spawn(manifest: &PluginManifest) -> Result<Self> {
+    /// Spawn the plugin subprocess and start the reader task that demuxes
+    /// incoming lines into pending-request fulfillment or host method dispatch.
+    pub async fn spawn(
+        manifest: &PluginManifest,
+        host_dispatch: Arc<crate::plugin::host_methods::HostMethodRegistry>,
+    ) -> Result<Self> {
         let runtime = resolve_runtime(&manifest.runtime)?;
         let entry = manifest.dir.join(&manifest.entry);
 
@@ -75,7 +79,7 @@ impl ShellBridgePlugin {
             .current_dir(&manifest.dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit()) // plugin logs flow to rsclaw stderr
+            .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
             .with_context(|| {
@@ -91,13 +95,54 @@ impl ShellBridgePlugin {
 
         debug!(plugin = %manifest.name, runtime, "plugin subprocess started");
 
+        let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let stdin_arc = Arc::new(Mutex::new(stdin));
+
+        let reader_pending = pending.clone();
+        let reader_stdin = stdin_arc.clone();
+        let reader_dispatch = host_dispatch.clone();
+        let reader_name = manifest.name.clone();
+        let reader_handle = tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => {
+                        debug!(plugin = %reader_name, "plugin stdout closed (EOF)");
+                        break;
+                    }
+                    Ok(_) => {
+                        if let Err(e) = handle_incoming(
+                            line.trim_end_matches('\n'),
+                            &reader_pending,
+                            reader_stdin.clone(),
+                            &reader_dispatch,
+                            &reader_name,
+                        )
+                        .await
+                        {
+                            warn!(plugin = %reader_name, "incoming dispatch error: {e:#}");
+                        }
+                    }
+                    Err(e) => {
+                        error!(plugin = %reader_name, "stdout read error: {e:#}");
+                        break;
+                    }
+                }
+            }
+        });
+
         Ok(Self {
             name: manifest.name.clone(),
-            stdin: Arc::new(Mutex::new(stdin)),
-            stdout: Arc::new(Mutex::new(BufReader::new(stdout))),
+            stdin: stdin_arc,
             child: Arc::new(Mutex::new(child)),
-            next_id: Arc::new(AtomicU64::new(1)),
+            next_id: Arc::new(AtomicI64::new(1)),
             timeout: Duration::from_secs(DEFAULT_CALL_TIMEOUT_SECS),
+            pending,
+            reader_handle: Arc::new(Mutex::new(Some(reader_handle))),
+            host_dispatch,
         })
     }
 
@@ -241,8 +286,11 @@ pub struct Plugin {
 }
 
 impl Plugin {
-    pub async fn spawn(manifest: PluginManifest) -> Result<Self> {
-        let inner = ShellBridgePlugin::spawn(&manifest).await?;
+    pub async fn spawn(
+        manifest: PluginManifest,
+        host_dispatch: Arc<crate::plugin::host_methods::HostMethodRegistry>,
+    ) -> Result<Self> {
+        let inner = ShellBridgePlugin::spawn(&manifest, host_dispatch).await?;
         Ok(Self { inner, manifest })
     }
 
