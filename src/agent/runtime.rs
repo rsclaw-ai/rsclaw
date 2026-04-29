@@ -4207,6 +4207,73 @@ const MAX_ERROR_STREAK: usize = 5;
                 // IMPORTANT: Check turn_scratchpad for tool calls from earlier iterations,
                 // not just current iteration's tool_calls (which is empty at this point).
                 //
+
+                // Check if turn_scratchpad contains tool calls (from earlier iterations)
+                // Must be defined BEFORE user tool request check
+                let has_tool_in_turn = turn_scratchpad.iter().any(|msg| {
+                    if let crate::provider::MessageContent::Parts(parts) = &msg.content {
+                        parts.iter().any(|p| {
+                            matches!(p, crate::provider::ContentPart::ToolUse { name, .. }
+                                if name == "opencode" || name == "claudecode" || name == "codex"
+                                    || name == "web_search" || name == "execute_command"
+                                    || name == "web_browser" || name == "web_fetch"
+                                    || name == "cron" || name == "read_file" || name == "write_file")
+                        })
+                    } else {
+                        false
+                    }
+                });
+
+                // First: check if user explicitly requested a tool call.
+                // If user says "用cron list查" / "调用xxx工具" but model didn't call ANY tool,
+                // this is a direct violation of user intent - block immediately.
+                let user_tool_request_keywords = [
+                    // Chinese: explicit tool call requests
+                    "用cron", "调用cron", "查cron", "cron list", "cron查询", "cron查",
+                    "用execute", "执行命令", "调用命令", "运行命令", "运行脚本",
+                    "用python", "调用python", "执行python", "运行python",
+                    "用opencode", "调用opencode", "opencode去", "opencode查",
+                    "帮我查", "帮我调用", "帮我执行", "帮我运行",
+                    "查一下", "查下", "看一下", "看下", "列一下", "列下",
+                    // English: explicit tool call requests
+                    "use cron", "call cron", "run cron", "cron list",
+                    "execute", "run script", "call tool",
+                    "help me check", "check for me", "list for me",
+                ];
+                let user_requests_tool = user_tool_request_keywords.iter().any(|kw| {
+                    ctx.user_text.to_lowercase().contains(&kw.to_lowercase()) || ctx.user_text.contains(kw)
+                });
+
+                // If user explicitly requested a tool but model returned text with no tool call,
+                // this is deception - user asked for action, model gave text instead.
+                if user_requests_tool && !text_buf.trim().is_empty() && !has_tool_in_turn {
+                    tracing::warn!(
+                        session = %ctx.session_key,
+                        user_text = %ctx.user_text.chars().take(100).collect::<String>(),
+                        text_preview = %text_buf.chars().take(100).collect::<String>(),
+                        "USER REQUESTED TOOL BUT MODEL DID NOT CALL IT - blocking response"
+                    );
+                    text_buf.clear();
+                    let correction_msg = Message {
+                        role: Role::User,
+                        content: MessageContent::Text(
+                            "[System Correction] User explicitly requested you to call a tool (cron/execute/etc).\n\
+                            You responded with text instead of calling the tool. This is a violation of user intent.\n\
+                            You MUST call the tool that the user requested:\n\
+                            - User said \"用cron list\" -> call cron tool with action=list\n\
+                            - User said \"查cron\" -> call cron tool\n\
+                            - User said \"执行命令\" -> call execute_command tool\n\
+                            Call the tool NOW. Do not explain or apologize."
+                                .to_owned(),
+                        ),
+                    };
+                    turn_scratchpad.push(correction_msg);
+                    tracing::info!(
+                        session = %ctx.session_key,
+                        "USER TOOL REQUEST VIOLATION: injected forced message, continuing loop"
+                    );
+                    continue;
+                }
                 // Skip deception detection for heartbeat/system/summarize sessions.
                 // - heartbeat/system: may legitimately report status without tools
                 // - Summarize: pure summary task with NO tools available by design
@@ -4229,6 +4296,9 @@ const MAX_ERROR_STREAK: usize = 5;
                     // Chinese: claiming to have called/used/checked something
                     "我通过", "我调用", "我查询", "我检查", "我搜索", "我运行", "我执行",
                     "命令查询", "命令检查", "通过命令", "调用了", "查询了", "检查了",
+                    // Chinese: claiming specific results without tool call (data fabrication)
+                    "任务列表中", "cron 任务列表", "当前只有", "个任务", "确实不在",
+                    "列表中", "在列表", "不在列表", "任务有", "有任务",
                     // English - claiming delegation/execution (NOT generic "I completed")
                     "I delegated", "I submitted", "I asked opencode", "opencode is", "I ran",
                     "I checked", "I searched", "I executed", "I visited",
@@ -4239,25 +4309,12 @@ const MAX_ERROR_STREAK: usize = 5;
                     "dispatched", "task dispatched", "task_id:", "task id:",
                     // English: claiming to have called/used something
                     "I called", "I used", "I ran", "via command", "through",
+                    // English: claiming specific results without tool call (data fabrication)
+                    "task list", "cron jobs", "currently has", "tasks:", "in the list",
                 ];
                 let lower_text = text_buf.to_lowercase();
                 let claims_action = deception_keywords.iter().any(|kw| {
                     lower_text.contains(&kw.to_lowercase()) || text_buf.contains(kw)
-                });
-
-                // Check if turn_scratchpad contains tool calls (from earlier iterations)
-                let has_tool_in_turn = turn_scratchpad.iter().any(|msg| {
-                    if let crate::provider::MessageContent::Parts(parts) = &msg.content {
-                        parts.iter().any(|p| {
-                            matches!(p, crate::provider::ContentPart::ToolUse { name, .. }
-                                if name == "opencode" || name == "claudecode" || name == "codex"
-                                    || name == "web_search" || name == "execute_command"
-                                    || name == "web_browser" || name == "web_fetch"
-                                    || name == "cron" || name == "read_file" || name == "write_file")
-                        })
-                    } else {
-                        false
-                    }
                 });
 
                 // Only flag deception for regular sessions when model claims action
