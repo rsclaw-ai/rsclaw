@@ -136,12 +136,17 @@ impl ShellBridgePlugin {
             }
         });
 
+        let timeout = manifest
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(DEFAULT_CALL_TIMEOUT_SECS));
+
         Ok(Self {
             name: manifest.name.clone(),
             stdin: stdin_arc,
             child: Arc::new(Mutex::new(child)),
             next_id: Arc::new(AtomicI64::new(1)),
-            timeout: Duration::from_secs(DEFAULT_CALL_TIMEOUT_SECS),
+            timeout,
             pending,
             reader_handle: Arc::new(Mutex::new(Some(reader_handle))),
         })
