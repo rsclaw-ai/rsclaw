@@ -120,10 +120,9 @@ impl HostMethodRegistry {
     /// and dispatch the action. Returns the raw JSON the browser produced.
     ///
     /// The profile name MUST match `SHARED_BROWSER_PROFILE` in
-    /// `wasm_runtime.rs` (currently "jimeng") so login state persists across
-    /// runtimes.
+    /// `wasm_runtime.rs` so login state persists across runtimes.
     async fn browser_call_raw(&self, action: &str, args: Value) -> Result<Value> {
-        const PROFILE: &str = "jimeng"; // MUST match wasm_runtime.rs::SHARED_BROWSER_PROFILE
+        const PROFILE: &str = "rsclaw"; // MUST match wasm_runtime.rs::SHARED_BROWSER_PROFILE
 
         let mut guard = self.browser.lock().await;
 

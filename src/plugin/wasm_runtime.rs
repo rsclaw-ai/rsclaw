@@ -36,11 +36,11 @@ const EPOCH_DEADLINE_TICKS: u64 = 18000;
 /// Per-store memory cap for wasm linear memory.
 const MEMORY_CAP_BYTES: usize = 256 * 1024 * 1024;
 
-/// On-disk Chrome profile dir name used by all wasm plugins. Kept as the
-/// legacy slug to preserve existing login sessions; do NOT interpret as
-/// "the jimeng plugin's profile" — every plugin (jimeng/douyin/xianyu)
-/// shares this single profile so a Bytedance login spans all of them.
-const SHARED_BROWSER_PROFILE: &str = "jimeng";
+/// On-disk Chrome profile dir name used by all plugins (wasm + shell). Every
+/// plugin (jimeng/douyin/xianyu/travel/...) shares this single profile so a
+/// single Bytedance login spans all of them, a single Taobao login covers
+/// travel + jimeng's downstream login flows, etc.
+const SHARED_BROWSER_PROFILE: &str = "rsclaw";
 
 use crate::browser::BrowserSession;
 
@@ -580,13 +580,11 @@ impl HostState {
             let chrome_path = crate::agent::platform::ensure_chrome()
                 .await
                 .map_err(|e| format!("failed to obtain Chrome: {e:#}"))?;
-            // All wasm plugins share one Chrome profile so that auth state
+            // All plugins share one Chrome profile so that auth state
             // (cookies, localStorage) is reused across the session — e.g.
-            // a single login to Bytedance covers jimeng + douyin + xianyu.
-            // The legacy slug "jimeng" was the first plugin's name and is
-            // still used as the on-disk profile dir to avoid invalidating
-            // existing login sessions; callers should treat this as an
-            // opaque shared identifier, not as a per-plugin profile.
+            // a single login to Bytedance covers jimeng + douyin + xianyu,
+            // a single Taobao login covers travel + jimeng. Callers should
+            // treat this as an opaque shared identifier.
             let session = BrowserSession::start(&chrome_path, true, Some(SHARED_BROWSER_PROFILE))
                 .await
                 .map_err(|e| format!("failed to start Chrome: {e:#}"))?;

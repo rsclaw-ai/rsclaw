@@ -245,6 +245,12 @@ impl ChromeProcess {
             "--password-store=basic",
             "--use-mock-keychain",
             "--window-size=1280,720",
+            // Deny native Chrome permission prompts (geolocation, notifications,
+            // camera/microphone, etc.). Some sites — Fliggy's order page in
+            // particular — request geolocation as a soft anti-bot signal; the
+            // prompt steals focus and can block downstream interaction in headed
+            // mode. Plugins can still grant permissions explicitly via CDP.
+            "--deny-permission-prompts",
             "about:blank",
         ];
         if !headed {
