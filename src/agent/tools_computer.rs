@@ -879,7 +879,7 @@ except ImportError:
                                         .unwrap_or_default();
                                     // Extract description from frontmatter
                                     let desc = if content.starts_with("---") {
-                                        content.splitn(3, "---").nth(1)
+                                        content.split("---").nth(1)
                                             .and_then(|fm| {
                                                 fm.lines().find_map(|l| {
                                                     l.strip_prefix("description:")

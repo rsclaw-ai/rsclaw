@@ -5505,7 +5505,7 @@ const MAX_ERROR_STREAK: usize = 5;
                             // Detect error from result content (exit_code != 0 or error field)
                             is_error: Some(
                                 result_text.contains("\"exit_code\":")
-                                && result_text.contains("\"exit_code\": 0") == false
+                                && !result_text.contains("\"exit_code\": 0")
                                 || result_text.contains("\"error\"")
                                 || result_text.contains("[stderr]")
                                 || result_text.contains("[exit code:")
@@ -6676,8 +6676,8 @@ const MAX_FILE_CONTENT_CHARS: usize = 20_000;
 /// Patch fields of an existing `AgentEntry` in `agents.list` in the config file.
 ///
 /// - `model`: `Some("")` or `Some("default")` removes the field (agent falls back to defaults).
-///            `Some("provider/model")` sets `model.primary`.
-///            `None` leaves it untouched.
+///   `Some("provider/model")` sets `model.primary`.
+///   `None` leaves it untouched.
 /// - `name`:  `Some("")` removes the field. `Some(x)` sets it. `None` leaves it.
 ///
 /// The config hot-reload watcher picks up the change automatically — no restart needed.

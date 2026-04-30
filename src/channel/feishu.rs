@@ -1533,136 +1533,6 @@ impl Channel for FeishuChannel {
 }
 
 // ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn init_crypto() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    }
-
-    #[test]
-    fn channel_name() {
-        init_crypto();
-        let ch = FeishuChannel::new(
-            "app_id",
-            "app_secret",
-            vec![],
-            Arc::new(|_, _, _, _, _, _| {}),
-        );
-        assert_eq!(ch.name(), "feishu");
-    }
-
-    #[test]
-    fn sender_id_extraction() {
-        let msg = FeishuMessage {
-            message_id: "m1".into(),
-            msg_type: "text".into(),
-            body: None,
-            sender: Some(MessageSender {
-                sender_id: Some(SenderIdInfo {
-                    open_id: Some("ou_abc123".into()),
-                    user_id: None,
-                    union_id: None,
-                }),
-                sender_type: Some("user".into()),
-            }),
-            chat_id: Some("oc_test".into()),
-            create_time: "1700000000000".into(),
-        };
-        assert_eq!(FeishuChannel::sender_id(&msg), "ou_abc123");
-    }
-
-    #[test]
-    fn bot_sender_detected() {
-        let msg = FeishuMessage {
-            message_id: "m2".into(),
-            msg_type: "text".into(),
-            body: None,
-            sender: Some(MessageSender {
-                sender_id: None,
-                sender_type: Some("app".into()),
-            }),
-            chat_id: None,
-            create_time: String::new(),
-        };
-        assert!(FeishuChannel::is_bot_sender(&msg));
-    }
-
-    #[test]
-    fn user_sender_not_bot() {
-        let msg = FeishuMessage {
-            message_id: "m3".into(),
-            msg_type: "text".into(),
-            body: None,
-            sender: Some(MessageSender {
-                sender_id: None,
-                sender_type: Some("user".into()),
-            }),
-            chat_id: None,
-            create_time: String::new(),
-        };
-        assert!(!FeishuChannel::is_bot_sender(&msg));
-    }
-
-    #[test]
-    fn text_content_parse() {
-        let raw = r#"{"text":"hello world"}"#;
-        let parsed: TextContent = serde_json::from_str(raw).unwrap();
-        assert_eq!(parsed.text.as_deref(), Some("hello world"));
-    }
-
-    #[test]
-    fn feishu_chunk_limit() {
-        let limit = platform_chunk_limit("feishu");
-        assert!(limit >= 4000);
-    }
-
-    #[test]
-    fn ws_event_json_data() {
-        // Verify parsing of a WS frame with JSON-string data field
-        let frame = r#"{"type":"event","data":"{\"header\":{\"event_type\":\"im.message.receive_v1\"},\"event\":{\"message\":{\"message_type\":\"text\",\"content\":\"{\\\"text\\\":\\\"hello\\\"}\",\"chat_id\":\"oc_test\",\"chat_type\":\"p2p\"},\"sender\":{\"sender_type\":\"user\",\"sender_id\":{\"open_id\":\"ou_xxx\"}}}}"}"#;
-        let val: serde_json::Value = serde_json::from_str(frame).unwrap();
-        let frame_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        assert_eq!(frame_type, "event");
-
-        let data_str = val.get("data").and_then(|v| v.as_str()).unwrap();
-        let event: serde_json::Value = serde_json::from_str(data_str).unwrap();
-        let event_type = event
-            .pointer("/header/event_type")
-            .and_then(|v| v.as_str())
-            .unwrap();
-        assert_eq!(event_type, "im.message.receive_v1");
-    }
-
-    #[test]
-    fn ws_pong_frame_ignored() {
-        let frame = r#"{"type":"pong"}"#;
-        let val: serde_json::Value = serde_json::from_str(frame).unwrap();
-        let frame_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        assert_eq!(frame_type, "pong");
-    }
-
-    #[test]
-    fn base64_decode_valid() {
-        // base64 of '{"hello":"world"}'
-        use base64::Engine;
-        let json_str = r#"{"hello":"world"}"#;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(json_str);
-        let decoded = base64_decode_json(&encoded).unwrap();
-        assert_eq!(decoded.get("hello").and_then(|v| v.as_str()), Some("world"));
-    }
-
-    #[test]
-    fn base64_decode_invalid() {
-        assert!(base64_decode_json("not-valid-base64!!!").is_none());
-    }
-}
-
-// ---------------------------------------------------------------------------
 // FeishuNotifier for ACP notifications
 // ---------------------------------------------------------------------------
 
@@ -1939,4 +1809,134 @@ fn audio_duration_ms(path: &str) -> Option<u64> {
     // Fallback: estimate from file size (mp3 ~128kbps = 16KB/s).
     let size = std::fs::metadata(path).ok()?.len();
     Some(size * 1000 / 16_000)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn init_crypto() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
+    #[test]
+    fn channel_name() {
+        init_crypto();
+        let ch = FeishuChannel::new(
+            "app_id",
+            "app_secret",
+            vec![],
+            Arc::new(|_, _, _, _, _, _| {}),
+        );
+        assert_eq!(ch.name(), "feishu");
+    }
+
+    #[test]
+    fn sender_id_extraction() {
+        let msg = FeishuMessage {
+            message_id: "m1".into(),
+            msg_type: "text".into(),
+            body: None,
+            sender: Some(MessageSender {
+                sender_id: Some(SenderIdInfo {
+                    open_id: Some("ou_abc123".into()),
+                    user_id: None,
+                    union_id: None,
+                }),
+                sender_type: Some("user".into()),
+            }),
+            chat_id: Some("oc_test".into()),
+            create_time: "1700000000000".into(),
+        };
+        assert_eq!(FeishuChannel::sender_id(&msg), "ou_abc123");
+    }
+
+    #[test]
+    fn bot_sender_detected() {
+        let msg = FeishuMessage {
+            message_id: "m2".into(),
+            msg_type: "text".into(),
+            body: None,
+            sender: Some(MessageSender {
+                sender_id: None,
+                sender_type: Some("app".into()),
+            }),
+            chat_id: None,
+            create_time: String::new(),
+        };
+        assert!(FeishuChannel::is_bot_sender(&msg));
+    }
+
+    #[test]
+    fn user_sender_not_bot() {
+        let msg = FeishuMessage {
+            message_id: "m3".into(),
+            msg_type: "text".into(),
+            body: None,
+            sender: Some(MessageSender {
+                sender_id: None,
+                sender_type: Some("user".into()),
+            }),
+            chat_id: None,
+            create_time: String::new(),
+        };
+        assert!(!FeishuChannel::is_bot_sender(&msg));
+    }
+
+    #[test]
+    fn text_content_parse() {
+        let raw = r#"{"text":"hello world"}"#;
+        let parsed: TextContent = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.text.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn feishu_chunk_limit() {
+        let limit = platform_chunk_limit("feishu");
+        assert!(limit >= 4000);
+    }
+
+    #[test]
+    fn ws_event_json_data() {
+        // Verify parsing of a WS frame with JSON-string data field
+        let frame = r#"{"type":"event","data":"{\"header\":{\"event_type\":\"im.message.receive_v1\"},\"event\":{\"message\":{\"message_type\":\"text\",\"content\":\"{\\\"text\\\":\\\"hello\\\"}\",\"chat_id\":\"oc_test\",\"chat_type\":\"p2p\"},\"sender\":{\"sender_type\":\"user\",\"sender_id\":{\"open_id\":\"ou_xxx\"}}}}"}"#;
+        let val: serde_json::Value = serde_json::from_str(frame).unwrap();
+        let frame_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(frame_type, "event");
+
+        let data_str = val.get("data").and_then(|v| v.as_str()).unwrap();
+        let event: serde_json::Value = serde_json::from_str(data_str).unwrap();
+        let event_type = event
+            .pointer("/header/event_type")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert_eq!(event_type, "im.message.receive_v1");
+    }
+
+    #[test]
+    fn ws_pong_frame_ignored() {
+        let frame = r#"{"type":"pong"}"#;
+        let val: serde_json::Value = serde_json::from_str(frame).unwrap();
+        let frame_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(frame_type, "pong");
+    }
+
+    #[test]
+    fn base64_decode_valid() {
+        // base64 of '{"hello":"world"}'
+        use base64::Engine;
+        let json_str = r#"{"hello":"world"}"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(json_str);
+        let decoded = base64_decode_json(&encoded).unwrap();
+        assert_eq!(decoded.get("hello").and_then(|v| v.as_str()), Some("world"));
+    }
+
+    #[test]
+    fn base64_decode_invalid() {
+        assert!(base64_decode_json("not-valid-base64!!!").is_none());
+    }
 }

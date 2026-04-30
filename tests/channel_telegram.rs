@@ -13,11 +13,20 @@ fn init_crypto() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-fn noop_on_message() -> Arc<
-    dyn Fn(i64, String, i64, bool, Option<i64>, Vec<rsclaw::agent::registry::ImageAttachment>, Vec<rsclaw::agent::registry::FileAttachment>)
-        + Send
+type OnMessage = Arc<
+    dyn Fn(
+            i64,
+            String,
+            i64,
+            bool,
+            Option<i64>,
+            Vec<rsclaw::agent::registry::ImageAttachment>,
+            Vec<rsclaw::agent::registry::FileAttachment>,
+        ) + Send
         + Sync,
-> {
+>;
+
+fn noop_on_message() -> OnMessage {
     Arc::new(|_, _, _, _, _, _, _| {})
 }
 

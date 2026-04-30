@@ -57,7 +57,7 @@ async fn stream_text_delta_events() {
     )
     .await;
 
-    let provider = AnthropicProvider::with_base_url("test-key", &server.uri());
+    let provider = AnthropicProvider::with_base_url("test-key", server.uri());
     let stream = provider.stream(simple_request("claude-3-5-sonnet")).await.unwrap();
     let events = collect_stream_events(stream).await;
 
@@ -87,7 +87,7 @@ async fn stream_tool_use() {
     )
     .await;
 
-    let provider = AnthropicProvider::with_base_url("test-key", &server.uri());
+    let provider = AnthropicProvider::with_base_url("test-key", server.uri());
     let stream = provider.stream(simple_request("claude-3-5-sonnet")).await.unwrap();
     let events = collect_stream_events(stream).await;
 
@@ -115,7 +115,7 @@ async fn stream_thinking_delta_discarded() {
     )
     .await;
 
-    let provider = AnthropicProvider::with_base_url("test-key", &server.uri());
+    let provider = AnthropicProvider::with_base_url("test-key", server.uri());
     let stream = provider.stream(simple_request("claude-3-5-sonnet")).await.unwrap();
     let events = collect_stream_events(stream).await;
 
@@ -138,7 +138,7 @@ async fn stream_error_event() {
     )
     .await;
 
-    let provider = AnthropicProvider::with_base_url("test-key", &server.uri());
+    let provider = AnthropicProvider::with_base_url("test-key", server.uri());
     let stream = provider.stream(simple_request("claude-3-5-sonnet")).await.unwrap();
     let events = collect_stream_events(stream).await;
 
@@ -164,7 +164,7 @@ async fn http_401_error() {
         .mount(&server)
         .await;
 
-    let provider = AnthropicProvider::with_base_url("bad-key", &server.uri());
+    let provider = AnthropicProvider::with_base_url("bad-key", server.uri());
     let result = provider.stream(simple_request("claude-3-5-sonnet")).await;
     let err_msg = result.err().expect("expected error").to_string();
     assert!(err_msg.contains("401"), "expected 401 in error: {err_msg}");
@@ -182,7 +182,7 @@ async fn http_429_error() {
         .mount(&server)
         .await;
 
-    let provider = AnthropicProvider::with_base_url("key", &server.uri());
+    let provider = AnthropicProvider::with_base_url("key", server.uri());
     let result = provider.stream(simple_request("claude-3-5-sonnet")).await;
     let err_msg = result.err().expect("expected error").to_string();
     assert!(err_msg.contains("429"), "expected 429 in error: {err_msg}");
@@ -198,7 +198,7 @@ async fn http_500_error() {
         .mount(&server)
         .await;
 
-    let provider = AnthropicProvider::with_base_url("key", &server.uri());
+    let provider = AnthropicProvider::with_base_url("key", server.uri());
     let result = provider.stream(simple_request("claude-3-5-sonnet")).await;
     let err_msg = result.err().expect("expected error").to_string();
     assert!(err_msg.contains("500"), "expected 500 in error: {err_msg}");
@@ -227,7 +227,7 @@ async fn request_includes_correct_headers() {
         .mount(&server)
         .await;
 
-    let provider = AnthropicProvider::with_base_url("my-secret-key", &server.uri());
+    let provider = AnthropicProvider::with_base_url("my-secret-key", server.uri());
     let result = provider.stream(simple_request("claude-3-5-sonnet")).await;
     assert!(result.is_ok(), "request should succeed when headers match");
 }
@@ -273,7 +273,7 @@ async fn request_body_maps_messages() {
         session_key: None,
     };
 
-    let provider = AnthropicProvider::with_base_url("key", &server.uri());
+    let provider = AnthropicProvider::with_base_url("key", server.uri());
     let result = provider.stream(req).await;
     assert!(
         result.is_ok(),

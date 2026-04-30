@@ -29,12 +29,12 @@ use super::security::{check_file_content_safety, check_read_safety, check_write_
 /// thing on a typo'd subcommand.
 ///
 /// Recognised formats (one per line, case-insensitive on the trigger):
-///   - clap (Rust):      `tip: some similar subcommands exist: 'a', 'b'`
-///                       `tip: a similar argument exists: '--foo'`
-///   - cobra (Go):       `Did you mean this?\n  xyz`
-///   - commander (Node): `(Did you mean --xyz?)`
-///   - click (Python):   `Did you mean "xyz"?` / `Did you mean 'xyz'?`
-///   - generic:          any line containing `did you mean` (lowered)
+/// - clap (Rust):      `tip: some similar subcommands exist: 'a', 'b'`
+///   `tip: a similar argument exists: '--foo'`
+/// - cobra (Go):       `Did you mean this?\n  xyz`
+/// - commander (Node): `(Did you mean --xyz?)`
+/// - click (Python):   `Did you mean "xyz"?` / `Did you mean 'xyz'?`
+/// - generic:          any line containing `did you mean` (lowered)
 fn extract_cli_hint(stderr: &str) -> Option<String> {
     let mut tip_line: Option<String> = None;
     let mut after_did_you_mean_this: Option<String> = None;

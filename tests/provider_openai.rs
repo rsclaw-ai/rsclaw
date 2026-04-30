@@ -56,7 +56,7 @@ async fn stream_text_delta() {
     )
     .await;
 
-    let provider = OpenAiProvider::with_base_url(&server.uri(), Some("test-key".to_owned()));
+    let provider = OpenAiProvider::with_base_url(server.uri(), Some("test-key".to_owned()));
     let stream = provider.stream(simple_request("gpt-4o")).await.unwrap();
     let events = collect_stream_events(stream).await;
 
@@ -85,7 +85,7 @@ async fn stream_tool_call_delta() {
     )
     .await;
 
-    let provider = OpenAiProvider::with_base_url(&server.uri(), Some("test-key".to_owned()));
+    let provider = OpenAiProvider::with_base_url(server.uri(), Some("test-key".to_owned()));
     let stream = provider.stream(simple_request("gpt-4o")).await.unwrap();
     let events = collect_stream_events(stream).await;
 
@@ -99,7 +99,7 @@ async fn non_sse_json_response() {
     let server = MockServer::start().await;
     mount_openai_json(&server, "This is JSON content").await;
 
-    let provider = OpenAiProvider::with_base_url(&server.uri(), Some("test-key".to_owned()));
+    let provider = OpenAiProvider::with_base_url(server.uri(), Some("test-key".to_owned()));
     let stream = provider.stream(simple_request("gpt-4o")).await.unwrap();
     let events = collect_stream_events(stream).await;
 
@@ -121,7 +121,7 @@ async fn http_error_401() {
         .mount(&server)
         .await;
 
-    let provider = OpenAiProvider::with_base_url(&server.uri(), Some("bad-key".to_owned()));
+    let provider = OpenAiProvider::with_base_url(server.uri(), Some("bad-key".to_owned()));
     let result = provider.stream(simple_request("gpt-4o")).await;
     let err_msg = result.err().expect("expected error").to_string();
     assert!(err_msg.contains("401"), "expected 401: {err_msg}");
@@ -137,7 +137,7 @@ async fn http_error_429() {
         .mount(&server)
         .await;
 
-    let provider = OpenAiProvider::with_base_url(&server.uri(), Some("key".to_owned()));
+    let provider = OpenAiProvider::with_base_url(server.uri(), Some("key".to_owned()));
     let result = provider.stream(simple_request("gpt-4o")).await;
     let err_msg = result.err().expect("expected error").to_string();
     assert!(err_msg.contains("429"), "expected 429: {err_msg}");
@@ -153,7 +153,7 @@ async fn http_error_500() {
         .mount(&server)
         .await;
 
-    let provider = OpenAiProvider::with_base_url(&server.uri(), Some("key".to_owned()));
+    let provider = OpenAiProvider::with_base_url(server.uri(), Some("key".to_owned()));
     let result = provider.stream(simple_request("gpt-4o")).await;
     let err_msg = result.err().expect("expected error").to_string();
     assert!(err_msg.contains("500"), "expected 500: {err_msg}");
