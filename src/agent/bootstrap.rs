@@ -254,96 +254,60 @@ alternative phrasings and edge cases.
 ";
 
 // ---------------------------------------------------------------------------
-// Platform rule seed files (site-rules/)
+// Embedded knowledge trees (site-rules/ + app-rules/)
 // ---------------------------------------------------------------------------
+//
+// `tools/` in the repo holds platform-wide knowledge for browser and
+// computer_use:
+//   - tools/web_browser/site-rules/       (per-host browser knowledge)
+//   - tools/computer_use/app-rules/       (per-app desktop automation)
+//
+// `include_dir!` snapshots the trees at compile time so the binary is
+// self-contained — no runtime download, no source-tree dependency. The
+// seed logic walks each tree and writes a file only if the user's local
+// copy doesn't already exist (so hand-edits survive an upgrade).
 
-const SITE_DOUYIN: &str = "\
----
-domain: creator.douyin.com
-aliases: [douyin, tiktok-cn]
-updated: 2026-04-17
----
-## Platform
-- Creator backend: https://creator.douyin.com/creator-micro/content/upload
-- Video publish: upload redirects to publish page (v1 or v2 route)
-- Note publish: image upload -> separate publish page
+use include_dir::{include_dir, Dir};
 
-## Effective Patterns
-- Title: contenteditable div, max 30 chars
-- Description: `.zone-container[contenteditable=\"true\"]`
-- Publish button: `button:has-text(\"publish\")` or `button:has-text(\"send\")`
-- Scheduled publish: radio button for scheduled, then date picker
-- Tags: input with # prefix, press space after each tag
+static SITE_RULES_TREE: Dir<'_> =
+    include_dir!("$CARGO_MANIFEST_DIR/tools/web_browser/site-rules");
+static APP_RULES_TREE: Dir<'_> =
+    include_dir!("$CARGO_MANIFEST_DIR/tools/computer_use/app-rules");
 
-## Known Issues
-- Anti-bot: strict detection, prefer GUI interaction over URL construction
-- Two different publish page versions (v1/v2) with different layouts
-- Video cover auto-selection may be required before publish enabled
-- QR login: scan in Douyin app, cookies persist across sessions
-";
-
-const SITE_KUAISHOU: &str = "\
----
-domain: cp.kuaishou.com
-aliases: [kuaishou, kwai]
-updated: 2026-04-17
----
-## Platform
-- Creator backend: https://cp.kuaishou.com/article/publish/video
-- Uses Ant Design UI components
-
-## Effective Patterns
-- Date picker: `.ant-picker-input` for scheduled publish
-- Time format: YYYY-MM-DD HH:MM:SS (with seconds)
-- Publish flow: upload -> fill form -> publish
-
-## Known Issues
-- Tutorial overlay (Joyride) blocks interaction on first visit, must dismiss
-- Guide overlay: `div[id^=\"react-joyride-step\"]` -> find skip/close button
-";
-
-const SITE_XIAOHONGSHU: &str = "\
----
-domain: creator.xiaohongshu.com
-aliases: [xiaohongshu, xhs, little-red-book]
-updated: 2026-04-17
----
-## Platform
-- Video: https://creator.xiaohongshu.com/publish/publish?target=video
-- Note/images: ?target=image (up to 30 images per note)
-- Success page: URL matches **/publish/success?**
-
-## Effective Patterns
-- Upload then fill title, description, tags
-- Success detection: wait for redirect to success URL
-
-## Known Issues
-- Very strict anti-crawl, always use web_browser (not web_fetch)
-- xsec_token mechanism in URLs, do not manually construct URLs
-- QR login: switch to QR panel first (click switch image element)
-";
-
-const SITE_BILIBILI: &str = "\
----
-domain: www.bilibili.com
-aliases: [bilibili, b-site]
-updated: 2026-04-17
----
-## Platform
-- Video upload via biliup CLI tool (Rust binary, not browser)
-- Install: `rsclaw tools install biliup` or download from GitHub
-
-## Effective Patterns
-- Login: `biliup login` (interactive QR code in terminal)
-- Upload: `biliup upload <file> --title <t> --desc <d> --tid <category> --tags t1,t2`
-- Category ID (tid) is required: e.g. 249 for lifestyle
-- Credential refresh: `biliup renew`
-
-## Known Issues
-- Browser automation not recommended (complex anti-bot)
-- biliup binary auto-downloads for current platform
-- Cookie files stored at cookies/bilibili_<account>.json
-";
+/// Walk an embedded `include_dir!` tree (recursively) and write each
+/// file to `dest/<relative path>`, creating intermediate dirs and
+/// skipping any file the user already has on disk. Returns the number
+/// of files newly created.
+fn extract_tree_preserving(dir: &Dir<'_>, dest: &Path) -> Result<usize> {
+    use include_dir::DirEntry;
+    let mut created = 0usize;
+    std::fs::create_dir_all(dest)?;
+    for entry in dir.entries() {
+        match entry {
+            DirEntry::File(file) => {
+                // `file.path()` is the path relative to the original
+                // `include_dir!` root, e.g. `amazon/product-search.md`
+                // or `douyin.md`.
+                let target = dest.join(file.path());
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if !target.exists() {
+                    std::fs::write(&target, file.contents())?;
+                    info!(file = %target.display(), "seeded knowledge file");
+                    created += 1;
+                }
+            }
+            DirEntry::Dir(subdir) => {
+                // Recurse — but pass the original `dest`. `subdir.entries()`
+                // still emits paths relative to the include_dir root, so
+                // joining with `dest` produces the correct target.
+                created += extract_tree_preserving(subdir, dest)?;
+            }
+        }
+    }
+    Ok(created)
+}
 
 // ---------------------------------------------------------------------------
 // Seeding logic
@@ -473,24 +437,18 @@ pub fn seed_tools(base_dir: &Path, lang: Option<&str>) -> Result<usize> {
     }
 
     // Site-rules — platform-wide DOM/URL knowledge for web_browser.
-    // Lives under tools/web_browser/site-rules/ (shared across all
-    // agents; was per-workspace, see seed_workspace_with_lang).
-    let site_rules_dir = tools_dir.join("web_browser").join("site-rules");
-    let site_rules: &[(&str, &str)] = &[
-        ("douyin.md", SITE_DOUYIN),
-        ("kuaishou.md", SITE_KUAISHOU),
-        ("xiaohongshu.md", SITE_XIAOHONGSHU),
-        ("bilibili.md", SITE_BILIBILI),
-    ];
-    std::fs::create_dir_all(&site_rules_dir)?;
-    for (name, content) in site_rules {
-        let path = site_rules_dir.join(name);
-        if !path.exists() {
-            std::fs::write(&path, content)?;
-            info!(file = %path.display(), "seeded site rule");
-            created += 1;
-        }
-    }
+    // Embedded at compile time via `include_dir!`; extracted file-by-file
+    // so user hand-edits survive an upgrade.
+    created += extract_tree_preserving(
+        &SITE_RULES_TREE,
+        &tools_dir.join("web_browser").join("site-rules"),
+    )?;
+
+    // App-rules — per-app desktop automation playbooks for computer_use.
+    created += extract_tree_preserving(
+        &APP_RULES_TREE,
+        &tools_dir.join("computer_use").join("app-rules"),
+    )?;
 
     Ok(created)
 }

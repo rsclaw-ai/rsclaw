@@ -108,6 +108,8 @@ fs2 = "0.4.3"
 rusqlite = { version = "0.32", optional = true, features = ["bundled"] }
 htmd    = "0.5"
 lol_html = "1.2"
+# Embed `tools/` site-rules + app-rules into the binary at compile time
+include_dir = "0.7"
 wasmtime = { version = "29", features = ["async"] }
 wasmtime-wasi = "29"
 moka = { version = "0.12", features = ["future"] }
