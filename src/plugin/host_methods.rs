@@ -47,6 +47,7 @@ impl HostMethodRegistry {
             "browser_click_at" => self.host_browser_click_at(params).await,
             "browser_fill" => self.host_browser_fill(params).await,
             "browser_snapshot" => self.host_browser_snapshot(params).await,
+            "browser_screenshot" => self.host_browser_screenshot(params).await,
             "browser_download" => self.host_browser_download(params).await,
             "sleep" => self.host_sleep(params).await,
             "storage_allocate_artifact" => self.host_storage_allocate_artifact(params).await,
@@ -116,18 +117,12 @@ impl HostMethodRegistry {
     // ---- A2 browser helper ----
 
     /// Lock the shared browser session, auto-starting Chrome on first use,
-    /// dispatch the action via `BrowserSession::execute`, and extract a
-    /// payload string the way wasm plugins see results.
+    /// and dispatch the action. Returns the raw JSON the browser produced.
     ///
-    /// Mirrors `wasm_runtime.rs::HostState::browser_action`. The two runtimes
-    /// MUST share this code path so a shell plugin and a wasm plugin see
-    /// byte-identical browser results.
-    async fn browser_call(&self, action: &str, args: Value) -> Result<Value> {
-        // The profile name MUST match `SHARED_BROWSER_PROFILE` in
-        // `wasm_runtime.rs` (currently "jimeng"). Both runtimes share the
-        // same Chrome profile so login state persists across runtimes.
-        // Making that constant `pub` would couple wasm_runtime to this
-        // module; a future cleanup task can do that if the value ever changes.
+    /// The profile name MUST match `SHARED_BROWSER_PROFILE` in
+    /// `wasm_runtime.rs` (currently "jimeng") so login state persists across
+    /// runtimes.
+    async fn browser_call_raw(&self, action: &str, args: Value) -> Result<Value> {
         const PROFILE: &str = "jimeng"; // MUST match wasm_runtime.rs::SHARED_BROWSER_PROFILE
 
         let mut guard = self.browser.lock().await;
@@ -144,17 +139,27 @@ impl HostMethodRegistry {
         }
 
         let session = guard.as_mut().expect("browser session just initialized");
-        match session.execute(action, &args).await {
-            Ok(val) => {
-                for field in &["text", "image", "data", "url", "result"] {
-                    if let Some(s) = val.get(field).and_then(|v| v.as_str()) {
-                        return Ok(Value::String(s.to_string()));
-                    }
-                }
-                Ok(val)
+        session
+            .execute(action, &args)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:#}"))
+    }
+
+    /// Like `browser_call_raw`, but extracts a single payload field the way
+    /// wasm plugins see results.
+    ///
+    /// Mirrors `wasm_runtime.rs::HostState::browser_action`. The two runtimes
+    /// MUST share this code path so a shell plugin and a wasm plugin see
+    /// byte-identical browser results — except `screenshot`, which uses
+    /// `browser_call_raw` directly to keep the auto-saved `image_path`.
+    async fn browser_call(&self, action: &str, args: Value) -> Result<Value> {
+        let val = self.browser_call_raw(action, args).await?;
+        for field in &["text", "image", "data", "url", "result"] {
+            if let Some(s) = val.get(field).and_then(|v| v.as_str()) {
+                return Ok(Value::String(s.to_string()));
             }
-            Err(e) => Err(anyhow::anyhow!("{e:#}")),
         }
+        Ok(val)
     }
 
     // ---- A2 stubs (filled in Tasks 11–15) ----
@@ -242,6 +247,17 @@ impl HostMethodRegistry {
     /// Params: `{}` (none required). Mirrors wasm `browser_snapshot`.
     async fn host_browser_snapshot(&self, _params: Value) -> Result<Value> {
         self.browser_call("snapshot", json!({})).await
+    }
+
+    /// Capture a viewport screenshot of the current page in the shared browser session.
+    ///
+    /// Returns the full JSON response `{image, image_path, mime}` (instead of
+    /// the single-field extraction `browser_call` does), so shell plugins can
+    /// notify the user with the on-disk path the host auto-saved to without
+    /// re-decoding the base64 data URI. wasm plugins go through `browser_call`
+    /// and only see `image`; the two surfaces deliberately differ here.
+    async fn host_browser_screenshot(&self, _params: Value) -> Result<Value> {
+        self.browser_call_raw("screenshot", json!({})).await
     }
     /// Download a resource (URL or element ref) to a local path in the shared browser session.
     ///
