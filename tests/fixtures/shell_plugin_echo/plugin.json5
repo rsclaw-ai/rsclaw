@@ -1,0 +1,27 @@
+{
+  name: "echo",
+  version: "0.0.0",
+  description: "Test fixture for shell-bridge bidirectional protocol",
+  runtime: "node",
+  entry: "./index.mjs",
+  tools: [
+    {
+      name: "echo",
+      description: "Echoes args back",
+      inputSchema: {
+        type: "object",
+        properties: { msg: { type: "string" } },
+        required: ["msg"]
+      }
+    },
+    {
+      name: "notify_then_echo",
+      description: "Sends a notify then echoes args",
+      inputSchema: {
+        type: "object",
+        properties: { msg: { type: "string" } },
+        required: ["msg"]
+      }
+    }
+  ]
+}

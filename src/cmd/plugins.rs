@@ -274,6 +274,7 @@ async fn install_wasm_file(src: &std::path::Path) -> Result<()> {
         hooks: vec![],
         tools: vec![],
         min_call_interval_ms: 0,
+        timeout_ms: None,
         requires_rsclaw: None,
         browser_cdn: Default::default(),
         extra: Default::default(),

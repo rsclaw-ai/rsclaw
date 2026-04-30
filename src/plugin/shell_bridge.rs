@@ -15,10 +15,11 @@
 //! Supported runtimes: `node`, `bun`, `deno`.
 
 use std::{
+    collections::HashMap,
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicI64, Ordering},
     },
     time::Duration,
 };
@@ -27,11 +28,12 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Mutex,
+    process::{Child, ChildStdin, Command},
+    sync::{Mutex, oneshot},
+    task::JoinHandle,
     time,
 };
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use super::manifest::PluginManifest;
 
@@ -42,18 +44,27 @@ const DEFAULT_CALL_TIMEOUT_SECS: u64 = 30;
 // ShellBridgePlugin
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct ShellBridgePlugin {
-    name: String,
+    pub name: String,
     stdin: Arc<Mutex<ChildStdin>>,
-    stdout: Arc<Mutex<BufReader<ChildStdout>>>,
     child: Arc<Mutex<Child>>,
-    next_id: Arc<AtomicU64>,
+    next_id: Arc<AtomicI64>,
     timeout: Duration,
+    pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>,
+    /// Reader task handle. `take()`d in `shutdown` so we can `await` the
+    /// task to completion after killing the subprocess (lets the reader
+    /// drain any in-flight responses cleanly before we drop pending).
+    reader_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl ShellBridgePlugin {
-    /// Spawn the plugin subprocess.
-    pub async fn spawn(manifest: &PluginManifest) -> Result<Self> {
+    /// Spawn the plugin subprocess and start the reader task that demuxes
+    /// incoming lines into pending-request fulfillment or host method dispatch.
+    pub async fn spawn(
+        manifest: &PluginManifest,
+        host_dispatch: Arc<crate::plugin::host_methods::HostMethodRegistry>,
+    ) -> Result<Self> {
         let runtime = resolve_runtime(&manifest.runtime)?;
         let entry = manifest.dir.join(&manifest.entry);
 
@@ -70,7 +81,7 @@ impl ShellBridgePlugin {
             .current_dir(&manifest.dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit()) // plugin logs flow to rsclaw stderr
+            .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
             .with_context(|| {
@@ -86,89 +97,225 @@ impl ShellBridgePlugin {
 
         debug!(plugin = %manifest.name, runtime, "plugin subprocess started");
 
+        let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let stdin_arc = Arc::new(Mutex::new(stdin));
+
+        let reader_pending = pending.clone();
+        let reader_stdin = stdin_arc.clone();
+        let reader_dispatch = host_dispatch.clone();
+        let reader_name = manifest.name.clone();
+        let reader_handle = tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => {
+                        debug!(plugin = %reader_name, "plugin stdout closed (EOF)");
+                        break;
+                    }
+                    Ok(_) => {
+                        if let Err(e) = handle_incoming(
+                            line.trim_end_matches('\n'),
+                            &reader_pending,
+                            reader_stdin.clone(),
+                            &reader_dispatch,
+                            &reader_name,
+                        )
+                        .await
+                        {
+                            warn!(plugin = %reader_name, "incoming dispatch error: {e:#}");
+                        }
+                    }
+                    Err(e) => {
+                        error!(plugin = %reader_name, "stdout read error: {e:#}");
+                        break;
+                    }
+                }
+            }
+        });
+
+        let timeout = manifest
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(DEFAULT_CALL_TIMEOUT_SECS));
+
         Ok(Self {
             name: manifest.name.clone(),
-            stdin: Arc::new(Mutex::new(stdin)),
-            stdout: Arc::new(Mutex::new(BufReader::new(stdout))),
+            stdin: stdin_arc,
             child: Arc::new(Mutex::new(child)),
-            next_id: Arc::new(AtomicU64::new(1)),
-            timeout: Duration::from_secs(DEFAULT_CALL_TIMEOUT_SECS),
+            next_id: Arc::new(AtomicI64::new(1)),
+            timeout,
+            pending,
+            reader_handle: Arc::new(Mutex::new(Some(reader_handle))),
         })
     }
 
     /// Call a plugin method and return the result.
+    ///
+    /// Host-initiated: assigns a positive id, writes the request, registers a
+    /// oneshot waiter in `pending`, and awaits the response from the reader task.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
+        // Serialize first so a malformed request never leaves a pending slot behind.
         let request = json!({
             "id":     id,
             "method": method,
             "params": params,
         });
-
         let line = serde_json::to_string(&request).context("serialize request")?;
 
-        // Send request.
-        {
+        // Register pending oneshot BEFORE writing to avoid a race where the reader
+        // sees the response before we've recorded our waiter.
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+
+        // Send request. Hold stdin only for the duration of the write; release
+        // before re-acquiring `pending` on error so the lock ordering is one-way.
+        let write_result: Result<()> = {
             let mut stdin = self.stdin.lock().await;
-            stdin
-                .write_all(line.as_bytes())
-                .await
-                .with_context(|| format!("write to plugin `{}`", self.name))?;
-            stdin.write_all(b"\n").await.context("write newline")?;
-            stdin.flush().await.context("flush stdin")?;
+            async {
+                stdin
+                    .write_all(line.as_bytes())
+                    .await
+                    .context("write request")?;
+                stdin.write_all(b"\n").await.context("write newline")?;
+                stdin.flush().await.context("flush stdin")?;
+                Ok(())
+            }
+            .await
+        };
+        if let Err(e) = write_result {
+            self.pending.lock().await.remove(&id);
+            return Err(e).with_context(|| format!("write to plugin `{}`", self.name));
         }
 
         // Wait for response with timeout.
-        let response_line = time::timeout(self.timeout, self.read_line()).await;
-
-        let line = match response_line {
-            Ok(Ok(l)) => l,
-            Ok(Err(e)) => {
-                bail!("plugin `{}` read error: {e:#}", self.name)
+        match time::timeout(self.timeout, rx).await {
+            Ok(Ok(Ok(v))) => Ok(v),
+            Ok(Ok(Err(e))) => bail!("plugin `{}` error: {e}", self.name),
+            Ok(Err(_canceled)) => {
+                // Sender was dropped — reader task ended (EOF or read error).
+                // Clear our entry so the dead map doesn't accumulate stale slots.
+                self.pending.lock().await.remove(&id);
+                bail!("plugin `{}` reader task ended unexpectedly", self.name);
             }
-            Err(_) => bail!(
-                "plugin `{}` call `{method}` timed out after {}s",
-                self.name,
-                self.timeout.as_secs()
-            ),
-        };
-
-        let resp: Value = serde_json::from_str(&line)
-            .with_context(|| format!("plugin `{}` returned invalid JSON: {line}", self.name))?;
-
-        // Validate ID matches.
-        if resp["id"] != id {
-            warn!(
-                plugin = %self.name,
-                expected = id,
-                got = ?resp["id"],
-                "response ID mismatch"
-            );
+            Err(_timeout) => {
+                // Remove pending entry so a late response is dropped cleanly.
+                self.pending.lock().await.remove(&id);
+                bail!(
+                    "plugin `{}` call `{method}` timed out after {}s",
+                    self.name,
+                    self.timeout.as_secs()
+                );
+            }
         }
-
-        if let Some(err) = resp.get("error") {
-            bail!("plugin `{}` error: {err}", self.name);
-        }
-
-        Ok(resp["result"].clone())
     }
 
-    /// Kill the subprocess gracefully.
+    /// Kill the subprocess and wait for the reader task to drain.
+    ///
+    /// Killing the child closes its stdout, the reader task observes EOF and
+    /// exits, and `await`-ing its handle here ensures any final pending
+    /// responses are processed before this function returns. Skipping the
+    /// await would leave a detached task that the runtime cleans up only at
+    /// shutdown — fine in practice but noisy under tracing and test reports.
     pub async fn shutdown(&self) {
         let mut child = self.child.lock().await;
         let _ = child.kill().await;
+        drop(child);
+        if let Some(handle) = self.reader_handle.lock().await.take() {
+            let _ = handle.await;
+        }
         debug!(plugin = %self.name, "plugin subprocess terminated");
     }
+}
 
-    async fn read_line(&self) -> Result<String> {
-        let mut line = String::new();
-        let mut stdout = self.stdout.lock().await;
-        stdout
-            .read_line(&mut line)
-            .await
-            .with_context(|| format!("read from plugin `{}`", self.name))?;
-        Ok(line.trim_end_matches('\n').to_owned())
+// ---------------------------------------------------------------------------
+// Protocol demux
+// ---------------------------------------------------------------------------
+
+/// Demultiplex one stdout line from a plugin subprocess:
+/// - `{"id": <pos>, "result"|"error": ...}` → response to a host-initiated call;
+///   look up `id` in pending and fulfill its oneshot.
+/// - `{"id": <neg>, "method": ..., "params": ...}` → plugin-initiated request;
+///   dispatch to host_methods on a fresh task and write the response back to stdin.
+async fn handle_incoming(
+    line: &str,
+    pending: &Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>,
+    stdin: Arc<Mutex<ChildStdin>>,
+    host_dispatch: &Arc<crate::plugin::host_methods::HostMethodRegistry>,
+    plugin_name: &str,
+) -> Result<()> {
+    let msg: Value = serde_json::from_str(line)
+        .with_context(|| format!("plugin `{plugin_name}` invalid JSON: {line}"))?;
+
+    let id = msg["id"]
+        .as_i64()
+        .ok_or_else(|| anyhow::anyhow!("plugin `{plugin_name}` message has no integer id"))?;
+
+    if id == 0 {
+        bail!("plugin `{plugin_name}` sent id=0, which is reserved");
+    }
+
+    if id > 0 {
+        // Host-initiated response.
+        let mut map = pending.lock().await;
+        if let Some(tx) = map.remove(&id) {
+            let result = if let Some(err) = msg.get("error") {
+                Err(err.to_string())
+            } else {
+                Ok(msg.get("result").cloned().unwrap_or(Value::Null))
+            };
+            // receiver dropped if call() timed out — intentional best-effort
+            let _ = tx.send(result);
+        } else {
+            warn!(
+                plugin = %plugin_name,
+                id,
+                "response with no pending request — dropping"
+            );
+        }
+        Ok(())
+    } else {
+        // Plugin-initiated request (id < 0).
+        let method = msg["method"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("plugin `{plugin_name}` request id={id} has no method"))?
+            .to_owned();
+        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+
+        // Run the host method on a separate task so the reader loop is not blocked.
+        let dispatch = host_dispatch.clone();
+        let name = plugin_name.to_owned();
+        tokio::spawn(async move {
+            let result = dispatch.handle(&method, params).await;
+            let response = match result {
+                Ok(v) => json!({ "id": id, "result": v }),
+                Err(e) => json!({ "id": id, "error": e.to_string() }),
+            };
+            match serde_json::to_string(&response) {
+                Ok(line) => {
+                    let mut sin = stdin.lock().await;
+                    if let Err(e) = sin.write_all(line.as_bytes()).await {
+                        warn!(plugin = %name, "failed to write response: {e}");
+                        return;
+                    }
+                    if let Err(e) = sin.write_all(b"\n").await {
+                        warn!(plugin = %name, "failed to write newline: {e}");
+                        return;
+                    }
+                    if let Err(e) = sin.flush().await {
+                        warn!(plugin = %name, "failed to flush: {e}");
+                    }
+                }
+                Err(e) => {
+                    warn!(plugin = %name, "failed to serialize response: {e}");
+                }
+            }
+        });
+        Ok(())
     }
 }
 
@@ -236,8 +383,11 @@ pub struct Plugin {
 }
 
 impl Plugin {
-    pub async fn spawn(manifest: PluginManifest) -> Result<Self> {
-        let inner = ShellBridgePlugin::spawn(&manifest).await?;
+    pub async fn spawn(
+        manifest: PluginManifest,
+        host_dispatch: Arc<crate::plugin::host_methods::HostMethodRegistry>,
+    ) -> Result<Self> {
+        let inner = ShellBridgePlugin::spawn(&manifest, host_dispatch).await?;
         Ok(Self { inner, manifest })
     }
 
