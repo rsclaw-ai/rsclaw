@@ -143,12 +143,6 @@ const vi: PartialLocaleType = {
     SubTitle: "Tất cả các tùy chọn cài đặt",
 
     Danger: {
-      Reset: {
-        Title: "Đặt lại tất cả cài đặt",
-        SubTitle: "Đặt lại tất cả các mục cài đặt về giá trị mặc định",
-        Action: "Đặt lại ngay",
-        Confirm: "Xác nhận đặt lại tất cả cài đặt?",
-      },
       Clear: {
         Title: "Xóa tất cả dữ liệu",
         SubTitle: "Xóa tất cả các cuộc trò chuyện và dữ liệu cài đặt",

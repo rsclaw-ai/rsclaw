@@ -143,12 +143,6 @@ const jp: PartialLocaleType = {
     SubTitle: "すべての設定オプション",
 
     Danger: {
-      Reset: {
-        Title: "すべての設定をリセット",
-        SubTitle: "すべての設定項目をデフォルト値にリセット",
-        Action: "今すぐリセット",
-        Confirm: "すべての設定をリセットしてもよろしいですか？",
-      },
       Clear: {
         Title: "すべてのデータをクリア",
         SubTitle: "すべてのチャット、設定データをクリア",

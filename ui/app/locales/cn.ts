@@ -162,17 +162,17 @@ const cn = {
     ShowPassword: "显示密码",
 
     Danger: {
-      Reset: {
-        Title: "重置所有设置",
-        SubTitle: "重置所有设置项回默认值",
-        Action: "立即重置",
-        Confirm: "确认重置所有设置？",
-      },
       Clear: {
-        Title: "清除所有数据",
-        SubTitle: "清除所有聊天、设置数据",
-        Action: "立即清除",
-        Confirm: "确认清除所有聊天、设置数据？",
+        Title: "清空会话历史",
+        SubTitle: "仅清空本地会话历史，不影响服务端",
+        Action: "立即清空",
+        Confirm: "确认清空所有会话历史？",
+      },
+      Cache: {
+        Title: "清空本地缓存",
+        SubTitle: "清空本地缓存，不包括会话历史",
+        Action: "立即清空",
+        Confirm: "确认清空本地缓存？会话历史会保留，应用会自动重新加载。",
       },
     },
     Lang: {

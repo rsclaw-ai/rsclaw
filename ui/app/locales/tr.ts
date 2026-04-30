@@ -143,12 +143,6 @@ const tr: PartialLocaleType = {
     SubTitle: "Tüm ayar seçenekleri",
 
     Danger: {
-      Reset: {
-        Title: "Tüm ayarları sıfırla",
-        SubTitle: "Tüm ayarları varsayılan değerlere sıfırla",
-        Action: "Hemen sıfırla",
-        Confirm: "Tüm ayarları sıfırlamak istediğinizden emin misiniz?",
-      },
       Clear: {
         Title: "Tüm verileri temizle",
         SubTitle: "Tüm sohbet ve ayar verilerini temizle",

@@ -148,13 +148,6 @@ const es: PartialLocaleType = {
     SubTitle: "Todas las opciones de configuración",
 
     Danger: {
-      Reset: {
-        Title: "Restablecer todas las configuraciones",
-        SubTitle:
-          "Restablecer todas las configuraciones a los valores predeterminados",
-        Action: "Restablecer ahora",
-        Confirm: "¿Confirmar el restablecimiento de todas las configuraciones?",
-      },
       Clear: {
         Title: "Eliminar todos los datos",
         SubTitle: "Eliminar todos los chats y datos de configuración",

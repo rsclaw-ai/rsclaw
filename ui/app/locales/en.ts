@@ -163,17 +163,18 @@ const en: LocaleType = {
     SubTitle: "All Settings",
     ShowPassword: "ShowPassword",
     Danger: {
-      Reset: {
-        Title: "Reset All Settings",
-        SubTitle: "Reset all setting items to default",
-        Action: "Reset",
-        Confirm: "Confirm to reset all settings to default?",
-      },
       Clear: {
-        Title: "Clear All Data",
-        SubTitle: "Clear all messages and settings",
+        Title: "Clear Chat History",
+        SubTitle: "Clears local chat history only — server data is preserved",
         Action: "Clear",
-        Confirm: "Confirm to clear all messages and settings?",
+        Confirm: "Confirm to clear all chat history?",
+      },
+      Cache: {
+        Title: "Clear Local Cache",
+        SubTitle: "Clears local cache — chat history is preserved",
+        Action: "Clear",
+        Confirm:
+          "Clear local cache? Chat history will be preserved. The app will reload automatically.",
       },
     },
     Lang: {

@@ -163,12 +163,6 @@ const da: PartialLocaleType = {
     SubTitle: "Alle indstillinger",
     ShowPassword: "Vis kodeord",
     Danger: {
-      Reset: {
-        Title: "Nulstil alle indstillinger",
-        SubTitle: "Gendan alt til standard",
-        Action: "Nulstil",
-        Confirm: "Vil du virkelig nulstille alt?",
-      },
       Clear: {
         Title: "Slet alle data",
         SubTitle: "Sletter alt om beskeder og indstillinger",

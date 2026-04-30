@@ -145,12 +145,6 @@ const de: PartialLocaleType = {
     SubTitle: "Alle Einstellungsmöglichkeiten",
 
     Danger: {
-      Reset: {
-        Title: "Alle Einstellungen zurücksetzen",
-        SubTitle: "Setzt alle Einstellungen auf die Standardwerte zurück",
-        Action: "Jetzt zurücksetzen",
-        Confirm: "Bestätigen Sie das Zurücksetzen aller Einstellungen?",
-      },
       Clear: {
         Title: "Alle Daten löschen",
         SubTitle: "Löscht alle Chats und Einstellungsdaten",
