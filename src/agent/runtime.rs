@@ -2325,6 +2325,9 @@ impl AgentRuntime {
             );
             all.extend(extra_tools.iter().cloned());
             all.extend(super::tools_builder::build_wasm_tool_defs(&self.wasm_plugins));
+            if let Some(ref reg) = self.plugins {
+                all.extend(super::tools_builder::build_shell_tool_defs(reg));
+            }
             if let Some(ref mcp) = self.mcp {
                 all.extend(mcp.all_tool_defs().await);
             }
@@ -2589,10 +2592,11 @@ impl AgentRuntime {
         // rebuild (handled by invalidate_plugins_skills_cache()).
 
         // Build/cache plugins system message.
-        // TODO: populate from self.plugins when plugin system is merged.
         if self.cached_plugins_system.is_none() {
-            self.cached_plugins_system =
-                super::tools_builder::build_plugins_system(&self.wasm_plugins);
+            self.cached_plugins_system = super::tools_builder::build_plugins_system(
+                &self.wasm_plugins,
+                self.plugins.as_deref(),
+            );
         }
 
         // Build/cache skills system message.
@@ -5765,8 +5769,8 @@ const MAX_ERROR_STREAK: usize = 5;
             return Err(anyhow!("MCP tool `{name}` not found"));
         }
 
-        // 4. WASM plugin tool: `<plugin>.<tool>` (must precede skill match
-        //    because plugins win the priority ladder).
+        // 4. Plugin tool: `<plugin>.<tool>` (must precede skill match because
+        //    plugins win the priority ladder). Wasm wins on collision.
         if let Some((plugin_name, tool_name)) = name.split_once('.') {
             if let Some(wp) = self.wasm_plugins.iter().find(|p| p.name == plugin_name) {
                 let notify_ctx = self.notification_tx.as_ref().map(|tx| {
@@ -5781,6 +5785,29 @@ const MAX_ERROR_STREAK: usize = 5;
                     }
                 });
                 return wp.call_tool_with_ctx(tool_name, args, notify_ctx).await;
+            }
+            // 4-bis. Shell plugin tool — same `<plugin>.<tool>` namespace; wasm
+            //        wins on collision (above). The plugin spawns once at startup
+            //        and we hand it the per-call ctx so it can dispatch host
+            //        methods (notify, log, etc.) on the active conversation.
+            if let Some(reg) = self.plugins.as_ref()
+                && let Some(plugin) = reg.get_shell(plugin_name)
+            {
+                let target_id = if !ctx.chat_id.is_empty() {
+                    ctx.chat_id.clone()
+                } else {
+                    ctx.peer_id.clone()
+                };
+                let params = serde_json::json!({
+                    "tool": tool_name,
+                    "args": args,
+                    "_ctx": {
+                        "target_id":   target_id,
+                        "channel":     ctx.channel.clone(),
+                        "session_key": ctx.session_key.clone(),
+                    }
+                });
+                return plugin.call("tool_call", params).await;
             }
         }
 

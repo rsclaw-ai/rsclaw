@@ -81,6 +81,11 @@ pub struct PluginManifest {
     /// the top of every dispatch). Default: 0 (no throttling).
     #[serde(default)]
     pub min_call_interval_ms: u32,
+    /// Per-call timeout in milliseconds for shell-bridge plugins. The host
+    /// drops the pending oneshot after this. Default 30s; raise for plugins
+    /// whose tools include long-running browser flows (login, booking).
+    /// Plugin-wide; per-tool override is a future enhancement.
+    pub timeout_ms: Option<u64>,
     /// Minimum rsclaw version required.
     pub requires_rsclaw: Option<String>,
     /// Plugin-declared CDN routing rules. The host applies them when this

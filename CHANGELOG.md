@@ -2,7 +2,50 @@
 
 All notable changes to RsClaw will be documented in this file.
 
-## [2026.4.28] - 2026-04-29
+## [2026.4.29] - 2026-04-29
+
+### Shell-bridge plugins are now first-class LLM-callable
+
+Node / Bun / Deno plugins are exposed to the LLM as `<plugin>.<tool>` — the
+same namespace as wasm plugins (wasm wins on collision). Previously shell
+plugins existed only for hooks and slot fills.
+
+- Bidirectional shell-bridge JSON-RPC protocol: plugins can call host methods
+  (`notify`, `log`, `browser_*`, `sleep`, `storage_allocate_artifact`) by
+  writing JSON-RPC requests with **negative ids** to stdout. Existing one-way
+  positive-id usage (hooks, slot fills) keeps working unchanged.
+- New module `src/plugin/host_methods.rs` containing the `HostMethodRegistry`,
+  the dispatcher for plugin-initiated requests.
+- Reader task in `shell_bridge.rs` owns stdout and demuxes lines by id sign;
+  pending-request map correlates host-initiated calls with their responses.
+- A2 host method catalog (full parity with wasm host functions): `notify`,
+  `log`, `browser_open` / `browser_eval` / `browser_eval_with_args` /
+  `browser_click` / `browser_click_at` / `browser_fill` / `browser_snapshot` /
+  `browser_download`, `sleep`, `storage_allocate_artifact`. Browser session is
+  shared between wasm and shell plugins so login state persists across runtimes.
+- Documentation: [`docs/plugin-development.md`](docs/plugin-development.md)
+  covers the wire protocol, host method catalog, and authoring tradeoffs.
+
+### Changed
+
+- `shell_bridge::Plugin::spawn` now requires a second `Arc<HostMethodRegistry>`
+  argument.
+- `load_all_plugins` now requires a fourth `notify_tx` argument; gateway
+  startup wires `notification_tx` through.
+- `tools_builder::build_plugins_system` now also takes shell plugins and
+  sorts blocks by name for byte-stable output.
+- `PluginRegistry`: `get` renamed to `get_shell` (no external callers existed
+  under the old name); added `shell_plugins_iter`.
+- `shell_bridge::ShellBridgePlugin::shutdown` now awaits the reader task
+  after killing the subprocess so in-flight responses drain cleanly.
+
+### Backward compatibility
+
+- Existing wasm plugins are unaffected.
+- Existing shell plugins used only for hooks/slots continue to work — the
+  bidirectional layer is a strict superset of the old one-way protocol.
+
+## [2026.4.28] - 2026-04-28
 
 ### Skills
 
