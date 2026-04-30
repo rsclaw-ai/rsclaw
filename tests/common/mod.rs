@@ -155,6 +155,7 @@ pub async fn start_server_with_handles(addr: SocketAddr) -> ServerHandles {
         cron_reload: broadcast::channel(1).0,
         notification_tx: broadcast::channel(16).0,
         wasm_plugins: Arc::new(Vec::new()),
+        plugins: Arc::new(rsclaw::plugin::PluginRegistry::default()),
         restart_request_tx: restart_request_tx.clone(),
         pending_restart: Arc::clone(&pending_restart),
         shutdown: shutdown.clone(),
