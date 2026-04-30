@@ -145,13 +145,6 @@ const fr: PartialLocaleType = {
     SubTitle: "Toutes les options de configuration",
 
     Danger: {
-      Reset: {
-        Title: "Réinitialiser tous les paramètres",
-        SubTitle:
-          "Réinitialiser toutes les options de configuration aux valeurs par défaut",
-        Action: "Réinitialiser maintenant",
-        Confirm: "Confirmer la réinitialisation de tous les paramètres ?",
-      },
       Clear: {
         Title: "Effacer toutes les données",
         SubTitle:

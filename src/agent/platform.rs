@@ -13,6 +13,83 @@ pub(crate) fn has_display() -> bool {
     }
 }
 
+/// Display backing-scale factor (physical pixels per logical point).
+///
+/// On macOS this is 2.0 on Retina displays and 1.0 elsewhere; cliclick and
+/// `screencapture -R` take *logical* point coordinates, but our screenshot
+/// pipeline returns physical-pixel dimensions, so the click handlers must
+/// divide incoming physical-pixel coords by this factor before calling out
+/// to cliclick / screencapture.
+///
+/// Cached lazily — detection shells out once per process (osascript + a
+/// transient screencapture) then reuses the result. Returns 1.0 if detection
+/// fails so callers stay correct on non-HiDPI Macs and other platforms.
+pub(crate) fn display_logical_scale() -> f64 {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<f64> = OnceLock::new();
+    *CACHE.get_or_init(detect_display_logical_scale)
+}
+
+#[cfg(target_os = "macos")]
+fn detect_display_logical_scale() -> f64 {
+    // osascript returns logical (point) bounds of the desktop, e.g.
+    // `0, 0, 1512, 982` on a 14" M1 Pro. Compare to a transient screencapture
+    // PNG header (physical pixels) to derive the ratio. We capture to a tiny
+    // tempfile and read just the IHDR chunk (24 bytes is enough).
+    let logical_w = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            "tell application \"Finder\" to set b to bounds of window of desktop",
+            "-e",
+            "return item 3 of b",
+        ])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if !o.status.success() {
+                return None;
+            }
+            String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().ok()
+        });
+
+    let logical_w = match logical_w {
+        Some(w) if w > 0.0 => w,
+        _ => return 1.0,
+    };
+
+    let tmp = std::env::temp_dir().join(format!("rsclaw_dpi_probe_{}.png", std::process::id()));
+    let captured = std::process::Command::new("screencapture")
+        .args(["-x", "-t", "png"])
+        .arg(&tmp)
+        .output()
+        .ok()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !captured {
+        return 1.0;
+    }
+    let bytes = std::fs::read(&tmp).ok();
+    let _ = std::fs::remove_file(&tmp);
+
+    let physical_w = bytes.and_then(|b| {
+        if b.len() < 24 {
+            return None;
+        }
+        Some(u32::from_be_bytes([b[16], b[17], b[18], b[19]]) as f64)
+    });
+    match physical_w {
+        Some(p) if p > 0.0 => (p / logical_w).max(1.0),
+        _ => 1.0,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn detect_display_logical_scale() -> f64 {
+    // Linux/X11 and most Windows configurations operate the input simulators
+    // in physical-pixel space already, so no conversion is needed.
+    1.0
+}
+
 /// Detect Chrome / Chromium binary path.
 ///
 /// Priority: user's existing system Chrome > `~/.rsclaw/tools/chrome`

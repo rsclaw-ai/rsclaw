@@ -288,14 +288,31 @@
   height: 100%;
 }
 
+// `chat-body` is now Virtuoso's outer scroller. Virtuoso ignores any
+// padding on this element when it sizes its sized list — items stretch
+// to the full clientWidth and overflow the padding box, pushing message
+// avatars/timestamps past the viewport. Padding lives on the wrapper
+// `chat-body-padded` instead, so Virtuoso receives an already-padded
+// content rect and items fit cleanly inside.
 .chat-body {
   flex: 1;
   overflow: auto;
   overflow-x: hidden;
-  padding: 20px;
-  padding-bottom: 40px;
   position: relative;
   overscroll-behavior: none;
+  box-sizing: border-box;
+}
+
+.chat-body-padded {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  padding: 20px;
+  padding-bottom: 40px;
+  box-sizing: border-box;
+  position: relative;
+  overflow: hidden;
 }
 
 .chat-body-main-title {

@@ -143,12 +143,6 @@ const id: PartialLocaleType = {
     SubTitle: "Semua opsi pengaturan",
 
     Danger: {
-      Reset: {
-        Title: "Atur Ulang Semua Pengaturan",
-        SubTitle: "Atur ulang semua opsi pengaturan ke nilai default",
-        Action: "Atur Ulang Sekarang",
-        Confirm: "Konfirmasi untuk mengatur ulang semua pengaturan?",
-      },
       Clear: {
         Title: "Hapus Semua Data",
         SubTitle: "Hapus semua data obrolan dan pengaturan",

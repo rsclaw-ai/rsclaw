@@ -144,12 +144,6 @@ const sk: PartialLocaleType = {
     Title: "Nastavenia",
     SubTitle: "Všetky nastavenia",
     Danger: {
-      Reset: {
-        Title: "Resetovať všetky nastavenia",
-        SubTitle: "Resetovať všetky položky nastavení na predvolené",
-        Action: "Resetovať",
-        Confirm: "Potvrdiť resetovanie všetkých nastavení na predvolené?",
-      },
       Clear: {
         Title: "Vymazať všetky údaje",
         SubTitle: "Vymazať všetky správy a nastavenia",

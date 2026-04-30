@@ -205,6 +205,85 @@ fn get_config_path() -> Result<String, String> {
     Ok(rsclaw_base_dir().to_string_lossy().to_string())
 }
 
+/// Wipe on-disk WebKit / Edge / WebView2 caches that survive a
+/// `localStorage.clear()` from the JS side.
+///
+/// Caller flow (settings -> Clear Local Cache):
+///   1. JS: `localStorage.clear()` + `sessionStorage.clear()`
+///   2. JS: `invoke("clear_webview_cache_dirs")`
+///   3. JS: `location.reload()`
+///
+/// We delete only *cache* and *transient* directories — not LocalStorage,
+/// IndexedDB user data, or anything under `~/.rsclaw/`. Some files may be
+/// held open by the running webview; failures on individual subpaths are
+/// swallowed and the JS-side reload re-creates them.
+///
+/// Returns the list of paths that were attempted (one per line) so the UI
+/// can show the user what was cleared.
+#[tauri::command]
+fn clear_webview_cache_dirs() -> Result<String, String> {
+    let home = dirs::home_dir().ok_or("no home dir")?;
+    let identifier = "ai.rsclaw.app";
+
+    // Per-platform list of cache subtrees that are safe to wipe while the
+    // app is running. We keep `LocalStorage` and `IndexedDB` since those
+    // hold user-visible chat sessions — JS clears them up-front.
+    let candidates: Vec<std::path::PathBuf> = if cfg!(target_os = "macos") {
+        let webkit = home
+            .join("Library")
+            .join("WebKit")
+            .join(identifier)
+            .join("WebsiteData");
+        vec![
+            webkit.join("ResourceLoadStatistics"),
+            webkit.join("EnhancedSecurity"),
+            webkit.join("ServiceWorker"),
+            webkit.join("CacheStorage"),
+            home.join("Library")
+                .join("Caches")
+                .join(identifier),
+        ]
+    } else if cfg!(target_os = "windows") {
+        // WebView2 user-data directory; Tauri stores it under the app's
+        // local appdata. We delete the cache subtrees only.
+        let local = home.join("AppData").join("Local").join(identifier);
+        let edge = local
+            .join("EBWebView")
+            .join("Default");
+        vec![
+            edge.join("Cache"),
+            edge.join("Code Cache"),
+            edge.join("Service Worker"),
+            edge.join("GPUCache"),
+        ]
+    } else {
+        // Linux WebKitGTK: ~/.cache/<identifier>/ is the cache root.
+        vec![home.join(".cache").join(identifier)]
+    };
+
+    let mut report = Vec::new();
+    for path in &candidates {
+        if !path.exists() {
+            continue;
+        }
+        let action = if path.is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        match action {
+            Ok(()) => report.push(format!("removed: {}", path.display())),
+            Err(e) => report.push(format!("skipped (in use): {} — {e}", path.display())),
+        }
+    }
+
+    Ok(if report.is_empty() {
+        "nothing to clear".to_owned()
+    } else {
+        report.join("\n")
+    })
+}
+
 /// Run initial setup: create directories + seed workspace.
 #[tauri::command]
 fn run_setup() -> Result<String, String> {
@@ -1218,6 +1297,7 @@ fn main() {
             stop_gateway,
             gateway_status,
             get_config_path,
+            clear_webview_cache_dirs,
             run_setup,
             write_config,
             read_config_file,
