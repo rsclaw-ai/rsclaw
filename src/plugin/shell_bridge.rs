@@ -323,7 +323,7 @@ async fn handle_incoming(
 // Runtime resolver
 // ---------------------------------------------------------------------------
 
-/// Resolve the JS runtime binary path.
+/// Resolve the shell-plugin runtime binary path (node/bun/deno).
 ///
 /// Priority: ~/.rsclaw/tools/node/ > system PATH.
 /// Preference order: `bun` > `node` > `deno` (if the manifest doesn't specify).
@@ -366,7 +366,7 @@ fn resolve_runtime(runtime: &str) -> Result<String> {
     }
 
     bail!(
-        "no suitable JS runtime found for `{runtime}`. \
+        "no suitable shell-plugin runtime found for `{runtime}`. \
          Run `rsclaw tools install node`, download from https://gitfast.io, or install node/bun/deno manually."
     )
 }
