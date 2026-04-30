@@ -735,7 +735,7 @@ pub(crate) fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "computer_use".to_owned(),
-        description: "Control the computer desktop. ONLY use when the user EXPLICITLY asks to take a screenshot, click, type, or interact with the desktop. Do NOT call this tool just because the message mentions words like 'screenshot' or 'screen' in other contexts. Screenshots auto-resize for HiDPI and return scale factor for coordinate mapping.".to_owned(),
+        description: "Control the computer desktop. ONLY use when the user EXPLICITLY asks to take a screenshot, click, type, or interact with the desktop. Do NOT call this tool just because the message mentions words like 'screenshot' or 'screen' in other contexts. Screenshots auto-resize, and mouse coordinates use the same physical-pixel space as the returned `original_width`/`original_height` (HiDPI is handled internally — multiply image-pixel coords by the returned `scale` and pass directly).".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -746,10 +746,10 @@ pub(crate) fn build_tool_list(
                     "cursor_position", "get_active_window", "ui_tree",
                     "list_skills", "get_skill", "wait"
                 ], "description": "Action to perform. ui_tree returns the accessibility tree of the focused window (interactive elements with role/label/coordinates). list_skills/get_skill load desktop automation playbooks from ~/.rsclaw/tools/computer_use/skills/."},
-                "x":         {"type": "number", "description": "X coordinate (mouse actions, drag start)"},
-                "y":         {"type": "number", "description": "Y coordinate (mouse actions, drag start)"},
-                "to_x":      {"type": "number", "description": "Drag destination X"},
-                "to_y":      {"type": "number", "description": "Drag destination Y"},
+                "x":         {"type": "number", "description": "X coordinate (mouse actions, drag start) in physical pixels"},
+                "y":         {"type": "number", "description": "Y coordinate (mouse actions, drag start) in physical pixels"},
+                "to_x":      {"type": "number", "description": "Drag destination X (physical pixels)"},
+                "to_y":      {"type": "number", "description": "Drag destination Y (physical pixels)"},
                 "button":    {"type": "string", "enum": ["left", "right", "middle"], "description": "Mouse button (default: left)"},
                 "text":      {"type": "string", "description": "Text for type action"},
                 "key":       {"type": "string", "description": "Key name or combo (e.g. Enter, ctrl+c, cmd+shift+s)"},
@@ -757,7 +757,14 @@ pub(crate) fn build_tool_list(
                 "direction": {"type": "string", "enum": ["up", "down", "left", "right"], "description": "Scroll direction (default: down)"},
                 "amount":    {"type": "integer", "description": "Scroll clicks (default: 3)"},
                 "ms":        {"type": "integer", "description": "Wait duration in milliseconds (max 10000)"},
-                "name":      {"type": "string", "description": "Skill name (for get_skill action)"}
+                "name":      {"type": "string", "description": "Skill name (for get_skill action)"},
+                "region":    {"type": "object", "description": "Optional screenshot region in physical pixels. Use after a full screenshot to zoom in on a specific area without recapturing the whole screen.", "properties": {
+                    "x":      {"type": "number"},
+                    "y":      {"type": "number"},
+                    "width":  {"type": "number"},
+                    "height": {"type": "number"}
+                }, "required": ["x", "y", "width", "height"]},
+                "max_long_edge_px": {"type": "integer", "description": "Screenshot resize cap: longest edge of returned image. Default 1024 (XGA). Range 64-8192. Larger values = more detail + more tokens."}
             },
             "required": ["action"]
         }),

@@ -7,9 +7,9 @@ use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
 use super::platform::{
-    jpeg_dimensions, is_cliclick_special_key, map_modifier, map_modifier_xdotool,
-    powershell_hidden, run_powershell_input, run_subprocess, win_map_key, win_mouse_click,
-    win_set_cursor,
+    display_logical_scale, jpeg_dimensions, is_cliclick_special_key, map_modifier,
+    map_modifier_xdotool, powershell_hidden, run_powershell_input, run_subprocess, win_map_key,
+    win_mouse_click, win_set_cursor,
 };
 
 impl super::runtime::AgentRuntime {
@@ -21,12 +21,29 @@ impl super::runtime::AgentRuntime {
         let is_macos = cfg!(target_os = "macos");
         let is_windows = cfg!(target_os = "windows");
 
-        // Helper: extract x, y from args
-        let xy = || {
+        // Helper: extract x, y from args (physical pixels — same coordinate
+        // space as the screenshot's `original_width`/`original_height`).
+        let xy_physical = || {
             (
-                args["x"].as_f64().unwrap_or(0.0) as i64,
-                args["y"].as_f64().unwrap_or(0.0) as i64,
+                args["x"].as_f64().unwrap_or(0.0),
+                args["y"].as_f64().unwrap_or(0.0),
             )
+        };
+
+        // Helper: convert physical-pixel coords to whatever the platform's
+        // input simulator expects.
+        //   macOS (cliclick / screencapture -R): logical point coordinates
+        //     — divide by the display backing-scale factor.
+        //   Windows / Linux: physical pixels — pass through unchanged.
+        // Returns `(x, y)` as `i64` rounded to the nearest integer.
+        let xy = || {
+            let (px, py) = xy_physical();
+            let scale = if is_macos { display_logical_scale() } else { 1.0 };
+            ((px / scale).round() as i64, (py / scale).round() as i64)
+        };
+        let to_native = |px: f64, py: f64| -> (i64, i64) {
+            let scale = if is_macos { display_logical_scale() } else { 1.0 };
+            ((px / scale).round() as i64, (py / scale).round() as i64)
         };
 
         match action {
@@ -37,41 +54,101 @@ impl super::runtime::AgentRuntime {
                 let tmp_path = std::env::temp_dir().join("rsclaw_screen.png");
                 let tmp_path_str = tmp_path.to_string_lossy().to_string();
 
+                // Optional region capture. Coords are physical pixels (same
+                // space as the previous screenshot's `original_*`). On macOS
+                // we convert to logical points before passing to screencapture
+                // since `-R` operates in points.
+                let region = args.get("region").and_then(|v| {
+                    let x = v.get("x")?.as_f64()?;
+                    let y = v.get("y")?.as_f64()?;
+                    let w = v.get("width")?.as_f64()?;
+                    let h = v.get("height")?.as_f64()?;
+                    if w <= 0.0 || h <= 0.0 {
+                        return None;
+                    }
+                    Some((x, y, w, h))
+                });
+
                 let output = if is_macos {
-                    tokio::process::Command::new("screencapture")
-                        .args(["-x", &tmp_path_str])
-                        .output()
-                        .await
+                    let mut cmd = tokio::process::Command::new("screencapture");
+                    cmd.arg("-x");
+                    if let Some((rx, ry, rw, rh)) = region {
+                        let scale = display_logical_scale();
+                        let lx = (rx / scale).round() as i64;
+                        let ly = (ry / scale).round() as i64;
+                        let lw = (rw / scale).round().max(1.0) as i64;
+                        let lh = (rh / scale).round().max(1.0) as i64;
+                        cmd.args(["-R", &format!("{lx},{ly},{lw},{lh}")]);
+                    }
+                    cmd.arg(&tmp_path_str).output().await
                 } else if is_windows {
+                    let (rx, ry, rw, rh) = region
+                        .map(|(x, y, w, h)| (x as i64, y as i64, w as i64, h as i64))
+                        .unwrap_or((-1, -1, -1, -1));
+                    let region_init = if rw > 0 {
+                        format!(
+                            "$rx={rx}; $ry={ry}; $rw={rw}; $rh={rh};"
+                        )
+                    } else {
+                        // Fall through to PrimaryScreen.Bounds.
+                        "$rx=-1; $ry=-1; $rw=-1; $rh=-1;".to_owned()
+                    };
                     let script = format!(
                         r#"
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-$screen = [System.Windows.Forms.Screen]::PrimaryScreen
-$bounds = $screen.Bounds
+{region_init}
+if ($rw -gt 0) {{
+    $bounds = New-Object System.Drawing.Rectangle($rx, $ry, $rw, $rh)
+}} else {{
+    $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+}}
 $bitmap = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
 $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
 $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
-$bitmap.Save('{}')
+$bitmap.Save('{tmp_path_str}')
 $graphics.Dispose()
 $bitmap.Dispose()
-"#,
-                        tmp_path_str
+"#
                     );
                     powershell_hidden()
                         .args(["-Command", &script])
                         .output()
                         .await
                 } else {
-                    let res = tokio::process::Command::new("scrot")
-                        .arg(&tmp_path_str)
-                        .output()
-                        .await;
-                    if res.is_err() || !res.as_ref().unwrap().status.success() {
-                        tokio::process::Command::new("import")
-                            .args(["-window", "root", &tmp_path_str])
+                    let res = if let Some((rx, ry, rw, rh)) = region {
+                        // scrot -a x,y,w,h (no logical conversion on X11).
+                        let area = format!(
+                            "{x},{y},{w},{h}",
+                            x = rx as i64,
+                            y = ry as i64,
+                            w = rw as i64,
+                            h = rh as i64
+                        );
+                        tokio::process::Command::new("scrot")
+                            .args(["-a", &area, &tmp_path_str])
                             .output()
                             .await
+                    } else {
+                        tokio::process::Command::new("scrot")
+                            .arg(&tmp_path_str)
+                            .output()
+                            .await
+                    };
+                    if res.is_err() || !res.as_ref().unwrap().status.success() {
+                        // ImageMagick fallback. Crop format: `WxH+X+Y`.
+                        let mut cmd = tokio::process::Command::new("import");
+                        cmd.args(["-window", "root"]);
+                        if let Some((rx, ry, rw, rh)) = region {
+                            cmd.args(["-crop", &format!(
+                                "{w}x{h}+{x}+{y}",
+                                x = rx as i64,
+                                y = ry as i64,
+                                w = rw as i64,
+                                h = rh as i64
+                            )]);
+                        }
+                        cmd.arg(&tmp_path_str).output().await
                     } else {
                         res
                     }
@@ -95,21 +172,30 @@ $bitmap.Dispose()
                     (0, 0)
                 };
 
-                // Resize to 1024px wide + convert to JPG q30 (~60KB).
-                // Matches Anthropic's recommended XGA (1024x768) and saves
-                // ~5-10x bandwidth vs raw PNG while maintaining OCR quality.
-                const TARGET_WIDTH: u32 = 1024;
+                // Resize so the longer edge fits in `max_long_edge_px`
+                // (default 1024 — matches Anthropic's XGA guidance and
+                // saves ~5-10x bandwidth vs raw PNG while keeping OCR
+                // quality). LLM can override per-call for region shots
+                // where it wants more detail. Convert to JPG q30 (~60KB).
+                const DEFAULT_MAX_LONG_EDGE: u32 = 1024;
                 const JPG_QUALITY: u32 = 30;
+                let max_long_edge = args["max_long_edge_px"]
+                    .as_u64()
+                    .filter(|n| *n >= 64 && *n <= 8192)
+                    .map(|n| n as u32)
+                    .unwrap_or(DEFAULT_MAX_LONG_EDGE);
+                let long_edge = orig_w.max(orig_h);
+                let need_resize = long_edge > max_long_edge;
+                let max_long_edge_str = max_long_edge.to_string();
 
                 let out_path = std::env::temp_dir().join("rsclaw_screen_out.jpg");
                 let out_str = out_path.to_string_lossy().to_string();
-                let need_resize = orig_w > TARGET_WIDTH;
 
                 let converted = if is_macos {
-                    // sips: resize + convert to JPEG in one pass
+                    // sips -Z N: longest-edge resize, preserves aspect.
                     let mut sips_args = vec![];
                     if need_resize {
-                        sips_args.extend_from_slice(&["--resampleWidth", "1024"]);
+                        sips_args.extend_from_slice(&["-Z", &max_long_edge_str]);
                     }
                     sips_args.extend_from_slice(&[
                         "-s", "format", "jpeg",
@@ -124,11 +210,14 @@ $bitmap.Dispose()
                         .map(|o| o.status.success())
                         .unwrap_or(false)
                 } else if is_windows {
-                    let new_w = if need_resize { TARGET_WIDTH } else { orig_w };
-                    let new_h = if need_resize {
-                        (orig_h as f64 * TARGET_WIDTH as f64 / orig_w as f64) as u32
+                    let (new_w, new_h) = if need_resize {
+                        let ratio = max_long_edge as f64 / long_edge as f64;
+                        (
+                            ((orig_w as f64) * ratio).round().max(1.0) as u32,
+                            ((orig_h as f64) * ratio).round().max(1.0) as u32,
+                        )
                     } else {
-                        orig_h
+                        (orig_w, orig_h)
                     };
                     let script = format!(
                         r#"
@@ -152,10 +241,17 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                         .map(|o| o.status.success())
                         .unwrap_or(false)
                 } else {
-                    // Linux: convert (ImageMagick)
-                    let resize_arg = if need_resize { "1024x" } else { "100%" };
+                    // ImageMagick `-resize NxN>` fits within NxN box (only
+                    // shrinks if larger). When already small, omit the flag
+                    // so we still convert PNG → JPEG.
+                    let mut convert_args: Vec<&str> = vec![&tmp_path_str];
+                    let resize_box = format!("{m}x{m}>", m = max_long_edge);
+                    if need_resize {
+                        convert_args.extend_from_slice(&["-resize", &resize_box]);
+                    }
+                    convert_args.extend_from_slice(&["-quality", "30", &out_str]);
                     tokio::process::Command::new("convert")
-                        .args([&tmp_path_str, "-resize", resize_arg, "-quality", "30", &out_str])
+                        .args(&convert_args)
                         .output()
                         .await
                         .map(|o| o.status.success())
@@ -345,12 +441,12 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
             // Drag (from x1,y1 to x2,y2)
             // =================================================================
             "drag" => {
-                let x1 = args["x"].as_f64().unwrap_or(0.0) as i64;
-                let y1 = args["y"].as_f64().unwrap_or(0.0) as i64;
-                let x2 = args["to_x"].as_f64()
-                    .ok_or_else(|| anyhow!("computer_use drag: `to_x` required"))? as i64;
-                let y2 = args["to_y"].as_f64()
-                    .ok_or_else(|| anyhow!("computer_use drag: `to_y` required"))? as i64;
+                let (x1, y1) = xy();
+                let to_x_phys = args["to_x"].as_f64()
+                    .ok_or_else(|| anyhow!("computer_use drag: `to_x` required"))?;
+                let to_y_phys = args["to_y"].as_f64()
+                    .ok_or_else(|| anyhow!("computer_use drag: `to_y` required"))?;
+                let (x2, y2) = to_native(to_x_phys, to_y_phys);
                 if is_macos {
                     run_subprocess("cliclick", &[&format!("dd:{x1},{y1}"), &format!("du:{x2},{y2}")]).await?;
                 } else if is_windows {
