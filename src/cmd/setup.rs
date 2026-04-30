@@ -663,6 +663,15 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         // Seed workspace with default SOUL.md, AGENTS.md, USER.md
         let workspace = base.join("workspace");
         let _ = crate::agent::bootstrap::seed_workspace(&workspace);
+        // Seed tool prompts + embedded knowledge trees (web_browser
+        // site-rules + computer_use app-rules). Previously skipped on
+        // the non-interactive path, leaving the per-host skill library
+        // empty even though the binary embeds it. Failure here means the
+        // agent boots without any site-rule knowledge — log so the user
+        // can see what happened instead of silently degrading.
+        if let Err(e) = crate::agent::bootstrap::seed_tools(&base, None) {
+            tracing::warn!(error = %e, "non-interactive setup: seed_tools failed; site-rule library may be empty");
+        }
         return Ok(());
     }
 
@@ -1245,6 +1254,18 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                         m.insert("primary".into(), json!(default_model_value));
                     }
                 }
+            }
+        }
+
+        // Mirror to agents.defaults.model.primary (openclaw compat). Without
+        // this, the loader has no fleet-level fallback and only the main
+        // agent ends up with a model — sub-agents and any future agent
+        // entry inherit nothing.
+        let defaults = agents_obj.entry("defaults").or_insert_with(|| json!({}));
+        if let Some(d_obj) = defaults.as_object_mut() {
+            let model_obj = d_obj.entry("model").or_insert_with(|| json!({}));
+            if let Some(m) = model_obj.as_object_mut() {
+                m.insert("primary".into(), json!(default_model_value));
             }
         }
     }

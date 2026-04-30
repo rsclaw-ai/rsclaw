@@ -57,6 +57,66 @@ fn rsclaw_base_dir() -> std::path::PathBuf {
     dirs::home_dir().unwrap_or_default().join(".rsclaw")
 }
 
+/// Resolve the tray menu language. Order:
+///   1. `gateway.language` field in `~/.rsclaw/rsclaw.json5` (the value the
+///      user picked during onboarding — keeps the tray consistent with the
+///      gateway daemon's locale).
+///   2. `LANG` / `LC_ALL` env var prefix (e.g. `zh_CN.UTF-8` → `zh`).
+///   3. `"en"` fallback.
+///
+/// Returns a normalized two-letter code. Only `zh` and `en` are recognized
+/// today; anything else collapses to `en` so the menu is never blank.
+fn tray_lang() -> &'static str {
+    let cfg_path = rsclaw_base_dir().join("rsclaw.json5");
+    if let Ok(body) = std::fs::read_to_string(&cfg_path)
+        && let Ok(val) = json5::from_str::<serde_json::Value>(&body)
+        && let Some(lang) = val
+            .pointer("/gateway/language")
+            .and_then(|v| v.as_str())
+    {
+        return resolve_tray_lang(lang);
+    }
+    let env_lang = std::env::var("LC_ALL")
+        .or_else(|_| std::env::var("LANG"))
+        .unwrap_or_default();
+    resolve_tray_lang(&env_lang)
+}
+
+/// Map a free-form language string to a tray locale code. Mirrors the
+/// gateway's `i18n::resolve_lang` for the subset the tray supports
+/// (today: zh + en). The config field stores human-readable names like
+/// `"Chinese"` / `"English"` (set by `cmd_onboard`), not 2-letter codes,
+/// so prefix-matching alone is not enough.
+fn resolve_tray_lang(s: &str) -> &'static str {
+    let l = s.to_ascii_lowercase();
+    if l.starts_with("zh")
+        || l.starts_with("cn")
+        || l.contains("chinese")
+        || l.contains("\u{4E2D}\u{6587}")
+    {
+        "zh"
+    } else {
+        "en"
+    }
+}
+
+/// Lookup a tray-menu label in the given language. Falls back to English.
+fn tray_label(lang: &str, key: &str) -> &'static str {
+    match (lang, key) {
+        ("zh", "open") => "\u{6253}\u{5F00} RsClaw",
+        ("zh", "start_gw") => "\u{542F}\u{52A8}\u{7F51}\u{5173}",
+        ("zh", "stop_gw") => "\u{505C}\u{6B62}\u{7F51}\u{5173}",
+        ("zh", "status_gw") => "\u{7F51}\u{5173}\u{72B6}\u{6001}",
+        ("zh", "quit") => "\u{9000}\u{51FA}",
+        (_, "open") => "Open RsClaw",
+        (_, "start_gw") => "Start Gateway",
+        (_, "stop_gw") => "Stop Gateway",
+        (_, "status_gw") => "Gateway Status",
+        (_, "quit") => "Quit",
+        _ => "",
+    }
+}
+
 fn run_rsclaw_command(args: &[&str]) -> Result<String, String> {
     // Try sidecar binary next to the executable first, then fall back to PATH.
     let exe_dir = std::env::current_exe()
@@ -1342,14 +1402,17 @@ fn main() {
                 }
             });
 
-            // Build system tray
-            let open = MenuItemBuilder::with_id("open", "Open RsClaw").build(app)?;
+            // Build system tray. Labels are localized off `gateway.language`
+            // (rsclaw.json5) with system-locale + English fallbacks; IDs stay
+            // ASCII so the menu-event router below is locale-independent.
+            let lang = tray_lang();
+            let open = MenuItemBuilder::with_id("open", tray_label(lang, "open")).build(app)?;
             let sep1 = PredefinedMenuItem::separator(app)?;
-            let start = MenuItemBuilder::with_id("start_gw", "Start Gateway").build(app)?;
-            let stop = MenuItemBuilder::with_id("stop_gw", "Stop Gateway").build(app)?;
-            let status = MenuItemBuilder::with_id("status_gw", "Gateway Status").build(app)?;
+            let start = MenuItemBuilder::with_id("start_gw", tray_label(lang, "start_gw")).build(app)?;
+            let stop = MenuItemBuilder::with_id("stop_gw", tray_label(lang, "stop_gw")).build(app)?;
+            let status = MenuItemBuilder::with_id("status_gw", tray_label(lang, "status_gw")).build(app)?;
             let sep2 = PredefinedMenuItem::separator(app)?;
-            let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+            let quit = MenuItemBuilder::with_id("quit", tray_label(lang, "quit")).build(app)?;
 
             let menu = MenuBuilder::new(app)
                 .item(&open)

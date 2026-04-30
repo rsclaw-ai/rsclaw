@@ -399,7 +399,15 @@ export const useChatStore = createPersistStore(
 
         get().updateStat(message, targetSession);
 
-        get().summarizeSession(false, targetSession);
+        // Auto-summarize disabled — it runs an extra LLM call after every
+        // agent reply to populate `session.memoryPrompt`, but the resulting
+        // value is never sent on subsequent turns: the WS path in
+        // `ChatGPTApi.chat` (client/platforms/openai.ts) takes only the
+        // last message and routes via `chat.send`, dropping the memory
+        // pre-context entirely. Keeping this call would just double LLM
+        // spend per turn for no behaviour change. Manual title refresh
+        // (chat header pencil icon → `summarizeSession(true, ...)`)
+        // continues to work because it's invoked from the UI directly.
       },
 
       async onUserInput(
@@ -456,6 +464,11 @@ export const useChatStore = createPersistStore(
           if (toAdd.length > 0) {
             session.messages = session.messages.concat(toAdd);
           }
+          // Reset the inactivity clock to NOW so the chat-level
+          // stuck-stream watchdog doesn't immediately trip on the
+          // first chunk if the previous session lastUpdate was hours
+          // stale (the user reopened an old session and sent again).
+          session.lastUpdate = Date.now();
         });
 
         const api: ClientApi = getClientApi(modelConfig.providerName);
@@ -470,6 +483,12 @@ export const useChatStore = createPersistStore(
             }
             get().updateTargetSession(session, (session) => {
               session.messages = session.messages.concat();
+              // Bump on each chunk so the chat-level stuck-stream
+              // watchdog can tell "still alive" from "actually hung".
+              // Without this, lastUpdate only ticks on turn boundaries
+              // and a long quiet generation looks identical to a dead
+              // connection.
+              session.lastUpdate = Date.now();
             });
           },
           async onFinish(message) {

@@ -545,7 +545,16 @@ function ConfigEditorPage() {
     const b = extractVal(raw, "bind");
     if (b) setBind(b);
     const l = extractVal(raw, "language");
-    if (l) setLanguage(l);
+    if (l) {
+      setLanguage(l);
+    } else {
+      // Config has no `language` field — the dropdown still shows the
+      // useState default ("zh-CN") which gives the user a false sense
+      // that it's persisted. Mark dirty so the next save writes the
+      // default value, and the tray menu (which reads gateway.language
+      // from rsclaw.json5) starts following it.
+      setDirty(true);
+    }
     const at = extractVal(raw, "authToken");
     if (at) { setAuthToken(at); setApiAuthToken(at); }
 

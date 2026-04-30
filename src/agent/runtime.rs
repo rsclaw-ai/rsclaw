@@ -4896,13 +4896,42 @@ impl AgentRuntime {
                 // the answer.  Raw HTML / search-result JSON never enters the
                 // conversation history.  Other tools are truncated as before.
                 let session_text = {
-                    const WEB_COMPRESS_THRESHOLD: usize = 1000;
+                    // Was 1000 bytes — too aggressive. Any clean JSON / API
+                    // response above 1KB triggered a 30-60 s LLM "compression"
+                    // pass that lost structure for no benefit. The threshold
+                    // now reflects what *actually* needs compression: raw HTML
+                    // dumps that survive the dehydrate pipeline.
+                    const WEB_COMPRESS_THRESHOLD: usize = 32_000;
                     let is_web_tool = matches!(
                         tool_name.as_str(),
                         "web_fetch" | "web_browser" | "browser" | "web_search"
                     );
 
-                    if is_web_tool && result_text.len() > WEB_COMPRESS_THRESHOLD {
+                    // Structured responses (JSON / Atom XML / RSS / plain
+                    // markdown lists) are already useful as-is; sending them
+                    // through an LLM "extractor" just truncates and reformats
+                    // for no gain. Detect heuristically by the first
+                    // non-whitespace byte.
+                    let starts_structured = result_text
+                        .trim_start()
+                        .as_bytes()
+                        .first()
+                        .is_some_and(|b| matches!(b, b'{' | b'[' | b'<'));
+
+                    if is_web_tool
+                        && starts_structured
+                        && result_text.len() <= 50_000
+                    {
+                        // Structured web response (JSON / Atom / XML) under
+                        // 50KB: pass through verbatim so the agent reads the
+                        // raw structured data. Truncating to the generic 3KB
+                        // default in the non-web branch would clip useful
+                        // fields (e.g. multiple Stack Exchange questions).
+                        result_text.clone()
+                    } else if is_web_tool
+                        && !starts_structured
+                        && result_text.len() > WEB_COMPRESS_THRESHOLD
+                    {
                         let sk = ctx.session_key.clone();
                         let tn = tool_name.clone();
                         match self.compress_tool_result_for_session(&sk, &tn, &result_text).await {

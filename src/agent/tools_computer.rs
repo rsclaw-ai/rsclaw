@@ -135,7 +135,7 @@ $bitmap.Dispose()
                             .output()
                             .await
                     };
-                    if res.is_err() || !res.as_ref().unwrap().status.success() {
+                    if !matches!(&res, Ok(o) if o.status.success()) {
                         // ImageMagick fallback. Crop format: `WxH+X+Y`.
                         let mut cmd = tokio::process::Command::new("import");
                         cmd.args(["-window", "root"]);

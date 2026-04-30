@@ -593,6 +593,10 @@ pub(crate) fn build_tool_list(
             - Falls back to browser rendering for JS-heavy pages and CAPTCHA-blocked sites (GET only)\n\
             - GET responses without headers/body are cached 15 minutes; non-GET bypasses cache\n\
             - For large pages, pass 'prompt' to LLM-extract specific information\n\
+            - DO NOT pass 'prompt' for compact structured responses (JSON APIs, RSS, \
+              <2KB text). Passing 'prompt' triggers an internal LLM summarize pass \
+              (extra ~30-60 s + tokens). For api.* / *.json / arxiv Atom / RSS / \
+              search-result JSON, omit 'prompt' — read the raw response directly.\n\
             \n\
             METHODS, HEADERS, BODY — supports the full HTTP surface:\n\
               - method: GET (default), POST, PUT, PATCH, DELETE\n\
@@ -610,7 +614,7 @@ pub(crate) fn build_tool_list(
                 "method":  {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"], "description": "HTTP method. Default: GET"},
                 "headers": {"type": "object", "description": "Optional request headers, e.g. {\"Authorization\": \"Bearer xyz\", \"X-API-Key\": \"...\"}", "additionalProperties": {"type": "string"}},
                 "body":    {"description": "Optional request body. String → sent as-is (set Content-Type via headers). Object/array → JSON-serialized; Content-Type defaulted to application/json."},
-                "prompt":  {"type": "string", "description": "What to extract from the page (e.g. 'list all API endpoints')"}
+                "prompt":  {"type": "string", "description": "OPTIONAL. What to extract from a LARGE HTML page (e.g. 'list all API endpoints'). Triggers an LLM-summarize pass on the response. OMIT for compact JSON/XML/text where you can read the raw body — passing 'prompt' on small structured responses just adds ~30-60 s of LLM latency for nothing."}
             },
             "required": ["url"]
         }),
