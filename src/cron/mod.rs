@@ -515,14 +515,80 @@ impl CronRunner {
     }
 
     /// Save jobs to store file. Returns early without saving if parse_failed is true.
+    /// Before saving, checks if the file was modified externally and merges changes.
     pub(crate) async fn save_store(&self, jobs: &[CronJob]) -> Result<()> {
         if self.parse_failed {
             // Don't save - file has syntax errors that user needs to fix
             return Ok(());
         }
+
+        // Check if file was modified externally since last load.
+        // Read current file content and compare job configurations.
+        let file_jobs = match tokio::fs::read(&self.store_path).await {
+            Ok(bytes) => {
+                match serde_json::from_slice::<CronStore>(&bytes) {
+                    Ok(store) => store.jobs,
+                    Err(e) => {
+                        // File has syntax errors - don't overwrite, warn and skip
+                        warn!(error = %e, "cron: file has syntax errors, skipping save to preserve user's manual edits");
+                        return Ok(());
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File doesn't exist, safe to write
+                Vec::new()
+            }
+            Err(e) => {
+                warn!(error = %e, "cron: failed to read file for merge check, proceeding with save");
+                jobs.to_vec()
+            }
+        };
+
+        // Detect external modifications: jobs with different configs (not just state).
+        // Compare configs (excluding state) to detect user edits.
+        let mut merged_jobs = jobs.to_vec();
+        let mut has_external_changes = false;
+
+        for file_job in &file_jobs {
+            // Find corresponding job in memory
+            if let Some(mem_job) = merged_jobs.iter_mut().find(|j| j.id == file_job.id) {
+                // Check if config changed (message, schedule, payload, enabled, etc. - NOT state)
+                if !cron_jobs_config_equal(mem_job, file_job) {
+                    has_external_changes = true;
+                    // Preserve state but update config from file
+                    let preserved_state = mem_job.state.clone();
+                    *mem_job = file_job.clone();
+                    mem_job.state = preserved_state;
+                    debug!(job_id = %file_job.id, "cron: merged external config change");
+                }
+            } else {
+                // New job added externally - include it
+                has_external_changes = true;
+                merged_jobs.push(file_job.clone());
+                debug!(job_id = %file_job.id, "cron: found new job from external edit");
+            }
+        }
+
+        // Check for jobs deleted externally (in memory but not in file)
+        let file_ids: std::collections::HashSet<_> = file_jobs.iter().map(|j| &j.id).collect();
+        let deleted_ids: Vec<_> = merged_jobs.iter()
+            .filter(|j| !file_ids.contains(&j.id))
+            .map(|j| j.id.clone())
+            .collect();
+        if !deleted_ids.is_empty() {
+            has_external_changes = true;
+            merged_jobs.retain(|j| file_ids.contains(&j.id));
+            debug!(deleted_ids = ?deleted_ids, "cron: removed jobs deleted externally");
+        }
+
+        if has_external_changes {
+            info!("cron: file was modified externally, merged user changes before saving state");
+        }
+
         let store = CronStore {
             version: 1,
-            jobs: jobs.to_vec(),
+            jobs: merged_jobs,
         };
         let json = serde_json::to_string_pretty(&store)?;
         let tmp = format!("{}.tmp", self.store_path.display());
