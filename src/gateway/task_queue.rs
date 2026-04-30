@@ -214,11 +214,11 @@ fn parse_task_prefix(text: &mut String) -> (u32, u64) {
     // Defensive: chat clients (Feishu/WeChat) often replace ASCII `--` with
     // an em-dash on send. Normalize em/en/figure-dashes back so flag parsing
     // stays robust regardless of the source client.
-    let normalized: String = text
-        .replace('\u{2014}', "--") // EM DASH
-        .replace('\u{2013}', "--") // EN DASH
-        .replace('\u{2012}', "--") // FIGURE DASH
-        .replace('\u{2015}', "--"); // HORIZONTAL BAR
+    // EM / EN / FIGURE / HORIZONTAL dashes — all collapse to ASCII "--".
+    let normalized: String = text.replace(
+        ['\u{2014}', '\u{2013}', '\u{2012}', '\u{2015}'],
+        "--",
+    );
     let trimmed = normalized.trim();
     if !trimmed.starts_with("/task ") && trimmed != "/task" {
         // No keyword auto-detection here — that path mistook short Chinese
@@ -353,18 +353,14 @@ pub fn get_task_queue() -> Option<Arc<TaskQueueManager>> {
     TASK_QUEUE.get().cloned()
 }
 
-/// Look up the outbound mpsc sender for a channel by name. Returns None if
+/// Look up the outbound mpsc sender for a channel.
+///
+/// When `account` is `Some`, the account-suffixed key `{name}/{account}` is
+/// tried first so multi-account channels (feishu) route replies back through
+/// the originating account instead of whichever one registered the bare
+/// `{name}` key last. Falls back to the bare `{name}` key. Returns `None` if
 /// the channel is not registered (or `install_channel_senders` was never
 /// called).
-fn lookup_channel_sender(name: &str) -> Option<mpsc::Sender<OutboundMessage>> {
-    lookup_channel_sender_for(name, None)
-}
-
-/// Like `lookup_channel_sender` but prefers the account-suffixed key
-/// `{name}/{account}` first. Used by multi-account channels (feishu) so
-/// replies route back through the account that received the inbound
-/// message instead of whichever account happened to register the bare
-/// `{name}` key last.
 fn lookup_channel_sender_for(
     name: &str,
     account: Option<&str>,

@@ -1647,7 +1647,7 @@ mod swap_tests {
             d.created_at = 1;
             store.add(d).await.expect("add");
         }
-        assert_eq!(store.is_migrating(), false);
+        assert!(!store.is_migrating());
 
         let new_emb: Arc<dyn Embedder> = Arc::new(StubEmbedder { dim: 8, seed_bias: 0.1 });
         store.begin_swap(Arc::clone(&new_emb)).expect("begin_swap");

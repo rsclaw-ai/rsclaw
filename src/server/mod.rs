@@ -656,7 +656,7 @@ async fn message_read(
         } else {
             format!("{channel}:{target}")
         };
-        match sessions.iter().filter(|s| s.contains(&needle)).last() {
+        match sessions.iter().filter(|s| s.contains(&needle)).next_back() {
             Some(s) => s.clone(),
             None => return (StatusCode::OK, Json(serde_json::json!([]))),
         }

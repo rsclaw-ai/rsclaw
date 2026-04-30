@@ -13,7 +13,7 @@ fn init_crypto() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-fn noop_on_message() -> Arc<
+type OnMessage = Arc<
     dyn Fn(
             String,
             String,
@@ -21,7 +21,9 @@ fn noop_on_message() -> Arc<
             Vec<rsclaw::agent::registry::FileAttachment>,
         ) + Send
         + Sync,
-> {
+>;
+
+fn noop_on_message() -> OnMessage {
     Arc::new(|_, _, _, _| {})
 }
 
@@ -63,7 +65,7 @@ async fn send_text_via_mock() {
         .await;
 
     let ch = WeChatPersonalChannel::new("mock-token".to_owned(), noop_on_message())
-        .with_base_url(&server.uri());
+        .with_base_url(server.uri());
 
     let result = ch
         .send(OutboundMessage {
@@ -98,7 +100,7 @@ async fn send_chunked_message() {
         .await;
 
     let ch = WeChatPersonalChannel::new("tok".to_owned(), noop_on_message())
-        .with_base_url(&server.uri());
+        .with_base_url(server.uri());
 
     // Build a message exceeding the default chunk limit
     let long_text = "W".repeat(10_000);

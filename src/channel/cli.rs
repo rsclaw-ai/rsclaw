@@ -92,6 +92,7 @@ mod tests {
                 images: vec![],
                 files: vec![],
                 channel: None,
+                account: None,
             })
             .await;
         assert!(result.is_ok());

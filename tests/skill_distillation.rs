@@ -107,8 +107,7 @@ async fn distill_with_llm_errors_on_empty_output() {
 
     let err = distill_with_llm("ignored prompt", provider, "mock-model".to_owned())
         .await
-        .err()
-        .expect("distill should fail when provider yields no text");
+        .expect_err("distill should fail when provider yields no text");
 
     let msg = err.to_string().to_lowercase();
     assert!(
