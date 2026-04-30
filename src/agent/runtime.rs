@@ -4225,54 +4225,60 @@ const MAX_ERROR_STREAK: usize = 5;
                 });
 
                 // First: check if user explicitly requested a tool call.
-                // If user says "用cron list查" / "调用xxx工具" but model didn't call ANY tool,
-                // this is a direct violation of user intent - block immediately.
-                let user_tool_request_keywords = [
-                    // Chinese: explicit tool call requests
-                    "用cron", "调用cron", "查cron", "cron list", "cron查询", "cron查",
-                    "用execute", "执行命令", "调用命令", "运行命令", "运行脚本",
-                    "用python", "调用python", "执行python", "运行python",
-                    "用opencode", "调用opencode", "opencode去", "opencode查",
-                    "帮我查", "帮我调用", "帮我执行", "帮我运行",
-                    "查一下", "查下", "看一下", "看下", "列一下", "列下",
-                    // English: explicit tool call requests
-                    "use cron", "call cron", "run cron", "cron list",
-                    "execute", "run script", "call tool",
-                    "help me check", "check for me", "list for me",
-                ];
-                let user_requests_tool = user_tool_request_keywords.iter().any(|kw| {
-                    ctx.user_text.to_lowercase().contains(&kw.to_lowercase()) || ctx.user_text.contains(kw)
-                });
+                // Skip this check for sessions where user_text is NOT a user request:
+                // - summarize: user_text is task output, no tools available by design
+                // - heartbeat/system: status reporting, no tool calling expected
+                let skip_user_tool_request_check = ctx.session_key.starts_with("summarize:")
+                    || ctx.session_key.starts_with("heartbeat:")
+                    || ctx.session_key.starts_with("system:");
+                if !skip_user_tool_request_check {
+                    let user_tool_request_keywords = [
+                        // Chinese: explicit tool call requests
+                        "用cron", "调用cron", "查cron", "cron list", "cron查询", "cron查",
+                        "用execute", "执行命令", "调用命令", "运行命令", "运行脚本",
+                        "用python", "调用python", "执行python", "运行python",
+                        "用opencode", "调用opencode", "opencode去", "opencode查",
+                        "帮我查", "帮我调用", "帮我执行", "帮我运行",
+                        "查一下", "查下", "看一下", "看下", "列一下", "列下",
+                        // English: explicit tool call requests
+                        "use cron", "call cron", "run cron", "cron list",
+                        "execute", "run script", "call tool",
+                        "help me check", "check for me", "list for me",
+                    ];
+                    let user_requests_tool = user_tool_request_keywords.iter().any(|kw| {
+                        ctx.user_text.to_lowercase().contains(&kw.to_lowercase()) || ctx.user_text.contains(kw)
+                    });
 
-                // If user explicitly requested a tool but model returned text with no tool call,
-                // this is deception - user asked for action, model gave text instead.
-                if user_requests_tool && !text_buf.trim().is_empty() && !has_tool_in_turn {
-                    tracing::warn!(
-                        session = %ctx.session_key,
-                        user_text = %ctx.user_text.chars().take(100).collect::<String>(),
-                        text_preview = %text_buf.chars().take(100).collect::<String>(),
-                        "USER REQUESTED TOOL BUT MODEL DID NOT CALL IT - blocking response"
-                    );
-                    text_buf.clear();
-                    let correction_msg = Message {
-                        role: Role::User,
-                        content: MessageContent::Text(
-                            "[System Correction] User explicitly requested you to call a tool (cron/execute/etc).\n\
-                            You responded with text instead of calling the tool. This is a violation of user intent.\n\
-                            You MUST call the tool that the user requested:\n\
-                            - User said \"用cron list\" -> call cron tool with action=list\n\
-                            - User said \"查cron\" -> call cron tool\n\
-                            - User said \"执行命令\" -> call execute_command tool\n\
-                            Call the tool NOW. Do not explain or apologize."
-                                .to_owned(),
-                        ),
-                    };
-                    turn_scratchpad.push(correction_msg);
-                    tracing::info!(
-                        session = %ctx.session_key,
-                        "USER TOOL REQUEST VIOLATION: injected forced message, continuing loop"
-                    );
-                    continue;
+                    // If user explicitly requested a tool but model returned text with no tool call,
+                    // this is deception - user asked for action, model gave text instead.
+                    if user_requests_tool && !text_buf.trim().is_empty() && !has_tool_in_turn {
+                        tracing::warn!(
+                            session = %ctx.session_key,
+                            user_text = %ctx.user_text.chars().take(100).collect::<String>(),
+                            text_preview = %text_buf.chars().take(100).collect::<String>(),
+                            "USER REQUESTED TOOL BUT MODEL DID NOT CALL IT - blocking response"
+                        );
+                        text_buf.clear();
+                        let correction_msg = Message {
+                            role: Role::User,
+                            content: MessageContent::Text(
+                                "[System Correction] User explicitly requested you to call a tool (cron/execute/etc).\n\
+                                You responded with text instead of calling the tool. This is a violation of user intent.\n\
+                                You MUST call the tool that the user requested:\n\
+                                - User said \"用cron list\" -> call cron tool with action=list\n\
+                                - User said \"查cron\" -> call cron tool\n\
+                                - User said \"执行命令\" -> call execute_command tool\n\
+                                Call the tool NOW. Do not explain or apologize."
+                                    .to_owned(),
+                            ),
+                        };
+                        turn_scratchpad.push(correction_msg);
+                        tracing::info!(
+                            session = %ctx.session_key,
+                            "USER TOOL REQUEST VIOLATION: injected forced message, continuing loop"
+                        );
+                        continue;
+                    }
                 }
                 // Skip deception detection for heartbeat/system/summarize sessions.
                 // - heartbeat/system: may legitimately report status without tools
@@ -6395,7 +6401,7 @@ fn is_likely_text_file(lower: &str) -> bool {
 
 /// Format a tool call result as human-readable markdown.
 fn format_tool_result(val: &serde_json::Value) -> String {
-    // exec tool: { exit_code, stdout, stderr }
+    // exec tool: { exit_code, stdout, stderr, error_parsed }
     if val.get("stdout").is_some() || val.get("stderr").is_some() {
         let stdout = val["stdout"].as_str().unwrap_or("").trim();
         let stderr = val["stderr"].as_str().unwrap_or("").trim();
@@ -6418,6 +6424,33 @@ fn format_tool_result(val: &serde_json::Value) -> String {
                 }
                 out.push_str(&format!("[exit code: {code}]"));
             }
+        }
+        // Include parsed error info for better LLM comprehension
+        if let Some(parsed) = val.get("error_parsed") {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str("[Error Analysis]\n");
+            if let Some(err_type) = parsed.get("error_type").and_then(|v| v.as_str()) {
+                out.push_str(&format!("Error type: {err_type}\n"));
+            }
+            if let Some(msg) = parsed.get("message").and_then(|v| v.as_str()) {
+                out.push_str(&format!("Message: {msg}\n"));
+            }
+            if let Some(line) = parsed.get("line").and_then(|v| v.as_i64()) {
+                out.push_str(&format!("Line: {line}\n"));
+            }
+            if let Some(hint) = parsed.get("hint").and_then(|v| v.as_str()) {
+                out.push_str(&format!("Hint: {hint}\n"));
+            }
+            out.push_str("\n[FIX SUGGESTION] Review the error details above and modify your command/query accordingly.");
+        }
+        // Include hint if available (CLI did-you-mean suggestions)
+        if let Some(hint) = val.get("hint").and_then(|v| v.as_str()) {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&format!("[Suggestion] {hint}"));
         }
         if out.is_empty() {
             "(no output)".to_owned()
