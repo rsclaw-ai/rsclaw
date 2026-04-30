@@ -2541,9 +2541,8 @@ fn resolve_config_path_for_write() -> std::path::PathBuf {
     if let Some(existing) = crate::config::loader::detect_config_path() {
         return existing;
     }
-    // Nothing exists -> new file in base_dir (defaults to ~/.rsclaw/)
-    let base = dirs_next::home_dir().unwrap_or_default().join(".rsclaw");
-    base.join("rsclaw.json5")
+    // Nothing exists -> new file in base_dir (RSCLAW_BASE_DIR or ~/.rsclaw/).
+    crate::config::loader::base_dir().join("rsclaw.json5")
 }
 
 fn rotate_backups(path: &std::path::Path) {

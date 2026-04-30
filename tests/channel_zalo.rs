@@ -191,6 +191,137 @@ async fn http_error_returns_err() {
 }
 
 #[tokio::test]
+async fn send_image_uploads_then_sends_attachment() {
+    let server = MockServer::start().await;
+
+    // Text precedes images.
+    Mock::given(method("POST"))
+        .and(path("/message/cs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"error": 0})))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    // Multipart upload returns attachment_id.
+    Mock::given(method("POST"))
+        .and(path("/upload/image"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "attachment_id": "att_42" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let ch = make_channel(&server.uri());
+
+    use base64::Engine;
+    let fake_png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&fake_png);
+    let data_uri = format!("data:image/png;base64,{b64}");
+
+    let msg = OutboundMessage {
+        target_id: "Z12345".to_owned(),
+        is_group: false,
+        text: "Here's an image".to_owned(),
+        reply_to: None,
+        images: vec![data_uri],
+        ..Default::default()
+    };
+
+    ch.send(msg).await.expect("send should succeed");
+}
+
+#[tokio::test]
+async fn webhook_image_downloads_and_dispatches() {
+    use std::sync::Mutex;
+    init_crypto();
+
+    let server = MockServer::start().await;
+
+    let fake_jpg: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+    Mock::given(method("GET"))
+        .and(path("/zalo-cdn/photo.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(fake_jpg.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let received: Arc<Mutex<Vec<(String, String, usize)>>> = Arc::new(Mutex::new(vec![]));
+    let rx = Arc::clone(&received);
+
+    let ch = ZaloChannel::with_api_base(
+        "tok",
+        Some(server.uri()),
+        Arc::new(move |from, text, images| {
+            rx.lock().expect("lock").push((from, text, images.len()));
+        }),
+    );
+
+    let body = format!(
+        r#"{{
+            "event_name": "user_send_image",
+            "sender": {{ "id": "Z77777" }},
+            "message": {{ "url": "{}/zalo-cdn/photo.jpg", "msg_id": "img1" }}
+        }}"#,
+        server.uri()
+    );
+
+    ch.handle_webhook(&body).await.expect("webhook should succeed");
+
+    let msgs = received.lock().expect("lock");
+    assert_eq!(msgs.len(), 1, "image webhook should dispatch once");
+    assert_eq!(msgs[0].0, "Z77777");
+    assert_eq!(msgs[0].2, 1, "should attach exactly one image");
+}
+
+#[tokio::test]
+async fn webhook_image_via_attachments_array() {
+    use std::sync::Mutex;
+    init_crypto();
+
+    let server = MockServer::start().await;
+
+    let fake_png: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47];
+    Mock::given(method("GET"))
+        .and(path("/zalo-cdn/att.png"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(fake_png.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let received: Arc<Mutex<Vec<(String, usize)>>> = Arc::new(Mutex::new(vec![]));
+    let rx = Arc::clone(&received);
+
+    let ch = ZaloChannel::with_api_base(
+        "tok",
+        Some(server.uri()),
+        Arc::new(move |from, _text, images| {
+            rx.lock().expect("lock").push((from, images.len()));
+        }),
+    );
+
+    let body = format!(
+        r#"{{
+            "event_name": "user_send_image",
+            "sender": {{ "id": "Z88888" }},
+            "message": {{
+                "msg_id": "img2",
+                "attachments": [
+                    {{ "type": "photo", "payload": {{ "url": "{}/zalo-cdn/att.png" }} }}
+                ]
+            }}
+        }}"#,
+        server.uri()
+    );
+
+    ch.handle_webhook(&body).await.expect("webhook should succeed");
+
+    let msgs = received.lock().expect("lock");
+    assert_eq!(msgs.len(), 1, "image-via-attachments should dispatch once");
+    assert_eq!(msgs[0].1, 1);
+}
+
+#[tokio::test]
 async fn webhook_unknown_event_is_skipped() {
     use std::sync::Mutex;
     init_crypto();

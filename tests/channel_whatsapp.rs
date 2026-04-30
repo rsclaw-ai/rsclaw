@@ -183,6 +183,212 @@ async fn webhook_text_dispatches_to_callback() {
 }
 
 #[tokio::test]
+async fn webhook_image_downloads_and_dispatches() {
+    use std::sync::Mutex;
+    init_crypto();
+
+    let server = MockServer::start().await;
+
+    // Metadata lookup: GET /<media_id> → returns download URL on same server.
+    let download_path = "/media-blob/abc";
+    Mock::given(method("GET"))
+        .and(path_regex(r"/wamid_image_1$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "url": format!("{}{}", &server.uri(), download_path),
+            "mime_type": "image/jpeg",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Actual binary download.
+    let fake_jpg: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+    Mock::given(method("GET"))
+        .and(path_regex(r"/media-blob/abc$"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(fake_jpg.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let received: Arc<Mutex<Vec<(String, String, usize)>>> = Arc::new(Mutex::new(vec![]));
+    let rx = Arc::clone(&received);
+
+    let ch = WhatsAppChannel::with_api_base(
+        "phone123",
+        "access-tok",
+        Some(server.uri()),
+        Arc::new(move |from, text, images| {
+            rx.lock().expect("lock").push((from, text, images.len()));
+        }),
+    );
+
+    let payload = WebhookPayload {
+        entry: vec![WhatsAppEntry {
+            changes: vec![WhatsAppChange {
+                value: WhatsAppValue {
+                    messages: Some(vec![WhatsAppMessage {
+                        from: "447911123456".to_owned(),
+                        id: "wamid.img".to_owned(),
+                        kind: "image".to_owned(),
+                        text: None,
+                        image: Some(rsclaw::channel::whatsapp::WhatsAppMediaRef {
+                            id: "wamid_image_1".to_owned(),
+                            mime_type: Some("image/jpeg".to_owned()),
+                            filename: None,
+                        }),
+                        audio: None,
+                        video: None,
+                        document: None,
+                    }]),
+                },
+            }],
+        }],
+    };
+
+    ch.handle_webhook(&payload).await;
+
+    let msgs = received.lock().expect("lock");
+    assert_eq!(msgs.len(), 1, "image webhook should dispatch once");
+    assert_eq!(msgs[0].0, "447911123456");
+    assert_eq!(msgs[0].2, 1, "should attach exactly one image");
+}
+
+#[tokio::test]
+async fn webhook_document_text_file_dispatches_content() {
+    use std::sync::Mutex;
+    init_crypto();
+
+    let server = MockServer::start().await;
+
+    let download_path = "/media-blob/doc";
+    Mock::given(method("GET"))
+        .and(path_regex(r"/wamid_doc_1$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "url": format!("{}{}", &server.uri(), download_path),
+            "mime_type": "text/plain",
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path_regex(r"/media-blob/doc$"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("hello-world"))
+        .mount(&server)
+        .await;
+
+    let received: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(vec![]));
+    let rx = Arc::clone(&received);
+
+    let ch = WhatsAppChannel::with_api_base(
+        "phone123",
+        "access-tok",
+        Some(server.uri()),
+        Arc::new(move |from, text, _images| {
+            rx.lock().expect("lock").push((from, text));
+        }),
+    );
+
+    let payload = WebhookPayload {
+        entry: vec![WhatsAppEntry {
+            changes: vec![WhatsAppChange {
+                value: WhatsAppValue {
+                    messages: Some(vec![WhatsAppMessage {
+                        from: "447911123456".to_owned(),
+                        id: "wamid.doc".to_owned(),
+                        kind: "document".to_owned(),
+                        text: None,
+                        image: None,
+                        audio: None,
+                        video: None,
+                        document: Some(rsclaw::channel::whatsapp::WhatsAppMediaRef {
+                            id: "wamid_doc_1".to_owned(),
+                            mime_type: Some("text/plain".to_owned()),
+                            filename: Some("note.txt".to_owned()),
+                        }),
+                    }]),
+                },
+            }],
+        }],
+    };
+
+    ch.handle_webhook(&payload).await;
+
+    let msgs = received.lock().expect("lock");
+    assert_eq!(msgs.len(), 1);
+    assert!(msgs[0].1.contains("note.txt"));
+    assert!(msgs[0].1.contains("hello-world"));
+}
+
+#[tokio::test]
+async fn webhook_unsupported_type_is_skipped() {
+    use std::sync::Mutex;
+    init_crypto();
+
+    let received: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(vec![]));
+    let rx = Arc::clone(&received);
+
+    let ch = WhatsAppChannel::new(
+        "phone123",
+        "access-tok",
+        Arc::new(move |from, text, _images| {
+            rx.lock().expect("lock").push((from, text));
+        }),
+    );
+
+    let payload = WebhookPayload {
+        entry: vec![WhatsAppEntry {
+            changes: vec![WhatsAppChange {
+                value: WhatsAppValue {
+                    messages: Some(vec![WhatsAppMessage {
+                        from: "447911123456".to_owned(),
+                        id: "wamid.sticker".to_owned(),
+                        kind: "sticker".to_owned(),
+                        text: None,
+                        image: None,
+                        audio: None,
+                        video: None,
+                        document: None,
+                    }]),
+                },
+            }],
+        }],
+    };
+
+    ch.handle_webhook(&payload).await;
+
+    let msgs = received.lock().expect("lock");
+    assert_eq!(msgs.len(), 0, "unsupported type should not dispatch");
+}
+
+#[tokio::test]
+async fn send_uses_bearer_auth_header() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/phone123/messages"))
+        .and(wiremock::matchers::header("authorization", "Bearer access-tok"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"messages": [{"id": "wamid.123"}]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let ch = make_channel(&server.uri());
+    let msg = OutboundMessage {
+        target_id: "447911123456".to_owned(),
+        is_group: false,
+        text: "Auth check".to_owned(),
+        reply_to: None,
+        images: vec![],
+    ..Default::default()
+    };
+
+    ch.send(msg).await.expect("send should succeed with bearer auth");
+}
+
+#[tokio::test]
 async fn http_error_returns_err() {
     let server = MockServer::start().await;
 

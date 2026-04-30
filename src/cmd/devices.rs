@@ -17,16 +17,11 @@ struct PairedDevice {
     paired_at: Option<String>,
 }
 
-/// Load paired devices from ~/.rsclaw/devices/paired.json.
+/// Load paired devices from `<base_dir>/devices/paired.json`.
 fn paired_json_path() -> std::path::PathBuf {
-    let home = dirs_next::home_dir().unwrap_or_default();
-
-    // Prefer RSCLAW_BASE_DIR if set.
-    let base = std::env::var("RSCLAW_BASE_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| home.join(".rsclaw"));
-
-    base.join("devices").join("paired.json")
+    crate::config::loader::base_dir()
+        .join("devices")
+        .join("paired.json")
 }
 
 fn load_devices() -> Result<Vec<PairedDevice>> {
