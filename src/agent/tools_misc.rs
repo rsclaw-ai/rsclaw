@@ -33,43 +33,68 @@ impl AgentRuntime {
         ));
         let out_str = out_path.to_string_lossy().to_string();
 
-        // Try sherpa-onnx first (installed via `rsclaw tools install sherpa-onnx`).
+        // Try sherpa-onnx first. Binary lives under
+        // `<base>/tools/sherpa-onnx/bin/` (installed via
+        // `rsclaw tools install sherpa-onnx`); models live separately
+        // under `<base>/models/vits-*/` (installed via
+        // `rsclaw models download vits-theresa`). Earlier code looked
+        // for the model under tools/sherpa-onnx/models/tts/, which is
+        // where models would never actually land — so the binary check
+        // passed but the model check always failed and TTS silently
+        // fell through to system `say` / SAPI / espeak.
         let sherpa_bin = crate::config::loader::base_dir()
             .join("tools")
             .join("sherpa-onnx")
             .join("bin")
             .join(if cfg!(target_os = "windows") { "sherpa-onnx-offline-tts.exe" } else { "sherpa-onnx-offline-tts" });
 
-        if sherpa_bin.exists() {
-            let model_dir = crate::config::loader::base_dir()
-                .join("tools")
-                .join("sherpa-onnx")
-                .join("models")
-                .join("tts");
-            // Look for any VITS model config.
-            let model_config = model_dir.join("model.onnx");
-            if model_config.exists() {
-                let mut cmd = tokio::process::Command::new(&sherpa_bin);
-                cmd.args([
-                    "--vits-model", model_config.to_str().unwrap_or(""),
-                    "--vits-tokens", model_dir.join("tokens.txt").to_str().unwrap_or(""),
-                    "--output-filename", &out_str,
-                    "--vits-length-scale", "1.0",
-                    tts_text,
-                ]);
-                #[cfg(target_os = "windows")]
-                {
-                    use std::os::windows::process::CommandExt;
-                    cmd.creation_flags(0x08000000);
-                }
-                let output = cmd.output().await;
-                if let Ok(o) = output {
-                    if o.status.success() && out_path.exists() {
-                        return Ok(out_str);
-                    }
-                }
-                // Fall through to system TTS if sherpa-onnx failed.
+        if sherpa_bin.exists()
+            && let Some(vits) = find_vits_model()
+        {
+            // sherpa-onnx 1.13 enforces `--flag=value` (single argv
+            // slot). Separate `--flag value` argv slots get rejected by
+            // parse-options.cc with "option format is --x=y".
+            let mut cmd = tokio::process::Command::new(&sherpa_bin);
+            cmd.arg(format!("--vits-model={}", vits.model.display()));
+            cmd.arg(format!("--vits-tokens={}", vits.tokens.display()));
+            if let Some(lex) = vits.lexicon.as_ref() {
+                cmd.arg(format!("--vits-lexicon={}", lex.display()));
             }
+            // `--vits-data-dir` is sherpa-onnx's espeak-ng dict path, NOT
+            // the jieba `dict/` shipped with the Chinese theresa bundle.
+            // Passing the latter here breaks model load. The jieba dict
+            // is consumed implicitly via the lexicon.txt path. Keep this
+            // hook for English bundles that DO use espeak-ng.
+            if let Some(data) = vits.data_dir.as_ref() {
+                let path_str = data.to_string_lossy();
+                let looks_like_jieba = path_str.ends_with("/dict")
+                    || path_str.ends_with("\\dict");
+                if !looks_like_jieba {
+                    cmd.arg(format!("--vits-data-dir={path_str}"));
+                }
+            }
+            // Flag is `--tts-rule-fsts`, not `--vits-rule-fsts` (the
+            // latter doesn't exist on sherpa-onnx 1.13+ and triggers
+            // "Invalid option" parse-options error).
+            if let Some(rule) = vits.rule_fsts.as_ref() {
+                cmd.arg(format!("--tts-rule-fsts={rule}"));
+            }
+            cmd.arg(format!("--output-filename={out_str}"));
+            cmd.arg("--vits-length-scale=1.0");
+            cmd.arg(tts_text);
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000);
+            }
+            let output = cmd.output().await;
+            if let Ok(o) = output
+                && o.status.success()
+                && out_path.exists()
+            {
+                return Ok(out_str);
+            }
+            // Fall through to system TTS if sherpa-onnx failed.
         }
 
         // Fallback: system TTS (same as tool_tts).
@@ -701,5 +726,126 @@ $synth.Speak('{}')
             )
         }))
     }
+}
+
+/// Located VITS TTS model under `<base>/models/vits-*/`.
+///
+/// `lexicon` / `data_dir` / `rule_fsts` are optional — only the Chinese
+/// VITS bundles (e.g. vits-zh-hf-theresa) ship them. Pure-English bundles
+/// only need `model` + `tokens`. The auto-TTS caller passes whichever
+/// fields are populated as CLI flags so the same logic handles both.
+///
+/// `rule_fsts` is a comma-joined absolute-path list — the Chinese
+/// theresa bundle ships `phone.fst,date.fst,number.fst,new_heteronym.fst`
+/// and sherpa-onnx expects all four, otherwise dates / numbers /
+/// heteronyms come out garbled.
+struct VitsModel {
+    model: std::path::PathBuf,
+    tokens: std::path::PathBuf,
+    lexicon: Option<std::path::PathBuf>,
+    data_dir: Option<std::path::PathBuf>,
+    rule_fsts: Option<String>,
+}
+
+/// Find an installed VITS TTS model under `<base>/models/`.
+///
+/// Search order picks the first directory matching `vits-*` (today the
+/// bundle is `vits-theresa`; future English / multilingual bundles go in
+/// the same place). File names inside the directory follow the standard
+/// sherpa-onnx VITS layout — `*.onnx` for the model, `tokens.txt`,
+/// optional `lexicon.txt`, optional `dict/`, optional `rule.fst`.
+fn find_vits_model() -> Option<VitsModel> {
+    let models_root = crate::config::loader::base_dir().join("models");
+    let entries = std::fs::read_dir(&models_root).ok()?;
+    let mut candidates: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("vits-"))
+        })
+        .collect();
+
+    // Explicit priority: prefer MeloTTS (best quality, ~300MB) over the
+    // lightweight HuggingFace community models (theresa et al). Anything
+    // not in the priority list falls to alphabetical order. Reordering by
+    // hand rather than relying on lexicographic sort means future bundles
+    // with arbitrary names don't accidentally win.
+    const PRIORITY: &[&str] = &[
+        "vits-melo-tts-zh_en",
+        "vits-melo-tts-zh",
+        "vits-zh-aishell3",
+        "vits-theresa",
+        "vits-zh-hf-theresa",
+    ];
+    candidates.sort_by_key(|p| {
+        let name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        let pri = PRIORITY
+            .iter()
+            .position(|n| *n == name.as_str())
+            .unwrap_or(usize::MAX);
+        (pri, name)
+    });
+    let candidate_dirs = candidates;
+
+    for dir in candidate_dirs {
+        let mut model: Option<std::path::PathBuf> = None;
+        let mut tokens: Option<std::path::PathBuf> = None;
+        let mut lexicon: Option<std::path::PathBuf> = None;
+        let mut fst_paths: Vec<std::path::PathBuf> = Vec::new();
+        let Ok(files) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in files.flatten() {
+            let p = entry.path();
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let is_int8 = name.contains(".int8.");
+            if name.ends_with(".onnx") && (model.is_none() || !is_int8) {
+                model = Some(p.clone());
+            } else if name == "tokens.txt" {
+                tokens = Some(p.clone());
+            } else if name == "lexicon.txt" {
+                lexicon = Some(p.clone());
+            } else if name.ends_with(".fst") {
+                fst_paths.push(p.clone());
+            }
+        }
+        // Stable ordering keeps the comma-joined string deterministic.
+        fst_paths.sort();
+        let rule_fsts = if fst_paths.is_empty() {
+            None
+        } else {
+            Some(
+                fst_paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        };
+        let data_dir = {
+            let d = dir.join("dict");
+            if d.is_dir() { Some(d) } else { None }
+        };
+        if let (Some(m), Some(t)) = (model, tokens) {
+            return Some(VitsModel {
+                model: m,
+                tokens: t,
+                lexicon,
+                data_dir,
+                rule_fsts,
+            });
+        }
+    }
+    None
 }
 

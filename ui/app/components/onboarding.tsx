@@ -827,8 +827,8 @@ export const MODELS: Record<string, ModelDef[]> = {
     { id: "qwen-turbo", tag: "\u5FEB\u901F", tagEn: "Fast", rec: false },
   ],
   doubao: [
-    { id: "doubao-seed-2-0-pro", tag: "\u63A8\u8350", tagEn: "Recommended", rec: true },
-    { id: "doubao-1-5-pro-256k", tag: "\u957F\u6587\u672C", tagEn: "Long context", rec: false },
+    { id: "doubao-seed-2.0-pro", tag: "\u63A8\u8350", tagEn: "Recommended", rec: true },
+    { id: "doubao-seed-2.0-lite", tag: "\u8F7B\u91CF", tagEn: "Lite", rec: false },
   ],
   deepseek: [
     { id: "deepseek-chat", tag: "\u901A\u7528", tagEn: "General", rec: true },
@@ -1599,6 +1599,13 @@ export function OnboardingPage() {
         // Pre-fill default URL for providers with editable URL (e.g. doubao)
         ps.baseUrl = p.defaultBaseUrl;
       }
+      // Doubao surfaces the API Protocol dropdown alongside custom.
+      // Default to OpenAI Responses (the Ark endpoint's native protocol
+      // for the Seed-1.6+ family with tool calling); user can switch to
+      // plain OpenAI Chat for older models if needed.
+      if (p.id === "doubao") {
+        ps.apiType = "openai-responses";
+      }
       m[p.id] = ps;
     });
     return m;
@@ -2063,8 +2070,10 @@ export function OnboardingPage() {
         if (ps.baseUrl) entry.baseUrl = ps.baseUrl;
         if (ps.userAgent) entry.userAgent = ps.userAgent;
         // Standard providers that opt into the api_type field (e.g. doubao
-        // for CodingPlan) save the user's selection.
-        if (id === "doubao" && ps.apiType) entry.api = ps.apiType;
+        // for CodingPlan) save the user's selection. Default to "openai"
+        // when the picker was never touched — otherwise the field would
+        // silently drop and the gateway would have to autodetect.
+        if (id === "doubao") entry.api = ps.apiType || "openai-responses";
         providers[id] = entry;
       } else {
         providers[id] = {};

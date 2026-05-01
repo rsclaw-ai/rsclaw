@@ -66,6 +66,7 @@ pub async fn transcribe_audio(
     info!(provider = %provider, file = effective_name, bytes = effective_bytes.len(), "transcribing audio");
 
     match provider.as_str() {
+        "sherpa" => transcribe_sherpa(&effective_bytes, &effective_name).await,
         "candle" => transcribe_candle(&effective_bytes).await,
         "macos" => transcribe_macos(&effective_bytes, &effective_name).await,
         "local" => transcribe_local(&effective_bytes, &effective_name).await,
@@ -161,7 +162,14 @@ fn detect_provider() -> String {
         return p.to_lowercase();
     }
 
-    // 1. Candle whisper model (pure Rust, no external deps)
+    // 1. Sherpa-onnx (preferred — same engine as TTS, works offline,
+    //    Chinese-friendly with whisper-turbo). Detected by the presence
+    //    of an installed model dir + the `sherpa-onnx-offline` binary.
+    if find_sherpa_stt_setup().is_some() {
+        return "sherpa".to_owned();
+    }
+
+    // 2. Candle whisper model (pure Rust, no external deps)
     let model_dir = crate::config::loader::base_dir().join("models/whisper-tiny");
     if model_dir.join("config.json").exists() {
         return "candle".to_owned();
@@ -1427,6 +1435,208 @@ async fn transcribe_candle(audio_bytes: &[u8]) -> Result<String> {
         "candle whisper inference not yet implemented; \
          install whisper-cli or set OPENAI_API_KEY as fallback"
     )
+}
+
+// ---------------------------------------------------------------------------
+// Sherpa-onnx (preferred local STT — pairs with sherpa-onnx TTS)
+// ---------------------------------------------------------------------------
+
+/// Locate the sherpa-onnx-offline binary. Prefers the bundled copy under
+/// `<base_dir>/tools/sherpa-onnx/bin/`, falls back to `$PATH`.
+fn find_sherpa_offline_bin() -> Option<std::path::PathBuf> {
+    let bundled = crate::config::loader::base_dir()
+        .join("tools")
+        .join("sherpa-onnx")
+        .join("bin")
+        .join(if cfg!(target_os = "windows") {
+            "sherpa-onnx-offline.exe"
+        } else {
+            "sherpa-onnx-offline"
+        });
+    if bundled.exists() {
+        return Some(bundled);
+    }
+    which::which("sherpa-onnx-offline").ok()
+}
+
+/// Locate an installed sherpa-onnx STT model directory. Prefers the
+/// paraformer-zh int8 model (best Chinese accuracy at ~70MB), then
+/// whisper-turbo, then whisper-tiny. Inside each dir we expect
+/// sherpa-onnx file naming — the tarballs strip their top-level
+/// directory on extract so files land directly under the chosen path.
+///
+/// Two model families are supported:
+///   - **whisper**: split encoder/decoder ONNX + tokens.txt
+///       (`*-encoder.onnx`, `*-decoder.onnx`, `*-tokens.txt`)
+///   - **paraformer**: single `model.onnx` (or `model.int8.onnx`) +
+///       `tokens.txt`
+enum SherpaSttSetup {
+    Whisper {
+        bin: std::path::PathBuf,
+        encoder: std::path::PathBuf,
+        decoder: std::path::PathBuf,
+        tokens: std::path::PathBuf,
+    },
+    Paraformer {
+        bin: std::path::PathBuf,
+        model: std::path::PathBuf,
+        tokens: std::path::PathBuf,
+    },
+}
+
+fn find_sherpa_stt_setup() -> Option<SherpaSttSetup> {
+    let bin = find_sherpa_offline_bin()?;
+    let models_root = crate::config::loader::base_dir().join("models");
+
+    // Search order: full-precision paraformer first (user installed it
+    // explicitly so they want the better quality), then int8 paraformer
+    // (best size/quality tradeoff for Chinese-only), then whisper-turbo
+    // (multilingual), then whisper-tiny (lightweight fallback).
+    for dir_name in ["paraformer-zh-full", "paraformer-zh", "whisper-turbo", "whisper-tiny"] {
+        let dir = models_root.join(dir_name);
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut encoder: Option<std::path::PathBuf> = None;
+        let mut decoder: Option<std::path::PathBuf> = None;
+        let mut paraformer_model: Option<std::path::PathBuf> = None;
+        let mut tokens: Option<std::path::PathBuf> = None;
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let is_int8 = name.contains(".int8.");
+            if name.ends_with("-encoder.onnx") && (encoder.is_none() || !is_int8) {
+                encoder = Some(p.clone());
+            } else if name.ends_with("-decoder.onnx") && (decoder.is_none() || !is_int8) {
+                decoder = Some(p.clone());
+            } else if name == "model.onnx"
+                || name == "model.int8.onnx"
+                || name.starts_with("paraformer")
+            {
+                // Paraformer: single bundled ONNX. Prefer non-int8 if both
+                // exist, otherwise take whatever's there.
+                if paraformer_model.is_none() || !is_int8 {
+                    paraformer_model = Some(p.clone());
+                }
+            }
+            if name.ends_with("-tokens.txt") || name == "tokens.txt" {
+                tokens = Some(p.clone());
+            }
+        }
+        let Some(t) = tokens else { continue };
+        if let (Some(e), Some(d)) = (encoder, decoder) {
+            return Some(SherpaSttSetup::Whisper {
+                bin: bin.clone(),
+                encoder: e,
+                decoder: d,
+                tokens: t,
+            });
+        }
+        if let Some(m) = paraformer_model {
+            return Some(SherpaSttSetup::Paraformer {
+                bin: bin.clone(),
+                model: m,
+                tokens: t,
+            });
+        }
+    }
+    None
+}
+
+/// Transcribe via the bundled `sherpa-onnx-offline` whisper pipeline.
+/// Decodes the input to 16 kHz mono WAV first, then shells out and parses
+/// the recognized text from stdout (sherpa prints `text: "..."`).
+async fn transcribe_sherpa(audio_bytes: &[u8], file_name: &str) -> Result<String> {
+    let setup = find_sherpa_stt_setup()
+        .context("sherpa-onnx STT not installed (need sherpa-onnx-offline + whisper-tiny/turbo model)")?;
+
+    // sherpa-onnx-offline accepts WAV; convert other formats to 16 kHz
+    // mono WAV via the existing PCM helper.
+    let wav_bytes = if file_name.to_lowercase().ends_with(".wav") {
+        audio_bytes.to_vec()
+    } else {
+        let pcm = decode_audio_to_pcm(audio_bytes)
+            .context("failed to decode audio for sherpa-onnx STT")?;
+        write_wav_from_pcm(&pcm, 16000)
+    };
+
+    let tmp_dir = std::env::temp_dir();
+    let wav_path = tmp_dir.join(format!("rsclaw_sherpa_stt_{}.wav", uuid::Uuid::new_v4()));
+    std::fs::write(&wav_path, &wav_bytes).context("write temp WAV for sherpa-onnx")?;
+
+    // sherpa-onnx 1.13 enforces `--flag=value` format (`parse-options.cc`
+    // bails with "option format is --x=y" if flag and value are separate
+    // argv slots). Build each option as a single string.
+    let (bin, mut args): (&std::path::PathBuf, Vec<String>) = match &setup {
+        SherpaSttSetup::Whisper { bin, encoder, decoder, tokens } => (
+            bin,
+            vec![
+                format!("--whisper-encoder={}", encoder.display()),
+                format!("--whisper-decoder={}", decoder.display()),
+                format!("--tokens={}", tokens.display()),
+            ],
+        ),
+        SherpaSttSetup::Paraformer { bin, model, tokens } => (
+            bin,
+            vec![
+                format!("--paraformer={}", model.display()),
+                format!("--tokens={}", tokens.display()),
+            ],
+        ),
+    };
+    args.push(wav_path.to_string_lossy().into_owned());
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(&args);
+    let output = cmd.output().await.context("sherpa-onnx-offline failed to launch")?;
+    let _ = std::fs::remove_file(&wav_path);
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("sherpa-onnx-offline exit {}: {}", output.status, stderr);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let text = parse_sherpa_stt_output(&stdout);
+    if text.is_empty() {
+        anyhow::bail!("sherpa-onnx-offline returned no recognized text:\n{}", stdout);
+    }
+    info!(chars = text.len(), "sherpa-onnx STT recognized");
+    Ok(text)
+}
+
+/// Pull the recognized text out of `sherpa-onnx-offline` stdout.
+///
+/// Output format depends on the sherpa-onnx version:
+///   - 1.13+ prints a single-line JSON object with a `"text"` field.
+///   - Older builds print a plain `text: "..."` line.
+///
+/// We try JSON first (new format), then fall back to the old prefix
+/// match. Either way, take the last match so the (longer) result line
+/// wins over earlier config-echo lines that may share the prefix.
+fn parse_sherpa_stt_output(stdout: &str) -> String {
+    for line in stdout.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('{')
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
+            && let Some(text) = v.get("text").and_then(|t| t.as_str())
+        {
+            return text.to_owned();
+        }
+    }
+    for line in stdout.lines().rev() {
+        if let Some(rest) = line.trim().strip_prefix("text:") {
+            let trimmed = rest.trim();
+            return trimmed
+                .trim_start_matches('"')
+                .trim_end_matches('"')
+                .to_owned();
+        }
+    }
+    String::new()
 }
 
 // ---------------------------------------------------------------------------

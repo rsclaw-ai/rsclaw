@@ -225,6 +225,68 @@ fn image_ref_to_data_url(image_ref: String) -> Option<String> {
 }
 
 /// Check if the current model supports vision (image input).
+/// Detect a natural-language intent to switch voice/text reply mode.
+///
+/// Returns `Some(true)` to switch to voice, `Some(false)` to switch to
+/// text, `None` if the user said nothing about reply mode. Used so the
+/// user doesn't have to remember the explicit `/voice` · `/text` slash
+/// commands — typing "用文字回复" or "no voice please" works too.
+///
+/// Implementation is intentionally a tiny keyword list, not a regex
+/// engine. False positives on weird phrasings are acceptable; the user
+/// can always issue `/voice` or `/text` explicitly to override.
+fn parse_voice_mode_intent(text: &str) -> Option<bool> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_lowercase();
+
+    const OFF_ZH: &[&str] = &[
+        "\u{7528}\u{6587}\u{5B57}",     // 用文字
+        "\u{6539}\u{6210}\u{6587}\u{5B57}", // 改成文字
+        "\u{56DE}\u{590D}\u{6587}\u{5B57}", // 回复文字
+        "\u{6587}\u{5B57}\u{56DE}\u{590D}", // 文字回复
+        "\u{4E0D}\u{8981}\u{8BED}\u{97F3}", // 不要语音
+        "\u{4E0D}\u{7528}\u{8BED}\u{97F3}", // 不用语音
+        "\u{522B}\u{8BED}\u{97F3}",      // 别语音
+        "\u{505C}\u{6B62}\u{8BED}\u{97F3}", // 停止语音
+        "\u{5173}\u{6389}\u{8BED}\u{97F3}", // 关掉语音
+        "\u{5173}\u{95ED}\u{8BED}\u{97F3}", // 关闭语音
+    ];
+    const OFF_EN: &[&str] = &[
+        "text only",
+        "no voice",
+        "stop voice",
+        "reply in text",
+        "respond in text",
+        "text reply",
+        "switch to text",
+    ];
+    const ON_ZH: &[&str] = &[
+        "\u{7528}\u{8BED}\u{97F3}",      // 用语音
+        "\u{8BED}\u{97F3}\u{56DE}\u{590D}", // 语音回复
+        "\u{6539}\u{6210}\u{8BED}\u{97F3}", // 改成语音
+        "\u{5207}\u{8BED}\u{97F3}",      // 切语音
+    ];
+    const ON_EN: &[&str] = &[
+        "reply in voice",
+        "voice reply",
+        "use voice",
+        "switch to voice",
+    ];
+
+    let says_off = OFF_ZH.iter().any(|p| trimmed.contains(p))
+        || OFF_EN.iter().any(|p| lower.contains(p));
+    let says_on = ON_ZH.iter().any(|p| trimmed.contains(p))
+        || ON_EN.iter().any(|p| lower.contains(p));
+    match (says_off, says_on) {
+        (true, false) => Some(false),
+        (false, true) => Some(true),
+        _ => None, // ambiguous (both / neither) — leave mode unchanged
+    }
+}
+
 fn model_supports_vision(model: &str, config: &RuntimeConfig) -> bool {
     // 1. Explicit config override
     if let Some(v) = config
@@ -834,7 +896,38 @@ impl AgentRuntime {
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
         let resolved = crate::channel::resolve_file_refs(text, &workspace);
         let text = resolved.text;
+
+        // Channels that locally transcribe voice (WeChat platform STT,
+        // Feishu speech recognition) tag the message with this prefix
+        // so the agent knows the user spoke even though only text crosses
+        // the on_message callback. Without this, voice_mode_sessions never
+        // gets set on those channels and the reply goes back as text.
+        const VOICE_INPUT_TAG: &str = "[__VOICE_INPUT__]";
+        let text: String = if let Some(stripped) = text.strip_prefix(VOICE_INPUT_TAG) {
+            self.voice_mode_sessions.insert(session_key.to_owned());
+            debug!(session = session_key, "voice mode enabled (channel-side transcription tag)");
+            stripped.trim_start_matches('\n').to_owned()
+        } else {
+            text
+        };
         let text = text.as_str();
+
+        // Voice-mode toggle by natural language. Once a session is in voice
+        // mode (either via /voice or because the user sent audio), the user
+        // shouldn't have to remember the explicit /text command — phrases
+        // like "用文字回复" or "no voice please" should switch back. Runs
+        // before media detection so a typed instruction beats the
+        // audio-attachment auto-enable that follows. Audio-only turns hit
+        // this path on the recursive run_turn call after transcription.
+        if let Some(want_voice) = parse_voice_mode_intent(text) {
+            if want_voice {
+                self.voice_mode_sessions.insert(session_key.to_owned());
+                debug!(session = session_key, "voice mode enabled (natural-language intent)");
+            } else {
+                self.voice_mode_sessions.remove(session_key);
+                debug!(session = session_key, "voice mode disabled (natural-language intent)");
+            }
+        }
 
         // Load referenced images as vision attachments.
         let mut images = images;

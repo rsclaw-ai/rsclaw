@@ -926,7 +926,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                 }
             }
             STEP_API_TYPE => {
-                // API protocol selection for custom/codingplan providers.
+                // API protocol selection for custom/codingplan/doubao.
                 let api_labels = &[
                     "OpenAI Chat (default)",
                     "OpenAI Responses",
@@ -935,7 +935,14 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                     "Ollama",
                 ];
                 let api_values = &["openai", "openai-responses", "anthropic", "gemini", "ollama"];
-                let current_idx = api_values.iter().position(|v| *v == api_type).unwrap_or(0);
+                // Doubao defaults the cursor to OpenAI Responses (its
+                // native protocol for the Seed-1.6+ family with tool
+                // calling). Custom/codingplan keep the historical OpenAI
+                // Chat default.
+                let prov = &defs.providers[provider_idx];
+                let preferred_default = if prov.name == "doubao" { "openai-responses" } else { "openai" };
+                let probe = if api_type.is_empty() { preferred_default } else { api_type.as_str() };
+                let current_idx = api_values.iter().position(|v| *v == probe).unwrap_or(0);
                 match select_step("  API Protocol", api_labels, current_idx) {
                     StepResult::Next(idx) => {
                         api_type = api_values[idx].to_string();
@@ -1215,8 +1222,20 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
             if !effective_base_url.is_empty() {
                 prov_obj.insert("baseUrl".into(), json!(effective_base_url));
             }
-            // Write api type for custom / codingplan / doubao providers
-            if (provider.name == "custom" || provider.name == "codingplan" || provider.name == "doubao") && !api_type.is_empty() {
+            // Write api type for custom / codingplan / doubao providers.
+            // Doubao always writes — the Ark endpoint's native protocol
+            // for Seed-1.6+ models with tool calling is OpenAI Responses.
+            // Older OpenAI Chat models still work; user can override via
+            // the API Protocol picker. Custom/codingplan still gate on
+            // a non-empty value (the user picked something explicitly).
+            if provider.name == "doubao" {
+                let resolved = if api_type.is_empty() {
+                    "openai-responses"
+                } else {
+                    api_type.as_str()
+                };
+                prov_obj.insert("api".into(), json!(resolved));
+            } else if (provider.name == "custom" || provider.name == "codingplan") && !api_type.is_empty() {
                 prov_obj.insert("api".into(), json!(api_type));
             }
             // Write user_agent (from wizard input or provider default)
