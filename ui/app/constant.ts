@@ -112,7 +112,12 @@ export const UNFINISHED_INPUT = (id: string) => "unfinished-input-" + id;
 
 export const STORAGE_KEY = "rsclaw";
 
-export const REQUEST_TIMEOUT_MS = 60000;
+// 5 minutes — generous to avoid killing slow tool turns (browser
+// navigation + multi-step reasoning) before they produce a chunk.
+// Used both as the HTTP request ceiling AND as the legacy
+// stale-message sweeper threshold in chat.tsx. The active-stream
+// watchdog (chat.tsx, STUCK_MS) is also 5 min for symmetry.
+export const REQUEST_TIMEOUT_MS = 300_000;
 export const REQUEST_TIMEOUT_MS_FOR_THINKING = REQUEST_TIMEOUT_MS * 5;
 
 export const EXPORT_MESSAGE_CLASS_NAME = "export-markdown";

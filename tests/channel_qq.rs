@@ -13,7 +13,7 @@ fn init_crypto() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-fn noop_on_message() -> Arc<
+type OnMessage = Arc<
     dyn Fn(
             String,
             String,
@@ -24,7 +24,9 @@ fn noop_on_message() -> Arc<
             Vec<rsclaw::agent::registry::FileAttachment>,
         ) + Send
         + Sync,
-> {
+>;
+
+fn noop_on_message() -> OnMessage {
     Arc::new(|_, _, _, _, _, _, _| {})
 }
 

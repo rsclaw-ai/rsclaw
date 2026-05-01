@@ -225,6 +225,68 @@ fn image_ref_to_data_url(image_ref: String) -> Option<String> {
 }
 
 /// Check if the current model supports vision (image input).
+/// Detect a natural-language intent to switch voice/text reply mode.
+///
+/// Returns `Some(true)` to switch to voice, `Some(false)` to switch to
+/// text, `None` if the user said nothing about reply mode. Used so the
+/// user doesn't have to remember the explicit `/voice` · `/text` slash
+/// commands — typing "用文字回复" or "no voice please" works too.
+///
+/// Implementation is intentionally a tiny keyword list, not a regex
+/// engine. False positives on weird phrasings are acceptable; the user
+/// can always issue `/voice` or `/text` explicitly to override.
+fn parse_voice_mode_intent(text: &str) -> Option<bool> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_lowercase();
+
+    const OFF_ZH: &[&str] = &[
+        "\u{7528}\u{6587}\u{5B57}",     // 用文字
+        "\u{6539}\u{6210}\u{6587}\u{5B57}", // 改成文字
+        "\u{56DE}\u{590D}\u{6587}\u{5B57}", // 回复文字
+        "\u{6587}\u{5B57}\u{56DE}\u{590D}", // 文字回复
+        "\u{4E0D}\u{8981}\u{8BED}\u{97F3}", // 不要语音
+        "\u{4E0D}\u{7528}\u{8BED}\u{97F3}", // 不用语音
+        "\u{522B}\u{8BED}\u{97F3}",      // 别语音
+        "\u{505C}\u{6B62}\u{8BED}\u{97F3}", // 停止语音
+        "\u{5173}\u{6389}\u{8BED}\u{97F3}", // 关掉语音
+        "\u{5173}\u{95ED}\u{8BED}\u{97F3}", // 关闭语音
+    ];
+    const OFF_EN: &[&str] = &[
+        "text only",
+        "no voice",
+        "stop voice",
+        "reply in text",
+        "respond in text",
+        "text reply",
+        "switch to text",
+    ];
+    const ON_ZH: &[&str] = &[
+        "\u{7528}\u{8BED}\u{97F3}",      // 用语音
+        "\u{8BED}\u{97F3}\u{56DE}\u{590D}", // 语音回复
+        "\u{6539}\u{6210}\u{8BED}\u{97F3}", // 改成语音
+        "\u{5207}\u{8BED}\u{97F3}",      // 切语音
+    ];
+    const ON_EN: &[&str] = &[
+        "reply in voice",
+        "voice reply",
+        "use voice",
+        "switch to voice",
+    ];
+
+    let says_off = OFF_ZH.iter().any(|p| trimmed.contains(p))
+        || OFF_EN.iter().any(|p| lower.contains(p));
+    let says_on = ON_ZH.iter().any(|p| trimmed.contains(p))
+        || ON_EN.iter().any(|p| lower.contains(p));
+    match (says_off, says_on) {
+        (true, false) => Some(false),
+        (false, true) => Some(true),
+        _ => None, // ambiguous (both / neither) — leave mode unchanged
+    }
+}
+
 fn model_supports_vision(model: &str, config: &RuntimeConfig) -> bool {
     // 1. Explicit config override
     if let Some(v) = config
@@ -834,7 +896,38 @@ impl AgentRuntime {
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
         let resolved = crate::channel::resolve_file_refs(text, &workspace);
         let text = resolved.text;
+
+        // Channels that locally transcribe voice (WeChat platform STT,
+        // Feishu speech recognition) tag the message with this prefix
+        // so the agent knows the user spoke even though only text crosses
+        // the on_message callback. Without this, voice_mode_sessions never
+        // gets set on those channels and the reply goes back as text.
+        const VOICE_INPUT_TAG: &str = "[__VOICE_INPUT__]";
+        let text: String = if let Some(stripped) = text.strip_prefix(VOICE_INPUT_TAG) {
+            self.voice_mode_sessions.insert(session_key.to_owned());
+            debug!(session = session_key, "voice mode enabled (channel-side transcription tag)");
+            stripped.trim_start_matches('\n').to_owned()
+        } else {
+            text
+        };
         let text = text.as_str();
+
+        // Voice-mode toggle by natural language. Once a session is in voice
+        // mode (either via /voice or because the user sent audio), the user
+        // shouldn't have to remember the explicit /text command — phrases
+        // like "用文字回复" or "no voice please" should switch back. Runs
+        // before media detection so a typed instruction beats the
+        // audio-attachment auto-enable that follows. Audio-only turns hit
+        // this path on the recursive run_turn call after transcription.
+        if let Some(want_voice) = parse_voice_mode_intent(text) {
+            if want_voice {
+                self.voice_mode_sessions.insert(session_key.to_owned());
+                debug!(session = session_key, "voice mode enabled (natural-language intent)");
+            } else {
+                self.voice_mode_sessions.remove(session_key);
+                debug!(session = session_key, "voice mode disabled (natural-language intent)");
+            }
+        }
 
         // Load referenced images as vision attachments.
         let mut images = images;
@@ -2297,6 +2390,9 @@ impl AgentRuntime {
             );
             all.extend(extra_tools.iter().cloned());
             all.extend(super::tools_builder::build_wasm_tool_defs(&self.wasm_plugins));
+            if let Some(ref reg) = self.plugins {
+                all.extend(super::tools_builder::build_shell_tool_defs(reg));
+            }
             if let Some(ref mcp) = self.mcp {
                 all.extend(mcp.all_tool_defs().await);
             }
@@ -2555,10 +2651,11 @@ impl AgentRuntime {
         // rebuild (handled by invalidate_plugins_skills_cache()).
 
         // Build/cache plugins system message.
-        // TODO: populate from self.plugins when plugin system is merged.
         if self.cached_plugins_system.is_none() {
-            self.cached_plugins_system =
-                super::tools_builder::build_plugins_system(&self.wasm_plugins);
+            self.cached_plugins_system = super::tools_builder::build_plugins_system(
+                &self.wasm_plugins,
+                self.plugins.as_deref(),
+            );
         }
 
         // Build/cache skills system message.
@@ -2785,6 +2882,40 @@ impl AgentRuntime {
             && !reply.is_empty
             && !reply.needs_outer_done_emit
         {
+            // One-shot install hint: when sherpa-onnx is missing the TTS
+            // path falls back to system `say` / SAPI / espeak which sound
+            // robotic for Chinese. Surface the install command once via
+            // the reply.text — `claim_first_hint` returns true only on
+            // the first call per feature so this fires exactly once.
+            let sherpa_tts_bin = crate::config::loader::base_dir()
+                .join("tools")
+                .join("sherpa-onnx")
+                .join("bin")
+                .join(if cfg!(target_os = "windows") {
+                    "sherpa-onnx-offline-tts.exe"
+                } else {
+                    "sherpa-onnx-offline-tts"
+                });
+            let has_vits_dir = std::fs::read_dir(
+                crate::config::loader::base_dir().join("models"),
+            )
+            .map(|entries| {
+                entries.flatten().any(|e| {
+                    e.path().is_dir()
+                        && e.file_name()
+                            .to_string_lossy()
+                            .starts_with("vits-")
+                })
+            })
+            .unwrap_or(false);
+            let sherpa_tts_ready = sherpa_tts_bin.exists() && has_vits_dir;
+            if !sherpa_tts_ready
+                && super::install_hints::claim_first_hint("tts-sherpa")
+            {
+                let lang = crate::i18n::default_lang();
+                reply.text.push_str(&crate::i18n::t("install_hint_tts_sherpa", lang));
+            }
+
             match self.generate_tts_audio(&reply.text).await {
                 Ok(audio_path) => {
                     let mime = if audio_path.ends_with(".wav") { "audio/wav" }
@@ -4892,13 +5023,42 @@ impl AgentRuntime {
                 // the answer.  Raw HTML / search-result JSON never enters the
                 // conversation history.  Other tools are truncated as before.
                 let session_text = {
-                    const WEB_COMPRESS_THRESHOLD: usize = 1000;
+                    // Was 1000 bytes — too aggressive. Any clean JSON / API
+                    // response above 1KB triggered a 30-60 s LLM "compression"
+                    // pass that lost structure for no benefit. The threshold
+                    // now reflects what *actually* needs compression: raw HTML
+                    // dumps that survive the dehydrate pipeline.
+                    const WEB_COMPRESS_THRESHOLD: usize = 32_000;
                     let is_web_tool = matches!(
                         tool_name.as_str(),
                         "web_fetch" | "web_browser" | "browser" | "web_search"
                     );
 
-                    if is_web_tool && result_text.len() > WEB_COMPRESS_THRESHOLD {
+                    // Structured responses (JSON / Atom XML / RSS / plain
+                    // markdown lists) are already useful as-is; sending them
+                    // through an LLM "extractor" just truncates and reformats
+                    // for no gain. Detect heuristically by the first
+                    // non-whitespace byte.
+                    let starts_structured = result_text
+                        .trim_start()
+                        .as_bytes()
+                        .first()
+                        .is_some_and(|b| matches!(b, b'{' | b'[' | b'<'));
+
+                    if is_web_tool
+                        && starts_structured
+                        && result_text.len() <= 50_000
+                    {
+                        // Structured web response (JSON / Atom / XML) under
+                        // 50KB: pass through verbatim so the agent reads the
+                        // raw structured data. Truncating to the generic 3KB
+                        // default in the non-web branch would clip useful
+                        // fields (e.g. multiple Stack Exchange questions).
+                        result_text.clone()
+                    } else if is_web_tool
+                        && !starts_structured
+                        && result_text.len() > WEB_COMPRESS_THRESHOLD
+                    {
                         let sk = ctx.session_key.clone();
                         let tn = tool_name.clone();
                         match self.compress_tool_result_for_session(&sk, &tn, &result_text).await {
@@ -5012,7 +5172,7 @@ impl AgentRuntime {
                             // Detect error from result content (exit_code != 0 or error field)
                             is_error: Some(
                                 result_text.contains("\"exit_code\":")
-                                && result_text.contains("\"exit_code\": 0") == false
+                                && !result_text.contains("\"exit_code\": 0")
                                 || result_text.contains("\"error\"")
                                 || result_text.contains("[stderr]")
                                 || result_text.contains("[exit code:")
@@ -5144,6 +5304,37 @@ impl AgentRuntime {
             "send_file" => {
                 // Returns a marker that the agent loop picks up to add to tool_files.
                 let path = args["path"].as_str().unwrap_or("").to_owned();
+                // In voice-reply mode the auto-TTS hook already attaches a
+                // freshly-synthesised audio file to the reply. If the LLM
+                // ALSO calls send_file with an audio path (often a stale
+                // /tmp/rsclaw_tts_*.wav from an earlier turn), the user
+                // receives two audio messages — usually with mismatched
+                // durations, since the LLM picks an old file. Short-circuit
+                // those calls and let auto-TTS own the audio channel.
+                let lower_path = path.to_lowercase();
+                let path_is_audio = lower_path.ends_with(".wav")
+                    || lower_path.ends_with(".mp3")
+                    || lower_path.ends_with(".ogg")
+                    || lower_path.ends_with(".opus")
+                    || lower_path.ends_with(".m4a")
+                    || lower_path.ends_with(".aac")
+                    || lower_path.ends_with(".flac")
+                    || lower_path.ends_with(".silk")
+                    || lower_path.ends_with(".amr");
+                if path_is_audio
+                    && self.voice_mode_sessions.contains(&ctx.session_key)
+                {
+                    debug!(
+                        session = %ctx.session_key,
+                        path = %path,
+                        "send_file: skipped audio attachment (voice_mode active, auto-TTS owns the audio)"
+                    );
+                    return Ok(json!({
+                        "skipped": true,
+                        "reason": "voice_mode active — auto-TTS will attach the audio reply; do not send separate audio files",
+                        "path": path,
+                    }));
+                }
                 let workspace = self.handle.config.workspace.as_deref()
                     .or(self.live.agents.read().await.defaults.workspace.as_deref())
                     .map(expand_tilde)
@@ -5272,8 +5463,8 @@ impl AgentRuntime {
             return Err(anyhow!("MCP tool `{name}` not found"));
         }
 
-        // 4. WASM plugin tool: `<plugin>.<tool>` (must precede skill match
-        //    because plugins win the priority ladder).
+        // 4. Plugin tool: `<plugin>.<tool>` (must precede skill match because
+        //    plugins win the priority ladder). Wasm wins on collision.
         if let Some((plugin_name, tool_name)) = name.split_once('.') {
             if let Some(wp) = self.wasm_plugins.iter().find(|p| p.name == plugin_name) {
                 let notify_ctx = self.notification_tx.as_ref().map(|tx| {
@@ -5288,6 +5479,29 @@ impl AgentRuntime {
                     }
                 });
                 return wp.call_tool_with_ctx(tool_name, args, notify_ctx).await;
+            }
+            // 4-bis. Shell plugin tool — same `<plugin>.<tool>` namespace; wasm
+            //        wins on collision (above). The plugin spawns once at startup
+            //        and we hand it the per-call ctx so it can dispatch host
+            //        methods (notify, log, etc.) on the active conversation.
+            if let Some(reg) = self.plugins.as_ref()
+                && let Some(plugin) = reg.get_shell(plugin_name)
+            {
+                let target_id = if !ctx.chat_id.is_empty() {
+                    ctx.chat_id.clone()
+                } else {
+                    ctx.peer_id.clone()
+                };
+                let params = serde_json::json!({
+                    "tool": tool_name,
+                    "args": args,
+                    "_ctx": {
+                        "target_id":   target_id,
+                        "channel":     ctx.channel.clone(),
+                        "session_key": ctx.session_key.clone(),
+                    }
+                });
+                return plugin.call("tool_call", params).await;
             }
         }
 
@@ -6156,8 +6370,8 @@ const MAX_FILE_CONTENT_CHARS: usize = 20_000;
 /// Patch fields of an existing `AgentEntry` in `agents.list` in the config file.
 ///
 /// - `model`: `Some("")` or `Some("default")` removes the field (agent falls back to defaults).
-///            `Some("provider/model")` sets `model.primary`.
-///            `None` leaves it untouched.
+///   `Some("provider/model")` sets `model.primary`.
+///   `None` leaves it untouched.
 /// - `name`:  `Some("")` removes the field. `Some(x)` sets it. `None` leaves it.
 ///
 /// The config hot-reload watcher picks up the change automatically — no restart needed.

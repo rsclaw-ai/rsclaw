@@ -455,13 +455,23 @@ fn resolve_download_url(
             Some(format!("{MIRROR_BASE}/python/{ver}/{filename}"))
         }
         "sherpa-onnx" => {
+            // Use the `-shared` variants (NOT `-shared-lib`). The `-lib`
+            // suffix is library-only (just .dylib/.so) and lacks the
+            // sherpa-onnx-offline / sherpa-onnx-offline-tts CLI binaries
+            // that TTS / STT actually invoke. The `-shared` archives ship
+            // bin/ alongside lib/ — that's the one we want.
+            //
+            // linux-aarch64 names the CPU build `-shared-cpu` (there are
+            // also `-shared-gpu-*` GPU variants we skip). Windows packages
+            // the runtime config in the suffix; `-shared-MT-Release` is
+            // the standard release build.
             let ver = section.get("version")?.as_str()?;
             let filename = match platform {
-                "linux-x64" => format!("sherpa-onnx-v{ver}-linux-x64-shared-lib.tar.bz2"),
-                "linux-arm64" => format!("sherpa-onnx-v{ver}-linux-aarch64-shared-cpu-lib.tar.bz2"),
-                "mac-x64" => format!("sherpa-onnx-v{ver}-osx-x64-shared-lib.tar.bz2"),
-                "mac-arm64" => format!("sherpa-onnx-v{ver}-osx-arm64-shared-lib.tar.bz2"),
-                "win-x64" => format!("sherpa-onnx-v{ver}-win-x64-shared-MT-Release-lib.tar.bz2"),
+                "linux-x64" => format!("sherpa-onnx-v{ver}-linux-x64-shared.tar.bz2"),
+                "linux-arm64" => format!("sherpa-onnx-v{ver}-linux-aarch64-shared-cpu.tar.bz2"),
+                "mac-x64" => format!("sherpa-onnx-v{ver}-osx-x64-shared.tar.bz2"),
+                "mac-arm64" => format!("sherpa-onnx-v{ver}-osx-arm64-shared.tar.bz2"),
+                "win-x64" => format!("sherpa-onnx-v{ver}-win-x64-shared-MT-Release.tar.bz2"),
                 _ => return None,
             };
             Some(format!("{MIRROR_BASE}/sherpa-onnx/{ver}/{filename}"))

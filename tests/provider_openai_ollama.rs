@@ -52,7 +52,7 @@ async fn qwen3_routes_to_api_chat() {
     )
     .await;
 
-    let provider = OpenAiProvider::ollama(&server.uri(), None);
+    let provider = OpenAiProvider::ollama(server.uri(), None);
     let stream = provider
         .stream(simple_request("qwen3:8b"))
         .await
@@ -128,7 +128,7 @@ async fn ollama_content_stream() {
     )
     .await;
 
-    let provider = OpenAiProvider::ollama(&server.uri(), None);
+    let provider = OpenAiProvider::ollama(server.uri(), None);
     let stream = provider
         .stream(simple_request("qwen3:8b"))
         .await
@@ -162,7 +162,7 @@ async fn ollama_thinking_stream() {
     )
     .await;
 
-    let provider = OpenAiProvider::ollama(&server.uri(), None);
+    let provider = OpenAiProvider::ollama(server.uri(), None);
     let stream = provider
         .stream(simple_request("qwen3:8b"))
         .await
@@ -207,7 +207,7 @@ async fn ollama_tool_call() {
     )
     .await;
 
-    let provider = OpenAiProvider::ollama(&server.uri(), None);
+    let provider = OpenAiProvider::ollama(server.uri(), None);
     let stream = provider
         .stream(simple_request("qwen3:8b"))
         .await
@@ -240,7 +240,7 @@ async fn ollama_http_error() {
         .mount(&server)
         .await;
 
-    let provider = OpenAiProvider::ollama(&server.uri(), None);
+    let provider = OpenAiProvider::ollama(server.uri(), None);
     let result = provider.stream(simple_request("qwen3:8b")).await;
     let err_msg = result.err().expect("expected error").to_string();
     assert!(

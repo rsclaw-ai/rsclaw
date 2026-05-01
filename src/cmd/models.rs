@@ -368,8 +368,31 @@ const AVAILABLE_MODELS: &[ModelDef] = &[
         url: "https://gitfast.org/tools/models/sherpa-onnx-whisper-turbo.tar.bz2",
     },
     ModelDef {
-        names: &["vits", "vits-theresa"],
-        label: "VITS-Theresa (Chinese TTS female voice, ~115MB)",
+        names: &["paraformer-zh", "paraformer", "paraformer-zh-int8"],
+        label: "Paraformer-ZH int8 (STT Chinese-only, high quality, ~70MB)",
+        dir: "paraformer-zh",
+        // Upstream filename has `-int8` BEFORE the date (not after) and
+        // only the 2025-10-07 release ships an int8 variant. Earlier
+        // guess `sherpa-onnx-paraformer-zh-2023-09-14-int8.tar.bz2`
+        // returns 404 from sherpa-onnx GitHub releases.
+        url: "https://gitfast.org/tools/models/sherpa-onnx-paraformer-zh-int8-2025-10-07.tar.bz2",
+    },
+    ModelDef {
+        names: &["paraformer-zh-full", "paraformer-full"],
+        label: "Paraformer-ZH full precision (STT Chinese-only, best quality, ~280MB)",
+        dir: "paraformer-zh-full",
+        // Aligned with int8 release date (2025-10-07) for consistency.
+        url: "https://gitfast.org/tools/models/sherpa-onnx-paraformer-zh-2025-10-07.tar.bz2",
+    },
+    ModelDef {
+        names: &["vits", "tts", "melo", "melo-tts", "melo-tts-zh", "vits-melo"],
+        label: "MeloTTS-ZH (Chinese+English TTS, default, ~300MB)",
+        dir: "vits-melo-tts-zh_en",
+        url: "https://gitfast.org/tools/models/vits-melo-tts-zh_en.tar.bz2",
+    },
+    ModelDef {
+        names: &["vits-theresa", "theresa"],
+        label: "VITS-Theresa (Chinese TTS female voice, lightweight, ~115MB)",
         dir: "vits-theresa",
         url: "https://gitfast.org/tools/models/vits-zh-hf-theresa.tar.bz2",
     },

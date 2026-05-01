@@ -147,13 +147,6 @@ const no: PartialLocaleType = {
     SubTitle: "Alle innstillingsalternativer",
 
     Danger: {
-      Reset: {
-        Title: "Tilbakestill alle innstillinger",
-        SubTitle:
-          "Tilbakestill alle innstillingsalternativer til standardverdier",
-        Action: "Tilbakestill nå",
-        Confirm: "Bekreft tilbakestilling av alle innstillinger?",
-      },
       Clear: {
         Title: "Slett alle data",
         SubTitle: "Slett alle samtaler og innstillingsdata",

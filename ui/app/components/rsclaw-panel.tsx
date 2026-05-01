@@ -499,7 +499,7 @@ function ConfigEditorPage() {
   const [providers, setProviders] = useState<{
     name: string; key: string; enabled: boolean; apiKey: string; baseUrl: string; apiType?: ApiType; userAgent?: string;
   }[]>([
-    { name: "Doubao (\u8C46\u5305)", key: "doubao", enabled: false, apiKey: "", baseUrl: "" },
+    { name: "Doubao (\u8C46\u5305)", key: "doubao", enabled: false, apiKey: "", baseUrl: "", apiType: "openai-responses" },
     { name: "Qwen (\u5343\u95EE)", key: "qwen", enabled: false, apiKey: "", baseUrl: "" },
     { name: "Anthropic", key: "anthropic", enabled: false, apiKey: "", baseUrl: "" },
     { name: "OpenAI", key: "openai", enabled: false, apiKey: "", baseUrl: "" },
@@ -545,7 +545,16 @@ function ConfigEditorPage() {
     const b = extractVal(raw, "bind");
     if (b) setBind(b);
     const l = extractVal(raw, "language");
-    if (l) setLanguage(l);
+    if (l) {
+      setLanguage(l);
+    } else {
+      // Config has no `language` field — the dropdown still shows the
+      // useState default ("zh-CN") which gives the user a false sense
+      // that it's persisted. Mark dirty so the next save writes the
+      // default value, and the tray menu (which reads gateway.language
+      // from rsclaw.json5) starts following it.
+      setDirty(true);
+    }
     const at = extractVal(raw, "authToken");
     if (at) { setAuthToken(at); setApiAuthToken(at); }
 
@@ -708,7 +717,15 @@ function ConfigEditorPage() {
       if (prov.baseUrl) entry.baseUrl = prov.baseUrl;
       else if (isCustomLike || prov.key === "ollama") delete entry.baseUrl;
       // Doubao opts into the api_type field too (CodingPlan offering).
-      if ((isCustomLike || prov.key === "doubao") && prov.apiType) entry.api = prov.apiType;
+      // For doubao, default to "openai" when the user enables it without
+      // touching the API Type dropdown — the dropdown's "-- Select --"
+      // placeholder used to silently skip the save, leaving gateway to
+      // autodetect a wrong protocol later.
+      if (isCustomLike) {
+        if (prov.apiType) entry.api = prov.apiType;
+      } else if (prov.key === "doubao") {
+        entry.api = prov.apiType || "openai-responses";
+      }
       if (prov.userAgent) entry.userAgent = prov.userAgent;
       else delete entry.userAgent;
       cfg.models.providers[prov.key] = entry;

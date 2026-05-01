@@ -162,12 +162,6 @@ const ko: PartialLocaleType = {
     SubTitle: "모든 설정 옵션",
     ShowPassword: "비밀번호 보기",
     Danger: {
-      Reset: {
-        Title: "모든 설정 초기화",
-        SubTitle: "모든 설정 항목을 기본값으로 초기화",
-        Action: "지금 초기화",
-        Confirm: "모든 설정을 초기화하시겠습니까?",
-      },
       Clear: {
         Title: "모든 데이터 지우기",
         SubTitle: "모든 채팅 및 설정 데이터 지우기",

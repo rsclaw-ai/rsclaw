@@ -10,10 +10,11 @@
 //! Public API:
 //!   - `PluginManifest` / `load_manifest()` / `scan_plugins()`
 //!   - `SlotRegistry`   — memory + context_engine slots
-//!   - `Plugin`         — live JS plugin handle (spawned subprocess)
+//!   - `Plugin`         — live shell plugin handle (spawned subprocess)
 //!   - `WasmPlugin`     — live WASM plugin handle (wasmtime)
 //!   - `load_all_plugins()` — unified loader that dispatches by runtime
 
+pub mod host_methods;
 pub mod manifest;
 pub mod shell_bridge;
 pub mod slots;
@@ -23,11 +24,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-pub use manifest::{LEGACY_MANIFEST_FILE, MANIFEST_FILE, PluginManifest, PluginToolDef, load_manifest, scan_plugins};
+pub use manifest::{
+    LEGACY_MANIFEST_FILE, MANIFEST_FILE, PluginManifest, PluginToolDef, load_manifest, scan_plugins,
+};
 pub use shell_bridge::Plugin;
 pub use slots::{ContextEngineSlot, MemoryItem, MemorySlot, MemoryStoreSlot, SlotRegistry};
-pub use wasm_runtime::{WasmPlugin, WasmToolDef, load_wasm_plugin};
 use tracing::{info, warn};
+pub use wasm_runtime::{WasmPlugin, WasmToolDef, load_wasm_plugin};
 
 use crate::config::schema::PluginsConfig;
 
@@ -37,7 +40,7 @@ use crate::config::schema::PluginsConfig;
 
 /// Loaded and running plugins, indexed by name.
 pub struct PluginRegistry {
-    /// JS plugins (shell bridge).
+    /// Shell plugins (subprocess + JSON-RPC bridge: node/bun/deno).
     plugins: HashMap<String, Plugin>,
     /// WASM plugins (wasmtime).
     wasm_plugins: Vec<WasmPlugin>,
@@ -53,8 +56,17 @@ impl PluginRegistry {
         }
     }
 
-    pub fn get(&self, name: &str) -> Option<&Plugin> {
+    /// Look up a shell-bridge plugin by name. Returns None if no such plugin
+    /// is loaded or the plugin uses the wasm runtime.
+    pub fn get_shell(&self, name: &str) -> Option<&Plugin> {
         self.plugins.get(name)
+    }
+
+    /// Iterate over all loaded shell-bridge plugins as (name, plugin) pairs.
+    /// Used by the agent runtime to build LLM tool definitions and the
+    /// plugins system message.
+    pub fn shell_plugins_iter(&self) -> impl Iterator<Item = (&String, &Plugin)> {
+        self.plugins.iter()
     }
 
     pub fn all(&self) -> impl Iterator<Item = &Plugin> {
@@ -75,7 +87,7 @@ impl PluginRegistry {
         self.plugins.is_empty() && self.wasm_plugins.is_empty()
     }
 
-    /// Number of JS plugins.
+    /// Number of shell plugins.
     pub fn js_count(&self) -> usize {
         self.plugins.len()
     }
@@ -110,9 +122,15 @@ pub async fn load_all_plugins(
     plugins_dir: &std::path::Path,
     config: Option<&PluginsConfig>,
     wasm_browser: Arc<tokio::sync::Mutex<Option<crate::browser::BrowserSession>>>,
+    notify_tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
 ) -> Result<PluginRegistry> {
     let manifests = scan_plugins(plugins_dir)?;
     let mut registry = PluginRegistry::new();
+
+    let host_dispatch = Arc::new(host_methods::HostMethodRegistry::new(
+        notify_tx,
+        Arc::clone(&wasm_browser),
+    ));
 
     // Shared wasmtime engine for all WASM plugins.
     let wasm_engine = if manifests.iter().any(|m| m.is_wasm()) {
@@ -167,10 +185,10 @@ pub async fn load_all_plugins(
                 }
             }
         } else {
-            // JS runtime (shell bridge)
-            match Plugin::spawn(manifest).await {
+            // Shell runtime (subprocess + JSON-RPC bridge: node/bun/deno)
+            match Plugin::spawn(manifest, host_dispatch.clone()).await {
                 Ok(plugin) => {
-                    info!(plugin = %plugin.manifest.name, "JS plugin started");
+                    info!(plugin = %plugin.manifest.name, "shell plugin started");
                     registry
                         .plugins
                         .insert(plugin.manifest.name.clone(), plugin);

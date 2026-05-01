@@ -6305,7 +6305,7 @@ dependencies = [
 
 [[package]]
 name = "rsclaw"
-version = "2026.4.28"
+version = "2026.5.1"
 dependencies = [
  "aes",
  "anycli",
@@ -6339,6 +6339,7 @@ dependencies = [
  "hnsw_rs",
  "htmd",
  "image",
+ "include_dir",
  "indicatif",
  "json5",
  "lark-websocket-protobuf",

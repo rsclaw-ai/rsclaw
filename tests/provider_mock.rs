@@ -170,7 +170,7 @@ fn content_part_tool_result_serialization() {
     assert_eq!(v["type"].as_str().unwrap(), "tool_result");
     assert_eq!(v["tool_use_id"].as_str().unwrap(), "tu_123");
     assert_eq!(v["content"].as_str().unwrap(), "result data");
-    assert_eq!(v["is_error"].as_bool().unwrap(), true);
+    assert!(v["is_error"].as_bool().unwrap());
 }
 
 #[test]

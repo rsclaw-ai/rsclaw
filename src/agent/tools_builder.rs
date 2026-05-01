@@ -5,13 +5,13 @@
 
 use serde_json::{Value, json};
 
+use super::registry::AgentRegistry;
 use crate::{
     config::schema::ExternalAgentConfig,
-    plugin::WasmPlugin,
+    plugin::{PluginRegistry, WasmPlugin},
     provider::ToolDef,
     skill::SkillRegistry,
 };
-use super::registry::AgentRegistry;
 
 /// Build a `Vec<ToolDef>` advertising every tool exported by every loaded
 /// WASM plugin. Tool names are namespaced as `<plugin>.<tool>` so the
@@ -30,14 +30,44 @@ pub(crate) fn build_wasm_tool_defs(plugins: &[WasmPlugin]) -> Vec<ToolDef> {
         .collect()
 }
 
-/// Build a system-prompt section that lists installed WASM plugins. Helps
-/// the model decide *to use* the plugin instead of falling back to a
-/// generic browser-automation flow.
-pub(crate) fn build_plugins_system(plugins: &[WasmPlugin]) -> Option<String> {
-    if plugins.is_empty() {
+/// Build a `Vec<ToolDef>` for every tool exported by every loaded
+/// shell-bridge plugin. Tool names are `<plugin>.<tool>`, mirroring the
+/// wasm-plugin convention so the dispatcher in `runtime.rs` can route
+/// either with the same `split_once('.')` pattern.
+pub(crate) fn build_shell_tool_defs(plugins: &PluginRegistry) -> Vec<ToolDef> {
+    plugins
+        .shell_plugins_iter()
+        .flat_map(|(plugin_name, plugin)| {
+            let plugin_name = plugin_name.clone();
+            plugin.manifest.tools.iter().map(move |t| ToolDef {
+                name: format!("{plugin_name}.{}", t.name),
+                description: t.description.clone(),
+                parameters: t.input_schema.clone().unwrap_or_else(|| {
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {}
+                    })
+                }),
+            })
+        })
+        .collect()
+}
+
+/// Build a system-prompt section that lists installed plugins (wasm + shell).
+/// Helps the model decide *to use* the plugin instead of falling back to a
+/// generic browser-automation flow. Sorted by name for byte-stable output.
+pub(crate) fn build_plugins_system(
+    wasm_plugins: &[WasmPlugin],
+    shell_plugins: Option<&PluginRegistry>,
+) -> Option<String> {
+    let no_shell = shell_plugins
+        .map(|r| r.shell_plugins_iter().next().is_none())
+        .unwrap_or(true);
+    if wasm_plugins.is_empty() && no_shell {
         return None;
     }
-    let blocks: Vec<String> = plugins
+
+    let mut blocks: Vec<(String, String)> = wasm_plugins
         .iter()
         .map(|p| {
             let tools_lines: Vec<String> = p
@@ -45,15 +75,45 @@ pub(crate) fn build_plugins_system(plugins: &[WasmPlugin]) -> Option<String> {
                 .iter()
                 .map(|t| format!("  - {}.{}: {}", p.name, t.name, t.description))
                 .collect();
-            format!(
-                "<plugin name=\"{}\" version=\"{}\">\n{}\n\nTools:\n{}\n</plugin>",
-                p.name,
-                p.version.as_deref().unwrap_or(""),
-                p.description.as_deref().unwrap_or(""),
-                tools_lines.join("\n"),
+            (
+                p.name.clone(),
+                format!(
+                    "<plugin name=\"{}\" version=\"{}\">\n{}\n\nTools:\n{}\n</plugin>",
+                    p.name,
+                    p.version.as_deref().unwrap_or(""),
+                    p.description.as_deref().unwrap_or(""),
+                    tools_lines.join("\n"),
+                ),
             )
         })
         .collect();
+
+    if let Some(reg) = shell_plugins {
+        for (plugin_name, plugin) in reg.shell_plugins_iter() {
+            let tools_lines: Vec<String> = plugin
+                .manifest
+                .tools
+                .iter()
+                .map(|t| format!("  - {}.{}: {}", plugin_name, t.name, t.description))
+                .collect();
+            blocks.push((
+                plugin_name.clone(),
+                format!(
+                    "<plugin name=\"{}\" version=\"{}\">\n{}\n\nTools:\n{}\n</plugin>",
+                    plugin_name,
+                    plugin.manifest.version.as_deref().unwrap_or(""),
+                    plugin.manifest.description.as_deref().unwrap_or(""),
+                    tools_lines.join("\n"),
+                ),
+            ));
+        }
+    }
+
+    // Sort by name for byte-stable output (HashMap iteration order is
+    // nondeterministic; this matters because the system prompt feeds the
+    // LLM's KV cache, and unstable ordering invalidates the cache).
+    blocks.sort_by(|a, b| a.0.cmp(&b.0));
+    let blocks_text: Vec<String> = blocks.into_iter().map(|(_, b)| b).collect();
 
     Some(format!(
         "## Installed Plugins\n\
@@ -62,7 +122,7 @@ pub(crate) fn build_plugins_system(plugins: &[WasmPlugin]) -> Option<String> {
          it over a generic browser-automation flow.\n\
          Priority: plugins > skills > built-in tools.\n\n\
          {}",
-        blocks.join("\n\n"),
+        blocks_text.join("\n\n"),
     ))
 }
 
@@ -72,9 +132,42 @@ pub(crate) fn toolset_allowed_names(
     toolset: &str,
     custom_tools: Option<&Vec<String>>,
 ) -> Option<std::collections::HashSet<String>> {
-    const MINIMAL: &[&str] = &["execute_command", "read_file", "write_file", "send_file", "list_dir", "search_file", "search_content", "web_search", "web_fetch", "memory", "clarify", "anycli", "use_skill", "task"];
-    const WEB: &[&str] = &["web_search", "web_fetch", "web_download", "read_file", "write_file", "list_dir", "search_file", "memory", "use_skill", "task"];
-    const CODE: &[&str] = &["execute_command", "read_file", "write_file", "list_dir", "search_file", "search_content", "memory", "use_skill", "task"];
+    const MINIMAL: &[&str] = &[
+        "execute_command",
+        "read_file",
+        "write_file",
+        "send_file",
+        "list_dir",
+        "search_file",
+        "search_content",
+        "web_search",
+        "web_fetch",
+        "memory",
+        "clarify",
+        "anycli",
+        "use_skill",
+    ];
+    const WEB: &[&str] = &[
+        "web_search",
+        "web_fetch",
+        "web_download",
+        "read_file",
+        "write_file",
+        "list_dir",
+        "search_file",
+        "memory",
+        "use_skill",
+    ];
+    const CODE: &[&str] = &[
+        "execute_command",
+        "read_file",
+        "write_file",
+        "list_dir",
+        "search_file",
+        "search_content",
+        "memory",
+        "use_skill",
+    ];
     const STANDARD: &[&str] = &[
         "execute_command",
         "read_file",
@@ -500,6 +593,10 @@ pub(crate) fn build_tool_list(
             - Falls back to browser rendering for JS-heavy pages and CAPTCHA-blocked sites (GET only)\n\
             - GET responses without headers/body are cached 15 minutes; non-GET bypasses cache\n\
             - For large pages, pass 'prompt' to LLM-extract specific information\n\
+            - DO NOT pass 'prompt' for compact structured responses (JSON APIs, RSS, \
+              <2KB text). Passing 'prompt' triggers an internal LLM summarize pass \
+              (extra ~30-60 s + tokens). For api.* / *.json / arxiv Atom / RSS / \
+              search-result JSON, omit 'prompt' — read the raw response directly.\n\
             \n\
             METHODS, HEADERS, BODY — supports the full HTTP surface:\n\
               - method: GET (default), POST, PUT, PATCH, DELETE\n\
@@ -517,7 +614,7 @@ pub(crate) fn build_tool_list(
                 "method":  {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"], "description": "HTTP method. Default: GET"},
                 "headers": {"type": "object", "description": "Optional request headers, e.g. {\"Authorization\": \"Bearer xyz\", \"X-API-Key\": \"...\"}", "additionalProperties": {"type": "string"}},
                 "body":    {"description": "Optional request body. String → sent as-is (set Content-Type via headers). Object/array → JSON-serialized; Content-Type defaulted to application/json."},
-                "prompt":  {"type": "string", "description": "What to extract from the page (e.g. 'list all API endpoints')"}
+                "prompt":  {"type": "string", "description": "OPTIONAL. What to extract from a LARGE HTML page (e.g. 'list all API endpoints'). Triggers an LLM-summarize pass on the response. OMIT for compact JSON/XML/text where you can read the raw body — passing 'prompt' on small structured responses just adds ~30-60 s of LLM latency for nothing."}
             },
             "required": ["url"]
         }),
@@ -560,11 +657,19 @@ pub(crate) fn build_tool_list(
             Other: type, select, check, scroll, screenshot, pdf, press, back, forward, reload, wait, evaluate, cookies, get_text, get_url, get_title, find, get_article, upload, new_tab, switch_tab, close_tab.\n\
             IMPORTANT: Always snapshot BEFORE clicking/filling. Element refs change after page updates.\n\n\
             Site-rules — platform-specific DOM selectors, URL routes, and gotchas live under \
-            `~/.rsclaw/tools/web_browser/site-rules/<domain>.md` (e.g. `douyin.md`, `kuaishou.md`, \
-            `xiaohongshu.md`, `bilibili.md`). When you `open` a URL whose host matches one of \
-            those filenames, read_file that rule file FIRST so you use the verified selectors \
-            instead of guessing them per-session. Saves 5+ snapshot/click iterations and avoids \
-            stale-selector breakage.\n\n\
+            `~/.rsclaw/tools/web_browser/site-rules/`. Two layouts coexist:\n\
+            - `<domain>.md` — flat, single-file (e.g. `douyin.md`, `kuaishou.md`, \
+              `xiaohongshu.md`, `bilibili.md`)\n\
+            - `<domain>/<task>.md` — nested per-task (e.g. `amazon/product-search.md`, \
+              `tiktok/upload.md`, `linkedin/connect.md`)\n\
+            When you `open` a URL whose host matches either layout, read_file the matching \
+            file FIRST so you use the verified selectors instead of guessing them per-session. \
+            Saves 5+ snapshot/click iterations and avoids stale-selector breakage.\n\n\
+            BEFORE reading any nested `<domain>/<task>.md` (which may have been imported from \
+            browser-use/browser-harness and use Python helper syntax), read \
+            `~/.rsclaw/tools/web_browser/site-rules/_VOCABULARY.md` once per session — it maps \
+            their `click_at_xy` / `type_text` / `js(...)` etc. to your `clickAt` / `type` / \
+            `evaluate` actions so you can translate the procedural code on the fly.\n\n\
             Screenshot routing — do NOT call `action=screenshot` without a target:\n\
             - Web page screenshot (user gave a URL): pass it inline,\n\
               `action=screenshot url=https://example.com` — this navigates\n\
@@ -642,7 +747,7 @@ pub(crate) fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "computer_use".to_owned(),
-        description: "Control the computer desktop. ONLY use when the user EXPLICITLY asks to take a screenshot, click, type, or interact with the desktop. Do NOT call this tool just because the message mentions words like 'screenshot' or 'screen' in other contexts. Screenshots auto-resize for HiDPI and return scale factor for coordinate mapping.".to_owned(),
+        description: "Control the computer desktop. ONLY use when the user EXPLICITLY asks to take a screenshot, click, type, or interact with the desktop. Do NOT call this tool just because the message mentions words like 'screenshot' or 'screen' in other contexts. Screenshots auto-resize, and mouse coordinates use the same physical-pixel space as the returned `original_width`/`original_height` (HiDPI is handled internally — multiply image-pixel coords by the returned `scale` and pass directly).".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -651,12 +756,12 @@ pub(crate) fn build_tool_list(
                     "double_click", "triple_click", "right_click", "middle_click",
                     "drag", "scroll", "type", "key", "hold_key",
                     "cursor_position", "get_active_window", "ui_tree",
-                    "list_skills", "get_skill", "wait"
-                ], "description": "Action to perform. ui_tree returns the accessibility tree of the focused window (interactive elements with role/label/coordinates). list_skills/get_skill load desktop automation playbooks from ~/.rsclaw/tools/computer_use/skills/."},
-                "x":         {"type": "number", "description": "X coordinate (mouse actions, drag start)"},
-                "y":         {"type": "number", "description": "Y coordinate (mouse actions, drag start)"},
-                "to_x":      {"type": "number", "description": "Drag destination X"},
-                "to_y":      {"type": "number", "description": "Drag destination Y"},
+                    "list_app_rules", "get_app_rule", "wait"
+                ], "description": "Action to perform. ui_tree returns the accessibility tree of the focused window (interactive elements with role/label/coordinates). list_app_rules/get_app_rule load per-app desktop automation playbooks from ~/.rsclaw/tools/computer_use/app-rules/."},
+                "x":         {"type": "number", "description": "X coordinate (mouse actions, drag start) in physical pixels"},
+                "y":         {"type": "number", "description": "Y coordinate (mouse actions, drag start) in physical pixels"},
+                "to_x":      {"type": "number", "description": "Drag destination X (physical pixels)"},
+                "to_y":      {"type": "number", "description": "Drag destination Y (physical pixels)"},
                 "button":    {"type": "string", "enum": ["left", "right", "middle"], "description": "Mouse button (default: left)"},
                 "text":      {"type": "string", "description": "Text for type action"},
                 "key":       {"type": "string", "description": "Key name or combo (e.g. Enter, ctrl+c, cmd+shift+s)"},
@@ -664,7 +769,14 @@ pub(crate) fn build_tool_list(
                 "direction": {"type": "string", "enum": ["up", "down", "left", "right"], "description": "Scroll direction (default: down)"},
                 "amount":    {"type": "integer", "description": "Scroll clicks (default: 3)"},
                 "ms":        {"type": "integer", "description": "Wait duration in milliseconds (max 10000)"},
-                "name":      {"type": "string", "description": "Skill name (for get_skill action)"}
+                "name":      {"type": "string", "description": "App-rule name (for get_app_rule action)"},
+                "region":    {"type": "object", "description": "Optional screenshot region in physical pixels. Use after a full screenshot to zoom in on a specific area without recapturing the whole screen.", "properties": {
+                    "x":      {"type": "number"},
+                    "y":      {"type": "number"},
+                    "width":  {"type": "number"},
+                    "height": {"type": "number"}
+                }, "required": ["x", "y", "width", "height"]},
+                "max_long_edge_px": {"type": "integer", "description": "Screenshot resize cap: longest edge of returned image. Default 1024 (XGA). Range 64-8192. Larger values = more detail + more tokens."}
             },
             "required": ["action"]
         }),
@@ -1161,7 +1273,8 @@ pub(crate) fn build_tool_list(
     for tool in &mut tools {
         if let Some(obj) = tool.parameters.as_object_mut() {
             obj.entry("additionalProperties").or_insert(json!(false));
-            obj.entry("$schema").or_insert(json!("http://json-schema.org/draft-07/schema#"));
+            obj.entry("$schema")
+                .or_insert(json!("http://json-schema.org/draft-07/schema#"));
         }
     }
 

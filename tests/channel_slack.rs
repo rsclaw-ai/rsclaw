@@ -13,8 +13,20 @@ fn init_crypto() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-fn noop_on_message() -> Arc<dyn Fn(String, String, String, bool) + Send + Sync> {
-    Arc::new(|_, _, _, _| {})
+type OnMessage = Arc<
+    dyn Fn(
+            String,
+            String,
+            String,
+            bool,
+            Vec<rsclaw::agent::registry::ImageAttachment>,
+            Vec<rsclaw::agent::registry::FileAttachment>,
+        ) + Send
+        + Sync,
+>;
+
+fn noop_on_message() -> OnMessage {
+    Arc::new(|_, _, _, _, _, _| {})
 }
 
 fn make_channel(base_url: &str) -> SlackChannel {

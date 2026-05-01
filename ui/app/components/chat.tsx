@@ -9,6 +9,7 @@ import React, {
   useRef,
   useState,
 } from "react";
+import { Virtuoso, VirtuosoHandle } from "react-virtuoso";
 
 import SendWhiteIcon from "../icons/send-white.svg";
 import BrainIcon from "../icons/brain.svg";
@@ -101,7 +102,6 @@ import {
 } from "./ui-lib";
 import { useNavigate } from "react-router-dom";
 import {
-  CHAT_PAGE_SIZE,
   ModelProvider,
   Path,
   REQUEST_TIMEOUT_MS,
@@ -1248,6 +1248,10 @@ function _Chat() {
   // spawn parallel streams.
   const isStreaming = session.messages.some((m) => m.streaming);
   const { submitKey, shouldSubmit } = useSubmitHandler();
+  // Virtuoso owns the scroll container. We capture its scroller into
+  // `scrollRef` for legacy consumers (markdown components passing
+  // `parentRef` for IntersectionObserver roots, etc.).
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const isScrolledToBottom = scrollRef?.current
     ? Math.abs(
@@ -1268,13 +1272,51 @@ function _Chat() {
 
   const isTyping = userInput !== "";
 
-  // if user is typing, should auto scroll to bottom
-  // if user is not typing, should auto scroll to bottom only if already at bottom
+  // Virtuoso owns the scroll container, so the legacy `useScrollToBottom`
+  // hook is permanently detached. Its render-time `scrollTo(0, scrollHeight)`
+  // would race Virtuoso's own layout: while the user scrolls up, Virtuoso
+  // unmounts items below the viewport and the scroller's `scrollHeight`
+  // briefly shrinks — the hook then snapped the view to that smaller
+  // height, which the user perceived as "jumped to the top".
+  // setAutoScroll/scrollDomToBottom remain as no-op stubs for callers;
+  // explicit "scroll to bottom" goes through `virtuosoRef.scrollToIndex`.
   const { setAutoScroll, scrollDomToBottom } = useScrollToBottom(
     scrollRef,
-    (isScrolledToBottom || isAttachWithTop) && !isTyping,
+    true,
     session.messages,
   );
+  const scrollChatToBottom = useCallback(() => {
+    virtuosoRef.current?.scrollToIndex({
+      index: "LAST",
+      align: "end",
+      behavior: "smooth",
+    });
+  }, []);
+
+  // Stable Virtuoso callbacks — these don't depend on `messages` so they
+  // can stay above its declaration.
+  const computeChatItemKey = useCallback(
+    (_idx: number, message: ChatMessage) => message.id,
+    [],
+  );
+  const captureScroller = useCallback((el: HTMLElement | Window | null) => {
+    (scrollRef as React.MutableRefObject<HTMLDivElement | null>).current =
+      el as HTMLDivElement | null;
+  }, []);
+
+  // Force a Virtuoso re-measure shortly after mount. Virtuoso reads its
+  // viewport width once on first paint; in flex layouts the parent's
+  // final width can land a tick after the child mounts, leaving items
+  // sized to the pre-layout width (10–30 px too wide here, which is what
+  // pushed avatars past the viewport). Dispatching a window resize event
+  // is the cheapest way to make Virtuoso's ResizeObserver re-run.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const id = window.requestAnimationFrame(() => {
+      window.dispatchEvent(new Event("resize"));
+    });
+    return () => window.cancelAnimationFrame(id);
+  }, []);
   const [hitBottom, setHitBottom] = useState(true);
   const isMobileScreen = useMobileScreen();
   const navigate = useNavigate();
@@ -1432,7 +1474,7 @@ function _Chat() {
     setUserInput("");
     setPromptHints([]);
     if (!isMobileScreen) inputRef.current?.focus();
-    setAutoScroll(true);
+    scrollChatToBottom();
   };
 
   // When the current turn finishes (no message is streaming), flush the next
@@ -1442,7 +1484,7 @@ function _Chat() {
     const [next, ...rest] = pendingQueue;
     setPendingQueue(rest);
     dispatchToStore(next.text, next.images, next.fileRefs);
-    setAutoScroll(true);
+    scrollChatToBottom();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isStreaming, pendingQueue]);
 
@@ -1521,6 +1563,63 @@ function _Chat() {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session]);
+
+  // Stuck-stream watchdog. The legacy stale-message sweeper above only
+  // fires for messages older than REQUEST_TIMEOUT_MS (60 s) by *creation
+  // date* — it doesn't know that the stream was healthy for the first 50 s
+  // and then died. As long as `isStreaming` stays true the queued
+  // messages can't flush.
+  //
+  // Watchdog instead tracks *inactivity*: when streaming, poll every 5 s
+  // and check how long since the session last updated. After 20 s of
+  // silence we force-clear any lingering `streaming` flag and stamp the
+  // empty bot message with an error, which lets `pendingQueue` flush the
+  // next staged input on the following render.
+  useEffect(() => {
+    if (!isStreaming) return;
+    // 5 min of zero-chunk silence → assume the stream is dead.
+    // Generous on purpose — long tool turns (browser navigation +
+    // multi-step reasoning) can stay quiet for minutes, and the
+    // explicit "强制发送 / Force send" button next to the queue
+    // indicator is the user-facing escape hatch when something feels
+    // stuck. `session.lastUpdate` ticks on every stream chunk
+    // (see chat.ts onUpdate), so this measures *real* inactivity.
+    const STUCK_MS = 300_000;
+    const id = setInterval(() => {
+      const since = Date.now() - session.lastUpdate;
+      if (since < STUCK_MS) return;
+      // 1. ABORT the underlying WS subscription via ChatControllerPool —
+      //    this also sends `chat.abort` to the backend (see openai.ts).
+      //    Without this step a late chunk arriving after the watchdog
+      //    fires would revive the message we just marked as errored,
+      //    flipping `streaming` back to true and stranding the queue.
+      const stuckIds = session.messages
+        .filter((m) => m.streaming)
+        .map((m) => m.id);
+      stuckIds.forEach((id) =>
+        ChatControllerPool.stop(session.id, id),
+      );
+      // 2. Force-clear the local flags. We do this synchronously so the
+      //    next render unblocks `pendingQueue` even if the abort signal
+      //    races with the controller cleanup.
+      chatStore.updateTargetSession(session, (s) => {
+        s.messages.forEach((m) => {
+          if (m.streaming) {
+            m.streaming = false;
+            if (m.content.length === 0) {
+              m.isError = true;
+              m.content = prettyObject({
+                error: true,
+                message: `stuck — no chunk for ${Math.round(since / 1000)} s, force-cleared`,
+              });
+            }
+          }
+        });
+      });
+    }, 5000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isStreaming, session.lastUpdate]);
 
   // check if should send message
   const onInputKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1668,55 +1767,50 @@ function _Chat() {
     );
   }, [context, isLoading, session.messages]);
 
-  const [msgRenderIndex, _setMsgRenderIndex] = useState(
-    Math.max(0, renderMessages.length - CHAT_PAGE_SIZE),
+  // Virtuoso virtualises the entire history, so we hand it the full,
+  // de-duplicated message list rather than the legacy fixed-size window.
+  // Dedupe is a guard against transient ID collisions during streaming.
+  const messages = useMemo(() => {
+    const seen = new Set<string>();
+    return renderMessages.filter((m) => {
+      if (seen.has(m.id)) return false;
+      seen.add(m.id);
+      return true;
+    });
+  }, [renderMessages]);
+
+  // Pin the initial bottom index. Virtuoso treats `initialTopMostItemIndex`
+  // as a tracked value — if we recompute `messages.length - 1` on every
+  // render and `messages` ref changes per streaming chunk, Virtuoso can
+  // re-snap toward index 0. We capture the index once on the first non-
+  // empty render and never let it react to data updates afterwards.
+  const initialBottomIndexRef = useRef<number | null>(null);
+  if (initialBottomIndexRef.current === null && messages.length > 0) {
+    initialBottomIndexRef.current = messages.length - 1;
+  }
+  const initialBottomIndex = initialBottomIndexRef.current ?? 0;
+
+  const handleAtBottomStateChange = useCallback(
+    (atBottom: boolean) => {
+      setHitBottom(atBottom);
+      setAutoScroll(atBottom);
+    },
+    [setAutoScroll],
   );
 
-  function setMsgRenderIndex(newIndex: number) {
-    newIndex = Math.min(renderMessages.length - CHAT_PAGE_SIZE, newIndex);
-    newIndex = Math.max(0, newIndex);
-    _setMsgRenderIndex(newIndex);
-  }
-
-  const messages = useMemo(() => {
-    const endRenderIndex = Math.min(
-      msgRenderIndex + 3 * CHAT_PAGE_SIZE,
-      renderMessages.length,
-    );
-    return renderMessages.slice(msgRenderIndex, endRenderIndex);
-  }, [msgRenderIndex, renderMessages]);
-
-  const onChatBodyScroll = (e: HTMLElement) => {
-    const bottomHeight = e.scrollTop + e.clientHeight;
-    const edgeThreshold = e.clientHeight;
-
-    const isTouchTopEdge = e.scrollTop <= edgeThreshold;
-    const isTouchBottomEdge = bottomHeight >= e.scrollHeight - edgeThreshold;
-    const isHitBottom =
-      bottomHeight >= e.scrollHeight - (isMobileScreen ? 4 : 10);
-
-    const prevPageMsgIndex = msgRenderIndex - CHAT_PAGE_SIZE;
-    const nextPageMsgIndex = msgRenderIndex + CHAT_PAGE_SIZE;
-
-    if (isTouchTopEdge && !isTouchBottomEdge) {
-      setMsgRenderIndex(prevPageMsgIndex);
-    } else if (isTouchBottomEdge) {
-      setMsgRenderIndex(nextPageMsgIndex);
-    }
-
-    setHitBottom(isHitBottom);
-    setAutoScroll(isHitBottom);
-  };
-
   function scrollToBottom() {
-    setMsgRenderIndex(renderMessages.length - CHAT_PAGE_SIZE);
+    virtuosoRef.current?.scrollToIndex({
+      index: messages.length - 1,
+      align: "end",
+      behavior: "smooth",
+    });
     scrollDomToBottom();
   }
 
-  // clear context index = context length + index in messages
+  // clear context index = context length + index in full message list.
   const clearContextIndex =
     (session.clearContextIndex ?? -1) >= 0
-      ? session.clearContextIndex! + context.length - msgRenderIndex
+      ? session.clearContextIndex! + context.length
       : -1;
 
   const [showPromptModal, setShowPromptModal] = useState(false);
@@ -2060,29 +2154,38 @@ function _Chat() {
         </div>
         <div className={styles["chat-main"]}>
           <div className={styles["chat-body-container"]}>
-            <div
+            <Virtuoso
+              ref={virtuosoRef}
+              data={messages}
               className={styles["chat-body"]}
-              ref={scrollRef}
-              onScroll={(e) => onChatBodyScroll(e.currentTarget)}
+              // Virtuoso applies `overflow: auto` inline to its scroll
+              // container, which beats className-level `overflow-x: hidden`
+              // from `.chat-body`. Re-pin overflow-x via inline style so a
+              // long unbreakable line (URL / code block / markdown table)
+              // can't open a horizontal scroll that lets bubbles drift past
+              // the viewport — Y still scrolls because `overflow-y` falls
+              // back to Virtuoso's default.
+              //
+              // Explicit width: at first paint Virtuoso sometimes measures
+              // its sized list using the container's pre-layout width
+              // (zero / wrong on flex-stretched parents) and bakes that
+              // into item widths. The bad widths persist until any reflow
+              // event (window resize, scroll, even text-selection drag)
+              // triggers a re-measure. Pinning `width: 100%` makes the
+              // intrinsic size match the parent on first paint and avoids
+              // the race entirely.
+              style={{ overflowX: "hidden", width: "100%" }}
+              scrollerRef={captureScroller}
+              followOutput="auto"
+              initialTopMostItemIndex={initialBottomIndex}
+              atBottomStateChange={handleAtBottomStateChange}
+              computeItemKey={computeChatItemKey}
               onMouseDown={() => inputRef.current?.blur()}
               onTouchStart={() => {
                 inputRef.current?.blur();
                 setAutoScroll(false);
               }}
-            >
-              {(() => {
-                // Dedupe visible messages by id (O(N) via Set, not O(N^2) via findIndex).
-                // The same message list rendered here gets used for reply chains
-                // and streaming preview; duplicates can appear transiently.
-                const seen = new Set<string>();
-                const uniqueMessages = messages.filter((m) => {
-                  if (seen.has(m.id)) return false;
-                  seen.add(m.id);
-                  return true;
-                });
-                return uniqueMessages;
-              })()
-                .map((message, i) => {
+              itemContent={(i, message) => {
                   const isUser = message.role === "user";
                   const isContext = i < context.length;
                   const showActions =
@@ -2470,8 +2573,8 @@ function _Chat() {
                       {shouldShowClearContextDivider && <ClearContextDivider />}
                     </Fragment>
                   );
-                })}
-            </div>
+                }}
+            />
             <div className={styles["chat-input-panel"]}>
               <PromptHints
                 prompts={promptHints}
@@ -2550,6 +2653,49 @@ function _Chat() {
                       ? `等待中 (${pendingQueue.length} 条)`
                       : `Queued (${pendingQueue.length})`}
                   </span>
+                  {isStreaming && (
+                    <button
+                      className={styles["pending-queue-force"]}
+                      onClick={() => {
+                        // 1. Abort the active stream(s) — sends
+                        //    `chat.abort` to the gateway so the backend
+                        //    stops generating chunks. Without this the
+                        //    cancelled run keeps burning tokens until
+                        //    onFinish.
+                        ChatControllerPool.stopAll();
+                        // 2. Synchronously clear streaming flags so the
+                        //    pendingQueue useEffect can flush the next
+                        //    staged message on the very next render —
+                        //    without waiting for abort propagation.
+                        chatStore.updateTargetSession(session, (s) => {
+                          s.messages.forEach((m) => {
+                            if (m.streaming) m.streaming = false;
+                          });
+                        });
+                      }}
+                      title={
+                        getLang() === "cn"
+                          ? "中断当前回复，立即发送队列首条"
+                          : "Abort current reply, send next queued"
+                      }
+                    >
+                      {/* Up-arrow icon: "push the queue through" */}
+                      <svg
+                        width="11"
+                        height="11"
+                        viewBox="0 0 12 12"
+                        fill="none"
+                      >
+                        <path
+                          d="M6 10V2M6 2L2.5 5.5M6 2L9.5 5.5"
+                          stroke="currentColor"
+                          strokeWidth="1.5"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        />
+                      </svg>
+                    </button>
+                  )}
                   <button
                     className={styles["pending-queue-clear"]}
                     onClick={() => {
@@ -2721,7 +2867,7 @@ function _Chat() {
                         setUserInput("");
                         setPromptHints([]);
                         if (!isMobileScreen) inputRef.current?.focus();
-                        setAutoScroll(true);
+                        scrollChatToBottom();
                       }, 0);
                     }}
                   />

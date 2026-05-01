@@ -56,7 +56,7 @@ async fn stream_text_parts() {
     )
     .await;
 
-    let provider = GeminiProvider::with_base_url("test-api-key", &format!("{}/v1beta", server.uri()));
+    let provider = GeminiProvider::with_base_url("test-api-key", format!("{}/v1beta", server.uri()));
     let stream = provider
         .stream(simple_request("gemini-2.0-flash"))
         .await
@@ -88,7 +88,7 @@ async fn stream_function_call() {
     )
     .await;
 
-    let provider = GeminiProvider::with_base_url("test-key", &format!("{}/v1beta", server.uri()));
+    let provider = GeminiProvider::with_base_url("test-key", format!("{}/v1beta", server.uri()));
     let stream = provider
         .stream(simple_request("gemini-2.0-flash"))
         .await
@@ -116,7 +116,7 @@ async fn stream_error_field() {
     )
     .await;
 
-    let provider = GeminiProvider::with_base_url("test-key", &format!("{}/v1beta", server.uri()));
+    let provider = GeminiProvider::with_base_url("test-key", format!("{}/v1beta", server.uri()));
     let stream = provider
         .stream(simple_request("gemini-2.0-flash"))
         .await
@@ -152,7 +152,7 @@ async fn request_url_includes_model() {
         .mount(&server)
         .await;
 
-    let provider = GeminiProvider::with_base_url("key123", &format!("{}/v1beta", server.uri()));
+    let provider = GeminiProvider::with_base_url("key123", format!("{}/v1beta", server.uri()));
     let result = provider.stream(simple_request("gemini-2.0-flash")).await;
     assert!(
         result.is_ok(),
@@ -182,7 +182,7 @@ async fn api_key_in_header() {
         .await;
 
     let provider =
-        GeminiProvider::with_base_url("my-secret-gemini-key", &format!("{}/v1beta", server.uri()));
+        GeminiProvider::with_base_url("my-secret-gemini-key", format!("{}/v1beta", server.uri()));
     let result = provider.stream(simple_request("gemini-2.0-flash")).await;
     assert!(
         result.is_ok(),
@@ -207,7 +207,7 @@ async fn gemini_http_error() {
         .mount(&server)
         .await;
 
-    let provider = GeminiProvider::with_base_url("bad-key", &format!("{}/v1beta", server.uri()));
+    let provider = GeminiProvider::with_base_url("bad-key", format!("{}/v1beta", server.uri()));
     let result = provider.stream(simple_request("gemini-2.0-flash")).await;
     let err_msg = result.err().expect("expected error").to_string();
     assert!(err_msg.contains("403"), "expected 403 in error: {err_msg}");

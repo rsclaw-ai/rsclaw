@@ -38,12 +38,31 @@ const ChatList = dynamic(async () => (await import("./chat-list")).ChatList, {
   loading: () => null,
 });
 
+// Persists the user's last NewChat agent pick across sessions. Stored in
+// localStorage rather than zustand so a wipe-on-disk-cache leaves it
+// alone (Clear Local Cache only clears sessionStorage + WebKit cache).
+const LAST_NEW_CHAT_AGENT_KEY = "rsclaw-last-new-chat-agent";
+const DEFAULT_NEW_CHAT_AGENT_ID = "main";
+
+function readLastNewChatAgent(): string {
+  try {
+    return (
+      window.localStorage?.getItem(LAST_NEW_CHAT_AGENT_KEY) ||
+      DEFAULT_NEW_CHAT_AGENT_ID
+    );
+  } catch {
+    return DEFAULT_NEW_CHAT_AGENT_ID;
+  }
+}
+
 function NewChatDialog(props: {
   onClose: () => void;
   onCreate: (topic: string, agentId: string) => void;
 }) {
   const [topic, setTopic] = useState("");
-  const [agentId, setAgentId] = useState("");
+  // Initial pick: last manually selected agent; first-run defaults to
+  // "main" (the always-present fallback agent on the gateway).
+  const [agentId, setAgentId] = useState(() => readLastNewChatAgent());
   const [agents, setAgents] = useState<{ id: string; name?: string; model?: string }[]>([]);
 
   useEffect(() => {
@@ -51,10 +70,26 @@ function NewChatDialog(props: {
       .then((data) => {
         const list = Array.isArray(data) ? data : data.agents || [];
         setAgents(list);
-        if (list.length > 0 && !agentId) setAgentId(list[0].id);
+        // If the persisted pick disappeared from the registry, fall back
+        // to "main" if present, otherwise the first available agent.
+        setAgentId((prev) => {
+          if (list.some((a: any) => a.id === prev)) return prev;
+          if (list.some((a: any) => a.id === DEFAULT_NEW_CHAT_AGENT_ID))
+            return DEFAULT_NEW_CHAT_AGENT_ID;
+          return list[0]?.id ?? prev;
+        });
       })
       .catch(() => {});
   }, []);
+
+  const handleCreate = () => {
+    try {
+      window.localStorage?.setItem(LAST_NEW_CHAT_AGENT_KEY, agentId);
+    } catch {
+      // ignore — storage may be unavailable/full
+    }
+    props.onCreate(topic, agentId);
+  };
 
   return (
     <div className={styles["new-chat-overlay"]} onClick={props.onClose}>
@@ -73,7 +108,7 @@ function NewChatDialog(props: {
             placeholder={Locale.NewChatDialog.SessionNamePlaceholder}
             onChange={(e) => setTopic(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") props.onCreate(topic, agentId);
+              if (e.key === "Enter") handleCreate();
             }}
           />
         </div>
@@ -102,7 +137,7 @@ function NewChatDialog(props: {
           </button>
           <button
             className={styles["new-chat-btn-primary"]}
-            onClick={() => props.onCreate(topic, agentId)}
+            onClick={handleCreate}
           >
             {Locale.NewChatDialog.Create}
           </button>
