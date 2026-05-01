@@ -593,6 +593,10 @@ pub(crate) fn build_tool_list(
             - Falls back to browser rendering for JS-heavy pages and CAPTCHA-blocked sites (GET only)\n\
             - GET responses without headers/body are cached 15 minutes; non-GET bypasses cache\n\
             - For large pages, pass 'prompt' to LLM-extract specific information\n\
+            - DO NOT pass 'prompt' for compact structured responses (JSON APIs, RSS, \
+              <2KB text). Passing 'prompt' triggers an internal LLM summarize pass \
+              (extra ~30-60 s + tokens). For api.* / *.json / arxiv Atom / RSS / \
+              search-result JSON, omit 'prompt' — read the raw response directly.\n\
             \n\
             METHODS, HEADERS, BODY — supports the full HTTP surface:\n\
               - method: GET (default), POST, PUT, PATCH, DELETE\n\
@@ -610,7 +614,7 @@ pub(crate) fn build_tool_list(
                 "method":  {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"], "description": "HTTP method. Default: GET"},
                 "headers": {"type": "object", "description": "Optional request headers, e.g. {\"Authorization\": \"Bearer xyz\", \"X-API-Key\": \"...\"}", "additionalProperties": {"type": "string"}},
                 "body":    {"description": "Optional request body. String → sent as-is (set Content-Type via headers). Object/array → JSON-serialized; Content-Type defaulted to application/json."},
-                "prompt":  {"type": "string", "description": "What to extract from the page (e.g. 'list all API endpoints')"}
+                "prompt":  {"type": "string", "description": "OPTIONAL. What to extract from a LARGE HTML page (e.g. 'list all API endpoints'). Triggers an LLM-summarize pass on the response. OMIT for compact JSON/XML/text where you can read the raw body — passing 'prompt' on small structured responses just adds ~30-60 s of LLM latency for nothing."}
             },
             "required": ["url"]
         }),
@@ -653,11 +657,19 @@ pub(crate) fn build_tool_list(
             Other: type, select, check, scroll, screenshot, pdf, press, back, forward, reload, wait, evaluate, cookies, get_text, get_url, get_title, find, get_article, upload, new_tab, switch_tab, close_tab.\n\
             IMPORTANT: Always snapshot BEFORE clicking/filling. Element refs change after page updates.\n\n\
             Site-rules — platform-specific DOM selectors, URL routes, and gotchas live under \
-            `~/.rsclaw/tools/web_browser/site-rules/<domain>.md` (e.g. `douyin.md`, `kuaishou.md`, \
-            `xiaohongshu.md`, `bilibili.md`). When you `open` a URL whose host matches one of \
-            those filenames, read_file that rule file FIRST so you use the verified selectors \
-            instead of guessing them per-session. Saves 5+ snapshot/click iterations and avoids \
-            stale-selector breakage.\n\n\
+            `~/.rsclaw/tools/web_browser/site-rules/`. Two layouts coexist:\n\
+            - `<domain>.md` — flat, single-file (e.g. `douyin.md`, `kuaishou.md`, \
+              `xiaohongshu.md`, `bilibili.md`)\n\
+            - `<domain>/<task>.md` — nested per-task (e.g. `amazon/product-search.md`, \
+              `tiktok/upload.md`, `linkedin/connect.md`)\n\
+            When you `open` a URL whose host matches either layout, read_file the matching \
+            file FIRST so you use the verified selectors instead of guessing them per-session. \
+            Saves 5+ snapshot/click iterations and avoids stale-selector breakage.\n\n\
+            BEFORE reading any nested `<domain>/<task>.md` (which may have been imported from \
+            browser-use/browser-harness and use Python helper syntax), read \
+            `~/.rsclaw/tools/web_browser/site-rules/_VOCABULARY.md` once per session — it maps \
+            their `click_at_xy` / `type_text` / `js(...)` etc. to your `clickAt` / `type` / \
+            `evaluate` actions so you can translate the procedural code on the fly.\n\n\
             Screenshot routing — do NOT call `action=screenshot` without a target:\n\
             - Web page screenshot (user gave a URL): pass it inline,\n\
               `action=screenshot url=https://example.com` — this navigates\n\
@@ -744,8 +756,8 @@ pub(crate) fn build_tool_list(
                     "double_click", "triple_click", "right_click", "middle_click",
                     "drag", "scroll", "type", "key", "hold_key",
                     "cursor_position", "get_active_window", "ui_tree",
-                    "list_skills", "get_skill", "wait"
-                ], "description": "Action to perform. ui_tree returns the accessibility tree of the focused window (interactive elements with role/label/coordinates). list_skills/get_skill load desktop automation playbooks from ~/.rsclaw/tools/computer_use/skills/."},
+                    "list_app_rules", "get_app_rule", "wait"
+                ], "description": "Action to perform. ui_tree returns the accessibility tree of the focused window (interactive elements with role/label/coordinates). list_app_rules/get_app_rule load per-app desktop automation playbooks from ~/.rsclaw/tools/computer_use/app-rules/."},
                 "x":         {"type": "number", "description": "X coordinate (mouse actions, drag start) in physical pixels"},
                 "y":         {"type": "number", "description": "Y coordinate (mouse actions, drag start) in physical pixels"},
                 "to_x":      {"type": "number", "description": "Drag destination X (physical pixels)"},
@@ -757,7 +769,7 @@ pub(crate) fn build_tool_list(
                 "direction": {"type": "string", "enum": ["up", "down", "left", "right"], "description": "Scroll direction (default: down)"},
                 "amount":    {"type": "integer", "description": "Scroll clicks (default: 3)"},
                 "ms":        {"type": "integer", "description": "Wait duration in milliseconds (max 10000)"},
-                "name":      {"type": "string", "description": "Skill name (for get_skill action)"},
+                "name":      {"type": "string", "description": "App-rule name (for get_app_rule action)"},
                 "region":    {"type": "object", "description": "Optional screenshot region in physical pixels. Use after a full screenshot to zoom in on a specific area without recapturing the whole screen.", "properties": {
                     "x":      {"type": "number"},
                     "y":      {"type": "number"},

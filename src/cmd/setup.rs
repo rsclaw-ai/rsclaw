@@ -663,6 +663,15 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         // Seed workspace with default SOUL.md, AGENTS.md, USER.md
         let workspace = base.join("workspace");
         let _ = crate::agent::bootstrap::seed_workspace(&workspace);
+        // Seed tool prompts + embedded knowledge trees (web_browser
+        // site-rules + computer_use app-rules). Previously skipped on
+        // the non-interactive path, leaving the per-host skill library
+        // empty even though the binary embeds it. Failure here means the
+        // agent boots without any site-rule knowledge — log so the user
+        // can see what happened instead of silently degrading.
+        if let Err(e) = crate::agent::bootstrap::seed_tools(&base, None) {
+            tracing::warn!(error = %e, "non-interactive setup: seed_tools failed; site-rule library may be empty");
+        }
         return Ok(());
     }
 
@@ -917,7 +926,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                 }
             }
             STEP_API_TYPE => {
-                // API protocol selection for custom/codingplan providers.
+                // API protocol selection for custom/codingplan/doubao.
                 let api_labels = &[
                     "OpenAI Chat (default)",
                     "OpenAI Responses",
@@ -926,7 +935,14 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                     "Ollama",
                 ];
                 let api_values = &["openai", "openai-responses", "anthropic", "gemini", "ollama"];
-                let current_idx = api_values.iter().position(|v| *v == api_type).unwrap_or(0);
+                // Doubao defaults the cursor to OpenAI Responses (its
+                // native protocol for the Seed-1.6+ family with tool
+                // calling). Custom/codingplan keep the historical OpenAI
+                // Chat default.
+                let prov = &defs.providers[provider_idx];
+                let preferred_default = if prov.name == "doubao" { "openai-responses" } else { "openai" };
+                let probe = if api_type.is_empty() { preferred_default } else { api_type.as_str() };
+                let current_idx = api_values.iter().position(|v| *v == probe).unwrap_or(0);
                 match select_step("  API Protocol", api_labels, current_idx) {
                     StepResult::Next(idx) => {
                         api_type = api_values[idx].to_string();
@@ -1206,8 +1222,20 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
             if !effective_base_url.is_empty() {
                 prov_obj.insert("baseUrl".into(), json!(effective_base_url));
             }
-            // Write api type for custom / codingplan / doubao providers
-            if (provider.name == "custom" || provider.name == "codingplan" || provider.name == "doubao") && !api_type.is_empty() {
+            // Write api type for custom / codingplan / doubao providers.
+            // Doubao always writes — the Ark endpoint's native protocol
+            // for Seed-1.6+ models with tool calling is OpenAI Responses.
+            // Older OpenAI Chat models still work; user can override via
+            // the API Protocol picker. Custom/codingplan still gate on
+            // a non-empty value (the user picked something explicitly).
+            if provider.name == "doubao" {
+                let resolved = if api_type.is_empty() {
+                    "openai-responses"
+                } else {
+                    api_type.as_str()
+                };
+                prov_obj.insert("api".into(), json!(resolved));
+            } else if (provider.name == "custom" || provider.name == "codingplan") && !api_type.is_empty() {
                 prov_obj.insert("api".into(), json!(api_type));
             }
             // Write user_agent (from wizard input or provider default)
@@ -1245,6 +1273,18 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                         m.insert("primary".into(), json!(default_model_value));
                     }
                 }
+            }
+        }
+
+        // Mirror to agents.defaults.model.primary (openclaw compat). Without
+        // this, the loader has no fleet-level fallback and only the main
+        // agent ends up with a model — sub-agents and any future agent
+        // entry inherit nothing.
+        let defaults = agents_obj.entry("defaults").or_insert_with(|| json!({}));
+        if let Some(d_obj) = defaults.as_object_mut() {
+            let model_obj = d_obj.entry("model").or_insert_with(|| json!({}));
+            if let Some(m) = model_obj.as_object_mut() {
+                m.insert("primary".into(), json!(default_model_value));
             }
         }
     }

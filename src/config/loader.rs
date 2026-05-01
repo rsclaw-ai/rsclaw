@@ -248,6 +248,133 @@ pub fn log_file() -> PathBuf {
     base_dir().join("var").join("logs").join("gateway.log")
 }
 
+/// Look up site-rule files that match a URL's host.
+///
+/// Returns relative paths under `tools/web_browser/site-rules/`. Both
+/// layouts are checked:
+///   * `<host>.md` — flat (legacy zh sites)
+///   * `<host_root>/*.md` — nested (browser-harness imports). `host_root`
+///     is the part of the host before the first dot, e.g. `reddit` for
+///     `www.reddit.com`.
+///
+/// Surfaced by `web_fetch` and `web_browser action=open` tool results so
+/// the agent gets a hard pointer to read the rule before acting — the
+/// prompt-only mention buried in the tool description was being ignored
+/// on hosts where the agent thought it knew what to do.
+pub fn applicable_site_rules(url: &str) -> Vec<String> {
+    // Extract host without pulling in the `url` crate. Skip scheme via
+    // `://` split, then take everything up to the first /?#: separator.
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let host_with_port = after_scheme
+        .find(|c: char| matches!(c, '/' | '?' | '#'))
+        .map(|i| &after_scheme[..i])
+        .unwrap_or(after_scheme);
+    // Strip optional port (e.g. example.com:8080).
+    let host = host_with_port
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(host_with_port);
+    if host.is_empty() {
+        return Vec::new();
+    }
+    let host = host.strip_prefix("www.").unwrap_or(host).to_owned();
+
+    let dir = base_dir()
+        .join("tools")
+        .join("web_browser")
+        .join("site-rules");
+    if !dir.is_dir() {
+        return Vec::new();
+    }
+
+    let mut rules = Vec::new();
+
+    let flat = dir.join(format!("{host}.md"));
+    if flat.is_file() {
+        rules.push(format!("site-rules/{host}.md"));
+    }
+
+    // Build a list of candidate directory names to try, ordered by
+    // specificity. For `api.stackexchange.com` we want both:
+    //   - `api`              (matches a hypothetical `site-rules/api/`)
+    //   - `stackexchange`    (matches the actual `site-rules/stackexchange/`)
+    // Plain `stackexchange.com` collapses to a single candidate.
+    //
+    // Previously only the leftmost label was tried, so subdomains like
+    // `api.stackexchange.com`, `m.youtube.com`, or `cdn.shopify.com` never
+    // resolved to the registrable-host rule directory and the agent saw
+    // no rule at all.
+    let mut candidates: Vec<String> = Vec::new();
+    let labels: Vec<&str> = host.split('.').filter(|s| !s.is_empty()).collect();
+    if let Some(first) = labels.first() {
+        candidates.push((*first).to_owned());
+    }
+    if labels.len() >= 2 {
+        let second_to_last = labels[labels.len() - 2];
+        if !candidates.iter().any(|c| c == second_to_last) {
+            candidates.push(second_to_last.to_owned());
+        }
+    }
+
+    for cand in &candidates {
+        let nested = dir.join(cand);
+        if !nested.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&nested) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().is_some_and(|e| e == "md") {
+                let name = p
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if !name.is_empty() {
+                    rules.push(format!("site-rules/{cand}/{name}"));
+                }
+            }
+        }
+    }
+
+    rules
+}
+
+/// Read concatenated body of every rule returned by
+/// [`applicable_site_rules`] for `url`.
+///
+/// Each rule body is preceded by a `# === path ===` separator line so the
+/// agent can see which file each section came from. Returns `None` if no
+/// rule applies.
+///
+/// Inlined directly into web_fetch/web_browser tool results so the agent
+/// has the working approach at hand without needing a separate read_file
+/// round-trip — the previous "hint that points at file paths" design was
+/// being ignored.
+pub fn applicable_site_rules_body(url: &str) -> Option<String> {
+    let paths = applicable_site_rules(url);
+    if paths.is_empty() {
+        return None;
+    }
+    let dir = base_dir().join("tools").join("web_browser");
+    let mut out = String::new();
+    for rel in &paths {
+        let p = dir.join(rel);
+        if let Ok(body) = std::fs::read_to_string(&p) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("# === ");
+            out.push_str(rel);
+            out.push_str(" ===\n");
+            out.push_str(body.trim_end());
+            out.push('\n');
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
 /// Cache directory: `$base_dir/var/cache/`
 pub fn cache_dir() -> PathBuf {
     base_dir().join("var").join("cache")

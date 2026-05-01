@@ -553,7 +553,12 @@ impl WeChatPersonalChannel {
                                     if !stt.is_empty() {
                                         info!(chars = stt.len(), "wechat: using WeChat voice-to-text");
                                         if !from.is_empty() {
-                                            (self.on_message)(from.clone(), stt.clone(), vec![], vec![]);
+                                            // Tag the text so the agent enables
+                                            // voice-reply mode for this turn —
+                                            // channel-side STT bypasses the
+                                            // agent's media_files audio detection.
+                                            let tagged = format!("[__VOICE_INPUT__]\n{stt}");
+                                            (self.on_message)(from.clone(), tagged, vec![], vec![]);
                                         }
                                         continue;
                                     }
@@ -570,7 +575,8 @@ impl WeChatPersonalChannel {
                                                 Ok(t) if !t.is_empty() => {
                                                     info!(chars = t.len(), "wechat: voice transcribed");
                                                     if !from.is_empty() {
-                                                        (self.on_message)(from.clone(), t, vec![], vec![]);
+                                                        let tagged = format!("[__VOICE_INPUT__]\n{t}");
+                                                        (self.on_message)(from.clone(), tagged, vec![], vec![]);
                                                     }
                                                 }
                                                 Ok(_) => warn!("wechat: voice transcription returned empty"),
@@ -1376,6 +1382,74 @@ impl WeChatPersonalChannel {
     }
 }
 
+/// Wrap an audio file in a minimal black-screen MP4 so WeChat clients
+/// render it as a playable video bubble.
+///
+/// WeChat ilink's silk + send_voice_message path returns 200 OK at the
+/// API layer but the Mac/Windows/iOS clients don't show the result as a
+/// voice message. The video path works reliably across clients, at the
+/// cost of a few hundred KB of black-frame H.264 overhead.
+///
+/// Requires `ffmpeg` on PATH. Output: 320x240 black frame + AAC audio,
+/// `+faststart` for streaming-friendly playback.
+async fn audio_to_video_mp4(audio_bytes: &[u8], filename: &str) -> anyhow::Result<Vec<u8>> {
+    use anyhow::Context;
+    let tmp_dir = tempfile::tempdir().context("create temp dir for audio→mp4")?;
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("wav");
+    let in_path = tmp_dir.path().join(format!("audio.{ext}"));
+    let out_path = tmp_dir.path().join("voice.mp4");
+    std::fs::write(&in_path, audio_bytes).context("write audio to temp file")?;
+
+    let output = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            // Synthetic black video, 1 fps is enough — we only need *something*
+            // for clients that gate on a video stream. yuv420p is required for
+            // H.264 to play back on iOS/macOS WeChat clients.
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=320x240:r=1",
+            "-i",
+            in_path.to_string_lossy().as_ref(),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-tune",
+            "stillimage",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            out_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .await
+        .context("spawn ffmpeg")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "ffmpeg audio→mp4 failed (exit {}): {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+    let bytes = std::fs::read(&out_path).context("read mp4 output")?;
+    Ok(bytes)
+}
+
 /// Resolve media source from VoiceItem.
 fn resolve_media_source_voice(v: &VoiceItem) -> Option<MediaSource> {
     if let Some(url) = &v.voice_url {
@@ -1493,8 +1567,66 @@ impl Channel for WeChatPersonalChannel {
                     }
                 };
 
-                // Audio files: send as file attachment (ilink bot API does not support voice send).
-                // User can click the file to play audio.
+                // Audio files: WeChat ilink's silk + send_voice_message flow
+                // returns 200 OK at the API layer but the client doesn't
+                // render the resulting message as a voice bubble (likely
+                // payload mismatch — ilink isn't documented). Workaround:
+                // wrap the audio in a minimal black-frame MP4 and send as
+                // video. WeChat plays MP4s inline with full transport
+                // controls so the user effectively gets a playable bubble.
+                let is_audio = crate::channel::is_audio_attachment(mime, filename);
+                if is_audio {
+                    let mp4_result = audio_to_video_mp4(&bytes, filename).await;
+                    let video_sent = match mp4_result {
+                        Ok(mp4_bytes) => {
+                            match self
+                                .upload_media(&mp4_bytes, &msg.target_id, UploadMediaType::Video)
+                                .await
+                            {
+                                Ok(uploaded) => match self
+                                    .send_video_message(&msg.target_id, &uploaded)
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        info!(
+                                            index = idx,
+                                            filename = %filename,
+                                            wav_bytes = bytes.len(),
+                                            mp4_bytes = mp4_bytes.len(),
+                                            "wechat: audio sent as video"
+                                        );
+                                        true
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            index = idx,
+                                            "wechat: send_video_message for audio failed (fall back to file): {e:#}"
+                                        );
+                                        false
+                                    }
+                                },
+                                Err(e) => {
+                                    warn!(
+                                        index = idx,
+                                        "wechat: audio→video upload failed (fall back to file): {e:#}"
+                                    );
+                                    false
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                index = idx,
+                                "wechat: ffmpeg audio→mp4 failed (fall back to file): {e:#}"
+                            );
+                            false
+                        }
+                    };
+                    if video_sent {
+                        continue;
+                    }
+                    // Fall through to File-attachment send below.
+                }
 
                 // Video files: upload as Video type and send as video message
                 let is_video = mime.starts_with("video/")

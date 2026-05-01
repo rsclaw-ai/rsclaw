@@ -288,31 +288,29 @@
   height: 100%;
 }
 
-// `chat-body` is now Virtuoso's outer scroller. Virtuoso ignores any
-// padding on this element when it sizes its sized list — items stretch
-// to the full clientWidth and overflow the padding box, pushing message
-// avatars/timestamps past the viewport. Padding lives on the wrapper
-// `chat-body-padded` instead, so Virtuoso receives an already-padded
-// content rect and items fit cleanly inside.
+// `chat-body` is Virtuoso's outer scroller. We keep the visual padding
+// on this element (so messages aren't flush to the edges) AND set
+// `box-sizing: border-box` so the declared 100% width *includes* the
+// padding instead of adding to it. Without border-box, the element
+// occupied parent_width + 40px and pushed avatars / right-aligned
+// timestamps past the viewport.
 .chat-body {
   flex: 1;
   overflow: auto;
   overflow-x: hidden;
+  // Vertical padding stays here (top breathing room + bottom space
+  // before the input panel). Horizontal padding moves to `.chat-message`
+  // because Virtuoso sizes its inner sizer using the scroller's
+  // clientWidth (which INCLUDES this element's padding) and positions
+  // the sizer starting at padding-left — net effect: items overflow
+  // padding-right by exactly one padding-right width, clipping
+  // avatars/timestamps. With horizontal padding moved onto each
+  // message wrapper, Virtuoso's sizer fits cleanly edge-to-edge.
+  padding: 20px 0 40px;
   position: relative;
   overscroll-behavior: none;
   box-sizing: border-box;
-}
-
-.chat-body-padded {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-height: 0;
-  padding: 20px;
-  padding-bottom: 40px;
-  box-sizing: border-box;
-  position: relative;
-  overflow: hidden;
+  scrollbar-gutter: stable;
 }
 
 .chat-body-main-title {
@@ -332,6 +330,18 @@
 .chat-message {
   display: flex;
   flex-direction: row;
+  // Flex items default to `min-width: min-content`, which can exceed the
+  // parent on long unbreakable strings (URLs, code) and push avatars /
+  // right-aligned timestamps past the viewport. `min-width: 0` lets
+  // children shrink correctly; `max-width: 100%` is the safety net.
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  // Horizontal inset moved off `.chat-body` so Virtuoso's sizer fits
+  // cleanly inside the scroller; messages keep the same visual gap from
+  // the chat edges as before.
+  padding-left: 20px;
+  padding-right: 20px;
 
   &:last-child {
     animation: slide-in ease 0.3s;
@@ -1164,7 +1174,8 @@
   flex: 1;
 }
 
-.pending-queue-clear {
+.pending-queue-clear,
+.pending-queue-force {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1182,6 +1193,11 @@
     opacity: 1;
     background: var(--hover-color);
   }
+}
+
+.pending-queue-force {
+  // Slightly tinted so users can tell it apart from the X button.
+  color: var(--primary);
 }
 
 .attach-file-chip-input {

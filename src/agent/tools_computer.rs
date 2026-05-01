@@ -135,7 +135,7 @@ $bitmap.Dispose()
                             .output()
                             .await
                     };
-                    if res.is_err() || !res.as_ref().unwrap().status.success() {
+                    if !matches!(&res, Ok(o) if o.status.success()) {
                         // ImageMagick fallback. Crop format: `WxH+X+Y`.
                         let mut cmd = tokio::process::Command::new("import");
                         cmd.args(["-window", "root"]);
@@ -956,16 +956,19 @@ except ImportError:
             }
 
             // =================================================================
-            // List available desktop skills
+            // List available app-rules (per-app desktop automation playbooks)
             // =================================================================
-            "list_skills" => {
-                let skills_dir = crate::config::loader::base_dir()
+            "list_app_rules" | "list_skills" => {
+                // `list_skills` is the legacy alias from before the
+                // skills/ → app-rules/ rename; kept for prompts that
+                // already learned the old name.
+                let app_rules_dir = crate::config::loader::base_dir()
                     .join("tools")
                     .join("computer_use")
-                    .join("skills");
-                let mut skills: Vec<Value> = Vec::new();
-                if skills_dir.is_dir() {
-                    if let Ok(entries) = std::fs::read_dir(&skills_dir) {
+                    .join("app-rules");
+                let mut rules: Vec<Value> = Vec::new();
+                if app_rules_dir.is_dir() {
+                    if let Ok(entries) = std::fs::read_dir(&app_rules_dir) {
                         for entry in entries.flatten() {
                             let path = entry.path();
                             if path.extension().is_some_and(|e| e == "md") {
@@ -986,45 +989,53 @@ except ImportError:
                                     } else {
                                         String::new()
                                     };
-                                    skills.push(json!({"name": name, "description": desc}));
+                                    rules.push(json!({"name": name, "description": desc}));
                                 }
                             }
                         }
                     }
                 }
-                Ok(json!({"action": "list_skills", "skills_dir": skills_dir.to_string_lossy(), "count": skills.len(), "skills": skills}))
+                Ok(json!({
+                    "action": "list_app_rules",
+                    "app_rules_dir": app_rules_dir.to_string_lossy(),
+                    "count": rules.len(),
+                    "app_rules": rules,
+                }))
             }
 
             // =================================================================
-            // Get a specific desktop skill by name
+            // Get a specific app-rule by name
             // =================================================================
-            "get_skill" => {
+            "get_app_rule" | "get_skill" => {
                 let name = args["name"].as_str()
-                    .ok_or_else(|| anyhow!("get_skill: `name` required"))?;
-                let skills_dir = crate::config::loader::base_dir()
+                    .ok_or_else(|| anyhow!("get_app_rule: `name` required"))?;
+                let app_rules_dir = crate::config::loader::base_dir()
                     .join("tools")
                     .join("computer_use")
-                    .join("skills");
-                let path = skills_dir.join(format!("{name}.md"));
+                    .join("app-rules");
+                let path = app_rules_dir.join(format!("{name}.md"));
                 if !path.exists() {
-                    return Err(anyhow!("skill not found: {name} (looked in {})", skills_dir.display()));
+                    return Err(anyhow!(
+                        "app-rule not found: {name} (looked in {})",
+                        app_rules_dir.display()
+                    ));
                 }
                 let content = std::fs::read_to_string(&path)
-                    .map_err(|e| anyhow!("read skill {name}: {e}"))?;
+                    .map_err(|e| anyhow!("read app-rule {name}: {e}"))?;
                 // Strip frontmatter, return body only
                 let body = if content.starts_with("---") {
                     content.splitn(3, "---").nth(2).unwrap_or(&content).trim()
                 } else {
                     content.trim()
                 };
-                Ok(json!({"action": "get_skill", "name": name, "content": body}))
+                Ok(json!({"action": "get_app_rule", "name": name, "content": body}))
             }
 
             other => Err(anyhow!(
                 "computer_use: unsupported action `{other}` \
                  (supported: screenshot, mouse_move, mouse_click, double_click, triple_click, \
                  right_click, middle_click, drag, scroll, type, key, hold_key, cursor_position, \
-                 get_active_window, ui_tree, list_skills, get_skill, wait)"
+                 get_active_window, ui_tree, list_app_rules, get_app_rule, wait)"
             )),
         }
     }

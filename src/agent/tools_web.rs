@@ -18,8 +18,58 @@ use super::web_parsers::{
     parse_baidu_results, parse_bing_html_results, parse_ddg_results, parse_sogou_results,
     search_engine_url, truncate_chars, urlencoding,
 };
+
+use crate::config::loader::{applicable_site_rules, applicable_site_rules_body};
 use crate::provider::{Message, MessageContent, Role, StreamEvent};
 use crate::agent::query_planner::{Intent, QueryPlan};
+
+/// Extract host from a URL without pulling in the `url` crate. Strips the
+/// optional `www.` prefix so `www.reddit.com` and `reddit.com` collapse
+/// to one cache key.
+fn host_of(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let host_with_port = after_scheme
+        .find(|c: char| matches!(c, '/' | '?' | '#'))
+        .map(|i| &after_scheme[..i])
+        .unwrap_or(after_scheme);
+    let host = host_with_port
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(host_with_port);
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.strip_prefix("www.").unwrap_or(host).to_owned())
+}
+
+/// LRU cache of hosts that already had their site rule surfaced to the
+/// agent recently. Entries expire after 5 minutes so a long conversation
+/// that revisits a host eventually re-surfaces the rule, but back-to-back
+/// calls don't loop on rule-only responses.
+///
+/// Uses `moka::future::Cache` because the project only enables moka's
+/// `future` feature — the `sync` feature is off, so `moka::sync::Cache`
+/// isn't available. `contains_key` is synchronous on the future cache,
+/// `insert` is async.
+fn site_rule_cache() -> &'static moka::future::Cache<String, ()> {
+    use moka::future::Cache;
+    use std::sync::LazyLock;
+    static CACHE: LazyLock<Cache<String, ()>> = LazyLock::new(|| {
+        Cache::builder()
+            .max_capacity(2_000)
+            .time_to_live(Duration::from_secs(5 * 60))
+            .build()
+    });
+    &CACHE
+}
+
+fn site_rule_recently_served(host: &str) -> bool {
+    site_rule_cache().contains_key(host)
+}
+
+async fn mark_site_rule_served(host: String) {
+    site_rule_cache().insert(host, ()).await;
+}
 
 impl AgentRuntime {
     pub(crate) async fn tool_web_search(&self, args: Value) -> Result<Value> {
@@ -629,6 +679,33 @@ impl AgentRuntime {
             .ok_or_else(|| anyhow!("web_fetch: `url` required"))?;
         let prompt = args.get("prompt").and_then(|v| v.as_str());
 
+        // Site-rule consultation gate. The site-rules tree under
+        // tools/web_browser/site-rules/ documents working URL patterns,
+        // selectors, and dead-ends per host (e.g. reddit's `.json`
+        // suffix, tradingview's JSON API). Previously these were merely
+        // hinted in the response — the agent ignored the hint and
+        // looped on the same failing URL. Short-circuit on first hit
+        // so the agent reads the rule before doing anything: return
+        // the rule body in place of the HTTP fetch, force a re-plan.
+        // LRU keyed by (host) — once delivered, subsequent calls in the
+        // same window pass through normally so the agent isn't stuck
+        // in a rule-only loop.
+        if let Some(host) = host_of(url) {
+            if !site_rule_recently_served(&host)
+                && let Some(body) = applicable_site_rules_body(url)
+            {
+                mark_site_rule_served(host).await;
+                return Ok(json!({
+                    "url": url,
+                    "consult_site_rule_first": true,
+                    "site_rule": body,
+                    "next_action": "Read the rule above, then call web_fetch \
+                        (or web_browser) with the URL / parameters it \
+                        prescribes. Do not retry the original URL unchanged.",
+                }));
+            }
+        }
+
         // Optional method (default GET). Anything other than GET disables
         // the response cache and the same-host redirect policy stays in
         // effect (avoids accidental cross-host POST replays).
@@ -881,12 +958,28 @@ impl AgentRuntime {
         let text = truncate_chars(&final_md, max_length);
         let text = self.maybe_summarize(&text, prompt).await;
 
-        Ok(json!({
+        // Surface site-rules for this host in the response so the agent
+        // can see them in the tool result (prompt-only mentions are easy
+        // to ignore — a structured field next to the data is harder).
+        let skills = applicable_site_rules(url);
+        let mut result = json!({
             "url": url,
             "title": final_title,
             "text": text,
             "length": text.len(),
-        }))
+        });
+        if !skills.is_empty() {
+            result["applicable_site_rules"] = json!(skills);
+            result["site_rules_hint"] = json!(
+                "VERIFIED selectors / URL patterns / API tricks for this host \
+                 already exist. read_file each path under \
+                 ~/.rsclaw/tools/web_browser/site-rules/ BEFORE deciding how to \
+                 fetch or scrape — they document the working approach (e.g. \
+                 .json suffix for reddit, JSON API for tradingview) and the \
+                 dead ends to avoid."
+            );
+        }
+        Ok(result)
     }
 
     /// Use web_browser to fetch JS-rendered page content via get_article.

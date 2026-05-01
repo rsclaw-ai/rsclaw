@@ -333,6 +333,76 @@ $g.Dispose();$b.Dispose()"#
         let reply = crate::agent::tools_cron::format_cron_jobs(&jobs);
         return Some(txt(reply));
     }
+    // /cron remove <id-or-index> — delete a cron job. Routed locally so the
+    // user gets a deterministic confirmation reply; previously this fell
+    // through to the LLM, which often acknowledged silently without
+    // surfacing a result message.
+    if let Some(rest) = lower
+        .strip_prefix("/cron remove ")
+        .or_else(|| lower.strip_prefix("/cron rm "))
+        .or_else(|| lower.strip_prefix("/cron delete "))
+        .or_else(|| lower.strip_prefix("/cron del "))
+    {
+        let key = rest.trim();
+        if key.is_empty() {
+            return Some(txt("/cron remove: <id> or <index> required".to_owned()));
+        }
+        let cron_path = crate::cron::resolve_cron_store_path();
+        let _guard = crate::cron::CRON_FILE_LOCK.lock().await;
+        let mut jobs = crate::agent::tools_cron::read_cron_jobs(&cron_path).await;
+        let zh = crate::i18n::default_lang() == "zh";
+        // Match by 1-based index when the arg is a positive integer,
+        // otherwise treat as job id (loop-xxxx / cron-xxxx).
+        let removed = if let Ok(idx) = key.parse::<usize>()
+            && idx >= 1
+            && idx <= jobs.len()
+        {
+            Some(jobs.remove(idx - 1))
+        } else {
+            jobs
+                .iter()
+                .position(|j| j["id"].as_str() == Some(key))
+                .map(|p| jobs.remove(p))
+        };
+        let Some(removed_job) = removed else {
+            drop(_guard);
+            return Some(txt(if zh {
+                format!("/cron remove: 没找到任务 `{key}`")
+            } else {
+                format!("/cron remove: no job matched `{key}`")
+            }));
+        };
+        if let Err(e) = crate::agent::tools_cron::write_cron_jobs(&cron_path, &jobs).await {
+            drop(_guard);
+            return Some(txt(format!("/cron remove: failed to save jobs: {e}")));
+        }
+        drop(_guard);
+        crate::cron::trigger_reload();
+        let id = removed_job["id"].as_str().unwrap_or(key);
+        let summary = removed_job["payload"]["text"]
+            .as_str()
+            .map(|s| {
+                let s = s.trim();
+                if s.chars().count() > 60 {
+                    let cut: String = s.chars().take(60).collect();
+                    format!("{cut}…")
+                } else {
+                    s.to_owned()
+                }
+            })
+            .unwrap_or_default();
+        return Some(txt(if zh {
+            if summary.is_empty() {
+                format!("已删除任务 {id}")
+            } else {
+                format!("已删除任务 {id}：{summary}")
+            }
+        } else if summary.is_empty() {
+            format!("Removed job {id}")
+        } else {
+            format!("Removed job {id}: {summary}")
+        }));
+    }
     // /loop <interval> <prompt-or-cmd> — schedule a recurring agentTurn
     // back to the originating channel/peer. Persists to cron.json5 and
     // signals the cron runner to reload.

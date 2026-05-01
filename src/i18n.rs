@@ -2347,6 +2347,18 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "vi" => "[fail] Tac vu loi\n\n**Tac vu**: {name}\n**That bai lien tiep**: {consecutive} lan\n**Loi**: {error}",
     );
 
+    msg!("install_hint_stt_sherpa",
+        "en" => "\n\n[System hint] This transcription used a fallback path (provider={provider}). For better Chinese accuracy, install:\n  rsclaw tools install sherpa-onnx\n  rsclaw models download paraformer-zh\nThis hint is shown only once.",
+        "zh" => "\n\n[\u{7CFB}\u{7EDF}\u{63D0}\u{793A}] \u{672C}\u{6B21}\u{8BED}\u{97F3}\u{8BC6}\u{522B}\u{8D70}\u{7684}\u{662F}\u{5907}\u{4EFD}\u{8DEF}\u{5F84}\u{FF08}provider={provider}\u{FF09}\u{3002}\u{8981}\u{83B7}\u{5F97}\u{66F4}\u{597D}\u{7684}\u{4E2D}\u{6587}\u{8BC6}\u{522B}\u{6548}\u{679C}\u{FF0C}\u{8BF7}\u{8FD0}\u{884C}\u{FF1A}\n  rsclaw tools install sherpa-onnx\n  rsclaw models download paraformer-zh\n\u{6B64}\u{63D0}\u{793A}\u{53EA}\u{663E}\u{793A}\u{4E00}\u{6B21}\u{3002}",
+        "ja" => "\n\n[\u{30B7}\u{30B9}\u{30C6}\u{30E0}\u{306E}\u{304A}\u{77E5}\u{3089}\u{305B}] \u{4ECA}\u{56DE}\u{306E}\u{97F3}\u{58F0}\u{8A8D}\u{8B58}\u{306F}\u{30D5}\u{30A9}\u{30FC}\u{30EB}\u{30D0}\u{30C3}\u{30AF}\u{7D4C}\u{8DEF}\u{3092}\u{4F7F}\u{7528}\u{3057}\u{307E}\u{3057}\u{305F}\u{FF08}provider={provider}\u{FF09}\u{3002}\u{8A8D}\u{8B58}\u{7CBE}\u{5EA6}\u{3092}\u{4E0A}\u{3052}\u{308B}\u{306B}\u{306F}\u{FF1A}\n  rsclaw tools install sherpa-onnx\n  rsclaw models download paraformer-zh\n\u{3053}\u{306E}\u{30D2}\u{30F3}\u{30C8}\u{306F}1\u{56DE}\u{306E}\u{307F}\u{8868}\u{793A}\u{3055}\u{308C}\u{307E}\u{3059}\u{3002}",
+    );
+
+    msg!("install_hint_tts_sherpa",
+        "en" => "\n\n[System hint] Voice reply is using the fallback system TTS — Chinese sounds robotic. For natural Chinese speech, install:\n  rsclaw tools install sherpa-onnx\n  rsclaw models download melo\nThis hint is shown only once.",
+        "zh" => "\n\n[\u{7CFB}\u{7EDF}\u{63D0}\u{793A}] \u{5F53}\u{524D}\u{8BED}\u{97F3}\u{56DE}\u{590D}\u{8D70}\u{7684}\u{662F}\u{7CFB}\u{7EDF}\u{5907}\u{4EFD} TTS\u{FF0C}\u{4E2D}\u{6587}\u{97F3}\u{8D28}\u{4E00}\u{822C}\u{3002}\u{8981}\u{4F7F}\u{7528}\u{66F4}\u{81EA}\u{7136}\u{7684} MeloTTS\u{FF0C}\u{8BF7}\u{8FD0}\u{884C}\u{FF1A}\n  rsclaw tools install sherpa-onnx\n  rsclaw models download melo\n\u{6B64}\u{63D0}\u{793A}\u{53EA}\u{663E}\u{793A}\u{4E00}\u{6B21}\u{3002}",
+        "ja" => "\n\n[\u{30B7}\u{30B9}\u{30C6}\u{30E0}\u{306E}\u{304A}\u{77E5}\u{3089}\u{305B}] \u{97F3}\u{58F0}\u{5FDC}\u{7B54}\u{306F}\u{30B7}\u{30B9}\u{30C6}\u{30E0}\u{30D0}\u{30C3}\u{30AF}\u{30A2}\u{30C3}\u{30D7} TTS \u{3092}\u{4F7F}\u{7528}\u{3057}\u{3066}\u{3044}\u{307E}\u{3059}\u{3002}\u{3088}\u{308A}\u{81EA}\u{7136}\u{306A}\u{4E2D}\u{56FD}\u{8A9E}\u{306E}\u{305F}\u{3081}\u{306B}\u{FF1A}\n  rsclaw tools install sherpa-onnx\n  rsclaw models download melo\n\u{3053}\u{306E}\u{30D2}\u{30F3}\u{30C8}\u{306F}1\u{56DE}\u{306E}\u{307F}\u{8868}\u{793A}\u{3055}\u{308C}\u{307E}\u{3059}\u{3002}",
+    );
+
     m
 });
 

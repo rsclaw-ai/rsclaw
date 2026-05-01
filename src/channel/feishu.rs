@@ -861,7 +861,10 @@ impl FeishuChannel {
                 match self.transcribe_voice(message_id, file_key).await {
                     Ok(t) => {
                         info!(chars = t.len(), "feishu: voice transcribed");
-                        t
+                        // Tag so the agent enables voice-reply mode for
+                        // the turn — feishu transcribes server-side, the
+                        // agent never sees raw audio bytes.
+                        format!("[__VOICE_INPUT__]\n{t}")
                     }
                     Err(e) => {
                         warn!("feishu: voice transcription failed: {e:#}");
@@ -1131,7 +1134,7 @@ impl FeishuChannel {
                 match self.transcribe_voice(&msg.message_id, &file_key).await {
                     Ok(text) => {
                         info!(chars = text.len(), "feishu: voice transcribed");
-                        Some(text)
+                        Some(format!("[__VOICE_INPUT__]\n{text}"))
                     }
                     Err(e) => {
                         warn!("feishu: voice transcription failed: {e:#}");

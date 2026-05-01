@@ -1455,7 +1455,30 @@ impl BrowserSession {
         self.refs.clear();
         self.ref_counter = 0;
 
-        Ok(json!({ "action": "open", "url": url, "text": format!("Navigated to {url}") }))
+        // Surface applicable site-rules so the agent reads the verified
+        // playbook for this host before snapshotting / clicking. Inline
+        // the rule body directly — a hint pointing at file paths gets
+        // ignored, the actual content sitting in the response doesn't.
+        let skills = crate::config::loader::applicable_site_rules(&url);
+        let mut result = json!({
+            "action": "open",
+            "url": url,
+            "text": format!("Navigated to {url}"),
+        });
+        if !skills.is_empty() {
+            result["applicable_site_rules"] = json!(skills);
+            if let Some(body) = crate::config::loader::applicable_site_rules_body(&url) {
+                result["site_rule"] = json!(body);
+            }
+            result["site_rules_hint"] = json!(
+                "Read the inlined `site_rule` above BEFORE the next \
+                 snapshot/click. It documents verified selectors, URL \
+                 routes, and quirks for this host — using it saves \
+                 5+ trial-and-error iterations and avoids stale-selector \
+                 breakage."
+            );
+        }
+        Ok(result)
     }
 
     async fn cmd_snapshot(&mut self, args: &Value) -> Result<Value> {
@@ -2623,6 +2646,22 @@ impl BrowserSession {
             .get("timeout")
             .and_then(|v| v.as_u64())
             .unwrap_or(15);
+
+        // No value supplied and target isn't a special keyword: treat as a
+        // pure sleep. Agents call `{"action":"wait","timeout":N}` to insert
+        // a delay before snapshotting an SPA — the previous behavior built
+        // a `!!document.querySelector('')` predicate that always returned
+        // false and spun until the deadline, then surfaced a confusing
+        // `waiting for element=` error.
+        const SELECTOR_TARGETS: &[&str] = &["url", "text", "networkidle", "fn", "js", "function"];
+        if value.is_empty() && !SELECTOR_TARGETS.contains(&target) {
+            time::sleep(Duration::from_secs(timeout_secs)).await;
+            return Ok(json!({
+                "action": "wait",
+                "target": "sleep",
+                "text": format!("Slept for {timeout_secs}s"),
+            }));
+        }
 
         let js = match target {
             "url" => format!(r#"location.href.includes('{}')"#, escape_js_string(value)),

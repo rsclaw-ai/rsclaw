@@ -11,7 +11,7 @@
 name       = "doubao"
 label      = "Doubao (ByteDance)"
 env_var    = "ARK_API_KEY"
-model      = "doubao/doubao-seed-2-0-pro-260215"
+model      = "doubao/doubao-seed-2.0-pro"
 base_url   = "https://ark.cn-beijing.volces.com/api/v3"
 needs_key  = true
 

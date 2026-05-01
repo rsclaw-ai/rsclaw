@@ -2,6 +2,137 @@
 
 All notable changes to RsClaw will be documented in this file.
 
+## [2026.5.1] - 2026-05-01
+
+### Voice end-to-end via sherpa-onnx
+
+- Sherpa-onnx STT (`paraformer-zh` int8 / full, `whisper-turbo`,
+  `whisper-tiny`) wired into `transcribe_audio` as the preferred provider.
+  Detected by inspecting `<base>/tools/sherpa-onnx/bin/sherpa-onnx-offline`
+  + a model directory with the expected file layout. JSON output parser
+  handles sherpa 1.13+ (`{"text": "..."}`) and legacy `text:` formats.
+- Sherpa-onnx TTS (`vits-melo-tts-zh_en` default, `vits-zh-aishell3`,
+  `vits-theresa` lightweight fallback) auto-discovered via explicit
+  priority list. VITS lookup picks up `lexicon.txt`, optional `dict/`,
+  and joins all `.fst` rule files comma-separated into `--tts-rule-fsts`.
+- All sherpa CLI invocations now use `--flag=value` argv format
+  (sherpa-onnx 1.13's parse-options enforces single-token options and
+  rejects `--flag value` splits).
+- Voice-tag plumbing: feishu and wechat channels prefix transcribed
+  voice text with `[__VOICE_INPUT__]`. Runtime detects the prefix at
+  `run_turn` entry, enables `voice_mode_sessions`, and strips the tag
+  before storing the message — auto-TTS replies in audio without
+  requiring channels to thread audio bytes through.
+- Auto-TTS suppresses LLM `send_file` calls for audio paths in
+  voice mode (was producing duplicate audio messages from stale TTS
+  files).
+- One-shot install hints: when STT or TTS fall back to non-sherpa
+  paths and `<base>/var/install-hints.json` doesn't already mark the
+  feature, append a localized hint with the install command. zh / en
+  / ja localized via `i18n.rs`.
+
+### WeChat audio delivery fallback chain
+
+- Try silk + `send_voice_message` first (200 OK at API but client
+  doesn't render).
+- Fall back to ffmpeg audio→mp4 (black 320×240 + AAC + faststart)
+  sent as `UploadMediaType::Video` (CDN periodically 5xx's, retry
+  loop already handles).
+- Fall back to `.wav` File attachment (always works, displays as
+  file).
+- New helper `audio_to_video_mp4` drives ffmpeg subprocess; failures
+  surface as `warn!` and continue down the chain.
+
+### Site-rule injection
+
+- `web_fetch` short-circuits the HTTP request and returns the
+  matching site-rule body on first hit per host (5-min LRU). Agent
+  receives a `next_action` field instructing it to make the
+  rule-prescribed call.
+- `web_browser action=open` inlines the rule body into the response
+  so the agent has the playbook before snapshotting.
+- `applicable_site_rules` now tries the second-to-last host label so
+  `api.stackexchange.com` resolves to `stackoverflow/` (the previous
+  leftmost-label-only logic missed every subdomain).
+
+### Bootstrap prompts
+
+- `SOUL.md` / `AGENTS.md` / `IDENTITY.md` (zh + en) rewritten with
+  explicit anti-hallucination self-check sections.
+- New voice-reply rules: don't say "click the attachment" when the
+  auto-TTS bubble plays inline; don't call `send_file` for audio
+  under voice_mode.
+
+### Sherpa-onnx bundling
+
+- `cmd/tools.rs` now requests the `*-shared.tar.bz2` variant per
+  platform (with CLI binaries) instead of `*-shared-lib` (lib-only).
+  linux-aarch64 uses `-shared-cpu`; win-x64 uses
+  `-shared-MT-Release`.
+- `cmd/models.rs` registers `vits-melo-tts-zh_en` under `vits` /
+  `tts` / `melo` aliases (default), keeps theresa as `theresa`.
+  Adds `paraformer-zh` int8 + full precision entries
+  (2025-10-07 release).
+
+### Doubao defaults
+
+- Default API protocol is now `openai-responses` (Ark Seed family
+  native protocol with tool calling) instead of OpenAI Chat. Custom
+  / codingplan still default to OpenAI Chat.
+- Default model: `doubao/doubao-seed-2.0-pro`. Onboarding wizard
+  also surfaces `doubao-seed-2.0-lite`.
+- Config save (panel + onboarding) now persists `api: openai-responses`
+  even when the user never opens the API Type dropdown.
+
+### `/cron remove`
+
+- Handled in gateway preparse with `remove`/`rm`/`delete`/`del`
+  aliases; matches by 1-based index or job id. Returns localized
+  confirmation text. Was previously falling through to the LLM and
+  getting silently swallowed.
+
+### UI
+
+- Chat virtualisation via react-virtuoso (long sessions no longer
+  freeze).
+- Stuck-stream watchdog with 5-min activity threshold and
+  force-send escape hatch.
+- Settings → Danger zone reworked: drop dead "Reset all settings",
+  add "Clear chat history" (idb only) and "Clear local cache"
+  (sessionStorage + WebKit cache, preserves language).
+- NewChatDialog remembers last-picked agent in localStorage.
+- Tray menu i18n (zh / en) reading `gateway.language` from
+  `rsclaw.json5`, falling back to `LANG` env, then English.
+- Config panel auto-marks dirty when `gateway.language` is missing
+  so first save persists the dropdown default.
+
+### Computer use
+
+- HiDPI mouse coordinate correction on macOS via cached
+  osascript+screencapture probe.
+- Screenshot region (`--region x,y,w,h`) and resize (`--size W H`)
+  flags.
+
+### Browser
+
+- `cmd_wait` with no target/value degrades to a pure sleep instead
+  of timing out on an empty CSS-selector predicate.
+
+### CI
+
+- `clippy -D warnings` clean across lib + tests.
+- Removed `unwrap()` in `tools_computer` screenshot fallback.
+- `non-interactive setup` logs `seed_tools` failures instead of
+  swallowing them.
+
+### Browser-harness skills
+
+- 80 browser-harness MIT skills (Amazon, Reddit, TikTok,
+  TradingView, Xiaohongshu, etc.) imported under
+  `tools/web_browser/site-rules/`. Embedded at compile time via
+  `include_dir!`; extracted on first run, preserves user
+  hand-edits.
+
 ## [2026.4.29] - 2026-04-29
 
 ### Shell-bridge plugins are now first-class LLM-callable
