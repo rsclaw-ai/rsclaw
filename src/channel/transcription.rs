@@ -65,7 +65,7 @@ pub async fn transcribe_audio(
     let provider = detect_provider();
     info!(provider = %provider, file = effective_name, bytes = effective_bytes.len(), "transcribing audio");
 
-    match provider.as_str() {
+    let result = match provider.as_str() {
         "sherpa" => transcribe_sherpa(&effective_bytes, &effective_name).await,
         "candle" => transcribe_candle(&effective_bytes).await,
         "macos" => transcribe_macos(&effective_bytes, &effective_name).await,
@@ -73,7 +73,29 @@ pub async fn transcribe_audio(
         "tencent" => transcribe_tencent(client, &effective_bytes, &effective_name).await,
         "aliyun" => transcribe_aliyun(client, &effective_bytes, &effective_name).await,
         _ => transcribe_openai(client, &effective_bytes, &effective_name, &effective_mime).await,
+    };
+
+    // One-shot install hint: if we landed on a non-sherpa fallback,
+    // tell the user once how to upgrade. Subsequent calls fall through
+    // silently because `claim_first_hint` returns false after the first
+    // call. Suppress when the user explicitly forced a non-sherpa
+    // provider via the env var — they presumably know what they're
+    // doing.
+    if provider != "sherpa"
+        && std::env::var("TRANSCRIPTION_PROVIDER").is_err()
+        && crate::agent::install_hints::claim_first_hint("stt-sherpa")
+    {
+        if let Ok(text) = result {
+            let lang = crate::i18n::default_lang();
+            let hint = crate::i18n::t_fmt(
+                "install_hint_stt_sherpa",
+                lang,
+                &[("provider", &provider)],
+            );
+            return Ok(format!("{text}{hint}"));
+        }
     }
+    result
 }
 
 /// Download a file from a URL and return the bytes.

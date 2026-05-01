@@ -9,6 +9,7 @@
 
 pub mod bootstrap;
 pub mod evolution;
+pub mod install_hints;
 pub mod turn_metrics;
 pub mod btw;
 pub mod collaboration;

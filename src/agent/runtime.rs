@@ -2882,6 +2882,40 @@ impl AgentRuntime {
             && !reply.is_empty
             && !reply.needs_outer_done_emit
         {
+            // One-shot install hint: when sherpa-onnx is missing the TTS
+            // path falls back to system `say` / SAPI / espeak which sound
+            // robotic for Chinese. Surface the install command once via
+            // the reply.text — `claim_first_hint` returns true only on
+            // the first call per feature so this fires exactly once.
+            let sherpa_tts_bin = crate::config::loader::base_dir()
+                .join("tools")
+                .join("sherpa-onnx")
+                .join("bin")
+                .join(if cfg!(target_os = "windows") {
+                    "sherpa-onnx-offline-tts.exe"
+                } else {
+                    "sherpa-onnx-offline-tts"
+                });
+            let has_vits_dir = std::fs::read_dir(
+                crate::config::loader::base_dir().join("models"),
+            )
+            .map(|entries| {
+                entries.flatten().any(|e| {
+                    e.path().is_dir()
+                        && e.file_name()
+                            .to_string_lossy()
+                            .starts_with("vits-")
+                })
+            })
+            .unwrap_or(false);
+            let sherpa_tts_ready = sherpa_tts_bin.exists() && has_vits_dir;
+            if !sherpa_tts_ready
+                && super::install_hints::claim_first_hint("tts-sherpa")
+            {
+                let lang = crate::i18n::default_lang();
+                reply.text.push_str(&crate::i18n::t("install_hint_tts_sherpa", lang));
+            }
+
             match self.generate_tts_audio(&reply.text).await {
                 Ok(audio_path) => {
                     let mime = if audio_path.ends_with(".wav") { "audio/wav" }
@@ -5270,6 +5304,37 @@ impl AgentRuntime {
             "send_file" => {
                 // Returns a marker that the agent loop picks up to add to tool_files.
                 let path = args["path"].as_str().unwrap_or("").to_owned();
+                // In voice-reply mode the auto-TTS hook already attaches a
+                // freshly-synthesised audio file to the reply. If the LLM
+                // ALSO calls send_file with an audio path (often a stale
+                // /tmp/rsclaw_tts_*.wav from an earlier turn), the user
+                // receives two audio messages — usually with mismatched
+                // durations, since the LLM picks an old file. Short-circuit
+                // those calls and let auto-TTS own the audio channel.
+                let lower_path = path.to_lowercase();
+                let path_is_audio = lower_path.ends_with(".wav")
+                    || lower_path.ends_with(".mp3")
+                    || lower_path.ends_with(".ogg")
+                    || lower_path.ends_with(".opus")
+                    || lower_path.ends_with(".m4a")
+                    || lower_path.ends_with(".aac")
+                    || lower_path.ends_with(".flac")
+                    || lower_path.ends_with(".silk")
+                    || lower_path.ends_with(".amr");
+                if path_is_audio
+                    && self.voice_mode_sessions.contains(&ctx.session_key)
+                {
+                    debug!(
+                        session = %ctx.session_key,
+                        path = %path,
+                        "send_file: skipped audio attachment (voice_mode active, auto-TTS owns the audio)"
+                    );
+                    return Ok(json!({
+                        "skipped": true,
+                        "reason": "voice_mode active — auto-TTS will attach the audio reply; do not send separate audio files",
+                        "path": path,
+                    }));
+                }
                 let workspace = self.handle.config.workspace.as_deref()
                     .or(self.live.agents.read().await.defaults.workspace.as_deref())
                     .map(expand_tilde)
