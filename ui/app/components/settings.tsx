@@ -37,6 +37,7 @@ import {
   OPENAI_BASE_URL,
   Path,
   RELEASE_URL,
+  StoreKey,
   UPDATE_URL,
 } from "../constant";
 import { ErrorBoundary } from "./error";
@@ -45,64 +46,9 @@ import { useNavigate } from "react-router-dom";
 import { Avatar, AvatarPicker } from "./emoji";
 import { getClientConfig } from "../config/client";
 import { Popover } from "./ui-lib";
-import { getAgents } from "../lib/rsclaw-api";
-
-function AgentSelect(props: { value: string; onChange: (v: string) => void }) {
-  const [agents, setAgents] = useState<{ id: string; name?: string; model?: string }[]>([]);
-  const [loaded, setLoaded] = useState(false);
-
-  useEffect(() => {
-    getAgents()
-      .then((data) => {
-        const list = Array.isArray(data) ? data : data.agents || [];
-        setAgents(list);
-        setLoaded(true);
-      })
-      .catch(() => setLoaded(true));
-  }, []);
-
-  return (
-    <select
-      aria-label={Locale.RsClawSettings.Agent}
-      value={props.value}
-      onChange={(e) => props.onChange(e.target.value)}
-    >
-      {!loaded && (
-        <option value={props.value}>{Locale.RsClawSettings.AgentLoading}</option>
-      )}
-      {loaded && agents.length === 0 && (
-        <option value={props.value}>{props.value || Locale.RsClawSettings.AgentDefault}</option>
-      )}
-      {agents.map((a) => (
-        <option key={a.id} value={a.id}>
-          {a.name || a.id}{a.model ? ` (${a.model})` : ""}
-        </option>
-      ))}
-    </select>
-  );
-}
-
 function DangerItems() {
-  const chatStore = useChatStore();
-  const appConfig = useAppConfig();
-
   return (
     <List>
-      <ListItem
-        title={Locale.Settings.Danger.Reset.Title}
-        subTitle={Locale.Settings.Danger.Reset.SubTitle}
-      >
-        <IconButton
-          aria={Locale.Settings.Danger.Reset.Title}
-          text={Locale.Settings.Danger.Reset.Action}
-          onClick={async () => {
-            if (await showConfirm(Locale.Settings.Danger.Reset.Confirm)) {
-              appConfig.reset();
-            }
-          }}
-          type="danger"
-        />
-      </ListItem>
       <ListItem
         title={Locale.Settings.Danger.Clear.Title}
         subTitle={Locale.Settings.Danger.Clear.SubTitle}
@@ -111,9 +57,57 @@ function DangerItems() {
           aria={Locale.Settings.Danger.Clear.Title}
           text={Locale.Settings.Danger.Clear.Action}
           onClick={async () => {
-            if (await showConfirm(Locale.Settings.Danger.Clear.Confirm)) {
-              chatStore.clearAllData();
+            if (!(await showConfirm(Locale.Settings.Danger.Clear.Confirm))) {
+              return;
             }
+            // Chat history only — leave UI prefs / masks / prompts /
+            // access tokens / WebKit cache alone.
+            try {
+              const { del: idbDel } = await import("idb-keyval");
+              await idbDel(StoreKey.Chat);
+            } catch {
+              // ignore
+            }
+            try {
+              window.localStorage?.removeItem(StoreKey.Chat);
+            } catch {
+              // ignore
+            }
+            window.location.reload();
+          }}
+          type="danger"
+        />
+      </ListItem>
+      <ListItem
+        title={Locale.Settings.Danger.Cache.Title}
+        subTitle={Locale.Settings.Danger.Cache.SubTitle}
+      >
+        <IconButton
+          aria={Locale.Settings.Danger.Cache.Title}
+          text={Locale.Settings.Danger.Cache.Action}
+          onClick={async () => {
+            if (!(await showConfirm(Locale.Settings.Danger.Cache.Confirm))) {
+              return;
+            }
+            // "Cache" here means the transient browser layer only —
+            // sessionStorage + on-disk WebKit/WebView2 caches. All
+            // persisted user data is preserved: chat history, language
+            // preference, theme/font, gateway connection settings, and
+            // any other zustand store in IndexedDB or localStorage.
+            try {
+              window.sessionStorage?.clear();
+            } catch {
+              // ignore — storage may be partitioned by the host
+            }
+            try {
+              const { isTauri, invoke } = await import("../utils/tauri");
+              if (isTauri) {
+                await invoke("clear_webview_cache_dirs");
+              }
+            } catch {
+              // ignore — Tauri unavailable in browser dev preview
+            }
+            window.location.reload();
           }}
           type="danger"
         />
@@ -305,19 +299,6 @@ export function Settings() {
               }
             ></input>
           </ListItem>
-          <ListItem
-            title={Locale.RsClawSettings.Agent}
-            subTitle={Locale.RsClawSettings.AgentSub}
-          >
-            <AgentSelect
-              value={config.modelConfig.model as string}
-              onChange={(v) =>
-                config.update(
-                  (config) => (config.modelConfig.model = v as any),
-                )
-              }
-            />
-          </ListItem>
         </List>
 
         <List>
@@ -398,6 +379,9 @@ export function Settings() {
             />
           </ListItem>
         </List>
+
+        {/* Danger zone: reset settings / clear chat data / clear local cache */}
+        <DangerItems />
       </div>
     </ErrorBoundary>
   );

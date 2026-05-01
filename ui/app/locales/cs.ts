@@ -143,12 +143,6 @@ const cs: PartialLocaleType = {
     SubTitle: "Všechny možnosti nastavení",
 
     Danger: {
-      Reset: {
-        Title: "Obnovit všechna nastavení",
-        SubTitle: "Obnovit všechny nastavení na výchozí hodnoty",
-        Action: "Okamžitě obnovit",
-        Confirm: "Opravdu chcete obnovit všechna nastavení?",
-      },
       Clear: {
         Title: "Smazat všechna data",
         SubTitle: "Smazat všechny chaty a nastavení",

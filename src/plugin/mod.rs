@@ -10,7 +10,7 @@
 //! Public API:
 //!   - `PluginManifest` / `load_manifest()` / `scan_plugins()`
 //!   - `SlotRegistry`   — memory + context_engine slots
-//!   - `Plugin`         — live JS plugin handle (spawned subprocess)
+//!   - `Plugin`         — live shell plugin handle (spawned subprocess)
 //!   - `WasmPlugin`     — live WASM plugin handle (wasmtime)
 //!   - `load_all_plugins()` — unified loader that dispatches by runtime
 
@@ -40,7 +40,7 @@ use crate::config::schema::PluginsConfig;
 
 /// Loaded and running plugins, indexed by name.
 pub struct PluginRegistry {
-    /// JS plugins (shell bridge).
+    /// Shell plugins (subprocess + JSON-RPC bridge: node/bun/deno).
     plugins: HashMap<String, Plugin>,
     /// WASM plugins (wasmtime).
     wasm_plugins: Vec<WasmPlugin>,
@@ -87,7 +87,7 @@ impl PluginRegistry {
         self.plugins.is_empty() && self.wasm_plugins.is_empty()
     }
 
-    /// Number of JS plugins.
+    /// Number of shell plugins.
     pub fn js_count(&self) -> usize {
         self.plugins.len()
     }
@@ -185,10 +185,10 @@ pub async fn load_all_plugins(
                 }
             }
         } else {
-            // JS runtime (shell bridge)
+            // Shell runtime (subprocess + JSON-RPC bridge: node/bun/deno)
             match Plugin::spawn(manifest, host_dispatch.clone()).await {
                 Ok(plugin) => {
-                    info!(plugin = %plugin.manifest.name, "JS plugin started");
+                    info!(plugin = %plugin.manifest.name, "shell plugin started");
                     registry
                         .plugins
                         .insert(plugin.manifest.name.clone(), plugin);

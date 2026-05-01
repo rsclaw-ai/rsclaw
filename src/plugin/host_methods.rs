@@ -39,6 +39,7 @@ impl HostMethodRegistry {
         debug!(method, "host method dispatch");
         match method {
             "notify" => self.host_notify(params).await,
+            "notify_with_image" => self.host_notify_with_image(params).await,
             "log" => self.host_log(params).await,
             "browser_open" => self.host_browser_open(params).await,
             "browser_eval" => self.host_browser_eval(params).await,
@@ -97,6 +98,53 @@ impl HostMethodRegistry {
         }
     }
 
+    /// Notify the user with an inline image (e.g. login QR, captcha screenshot).
+    ///
+    /// Mirrors `wasm_runtime.rs::notify_with_image`. Requires `text`,
+    /// `image_data_uri` (a `data:image/...;base64,...` URI — what the
+    /// `browser_screenshot` host method returns in its `image` field), and
+    /// `_ctx` (with `target_id` + `channel`).
+    async fn host_notify_with_image(&self, params: Value) -> Result<Value> {
+        let text = params["text"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("notify_with_image: `text` required"))?
+            .to_owned();
+        let image = params["image_data_uri"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("notify_with_image: `image_data_uri` required"))?
+            .to_owned();
+        let ctx = params
+            .get("_ctx")
+            .ok_or_else(|| anyhow::anyhow!("notify_with_image: `_ctx` required"))?;
+        let target_id = ctx["target_id"].as_str().unwrap_or("").to_owned();
+        let channel = ctx["channel"].as_str().unwrap_or("").to_owned();
+
+        tracing::info!(target: "shell_plugin_notify", "{text}");
+
+        let Some(tx) = &self.notify_tx else {
+            warn!(
+                "notify_with_image called but notify_tx is not configured (plugin not in agent ctx); logged only"
+            );
+            return Ok(json!({ "status": "logged_only" }));
+        };
+
+        let msg = OutboundMessage {
+            target_id,
+            text,
+            channel: if channel.is_empty() {
+                None
+            } else {
+                Some(channel)
+            },
+            images: vec![image],
+            ..Default::default()
+        };
+        match tx.send(msg) {
+            Ok(_) => Ok(json!({ "status": "dispatched" })),
+            Err(_) => Ok(json!({ "status": "no_receivers" })),
+        }
+    }
+
     /// Forward a plugin log line into the gateway's tracing spans.
     ///
     /// Accepts `level` (`error` | `warn` | `debug` | `info`) and `text`.
@@ -120,10 +168,9 @@ impl HostMethodRegistry {
     /// and dispatch the action. Returns the raw JSON the browser produced.
     ///
     /// The profile name MUST match `SHARED_BROWSER_PROFILE` in
-    /// `wasm_runtime.rs` (currently "jimeng") so login state persists across
-    /// runtimes.
+    /// `wasm_runtime.rs` so login state persists across runtimes.
     async fn browser_call_raw(&self, action: &str, args: Value) -> Result<Value> {
-        const PROFILE: &str = "jimeng"; // MUST match wasm_runtime.rs::SHARED_BROWSER_PROFILE
+        const PROFILE: &str = "rsclaw"; // MUST match wasm_runtime.rs::SHARED_BROWSER_PROFILE
 
         let mut guard = self.browser.lock().await;
 

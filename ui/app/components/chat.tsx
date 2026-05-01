@@ -9,6 +9,7 @@ import React, {
   useRef,
   useState,
 } from "react";
+import { Virtuoso, VirtuosoHandle } from "react-virtuoso";
 
 import SendWhiteIcon from "../icons/send-white.svg";
 import BrainIcon from "../icons/brain.svg";
@@ -101,7 +102,6 @@ import {
 } from "./ui-lib";
 import { useNavigate } from "react-router-dom";
 import {
-  CHAT_PAGE_SIZE,
   ModelProvider,
   Path,
   REQUEST_TIMEOUT_MS,
@@ -1248,6 +1248,10 @@ function _Chat() {
   // spawn parallel streams.
   const isStreaming = session.messages.some((m) => m.streaming);
   const { submitKey, shouldSubmit } = useSubmitHandler();
+  // Virtuoso owns the scroll container. We capture its scroller into
+  // `scrollRef` for legacy consumers (markdown components passing
+  // `parentRef` for IntersectionObserver roots, etc.).
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const isScrolledToBottom = scrollRef?.current
     ? Math.abs(
@@ -1268,13 +1272,37 @@ function _Chat() {
 
   const isTyping = userInput !== "";
 
-  // if user is typing, should auto scroll to bottom
-  // if user is not typing, should auto scroll to bottom only if already at bottom
+  // Virtuoso owns the scroll container, so the legacy `useScrollToBottom`
+  // hook is permanently detached. Its render-time `scrollTo(0, scrollHeight)`
+  // would race Virtuoso's own layout: while the user scrolls up, Virtuoso
+  // unmounts items below the viewport and the scroller's `scrollHeight`
+  // briefly shrinks — the hook then snapped the view to that smaller
+  // height, which the user perceived as "jumped to the top".
+  // setAutoScroll/scrollDomToBottom remain as no-op stubs for callers;
+  // explicit "scroll to bottom" goes through `virtuosoRef.scrollToIndex`.
   const { setAutoScroll, scrollDomToBottom } = useScrollToBottom(
     scrollRef,
-    (isScrolledToBottom || isAttachWithTop) && !isTyping,
+    true,
     session.messages,
   );
+  const scrollChatToBottom = useCallback(() => {
+    virtuosoRef.current?.scrollToIndex({
+      index: "LAST",
+      align: "end",
+      behavior: "smooth",
+    });
+  }, []);
+
+  // Stable Virtuoso callbacks — these don't depend on `messages` so they
+  // can stay above its declaration.
+  const computeChatItemKey = useCallback(
+    (_idx: number, message: ChatMessage) => message.id,
+    [],
+  );
+  const captureScroller = useCallback((el: HTMLElement | Window | null) => {
+    (scrollRef as React.MutableRefObject<HTMLDivElement | null>).current =
+      el as HTMLDivElement | null;
+  }, []);
   const [hitBottom, setHitBottom] = useState(true);
   const isMobileScreen = useMobileScreen();
   const navigate = useNavigate();
@@ -1432,7 +1460,7 @@ function _Chat() {
     setUserInput("");
     setPromptHints([]);
     if (!isMobileScreen) inputRef.current?.focus();
-    setAutoScroll(true);
+    scrollChatToBottom();
   };
 
   // When the current turn finishes (no message is streaming), flush the next
@@ -1442,7 +1470,7 @@ function _Chat() {
     const [next, ...rest] = pendingQueue;
     setPendingQueue(rest);
     dispatchToStore(next.text, next.images, next.fileRefs);
-    setAutoScroll(true);
+    scrollChatToBottom();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isStreaming, pendingQueue]);
 
@@ -1668,55 +1696,50 @@ function _Chat() {
     );
   }, [context, isLoading, session.messages]);
 
-  const [msgRenderIndex, _setMsgRenderIndex] = useState(
-    Math.max(0, renderMessages.length - CHAT_PAGE_SIZE),
+  // Virtuoso virtualises the entire history, so we hand it the full,
+  // de-duplicated message list rather than the legacy fixed-size window.
+  // Dedupe is a guard against transient ID collisions during streaming.
+  const messages = useMemo(() => {
+    const seen = new Set<string>();
+    return renderMessages.filter((m) => {
+      if (seen.has(m.id)) return false;
+      seen.add(m.id);
+      return true;
+    });
+  }, [renderMessages]);
+
+  // Pin the initial bottom index. Virtuoso treats `initialTopMostItemIndex`
+  // as a tracked value — if we recompute `messages.length - 1` on every
+  // render and `messages` ref changes per streaming chunk, Virtuoso can
+  // re-snap toward index 0. We capture the index once on the first non-
+  // empty render and never let it react to data updates afterwards.
+  const initialBottomIndexRef = useRef<number | null>(null);
+  if (initialBottomIndexRef.current === null && messages.length > 0) {
+    initialBottomIndexRef.current = messages.length - 1;
+  }
+  const initialBottomIndex = initialBottomIndexRef.current ?? 0;
+
+  const handleAtBottomStateChange = useCallback(
+    (atBottom: boolean) => {
+      setHitBottom(atBottom);
+      setAutoScroll(atBottom);
+    },
+    [setAutoScroll],
   );
 
-  function setMsgRenderIndex(newIndex: number) {
-    newIndex = Math.min(renderMessages.length - CHAT_PAGE_SIZE, newIndex);
-    newIndex = Math.max(0, newIndex);
-    _setMsgRenderIndex(newIndex);
-  }
-
-  const messages = useMemo(() => {
-    const endRenderIndex = Math.min(
-      msgRenderIndex + 3 * CHAT_PAGE_SIZE,
-      renderMessages.length,
-    );
-    return renderMessages.slice(msgRenderIndex, endRenderIndex);
-  }, [msgRenderIndex, renderMessages]);
-
-  const onChatBodyScroll = (e: HTMLElement) => {
-    const bottomHeight = e.scrollTop + e.clientHeight;
-    const edgeThreshold = e.clientHeight;
-
-    const isTouchTopEdge = e.scrollTop <= edgeThreshold;
-    const isTouchBottomEdge = bottomHeight >= e.scrollHeight - edgeThreshold;
-    const isHitBottom =
-      bottomHeight >= e.scrollHeight - (isMobileScreen ? 4 : 10);
-
-    const prevPageMsgIndex = msgRenderIndex - CHAT_PAGE_SIZE;
-    const nextPageMsgIndex = msgRenderIndex + CHAT_PAGE_SIZE;
-
-    if (isTouchTopEdge && !isTouchBottomEdge) {
-      setMsgRenderIndex(prevPageMsgIndex);
-    } else if (isTouchBottomEdge) {
-      setMsgRenderIndex(nextPageMsgIndex);
-    }
-
-    setHitBottom(isHitBottom);
-    setAutoScroll(isHitBottom);
-  };
-
   function scrollToBottom() {
-    setMsgRenderIndex(renderMessages.length - CHAT_PAGE_SIZE);
+    virtuosoRef.current?.scrollToIndex({
+      index: messages.length - 1,
+      align: "end",
+      behavior: "smooth",
+    });
     scrollDomToBottom();
   }
 
-  // clear context index = context length + index in messages
+  // clear context index = context length + index in full message list.
   const clearContextIndex =
     (session.clearContextIndex ?? -1) >= 0
-      ? session.clearContextIndex! + context.length - msgRenderIndex
+      ? session.clearContextIndex! + context.length
       : -1;
 
   const [showPromptModal, setShowPromptModal] = useState(false);
@@ -2060,29 +2083,30 @@ function _Chat() {
         </div>
         <div className={styles["chat-main"]}>
           <div className={styles["chat-body-container"]}>
-            <div
+            <div className={styles["chat-body-padded"]}>
+            <Virtuoso
+              ref={virtuosoRef}
+              data={messages}
               className={styles["chat-body"]}
-              ref={scrollRef}
-              onScroll={(e) => onChatBodyScroll(e.currentTarget)}
+              // Virtuoso applies `overflow: auto` inline to its scroll
+              // container, which beats className-level `overflow-x: hidden`
+              // from `.chat-body`. Re-pin overflow-x via inline style so a
+              // long unbreakable line (URL / code block / markdown table)
+              // can't open a horizontal scroll that lets bubbles drift past
+              // the viewport — Y still scrolls because `overflow-y` falls
+              // back to Virtuoso's default.
+              style={{ overflowX: "hidden" }}
+              scrollerRef={captureScroller}
+              followOutput="auto"
+              initialTopMostItemIndex={initialBottomIndex}
+              atBottomStateChange={handleAtBottomStateChange}
+              computeItemKey={computeChatItemKey}
               onMouseDown={() => inputRef.current?.blur()}
               onTouchStart={() => {
                 inputRef.current?.blur();
                 setAutoScroll(false);
               }}
-            >
-              {(() => {
-                // Dedupe visible messages by id (O(N) via Set, not O(N^2) via findIndex).
-                // The same message list rendered here gets used for reply chains
-                // and streaming preview; duplicates can appear transiently.
-                const seen = new Set<string>();
-                const uniqueMessages = messages.filter((m) => {
-                  if (seen.has(m.id)) return false;
-                  seen.add(m.id);
-                  return true;
-                });
-                return uniqueMessages;
-              })()
-                .map((message, i) => {
+              itemContent={(i, message) => {
                   const isUser = message.role === "user";
                   const isContext = i < context.length;
                   const showActions =
@@ -2470,7 +2494,8 @@ function _Chat() {
                       {shouldShowClearContextDivider && <ClearContextDivider />}
                     </Fragment>
                   );
-                })}
+                }}
+            />
             </div>
             <div className={styles["chat-input-panel"]}>
               <PromptHints
@@ -2721,7 +2746,7 @@ function _Chat() {
                         setUserInput("");
                         setPromptHints([]);
                         if (!isMobileScreen) inputRef.current?.focus();
-                        setAutoScroll(true);
+                        scrollChatToBottom();
                       }, 0);
                     }}
                   />

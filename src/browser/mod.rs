@@ -390,7 +390,7 @@ impl ChromeProcess {
             (dir, Some(tmp))
         };
 
-        // Try a range of ports.
+// Try a range of ports.
         // Headed Chrome uses 9222-9231 (standard user ports, wider range).
         // Headless Chrome pool uses 9242-9251 (separate range, avoids conflict).
         let (port_start, port_count) = if headed {
@@ -425,6 +425,12 @@ impl ChromeProcess {
             "--window-size=1280,720".to_string(),
             // Keep Chrome running with a blank page - headless Chrome exits after loading about:blank
             "--no-exit-on-main-process-crash".to_string(),
+            // Deny native Chrome permission prompts (geolocation, notifications,
+            // camera/microphone, etc.). Some sites request geolocation as a soft
+            // anti-bot signal; the prompt steals focus and can block downstream
+            // interaction in headed mode. Plugins can still grant permissions
+            // explicitly via CDP.
+            "--deny-permission-prompts".to_string(),
             "data:,".to_string(),  // Use minimal page instead of about:blank
         ];
         if !headed {

@@ -152,12 +152,6 @@ const tw = {
     SubTitle: "設定選項",
 
     Danger: {
-      Reset: {
-        Title: "重設所有設定",
-        SubTitle: "重設所有設定項回預設值",
-        Action: "立即重設",
-        Confirm: "確認重設所有設定？",
-      },
       Clear: {
         Title: "清除所有資料",
         SubTitle: "清除所有聊天、設定資料",
