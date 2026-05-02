@@ -257,6 +257,7 @@ mod tests {
             opencode: None,
             claudecode: None,
             codex: None,
+            openclaude: None,
             agent_dir: None,
             system: None,
             temperature: None,

@@ -105,6 +105,7 @@ impl AgentRuntime {
             opencode: None,
             claudecode: None,
             codex: None,
+            openclaude: None,
             temperature: None,
         };
 
@@ -219,6 +220,7 @@ impl AgentRuntime {
             opencode: None,
             claudecode: None,
             codex: None,
+            openclaude: None,
             temperature: None,
         };
 

@@ -1299,4 +1299,258 @@ impl AgentRuntime {
             "status": "submitted"
         }))
     }
+
+    // -----------------------------------------------------------------------
+    // OpenClaude gRPC integration
+    // -----------------------------------------------------------------------
+
+    /// Get or create the OpenClaude gRPC client.
+    pub(crate) async fn get_openclaude_client(&self) -> Result<crate::acp::OpenClaudeClient> {
+        if let Some(client) = self.openclaude_client.get() {
+            return Ok(client.clone());
+        }
+
+        // Get configuration
+        let config = self
+            .handle
+            .config
+            .openclaude
+            .as_ref()
+            .ok_or_else(|| anyhow!("OpenClaude config not set"))?;
+
+        let endpoint = config
+            .endpoint
+            .as_deref()
+            .unwrap_or("http://localhost:50051");
+
+        // Use agent's workspace directory
+        let cwd = self
+            .handle
+            .config
+            .workspace
+            .as_deref()
+            .or(self.config.agents.defaults.workspace.as_deref())
+            .map(expand_tilde)
+            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+
+        let cwd_str = if cfg!(target_os = "windows") {
+            let abs_path = if cwd.is_absolute() {
+                cwd.clone()
+            } else {
+                std::env::current_dir().unwrap_or_default().join(&cwd)
+            };
+            abs_path.to_string_lossy().to_string()
+        } else {
+            cwd.to_string_lossy().to_string()
+        };
+
+        let model = config.model.as_deref();
+
+        tracing::info!(endpoint = %endpoint, cwd = %cwd_str, model = ?model, "OpenClaude: connecting gRPC client");
+
+        let client = crate::acp::OpenClaudeClient::connect(endpoint, &cwd_str, model).await?;
+
+        // Create session
+        let session_id = client.create_session().await?;
+        tracing::info!(session_id = %session_id, "OpenClaude: session created");
+
+        self.openclaude_client.set(client.clone()).ok();
+        Ok(client)
+    }
+
+    /// Tool handler for OpenClaude gRPC calls.
+    pub(crate) async fn tool_openclaude(&self, ctx: &RunContext, args: Value) -> Result<Value> {
+        let task = args["task"]
+            .as_str()
+            .ok_or_else(|| anyhow!("openclaude tool requires 'task' argument"))?;
+
+        tracing::info!(task = %task, "tool_openclaude: starting");
+
+        let lang = self.config.raw.gateway.as_ref()
+            .and_then(|g| g.language.as_deref())
+            .map(crate::i18n::resolve_lang)
+            .unwrap_or("en");
+
+        let notif_tx = self.notification_tx.clone();
+        let target_id = ctx.peer_id.clone();
+        let channel_name = ctx.channel.clone();
+
+        let client = match self.get_openclaude_client().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("tool_openclaude: get_client failed: {}", e);
+                if let Some(ref tx) = notif_tx {
+                    let _ = tx.send(crate::channel::OutboundMessage {
+                        target_id: target_id.clone(),
+                        is_group: false,
+                        text: crate::i18n::t_fmt("acp_start_failed", lang, &[("name", "OpenClaude"), ("error", &e.to_string())]),
+                        reply_to: None,
+                        images: vec![],
+                        files: vec![],
+                        channel: Some(channel_name.clone()),
+                        account: None,
+                    });
+                }
+                return Err(e);
+            }
+        };
+
+        let session_id = client.session_id().await.unwrap_or_default();
+
+        // Send initial notification
+        if let Some(ref tx) = notif_tx {
+            let _ = tx.send(crate::channel::OutboundMessage {
+                target_id: target_id.clone(),
+                is_group: false,
+                text: crate::i18n::t_fmt("acp_submitted", lang, &[("name", "OpenClaude")]),
+                reply_to: None,
+                images: vec![],
+                files: vec![],
+                channel: Some(channel_name.clone()),
+                account: None,
+            });
+        }
+
+        let task_str = task.to_string();
+        let notif_tx_bg = notif_tx.clone();
+        let target_id_bg = target_id.clone();
+        let channel_bg = channel_name.clone();
+        let lang_bg = lang;
+
+        tokio::spawn(async move {
+            tracing::info!("tool_openclaude: background task started");
+
+            // Subscribe to events
+            let mut event_rx = client.subscribe_events();
+            let events = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+            let events_clone = Arc::clone(&events);
+
+            // Event collection task
+            let _event_collector = tokio::spawn(async move {
+                loop {
+                    match event_rx.recv().await {
+                        Ok(event) => {
+                            let event_str = match &event {
+                                crate::acp::ServerEvent::TextChunk { text } => {
+                                    tracing::debug!("OpenClaude text: {}", text);
+                                    String::new()
+                                }
+                                crate::acp::ServerEvent::ToolCallStarted { tool_name, .. } => {
+                                    format!("🔧 {}", tool_name)
+                                }
+                                crate::acp::ServerEvent::ToolCallCompleted { tool_name, output, is_error, .. } => {
+                                    if *is_error {
+                                        format!("❌ {} error", tool_name)
+                                    } else {
+                                        let truncated = if output.chars().count() > 100 {
+                                            output.chars().take(100).collect::<String>() + "..."
+                                        } else {
+                                            output.clone()
+                                        };
+                                        format!("✅ {}: {}", tool_name, truncated)
+                                    }
+                                }
+                                crate::acp::ServerEvent::ActionRequired { question, .. } => {
+                                    format!("⚠️ Permission: {}", question)
+                                }
+                                crate::acp::ServerEvent::Done { .. } => {
+                                    "✅ Done".to_string()
+                                }
+                                crate::acp::ServerEvent::Error { message, .. } => {
+                                    format!("❌ Error: {}", message)
+                                }
+                            };
+                            if !event_str.is_empty() {
+                                events_clone.lock().await.push(event_str);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            // Send prompt
+            let result = client.send_prompt(&task_str).await;
+
+            match result {
+                Ok(prompt_result) => {
+                    tracing::info!(
+                        stop_reason = ?prompt_result.stop_reason,
+                        prompt_tokens = prompt_result.prompt_tokens,
+                        completion_tokens = prompt_result.completion_tokens,
+                        "tool_openclaude: prompt completed"
+                    );
+
+                    let events_list = events.lock().await.clone();
+                    let tool_count = events_list.iter().filter(|e| e.starts_with("🔧")).count();
+
+                    let status_icon = match prompt_result.stop_reason {
+                        crate::acp::StopReason::EndTurn => "✅",
+                        crate::acp::StopReason::MaxTokens => "⚠️",
+                        crate::acp::StopReason::Cancelled => "⏹️",
+                        crate::acp::StopReason::Incomplete => "❓",
+                    };
+
+                    let summary = if !prompt_result.full_text.is_empty() {
+                        let truncated = if prompt_result.full_text.chars().count() > 2000 {
+                            let cutoff = prompt_result.full_text
+                                .char_indices()
+                                .nth(2000)
+                                .map(|(i, _)| i)
+                                .unwrap_or(prompt_result.full_text.len());
+                            prompt_result.full_text[..cutoff].to_string()
+                        } else {
+                            prompt_result.full_text.clone()
+                        };
+                        crate::i18n::t_fmt("acp_done_result", lang_bg, &[
+                            ("status", status_icon), ("name", "OpenClaude"),
+                            ("count", &tool_count.to_string()), ("result", &truncated),
+                        ])
+                    } else if tool_count > 0 {
+                        crate::i18n::t_fmt("acp_done_summary", lang_bg, &[
+                            ("status", status_icon), ("name", "OpenClaude"),
+                            ("count", &tool_count.to_string()), ("summary", &events_list.join("\n")),
+                        ])
+                    } else {
+                        crate::i18n::t_fmt("acp_done_empty", lang_bg, &[("status", status_icon), ("name", "OpenClaude")])
+                    };
+
+                    if let Some(ref tx) = notif_tx_bg {
+                        let _ = tx.send(crate::channel::OutboundMessage {
+                            target_id: target_id_bg.clone(),
+                            is_group: false,
+                            text: summary,
+                            reply_to: None,
+                            images: vec![],
+                            files: vec![],
+                            channel: Some(channel_bg.clone()),
+                            account: None,
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("tool_openclaude: send_prompt failed: {}", e);
+                    if let Some(ref tx) = notif_tx_bg {
+                        let _ = tx.send(crate::channel::OutboundMessage {
+                            target_id: target_id_bg.clone(),
+                            is_group: false,
+                            text: crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "OpenClaude"), ("error", &e.to_string())]),
+                            reply_to: None,
+                            images: vec![],
+                            files: vec![],
+                            channel: Some(channel_bg.clone()),
+                            account: None,
+                        });
+                    }
+                }
+            }
+            tracing::info!("tool_openclaude: background task finished");
+        });
+
+        Ok(serde_json::json!({
+            "output": crate::i18n::t_fmt("acp_queued", lang, &[("name", "OpenClaude")]),
+            "status": "submitted",
+            "session_id": session_id
+        }))
+    }
 }

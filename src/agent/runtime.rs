@@ -435,6 +435,7 @@ pub struct AgentRuntime {
     pub(crate) opencode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
     pub(crate) claudecode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
     pub(crate) codex_client: Arc<tokio::sync::OnceCell<crate::acp::CodexClient>>,
+    pub(crate) openclaude_client: Arc<tokio::sync::OnceCell<crate::acp::OpenClaudeClient>>,
     /// In-memory session alias cache: alias_key → canonical session_key.
     /// Loaded from redb on first use, avoids repeated DB lookups.
     session_aliases: std::collections::HashMap<String, String>,
@@ -524,6 +525,7 @@ impl AgentRuntime {
             opencode_client: Arc::new(tokio::sync::OnceCell::new()),
             claudecode_client: Arc::new(tokio::sync::OnceCell::new()),
             codex_client: Arc::new(tokio::sync::OnceCell::new()),
+            openclaude_client: Arc::new(tokio::sync::OnceCell::new()),
             session_aliases,
             exec_pool,
         };
@@ -4346,6 +4348,7 @@ const MAX_ERROR_STREAK: usize = 5;
                         parts.iter().any(|p| {
                             matches!(p, crate::provider::ContentPart::ToolUse { name, .. }
                                 if name == "opencode" || name == "claudecode" || name == "codex"
+                                    || name == "openclaude"
                                     || name == "web_search" || name == "execute_command"
                                     || name == "web_browser" || name == "web_fetch"
                                     || name == "cron" || name == "read_file" || name == "write_file")
@@ -4781,7 +4784,7 @@ const MAX_ERROR_STREAK: usize = 5;
 
                 // Upgrade iteration limit when complex or multi-step tools are used.
                 if matches!(tool_name.as_str(),
-                    "web_browser" | "opencode" | "claudecode" | "agent"
+                    "web_browser" | "opencode" | "claudecode" | "openclaude" | "agent"
                     | "search_content" | "search_file" | "execute_command" | "exec"
                 ) {
                     max_iterations = max_iterations.max(configured_complex);
@@ -5923,6 +5926,7 @@ const MAX_ERROR_STREAK: usize = 5;
             "opencode" => return self.tool_opencode(ctx, args).await,
             "claudecode" => return self.tool_claudecode(ctx, args).await,
             "codex" => return self.tool_codex(ctx, args).await,
+            "openclaude" => return self.tool_openclaude(ctx, args).await,
             _ => {}
         }
 

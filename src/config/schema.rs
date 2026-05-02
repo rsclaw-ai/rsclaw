@@ -311,6 +311,9 @@ pub struct AgentDefaults {
     /// Codex MCP configuration for default agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codex: Option<CodexConfig>,
+    /// OpenClaude gRPC configuration for default agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openclaude: Option<OpenClaudeConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -360,6 +363,11 @@ pub struct AgentEntry {
     /// Uses OpenAI Codex CLI via MCP protocol.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codex: Option<CodexConfig>,
+    /// rsclaw extension: use OpenClaude gRPC client instead of LLM
+    /// When set, this agent connects to OpenClaude gRPC server and routes all prompts through it.
+    /// Supports 200+ models: OpenAI, Gemini, DeepSeek, Ollama, etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openclaude: Option<OpenClaudeConfig>,
     /// OpenClaw-specific
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_dir: Option<String>,
@@ -423,6 +431,20 @@ pub struct CodexConfig {
     pub model: Option<String>,
     /// Timeout for initialization/session creation in seconds (default: 600).
     /// OpenCode/ClaudeCode/Codex can take long to initialize as they load MCP servers.
+    pub init_timeout_seconds: Option<u64>,
+}
+
+/// OpenClaude gRPC configuration for an agent.
+/// Uses OpenClaude gRPC server for multi-provider coding agent access.
+/// OpenClaude supports OpenAI, Gemini, DeepSeek, Ollama, and 200+ models.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenClaudeConfig {
+    /// gRPC endpoint (default: "http://localhost:50051")
+    pub endpoint: Option<String>,
+    /// Model ID (e.g., "gpt-4o", "deepseek-v4-flash", "gemini-2.0-flash")
+    pub model: Option<String>,
+    /// Timeout for initialization/session creation in seconds (default: 600).
     pub init_timeout_seconds: Option<u64>,
 }
 

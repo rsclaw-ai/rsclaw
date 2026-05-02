@@ -1,4 +1,11 @@
 fn main() {
+    // Compile protobuf definitions for OpenClaude gRPC client
+    let proto_path = "proto/openclaude.proto";
+    if std::path::Path::new(proto_path).exists() {
+        tonic_build::compile_protos(proto_path)
+            .expect("Failed to compile protobuf definitions");
+    }
+
     // Set RSCLAW_BUILD_VERSION and RSCLAW_BUILD_DATE at compile time.
     // CI overrides these via env vars; local dev gets sensible defaults.
     //
