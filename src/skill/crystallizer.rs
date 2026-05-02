@@ -498,8 +498,13 @@ pub async fn crystallize_one(
     }
 
     // 7. Derive slug + write.
-    let fallback = format!("auto-skill-{}", &doc_id[..8.min(doc_id.len())]);
-    let slug = extract_skill_slug(&skill_md, &fallback);
+    let fallback = format!("memory-{}", &doc_id[..8.min(doc_id.len())]);
+    let raw_slug = extract_skill_slug(&skill_md, &fallback);
+    let slug = if raw_slug.starts_with("memory-") {
+        format!("auto-{raw_slug}")
+    } else {
+        format!("auto-memory-{raw_slug}")
+    };
     let path = write_skill(skills_dir, &slug, &skill_md)
         .with_context(|| format!("write_skill failed for slug '{slug}'"))?;
 
