@@ -100,6 +100,7 @@ pub async fn crystallize_workflow(
     user_text: &str,
     reply_text: &str,
     metrics: &TurnMetrics,
+    signature: u64,
     providers: &Arc<ProviderRegistry>,
     flash_model: &str,
     skills_dir: &Path,
@@ -153,8 +154,13 @@ pub async fn crystallize_workflow(
         return Ok(None);
     }
 
-    let fallback = "auto-workflow-skill".to_owned();
-    let slug = crate::skill::crystallizer::extract_skill_slug(&skill_md, &fallback);
+    let fallback = format!("flow-{signature:08x}");
+    let raw_slug = crate::skill::crystallizer::extract_skill_slug(&skill_md, &fallback);
+    let slug = if raw_slug.starts_with("flow-") {
+        format!("auto-{raw_slug}")
+    } else {
+        format!("auto-flow-{raw_slug}")
+    };
     let path = crate::skill::crystallizer::write_skill(skills_dir, &slug, &skill_md)
         .with_context(|| format!("write_skill failed for slug '{slug}'"))?;
 

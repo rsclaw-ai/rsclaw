@@ -129,6 +129,15 @@ pub struct TuiArgs {
     pub timeout_ms: Option<u64>,
 }
 
+#[derive(Args, Debug)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct UpdateWrapper {
+    #[command(flatten)]
+    pub run_args: UpdateArgs,
+    #[command(subcommand)]
+    pub cmd: Option<UpdateCommand>,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum UpdateCommand {
     /// Run the update process (default).

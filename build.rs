@@ -7,10 +7,12 @@ fn main() {
     //   Display code (preparse.rs, main.rs) adds "v" when showing to users.
     //   CI/scripts should pass bare versions: RSCLAW_BUILD_VERSION=2026.4.15
     //   NOT: RSCLAW_BUILD_VERSION=v2026.4.15
-    if std::env::var("RSCLAW_BUILD_VERSION").is_err() {
-        let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "dev".to_owned());
-        println!("cargo:rustc-env=RSCLAW_BUILD_VERSION={version}");
-    }
+    let version = std::env::var("RSCLAW_BUILD_VERSION").unwrap_or_else(|_| {
+        std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "dev".to_owned())
+    });
+    // Defensive: strip a leading 'v' so CI mistakes don't produce vv2026.5.1.
+    let version = version.trim_start_matches('v');
+    println!("cargo:rustc-env=RSCLAW_BUILD_VERSION={version}");
     if std::env::var("RSCLAW_BUILD_DATE").is_err() {
         // Simple date without external crates
         let output = std::process::Command::new("date").arg("+%Y-%m-%d").output();
