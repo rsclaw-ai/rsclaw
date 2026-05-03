@@ -864,6 +864,9 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
             })
             .collect();
         body["tools"] = json!(tools);
+        // Some providers (e.g. kimi-for-coding) require explicit tool_choice
+        // to enable function calling; without it they ignore the tools list.
+        body["tool_choice"] = json!("auto");
     }
 
     // Normalize messages for stable KV cache prefix: trim content whitespace,
