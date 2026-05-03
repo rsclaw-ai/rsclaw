@@ -747,7 +747,7 @@ pub(crate) fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "computer_use".to_owned(),
-        description: "Control the computer desktop. ONLY use when the user EXPLICITLY asks to take a screenshot, click, type, or interact with the desktop. Do NOT call this tool just because the message mentions words like 'screenshot' or 'screen' in other contexts. Screenshots auto-resize, and mouse coordinates use the same physical-pixel space as the returned `original_width`/`original_height` (HiDPI is handled internally — multiply image-pixel coords by the returned `scale` and pass directly).".to_owned(),
+        description: "Control the computer desktop. ONLY use when the user EXPLICITLY asks to take a screenshot, click, type, or interact with the desktop. Do NOT call this tool just because the message mentions words like 'screenshot' or 'screen' in other contexts. Screenshots auto-resize, and mouse coordinates use the same physical-pixel space as the returned `original_width`/`original_height` (HiDPI is handled internally — multiply image-pixel coords by the returned `scale` and pass directly).\n\nCRITICAL — App-Rule Loading (MANDATORY):\nBefore controlling ANY desktop application (WeChat, Finder, Safari, etc.), you MUST first load the app-specific automation guide.\n1. Call `get_app_rule` with the app name (e.g. name='wechat').\n2. Read and follow the returned guide EXACTLY.\n3. Only then proceed with screenshot/click/type actions.\nNEVER guess coordinates or workflows — the app-rule contains version-specific steps you cannot infer.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
