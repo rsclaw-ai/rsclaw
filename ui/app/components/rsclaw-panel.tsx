@@ -504,7 +504,7 @@ function ConfigEditorPage() {
     { name: "Anthropic", key: "anthropic", enabled: false, apiKey: "", baseUrl: "" },
     { name: "OpenAI", key: "openai", enabled: false, apiKey: "", baseUrl: "" },
     { name: "DeepSeek", key: "deepseek", enabled: false, apiKey: "", baseUrl: "" },
-    { name: "Kimi", key: "kimi", enabled: false, apiKey: "", baseUrl: "", userAgent: "claude-code/0.1.0" },
+    { name: "Kimi", key: "kimi", enabled: false, apiKey: "", baseUrl: "", apiType: "openai", userAgent: "rsclaw/2026.5.5" },
     { name: "CodingPlan", key: "codingplan", enabled: false, apiKey: "", baseUrl: "" },
     { name: "Ollama", key: "ollama", enabled: true, apiKey: "", baseUrl: "http://localhost:11434" },
     { name: "Custom Provider", key: "custom", enabled: false, apiKey: "", baseUrl: "" },
@@ -589,8 +589,8 @@ function ConfigEditorPage() {
         enabled: enabled !== undefined ? enabled === "true" : (isCustomLike ? !!baseUrl : apiKey.length > 0),
         apiKey,
         baseUrl: baseUrl || "",
-        userAgent: userAgent || (pName === "kimi" ? "claude-code/0.1.0" : ""),
-        ...((isCustomLike || pName === "doubao") ? { apiType } : {}),
+        userAgent: userAgent || (pName === "kimi" ? "rsclaw/2026.5.5" : ""),
+        ...((isCustomLike || pName === "doubao" || pName === "kimi") ? { apiType } : {}),
       };
     });
     setProviders(newProviders);
@@ -725,6 +725,8 @@ function ConfigEditorPage() {
         if (prov.apiType) entry.api = prov.apiType;
       } else if (prov.key === "doubao") {
         entry.api = prov.apiType || "openai-responses";
+      } else if (prov.key === "kimi") {
+        entry.api = prov.apiType || "openai";
       }
       if (prov.userAgent) entry.userAgent = prov.userAgent;
       else delete entry.userAgent;
@@ -937,7 +939,7 @@ function ConfigEditorPage() {
               markDirty();
             }} />
           </div>
-          {(isCustomLike || prov.key === "doubao") && (
+          {(isCustomLike || prov.key === "doubao" || prov.key === "kimi") && (
             <div style={fieldRow}>
               <div style={fieldLabel}>API Type</div>
               <select
@@ -1000,7 +1002,7 @@ function ConfigEditorPage() {
           <div style={{ ...fieldRow, borderBottom: "none" }}>
             <div style={fieldLabel}>User-Agent</div>
             <input style={fieldInput} value={prov.userAgent || ""}
-              placeholder="e.g. claude-code/0.1.0"
+              placeholder="e.g. rsclaw/2026.5.5"
               onChange={(e) => {
                 const next = [...providers];
                 next[idx] = { ...next[idx], userAgent: e.target.value };
@@ -4214,7 +4216,7 @@ function TauriConfigPageInner() {
                             <input
                               style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none" }}
                               type="text"
-                              placeholder="claude-code/0.1.0"
+                              placeholder="rsclaw/2026.5.5"
                               value={getVal(`models.providers.${p.id}.userAgent`, "")}
                               onChange={(e) => {
                                 updateConfig(`models.providers.${p.id}.userAgent`, e.target.value);
@@ -4289,7 +4291,7 @@ function TauriConfigPageInner() {
                             <input
                               style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none" }}
                               type="text"
-                              placeholder="e.g. claude-code/0.1.0"
+                              placeholder="e.g. rsclaw/2026.5.5"
                               value={getVal(`models.providers.${p.id}.userAgent`, "")}
                               onChange={(e) => {
                                 updateConfig(`models.providers.${p.id}.userAgent`, e.target.value);
@@ -4344,7 +4346,7 @@ function TauriConfigPageInner() {
                             <input
                               style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none" }}
                               type="text"
-                              placeholder="e.g. claude-code/0.1.0"
+                              placeholder="e.g. rsclaw/2026.5.5"
                               value={getVal(`models.providers.${p.id}.userAgent`, "")}
                               onChange={(e) => {
                                 updateConfig(`models.providers.${p.id}.userAgent`, e.target.value);

@@ -1194,7 +1194,7 @@ async fn parse_sse_chunk_with_buffer(
 
         // Process complete lines
         for line in complete_portion.lines() {
-            if let Some(data) = line.strip_prefix("data: ") {
+            if let Some(data) = line.strip_prefix("data:").map(|s| s.trim_start()) {
                 if data == "[DONE]" {
                     events.push(Ok(StreamEvent::Done { usage: None }));
                     continue;
@@ -1228,7 +1228,7 @@ fn parse_sse_chunk(chunk: Result<bytes::Bytes>) -> Vec<Result<StreamEvent>> {
     let mut events = Vec::new();
     let mut has_data_line = false;
     for line in text.lines() {
-        if let Some(data) = line.strip_prefix("data: ") {
+        if let Some(data) = line.strip_prefix("data:").map(|s| s.trim_start()) {
             has_data_line = true;
             if data == "[DONE]" {
                 events.push(Ok(StreamEvent::Done { usage: None }));
@@ -1638,7 +1638,7 @@ async fn parse_responses_sse_chunk_buffered(
             current_event_type = Some(event_type.trim().to_owned());
             continue;
         }
-        if let Some(data) = line.strip_prefix("data: ") {
+        if let Some(data) = line.strip_prefix("data:").map(|s| s.trim_start()) {
             if data == "[DONE]" {
                 events.push(Ok(StreamEvent::Done { usage: None }));
                 continue;
