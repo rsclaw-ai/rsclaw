@@ -228,6 +228,10 @@ fn serialize_part(part: &ContentPart) -> Value {
             "content":     content,
             "is_error":    is_error.unwrap_or(false),
         }),
+        ContentPart::Reasoning { text } => json!({
+            "type": "text",
+            "text": text,
+        }),
     }
 }
 

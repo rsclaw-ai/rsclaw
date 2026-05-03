@@ -227,6 +227,9 @@ fn serialize_part(part: &ContentPart) -> Value {
                 "response": { "content": content },
             }
         }),
+        ContentPart::Reasoning { text } => json!({
+            "text": text,
+        }),
     }
 }
 

@@ -147,6 +147,9 @@ pub enum ContentPart {
         content: String,
         is_error: Option<bool>,
     },
+    Reasoning {
+        text: String,
+    },
 }
 
 /// A tool definition passed to the LLM.

@@ -4459,6 +4459,11 @@ impl AgentRuntime {
                 // Only save text if there are no tool calls (final reply).
                 parts.push(crate::provider::ContentPart::Text { text: text_buf });
             }
+            // Persist reasoning_content so providers that require it (e.g.
+            // kimi-for-coding) see it on subsequent turns.
+            if !reasoning_buf.is_empty() {
+                parts.push(crate::provider::ContentPart::Reasoning { text: reasoning_buf });
+            }
             for (id, name, input) in &tool_calls {
                 parts.push(crate::provider::ContentPart::ToolUse {
                     id: id.clone(),
@@ -5757,10 +5762,23 @@ impl AgentRuntime {
     }
 
     pub(crate) fn tool_use_skill(&self, args: Value) -> Result<Value> {
+        // Try "name" first, then fall back to common alternatives the model
+        // sometimes emits when it confuses the parameter name.
         let name = args
             .get("name")
+            .or_else(|| args.get("skill"))
+            .or_else(|| args.get("skill_name"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("use_skill: 'name' is required"))?;
+            .ok_or_else(|| {
+                let available: Vec<String> =
+                    self.skills.all().map(|s| s.name.clone()).collect();
+                anyhow!(
+                    "use_skill: 'name' is required. Available skills: {}. \
+                     Received args: {}",
+                    available.join(", "),
+                    args
+                )
+            })?;
         let Some(skill) = self.skills.get(name) else {
             let available: Vec<&str> = self.skills.all().map(|s| s.name.as_str()).collect();
             return Ok(serde_json::json!({

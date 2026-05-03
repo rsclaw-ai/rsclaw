@@ -1058,10 +1058,13 @@ fn serialize_message(msg: &Message) -> Value {
         return json!({ "role": "tool", "content": text });
     }
 
-    // Assistant messages: extract tool_calls if present
+    // Assistant messages: extract tool_calls and reasoning_content if present.
+    // Some providers (e.g. kimi-for-coding) require reasoning_content on every
+    // assistant message when thinking is enabled.
     if msg.role == Role::Assistant {
         if let MessageContent::Parts(parts) = &msg.content {
             let mut text_parts = Vec::new();
+            let mut reasoning_parts = Vec::new();
             let mut tool_calls = Vec::new();
             for part in parts {
                 match part {
@@ -1076,16 +1079,26 @@ fn serialize_message(msg: &Message) -> Value {
                         }));
                     }
                     ContentPart::Text { text } => text_parts.push(text.clone()),
+                    ContentPart::Reasoning { text } => reasoning_parts.push(text.clone()),
                     _ => {}
                 }
             }
             let text = text_parts.join("");
-            if !tool_calls.is_empty() {
-                return json!({
+            let reasoning = reasoning_parts.join("");
+            if !tool_calls.is_empty() || !reasoning.is_empty() {
+                let mut obj = json!({
                     "role": "assistant",
                     "content": text,
-                    "tool_calls": tool_calls,
                 });
+                if let Some(obj_map) = obj.as_object_mut() {
+                    if !tool_calls.is_empty() {
+                        obj_map.insert("tool_calls".to_owned(), json!(tool_calls));
+                    }
+                    if !reasoning.is_empty() {
+                        obj_map.insert("reasoning_content".to_owned(), json!(reasoning));
+                    }
+                }
+                return obj;
             }
         }
     }
@@ -1122,6 +1135,10 @@ fn serialize_part(part: &ContentPart) -> Value {
             "role":         "tool",
             "tool_call_id": tool_use_id,
             "content":      content,
+        }),
+        ContentPart::Reasoning { text } => json!({
+            "type":     "reasoning",
+            "reasoning": text,
         }),
     }
 }
