@@ -617,7 +617,7 @@ public class WinScroll {{
                         let base = parts[parts.len() - 1];
                         // Use kp: for special keys, t: for regular characters
                         if is_cliclick_special_key(base) {
-                            cliclick_args.push(format!("kp:{base}"));
+                            cliclick_args.push(format!("kp:{}", base.to_lowercase()));
                         } else {
                             cliclick_args.push(format!("t:{base}"));
                         }
@@ -628,7 +628,7 @@ public class WinScroll {{
                         let refs: Vec<&str> = cliclick_args.iter().map(|s| s.as_str()).collect();
                         run_subprocess("cliclick", &refs).await?;
                     } else if is_cliclick_special_key(key) {
-                        run_subprocess("cliclick", &[&format!("kp:{key}")]).await?;
+                        run_subprocess("cliclick", &[&format!("kp:{}", key.to_lowercase())]).await?;
                     } else {
                         // Single regular character — use osascript keystroke
                         let escaped = key.replace('\\', "\\\\").replace('"', "\\\"");
