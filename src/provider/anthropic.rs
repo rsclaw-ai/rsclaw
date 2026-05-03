@@ -12,7 +12,7 @@ use super::{
     TokenUsage,
 };
 
-pub const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com/v1";
+pub const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 
@@ -63,7 +63,7 @@ impl LlmProvider for AnthropicProvider {
 
             let resp = self
                 .client
-                .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
+                .post(format!("{}/v1/messages", self.base_url.trim_end_matches('/')))
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", ANTHROPIC_VERSION)
                 .header("content-type", "application/json")
@@ -404,8 +404,18 @@ fn parse_event(data: &str) -> Option<StreamEvent> {
                     if text.is_empty() { None } else { Some(StreamEvent::ReasoningDelta(text)) }
                 }
                 "input_json_delta" => {
-                    // Tool input streaming — accumulation is handled by the agent loop.
-                    None
+                    // Tool input streaming — emit as ToolCall so the agent loop
+                    // accumulates partial JSON fragments (same pattern as OpenAI).
+                    let partial = v["delta"]["partial_json"].as_str().unwrap_or("");
+                    if partial.is_empty() {
+                        None
+                    } else {
+                        Some(StreamEvent::ToolCall {
+                            id: String::new(),
+                            name: String::new(),
+                            input: Value::String(partial.to_owned()),
+                        })
+                    }
                 }
                 _ => None,
             }
