@@ -49,7 +49,7 @@ Use this skill in two scenarios:
    - The macOS menu bar should say "WeChat", and the WeChat main window should be the dominant content.
    - **Identify which view you are in:**
      - **Chat list view**: Left column shows a list of chat rows (avatar + name + last message). Right pane may be empty or show a grey "WeChat" placeholder. This is where you need to be.
-     - **Chat window view**: Right pane shows a conversation with message bubbles (green on right = your messages, white/grey on left = others). Title bar at top shows a contact/group name. An input box is at the bottom. **If you see this view, you are INSIDE a specific chat — you must return to the chat list first (see below).**
+     - **Chat window view**: Right pane shows a conversation with message bubbles (green on right = your messages, white/grey on left = others). Title bar at top shows a contact/group name. An input box is at the bottom. **If you see this view, check the title bar:** if it already shows the TARGET group name, you are already in the right chat — skip to step 5 (click input box). If it shows a DIFFERENT chat, you must return to the chat list first (see below).
    - **If you see any other app on top, or any modal popup blocking the window, STOP and tell the user. Do not start clicking.**
 
    **How to return to the chat list from inside a chat:**
@@ -57,9 +57,9 @@ Use this skill in two scenarios:
    - Or click the back button if visible in the top-left of the right pane.
    - After clicking, `wait 300ms`, re-activate WeChat, `screenshot` to confirm you are now in the chat list view.
 
-3. **Locate the target chat in the chat list (left column).**
-   - The chat list is the leftmost column showing rows: avatar on the left, name + last message on the right.
-   - **FIRST, scan the visible rows for the target name.** This is faster and more reliable than search. If you see it, click the row's **name/text area** (avoid the avatar — it opens a contact card) and proceed to step 4.
+3. **Locate the target chat (skip this step if you already entered the target chat in step 2).**
+   - **PREFERRED: Call `ui_analyze` on the latest screenshot.** It returns element labels and coordinates. Look for an element whose label matches the target group name, then click those coordinates directly. This avoids guessing and avoids search entirely.
+   - **If ui_analyze is unavailable or misses the target:** manually scan the chat list (left column) showing rows: avatar on the left, name + last message on the right. Read every visible name from top to bottom. If you see the target, click the row's **name/text area** (avoid the avatar). After clicking, proceed to step 4.
    - **If NOT visible, use search:**
      1. Click the search box at the very top of the chat list (the small magnifying-glass icon or search input field).
      2. `type` the exact target name (e.g. "RsClaw研发群"). The `type` action auto-pastes CJK text via clipboard.
