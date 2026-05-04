@@ -1057,9 +1057,15 @@ except ImportError:
             .map(|cu| (cu.ui_analyze_api_url.clone(), cu.ui_analyze_api_key.clone()))
             .unwrap_or((None, None));
 
-        let api_url = api_url.ok_or_else(|| {
-            anyhow!("ui_analyze: `tools.computerUse.uiAnalyzeApiUrl` is not configured")
-        })?;
+        let Some(api_url) = api_url else {
+            return Ok(json!({
+                "action": "ui_analyze",
+                "image": image_path,
+                "count": 0,
+                "elements": [],
+                "note": "ui_analyze is not configured (tools.computerUse.uiAnalyzeApiUrl). Use computer_use ui_tree or screenshot reasoning instead.",
+            }));
+        };
 
         let provider = crate::provider::ui_tars::UiTarsProvider::new(api_url, api_key);
 
