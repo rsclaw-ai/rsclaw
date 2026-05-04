@@ -5402,6 +5402,7 @@ impl AgentRuntime {
             "web_download" => return self.tool_web_download(args).await,
             "web_browser" | "browser" => return self.tool_web_browser(ctx, args).await,
             "computer_use" => return self.tool_computer_use(args).await,
+            "ui_analyze" => return self.tool_ui_analyze(args).await,
             "image_gen" | "image" => return self.tool_image(args).await,
             "video_gen" | "video" => return self.tool_video(args, ctx).await,
             "pdf" => return self.tool_pdf(args).await,

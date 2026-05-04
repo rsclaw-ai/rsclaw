@@ -1039,4 +1039,41 @@ except ImportError:
             )),
         }
     }
+
+    /// Analyze a screenshot with the local UI-TARS VLM and return detected UI elements.
+    pub(crate) async fn tool_ui_analyze(&self, args: Value) -> Result<Value> {
+        let image_path = args["image_path"]
+            .as_str()
+            .ok_or_else(|| anyhow!("ui_analyze: `image_path` required"))?;
+        let max_tokens = args["max_tokens"].as_u64().unwrap_or(400) as u32;
+
+        // Read config for API URL and key.
+        let (api_url, api_key) = self
+            .config
+            .raw
+            .tools
+            .as_ref()
+            .and_then(|t| t.computer_use.as_ref())
+            .map(|cu| (cu.ui_analyze_api_url.clone(), cu.ui_analyze_api_key.clone()))
+            .unwrap_or((None, None));
+
+        let api_url = api_url.ok_or_else(|| {
+            anyhow!("ui_analyze: `tools.computerUse.uiAnalyzeApiUrl` is not configured")
+        })?;
+
+        let provider = crate::provider::ui_tars::UiTarsProvider::new(api_url, api_key);
+
+        let elements = provider.analyze(image_path, max_tokens).await?;
+
+        // Scale normalized coords to screenshot pixels.
+        let (screen_w, screen_h) = (1920u32, 1080u32); // TODO: detect actual screen size
+        let scaled = crate::provider::ui_tars::UiTarsProvider::scale_coords(&elements, screen_w, screen_h);
+
+        Ok(json!({
+            "action": "ui_analyze",
+            "image": image_path,
+            "count": scaled.len(),
+            "elements": scaled,
+        }))
+    }
 }

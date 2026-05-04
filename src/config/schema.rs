@@ -1461,6 +1461,10 @@ pub struct WebBrowserConfig {
 #[serde(rename_all = "camelCase")]
 pub struct ComputerUseConfig {
     pub enabled: Option<bool>,
+    /// Base URL for the UI-TARS / ui_analyze API (e.g. http://macstudio:8000/v1).
+    pub ui_analyze_api_url: Option<String>,
+    /// API key for the UI-TARS / ui_analyze endpoint (optional).
+    pub ui_analyze_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

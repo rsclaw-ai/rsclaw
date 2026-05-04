@@ -11,6 +11,7 @@ pub mod gemini;
 pub mod model_defaults;
 pub mod openai;
 pub mod registry;
+pub mod ui_tars;
 
 use std::pin::Pin;
 

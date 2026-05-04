@@ -745,6 +745,24 @@ pub(crate) fn build_tool_list(
             "required": ["action"]
         }),
     });
+    // UI-TARS visual analysis — send screenshot to a remote VLM API for element detection.
+    tools.push(ToolDef {
+        name: "ui_analyze".to_owned(),
+        description: "Analyze the current screen screenshot with a remote VLM API (UI-TARS) to detect interactive UI elements.\n\
+            Use this BEFORE clicking or typing when you are unsure where elements are located.\n\
+            Returns a list of elements with their type, label text, and normalized coordinates (0-1000).\n\
+            After receiving results, use the coordinates to call computer_use click actions.\n\
+            This is faster and more accurate than accessibility trees for visual apps (WeChat, Safari, etc.).".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "image_path": {"type": "string", "description": "Absolute path to the screenshot image (PNG/JPEG). Usually the result of a previous computer_use screenshot action."},
+                "max_tokens": {"type": "integer", "description": "Max tokens for VLM response. Default 400.", "default": 400}
+            },
+            "required": ["image_path"]
+        }),
+    });
+
     tools.push(ToolDef {
         name: "computer_use".to_owned(),
         description: "Control the computer desktop. ONLY use when the user EXPLICITLY asks to take a screenshot, click, type, or interact with the desktop. Do NOT call this tool just because the message mentions words like 'screenshot' or 'screen' in other contexts. Screenshots auto-resize, and mouse coordinates use the same physical-pixel space as the returned `original_width`/`original_height` (HiDPI is handled internally — multiply image-pixel coords by the returned `scale` and pass directly).\n\nCRITICAL — App-Rule Loading (MANDATORY):\nBefore controlling ANY desktop application (WeChat, Finder, Safari, etc.), you MUST first load the app-specific automation guide.\n1. Call `get_app_rule` with the app name (e.g. name='wechat').\n2. Read and follow the returned guide EXACTLY.\n3. Only then proceed with screenshot/click/type actions.\nNEVER guess coordinates or workflows — the app-rule contains version-specific steps you cannot infer.".to_owned(),
