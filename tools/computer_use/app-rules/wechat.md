@@ -59,15 +59,15 @@ Use this skill in two scenarios:
 
 3. **Locate the target chat in the chat list (left column).**
    - The chat list is the leftmost column showing rows: avatar on the left, name + last message on the right.
-   - Scan the visible rows for the target name.
-   - If the target name is **visible**: identify the row's vertical center coordinate from the screenshot. Click only on the **name/text area** — avoid clicking on the avatar (which opens a contact card). After clicking, proceed to step 4.
-   - **If NOT visible, use search (do NOT type randomly in the window):**
+   - **FIRST, scan the visible rows for the target name.** This is faster and more reliable than search. If you see it, click the row's **name/text area** (avoid the avatar — it opens a contact card) and proceed to step 4.
+   - **If NOT visible, use search:**
      1. Press `cmd+f` (macOS) or `ctrl+f` (Windows) to open the chat search box at the top of the chat list.
      2. `type` the exact target name (e.g. "RsClaw研发群"). The `type` action auto-pastes CJK text via clipboard.
      3. `wait 1000ms` for results to appear, then `screenshot`.
      4. Look at the dropdown results under the **联系人** or **群聊** category header. Find the row matching the target name.
      5. **Click that row** to enter the chat. **Do NOT press Return** — Return on the search box does not enter the chat; you must click the matching result row.
      6. After clicking, proceed to step 4.
+   - **If search returns no results:** do NOT try alternative spellings or keywords. Report to the user: "I could not find a group named 'X' in your WeChat. Please check the exact name or open the group manually." Stop here.
 
 4. **Verify the chat opened.** After the click, `wait 500ms`, re-activate WeChat (focus may have shifted), `wait 200ms`, `screenshot`. Look at the **right pane title bar** — it must show the target name. If not, the click landed wrong; do not type.
 
@@ -216,6 +216,8 @@ After entering the group (step 3 above), you are at the **bottom** of the conver
 - **Trust the screenshot, not your assumption.** After every click, re-screenshot and verify visually. If the right pane title doesn't match what you expected, do not proceed — re-screenshot, identify what actually opened, and either retry the click or report the mismatch.
 
 - **Never claim success when you can't verify it.** If the final screenshot doesn't show your message bubble at the bottom of the chat, the send failed. Say so. Do not write "✅ 发送成功" based on intent rather than evidence.
+
+- **NEVER send screenshots or images to the user during this workflow.** Screenshots are for your internal analysis only. Do not attach them to messages, do not share image paths, do not describe screenshot contents in your replies unless the user explicitly asks. Only report outcomes in plain text (e.g. "Message sent" or "Could not find the group").
 
 ## Avoid
 

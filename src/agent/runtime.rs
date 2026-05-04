@@ -4754,7 +4754,14 @@ impl AgentRuntime {
                                 .filter(|u| u.starts_with("data:image/"))
                         });
                         let img_path = v.get("image_path").and_then(|p| p.as_str());
-                        if let Some(img) = img_data.or(img_path) {
+                        // computer_use / ui_analyze screenshots are internal agent state —
+                        // never auto-send to the user. Only image-gen and explicit uploads
+                        // should forward images.
+                        let is_internal_screenshot =
+                            tool_name == "computer_use" || tool_name == "ui_analyze";
+                        if !is_internal_screenshot
+                            && let Some(img) = img_data.or(img_path)
+                        {
                             let desc = v
                                 .get("revised_prompt")
                                 .and_then(|p| p.as_str())
