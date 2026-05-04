@@ -61,7 +61,7 @@ Use this skill in two scenarios:
    - The chat list is the leftmost column showing rows: avatar on the left, name + last message on the right.
    - **FIRST, scan the visible rows for the target name.** This is faster and more reliable than search. If you see it, click the row's **name/text area** (avoid the avatar — it opens a contact card) and proceed to step 4.
    - **If NOT visible, use search:**
-     1. Press `cmd+f` (macOS) or `ctrl+f` (Windows) to open the chat search box at the top of the chat list.
+     1. Click the search box at the very top of the chat list (the small magnifying-glass icon or search input field).
      2. `type` the exact target name (e.g. "RsClaw研发群"). The `type` action auto-pastes CJK text via clipboard.
      3. `wait 1000ms` for results to appear, then `screenshot`.
      4. Look at the dropdown results under the **联系人** or **群聊** category header. Find the row matching the target name.
