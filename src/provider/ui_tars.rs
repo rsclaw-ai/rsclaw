@@ -1,21 +1,32 @@
-//! UI-TARS VLM provider — HTTP client for remote GUI element detection.
+//! UI-TARS VLM provider — HTTP client for remote GUI automation.
 //!
-//! Calls a remote OpenAI-compatible API (e.g. vllm-mlx) that serves the
+//! Calls a remote OpenAI-compatible API (e.g. mlx_vlm server) that serves the
 //! UI-TARS model.  The image is sent as a base64 data URI inside the
 //! chat-completions request.
+//!
+//! UI-TARS native output format (step-by-step):
+//!   Thought: I need to click the send button.
+//!   Action: click(start_box='<bbox>x1 y1 x2 y2</bbox>')
+//!
+//! We parse both the native Thought/Action format and a simplified
+//! type/label/coords format so the agent can consume the result flexibly.
 
 use anyhow::{Context, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// A detected UI element with normalized coordinates (0-1000).
+/// A detected UI element or automation step.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiElement {
     pub element_type: String,
     pub label: String,
     /// Normalized coordinates [x, y] in 0-1000 range.
     pub coords: [u32; 2],
+    /// UI-TARS thought (reasoning) for this step.
+    pub thought: Option<String>,
+    /// Raw UI-TARS action string.
+    pub action: Option<String>,
 }
 
 /// UI-TARS HTTP provider.
@@ -46,7 +57,7 @@ impl UiTarsProvider {
         self
     }
 
-    /// Analyze a screenshot and return detected UI elements.
+    /// Analyze a screenshot and return detected UI elements / steps.
     pub async fn analyze(&self, image_path: &str, max_tokens: u32) -> Result<Vec<UiElement>> {
         // Read image and encode to base64
         let image_bytes = tokio::fs::read(image_path)
@@ -65,20 +76,16 @@ impl UiTarsProvider {
 
         let data_uri = format!("data:{};base64,{}", mime, b64);
 
-        let system_prompt = r#"You are a GUI automation assistant. Analyze the screenshot and list all interactive UI elements.
-For each element, output exactly one line in this format:
-type=<element_type>, label=<text>, coords=(<x>,<y>)
-Coordinates are normalized 0-1000.
-Only output the element lines, no extra text."#;
-
+        // Use the default system prompt ("You are a helpful assistant.")
+        // UI-TARS is trained with this default; custom system prompts cause
+        // the model to regress into training-data patterns.
         let body = json!({
             "model": self.model,
             "max_tokens": max_tokens,
             "messages": [
-                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": [
                     {"type": "image_url", "image_url": {"url": data_uri}},
-                    {"type": "text", "text": "List all interactive UI elements in this screenshot."}
+                    {"type": "text", "text": "Task: Observe the screen and identify all interactive UI elements. For each element output:\nThought: <your reasoning>\nAction: <action>(start_box='<bbox>x1 y1 x2 y2</bbox>')\nSupported actions: click, type, scroll, hotkey. Coordinates are in 0-1000 range."}
                 ]}
             ]
         });
@@ -128,19 +135,60 @@ Only output the element lines, no extra text."#;
                     (e.coords[0] as f64 / 1000.0 * screen_w as f64) as u32,
                     (e.coords[1] as f64 / 1000.0 * screen_h as f64) as u32,
                 ],
+                thought: e.thought.clone(),
+                action: e.action.clone(),
             })
             .collect()
     }
 }
 
 /// Parse UI-TARS text response into structured elements.
+///
+/// Supports both:
+///   Thought: ...\nAction: click(start_box='<bbox>x1 y1 x2 y2</bbox>')\n
+///   type=button, label=Send, coords=(500,750)
 fn parse_ui_tars_response(text: &str) -> Vec<UiElement> {
     let mut elements = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i].trim();
         if line.is_empty() {
+            i += 1;
             continue;
         }
+
+        // Try native Thought/Action format first
+        if line.starts_with("Thought:") {
+            let thought = line.strip_prefix("Thought:").unwrap_or("").trim().to_owned();
+            let mut action = String::new();
+            let mut action_type = String::new();
+            let mut coords = [0u32, 0];
+            let mut label = String::new();
+
+            i += 1;
+            if i < lines.len() {
+                let action_line = lines[i].trim();
+                if action_line.starts_with("Action:") {
+                    action = action_line.strip_prefix("Action:").unwrap_or("").trim().to_owned();
+                    // Parse action type and bbox
+                    (action_type, label, coords) = parse_action(&action);
+                    i += 1;
+                }
+            }
+
+            elements.push(UiElement {
+                element_type: action_type,
+                label,
+                coords,
+                thought: Some(thought),
+                action: Some(action),
+            });
+            continue;
+        }
+
+        // Fallback to simple type/label/coords format
         let element_type = extract_field(line, "type=").unwrap_or("unknown").to_owned();
         let label = extract_field(line, "label=").unwrap_or("").to_owned();
         let coords = extract_field(line, "coords=")
@@ -160,10 +208,64 @@ fn parse_ui_tars_response(text: &str) -> Vec<UiElement> {
                 element_type,
                 label,
                 coords,
+                thought: None,
+                action: None,
             });
         }
+        i += 1;
     }
     elements
+}
+
+/// Parse a UI-TARS action string into (action_type, label, center_coords).
+///
+/// Examples:
+///   click(start_box='<bbox>450 780 500 820</bbox>')
+///   type(content='Hello world')
+///   scroll(start_box='<bbox>100 200 300 400</bbox>', direction='down')
+fn parse_action(action: &str) -> (String, String, [u32; 2]) {
+    let action = action.trim();
+
+    // Extract action type: everything before first '('
+    let action_type = action.split('(').next().unwrap_or("unknown").trim().to_lowercase();
+
+    // Extract bbox from <bbox>...</bbox>
+    let coords = if let Some(start) = action.find("<bbox>") {
+        if let Some(end) = action.find("</bbox>") {
+            let inner = &action[start + 6..end];
+            let nums: Vec<&str> = inner.split_whitespace().collect();
+            if nums.len() == 4 {
+                if let (Ok(x1), Ok(y1), Ok(x2), Ok(y2)) = (
+                    nums[0].parse::<f64>(),
+                    nums[1].parse::<f64>(),
+                    nums[2].parse::<f64>(),
+                    nums[3].parse::<f64>(),
+                ) {
+                    let cx = ((x1 + x2) / 2.0).clamp(0.0, 1000.0) as u32;
+                    let cy = ((y1 + y2) / 2.0).clamp(0.0, 1000.0) as u32;
+                    [cx, cy]
+                } else {
+                    [0, 0]
+                }
+            } else {
+                [0, 0]
+            }
+        } else {
+            [0, 0]
+        }
+    } else {
+        [0, 0]
+    };
+
+    // Extract label from content='...' or description
+    let label = if let Some(start) = action.find("content='") {
+        let rest = &action[start + 9..];
+        rest.split('\'').next().unwrap_or("").to_owned()
+    } else {
+        String::new()
+    };
+
+    (action_type, label, coords)
 }
 
 /// Extract a `prefix=value` field from a comma-separated line.
@@ -193,13 +295,15 @@ mod tests {
             element_type: "button".to_owned(),
             label: "Send".to_owned(),
             coords: [500, 750],
+            thought: None,
+            action: None,
         }];
         let scaled = UiTarsProvider::scale_coords(&elements, 1920, 1080);
         assert_eq!(scaled[0].coords, [960, 810]);
     }
 
     #[test]
-    fn parse_response() {
+    fn parse_simple_response() {
         let text = "type=button, label=Send, coords=(500,750)\ntype=input, label=Search, coords=(200,300)";
         let elems = parse_ui_tars_response(text);
         assert_eq!(elems.len(), 2);
@@ -208,5 +312,27 @@ mod tests {
         assert_eq!(elems[0].coords, [500, 750]);
         assert_eq!(elems[1].element_type, "input");
         assert_eq!(elems[1].coords, [200, 300]);
+    }
+
+    #[test]
+    fn parse_thought_action_click() {
+        let text = "Thought: I need to click the send button.\nAction: click(start_box='<bbox>450 780 500 820</bbox>')";
+        let elems = parse_ui_tars_response(text);
+        assert_eq!(elems.len(), 1);
+        assert_eq!(elems[0].element_type, "click");
+        assert_eq!(elems[0].thought.as_deref(), Some("I need to click the send button."));
+        assert_eq!(elems[0].action.as_deref(), Some("click(start_box='<bbox>450 780 500 820</bbox>')"));
+        // Center of (450,780)-(500,820) = (475,800)
+        assert_eq!(elems[0].coords, [475, 800]);
+    }
+
+    #[test]
+    fn parse_thought_action_type() {
+        let text = "Thought: Type the search query.\nAction: type(content='hello')";
+        let elems = parse_ui_tars_response(text);
+        assert_eq!(elems.len(), 1);
+        assert_eq!(elems[0].element_type, "type");
+        assert_eq!(elems[0].label, "hello");
+        assert_eq!(elems[0].thought.as_deref(), Some("Type the search query."));
     }
 }
