@@ -141,35 +141,19 @@ fn parse_ui_tars_response(text: &str) -> Vec<UiElement> {
         if line.is_empty() {
             continue;
         }
-        // Parse: type=button, label=Send, coords=(500,750)
-        let mut element_type = "unknown".to_owned();
-        let mut label = "".to_owned();
-        let mut coords = [0u32, 0];
-
-        for part in line.split(',') {
-            let part = part.trim();
-            if let Some((k, v)) = part.split_once('=') {
-                let k = k.trim();
-                let v = v.trim();
-                match k {
-                    "type" => element_type = v.to_owned(),
-                    "label" => label = v.to_owned(),
-                    "coords" => {
-                        // v might be "(500,750)" or "=(500,750)" depending on split
-                        let v = v.trim_start_matches('=').trim();
-                        if let Some(inner) = v.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-                            let nums: Vec<&str> = inner.split(',').collect();
-                            if nums.len() == 2 {
-                                if let (Ok(x), Ok(y)) = (nums[0].trim().parse(), nums[1].trim().parse()) {
-                                    coords = [x, y];
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+        let element_type = extract_field(line, "type=").unwrap_or("unknown").to_owned();
+        let label = extract_field(line, "label=").unwrap_or("").to_owned();
+        let coords = extract_field(line, "coords=")
+            .and_then(|v| {
+                let v = v.trim_start_matches('=').trim();
+                v.strip_prefix('(').and_then(|s| s.strip_suffix(')')).and_then(|inner| {
+                    let mut nums = inner.split(',');
+                    let x = nums.next()?.trim().parse().ok()?;
+                    let y = nums.next()?.trim().parse().ok()?;
+                    Some([x, y])
+                })
+            })
+            .unwrap_or([0, 0]);
 
         if element_type != "unknown" || coords != [0, 0] {
             elements.push(UiElement {
@@ -180,6 +164,23 @@ fn parse_ui_tars_response(text: &str) -> Vec<UiElement> {
         }
     }
     elements
+}
+
+/// Extract a `prefix=value` field from a comma-separated line.
+/// Handles commas inside parentheses (e.g. `coords=(500,750)`).
+fn extract_field<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    let start = line.find(prefix)? + prefix.len();
+    let rest = &line[start..];
+    let mut depth = 0i32;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => return Some(rest[..i].trim()),
+            _ => {}
+        }
+    }
+    Some(rest.trim())
 }
 
 #[cfg(test)]
