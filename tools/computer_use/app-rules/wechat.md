@@ -45,17 +45,29 @@ Use this skill in two scenarios:
    `wait 300ms`, `type "WeChat"`, `wait 300ms`, `key "Return"`.
    Then `wait 800ms` and `screenshot`.
 
-2. **Verify WeChat is actually frontmost.** Look at the screenshot. The macOS menu bar should say "WeChat", and the WeChat main window should be the dominant content. **If you see any other app on top, or any modal popup blocking the chat list, STOP and tell the user. Do not start clicking.**
+2. **Verify WeChat is actually frontmost and identify the current view.** Look at the screenshot carefully:
+   - The macOS menu bar should say "WeChat", and the WeChat main window should be the dominant content.
+   - **Identify which view you are in:**
+     - **Chat list view**: Left column shows a list of chat rows (avatar + name + last message). Right pane may be empty or show a grey "WeChat" placeholder. This is where you need to be.
+     - **Chat window view**: Right pane shows a conversation with message bubbles (green on right = your messages, white/grey on left = others). Title bar at top shows a contact/group name. An input box is at the bottom. **If you see this view, you are INSIDE a specific chat — you must return to the chat list first (see below).**
+   - **If you see any other app on top, or any modal popup blocking the window, STOP and tell the user. Do not start clicking.**
 
-3. **Locate the target chat in the list (left column).**
-   - The chat list is the second column from the left (after the icon sidebar). Each row is a single chat: avatar on the left, name + last message on the right.
-   - If the target name is **visible** in the list: identify the row's vertical center coordinate from the screenshot. Click only on the **name area** — avoid clicking on the avatar (which can pop a contact card).
-   - **Coordinate fallback** (macOS): if the screenshot makes it hard to judge exact coordinates, get the window position first, then compute relative coordinates:
-     ```json
-     {"tool": "exec", "command": "osascript -e 'tell application \"System Events\" to tell process \"WeChat\" to return (position of window 1) as string'"}
-     ```
-     The chat list starts at `win_x + 0` and is about 250px wide. The first chat row starts at `win_y + 40` (search box height) and each row is ~65px. The 3rd row's center is at `(win_x + 130, win_y + 40 + 65*2 + 32)`.
-   - If **not visible**: open search with `cmd+f` (macOS) or `ctrl+f` (Windows), `type` the target name (the type action handles CJK automatically via clipboard paste), wait 800ms, screenshot, find the matching row in the dropdown under the 联系人 / 群聊 category header, click that row. **Do not press Return** on the search result — Return on the search header doesn't enter the chat; you must click the row.
+   **How to return to the chat list from inside a chat:**
+   - **Click anywhere in the left column** (the chat list area) to return focus there. Do NOT press Esc — it does nothing in WeChat.
+   - Or click the back button if visible in the top-left of the right pane.
+   - After clicking, `wait 300ms`, re-activate WeChat, `screenshot` to confirm you are now in the chat list view.
+
+3. **Locate the target chat in the chat list (left column).**
+   - The chat list is the leftmost column showing rows: avatar on the left, name + last message on the right.
+   - Scan the visible rows for the target name.
+   - If the target name is **visible**: identify the row's vertical center coordinate from the screenshot. Click only on the **name/text area** — avoid clicking on the avatar (which opens a contact card). After clicking, proceed to step 4.
+   - **If NOT visible, use search (do NOT type randomly in the window):**
+     1. Press `cmd+f` (macOS) or `ctrl+f` (Windows) to open the chat search box at the top of the chat list.
+     2. `type` the exact target name (e.g. "RsClaw研发群"). The `type` action auto-pastes CJK text via clipboard.
+     3. `wait 1000ms` for results to appear, then `screenshot`.
+     4. Look at the dropdown results under the **联系人** or **群聊** category header. Find the row matching the target name.
+     5. **Click that row** to enter the chat. **Do NOT press Return** — Return on the search box does not enter the chat; you must click the matching result row.
+     6. After clicking, proceed to step 4.
 
 4. **Verify the chat opened.** After the click, `wait 500ms`, re-activate WeChat (focus may have shifted), `wait 200ms`, `screenshot`. Look at the **right pane title bar** — it must show the target name. If not, the click landed wrong; do not type.
 
