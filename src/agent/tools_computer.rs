@@ -69,6 +69,18 @@ impl super::runtime::AgentRuntime {
         let tmp_path = std::env::temp_dir().join(format!("rsclaw_screen-{nonce}.png"));
         let tmp_path_str = tmp_path.to_string_lossy().to_string();
 
+        // RAII guard: remove the tmp file when this guard drops, no matter
+        // which path exits the function. Earlier code only cleaned up on
+        // the happy path — the two `return Err` / `?` exits below leaked
+        // megabyte-sized PNGs into /tmp on every failure.
+        struct TmpFile(std::path::PathBuf);
+        impl Drop for TmpFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _tmp_guard = TmpFile(tmp_path.clone());
+
         let output = if is_macos {
             let mut cmd = tokio::process::Command::new("screencapture");
             cmd.arg("-x");
@@ -186,6 +198,10 @@ $bitmap.Dispose()
             std::env::temp_dir().join(format!("rsclaw_screen_out-{nonce}.jpg"))
         };
         let out_str = out_path.to_string_lossy().to_string();
+        // Same RAII pattern as tmp_path — removes out_path no matter how
+        // we exit. The original code only deleted out_path on the happy
+        // conversion path.
+        let _out_guard = TmpFile(out_path.clone());
 
         let converted = if is_macos {
             if keep_png && !need_resize {

@@ -259,9 +259,15 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
             let mut parts = line.split_whitespace();
             let hex = parts.next()?;
             let name = parts.next()?;
-            // SHA256SUMS files often write "*name" for binary-mode lines.
-            let name = name.trim_start_matches('*');
-            if name == asset_filename || asset_filename.ends_with(name) {
+            // SHA256SUMS files often write "*name" for binary-mode lines and
+            // sometimes prefix with "./" for path-relative entries. Strip
+            // both, then require a strict basename match. Earlier code
+            // also accepted `asset_filename.ends_with(name)` which made
+            // a SHA256SUMS entry "linux.tar.gz" spuriously match
+            // "rsclaw-vX-Y-x86_64-linux.tar.gz" — a security-relevant
+            // wildcard.
+            let name = name.trim_start_matches('*').trim_start_matches("./");
+            if name == asset_filename {
                 Some(hex.to_lowercase())
             } else {
                 None
