@@ -1326,6 +1326,7 @@ impl BrowserSession {
         // interactive mode: only return elements with @ref (saves 80% tokens)
         let interactive = args.get("interactive").and_then(|v| v.as_bool()).unwrap_or(false)
             || args.get("i").and_then(|v| v.as_bool()).unwrap_or(false);
+        let annotate = args.get("annotate").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let js = if interactive { SNAPSHOT_INTERACTIVE_JS } else { SNAPSHOT_JS };
         let result = self
@@ -1370,6 +1371,30 @@ impl BrowserSession {
             self.refs.insert(key.clone(), key);
         }
         self.ref_counter = ref_count;
+
+        // Annotated screenshot: overlay colorful borders + numbered labels on interactive elements.
+        // Only available in interactive mode (needs data-ref attributes).
+        if annotate && interactive && ref_count > 0 {
+            let annotate_js = SNAPSHOT_ANNOTATE_JS;
+            let legend_raw = self.eval_js(annotate_js).await.unwrap_or_else(|_| "[]".to_string());
+
+            // Capture screenshot with overlays.
+            let ss_result = self.cdp.send("Page.captureScreenshot", json!({"format": "png"})).await?;
+            let data = ss_result.get("data").and_then(|v| v.as_str()).unwrap_or("");
+
+            // Remove annotations.
+            let _ = self.eval_js("document.querySelectorAll('.__rsclaw_anno').forEach(e=>e.remove())").await;
+
+            let legend: Value = serde_json::from_str(&legend_raw).unwrap_or(json!([]));
+            let save_path = save_screenshot_bytes(data, "png").await?;
+
+            return Ok(json!({
+                "action": "snapshot",
+                "text": lines,
+                "image_path": save_path,
+                "legend": legend,
+            }));
+        }
 
         Ok(json!({
             "action": "snapshot",
@@ -2452,7 +2477,12 @@ impl BrowserSession {
     async fn cmd_get_text(&self) -> Result<Value> {
         let text = self.eval_js("document.body.innerText").await?;
         let truncated = if text.len() > 50_000 {
-            text[..50_000].to_owned()
+            // Truncate at a valid UTF-8 char boundary so CJK chars are not split.
+            let mut idx = 50_000;
+            while idx > 0 && !text.is_char_boundary(idx) {
+                idx -= 1;
+            }
+            text[..idx].to_owned()
         } else {
             text
         };
@@ -3939,6 +3969,73 @@ const SNAPSHOT_INTERACTIVE_JS: &str = r#"(function(){
   }
   if (document.body) walk(document.body, 0);
   return JSON.stringify({lines: lines, refCount: counter});
+})()"#;
+
+/// Set-of-Marks annotation: inject colorful borders + numbered labels on elements
+/// that have `data-ref` attributes (set by snapshot). Returns a legend array.
+const SNAPSHOT_ANNOTATE_JS: &str = r#"(function(){
+  var refs = document.querySelectorAll('[data-ref]');
+  var labels = [];
+  var colorMap = {
+    button:     {border:'#FF6B9D', bg:'rgba(255,107,157,0.12)', name:'pink'},
+    link:       {border:'#4A90FF', bg:'rgba(74,144,255,0.12)', name:'blue'},
+    input:      {border:'#7ED321', bg:'rgba(126,211,33,0.12)', name:'green'},
+    select:     {border:'#F5A623', bg:'rgba(245,166,35,0.12)', name:'orange'},
+    textarea:   {border:'#50E3C2', bg:'rgba(80,227,194,0.12)', name:'cyan'},
+    editable:   {border:'#BD10E0', bg:'rgba(189,16,224,0.10)', name:'purple'},
+    clickable:  {border:'#9B9B9B', bg:'rgba(155,155,155,0.10)', name:'grey'},
+    'upload[file]': {border:'#D0021B', bg:'rgba(208,2,27,0.10)', name:'red'}
+  };
+  refs.forEach(function(el){
+    var ref = el.getAttribute('data-ref');
+    var num = ref.replace('@e','');
+    var rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+
+    // Detect element category for color
+    var tag = el.tagName.toLowerCase();
+    var role = el.getAttribute('role') || '';
+    var cls = (el.className || '').toString().toLowerCase();
+    var isEditable = el.isContentEditable && !el.parentElement.isContentEditable;
+    var cat = 'clickable';
+    if (tag === 'input' && el.type === 'file') cat = 'upload[file]';
+    else if (tag === 'a') cat = 'link';
+    else if (tag === 'button' || role === 'button') cat = 'button';
+    else if (tag === 'input') cat = 'input';
+    else if (tag === 'select') cat = 'select';
+    else if (tag === 'textarea') cat = 'textarea';
+    else if (isEditable) cat = 'editable';
+
+    var c = colorMap[cat] || colorMap.clickable;
+
+    // 1. Colored border overlay (inset to not affect layout)
+    var box = document.createElement('div');
+    box.className = '__rsclaw_anno';
+    box.style.cssText = 'position:fixed;z-index:999998;pointer-events:none;box-sizing:border-box;'+
+      'border:2px solid '+c.border+';background:'+c.bg+';'+
+      'left:'+rect.left+'px;top:'+rect.top+'px;'+
+      'width:'+rect.width+'px;height:'+rect.height+'px;';
+    document.body.appendChild(box);
+
+    // 2. Numbered badge (top-left corner)
+    var badge = document.createElement('div');
+    badge.className = '__rsclaw_anno';
+    badge.textContent = num;
+    badge.style.cssText = 'position:fixed;z-index:999999;pointer-events:none;'+
+      'background:'+c.border+';color:#fff;font-size:10px;font-weight:bold;'+
+      'padding:1px 4px;border-radius:3px;line-height:1;'+
+      'left:'+(rect.left)+'px;top:'+(rect.top-14)+'px;';
+    // If element is at very top, put badge inside top-left instead
+    if (rect.top < 16) {
+      badge.style.top = rect.top + 'px';
+    }
+    document.body.appendChild(badge);
+
+    // 3. Legend entry
+    var text = (el.innerText || el.value || el.getAttribute('placeholder') || el.getAttribute('alt') || '').substring(0,40);
+    labels.push({num:parseInt(num), ref:ref, type:cat, color:c.name, text:text});
+  });
+  return JSON.stringify(labels);
 })()"#;
 
 #[cfg(test)]

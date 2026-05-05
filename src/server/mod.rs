@@ -1177,9 +1177,13 @@ async fn cron_save_and_reload(
     // for other readers and caused jobs to silently disappear from the UI.
     let store = serde_json::json!({ "version": 1, "jobs": jobs });
     let json = serde_json::to_string_pretty(&store).map_err(|e| format!("serialize: {e}"))?;
-    tokio::fs::write(&path, json)
+    let tmp = format!("{}.tmp", path.display());
+    tokio::fs::write(&tmp, json)
         .await
-        .map_err(|e| format!("write jobs.json: {e}"))?;
+        .map_err(|e| format!("write jobs.json tmp: {e}"))?;
+    tokio::fs::rename(&tmp, &path)
+        .await
+        .map_err(|e| format!("rename jobs.json: {e}"))?;
     let _ = reload_tx.send(());
     Ok(())
 }

@@ -321,7 +321,21 @@ pub(crate) fn build_system_prompt(
              - Cron jobs: `cron` tool (action=list/add/remove).\n\
              - Install tools (python, node, ffmpeg, chrome, etc.): `install_tool`. Do NOT download manually.\n\
              - Memory: use `memory` to recall prior conversations. Search memory at session start if user references prior work.\n\
-             - Save corrected/complete info to memory immediately so it survives compaction."
+             - Save corrected/complete info to memory immediately so it survives compaction.
+
+             ### GUI / Desktop Automation (computer_use)
+             For any GUI or desktop automation task (WeChat, Finder, Safari, etc.):
+             - **ALWAYS prefer 'computer_use action=ui_tars' with a natural-language instruction.**
+               The UI-TARS vision model handles screenshot -> analysis -> execution internally.
+               Example: computer_use action=ui_tars instruction='Open WeChat and send a message to File Transfer'.
+             - Only fall back to manual 'screenshot' + individual 'click'/'type'/'key' calls
+               if 'ui_tars' is unavailable (not configured) or explicitly fails after retry.
+             - Do NOT use 'get_app_rule' for apps that have been moved/removed from app-rules.
+             - For WeChat specifically: even if a wechat app-rule exists, ALL GUI operations
+               (click, search, scroll, type) MUST go through 'computer_use action=ui_tars'.
+               You may call 'get_app_rule' to read WeChat strategy (trigger conditions,
+               reply rules, Quote method), but never execute manual screenshot+click
+               workflows described inside it."
                 .to_owned(),
         );
 

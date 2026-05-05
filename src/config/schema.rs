@@ -1465,6 +1465,10 @@ pub struct ComputerUseConfig {
     pub ui_analyze_api_url: Option<String>,
     /// API key for the UI-TARS / ui_analyze endpoint (optional).
     pub ui_analyze_api_key: Option<String>,
+    /// Model name/path for the UI-TARS / ui_analyze endpoint.
+    /// Required when the server needs a local path (e.g. mlx_vlm built-in server
+    /// with HuggingFace cache). Defaults to "ui-tars".
+    pub ui_analyze_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

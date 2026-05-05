@@ -520,6 +520,14 @@ impl CronRunner {
             // Don't save - file has syntax errors that user needs to fix
             return Ok(());
         }
+        let disabled_ids: Vec<&str> = jobs
+            .iter()
+            .filter(|j| !j.enabled)
+            .map(|j| j.id.as_str())
+            .collect();
+        if !disabled_ids.is_empty() {
+            info!(disabled = ?disabled_ids, "cron: save_store persisting disabled jobs");
+        }
         let store = CronStore {
             version: 1,
             jobs: jobs.to_vec(),
@@ -2233,7 +2241,9 @@ pub fn save_cron_jobs(jobs: &[CronJob]) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent).context("failed to create cron directory")?;
     }
 
-    std::fs::write(&cron_file, json).context("failed to write cron jobs file")?;
+    let tmp = format!("{}.tmp", cron_file.display());
+    std::fs::write(&tmp, json).context("failed to write cron jobs tmp file")?;
+    std::fs::rename(&tmp, &cron_file).context("failed to rename cron jobs file")?;
     Ok(())
 }
 

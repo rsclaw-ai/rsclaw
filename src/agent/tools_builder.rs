@@ -642,7 +642,7 @@ pub(crate) fn build_tool_list(
         name: "web_browser".to_owned(),
         description: "Control a web browser. Core workflow:\n\
             1. `open` — navigate to a URL\n\
-            2. `snapshot` — get page structure with interactive element refs (@e1, @e2...). Use `interactive: true` to only get actionable elements (saves tokens).\n\
+            2. `snapshot` — get page structure with interactive element refs (@e1, @e2...). Use `interactive: true` to only get actionable elements (saves tokens). Use `interactive: true, annotate: true` to also get a screenshot with colorful borders + numbered labels overlaid on each element — the model sees both structured text and visual markers for better grounding.\n\
             3. `click` ref=@e1 / `fill` ref=@e2 text='...' — interact using refs\n\
             4. Re-snapshot after any page change to get updated refs\n\
             Autocomplete inputs (Ctrip/Fliggy/Qunar city pickers, Google/Baidu search, flight/hotel/movie pickers, any input that pops a dropdown of suggestions): ALWAYS use `pick` ref=@eN query='武汉' in a single call — it focuses, types, waits for the popup, and clicks the first visible candidate. DO NOT build it yourself out of click+type+wait+screenshot loops; that wastes 5-7 iterations per field and the dropdown often dismisses before you re-screenshot. `pick` handles IME/React-controlled inputs that silently drop programmatic values.\n\
@@ -699,6 +699,7 @@ pub(crate) fn build_tool_list(
                 ]},
                 "url":        {"type": "string", "description": "URL for open/navigate"},
                 "interactive":{"type": "boolean", "description": "For snapshot: only return actionable elements (saves ~80% tokens). Default: false"},
+                "annotate":   {"type": "boolean", "description": "For snapshot: overlay colorful borders + numbered labels on interactive elements and return a screenshot alongside the structured text. Helps the model visually locate elements. Only works with interactive=true."},
                 "ref":        {"type": "string", "description": "Element ref like @e3 from snapshot"},
                 "from":       {"type": "string", "description": "Source element ref for drag"},
                 "to":         {"type": "string", "description": "Target element ref for drag"},
@@ -719,7 +720,7 @@ pub(crate) fn build_tool_list(
                 "format":     {"type": "string", "enum": ["png", "jpeg"], "description": "Screenshot format"},
                 "quality":    {"type": "integer", "description": "JPEG quality (1-100)"},
                 "full_page":  {"type": "boolean", "description": "Capture full scrollable page"},
-                "annotate":   {"type": "boolean", "description": "Overlay numbered labels on interactive elements"},
+                "annotate":   {"type": "boolean", "description": "Overlay colorful borders + numbered labels on interactive elements and return a legend mapping numbers to refs. For snapshot+annotate, use snapshot action with annotate=true instead."},
                 "width":      {"type": "integer", "description": "Viewport width for set_viewport"},
                 "height":     {"type": "integer", "description": "Viewport height for set_viewport"},
                 "scale":      {"type": "number", "description": "Device scale factor for set_viewport"},
@@ -765,7 +766,7 @@ pub(crate) fn build_tool_list(
 
     tools.push(ToolDef {
         name: "computer_use".to_owned(),
-        description: "Control the computer desktop. ONLY use when the user EXPLICITLY asks to take a screenshot, click, type, or interact with the desktop. Do NOT call this tool just because the message mentions words like 'screenshot' or 'screen' in other contexts. Screenshots auto-resize, and mouse coordinates use the same physical-pixel space as the returned `original_width`/`original_height` (HiDPI is handled internally — multiply image-pixel coords by the returned `scale` and pass directly).\n\nCRITICAL — App-Rule Loading (MANDATORY):\nBefore controlling ANY desktop application (WeChat, Finder, Safari, etc.), you MUST first load the app-specific automation guide.\n1. Call `get_app_rule` with the app name (e.g. name='wechat').\n2. Read and follow the returned guide EXACTLY.\n3. Only then proceed with screenshot/click/type actions.\nNEVER guess coordinates or workflows — the app-rule contains version-specific steps you cannot infer.".to_owned(),
+        description: "Control the computer desktop. ONLY use when the user EXPLICITLY asks to take a screenshot, click, type, or interact with the desktop. Do NOT call this tool just because the message mentions words like 'screenshot' or 'screen' in other contexts. Screenshots auto-resize, and mouse coordinates use the same physical-pixel space as the returned `original_width`/`original_height` (HiDPI is handled internally — multiply image-pixel coords by the returned `scale` and pass directly).\n\nCRITICAL — App-Rule Loading (MANDATORY):\nBefore controlling ANY desktop application (WeChat, Finder, Safari, etc.), you MUST first load the app-specific automation guide.\n1. Call `get_app_rule` with the app name (e.g. name='wechat').\n2. Read and follow the returned guide EXACTLY.\n3. Only then proceed with screenshot/click/type actions.\nNEVER guess coordinates or workflows — the app-rule contains version-specific steps you cannot infer.\n\nEND-TO-END AUTOMATION — ui_tars action:\nFor complex multi-step desktop tasks (e.g. 'Open WeChat, find a group, send a message'), use the `ui_tars` action with a natural-language instruction instead of scripting individual click/type steps. The UI-TARS vision model will drive the loop internally: screenshot -> analyze -> execute -> repeat. This is more robust than hand-coding coordinates.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -774,8 +775,9 @@ pub(crate) fn build_tool_list(
                     "double_click", "triple_click", "right_click", "middle_click",
                     "drag", "scroll", "type", "key", "hold_key",
                     "cursor_position", "get_active_window", "ui_tree",
-                    "list_app_rules", "get_app_rule", "wait"
-                ], "description": "Action to perform. ui_tree returns the accessibility tree of the focused window (interactive elements with role/label/coordinates). list_app_rules/get_app_rule load per-app desktop automation playbooks from ~/.rsclaw/tools/computer_use/app-rules/."},
+                    "list_app_rules", "get_app_rule", "wait",
+                    "ui_tars"
+                ], "description": "Action to perform. ui_tree returns the accessibility tree of the focused window (interactive elements with role/label/coordinates). list_app_rules/get_app_rule load per-app desktop automation playbooks from ~/.rsclaw/tools/computer_use/app-rules/. ui_tars runs an end-to-end agent loop using the UI-TARS vision model — pass an instruction and it handles screenshot/analysis/execution internally."},
                 "x":         {"type": "number", "description": "X coordinate (mouse actions, drag start) in physical pixels"},
                 "y":         {"type": "number", "description": "Y coordinate (mouse actions, drag start) in physical pixels"},
                 "to_x":      {"type": "number", "description": "Drag destination X (physical pixels)"},
@@ -794,7 +796,9 @@ pub(crate) fn build_tool_list(
                     "width":  {"type": "number"},
                     "height": {"type": "number"}
                 }, "required": ["x", "y", "width", "height"]},
-                "max_long_edge_px": {"type": "integer", "description": "Screenshot resize cap: longest edge of returned image. Default 1024 (XGA). Range 64-8192. Larger values = more detail + more tokens."}
+                "max_long_edge_px": {"type": "integer", "description": "Screenshot resize cap: longest edge of returned image. Default 1024 (XGA). Range 64-8192. Larger values = more detail + more tokens."},
+                "instruction": {"type": "string", "description": "NATURAL-LANGUAGE task instruction for the ui_tars end-to-end agent loop. Example: 'Open WeChat, search for RsClaw研发群, and send a greeting message'. The UI-TARS vision model will drive screenshot->analyze->execute internally. ONLY used with action=ui_tars."},
+                "max_steps": {"type": "integer", "description": "Maximum steps for the ui_tars loop (default: 30). ONLY used with action=ui_tars."}
             },
             "required": ["action"]
         }),
