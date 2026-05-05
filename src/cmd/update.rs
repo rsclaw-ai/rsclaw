@@ -197,7 +197,19 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
 
     let Some(url) = download_url else {
         // No pre-built binary, suggest building from source
-        if !quiet {
+        if quiet {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "currentVersion": current,
+                    "latestVersion": latest_version,
+                    "updateAvailable": true,
+                    "status": "no-prebuilt-binary",
+                    "platform": format!("{os}-{arch}"),
+                    "fromSource": "cd /path/to/rsclaw && git pull && cargo build --release",
+                })
+            );
+        } else {
             println!("  {} no pre-built binary for {os}-{arch}", yellow("[!]"));
             println!("  Update from source:");
             println!("    cd /path/to/rsclaw && git pull && cargo build --release");
@@ -385,7 +397,9 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
         );
     }
 
-    println!();
+    if !quiet {
+        println!();
+    }
     Ok(())
 }
 
