@@ -43,16 +43,35 @@ fn build_update_client(timeout_secs: u64) -> Result<reqwest::Client> {
 }
 
 async fn do_update(args: &UpdateArgs) -> Result<()> {
-    banner(&format!(
-        "rsclaw update v{}",
-        option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
-    ));
+    // In --json mode, suppress all human-readable banners/progress so the
+    // caller gets a single parseable JSON object at the end. This was a
+    // mid-flow `println!(json!(...))` before, which interleaved with the
+    // human output and broke any process trying to consume the result.
+    let quiet = args.json;
+
+    if !quiet {
+        banner(&format!(
+            "rsclaw update v{}",
+            option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+        ));
+    }
 
     let timeout_secs = args.timeout.unwrap_or(30);
     let client = build_update_client(timeout_secs)?;
 
+    // Best-effort cleanup of a stale `.old` backup left by a previous
+    // update run — without this they accumulate forever.
+    if let Ok(current_exe) = std::env::current_exe() {
+        let stale_backup = current_exe.with_extension("old");
+        if stale_backup.exists() {
+            let _ = std::fs::remove_file(&stale_backup);
+        }
+    }
+
     // 1. Check latest release — try app.rsclaw.ai first, fallback GitHub
-    println!("  {} checking for updates...", dim("[..]"));
+    if !quiet {
+        println!("  {} checking for updates...", dim("[..]"));
+    }
 
     // Try app.rsclaw.ai first (object or array), fallback GitHub releases list (array).
     // A valid release must have tag_name and assets so we can download the binary.
@@ -86,39 +105,61 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
         .to_owned();
     let current = option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev");
 
-    kv("Current:", current);
-    kv("Latest:", &latest_version);
+    if !quiet {
+        kv("Current:", current);
+        kv("Latest:", &latest_version);
+    }
 
     if latest_version.is_empty() {
-        println!("  {} could not determine latest version", yellow("[!]"));
+        if quiet {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "currentVersion": current,
+                    "status": "version-check-failed",
+                })
+            );
+        } else {
+            println!("  {} could not determine latest version", yellow("[!]"));
+        }
         return Ok(());
     }
 
     if latest_version == current {
-        println!("  {} already up to date", green("[ok]"));
+        if quiet {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "currentVersion": current,
+                    "latestVersion": latest_version,
+                    "updateAvailable": false,
+                    "status": "up-to-date",
+                })
+            );
+        } else {
+            println!("  {} already up to date", green("[ok]"));
+        }
         return Ok(());
     }
 
-    if args.json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "currentVersion": current,
-                "latestVersion": latest_version,
-                "updateAvailable": true,
-                "dryRun": args.dry_run,
-            })
-        );
-        if args.dry_run {
-            return Ok(());
-        }
-    }
-
     if args.dry_run {
-        println!(
-            "  {} would update to {latest_version} (dry run)",
-            dim("[..]")
-        );
+        if quiet {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "currentVersion": current,
+                    "latestVersion": latest_version,
+                    "updateAvailable": true,
+                    "dryRun": true,
+                    "status": "dry-run",
+                })
+            );
+        } else {
+            println!(
+                "  {} would update to {latest_version} (dry run)",
+                dim("[..]")
+            );
+        }
         return Ok(());
     }
 
@@ -156,14 +197,18 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
 
     let Some(url) = download_url else {
         // No pre-built binary, suggest building from source
-        println!("  {} no pre-built binary for {os}-{arch}", yellow("[!]"));
-        println!("  Update from source:");
-        println!("    cd /path/to/rsclaw && git pull && cargo build --release");
+        if !quiet {
+            println!("  {} no pre-built binary for {os}-{arch}", yellow("[!]"));
+            println!("  Update from source:");
+            println!("    cd /path/to/rsclaw && git pull && cargo build --release");
+        }
         return Ok(());
     };
 
     // 4. Download binary
-    println!("  {} downloading {asset_name}...", dim("[..]"));
+    if !quiet {
+        println!("  {} downloading {asset_name}...", dim("[..]"));
+    }
     let download = if url.contains("github.com") || url.contains("githubusercontent.com") { proxy_url(&url) } else { url.clone() };
     let downloaded = client.get(&download).send().await?.bytes().await?;
 
@@ -171,43 +216,145 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
         anyhow::bail!("downloaded binary is empty");
     }
 
-    // 5. Extract binary from archive (tar.gz / zip) if needed
-    let binary_name = if std::env::consts::OS == "windows" { "rsclaw.exe" } else { "rsclaw" };
-    let binary = extract_binary(&downloaded, binary_name, &download)
-        .unwrap_or_else(|e| {
-            println!("  {} could not extract archive ({}), using raw download", yellow("[!]"), e);
-            downloaded.to_vec()
+    // 4b. SHA256 verification.
+    //
+    // The release publishes a SHA256SUMS.txt asset with one
+    // "<hex-digest>  <filename>" line per binary. Without verification a
+    // hostile GITHUB_PROXY (or any MITM if TLS validation ever broke)
+    // could substitute an arbitrary binary that we'd then chmod 755 over
+    // the live executable. Verify before touching disk.
+    let sum_url = release["assets"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter().find_map(|a| {
+                let name = a["name"].as_str().unwrap_or("");
+                if name.eq_ignore_ascii_case("SHA256SUMS.txt") || name.eq_ignore_ascii_case("SHA256SUMS") {
+                    a["browser_download_url"].as_str().map(|s| s.to_owned())
+                } else {
+                    None
+                }
+            })
         });
+    if let Some(su) = sum_url {
+        let su_dl = if su.contains("github.com") || su.contains("githubusercontent.com") {
+            proxy_url(&su)
+        } else {
+            su.clone()
+        };
+        let sums = client.get(&su_dl).send().await?.text().await.unwrap_or_default();
+        let asset_filename = url.rsplit('/').next().unwrap_or("");
+        let expected = sums.lines().find_map(|line| {
+            let mut parts = line.split_whitespace();
+            let hex = parts.next()?;
+            let name = parts.next()?;
+            // SHA256SUMS files often write "*name" for binary-mode lines.
+            let name = name.trim_start_matches('*');
+            if name == asset_filename || asset_filename.ends_with(name) {
+                Some(hex.to_lowercase())
+            } else {
+                None
+            }
+        });
+        match expected {
+            Some(expected_hex) => {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(&downloaded);
+                let actual_hex = format!("{:x}", hasher.finalize());
+                if actual_hex != expected_hex {
+                    anyhow::bail!(
+                        "SHA256 mismatch for {asset_filename}: expected {expected_hex}, got {actual_hex}. Aborting update."
+                    );
+                }
+                if !quiet {
+                    println!("  {} SHA256 verified", green("[ok]"));
+                }
+            }
+            None => {
+                if !quiet {
+                    println!(
+                        "  {} no SHA256 entry for {asset_filename} in SHA256SUMS — proceeding without verify",
+                        yellow("[!]")
+                    );
+                }
+            }
+        }
+    } else if !quiet {
+        println!(
+            "  {} release has no SHA256SUMS asset — proceeding without verify",
+            yellow("[!]")
+        );
+    }
 
-    // 6. Replace current executable
+    // 5. Extract binary from archive (tar.gz / zip) if needed.
+    //
+    // If the URL is an archive but extraction fails, FAIL HARD. The earlier
+    // fallback ("could not extract, using raw download") wrote the
+    // archive's gzipped/zipped bytes as the executable, then chmod +x'd
+    // it — a pretty reliable way to brick the install.
+    let binary_name = if std::env::consts::OS == "windows" { "rsclaw.exe" } else { "rsclaw" };
+    let url_lower = download.to_lowercase();
+    let looks_archived = url_lower.ends_with(".tar.gz")
+        || url_lower.ends_with(".tgz")
+        || url_lower.ends_with(".zip");
+    let binary = if looks_archived {
+        extract_binary(&downloaded, binary_name, &download)?
+    } else {
+        downloaded.to_vec()
+    };
+
+    // 6. Atomically replace the current executable.
+    //
+    // Write to <current>.new, fsync, chmod, then rename. Rename within the
+    // same dir is atomic on POSIX and Windows (replace_file under-the-hood
+    // for Rust). The previous flow `rename(current → .old) → write(current)`
+    // left a corrupt or missing executable if `write` partial-failed.
     let current_exe = std::env::current_exe()?;
+    let new_path = current_exe.with_extension("new");
     let backup = current_exe.with_extension("old");
 
-    // Backup current binary
-    std::fs::rename(&current_exe, &backup)?;
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&new_path)?;
+        f.write_all(&binary)?;
+        f.sync_all()?;
+    }
 
-    // Write new binary
-    std::fs::write(&current_exe, &binary)?;
-
-    // Set executable permission on Unix
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(
-            &current_exe,
+            &new_path,
             std::fs::Permissions::from_mode(0o755),
         )?;
     }
 
-    println!("  {} updated to {latest_version}", green("[ok]"));
-    kv("Binary:", &current_exe.display().to_string());
-    kv("Backup:", &backup.display().to_string());
+    // Move current → backup (so we have a rollback target) then rename
+    // new → current. If the second rename fails, restore from backup.
+    if backup.exists() {
+        let _ = std::fs::remove_file(&backup);
+    }
+    std::fs::rename(&current_exe, &backup)?;
+    if let Err(e) = std::fs::rename(&new_path, &current_exe) {
+        // Restore previous executable.
+        let _ = std::fs::rename(&backup, &current_exe);
+        let _ = std::fs::remove_file(&new_path);
+        anyhow::bail!("update: atomic swap failed: {e}");
+    }
 
-    // 6. Restart gateway if running
+    if !quiet {
+        println!("  {} updated to {latest_version}", green("[ok]"));
+        kv("Binary:", &current_exe.display().to_string());
+        kv("Backup:", &backup.display().to_string());
+    }
+
+    // 7. Restart gateway if running
     if !args.no_restart {
         let pid_file = config::loader::pid_file();
         if pid_file.exists() {
-            println!("  {} restarting gateway...", dim("[..]"));
+            if !quiet {
+                println!("  {} restarting gateway...", dim("[..]"));
+            }
             if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
                 if let Ok(pid) = pid_str.trim().parse::<i32>() {
                     let _ = crate::sys::process_terminate(pid as u32);
@@ -216,10 +363,26 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
                         .arg("gateway")
                         .arg("start")
                         .spawn();
-                    println!("  {} gateway restarted", green("[ok]"));
+                    if !quiet {
+                        println!("  {} gateway restarted", green("[ok]"));
+                    }
                 }
             }
         }
+    }
+
+    if quiet {
+        println!(
+            "{}",
+            serde_json::json!({
+                "currentVersion": current,
+                "latestVersion": latest_version,
+                "updateAvailable": true,
+                "status": "updated",
+                "binary": current_exe.display().to_string(),
+                "backup": backup.display().to_string(),
+            })
+        );
     }
 
     println!();

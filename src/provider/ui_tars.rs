@@ -86,7 +86,17 @@ impl UiTarsProvider {
     }
 
     /// Analyze a screenshot and return detected UI elements / steps.
-    pub async fn analyze(&self, image_path: &str, max_tokens: u32) -> Result<Vec<UiElement>> {
+    ///
+    /// `task_hint` is an optional natural-language description of what the
+    /// caller is trying to do (used only to pick the Thought-section
+    /// language: contains CJK → Chinese, else English). Pass `""` if you
+    /// don't know.
+    pub async fn analyze(
+        &self,
+        image_path: &str,
+        max_tokens: u32,
+        task_hint: &str,
+    ) -> Result<Vec<UiElement>> {
         // Read image and encode to base64
         let image_bytes = tokio::fs::read(image_path)
             .await
@@ -104,19 +114,28 @@ impl UiTarsProvider {
             None
         };
 
-        // Determine MIME type from extension
-        let mime = if image_path.ends_with(".png") {
+        // Determine MIME type from extension (case-insensitive).
+        let lc = image_path.to_lowercase();
+        let mime = if lc.ends_with(".png") {
             "image/png"
-        } else if image_path.ends_with(".jpg") || image_path.ends_with(".jpeg") {
+        } else if lc.ends_with(".jpg") || lc.ends_with(".jpeg") {
             "image/jpeg"
+        } else if lc.ends_with(".webp") {
+            "image/webp"
         } else {
             "image/png"
         };
 
-        let data_uri = format!("data:{};base64,{},", mime, b64);
+        // CRITICAL: no trailing comma — earlier version had `},` which
+        // appended a literal `,` to the base64 payload and corrupted every
+        // request to strict decoders.
+        let data_uri = format!("data:{};base64,{}", mime, b64);
 
-        let max_tokens = if self.version == UiTarsVersion::V1_5 {
-            2048
+        // V1.5 needs a higher cap for full-screen element enumeration but
+        // we still respect the caller's request when they explicitly passed
+        // a larger value. Earlier: hard-pinned to 2048 silently.
+        let effective_max_tokens = if self.version == UiTarsVersion::V1_5 {
+            max_tokens.max(2048)
         } else {
             max_tokens
         };
@@ -124,21 +143,29 @@ impl UiTarsProvider {
         // Build messages matching the UI-TARS training data format (same as predict).
         // UI-TARS 1.5 is trained on single-step action prediction, not open-ended
         // element enumeration. Use a concrete task prompt to get usable output.
-        let system_prompt = r#"You are a GUI agent. Given a screenshot, identify interactive UI elements.
-
-## Output Format
-```
-Thought: ...
-Action: ...
-```
-
-## Action Space
-click(start_box='<|box_start|>(x1, y1)<|box_end|>')
-
-## Note
-- Use Chinese in Thought part.
-- Output one Thought/Action pair per element.
-"#;
+        //
+        // Pick the Thought-section language from the caller's task_hint:
+        // CJK characters → Chinese (matches UI-TARS training distribution);
+        // otherwise English. Without this hint UI-TARS defaulted to Chinese
+        // even when the user clearly typed in English.
+        let thought_lang = if task_hint.chars().any(is_cjk) {
+            "Chinese"
+        } else {
+            "English"
+        };
+        let system_prompt = format!(
+            "You are a GUI agent. Given a screenshot, identify interactive UI elements.\n\n\
+             ## Output Format\n\
+             ```\n\
+             Thought: ...\n\
+             Action: ...\n\
+             ```\n\n\
+             ## Action Space\n\
+             click(start_box='<|box_start|>(x1, y1)<|box_end|>')\n\n\
+             ## Note\n\
+             - Use {thought_lang} in Thought part.\n\
+             - Output one Thought/Action pair per element.\n"
+        );
         let instruction = "Find all interactive UI elements (buttons, inputs, links, icons) on the screen. For each one, output its location using a click action with coordinates.";
 
         let mut messages = vec![];
@@ -155,7 +182,7 @@ click(start_box='<|box_start|>(x1, y1)<|box_end|>')
 
         let body = json!({
             "model": self.model,
-            "max_tokens": max_tokens,
+            "max_tokens": effective_max_tokens,
             "temperature": 0,
             "messages": messages
         });
@@ -336,6 +363,23 @@ click(start_box='<|box_start|>(x1, y1)<|box_end|>')
         let actions = parse_ui_tars_prediction(content, smart_dims, img_w, img_h, screen_w, screen_h);
         Ok(actions)
     }
+}
+
+/// Detect whether `c` is a CJK character. Used to pick the Thought-section
+/// language hint passed to UI-TARS — Chinese hint matches the Chinese
+/// majority of UI-TARS training data; English speakers should not see it.
+///
+/// Covers CJK Unified Ideographs (主), Compatibility (々), and the Hiragana
+/// / Katakana ranges (Japanese mixed text counts as CJK for our purposes).
+fn is_cjk(c: char) -> bool {
+    matches!(
+        c,
+        '\u{3040}'..='\u{309F}'   // Hiragana
+        | '\u{30A0}'..='\u{30FF}' // Katakana
+        | '\u{3400}'..='\u{4DBF}' // CJK Extension A
+        | '\u{4E00}'..='\u{9FFF}' // CJK Unified Ideographs
+        | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
+    )
 }
 
 /// Parse UI-TARS text response into structured elements.

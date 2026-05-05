@@ -53,7 +53,20 @@ impl super::runtime::AgentRuntime {
         let is_macos = cfg!(target_os = "macos");
         let is_windows = cfg!(target_os = "windows");
 
-        let tmp_path = std::env::temp_dir().join("rsclaw_screen.png");
+        // Per-call unique tmp filename: shared paths under
+        // `temp_dir().join("rsclaw_screen.png")` race when two
+        // tool_screenshot calls overlap (e.g. ui_tars probe + a regular
+        // screenshot from another session) — whichever process finishes
+        // last wins, the other reads bytes for the wrong screen.
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let tmp_path = std::env::temp_dir().join(format!("rsclaw_screen-{nonce}.png"));
         let tmp_path_str = tmp_path.to_string_lossy().to_string();
 
         let output = if is_macos {
@@ -164,10 +177,13 @@ $bitmap.Dispose()
         let need_resize = long_edge > max_long_edge;
         let max_long_edge_str = max_long_edge.to_string();
 
+        // Match the tmp_path nonce so the resize/convert output is
+        // also unique per call. Otherwise concurrent calls clobber the
+        // converted JPEG/PNG read further down.
         let out_path = if keep_png {
-            std::env::temp_dir().join("rsclaw_screen_out.png")
+            std::env::temp_dir().join(format!("rsclaw_screen_out-{nonce}.png"))
         } else {
-            std::env::temp_dir().join("rsclaw_screen_out.jpg")
+            std::env::temp_dir().join(format!("rsclaw_screen_out-{nonce}.jpg"))
         };
         let out_str = out_path.to_string_lossy().to_string();
 
@@ -1169,13 +1185,26 @@ except ImportError:
                 // Activate target app before first screenshot so UI-TARS operates
                 // on the correct window, not whatever happens to be in front.
                 if is_macos {
-                    if let Some(app) = Self::extract_app_name(instruction) {
-                        let _ = tokio::process::Command::new("osascript")
-                            .args(["-e", &format!("tell application \"{}\" to activate", app)])
-                            .output()
-                            .await;
-                        // Wait for the window to actually come to the front
-                        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                    match Self::extract_app_name(instruction) {
+                        Some(app) => {
+                            let _ = tokio::process::Command::new("osascript")
+                                .args(["-e", &format!("tell application \"{}\" to activate", app)])
+                                .output()
+                                .await;
+                            // Wait for the window to actually come to the front
+                            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                        }
+                        None => {
+                            // No keyword match — UI-TARS will operate on whatever
+                            // is frontmost. Log so a misnamed app doesn't fail
+                            // silently. Add the app to extract_app_name's allow
+                            // list to suppress this and get explicit activation.
+                            tracing::debug!(
+                                instruction,
+                                "ui_tars: no app keyword recognized in instruction; \
+                                 skipping activation, operating on current frontmost window"
+                            );
+                        }
                     }
                 }
 
@@ -1583,6 +1612,9 @@ except ImportError:
             .as_str()
             .ok_or_else(|| anyhow!("ui_analyze: `image_path` required"))?;
         let max_tokens = args["max_tokens"].as_u64().unwrap_or(400) as u32;
+        // Optional natural-language task description — UI-TARS uses it only
+        // to pick the Thought-section language (CJK → Chinese, else English).
+        let task_hint = args["task"].as_str().unwrap_or("");
 
         // Read config for API URL, key, and model.
         let (api_url, api_key, model) = self
@@ -1615,7 +1647,7 @@ except ImportError:
             provider = provider.with_model(model);
         }
 
-        let elements = provider.analyze(image_path, max_tokens).await?;
+        let elements = provider.analyze(image_path, max_tokens, task_hint).await?;
 
         // Use the image file's actual dimensions as the coordinate reference.
         // detect_screen_size() may return a different display's resolution,

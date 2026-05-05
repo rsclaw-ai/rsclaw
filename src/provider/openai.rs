@@ -866,7 +866,21 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
         body["tools"] = json!(tools);
         // Some providers (e.g. kimi-for-coding) require explicit tool_choice
         // to enable function calling; without it they ignore the tools list.
-        body["tool_choice"] = json!("auto");
+        // Other providers (some DeepSeek strict modes, certain Azure
+        // deployments) reject or misinterpret unsolicited "auto", so we
+        // gate on a model-name heuristic instead of sending it everywhere.
+        // Match on lowercased model id so "kimi-for-coding/k1.5-32k" works
+        // alongside "moonshot-v1-8k" and "qwen-coder-plus".
+        let needs_explicit_tool_choice = {
+            let m = req.model.to_lowercase();
+            m.contains("kimi")
+                || m.contains("moonshot")
+                || m.contains("k1.5")
+                || m.contains("k2")
+        };
+        if needs_explicit_tool_choice {
+            body["tool_choice"] = json!("auto");
+        }
     }
 
     // Normalize messages for stable KV cache prefix: trim content whitespace,
