@@ -69,6 +69,7 @@ pub mod browser;
 pub mod channel;
 pub mod cli;
 pub mod cmd;
+pub mod computer;
 pub mod config;
 pub mod cron;
 pub mod events;

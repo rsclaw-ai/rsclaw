@@ -260,5 +260,76 @@ pub async fn chat_abort(ctx: MethodCtx) -> MethodResult {
     }))
 }
 
+/// `chat.permission_response` — desktop UI replies to a
+/// `PermissionRequest` event surfaced by the computer_use VLM driver.
+///
+/// Params:
+///   `requestId` (string) — id minted by the driver
+///   `decision`  (string) — one of "allow_once" / "allow_session" /
+///                          "allow_always" / "deny"
+///
+/// Returns `{ resolved: true }` on success, or `{ resolved: false }`
+/// when the id is unknown (request already timed out or was cancelled).
+pub async fn chat_permission_response(ctx: MethodCtx) -> MethodResult {
+    let params = ctx
+        .req
+        .params
+        .as_ref()
+        .ok_or_else(|| ErrorShape::bad_request("missing params"))?;
+
+    let request_id = params
+        .get("requestId")
+        .or_else(|| params.get("request_id"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ErrorShape::bad_request("missing required param: requestId"))?
+        .to_owned();
+
+    let decision_str = params
+        .get("decision")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ErrorShape::bad_request("missing required param: decision"))?;
+
+    use crate::computer::permission::{PermissionDecision, PermissionStore as _};
+    let decision = match decision_str {
+        "allow_once" => PermissionDecision::AllowOnce,
+        "allow_session" => PermissionDecision::AllowSession,
+        "allow_always" => PermissionDecision::AllowAlways,
+        "deny" => PermissionDecision::Deny,
+        other => {
+            return Err(ErrorShape::bad_request(format!(
+                "invalid decision `{other}` (expected: allow_once, allow_session, allow_always, deny)"
+            )));
+        }
+    };
+
+    // Persist the decision so subsequent runs in the same session /
+    // future sessions see it. The driver's polling loop also reads
+    // from the same store, so this synchronises both wake-up paths.
+    let agent_id = params
+        .get("agentId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default");
+    let app = params.get("app").and_then(|v| v.as_str()).unwrap_or("");
+    if let Err(e) = ctx
+        .state
+        .computer_permission
+        .record(agent_id, app, decision)
+        .await
+    {
+        tracing::warn!(error = %e, "computer_permission.record failed");
+    }
+
+    let resolved = ctx
+        .state
+        .computer_permission
+        .resolve_pending_request(&request_id, decision)
+        .await;
+
+    Ok(serde_json::json!({
+        "resolved": resolved,
+        "requestId": request_id,
+    }))
+}
+
 // is_compaction_message moved to crate::agent::compaction::is_compaction_message
 use crate::agent::compaction::is_compaction_message;

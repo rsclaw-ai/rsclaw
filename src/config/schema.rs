@@ -477,6 +477,24 @@ pub struct ModelConfig {
     /// classification, summarization). Falls back to `primary` when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flash: Option<String>,
+    /// Vision model used by the GUI agent (`computer_use`) — must support
+    /// image inputs. Resolution chain when ui_tars / VlmDriver runs:
+    ///   1. per-agent `model.vision`
+    ///   2. `agents.defaults.model.vision`
+    ///   3. per-agent `model.primary`  ← fallback (assumes primary handles vision)
+    ///   4. `agents.defaults.model.primary`
+    /// Vision-capability check (in priority order):
+    ///   1. The provider's `models[]` entry — if `input` lists `image`,
+    ///      treat as vision-capable. If `input` is declared but contains
+    ///      only `text`, surface a clear error.
+    ///   2. Otherwise the built-in `is_known_vision_model` allow-list.
+    ///      Defaulting to text-only is intentional: vision-capable
+    ///      models are still the minority, so an unknown model is more
+    ///      likely text-only than vision. Misclassifications can be
+    ///      fixed by either adding `input: ["text", "image"]` to the
+    ///      model's provider config or extending the allow-list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1461,14 +1479,12 @@ pub struct WebBrowserConfig {
 #[serde(rename_all = "camelCase")]
 pub struct ComputerUseConfig {
     pub enabled: Option<bool>,
-    /// Base URL for the UI-TARS / ui_analyze API (e.g. http://macstudio:8000/v1).
-    pub ui_analyze_api_url: Option<String>,
-    /// API key for the UI-TARS / ui_analyze endpoint (optional).
-    pub ui_analyze_api_key: Option<String>,
-    /// Model name/path for the UI-TARS / ui_analyze endpoint.
-    /// Required when the server needs a local path (e.g. mlx_vlm built-in server
-    /// with HuggingFace cache). Defaults to "ui-tars".
-    pub ui_analyze_model: Option<String>,
+    // Note: `ui_analyze_*` fields were removed when the standalone
+    // ui_analyze tool was deleted. The new VlmDriver consumes the
+    // screenshot directly via the configured vision model — no
+    // separate element-detection endpoint is needed.
+    // Vision model selection lives in `agents.<id>.model.vision` (see
+    // `src/agent/runtime.rs::resolve_vision_model_name`).
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

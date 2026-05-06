@@ -746,23 +746,6 @@ pub(crate) fn build_tool_list(
             "required": ["action"]
         }),
     });
-    // UI-TARS visual analysis — send screenshot to a remote VLM API for element detection.
-    tools.push(ToolDef {
-        name: "ui_analyze".to_owned(),
-        description: "Analyze the current screen screenshot with a remote VLM API (UI-TARS) to detect interactive UI elements.\n\
-            Use this BEFORE clicking or typing when you are unsure where elements are located.\n\
-            Returns a list of elements with their type, label text, and normalized coordinates (0-1000).\n\
-            After receiving results, use the coordinates to call computer_use click actions.\n\
-            This is faster and more accurate than accessibility trees for visual apps (WeChat, Safari, etc.).".to_owned(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "image_path": {"type": "string", "description": "Absolute path to the screenshot image (PNG/JPEG). Usually the result of a previous computer_use screenshot action."},
-                "max_tokens": {"type": "integer", "description": "Max tokens for VLM response. Default 400.", "default": 400}
-            },
-            "required": ["image_path"]
-        }),
-    });
 
     tools.push(ToolDef {
         name: "computer_use".to_owned(),

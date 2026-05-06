@@ -381,6 +381,15 @@ pub struct AgentRuntime {
     /// SSE broadcast channel — None when running outside the gateway (e.g.
     /// tests).
     pub event_bus: Option<broadcast::Sender<AgentEvent>>,
+    /// Shared permission store for computer_use. Same `Arc` is held by
+    /// `AppState` so the WS handler can resolve pending requests minted
+    /// inside an agent run. `None` outside the gateway (tests / CLI).
+    pub computer_permission: Option<Arc<crate::computer::permission::RedbPermissionStore>>,
+    /// Broadcast channel that surfaces `PermissionRequest` to the WS
+    /// gateway. The Tauri UI subscribes and shows the modal. `None`
+    /// outside the gateway.
+    pub computer_permission_tx:
+        Option<broadcast::Sender<crate::computer::permission::PermissionRequest>>,
     /// Dynamic agent spawner — None when running outside the gateway.
     pub spawner: Option<Arc<crate::agent::AgentSpawner>>,
     /// Plugin registry — None when running outside the gateway or with no
@@ -494,6 +503,8 @@ impl AgentRuntime {
             memory,
             agents,
             event_bus,
+            computer_permission: None,
+            computer_permission_tx: None,
             spawner,
             plugins,
             mcp,
@@ -622,6 +633,286 @@ pub fn resolve_flash_model_for(
         .map(str::to_owned)
 }
 
+/// Outcome of vision-model resolution. The four cases are distinguished
+/// so the caller can format actionable error messages — "you have no
+/// vision model AND no primary, configure one", vs "your primary
+/// {name} is text-only, set agents.defaults.model.vision".
+#[derive(Debug, Clone)]
+pub enum VisionResolution {
+    /// An explicit `model.vision` was configured (per-agent or in
+    /// defaults). The string is the model identifier.
+    Configured(String),
+    /// No `vision` set; falling back to the agent's primary model.
+    /// Caller may want to verify the primary actually supports images
+    /// before proceeding.
+    FallbackToPrimary(String),
+    /// Neither `vision` nor `primary` is configured anywhere — the
+    /// runtime can't proceed. Caller surfaces a "configure
+    /// agents.defaults.model.{vision,primary}" message.
+    NoneConfigured,
+}
+
+/// Resolve the vision model for `computer_use` (and any other VLM-backed
+/// path). Lookup chain:
+///
+///   1. per-agent `model.vision`
+///   2. `defaults.model.vision`
+///   3. per-agent `model.primary`
+///   4. `defaults.model.primary`
+///
+/// (1) and (2) return `Configured`. (3) and (4) return
+/// `FallbackToPrimary`. Nothing → `NoneConfigured`.
+pub fn resolve_vision_model_for(
+    per_agent: &crate::config::schema::AgentEntry,
+    defaults: &crate::config::schema::AgentDefaults,
+) -> VisionResolution {
+    if let Some(name) = per_agent
+        .model
+        .as_ref()
+        .and_then(|m| m.vision.as_deref())
+        .map(str::to_owned)
+    {
+        return VisionResolution::Configured(name);
+    }
+    if let Some(name) = defaults
+        .model
+        .as_ref()
+        .and_then(|m| m.vision.as_deref())
+        .map(str::to_owned)
+    {
+        return VisionResolution::Configured(name);
+    }
+    if let Some(name) = per_agent
+        .model
+        .as_ref()
+        .and_then(|m| m.primary.as_deref())
+        .map(str::to_owned)
+    {
+        return VisionResolution::FallbackToPrimary(name);
+    }
+    if let Some(name) = defaults
+        .model
+        .as_ref()
+        .and_then(|m| m.primary.as_deref())
+        .map(str::to_owned)
+    {
+        return VisionResolution::FallbackToPrimary(name);
+    }
+    VisionResolution::NoneConfigured
+}
+
+/// Look up `model_name` (e.g. `"kimi/kimi-for-coding"` or just
+/// `"kimi-for-coding"`) in the provider config and return whether its
+/// `input` array contains `image`. Returns:
+///   - `Some(true)`  — explicitly declared as image-capable.
+///   - `Some(false)` — explicitly declared as text-only (no `image`
+///                     in the array).
+///   - `None`        — no `models[].input` entry found; caller should
+///                     fall back to the blocklist heuristic.
+///
+/// The lookup is fuzzy: it tries `provider/model_id` first (when the
+/// name contains `/`), then falls back to scanning every provider for a
+/// matching `model.id`. This way users who write `"kimi-for-coding"`
+/// (without provider prefix) still get the declaration honoured.
+pub fn model_supports_image_input(
+    config: &crate::config::schema::Config,
+    model_name: &str,
+) -> Option<bool> {
+    use crate::config::schema::InputType;
+
+    let models_cfg = config.models.as_ref()?;
+    let (prov_name, model_id) = match model_name.split_once('/') {
+        Some((p, m)) => (Some(p), m),
+        None => (None, model_name),
+    };
+
+    // Closure: probe one provider's models[] for a matching id.
+    let probe = |entries: &Option<Vec<crate::config::schema::ModelDef>>| {
+        entries.as_ref().and_then(|defs| {
+            defs.iter()
+                .find(|d| d.id == model_id)
+                .and_then(|d| d.input.as_ref())
+                .map(|inputs| inputs.contains(&InputType::Image))
+        })
+    };
+
+    // Targeted lookup first.
+    if let Some(prov) = prov_name {
+        if let Some(pc) = models_cfg.providers.get(prov) {
+            if let Some(verdict) = probe(&pc.models) {
+                return Some(verdict);
+            }
+        }
+    }
+
+    // Otherwise scan every provider — first hit wins.
+    for pc in models_cfg.providers.values() {
+        if let Some(verdict) = probe(&pc.models) {
+            return Some(verdict);
+        }
+    }
+    None
+}
+
+/// Heuristic substring list of model names known to be **vision-capable**
+/// (accept image input). When the schema-driven check
+/// (`models.providers[].models[].input` array) is missing, the resolver
+/// falls back to this allow-list. Models NOT in this list are treated as
+/// text-only by default — safer than the inverse (an unknown new model
+/// is more likely text-only than vision-capable, and forcing the user
+/// to opt in by either listing it here or declaring `input: ["image"]`
+/// in their config produces a clear error message instead of a cryptic
+/// API failure later).
+///
+/// Match is `model.to_lowercase().contains(s)`. Add a substring when
+/// you've confirmed a model family ships with image input.
+pub fn is_known_vision_model(model: &str) -> bool {
+    let m = model.to_lowercase();
+    [
+        // -------- universal suffixes (covers most "-vision" / "-vl"
+        // -------- variants across vendors without per-model entries)
+        "-vision",
+        "-vl-", "-vl/", "-vl:",
+        "-omni",
+
+        // -------- OpenAI
+        "gpt-4o", "gpt-4-vision", "gpt-4-turbo", "gpt-4.1",
+        "gpt-5", "chatgpt-4o", "o1-", "o3-", "o4-",
+        // (bare "gpt-4" intentionally NOT included — original GPT-4 base is text-only)
+
+        // -------- Anthropic Claude 3+
+        "claude-3", "claude-sonnet-4", "claude-opus-4", "claude-haiku-4",
+        "claude-4", "claude-5",
+        // (claude-instant / claude-2 are text-only)
+
+        // -------- Google Gemini + Gemma 3+
+        "gemini-1.5", "gemini-2", "gemini-3", "gemini-pro-vision",
+        "gemma-3", "gemma-4",
+        "paligemma",
+        // (gemma-1/-2 text-only)
+
+        // -------- Meta Llama (3.2 vision + Llama 4 multimodal)
+        "llama-3.2-11b-vision", "llama-3.2-90b-vision", "llama-3.2-vision",
+        "llama-4",
+        // (llama-3 / llama-3.1 / llama-3.3 / llama-3.2-1b / llama-3.2-3b are text-only)
+
+        // -------- Mistral
+        "pixtral",
+        "mistral-small-3.1", "mistral-small-3.2", "mistral-small-4",
+        "mistral-medium-3",
+
+        // -------- Cohere
+        "aya-vision", "command-a-vision",
+
+        // -------- xAI Grok (3+ natively multimodal; older variants need -vision)
+        "grok-2-vision", "grok-1.5-vision",
+        "grok-3", "grok-4", "grok-5",
+
+        // -------- ByteDance Doubao
+        // Seed 1.x: required `-vision` suffix to be multimodal.
+        "doubao-seed-1.5-vision", "doubao-1.5-vision", "doubao-1-5-vision",
+        "doubao-seed-1.6-vision",
+        // Seed 2+ family: entire subtree is multimodal-by-default
+        // (pro / lite / code / flash / vision all accept image input).
+        // List 2..=9 explicitly so future generations (3.x, 4.x, ...)
+        // are auto-recognised without a code change.
+        "doubao-seed-2", "doubao-seed-3", "doubao-seed-4", "doubao-seed-5",
+        "doubao-seed-6", "doubao-seed-7", "doubao-seed-8", "doubao-seed-9",
+        // Other vision lines.
+        "doubao-pro-vision", "doubao-vision",
+        "seedream", "seedance",
+
+        // -------- Alibaba Qwen
+        "qwen-vl", "qwen2-vl", "qwen2.5-vl", "qwen3-vl",
+        "qwen-max-vision",
+        // Qwen 3.5+ base series multimodal; both spellings.
+        "qwen3.5", "qwen-3.5",
+        "qwen3.6", "qwen-3.6",
+        "qwen3.7", "qwen-3.7",
+        "qwen3.8", "qwen-3.8",
+        "qwen3.9", "qwen-3.9",
+        "qwen4", "qwen-4",
+        "qvq",  // Qwen visual-question
+
+        // -------- Moonshot Kimi
+        "kimi-for-coding",
+        "kimi-k2.5", "kimi-k2.6", "kimi-k2.7", "kimi-k2.8", "kimi-k2.9",
+        "kimi-vl",
+        "moonshot-v1-vision",
+
+        // -------- Zhipu GLM (look for "vN" suffix — glm-4v, glm-4.5v, ...)
+        "glm-4v", "glm-4.1v", "glm-4.5v", "glm-4.6v", "glm-5v",
+        "cogvlm", "cogagent",
+
+        // -------- Baidu ERNIE
+        "ernie-vl", "ernie-4.5-vl", "ernie-5",
+        "ernie-vision",
+
+        // -------- SenseTime SenseChat
+        "sensechat-vision", "sensechat-v",
+        "sensenova-v6",
+
+        // -------- 01.AI Yi
+        "yi-vl", "yi-vision",
+
+        // -------- Baichuan
+        "baichuan-omni", "baichuan-vl", "baichuan2-vl",
+
+        // -------- DeepSeek
+        "deepseek-vl", "deepseek-vl2",
+        "janus",
+
+        // -------- Tencent Hunyuan
+        "hunyuan-vision", "hunyuan-vl", "hunyuanocr",
+
+        // -------- MiniMax
+        // NOTE: M2 / M2.5 / M2.7 base models are TEXT-ONLY despite
+        // marketing claims of "native multimodality" — confirmed by
+        // Artificial Analysis (artificialanalysis.ai) and the official
+        // model card on build.nvidia.com (text input only). Only the
+        // explicitly vision-tagged variants accept images.
+        "minimax-vl", "abab-vision", "abab6.5-vision",
+
+        // -------- StepFun
+        "step-1v", "step-1o", "step-2-vision",
+        "step-3", "step-3.5",
+
+        // -------- Open-source major VLMs
+        "llava",
+        "internvl", "mini-internvl", "xcomposer",
+        "minicpm-v", "minicpm-o", "minicpm-llama3-v",
+        "phi-3-vision", "phi-3.5-vision", "phi-4-multimodal",
+        "idefics",
+        "blip", "instructblip", "xgen-mm",
+        "fuyu", "kosmos",
+        "ferret", "openelm-vision", "mm1",
+        "florence-2", "florence-vl",
+        "smolvlm",
+        "vila", "nvila", "eagle2", "nvlm", "nemotron-vl",
+        "pali-3",
+
+        // -------- GUI-agent / screen-understanding VLMs (RsClaw's core
+        //          user community — keep this list eager)
+        "ui-tars",
+        "showui", "os-atlas", "seeclick", "screenagent",
+        "aria-ui", "omniparser",
+        "mobileagent", "appagent", "autoui",
+    ]
+    .iter()
+    .any(|needle| m.contains(needle))
+}
+
+/// User-facing error message emitted when vision-model resolution lands
+/// on a configuration that can't drive `computer_use`. Localised — the
+/// gateway language is read from `crate::i18n::default_lang()` so the
+/// message reaches the user in the channel they configured (Feishu /
+/// WeChat / Telegram / etc.). Falls back to English when the language
+/// is unset.
+pub fn vision_unavailable_message(reason: &str) -> String {
+    let lang = crate::i18n::default_lang();
+    crate::i18n::t_fmt("vision_unavailable", lang, &[("reason", reason)])
+}
+
 impl AgentRuntime {
 
     /// Estimate fixed context overhead: system prompt + tools tokens.
@@ -650,6 +941,64 @@ impl AgentRuntime {
     pub(crate) fn resolve_flash_model_name(&self) -> String {
         resolve_flash_model_for(&self.handle.config, &self.config.agents.defaults)
             .unwrap_or_else(|| self.resolve_model_name())
+    }
+
+    /// Resolve the vision model for `computer_use` via the
+    /// `model.vision → primary` fallback chain. Returns
+    /// `Err(actionable message)` when the resolved model is known to
+    /// be text-only or when nothing is configured at all — caller
+    /// surfaces this directly to the user.
+    ///
+    /// Use this from anywhere that wants to drive a VLM-backed loop
+    /// (`computer_use ui_tars`).
+    pub(crate) fn resolve_vision_model_name(&self) -> Result<String, String> {
+        match resolve_vision_model_for(
+            &self.handle.config,
+            &self.config.agents.defaults,
+        ) {
+            VisionResolution::Configured(name) => Ok(name),
+            VisionResolution::FallbackToPrimary(name) => {
+                // 1. Honour the per-model `input` declaration in
+                //    `models.providers[].models[]` first. If the user
+                //    has listed `image` we trust them; if they
+                //    explicitly listed only `text` we surface that as
+                //    a config error.
+                match model_supports_image_input(&self.config.raw, &name) {
+                    Some(true) => return Ok(name),
+                    Some(false) => {
+                        return Err(vision_unavailable_message(&format!(
+                            "model `{name}` is declared as text-only \
+                             (`input: [\"text\"]`) in its provider config. \
+                             Add `\"image\"` to the model's `input` array \
+                             or set `agents.defaults.model.vision`."
+                        )));
+                    }
+                    None => {} // no declaration → fall through to heuristic
+                }
+
+                // 2. No declaration: fall back to a vision-allow-list.
+                //    Defaulting to text-only here is the safer choice
+                //    — an unknown model name is more likely text-only
+                //    than vision-capable, and a clear error pointing
+                //    at the config beats a cryptic API failure later.
+                if is_known_vision_model(&name) {
+                    Ok(name)
+                } else {
+                    Err(vision_unavailable_message(&format!(
+                        "primary model `{name}` is not in the built-in \
+                         vision allow-list and its provider config does \
+                         not declare `input: [\"image\"]`. Either set \
+                         `agents.defaults.model.vision` to a vision \
+                         model, or declare `input: [\"text\", \"image\"]` \
+                         on the `{name}` entry under \
+                         `models.providers.<provider>.models[]`."
+                    )))
+                }
+            }
+            VisionResolution::NoneConfigured => Err(vision_unavailable_message(
+                "no model is configured for this agent.",
+            )),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -4754,11 +5103,10 @@ impl AgentRuntime {
                                 .filter(|u| u.starts_with("data:image/"))
                         });
                         let img_path = v.get("image_path").and_then(|p| p.as_str());
-                        // computer_use / ui_analyze screenshots are internal agent state —
+                        // computer_use screenshots are internal agent state —
                         // never auto-send to the user. Only image-gen and explicit uploads
                         // should forward images.
-                        let is_internal_screenshot =
-                            tool_name == "computer_use" || tool_name == "ui_analyze";
+                        let is_internal_screenshot = tool_name == "computer_use";
                         if !is_internal_screenshot
                             && let Some(img) = img_data.or(img_path)
                         {
@@ -5409,7 +5757,6 @@ impl AgentRuntime {
             "web_download" => return self.tool_web_download(args).await,
             "web_browser" | "browser" => return self.tool_web_browser(ctx, args).await,
             "computer_use" => return self.tool_computer_use(args).await,
-            "ui_analyze" => return self.tool_ui_analyze(args).await,
             "image_gen" | "image" => return self.tool_image(args).await,
             "video_gen" | "video" => return self.tool_video(args, ctx).await,
             "pdf" => return self.tool_pdf(args).await,
@@ -6666,6 +7013,284 @@ mod tests {
         // "HEARTBEAT_OK" reply bug where cron jobs got the minimal prompt.
         assert!(!is_minimal_context_session("cron:morning-briefing"));
         assert!(!is_minimal_context_session("agent:main:telegram:direct:u1"));
+    }
+
+    // ------------------------------------------------------------------
+    // model_supports_image_input — schema-driven vision-capability lookup
+    // ------------------------------------------------------------------
+
+    fn build_config_with_models(
+        provider_name: &str,
+        models: Vec<crate::config::schema::ModelDef>,
+    ) -> crate::config::schema::Config {
+        use crate::config::schema::{
+            ApiFormat, Config, ModelsConfig, ProviderConfig,
+        };
+        let pc = ProviderConfig {
+            base_url: None,
+            api_key: None,
+            api: Some(ApiFormat::OpenAiCompletions),
+            models: Some(models),
+            enabled: Some(true),
+            user_agent: None,
+        };
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(provider_name.to_owned(), pc);
+        Config {
+            models: Some(ModelsConfig {
+                mode: None,
+                providers,
+            }),
+            ..Config::default()
+        }
+    }
+
+    fn model_def(id: &str, inputs: Option<Vec<crate::config::schema::InputType>>) -> crate::config::schema::ModelDef {
+        crate::config::schema::ModelDef {
+            id: id.to_owned(),
+            name: None,
+            reasoning: None,
+            input: inputs,
+            cost: None,
+            context_window: None,
+            max_tokens: None,
+            enabled: None,
+        }
+    }
+
+    #[test]
+    fn model_supports_image_input_explicit_image() {
+        use crate::config::schema::InputType;
+        let cfg = build_config_with_models(
+            "kimi",
+            vec![model_def("kimi-for-coding", Some(vec![InputType::Text, InputType::Image]))],
+        );
+        // Both qualified and unqualified lookups resolve.
+        assert_eq!(model_supports_image_input(&cfg, "kimi/kimi-for-coding"), Some(true));
+        assert_eq!(model_supports_image_input(&cfg, "kimi-for-coding"), Some(true));
+    }
+
+    #[test]
+    fn model_supports_image_input_text_only() {
+        use crate::config::schema::InputType;
+        let cfg = build_config_with_models(
+            "deepseek",
+            vec![model_def("deepseek-chat", Some(vec![InputType::Text]))],
+        );
+        assert_eq!(model_supports_image_input(&cfg, "deepseek/deepseek-chat"), Some(false));
+    }
+
+    #[test]
+    fn model_supports_image_input_no_input_field_returns_none() {
+        let cfg = build_config_with_models(
+            "kimi",
+            vec![model_def("kimi-for-coding", None)],
+        );
+        // input field absent → caller should fall back to blocklist.
+        assert_eq!(model_supports_image_input(&cfg, "kimi/kimi-for-coding"), None);
+    }
+
+    #[test]
+    fn model_supports_image_input_unknown_model_returns_none() {
+        use crate::config::schema::InputType;
+        let cfg = build_config_with_models(
+            "kimi",
+            vec![model_def("kimi-for-coding", Some(vec![InputType::Image]))],
+        );
+        assert_eq!(model_supports_image_input(&cfg, "openai/gpt-4"), None);
+    }
+
+    // ------------------------------------------------------------------
+    // is_known_vision_model — built-in allow-list
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn is_known_vision_model_kimi_family() {
+        // kimi-for-coding ships vision tuning.
+        assert!(is_known_vision_model("kimi/kimi-for-coding"));
+        assert!(is_known_vision_model("kimi-for-coding"));
+        // K2.5+ series is multimodal; older K2.x (K2.0..=K2.4) is not.
+        assert!(is_known_vision_model("kimi/kimi-k2.5"));
+        assert!(is_known_vision_model("kimi/kimi-k2.6-preview"));
+        assert!(is_known_vision_model("kimi/kimi-k2.7"));
+        // Pre-2.5 must NOT match.
+        assert!(!is_known_vision_model("kimi/kimi-k2.0"));
+        assert!(!is_known_vision_model("kimi/kimi-k1"));
+    }
+
+    #[test]
+    fn is_known_vision_model_major_vlms() {
+        for name in [
+            // International
+            "openai/gpt-4o",
+            "openai/gpt-4-vision-preview",
+            "openai/gpt-5",
+            "anthropic/claude-3-opus",
+            "anthropic/claude-sonnet-4-5",
+            "anthropic/claude-4-7",
+            "google/gemini-1.5-pro",
+            "google/gemini-3-ultra",
+            "google/gemma-3-27b-it",
+            "google/gemma-4-9b",
+            "google/paligemma-3b-mix",
+            "meta/llama-3.2-90b-vision-instruct",
+            "meta/llama-4-scout-17b",
+            "mistral/pixtral-12b",
+            "mistral/mistral-small-3.1-24b",
+            "cohere/aya-vision-32b",
+            "xai/grok-3", "xai/grok-4-fast",
+
+            // Chinese — ByteDance / Alibaba / Moonshot / Zhipu / Baidu / 01 / Baichuan / DeepSeek / Tencent / MiniMax / StepFun
+            "doubao/doubao-seed-1.5-vision-pro",
+            "doubao/doubao-seed-1.6-vision-thinking",
+            // Doubao Seed 2+ — entire 2.x / 3.x / ... subtree is multimodal
+            "doubao/doubao-seed-2.0-pro",
+            "doubao/doubao-seed-2.0-lite",
+            "doubao/doubao-seed-2.0-code",
+            "doubao/doubao-seed-2.0-vision",
+            "doubao/doubao-seed-2.0-flash",
+            "doubao/doubao-seed-2.5-pro",       // future minor
+            "doubao/doubao-seed-3.0-pro",       // future major (auto-covered)
+            "doubao/doubao-seed-4-omni",
+            "doubao/doubao-vision",
+            "doubao/seedream",
+            "qwen/qwen-vl-plus",
+            "qwen/qwen2.5-vl-72b",
+            "qwen/qwen3-vl-30b",
+            "qwen/qwen3.5-instruct",
+            "qwen/qwen-3.6-pro",
+            "qwen/qvq-72b-preview",
+            "kimi/kimi-for-coding",
+            "kimi/kimi-k2.5",
+            "kimi/kimi-k2.6-preview",
+            "kimi/kimi-vl-thinking",
+            "zhipu/glm-4v-9b",
+            "zhipu/glm-4.5v",
+            "zhipu/cogagent-9b",
+            "baidu/ernie-4.5-vl-424b",
+            "baidu/ernie-5-pro",
+            "sensetime/sensenova-v6-pro",
+            "01-ai/yi-vl-34b",
+            "baichuan/baichuan-omni-1.5",
+            "deepseek/deepseek-vl2",
+            "deepseek/janus-pro-7b",
+            "tencent/hunyuan-vision",
+            "minimax/minimax-vl-01",
+            "stepfun/step-1o-vision-32k",
+            "stepfun/step-3",
+
+            // Open-source
+            "liuhaotian/llava-1.6-34b",
+            "opengvlab/internvl3-78b",
+            "openbmb/minicpm-v-2.6",
+            "microsoft/phi-3-vision-128k",
+            "microsoft/florence-2-large",
+            "huggingfaceh4/idefics3-8b",
+            "huggingfaceh4/smolvlm-instruct",
+            "nvidia/nvila-15b",
+
+            // GUI-agent VLMs
+            "bytedance/ui-tars-1.5-7b",
+            "bytedance/ui-tars-2",
+            "showui-2b",
+            "os-atlas-pro-7b",
+
+            // Universal suffix matchers
+            "anything-with-vision-suffix",
+            "weird-foo-omni",
+        ] {
+            assert!(is_known_vision_model(name), "should match: {name}");
+        }
+    }
+
+    #[test]
+    fn is_known_vision_model_text_only_returns_false() {
+        for name in [
+            // OpenAI text-only
+            "openai/gpt-3.5-turbo",
+            "openai/gpt-4",                 // bare GPT-4 base is text-only
+            "openai/text-davinci-003",
+            // Anthropic legacy
+            "anthropic/claude-2.1",
+            "anthropic/claude-instant-1",
+            // DeepSeek non-VL
+            "deepseek/deepseek-chat",
+            "deepseek/deepseek-reasoner",
+            "deepseek/deepseek-coder",
+            "deepseek/deepseek-v3",
+            // Doubao text-only
+            "doubao/doubao-seed-1.6",       // text variant; only -vision suffix is multimodal
+            "doubao/doubao-pro-256k",
+            "doubao/doubao-lite",
+            // Qwen text-only (pre-3.5)
+            "qwen/qwen-turbo",
+            "qwen/qwen-max",
+            "qwen/qwen-plus",
+            "qwen/qwen3.0",
+            "qwen/qwen3.4",
+            "qwen/qwen-3.4-instruct",
+            "qwen/qwen3-coder",             // coder is text-only
+            // Pre-3 Gemma
+            "google/gemma-2-9b",
+            "google/gemma-1-7b",
+            // Llama text-only
+            "meta/llama-3-70b",
+            "meta/llama-3.1-405b",
+            "meta/llama-3.2-3b",            // small Llama 3.2 are text
+            // Mistral text-only
+            "mistral/mistral-7b-instruct",
+            "mistral/mixtral-8x7b",
+            "mistral/codestral-22b",
+            "mistral/mistral-large-2411",
+            // Kimi pre-2.5
+            "kimi/kimi-k1",
+            "kimi/kimi-k2.0",
+            "kimi/kimi-k2.4",
+            "kimi/moonshot-v1-128k",        // base v1 is text without -vision
+            // Zhipu text-only (no v suffix)
+            "zhipu/glm-4-flash",
+            "zhipu/glm-4.5",
+            "zhipu/glm-5",                  // bare GLM-5 (the VL variant is glm-5v)
+            // Baidu text-only
+            "baidu/ernie-3.5-128k",
+            "baidu/ernie-4.0-turbo",
+            "baidu/ernie-speed",
+            // Yi text-only
+            "01-ai/yi-large",
+            "01-ai/yi-lightning",
+            // Baichuan text-only
+            "baichuan/baichuan2-13b",
+            "baichuan/baichuan4",
+            // Hunyuan text-only
+            "tencent/hunyuan-large",
+            "tencent/hunyuan-t1",
+            // MiniMax text-only — including base M2 / M2.5 / M2.7
+            // (despite "native multimodal" marketing, third-party
+            // testing confirms text-only input).
+            "minimax/abab6.5-chat",
+            "minimax/minimax-m1",
+            "minimax/minimax-m2",
+            "minimax/minimax-m2.5",
+            "minimax/minimax-m2.7",
+            "minimax/minimax-m3-base",
+            // StepFun text-only
+            "stepfun/step-1-128k",
+            "stepfun/step-2-mini",
+            // SmolLM (NOT SmolVLM)
+            "huggingfaceh4/smollm-1.7b",
+            "huggingfaceh4/smollm2-1.7b",
+            // MiniCPM bare (NOT minicpm-v)
+            "openbmb/minicpm-2b",
+            "openbmb/minicpm3-4b",
+            // Phi text-only
+            "microsoft/phi-3-mini-4k",
+            "microsoft/phi-4",              // bare phi-4 is text; phi-4-multimodal is vision
+            // Generic / unknown model — defaults to text-only.
+            "some-new-llm/v1",
+            "future-vendor/futurelm-2030",
+        ] {
+            assert!(!is_known_vision_model(name), "should NOT match (false positive): {name}");
+        }
     }
 }
 

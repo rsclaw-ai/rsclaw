@@ -2346,6 +2346,19 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "ja" => "\n\n[\u{30B7}\u{30B9}\u{30C6}\u{30E0}\u{306E}\u{304A}\u{77E5}\u{3089}\u{305B}] \u{4ECA}\u{56DE}\u{306E}\u{97F3}\u{58F0}\u{8A8D}\u{8B58}\u{306F}\u{30D5}\u{30A9}\u{30FC}\u{30EB}\u{30D0}\u{30C3}\u{30AF}\u{7D4C}\u{8DEF}\u{3092}\u{4F7F}\u{7528}\u{3057}\u{307E}\u{3057}\u{305F}\u{FF08}provider={provider}\u{FF09}\u{3002}\u{8A8D}\u{8B58}\u{7CBE}\u{5EA6}\u{3092}\u{4E0A}\u{3052}\u{308B}\u{306B}\u{306F}\u{FF1A}\n  rsclaw tools install sherpa-onnx\n  rsclaw models download paraformer-zh\n\u{3053}\u{306E}\u{30D2}\u{30F3}\u{30C8}\u{306F}1\u{56DE}\u{306E}\u{307F}\u{8868}\u{793A}\u{3055}\u{308C}\u{307E}\u{3059}\u{3002}",
     );
 
+    msg!("vision_unavailable",
+        "en" => "computer_use requires a vision-capable model, but {reason}\n\nHow to fix:\n• Set `agents.defaults.model.vision` to a vision model in your config, OR\n• Replace `agents.defaults.model.primary` with a vision-capable model.\n\nKnown vision-capable model identifiers include:\n• qwen-3.x-x\n• kimi-k2.5/kimi-k2.6/kimi-k2.x/kimi-for-coding\n• doubao-seed-2.0-pro/doubao-seed-2.0-lite/doubao-seed-2.x\n• gpt-4o / gpt-4o-mini\n• claude-3-5-sonnet / claude-sonnet-4-x\n• gemini-1.5-x/gemini-2-x/gemini-3-x\n• gemma-3-x/gemma-4-x",
+        "zh" => "computer_use 需要支持视觉的模型，但{reason}\n\n如何修复:\n• 在配置中将 `agents.defaults.model.vision` 设为视觉模型，或\n• 将 `agents.defaults.model.primary` 替换为支持视觉的模型。\n\n已知支持视觉的模型标识包括:\n• qwen-3.x-x\n• kimi-k2.5/kimi-k2.6/kimi-k2.x/kimi-for-coding\n• doubao-seed-2.0-pro/doubao-seed-2.0-lite/doubao-seed-2.x\n• gpt-4o / gpt-4o-mini\n• claude-3-5-sonnet / claude-sonnet-4-x\n• gemini-1.5-x/gemini-2-x/gemini-3-x\n• gemma-3-x/gemma-4-x",
+        "ja" => "computer_use には視覚対応モデルが必要ですが、{reason}\n\n対処方法:\n• 設定で `agents.defaults.model.vision` に視覚モデルを設定するか、\n• `agents.defaults.model.primary` を視覚対応モデルに置き換えてください。\n\n既知の視覚対応モデル ID:\n• qwen-3.x-x\n• kimi-k2.5/kimi-k2.6/kimi-k2.x/kimi-for-coding\n• doubao-seed-2.0-pro/doubao-seed-2.0-lite/doubao-seed-2.x\n• gpt-4o / gpt-4o-mini\n• claude-3-5-sonnet / claude-sonnet-4-x\n• gemini-1.5-x/gemini-2-x/gemini-3-x\n• gemma-3-x/gemma-4-x",
+        "ko" => "computer_use 에는 비전 지원 모델이 필요하지만, {reason}\n\n해결 방법:\n• 구성에서 `agents.defaults.model.vision` 를 비전 모델로 설정하거나,\n• `agents.defaults.model.primary` 를 비전 지원 모델로 교체하세요.\n\n알려진 비전 지원 모델 ID:\n• qwen-3.x-x\n• kimi-k2.5/kimi-k2.6/kimi-k2.x/kimi-for-coding\n• doubao-seed-2.0-pro/doubao-seed-2.0-lite/doubao-seed-2.x\n• gpt-4o / gpt-4o-mini\n• claude-3-5-sonnet / claude-sonnet-4-x\n• gemini-1.5-x/gemini-2-x/gemini-3-x\n• gemma-3-x/gemma-4-x",
+        "th" => "computer_use ต้องใช้โมเดลที่รองรับการมองเห็น แต่ {reason}\n\nวิธีแก้:\n• ตั้งค่า `agents.defaults.model.vision` เป็นโมเดลวิชั่นในการตั้งค่า หรือ\n• เปลี่ยน `agents.defaults.model.primary` เป็นโมเดลที่รองรับวิชั่น\n\nรายชื่อโมเดลที่รองรับวิชั่น:\n• qwen-3.x-x\n• kimi-k2.5/kimi-k2.6/kimi-k2.x/kimi-for-coding\n• doubao-seed-2.0-pro/doubao-seed-2.0-lite/doubao-seed-2.x\n• gpt-4o / gpt-4o-mini\n• claude-3-5-sonnet / claude-sonnet-4-x\n• gemini-1.5-x/gemini-2-x/gemini-3-x\n• gemma-3-x/gemma-4-x",
+        "vi" => "computer_use yeu cau mo hinh ho tro thi giac, nhung {reason}\n\nCach khac phuc:\n• Dat `agents.defaults.model.vision` thanh mo hinh vision trong config, HOAC\n• Thay `agents.defaults.model.primary` bang mo hinh ho tro vision.\n\nDanh sach mo hinh ho tro vision:\n• qwen-3.x-x\n• kimi-k2.5/kimi-k2.6/kimi-k2.x/kimi-for-coding\n• doubao-seed-2.0-pro/doubao-seed-2.0-lite/doubao-seed-2.x\n• gpt-4o / gpt-4o-mini\n• claude-3-5-sonnet / claude-sonnet-4-x\n• gemini-1.5-x/gemini-2-x/gemini-3-x\n• gemma-3-x/gemma-4-x",
+        "es" => "computer_use requiere un modelo con capacidad de vision, pero {reason}\n\nComo solucionarlo:\n• Configure `agents.defaults.model.vision` con un modelo de vision, O\n• Reemplace `agents.defaults.model.primary` con un modelo con vision.\n\nIdentificadores de modelos con vision conocidos:\n• qwen-3.x-x\n• kimi-k2.5/kimi-k2.6/kimi-k2.x/kimi-for-coding\n• doubao-seed-2.0-pro/doubao-seed-2.0-lite/doubao-seed-2.x\n• gpt-4o / gpt-4o-mini\n• claude-3-5-sonnet / claude-sonnet-4-x\n• gemini-1.5-x/gemini-2-x/gemini-3-x\n• gemma-3-x/gemma-4-x",
+        "fr" => "computer_use exige un modele compatible vision, mais {reason}\n\nComment corriger :\n• Definissez `agents.defaults.model.vision` sur un modele vision, OU\n• Remplacez `agents.defaults.model.primary` par un modele vision.\n\nIdentifiants de modeles vision connus :\n• qwen-3.x-x\n• kimi-k2.5/kimi-k2.6/kimi-k2.x/kimi-for-coding\n• doubao-seed-2.0-pro/doubao-seed-2.0-lite/doubao-seed-2.x\n• gpt-4o / gpt-4o-mini\n• claude-3-5-sonnet / claude-sonnet-4-x\n• gemini-1.5-x/gemini-2-x/gemini-3-x\n• gemma-3-x/gemma-4-x",
+        "de" => "computer_use erfordert ein vision-faehiges Modell, aber {reason}\n\nSo behebt man das:\n• Setzen Sie `agents.defaults.model.vision` auf ein Vision-Modell in der Konfiguration, ODER\n• Ersetzen Sie `agents.defaults.model.primary` durch ein vision-faehiges Modell.\n\nBekannte vision-faehige Modell-IDs:\n• qwen-3.x-x\n• kimi-k2.5/kimi-k2.6/kimi-k2.x/kimi-for-coding\n• doubao-seed-2.0-pro/doubao-seed-2.0-lite/doubao-seed-2.x\n• gpt-4o / gpt-4o-mini\n• claude-3-5-sonnet / claude-sonnet-4-x\n• gemini-1.5-x/gemini-2-x/gemini-3-x\n• gemma-3-x/gemma-4-x",
+        "ru" => "computer_use \u{0442}\u{0440}\u{0435}\u{0431}\u{0443}\u{0435}\u{0442} \u{043C}\u{043E}\u{0434}\u{0435}\u{043B}\u{044C} \u{0441} \u{043F}\u{043E}\u{0434}\u{0434}\u{0435}\u{0440}\u{0436}\u{043A}\u{043E}\u{0439} \u{0437}\u{0440}\u{0435}\u{043D}\u{0438}\u{044F}, \u{043D}\u{043E} {reason}\n\n\u{041A}\u{0430}\u{043A} \u{0438}\u{0441}\u{043F}\u{0440}\u{0430}\u{0432}\u{0438}\u{0442}\u{044C}:\n• \u{0423}\u{0441}\u{0442}\u{0430}\u{043D}\u{043E}\u{0432}\u{0438}\u{0442}\u{0435} `agents.defaults.model.vision` \u{043D}\u{0430} \u{0432}\u{0438}\u{0437}\u{0443}\u{0430}\u{043B}\u{044C}\u{043D}\u{0443}\u{044E} \u{043C}\u{043E}\u{0434}\u{0435}\u{043B}\u{044C} \u{0432} \u{043A}\u{043E}\u{043D}\u{0444}\u{0438}\u{0433}\u{0435}, \u{0418}\u{041B}\u{0418}\n• \u{0417}\u{0430}\u{043C}\u{0435}\u{043D}\u{0438}\u{0442}\u{0435} `agents.defaults.model.primary` \u{043D}\u{0430} \u{0432}\u{0438}\u{0437}\u{0443}\u{0430}\u{043B}\u{044C}\u{043D}\u{0443}\u{044E} \u{043C}\u{043E}\u{0434}\u{0435}\u{043B}\u{044C}.\n\n\u{0418}\u{0437}\u{0432}\u{0435}\u{0441}\u{0442}\u{043D}\u{044B}\u{0435} \u{0432}\u{0438}\u{0437}\u{0443}\u{0430}\u{043B}\u{044C}\u{043D}\u{044B}\u{0435} \u{043C}\u{043E}\u{0434}\u{0435}\u{043B}\u{0438}:\n• qwen-3.x-x\n• kimi-k2.5/kimi-k2.6/kimi-k2.x/kimi-for-coding\n• doubao-seed-2.0-pro/doubao-seed-2.0-lite/doubao-seed-2.x\n• gpt-4o / gpt-4o-mini\n• claude-3-5-sonnet / claude-sonnet-4-x\n• gemini-1.5-x/gemini-2-x/gemini-3-x\n• gemma-3-x/gemma-4-x",
+    );
+
     msg!("install_hint_tts_sherpa",
         "en" => "\n\n[System hint] Voice reply is using the fallback system TTS — Chinese sounds robotic. For natural Chinese speech, install:\n  rsclaw tools install sherpa-onnx\n  rsclaw models download melo\nThis hint is shown only once.",
         "zh" => "\n\n[\u{7CFB}\u{7EDF}\u{63D0}\u{793A}] \u{5F53}\u{524D}\u{8BED}\u{97F3}\u{56DE}\u{590D}\u{8D70}\u{7684}\u{662F}\u{7CFB}\u{7EDF}\u{5907}\u{4EFD} TTS\u{FF0C}\u{4E2D}\u{6587}\u{97F3}\u{8D28}\u{4E00}\u{822C}\u{3002}\u{8981}\u{4F7F}\u{7528}\u{66F4}\u{81EA}\u{7136}\u{7684} MeloTTS\u{FF0C}\u{8BF7}\u{8FD0}\u{884C}\u{FF1A}\n  rsclaw tools install sherpa-onnx\n  rsclaw models download melo\n\u{6B64}\u{63D0}\u{793A}\u{53EA}\u{663E}\u{793A}\u{4E00}\u{6B21}\u{3002}",
@@ -2473,5 +2486,44 @@ mod tests {
     fn default_lang_fallback() {
         // Before set_default_lang is called, default is "en"
         assert_eq!(default_lang(), "en");
+    }
+
+    #[test]
+    fn vision_unavailable_translates_per_language() {
+        // Each translation must (a) interpolate {reason} and (b) keep
+        // the model-name list intact so the user sees something
+        // actionable in their channel.
+        for (lang, expected_keyword) in [
+            ("en", "How to fix"),
+            ("zh", "如何修复"),
+            ("ja", "対処方法"),
+            ("ko", "해결 방법"),
+            ("fr", "Comment corriger"),
+            ("de", "So behebt"),
+            ("es", "Como solucionarlo"),
+        ] {
+            let msg = t_fmt(
+                "vision_unavailable",
+                lang,
+                &[("reason", "primary text-only")],
+            );
+            assert!(msg.contains("primary text-only"), "{lang}: missing reason");
+            assert!(msg.contains(expected_keyword), "{lang}: missing keyword");
+            // Every translation must list the canonical model groups.
+            assert!(msg.contains("kimi-for-coding"), "{lang}: missing kimi");
+            assert!(msg.contains("doubao-seed-2"), "{lang}: missing doubao");
+            assert!(msg.contains("gpt-4o"), "{lang}: missing gpt-4o");
+        }
+    }
+
+    #[test]
+    fn vision_unavailable_unknown_lang_falls_back_to_english() {
+        let msg = t_fmt(
+            "vision_unavailable",
+            "zz",
+            &[("reason", "no model configured")],
+        );
+        assert!(msg.contains("How to fix"));
+        assert!(msg.contains("no model configured"));
     }
 }

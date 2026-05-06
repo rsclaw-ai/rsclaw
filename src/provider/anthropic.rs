@@ -60,10 +60,15 @@ impl LlmProvider for AnthropicProvider {
     fn stream(&self, req: LlmRequest) -> BoxFuture<'_, Result<LlmStream>> {
         Box::pin(async move {
             let body = build_request_body(&req)?;
+            let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+            // Capture model + URL up-front so the failure path can
+            // surface them in the error message — a bare "404 Not
+            // Found" is otherwise impossible to triage.
+            let model_for_log = req.model.clone();
 
             let resp = self
                 .client
-                .post(format!("{}/v1/messages", self.base_url.trim_end_matches('/')))
+                .post(&url)
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", ANTHROPIC_VERSION)
                 .header("content-type", "application/json")
@@ -75,12 +80,14 @@ impl LlmProvider for AnthropicProvider {
                 .timeout(std::time::Duration::from_secs(120))
                 .send()
                 .await
-                .context("Anthropic request failed")?;
+                .with_context(|| format!("Anthropic request failed (url={url})"))?;
 
             let status = resp.status();
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("Anthropic API error {status}: {body}");
+                anyhow::bail!(
+                    "Anthropic API error {status} at {url} (model={model_for_log}): {body}"
+                );
             }
 
             let byte_stream = resp.bytes_stream();
@@ -194,11 +201,52 @@ fn serialize_message(msg: &Message) -> Value {
         Role::System => "user", // fallback, shouldn't happen
     };
 
+    // Anthropic's API rejects messages with empty `content` ("the
+    // message at position N with role 'user' must not be empty").
+    // Empty content here is almost always a bug somewhere upstream
+    // (compaction, tool-result truncation, an aborted turn that left
+    // a husk in history). Rather than 400-out the entire turn, we
+    // substitute a single-char placeholder so the conversation can
+    // make forward progress; the upstream bug should still be fixed,
+    // but a placeholder beats a hard failure on every retry.
+    const EMPTY_PLACEHOLDER: &str = "(empty turn)";
     let content = match &msg.content {
-        MessageContent::Text(t) => json!(t),
+        MessageContent::Text(t) => {
+            if t.trim().is_empty() {
+                tracing::warn!(role, "empty text-content message; substituting placeholder");
+                json!(EMPTY_PLACEHOLDER)
+            } else {
+                json!(t)
+            }
+        }
         MessageContent::Parts(parts) => {
             let serialized: Vec<Value> = parts.iter().map(serialize_part).collect();
-            json!(serialized)
+            // Reject entirely-empty parts arrays, and arrays where
+            // every Text/Reasoning part is whitespace.
+            let has_meaningful_content = !serialized.is_empty()
+                && serialized.iter().any(|p| {
+                    let t = p.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if t == "text" {
+                        p.get("text")
+                            .and_then(|v| v.as_str())
+                            .map(|s| !s.trim().is_empty())
+                            .unwrap_or(false)
+                    } else {
+                        // image / tool_use / tool_result are non-empty
+                        // by construction — they always carry data.
+                        true
+                    }
+                });
+            if has_meaningful_content {
+                json!(serialized)
+            } else {
+                tracing::warn!(
+                    role,
+                    parts_len = serialized.len(),
+                    "all-empty parts array; substituting placeholder"
+                );
+                json!([{ "type": "text", "text": EMPTY_PLACEHOLDER }])
+            }
         }
     };
 

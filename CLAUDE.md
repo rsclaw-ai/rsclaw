@@ -160,6 +160,15 @@ RSCLAW_BUILD_VERSION=dev RSCLAW_BUILD_DATE=test cargo build
 cargo run -- --dev                          # port 18889
 RSCLAW_BUILD_VERSION=dev RSCLAW_BUILD_DATE=test cargo test
 
+# macOS only — wraps `cargo build` and re-signs the binary with a
+# stable codesign identifier so Accessibility / Input Monitoring grants
+# survive rebuilds (otherwise computer_use's enigo input synthesis
+# fails with "the application does not have the permission to simulate
+# input" after every rebuild). Use this instead of `cargo build` for
+# computer_use development.
+bash scripts/dev-build.sh
+bash scripts/dev-build.sh --release
+
 # Frontend
 cd ui && yarn dev
 cd ui && yarn tsc --noEmit
