@@ -781,7 +781,8 @@ pub(crate) fn build_tool_list(
                 }, "required": ["x", "y", "width", "height"]},
                 "max_long_edge_px": {"type": "integer", "description": "Screenshot resize cap: longest edge of returned image. Default 1024 (XGA). Range 64-8192. Larger values = more detail + more tokens."},
                 "instruction": {"type": "string", "description": "NATURAL-LANGUAGE task instruction for the ui_tars end-to-end agent loop. Example: 'Open WeChat, search for RsClaw研发群, and send a greeting message'. The UI-TARS vision model will drive screenshot->analyze->execute internally. ONLY used with action=ui_tars."},
-                "max_steps": {"type": "integer", "description": "Maximum steps for the ui_tars loop (default: 30). ONLY used with action=ui_tars."}
+                "max_steps": {"type": "integer", "description": "Maximum steps for the ui_tars loop (default: 30). ONLY used with action=ui_tars."},
+                "async": {"type": "boolean", "description": "Run ui_tars in the background instead of blocking the current turn. STRONGLY RECOMMENDED for any task expected to take >30 seconds (WeChat group monitoring, video downloads, multi-step automations). With async=true the call returns a `task_id` immediately and you should reply to the user with an acknowledgement (e.g. '我已经开始处理'); the actual outcome arrives as a separate message when the task finishes. Without async (default false), the tool blocks for up to 4 minutes — suitable only for quick visual queries (e.g. 'screenshot and tell me what's on screen'). ONLY used with action=ui_tars."}
             },
             "required": ["action"]
         }),

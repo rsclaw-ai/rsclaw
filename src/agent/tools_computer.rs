@@ -46,7 +46,11 @@ impl super::runtime::AgentRuntime {
     /// Top-level dispatcher for the `computer_use` tool. Routes by
     /// `args["action"]` to one of the handlers documented in the module
     /// header.
-    pub(crate) async fn tool_computer_use(&self, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_computer_use(
+        &self,
+        ctx: &super::runtime::RunContext,
+        args: Value,
+    ) -> Result<Value> {
         let action_str = args["action"]
             .as_str()
             .ok_or_else(|| anyhow!("computer_use: `action` required"))?;
@@ -92,7 +96,7 @@ impl super::runtime::AgentRuntime {
             "get_app_rule" | "get_skill" => get_app_rule(&args),
 
             // ---- End-to-end VLM driver -----------------------------------
-            "ui_tars" => self.tool_ui_tars(&args).await,
+            "ui_tars" => self.tool_ui_tars(ctx, &args).await,
 
             other => Err(anyhow!(
                 "computer_use: unsupported action `{other}` \
@@ -386,11 +390,24 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
     // ui_tars — end-to-end VLM loop. Resolves vision model -> provider,
     // builds VlmDriver, runs the instruction, translates outcome to JSON.
     // -----------------------------------------------------------------------
-    async fn tool_ui_tars(&self, args: &Value) -> Result<Value> {
+    async fn tool_ui_tars(
+        &self,
+        ctx: &super::runtime::RunContext,
+        args: &Value,
+    ) -> Result<Value> {
         let instruction = args["instruction"]
             .as_str()
             .ok_or_else(|| anyhow!("computer_use ui_tars: `instruction` required"))?;
         let max_steps = args["max_steps"].as_u64().unwrap_or(30) as usize;
+        // Plan B: fire-and-forget mode. Default opt-in via `async: true`
+        // (or alias `background: true`). When set, the driver runs in a
+        // detached tokio task, the tool call returns a `task_id`
+        // immediately, and the agent inbox stays free to process
+        // heartbeats / other channels. On completion, an internal
+        // AgentMessage is injected back into the same session so the
+        // upstream LLM can see the outcome and respond to the user.
+        let async_mode = args["async"].as_bool().unwrap_or(false)
+            || args["background"].as_bool().unwrap_or(false);
 
         // 1. Resolve the vision model. Returns a clear, actionable error
         //    when nothing usable is configured.
@@ -431,11 +448,168 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
             }) as Arc<dyn Fn(PermissionRequest) + Send + Sync>
         });
 
+        let abort = Arc::new(AtomicBool::new(false));
+        let agent_id = self.handle.id.clone();
+        let app_label = derive_app_label(instruction);
+
+        // ---------- ASYNC PATH (fire-and-forget) ----------
+        if async_mode {
+            let task_id = format!("ui_tars-{}", uuid::Uuid::new_v4().simple());
+            let instruction_owned = instruction.to_owned();
+            let permission_clone = Arc::clone(&permission);
+            let provider_clone = Arc::clone(&provider);
+            let model_name_clone = model_name.clone();
+            let app_rules_clone = app_rules.clone();
+            let permission_emit_clone = permission_emit.clone();
+            let self_handle = Arc::clone(&self.handle);
+            let notification_tx = self.notification_tx.clone();
+            let session_key = ctx.session_key.clone();
+            let channel = ctx.channel.clone();
+            let peer_id = ctx.peer_id.clone();
+            let chat_id = ctx.chat_id.clone();
+            let abort_clone = Arc::clone(&abort);
+            let task_id_for_log = task_id.clone();
+
+            tokio::spawn(async move {
+                tracing::info!(
+                    task_id = %task_id_for_log,
+                    agent = %agent_id,
+                    "ui_tars: detached task started"
+                );
+                // Build the driver inside the spawned task — NativeOperator
+                // has no state and is cheap to construct; this avoids
+                // Send/Sync complications around borrowing operator/
+                // app_rules across the spawn boundary.
+                let operator = NativeOperator::new();
+                let driver = VlmDriver {
+                    operator: &operator,
+                    provider: provider_clone,
+                    model_name: model_name_clone,
+                    coord_format: CoordFormat::Auto,
+                    max_loop: max_steps,
+                    abort: abort_clone,
+                    app_rules: &app_rules_clone,
+                    permission: permission_clone,
+                    agent_id: agent_id.clone(),
+                    app: app_label,
+                    permission_emit: permission_emit_clone,
+                };
+
+                let outcome = driver.run(&instruction_owned).await
+                    .unwrap_or_else(|e| DriverOutcome::OperatorError {
+                        message: format!("driver run failed: {e}"),
+                        steps: 0,
+                    });
+
+                // Build a human-readable result for the wake message.
+                let result_text = match &outcome {
+                    DriverOutcome::Finished { content, steps } => {
+                        format!(
+                            "[ui_tars task {task_id_for_log} completed in {steps} steps] {content}"
+                        )
+                    }
+                    DriverOutcome::CallUser { reason, steps } => {
+                        format!(
+                            "[ui_tars task {task_id_for_log} needs user input after {steps} steps] {reason}"
+                        )
+                    }
+                    DriverOutcome::MaxLoop { steps } => {
+                        format!(
+                            "[ui_tars task {task_id_for_log}] hit max_loop ({steps} steps) without finishing — task may be incomplete"
+                        )
+                    }
+                    DriverOutcome::UserAbort { steps } => {
+                        format!("[ui_tars task {task_id_for_log}] aborted after {steps} steps")
+                    }
+                    DriverOutcome::PermissionDenied => {
+                        format!("[ui_tars task {task_id_for_log}] permission denied — user declined")
+                    }
+                    DriverOutcome::OperatorError { message, steps } => {
+                        format!(
+                            "[ui_tars task {task_id_for_log}] failed after {steps} steps: {message}"
+                        )
+                    }
+                };
+
+                tracing::info!(
+                    task_id = %task_id_for_log,
+                    "ui_tars: detached task finished, waking parent agent"
+                );
+
+                // Wake the parent agent: send an internal message so the
+                // LLM observes the task outcome on the next turn and
+                // replies to the user. Mirrors the pattern used by
+                // `tool_agent_task` in tools_agent.rs.
+                let (wake_tx, wake_rx) =
+                    tokio::sync::oneshot::channel::<crate::agent::AgentReply>();
+                let wake_msg = crate::agent::AgentMessage {
+                    session_key: session_key.clone(),
+                    text: result_text,
+                    channel: channel.clone(),
+                    peer_id: peer_id.clone(),
+                    chat_id: chat_id.clone(),
+                    reply_tx: wake_tx,
+                    extra_tools: vec![],
+                    images: vec![],
+                    files: vec![],
+                    account: None,
+                };
+                if let Err(e) = self_handle.tx.send(wake_msg).await {
+                    tracing::warn!(
+                        task_id = %task_id_for_log,
+                        "ui_tars: failed to wake parent agent: {e}"
+                    );
+                    return;
+                }
+
+                // Forward the agent's reply (composed from the result
+                // text) to the originating channel so the user sees
+                // the outcome. Same plumbing as `tool_agent_task`.
+                if let Ok(reply) = wake_rx.await {
+                    if reply.text.is_empty() {
+                        return;
+                    }
+                    let Some(ref ntx) = notification_tx else { return };
+                    let target = if !chat_id.is_empty() { chat_id } else { peer_id };
+                    if target.is_empty() || channel.is_empty() || channel == "system" || channel == "cron" {
+                        return;
+                    }
+                    let body = if channel == "ws" || channel == "desktop" {
+                        crate::channel::outbound_with_kind(
+                            crate::channel::outbound_kind::TASK_COMPLETE,
+                            reply.text,
+                        )
+                    } else {
+                        reply.text
+                    };
+                    let _ = ntx.send(crate::channel::OutboundMessage {
+                        target_id: target,
+                        is_group: false,
+                        text: body,
+                        reply_to: None,
+                        images: reply.images.clone(),
+                        files: reply.files.clone(),
+                        channel: Some(channel),
+                        account: None,
+                    });
+                }
+            });
+
+            return Ok(json!({
+                "action":     "ui_tars",
+                "task_id":    task_id,
+                "status":     "started",
+                "instruction": instruction,
+                "estimated_seconds": (max_steps as u64) * 10,
+                "hint": "Task is running in the background. Acknowledge to the user (e.g. \"我已经开始处理\"); the result will arrive as a separate message when the task finishes.",
+            }));
+        }
+
+        // ---------- SYNC PATH (legacy behaviour, default) ----------
         // 4. Build the driver. NativeOperator is the default; Phase 2 will
         //    branch on instruction keywords to swap in IphoneMirrorOperator
         //    or AdbOperator.
         let operator = NativeOperator::new();
-        let abort = Arc::new(AtomicBool::new(false));
 
         let driver = VlmDriver {
             operator: &operator,
@@ -446,19 +620,18 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
             abort: abort.clone(),
             app_rules: &app_rules,
             permission,
-            agent_id: self.handle.id.clone(),
-            app: derive_app_label(instruction),
+            agent_id,
+            app: app_label,
             permission_emit,
         };
 
-        // Hard timeout safety net (Plan B-lite — see
-        // docs/adr/2026-05-06-async-long-running-tools.md). The agent
-        // runtime processes one message at a time per agent; a runaway
-        // ui_tars loop here blocks heartbeats and other channels until
-        // it returns. Cap the whole driver run at 4 minutes so the
-        // heartbeat (300s timeout) never fires while we're inside.
-        // Real fire-and-forget is the proper fix; this is the
-        // safety net until that lands.
+        // Hard timeout safety net. The agent runtime processes one
+        // message at a time per agent; a runaway ui_tars loop here
+        // blocks heartbeats and other channels until it returns. Cap
+        // the whole driver run at 4 minutes so the heartbeat (300s
+        // timeout) never fires while we're inside.
+        // The async path above is the proper fix; this safety net
+        // covers the (legacy) sync path.
         const UI_TARS_HARD_TIMEOUT_SECS: u64 = 240;
         let outcome = match tokio::time::timeout(
             std::time::Duration::from_secs(UI_TARS_HARD_TIMEOUT_SECS),
@@ -468,10 +641,6 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
         {
             Ok(res) => res?,
             Err(_) => {
-                // Tell the driver to stop on its next abort check.
-                // The .await above already returned, so this is more
-                // about being a good neighbour to anyone who still
-                // holds a reference (we own the abort Arc).
                 abort.store(true, std::sync::atomic::Ordering::SeqCst);
                 tracing::warn!(
                     instruction,
@@ -481,8 +650,8 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                 DriverOutcome::OperatorError {
                     message: format!(
                         "ui_tars exceeded the {UI_TARS_HARD_TIMEOUT_SECS}s hard timeout. \
-                         The driver was aborted to prevent the agent inbox \
-                         from blocking heartbeats and other channels."
+                         For long-running tasks, pass `async: true` to run \
+                         in the background instead."
                     ),
                     steps: max_steps,
                 }
