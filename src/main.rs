@@ -192,7 +192,10 @@ async fn run() -> Result<()> {
         Command::Tray => cmd_tray(),
         Command::Backup(sub) => cmd_backup(sub).await,
         Command::Reset(args) => cmd_reset(args).await,
-        Command::Update(sub) | Command::Upgrade(sub) => cmd_update(sub).await,
+        Command::Update(wrapper) | Command::Upgrade(wrapper) => {
+            let sub = wrapper.cmd.unwrap_or(cli::UpdateCommand::Run(wrapper.run_args));
+            cmd_update(sub).await
+        }
         Command::Pairing(sub) => cmd_pairing(sub).await,
         Command::Acp(sub) => cmd_acp(sub).await,
         Command::Approvals(sub) => cmd_approvals(sub).await,

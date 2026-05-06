@@ -3234,6 +3234,7 @@ impl AgentRuntime {
                 &user_text,
                 &reply_text,
                 &metrics,
+                signature,
                 &providers,
                 &flash_model,
                 &skills_dir,

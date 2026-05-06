@@ -63,7 +63,7 @@ pub use models::{
 };
 pub use ops::{
     BackupCommand, BackupCreateArgs, HealthArgs, LogsArgs, ResetArgs, StatusArgs, TuiArgs,
-    UpdateArgs, UpdateCommand,
+    UpdateArgs, UpdateCommand, UpdateWrapper,
 };
 pub use plugins::PluginsCommand;
 pub use qr::QrArgs;
@@ -247,12 +247,10 @@ pub enum Command {
     Reset(ResetArgs),
 
     /// Update rsclaw binary.
-    #[command(subcommand)]
-    Update(UpdateCommand),
+    Update(UpdateWrapper),
 
     /// Alias for `update`.
-    #[command(subcommand)]
-    Upgrade(UpdateCommand),
+    Upgrade(UpdateWrapper),
 
     /// DM pairing management.
     #[command(subcommand)]
