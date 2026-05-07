@@ -47,6 +47,7 @@ use super::operator::Operator;
 use super::parser::{CoordFormat, parse_vlm_response};
 use super::permission::{PermissionDecision, PermissionRequest, PermissionStore};
 use super::prompt::{PromptInputs, build_system_prompt};
+use super::status::ComputerUseStatus;
 
 use crate::provider::{
     ContentPart, LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
@@ -110,16 +111,37 @@ pub struct VlmDriver<'a> {
     /// answered AllowOnce.
     pub permission_emit:
         Option<Arc<dyn Fn(PermissionRequest) + Send + Sync + 'a>>,
+    /// Optional sender for `ComputerUseStatus` events — when set, the
+    /// driver emits a `Started` at the top of the loop, a `Step` after
+    /// each executed action, and a `Finished` on exit. Surfaced to the
+    /// settings UI's live status panel. `None` (CLI / tests) makes
+    /// emission a no-op.
+    pub status_emit:
+        Option<Arc<dyn Fn(ComputerUseStatus) + Send + Sync + 'a>>,
+    /// Stable identifier for this run, included in every emitted status
+    /// event so the UI can correlate them. Caller-minted (typically
+    /// `ui_tars-<uuid>`).
+    pub run_id: String,
 }
 
 impl VlmDriver<'_> {
     /// Run the full loop. The instruction is the user's natural-language
     /// goal (e.g. "open WeChat and check the latest 5 messages").
     pub async fn run(&self, instruction: &str) -> Result<DriverOutcome> {
-        // 1. Permission gate.
+        let outcome = self.run_inner(instruction).await?;
+        self.emit_finished(&outcome);
+        Ok(outcome)
+    }
+
+    async fn run_inner(&self, instruction: &str) -> Result<DriverOutcome> {
+        // 1. Permission gate. No `Started` is emitted on denial — the
+        //    permission dialog already handled the visual; the wrapper
+        //    will still emit `Finished { kind = "permission_denied" }`
+        //    so the UI can surface a brief "denied" state.
         if let Some(deny) = self.permission_gate(instruction).await? {
             return Ok(deny);
         }
+        self.emit_started(instruction);
 
         // 2. Build the system prompt once. The action space + matched
         //    app-rules are stable across the loop, so we don't rebuild.
@@ -257,7 +279,7 @@ impl VlmDriver<'_> {
                 // user-message tells the model exactly what went wrong.
                 // This is more effective than retrying blind: the
                 // model sees the format error and corrects itself.
-                history.push(Step {
+                let step = Step {
                     thought: String::new(),
                     action_summary: "(no parseable action — your reply was missing the required `Action: ...` line)".to_owned(),
                     result_ok: false,
@@ -265,7 +287,9 @@ impl VlmDriver<'_> {
                         "Reminder: every reply must end with one `Action:` line picking from the Action Space (click/type/scroll/wait/finished/etc). Do NOT discuss tools."
                             .to_owned(),
                     ),
-                });
+                };
+                self.emit_step(steps + 1, &step);
+                history.push(step);
                 steps += 1;
                 continue;
             }
@@ -275,6 +299,20 @@ impl VlmDriver<'_> {
             // 3e. Execute each action.
             for pa in parsed {
                 let summary = summarize_parsed(&pa);
+                // Diagnostic: surface the model's raw extracted coords +
+                // screen dims at INFO level so coordinate-system bugs are
+                // visible without bumping the whole crate to debug. Cheap
+                // to keep — fires at most once per executed step.
+                info!(
+                    step = steps + 1,
+                    action_type = %pa.action_type,
+                    raw_start = ?pa.start,
+                    raw_end = ?pa.end,
+                    screen_w,
+                    screen_h,
+                    scale,
+                    "VLM action parsed"
+                );
 
                 // Terminal actions short-circuit the whole loop.
                 match pa.action_type.as_str() {
@@ -285,12 +323,14 @@ impl VlmDriver<'_> {
                             .cloned()
                             .unwrap_or_else(|| pa.thought.clone());
                         info!(steps, "VlmDriver: finished");
-                        history.push(Step {
+                        let step = Step {
                             thought: pa.thought.clone(),
                             action_summary: summary,
                             result_ok: true,
                             result_message: None,
-                        });
+                        };
+                        self.emit_step(steps + 1, &step);
+                        history.push(step);
                         return Ok(DriverOutcome::Finished { content, steps });
                     }
                     "call_user" => {
@@ -300,12 +340,14 @@ impl VlmDriver<'_> {
                             .cloned()
                             .unwrap_or_else(|| pa.thought.clone());
                         info!(steps, "VlmDriver: call_user");
-                        history.push(Step {
+                        let step = Step {
                             thought: pa.thought.clone(),
                             action_summary: summary,
                             result_ok: true,
                             result_message: None,
-                        });
+                        };
+                        self.emit_step(steps + 1, &step);
+                        history.push(step);
                         return Ok(DriverOutcome::CallUser { reason, steps });
                     }
                     "error_env" => {
@@ -327,12 +369,14 @@ impl VlmDriver<'_> {
                         action_type = %pa.action_type,
                         "could not map parsed action; skipping"
                     );
-                    history.push(Step {
+                    let step = Step {
                         thought: pa.thought.clone(),
                         action_summary: summary,
                         result_ok: false,
                         result_message: Some("unmapped action type".to_owned()),
-                    });
+                    };
+                    self.emit_step(steps + 1, &step);
+                    history.push(step);
                     steps += 1;
                     if steps >= self.max_loop {
                         return Ok(DriverOutcome::MaxLoop { steps });
@@ -357,12 +401,14 @@ impl VlmDriver<'_> {
                     }
                 };
 
-                history.push(Step {
+                let step = Step {
                     thought: pa.thought.clone(),
                     action_summary: summary,
                     result_ok: exec_result.ok,
                     result_message: exec_result.message.clone(),
-                });
+                };
+                self.emit_step(steps + 1, &step);
+                history.push(step);
                 steps += 1;
 
                 if self.abort.load(Ordering::SeqCst) {
@@ -473,6 +519,56 @@ impl VlmDriver<'_> {
             }
         }
     }
+
+    fn emit_status(&self, ev: ComputerUseStatus) {
+        if let Some(emit) = self.status_emit.as_ref() {
+            emit(ev);
+        }
+    }
+
+    fn emit_started(&self, instruction: &str) {
+        self.emit_status(ComputerUseStatus::Started {
+            run_id: self.run_id.clone(),
+            agent_id: self.agent_id.clone(),
+            app: self.app.clone(),
+            instruction: truncate(instruction, 200),
+            max_steps: self.max_loop,
+        });
+    }
+
+    fn emit_step(&self, step_index: usize, step: &Step) {
+        self.emit_status(ComputerUseStatus::Step {
+            run_id: self.run_id.clone(),
+            step_index,
+            action_summary: step.action_summary.clone(),
+            thought: truncate(&step.thought, 200),
+            result_ok: step.result_ok,
+            result_message: step.result_message.as_deref().map(|m| truncate(m, 120)),
+        });
+    }
+
+    fn emit_finished(&self, outcome: &DriverOutcome) {
+        let (kind, steps, summary) = match outcome {
+            DriverOutcome::Finished { content, steps } => {
+                ("finished", *steps, truncate(content, 200))
+            }
+            DriverOutcome::CallUser { reason, steps } => {
+                ("call_user", *steps, truncate(reason, 200))
+            }
+            DriverOutcome::MaxLoop { steps } => ("max_loop", *steps, String::new()),
+            DriverOutcome::UserAbort { steps } => ("user_abort", *steps, String::new()),
+            DriverOutcome::PermissionDenied => ("permission_denied", 0, String::new()),
+            DriverOutcome::OperatorError { message, steps } => {
+                ("operator_error", *steps, truncate(message, 200))
+            }
+        };
+        self.emit_status(ComputerUseStatus::Finished {
+            run_id: self.run_id.clone(),
+            outcome_kind: kind.to_owned(),
+            steps,
+            summary,
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -582,7 +678,21 @@ fn parsed_to_action(
     screen_w: u32,
     screen_h: u32,
 ) -> Option<Action> {
-    let scale = |c: (f32, f32)| -> (i32, i32) { (c.0 as i32, c.1 as i32) };
+    // Coord pipeline: model emits in a 0-1000 normalized grid (see
+    // the prompt's "Coordinate Space" section + UITARS_1_5-style
+    // examples), so we rescale `x/1000 * screen_w` to physical
+    // pixels. This matches ui-tars-desktop's defaultNormalizeCoords
+    // pipeline and works across UI-TARS, Doubao-vision, Claude,
+    // GPT-4o, kimi etc. — the in-context examples anchor any
+    // vision-capable LLM into the 0-1000 range, and the same rescale
+    // takes them home.
+    let scale = |c: (f32, f32)| -> (i32, i32) {
+        let (x, y) = c;
+        (
+            (x * screen_w as f32 / 1000.0).round() as i32,
+            (y * screen_h as f32 / 1000.0).round() as i32,
+        )
+    };
 
     let start_xy = p.start.map(scale);
     let end_xy = p.end.map(scale);
@@ -727,39 +837,70 @@ mod tests {
         }
     }
 
-    // The old `maps_click_normalized` test asserted that small
-    // coordinates were rescaled assuming a 0-1000 grid. That heuristic
-    // was the root cause of the "every click hits the top-left"
-    // production bug — general LLMs emit absolute pixels in the
-    // screenshot's space and the rescale was distorting them. The
-    // resolver is now pass-through, so what the parser produces is
-    // what the operator gets.
+    // Coordinate convention: 0-1000 normalized grid (matches
+    // ui-tars-desktop's defaultNormalizeCoords). Whatever the model
+    // emits inside `start_box` / `end_box` is treated as a point on
+    // the 0-1000 plane and rescaled to physical pixels via
+    // `x / 1000 * screen_w`. The system prompt's Coordinate Space
+    // section + UITARS_1_5-style examples anchor any vision-capable
+    // LLM into this range without per-model fine-tuning.
 
     #[test]
-    fn maps_click_absolute_small_coords() {
-        // A click on a top-left UI element (e.g. macOS menu bar
-        // around y=80 in physical pixels). Must NOT be remapped.
+    fn maps_click_top_left_corner() {
+        // (0, 0) on the grid → (0, 0) on the screen.
         let mut p = pa("click", &[]);
-        p.start = Some((120.0, 80.0));
+        p.start = Some((0.0, 0.0));
         let a = parsed_to_action(&p, 2880, 1800).unwrap();
         match a {
             Action::Click { x, y, .. } => {
-                assert_eq!(x, 120);
-                assert_eq!(y, 80);
+                assert_eq!(x, 0);
+                assert_eq!(y, 0);
             }
             _ => panic!("wrong variant"),
         }
     }
 
     #[test]
-    fn maps_click_absolute_mid_screen() {
+    fn maps_click_centre_of_screen() {
+        // (500, 500) on the grid → midpoint of the screen.
         let mut p = pa("click", &[]);
-        p.start = Some((1500.0, 800.0));
+        p.start = Some((500.0, 500.0));
+        let a = parsed_to_action(&p, 2880, 1800).unwrap();
+        match a {
+            Action::Click { x, y, .. } => {
+                assert_eq!(x, 1440);
+                assert_eq!(y, 900);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn maps_click_bottom_right_corner() {
+        // (1000, 1000) on the grid → bottom-right of the screen.
+        let mut p = pa("click", &[]);
+        p.start = Some((1000.0, 1000.0));
         let a = parsed_to_action(&p, 1920, 1080).unwrap();
         match a {
             Action::Click { x, y, .. } => {
-                assert_eq!(x, 1500);
-                assert_eq!(y, 800);
+                assert_eq!(x, 1920);
+                assert_eq!(y, 1080);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn maps_click_arbitrary_point() {
+        // (40, 50) — small grid coords (e.g. WeChat search box top
+        // left). Must NOT be passed through as raw pixels.
+        let mut p = pa("click", &[]);
+        p.start = Some((40.0, 50.0));
+        let a = parsed_to_action(&p, 2880, 1800).unwrap();
+        match a {
+            Action::Click { x, y, .. } => {
+                assert_eq!(x, 115); // 40/1000*2880 = 115.2
+                assert_eq!(y, 90); // 50/1000*1800 = 90
             }
             _ => panic!("wrong variant"),
         }
@@ -772,7 +913,17 @@ mod tests {
         p.end = Some((200.0, 200.0));
         let a = parsed_to_action(&p, 1920, 1080).unwrap();
         match a {
-            Action::Drag { .. } => {}
+            Action::Drag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+            } => {
+                assert_eq!(from_x, 192);
+                assert_eq!(from_y, 108);
+                assert_eq!(to_x, 384);
+                assert_eq!(to_y, 216);
+            }
             _ => panic!("wrong variant"),
         }
     }

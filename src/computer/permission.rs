@@ -27,6 +27,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -67,6 +68,17 @@ pub enum PermissionDecision {
     AllowSession,
     AllowAlways,
     Deny,
+}
+
+/// One persisted "Always allow" entry, surfaced by `list_grants` for the
+/// settings UI so the user can review / revoke saved decisions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedGrant {
+    pub agent_id: String,
+    pub app: String,
+    pub decision: PermissionDecision,
+    /// Unix timestamp seconds.
+    pub granted_at: i64,
 }
 
 pub type CheckFut<'a> =
@@ -129,6 +141,12 @@ fn compose_key(agent_id: &str, app: &str) -> String {
     format!("{agent_id}\0{app}")
 }
 
+/// Inverse of `compose_key`. Returns None when the key does not contain
+/// the NUL separator (data corruption / stray write).
+fn split_key(key: &str) -> Option<(&str, &str)> {
+    key.split_once('\0')
+}
+
 /// In-memory + redb-backed `PermissionStore` implementation.
 ///
 /// Cloneable via `Arc` because `RedbStore` is held behind one and the
@@ -139,8 +157,10 @@ pub struct RedbPermissionStore {
     /// Persistent backing store (shared with the rest of the gateway).
     redb: Arc<RedbStore>,
     /// Bypass switch — when true, every `check` returns `AllowAlways`.
-    /// Wired from `crate::config::schema` runtime config.
-    bypass_all: bool,
+    /// Initial value comes from `crate::config::schema::ComputerUseConfig`;
+    /// `set_bypass_all` flips it at runtime via the settings UI. Override
+    /// is runtime-only — it does not persist across gateway restart.
+    bypass_all: AtomicBool,
     /// Pending UI requests awaiting user decision. Keyed by
     /// `request_id` (the same value carried in `PermissionRequest`).
     /// The WS handler resolves these by calling
@@ -159,9 +179,51 @@ impl RedbPermissionStore {
         Self {
             sessions: RwLock::new(HashMap::new()),
             redb,
-            bypass_all,
+            bypass_all: AtomicBool::new(bypass_all),
             pending: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Inherent reader for the bypass switch. Mirrors the
+    /// `PermissionStore::bypass_all` trait method so HTTP handlers
+    /// holding an `Arc<RedbPermissionStore>` (concrete) can read it
+    /// without bringing the trait into scope.
+    pub fn is_bypass_all(&self) -> bool {
+        self.bypass_all.load(Ordering::Relaxed)
+    }
+
+    /// Flip the bypass switch at runtime. Used by the settings UI
+    /// (`PUT /api/v1/computer-use/bypass`). Does not persist — restart
+    /// reloads the config-defined value.
+    pub fn set_bypass_all(&self, on: bool) {
+        let prev = self.bypass_all.swap(on, Ordering::SeqCst);
+        if prev != on {
+            warn!(bypass_all = on, "computer-use permission gate: bypass toggled");
+        }
+    }
+
+    /// List every persisted "Always allow" grant for the settings UI.
+    /// Session-scoped grants are excluded — they are ephemeral and not
+    /// useful in a manage-saved-permissions panel.
+    pub async fn list_grants(&self) -> Result<Vec<SavedGrant>> {
+        let raw = self.redb.permission_list_all()?;
+        let mut out = Vec::with_capacity(raw.len());
+        for (key, value) in raw {
+            let Some((agent_id, app)) = split_key(&key) else {
+                warn!(key = %key, "skipping malformed permission key");
+                continue;
+            };
+            match serde_json::from_str::<PersistedGrant>(&value) {
+                Ok(g) => out.push(SavedGrant {
+                    agent_id: agent_id.to_owned(),
+                    app: app.to_owned(),
+                    decision: g.decision,
+                    granted_at: g.granted_at,
+                }),
+                Err(e) => warn!(error = %e, key = %key, "skipping corrupt permission grant"),
+            }
+        }
+        Ok(out)
     }
 
     /// Register a oneshot for a pending UI request. Called by the code
@@ -239,15 +301,23 @@ impl RedbPermissionStore {
 impl PermissionStore for RedbPermissionStore {
     fn check<'a>(&'a self, agent_id: &'a str, app: &'a str) -> CheckFut<'a> {
         Box::pin(async move {
-            if self.bypass_all {
+            if self.bypass_all.load(Ordering::Relaxed) {
                 return Ok(Some(PermissionDecision::AllowAlways));
             }
 
-            // 1. Session cache hit?
+            // 1. Session cache hit? Once-scoped entries are consumed
+            //    on read so the next call re-prompts as documented.
+            //    We take a write lock to support the consume path; the
+            //    extra contention is negligible at human-scale latency.
             {
-                let sessions = self.sessions.read().await;
-                if let Some(cached) = sessions.get(&(agent_id.to_owned(), app.to_owned())) {
-                    return Ok(Some(cached.decision));
+                let mut sessions = self.sessions.write().await;
+                let key = (agent_id.to_owned(), app.to_owned());
+                if let Some(cached) = sessions.get(&key) {
+                    let decision = cached.decision;
+                    if cached.scope == GrantScope::Once {
+                        sessions.remove(&key);
+                    }
+                    return Ok(Some(decision));
                 }
             }
 
@@ -266,9 +336,23 @@ impl PermissionStore for RedbPermissionStore {
             let now = chrono::Utc::now().timestamp();
             match decision {
                 PermissionDecision::AllowOnce => {
-                    // Caller honors it for this single run; we keep no
-                    // memory of it so the next call re-prompts.
-                    info!(agent_id, app, "permission: allow_once (no cache)");
+                    // Cache as Once-scoped so the driver's polling
+                    // permission_gate wakes up on the next `check()`.
+                    // The check() implementation removes Once entries
+                    // after the first read (consume-once), preserving
+                    // the "re-prompt next call" semantics: this run
+                    // sees Some(AllowOnce) → proceeds; subsequent
+                    // runs find an empty cache → re-emit the prompt.
+                    let mut sessions = self.sessions.write().await;
+                    sessions.insert(
+                        (agent_id.to_owned(), app.to_owned()),
+                        CachedDecision {
+                            decision,
+                            scope: GrantScope::Once,
+                            granted_at: now,
+                        },
+                    );
+                    info!(agent_id, app, "permission: allow_once (cached, consume-on-read)");
                 }
                 PermissionDecision::AllowSession => {
                     let mut sessions = self.sessions.write().await;
@@ -332,7 +416,7 @@ impl PermissionStore for RedbPermissionStore {
     }
 
     fn bypass_all(&self) -> bool {
-        self.bypass_all
+        self.bypass_all.load(Ordering::Relaxed)
     }
 }
 
@@ -379,14 +463,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allow_once_is_not_cached() {
+    async fn allow_once_is_consume_on_read() {
+        // record(AllowOnce) caches with Once-scope so the driver's
+        // polling permission_gate wakes up on the next check(); after
+        // that consume-on-read fires and a second check() returns None
+        // (preserving the "re-prompt next call" semantics).
         let (store, _redb, _dir) = open_store(false);
         store
             .record("agent:a", "WeChat", PermissionDecision::AllowOnce)
             .await
             .expect("record");
-        let got = store.check("agent:a", "WeChat").await.expect("check");
-        assert_eq!(got, None);
+        let first = store.check("agent:a", "WeChat").await.expect("check");
+        assert_eq!(first, Some(PermissionDecision::AllowOnce));
+        let second = store.check("agent:a", "WeChat").await.expect("check");
+        assert_eq!(second, None);
     }
 
     #[tokio::test]

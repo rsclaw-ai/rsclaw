@@ -84,9 +84,23 @@ impl LlmProvider for AnthropicProvider {
 
             let status = resp.status();
             if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
+                let resp_body = resp.text().await.unwrap_or_default();
+                let req_body_str = serde_json::to_string(&body).unwrap_or_default();
+                let req_body_preview = if req_body_str.len() > 4000 {
+                    format!("{}...[truncated, total {} bytes]", &req_body_str[..4000], req_body_str.len())
+                } else {
+                    req_body_str
+                };
+                tracing::warn!(
+                    url = %url,
+                    model = %model_for_log,
+                    status = %status,
+                    request_body = %req_body_preview,
+                    response_body = %resp_body,
+                    "Anthropic provider non-2xx response"
+                );
                 anyhow::bail!(
-                    "Anthropic API error {status} at {url} (model={model_for_log}): {body}"
+                    "Anthropic API error {status} at {url} (model={model_for_log}): {resp_body}"
                 );
             }
 

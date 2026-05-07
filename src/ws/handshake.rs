@@ -480,6 +480,40 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         });
     }
 
+    // 8d. computer_use status relay: forward Started/Step/Finished events
+    //     so the live status panel in the settings UI can render the
+    //     ongoing GUI-agent run. Lossy by design — broadcast lag drops
+    //     events; the next Step/Finished resyncs the panel.
+    {
+        let rx = state.computer_status_tx.subscribe();
+        let relay_tx = outbound_tx.clone();
+        let relay_conn = Arc::clone(&conn);
+        let relay_id = conn_id.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt as _;
+            info!(conn = %relay_id, "ws computer-status-relay started");
+            let mut stream = tokio_stream::wrappers::BroadcastStream::new(rx);
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(ev) => {
+                        let seq = relay_conn.write().await.next_seq();
+                        let payload = serde_json::to_value(&ev).unwrap_or(json!({}));
+                        let frame = EventFrame::new("computer_use_status", payload, seq);
+                        let json = serde_json::to_string(&frame).unwrap_or_default();
+                        if relay_tx.send(json).await.is_err() {
+                            info!(conn = %relay_id, "ws computer-status-relay: outbound closed");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(conn = %relay_id, error = %e, "ws computer-status-relay: recv error");
+                    }
+                }
+            }
+            info!(conn = %relay_id, "ws computer-status-relay exited");
+        });
+    }
+
     // 9. Main dispatch loop.
     let mut rate_limiter = super::rate_limit::RateLimiter::default_write_limiter();
     loop {

@@ -390,6 +390,11 @@ pub struct AgentRuntime {
     /// outside the gateway.
     pub computer_permission_tx:
         Option<broadcast::Sender<crate::computer::permission::PermissionRequest>>,
+    /// Broadcast channel that surfaces VlmDriver progress
+    /// (`ComputerUseStatus::Started/Step/Finished`) to the WS gateway
+    /// for the live status panel. `None` outside the gateway.
+    pub computer_status_tx:
+        Option<broadcast::Sender<crate::computer::status::ComputerUseStatus>>,
     /// Dynamic agent spawner — None when running outside the gateway.
     pub spawner: Option<Arc<crate::agent::AgentSpawner>>,
     /// Plugin registry — None when running outside the gateway or with no
@@ -505,6 +510,7 @@ impl AgentRuntime {
             event_bus,
             computer_permission: None,
             computer_permission_tx: None,
+            computer_status_tx: None,
             spawner,
             plugins,
             mcp,

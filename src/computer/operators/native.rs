@@ -63,11 +63,11 @@ impl Operator for NativeOperator {
         // Mirrors the UI-TARS-desktop NutJSOperator action space —
         // matches what the GUI VLM training data expects.
         vec![
-            ActionSpec::new("click(start_box='[x1,y1,x2,y2]')"),
-            ActionSpec::new("left_double(start_box='[x1,y1,x2,y2]')"),
-            ActionSpec::new("right_single(start_box='[x1,y1,x2,y2]')"),
+            ActionSpec::new("click(start_box='<|box_start|>(x1,y1)<|box_end|>')"),
+            ActionSpec::new("left_double(start_box='<|box_start|>(x1,y1)<|box_end|>')"),
+            ActionSpec::new("right_single(start_box='<|box_start|>(x1,y1)<|box_end|>')"),
             ActionSpec::new(
-                "drag(start_box='[x1,y1,x2,y2]', end_box='[x3,y3,x4,y4]')",
+                "drag(start_box='<|box_start|>(x1,y1)<|box_end|>', end_box='<|box_start|>(x3,y3)<|box_end|>')",
             ),
             ActionSpec::with_note(
                 "hotkey(key='')",
@@ -78,7 +78,7 @@ impl Operator for NativeOperator {
                 "# Add \\n at end of content to submit",
             ),
             ActionSpec::new(
-                "scroll(start_box='[x1,y1,x2,y2]', direction='down or up or right or left')",
+                "scroll(start_box='<|box_start|>(x1,y1)<|box_end|>', direction='down or up or right or left')",
             ),
             ActionSpec::with_note(
                 "wait()",

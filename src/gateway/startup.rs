@@ -257,17 +257,31 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let heartbeat_memory = memory.clone();
 
     // Shared computer_use permission store + broadcast channel.
-    // Bypass-all defaults to true today (no Tauri dialog yet); flip to
-    // false once `ComputerUsePermissionDialog.tsx` is wired.
+    // `bypass_all` is read from `tools.computerUse.bypassAll` (default
+    // false). The settings UI exposes a runtime toggle that mutates the
+    // store's AtomicBool without touching the config file.
+    let bypass_all_default = config
+        .raw
+        .tools
+        .as_ref()
+        .and_then(|t| t.computer_use.as_ref())
+        .and_then(|cu| cu.bypass_all)
+        .unwrap_or(false);
     let computer_permission = Arc::new(
         crate::computer::permission::RedbPermissionStore::new(
             Arc::clone(&store.db),
-            true,
+            bypass_all_default,
         ),
     );
     let (computer_permission_tx, _) = broadcast::channel::<
         crate::computer::permission::PermissionRequest,
     >(64);
+    // Status events are higher-frequency than permission requests (one
+    // per VLM step), so give a larger buffer. Subscribers that lag
+    // simply drop events — status is best-effort UX, not load-bearing.
+    let (computer_status_tx, _) = broadcast::channel::<
+        crate::computer::status::ComputerUseStatus,
+    >(256);
 
     spawn_agent_tasks(
         receivers,
@@ -286,6 +300,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Arc::clone(&wasm_plugins),
         Arc::clone(&computer_permission),
         computer_permission_tx.clone(),
+        computer_status_tx.clone(),
     );
 
     // Set i18n default language from gateway config.
@@ -640,6 +655,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         event_bus: event_tx,
         computer_permission: Arc::clone(&computer_permission),
         computer_permission_tx: computer_permission_tx.clone(),
+        computer_status_tx: computer_status_tx.clone(),
         devices,
         ws_conns,
         feishu: Arc::clone(&feishu_slot),
@@ -959,6 +975,7 @@ fn spawn_agent_tasks(
     wasm_plugins: Arc<Vec<crate::plugin::WasmPlugin>>,
     computer_permission: Arc<crate::computer::permission::RedbPermissionStore>,
     computer_permission_tx: broadcast::Sender<crate::computer::permission::PermissionRequest>,
+    computer_status_tx: broadcast::Sender<crate::computer::status::ComputerUseStatus>,
 ) {
     for (agent_id, mut rx) in receivers {
         let handle = match registry.get(&agent_id) {
@@ -1010,6 +1027,7 @@ fn spawn_agent_tasks(
         // handler can resolve.
         runtime.computer_permission = Some(Arc::clone(&computer_permission));
         runtime.computer_permission_tx = Some(computer_permission_tx.clone());
+        runtime.computer_status_tx = Some(computer_status_tx.clone());
 
         let event_tx_task = event_tx.clone();
         tokio::spawn(async move {
