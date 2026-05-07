@@ -538,8 +538,13 @@ pub(crate) async fn read_cron_jobs(path: &std::path::Path) -> Vec<Value> {
 /// Write cron jobs as JSON (readable by json5 parser).
 pub(crate) async fn write_cron_jobs(path: &std::path::Path, jobs: &[Value]) -> Result<()> {
     let wrapper = json!({"version": 1, "jobs": jobs});
-    tokio::fs::write(path, serde_json::to_string_pretty(&wrapper)?)
+    let json = serde_json::to_string_pretty(&wrapper)?;
+    let tmp = format!("{}.tmp", path.display());
+    tokio::fs::write(&tmp, json)
         .await
-        .map_err(|e| anyhow!("cron: failed to write jobs: {e}"))?;
+        .map_err(|e| anyhow!("cron: failed to write jobs tmp: {e}"))?;
+    tokio::fs::rename(&tmp, path)
+        .await
+        .map_err(|e| anyhow!("cron: failed to rename jobs file: {e}"))?;
     Ok(())
 }

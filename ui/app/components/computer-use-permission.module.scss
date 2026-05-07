@@ -1,0 +1,118 @@
+// Permission dialog — full-screen mask with a centred red-accented card.
+// Mirrors the style of `showConfirm` (ui-lib) but with destructive accent
+// since this is a security-significant prompt.
+
+.mask {
+  position: fixed;
+  inset: 0;
+  z-index: 100; // above sidebar, chat, etc.
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+}
+
+.card {
+  width: min(560px, calc(100vw - 40px));
+  max-height: calc(100vh - 80px);
+  overflow-y: auto;
+  background: var(--white);
+  color: var(--black);
+  border-radius: 12px;
+  border: 2px solid #e74c3c;
+  box-shadow:
+    0 24px 60px rgba(0, 0, 0, 0.35),
+    0 0 0 1px rgba(231, 76, 60, 0.2);
+  padding: 24px;
+  font-family: inherit;
+}
+
+.title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 18px;
+  font-weight: 700;
+  color: #c0392b;
+  margin-bottom: 8px;
+}
+
+.titleDot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #e74c3c;
+  box-shadow: 0 0 0 4px rgba(231, 76, 60, 0.18);
+  flex-shrink: 0;
+}
+
+.subtitle {
+  font-size: 13px;
+  opacity: 0.7;
+  margin-bottom: 18px;
+}
+
+.detailGrid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: 14px;
+  row-gap: 10px;
+  font-size: 14px;
+  margin-bottom: 22px;
+  padding: 14px;
+  background: var(--gray);
+  border-radius: 8px;
+}
+
+.detailLabel {
+  font-weight: 600;
+  opacity: 0.75;
+  white-space: nowrap;
+}
+
+.detailValue {
+  word-break: break-word;
+  line-height: 1.5;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+.btn {
+  flex: 1 1 auto;
+  min-width: 120px;
+  padding: 10px 16px;
+  font-size: 14px;
+  font-weight: 600;
+  border: 1px solid var(--border-in-light);
+  background: var(--white);
+  color: var(--black);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.btn:hover {
+  background: var(--gray);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btnDanger {
+  composes: btn;
+  border-color: #e74c3c;
+  color: #c0392b;
+}
+
+.btnDanger:hover {
+  background: #fdecea;
+  border-color: #c0392b;
+}

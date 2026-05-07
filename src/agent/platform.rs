@@ -310,14 +310,10 @@ pub(crate) async fn run_powershell_input(script: &str) -> Result<()> {
     run_subprocess("powershell", &["-NoProfile", "-Command", &full]).await
 }
 
-/// Windows: set cursor position via .NET
-pub(crate) async fn win_set_cursor(x: i64, y: i64) -> Result<()> {
-    run_powershell_input(&format!(
-        "[System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point({x},{y})"
-    )).await
-}
-
 /// Windows: mouse click with P/Invoke. Supports left/right/middle and repeat count.
+///
+/// Still used by `triple_click` in `tools_computer.rs` (the rest of the
+/// click/move pipeline now goes through enigo via `NativeOperator`).
 pub(crate) async fn win_mouse_click(x: i64, y: i64, button: &str, clicks: i32) -> Result<()> {
     let (down_flag, up_flag) = match button {
         "right" => ("0x0008", "0x0010"),
@@ -343,115 +339,6 @@ public class WinClick {{
 "@
 [WinClick]::Click({x}, {y}, {down_flag}, {up_flag}, {clicks})"#
     )).await
-}
-
-/// Windows: map key names to SendKeys format, including modifier combos.
-pub(crate) fn win_map_key(key: &str) -> String {
-    // Handle modifier combos like "ctrl+c" -> "^c"
-    if key.contains('+') {
-        let parts: Vec<&str> = key.split('+').collect();
-        let mut prefix = String::new();
-        for &modifier in &parts[..parts.len() - 1] {
-            match modifier.to_lowercase().as_str() {
-                "ctrl" | "control" => prefix.push('^'),
-                "alt" => prefix.push('%'),
-                "shift" => prefix.push('+'),
-                _ => {}
-            }
-        }
-        let base = win_map_single_key(parts[parts.len() - 1]);
-        format!("{prefix}{base}")
-    } else {
-        win_map_single_key(key)
-    }
-}
-
-/// Check if a key name is a cliclick kp: special key.
-pub(crate) fn is_cliclick_special_key(key: &str) -> bool {
-    matches!(key.to_lowercase().as_str(),
-        "arrow-down" | "arrow-left" | "arrow-right" | "arrow-up"
-        | "brightness-down" | "brightness-up"
-        | "delete" | "end" | "enter" | "esc"
-        | "f1" | "f2" | "f3" | "f4" | "f5" | "f6" | "f7" | "f8"
-        | "f9" | "f10" | "f11" | "f12" | "f13" | "f14" | "f15" | "f16"
-        | "fwd-delete" | "home"
-        | "keys-light-down" | "keys-light-toggle" | "keys-light-up"
-        | "mute" | "num-0" | "num-1" | "num-2" | "num-3" | "num-4"
-        | "num-5" | "num-6" | "num-7" | "num-8" | "num-9"
-        | "num-clear" | "num-divide" | "num-enter" | "num-equals"
-        | "num-minus" | "num-multiply" | "num-plus"
-        | "page-down" | "page-up"
-        | "play-next" | "play-pause" | "play-previous"
-        | "return" | "space" | "tab"
-        | "volume-down" | "volume-up"
-    )
-}
-
-/// Map modifier name to cliclick format.
-pub(crate) fn map_modifier(name: &str) -> String {
-    match name.to_lowercase().as_str() {
-        "ctrl" | "control" => "ctrl".to_owned(),
-        "alt" | "option" => "alt".to_owned(),
-        "shift" => "shift".to_owned(),
-        "cmd" | "command" | "super" => "cmd".to_owned(),
-        _ => name.to_owned(),
-    }
-}
-
-/// Map modifier name to xdotool format.
-pub(crate) fn map_modifier_xdotool(name: &str) -> String {
-    match name.to_lowercase().as_str() {
-        "ctrl" | "control" => "ctrl".to_owned(),
-        "alt" | "option" => "alt".to_owned(),
-        "shift" => "shift".to_owned(),
-        "super" | "cmd" | "command" => "super".to_owned(),
-        _ => name.to_owned(),
-    }
-}
-
-/// Map a single key name to Windows SendKeys format.
-pub(crate) fn win_map_single_key(key: &str) -> String {
-    match key {
-        "Return" | "Enter" => "{ENTER}".to_owned(),
-        "Escape" | "Esc" => "{ESC}".to_owned(),
-        "Tab" => "{TAB}".to_owned(),
-        "BackSpace" | "Backspace" => "{BACKSPACE}".to_owned(),
-        "Delete" => "{DELETE}".to_owned(),
-        "Insert" => "{INSERT}".to_owned(),
-        "Up" => "{UP}".to_owned(),
-        "Down" => "{DOWN}".to_owned(),
-        "Left" => "{LEFT}".to_owned(),
-        "Right" => "{RIGHT}".to_owned(),
-        "Home" => "{HOME}".to_owned(),
-        "End" => "{END}".to_owned(),
-        "Page_Up" | "PageUp" => "{PGUP}".to_owned(),
-        "Page_Down" | "PageDown" => "{PGDN}".to_owned(),
-        "F1" => "{F1}".to_owned(),
-        "F2" => "{F2}".to_owned(),
-        "F3" => "{F3}".to_owned(),
-        "F4" => "{F4}".to_owned(),
-        "F5" => "{F5}".to_owned(),
-        "F6" => "{F6}".to_owned(),
-        "F7" => "{F7}".to_owned(),
-        "F8" => "{F8}".to_owned(),
-        "F9" => "{F9}".to_owned(),
-        "F10" => "{F10}".to_owned(),
-        "F11" => "{F11}".to_owned(),
-        "F12" => "{F12}".to_owned(),
-        "space" | "Space" => " ".to_owned(),
-        // Special characters that need escaping in SendKeys
-        "+" => "{+}".to_owned(),
-        "^" => "{^}".to_owned(),
-        "%" => "{%}".to_owned(),
-        "~" => "{~}".to_owned(),
-        "(" => "{(}".to_owned(),
-        ")" => "{)}".to_owned(),
-        "{" => "{{}".to_owned(),
-        "}" => "{}}".to_owned(),
-        "[" => "{[}".to_owned(),
-        "]" => "{]}".to_owned(),
-        other => other.to_owned(),
-    }
 }
 
 /// Match user text against installed skills by keyword overlap.

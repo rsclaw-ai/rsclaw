@@ -42,7 +42,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
     extract::Multipart,
-    routing::{get, patch, post},
+    routing::{get, patch, post, put},
 };
 use futures::{Stream, StreamExt as _};
 use serde::{Deserialize, Serialize};
@@ -91,6 +91,16 @@ pub struct AppState {
     pub store: Arc<Store>,
     /// Broadcast channel for SSE: agent sends events here.
     pub event_bus: broadcast::Sender<AgentEvent>,
+    /// Shared computer_use permission store. Drivers register pending
+    /// requests via `register_pending_request`; the WS handler resolves
+    /// them via `resolve_pending_request` once the user clicks a button
+    /// in the Tauri permission dialog.
+    pub computer_permission: Arc<crate::computer::permission::RedbPermissionStore>,
+    /// Broadcast channel for `PermissionRequest` events. Subscribed by
+    /// the WS gateway (delivered to the desktop UI as `permission_request`
+    /// frames).
+    pub computer_permission_tx:
+        broadcast::Sender<crate::computer::permission::PermissionRequest>,
     /// Device token store for WebSocket gateway auth.
     pub devices: Arc<crate::ws::DeviceStore>,
     /// Active WebSocket connections registry.
@@ -226,6 +236,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/config", get(get_config).put(save_config))
         .route("/cron", get(cron_list).post(cron_create))
         .route("/cron/reload", post(cron_reload))
+        .route("/cron/bulk_replace", put(cron_bulk_replace))
         .route("/cron/{id}", get(cron_get).put(cron_update).delete(cron_delete))
         .route("/cron/{id}/trigger", post(cron_trigger))
         .route("/cron/{id}/history", get(cron_history))
@@ -1132,6 +1143,62 @@ async fn cron_reload(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+/// PUT /api/v1/cron/bulk_replace — atomically replace the entire cron
+/// job set with the supplied list. Used by the Tauri tray (see
+/// `ui/src-tauri/src/main.rs::save_cron_jobs`) so the UI never needs
+/// to write the cron.json5 file directly — preventing the 3-writer
+/// race where Tauri / ws cron.update / cron runner all hit the same
+/// file. Body shape: `{ "version": 1, "jobs": [...] }` (matches
+/// `cron.json5`).
+async fn cron_bulk_replace(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let jobs_array = match body.get("jobs").and_then(|v| v.as_array()) {
+        Some(arr) => arr.clone(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "missing `jobs` array"})),
+            )
+                .into_response();
+        }
+    };
+    let jobs: Vec<crate::cron::CronJob> = match jobs_array
+        .iter()
+        .map(|v| serde_json::from_value::<crate::cron::CronJob>(v.clone()))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(j) => j,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid cron job: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    // Serialize against concurrent cron.add / cron.update etc.
+    let _guard = crate::cron::CRON_FILE_LOCK.lock().await;
+
+    if let Err(e) = crate::cron::save_cron_jobs(&jobs) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("save failed: {e}")})),
+        )
+            .into_response();
+    }
+
+    // Notify CronRunner to reload (drops in-flight tasks for jobs
+    // whose schedule / enabled state changed).
+    if let Err(e) = state.cron_reload.send(()) {
+        tracing::warn!(err = %e, "cron: bulk_replace reload signal failed");
+    }
+
+    Json(serde_json::json!({ "replaced": jobs.len() })).into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Cron CRUD API
 // ---------------------------------------------------------------------------
@@ -1177,9 +1244,13 @@ async fn cron_save_and_reload(
     // for other readers and caused jobs to silently disappear from the UI.
     let store = serde_json::json!({ "version": 1, "jobs": jobs });
     let json = serde_json::to_string_pretty(&store).map_err(|e| format!("serialize: {e}"))?;
-    tokio::fs::write(&path, json)
+    let tmp = format!("{}.tmp", path.display());
+    tokio::fs::write(&tmp, json)
         .await
-        .map_err(|e| format!("write jobs.json: {e}"))?;
+        .map_err(|e| format!("write jobs.json tmp: {e}"))?;
+    tokio::fs::rename(&tmp, &path)
+        .await
+        .map_err(|e| format!("rename jobs.json: {e}"))?;
     let _ = reload_tx.send(());
     Ok(())
 }

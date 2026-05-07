@@ -864,6 +864,23 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
             })
             .collect();
         body["tools"] = json!(tools);
+        // Some providers (e.g. kimi-for-coding) require explicit tool_choice
+        // to enable function calling; without it they ignore the tools list.
+        // Other providers (some DeepSeek strict modes, certain Azure
+        // deployments) reject or misinterpret unsolicited "auto", so we
+        // gate on a model-name heuristic instead of sending it everywhere.
+        // Match on lowercased model id so "kimi-for-coding/k1.5-32k" works
+        // alongside "moonshot-v1-8k" and "qwen-coder-plus".
+        let needs_explicit_tool_choice = {
+            let m = req.model.to_lowercase();
+            m.contains("kimi")
+                || m.contains("moonshot")
+                || m.contains("k1.5")
+                || m.contains("k2")
+        };
+        if needs_explicit_tool_choice {
+            body["tool_choice"] = json!("auto");
+        }
     }
 
     // Normalize messages for stable KV cache prefix: trim content whitespace,
@@ -1058,10 +1075,13 @@ fn serialize_message(msg: &Message) -> Value {
         return json!({ "role": "tool", "content": text });
     }
 
-    // Assistant messages: extract tool_calls if present
+    // Assistant messages: extract tool_calls and reasoning_content if present.
+    // Some providers (e.g. kimi-for-coding) require reasoning_content on every
+    // assistant message when thinking is enabled.
     if msg.role == Role::Assistant {
         if let MessageContent::Parts(parts) = &msg.content {
             let mut text_parts = Vec::new();
+            let mut reasoning_parts = Vec::new();
             let mut tool_calls = Vec::new();
             for part in parts {
                 match part {
@@ -1076,16 +1096,26 @@ fn serialize_message(msg: &Message) -> Value {
                         }));
                     }
                     ContentPart::Text { text } => text_parts.push(text.clone()),
+                    ContentPart::Reasoning { text } => reasoning_parts.push(text.clone()),
                     _ => {}
                 }
             }
             let text = text_parts.join("");
-            if !tool_calls.is_empty() {
-                return json!({
+            let reasoning = reasoning_parts.join("");
+            if !tool_calls.is_empty() || !reasoning.is_empty() {
+                let mut obj = json!({
                     "role": "assistant",
                     "content": text,
-                    "tool_calls": tool_calls,
                 });
+                if let Some(obj_map) = obj.as_object_mut() {
+                    if !tool_calls.is_empty() {
+                        obj_map.insert("tool_calls".to_owned(), json!(tool_calls));
+                    }
+                    if !reasoning.is_empty() {
+                        obj_map.insert("reasoning_content".to_owned(), json!(reasoning));
+                    }
+                }
+                return obj;
             }
         }
     }
@@ -1122,6 +1152,10 @@ fn serialize_part(part: &ContentPart) -> Value {
             "role":         "tool",
             "tool_call_id": tool_use_id,
             "content":      content,
+        }),
+        ContentPart::Reasoning { text } => json!({
+            "type":     "reasoning",
+            "reasoning": text,
         }),
     }
 }
@@ -1194,7 +1228,7 @@ async fn parse_sse_chunk_with_buffer(
 
         // Process complete lines
         for line in complete_portion.lines() {
-            if let Some(data) = line.strip_prefix("data: ") {
+            if let Some(data) = line.strip_prefix("data:").map(|s| s.trim_start()) {
                 if data == "[DONE]" {
                     events.push(Ok(StreamEvent::Done { usage: None }));
                     continue;
@@ -1228,7 +1262,7 @@ fn parse_sse_chunk(chunk: Result<bytes::Bytes>) -> Vec<Result<StreamEvent>> {
     let mut events = Vec::new();
     let mut has_data_line = false;
     for line in text.lines() {
-        if let Some(data) = line.strip_prefix("data: ") {
+        if let Some(data) = line.strip_prefix("data:").map(|s| s.trim_start()) {
             has_data_line = true;
             if data == "[DONE]" {
                 events.push(Ok(StreamEvent::Done { usage: None }));
@@ -1638,7 +1672,7 @@ async fn parse_responses_sse_chunk_buffered(
             current_event_type = Some(event_type.trim().to_owned());
             continue;
         }
-        if let Some(data) = line.strip_prefix("data: ") {
+        if let Some(data) = line.strip_prefix("data:").map(|s| s.trim_start()) {
             if data == "[DONE]" {
                 events.push(Ok(StreamEvent::Done { usage: None }));
                 continue;

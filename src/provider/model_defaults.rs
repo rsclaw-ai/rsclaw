@@ -33,12 +33,12 @@ pub fn get_model_defaults(provider: &str, model_id: &str) -> Option<ModelDefault
     match provider.as_str() {
         // DeepSeek
         "deepseek" => match model_lower.as_str() {
-            "deepseek-chat" => Some(ModelDefaults {
+            "deepseek-chat" | "deepseek-v4-flash" => Some(ModelDefaults {
                 max_tokens: 8192,
                 context_window: 64_000,
             }),
             // Reasoning models need much larger output budget
-            "deepseek-reasoner" | "deepseek-r1" => Some(ModelDefaults {
+            "deepseek-reasoner" | "deepseek-v4-pro" | "deepseek-r1" => Some(ModelDefaults {
                 max_tokens: 65536,
                 context_window: 131_072,
             }),
@@ -111,7 +111,7 @@ pub fn get_model_defaults(provider: &str, model_id: &str) -> Option<ModelDefault
         // SiliconFlow / 硅基流动
         "siliconflow" | "silicon" => {
             // SiliconFlow hosts many models
-            if model_lower.contains("deepseek-r1") || model_lower.contains("deepseek-reasoner") {
+            if model_lower.contains("deepseek-r1") || model_lower.contains("deepseek-reasoner") || model_lower.contains("deepseek-v4-pro") {
                 Some(ModelDefaults {
                     max_tokens: 65536,
                     context_window: 131_072,

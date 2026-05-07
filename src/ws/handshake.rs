@@ -445,6 +445,41 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         });
     }
 
+    // 8c. computer_use permission relay: forward every PermissionRequest
+    //     to the desktop UI as a `permission_request` EventFrame so the
+    //     Tauri shell can show the consent dialog. The UI replies via
+    //     `chat.permission_response`, which `chat::chat_permission_response`
+    //     resolves on `state.computer_permission`.
+    {
+        let rx = state.computer_permission_tx.subscribe();
+        let relay_tx = outbound_tx.clone();
+        let relay_conn = Arc::clone(&conn);
+        let relay_id = conn_id.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt as _;
+            info!(conn = %relay_id, "ws permission-relay started");
+            let mut stream = tokio_stream::wrappers::BroadcastStream::new(rx);
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(req) => {
+                        let seq = relay_conn.write().await.next_seq();
+                        let payload = serde_json::to_value(&req).unwrap_or(json!({}));
+                        let frame = EventFrame::new("permission_request", payload, seq);
+                        let json = serde_json::to_string(&frame).unwrap_or_default();
+                        if relay_tx.send(json).await.is_err() {
+                            info!(conn = %relay_id, "ws permission-relay: outbound closed");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(conn = %relay_id, error = %e, "ws permission-relay: recv error");
+                    }
+                }
+            }
+            info!(conn = %relay_id, "ws permission-relay exited");
+        });
+    }
+
     // 9. Main dispatch loop.
     let mut rate_limiter = super::rate_limit::RateLimiter::default_write_limiter();
     loop {

@@ -163,7 +163,6 @@ fn is_internal_session(session_key: &str) -> bool {
     session_key.starts_with("heartbeat:")
         || session_key.starts_with("cron:")
         || session_key.starts_with("system:")
-        || session_key.starts_with("summarize:")
 }
 
 /// Sessions that should run with a minimal system prompt and only the
@@ -353,9 +352,6 @@ pub struct RunContext {
     pub recalled_memory_ids: std::collections::HashSet<String>,
     /// Whether a loop-detection warning was triggered during this turn.
     pub loop_warning_triggered: bool,
-    /// Count of consecutive `python -c` inline execution failures.
-    /// Used to guide LLM to switch to file-based execution for easier debugging.
-    pub python_inline_streak: usize,
     /// Per-turn difficulty counters for workflow crystallization.
     pub turn_metrics: super::turn_metrics::TurnMetrics,
     /// The original user request text for this turn — saved on RunContext
@@ -385,6 +381,15 @@ pub struct AgentRuntime {
     /// SSE broadcast channel — None when running outside the gateway (e.g.
     /// tests).
     pub event_bus: Option<broadcast::Sender<AgentEvent>>,
+    /// Shared permission store for computer_use. Same `Arc` is held by
+    /// `AppState` so the WS handler can resolve pending requests minted
+    /// inside an agent run. `None` outside the gateway (tests / CLI).
+    pub computer_permission: Option<Arc<crate::computer::permission::RedbPermissionStore>>,
+    /// Broadcast channel that surfaces `PermissionRequest` to the WS
+    /// gateway. The Tauri UI subscribes and shows the modal. `None`
+    /// outside the gateway.
+    pub computer_permission_tx:
+        Option<broadcast::Sender<crate::computer::permission::PermissionRequest>>,
     /// Dynamic agent spawner — None when running outside the gateway.
     pub spawner: Option<Arc<crate::agent::AgentSpawner>>,
     /// Plugin registry — None when running outside the gateway or with no
@@ -435,7 +440,6 @@ pub struct AgentRuntime {
     pub(crate) opencode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
     pub(crate) claudecode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
     pub(crate) codex_client: Arc<tokio::sync::OnceCell<crate::acp::CodexClient>>,
-    pub(crate) openclaude_client: Arc<tokio::sync::OnceCell<crate::acp::OpenClaudeClient>>,
     /// In-memory session alias cache: alias_key → canonical session_key.
     /// Loaded from redb on first use, avoids repeated DB lookups.
     session_aliases: std::collections::HashMap<String, String>,
@@ -499,6 +503,8 @@ impl AgentRuntime {
             memory,
             agents,
             event_bus,
+            computer_permission: None,
+            computer_permission_tx: None,
             spawner,
             plugins,
             mcp,
@@ -525,7 +531,6 @@ impl AgentRuntime {
             opencode_client: Arc::new(tokio::sync::OnceCell::new()),
             claudecode_client: Arc::new(tokio::sync::OnceCell::new()),
             codex_client: Arc::new(tokio::sync::OnceCell::new()),
-            openclaude_client: Arc::new(tokio::sync::OnceCell::new()),
             session_aliases,
             exec_pool,
         };
@@ -628,6 +633,286 @@ pub fn resolve_flash_model_for(
         .map(str::to_owned)
 }
 
+/// Outcome of vision-model resolution. The four cases are distinguished
+/// so the caller can format actionable error messages — "you have no
+/// vision model AND no primary, configure one", vs "your primary
+/// {name} is text-only, set agents.defaults.model.vision".
+#[derive(Debug, Clone)]
+pub enum VisionResolution {
+    /// An explicit `model.vision` was configured (per-agent or in
+    /// defaults). The string is the model identifier.
+    Configured(String),
+    /// No `vision` set; falling back to the agent's primary model.
+    /// Caller may want to verify the primary actually supports images
+    /// before proceeding.
+    FallbackToPrimary(String),
+    /// Neither `vision` nor `primary` is configured anywhere — the
+    /// runtime can't proceed. Caller surfaces a "configure
+    /// agents.defaults.model.{vision,primary}" message.
+    NoneConfigured,
+}
+
+/// Resolve the vision model for `computer_use` (and any other VLM-backed
+/// path). Lookup chain:
+///
+///   1. per-agent `model.vision`
+///   2. `defaults.model.vision`
+///   3. per-agent `model.primary`
+///   4. `defaults.model.primary`
+///
+/// (1) and (2) return `Configured`. (3) and (4) return
+/// `FallbackToPrimary`. Nothing → `NoneConfigured`.
+pub fn resolve_vision_model_for(
+    per_agent: &crate::config::schema::AgentEntry,
+    defaults: &crate::config::schema::AgentDefaults,
+) -> VisionResolution {
+    if let Some(name) = per_agent
+        .model
+        .as_ref()
+        .and_then(|m| m.vision.as_deref())
+        .map(str::to_owned)
+    {
+        return VisionResolution::Configured(name);
+    }
+    if let Some(name) = defaults
+        .model
+        .as_ref()
+        .and_then(|m| m.vision.as_deref())
+        .map(str::to_owned)
+    {
+        return VisionResolution::Configured(name);
+    }
+    if let Some(name) = per_agent
+        .model
+        .as_ref()
+        .and_then(|m| m.primary.as_deref())
+        .map(str::to_owned)
+    {
+        return VisionResolution::FallbackToPrimary(name);
+    }
+    if let Some(name) = defaults
+        .model
+        .as_ref()
+        .and_then(|m| m.primary.as_deref())
+        .map(str::to_owned)
+    {
+        return VisionResolution::FallbackToPrimary(name);
+    }
+    VisionResolution::NoneConfigured
+}
+
+/// Look up `model_name` (e.g. `"kimi/kimi-for-coding"` or just
+/// `"kimi-for-coding"`) in the provider config and return whether its
+/// `input` array contains `image`. Returns:
+///   - `Some(true)`  — explicitly declared as image-capable.
+///   - `Some(false)` — explicitly declared as text-only (no `image`
+///                     in the array).
+///   - `None`        — no `models[].input` entry found; caller should
+///                     fall back to the blocklist heuristic.
+///
+/// The lookup is fuzzy: it tries `provider/model_id` first (when the
+/// name contains `/`), then falls back to scanning every provider for a
+/// matching `model.id`. This way users who write `"kimi-for-coding"`
+/// (without provider prefix) still get the declaration honoured.
+pub fn model_supports_image_input(
+    config: &crate::config::schema::Config,
+    model_name: &str,
+) -> Option<bool> {
+    use crate::config::schema::InputType;
+
+    let models_cfg = config.models.as_ref()?;
+    let (prov_name, model_id) = match model_name.split_once('/') {
+        Some((p, m)) => (Some(p), m),
+        None => (None, model_name),
+    };
+
+    // Closure: probe one provider's models[] for a matching id.
+    let probe = |entries: &Option<Vec<crate::config::schema::ModelDef>>| {
+        entries.as_ref().and_then(|defs| {
+            defs.iter()
+                .find(|d| d.id == model_id)
+                .and_then(|d| d.input.as_ref())
+                .map(|inputs| inputs.contains(&InputType::Image))
+        })
+    };
+
+    // Targeted lookup first.
+    if let Some(prov) = prov_name {
+        if let Some(pc) = models_cfg.providers.get(prov) {
+            if let Some(verdict) = probe(&pc.models) {
+                return Some(verdict);
+            }
+        }
+    }
+
+    // Otherwise scan every provider — first hit wins.
+    for pc in models_cfg.providers.values() {
+        if let Some(verdict) = probe(&pc.models) {
+            return Some(verdict);
+        }
+    }
+    None
+}
+
+/// Heuristic substring list of model names known to be **vision-capable**
+/// (accept image input). When the schema-driven check
+/// (`models.providers[].models[].input` array) is missing, the resolver
+/// falls back to this allow-list. Models NOT in this list are treated as
+/// text-only by default — safer than the inverse (an unknown new model
+/// is more likely text-only than vision-capable, and forcing the user
+/// to opt in by either listing it here or declaring `input: ["image"]`
+/// in their config produces a clear error message instead of a cryptic
+/// API failure later).
+///
+/// Match is `model.to_lowercase().contains(s)`. Add a substring when
+/// you've confirmed a model family ships with image input.
+pub fn is_known_vision_model(model: &str) -> bool {
+    let m = model.to_lowercase();
+    [
+        // -------- universal suffixes (covers most "-vision" / "-vl"
+        // -------- variants across vendors without per-model entries)
+        "-vision",
+        "-vl-", "-vl/", "-vl:",
+        "-omni",
+
+        // -------- OpenAI
+        "gpt-4o", "gpt-4-vision", "gpt-4-turbo", "gpt-4.1",
+        "gpt-5", "chatgpt-4o", "o1-", "o3-", "o4-",
+        // (bare "gpt-4" intentionally NOT included — original GPT-4 base is text-only)
+
+        // -------- Anthropic Claude 3+
+        "claude-3", "claude-sonnet-4", "claude-opus-4", "claude-haiku-4",
+        "claude-4", "claude-5",
+        // (claude-instant / claude-2 are text-only)
+
+        // -------- Google Gemini + Gemma 3+
+        "gemini-1.5", "gemini-2", "gemini-3", "gemini-pro-vision",
+        "gemma-3", "gemma-4",
+        "paligemma",
+        // (gemma-1/-2 text-only)
+
+        // -------- Meta Llama (3.2 vision + Llama 4 multimodal)
+        "llama-3.2-11b-vision", "llama-3.2-90b-vision", "llama-3.2-vision",
+        "llama-4",
+        // (llama-3 / llama-3.1 / llama-3.3 / llama-3.2-1b / llama-3.2-3b are text-only)
+
+        // -------- Mistral
+        "pixtral",
+        "mistral-small-3.1", "mistral-small-3.2", "mistral-small-4",
+        "mistral-medium-3",
+
+        // -------- Cohere
+        "aya-vision", "command-a-vision",
+
+        // -------- xAI Grok (3+ natively multimodal; older variants need -vision)
+        "grok-2-vision", "grok-1.5-vision",
+        "grok-3", "grok-4", "grok-5",
+
+        // -------- ByteDance Doubao
+        // Seed 1.x: required `-vision` suffix to be multimodal.
+        "doubao-seed-1.5-vision", "doubao-1.5-vision", "doubao-1-5-vision",
+        "doubao-seed-1.6-vision",
+        // Seed 2+ family: entire subtree is multimodal-by-default
+        // (pro / lite / code / flash / vision all accept image input).
+        // List 2..=9 explicitly so future generations (3.x, 4.x, ...)
+        // are auto-recognised without a code change.
+        "doubao-seed-2", "doubao-seed-3", "doubao-seed-4", "doubao-seed-5",
+        "doubao-seed-6", "doubao-seed-7", "doubao-seed-8", "doubao-seed-9",
+        // Other vision lines.
+        "doubao-pro-vision", "doubao-vision",
+        "seedream", "seedance",
+
+        // -------- Alibaba Qwen
+        "qwen-vl", "qwen2-vl", "qwen2.5-vl", "qwen3-vl",
+        "qwen-max-vision",
+        // Qwen 3.5+ base series multimodal; both spellings.
+        "qwen3.5", "qwen-3.5",
+        "qwen3.6", "qwen-3.6",
+        "qwen3.7", "qwen-3.7",
+        "qwen3.8", "qwen-3.8",
+        "qwen3.9", "qwen-3.9",
+        "qwen4", "qwen-4",
+        "qvq",  // Qwen visual-question
+
+        // -------- Moonshot Kimi
+        "kimi-for-coding",
+        "kimi-k2.5", "kimi-k2.6", "kimi-k2.7", "kimi-k2.8", "kimi-k2.9",
+        "kimi-vl",
+        "moonshot-v1-vision",
+
+        // -------- Zhipu GLM (look for "vN" suffix — glm-4v, glm-4.5v, ...)
+        "glm-4v", "glm-4.1v", "glm-4.5v", "glm-4.6v", "glm-5v",
+        "cogvlm", "cogagent",
+
+        // -------- Baidu ERNIE
+        "ernie-vl", "ernie-4.5-vl", "ernie-5",
+        "ernie-vision",
+
+        // -------- SenseTime SenseChat
+        "sensechat-vision", "sensechat-v",
+        "sensenova-v6",
+
+        // -------- 01.AI Yi
+        "yi-vl", "yi-vision",
+
+        // -------- Baichuan
+        "baichuan-omni", "baichuan-vl", "baichuan2-vl",
+
+        // -------- DeepSeek
+        "deepseek-vl", "deepseek-vl2",
+        "janus",
+
+        // -------- Tencent Hunyuan
+        "hunyuan-vision", "hunyuan-vl", "hunyuanocr",
+
+        // -------- MiniMax
+        // NOTE: M2 / M2.5 / M2.7 base models are TEXT-ONLY despite
+        // marketing claims of "native multimodality" — confirmed by
+        // Artificial Analysis (artificialanalysis.ai) and the official
+        // model card on build.nvidia.com (text input only). Only the
+        // explicitly vision-tagged variants accept images.
+        "minimax-vl", "abab-vision", "abab6.5-vision",
+
+        // -------- StepFun
+        "step-1v", "step-1o", "step-2-vision",
+        "step-3", "step-3.5",
+
+        // -------- Open-source major VLMs
+        "llava",
+        "internvl", "mini-internvl", "xcomposer",
+        "minicpm-v", "minicpm-o", "minicpm-llama3-v",
+        "phi-3-vision", "phi-3.5-vision", "phi-4-multimodal",
+        "idefics",
+        "blip", "instructblip", "xgen-mm",
+        "fuyu", "kosmos",
+        "ferret", "openelm-vision", "mm1",
+        "florence-2", "florence-vl",
+        "smolvlm",
+        "vila", "nvila", "eagle2", "nvlm", "nemotron-vl",
+        "pali-3",
+
+        // -------- GUI-agent / screen-understanding VLMs (RsClaw's core
+        //          user community — keep this list eager)
+        "ui-tars",
+        "showui", "os-atlas", "seeclick", "screenagent",
+        "aria-ui", "omniparser",
+        "mobileagent", "appagent", "autoui",
+    ]
+    .iter()
+    .any(|needle| m.contains(needle))
+}
+
+/// User-facing error message emitted when vision-model resolution lands
+/// on a configuration that can't drive `computer_use`. Localised — the
+/// gateway language is read from `crate::i18n::default_lang()` so the
+/// message reaches the user in the channel they configured (Feishu /
+/// WeChat / Telegram / etc.). Falls back to English when the language
+/// is unset.
+pub fn vision_unavailable_message(reason: &str) -> String {
+    let lang = crate::i18n::default_lang();
+    crate::i18n::t_fmt("vision_unavailable", lang, &[("reason", reason)])
+}
+
 impl AgentRuntime {
 
     /// Estimate fixed context overhead: system prompt + tools tokens.
@@ -656,6 +941,64 @@ impl AgentRuntime {
     pub(crate) fn resolve_flash_model_name(&self) -> String {
         resolve_flash_model_for(&self.handle.config, &self.config.agents.defaults)
             .unwrap_or_else(|| self.resolve_model_name())
+    }
+
+    /// Resolve the vision model for `computer_use` via the
+    /// `model.vision → primary` fallback chain. Returns
+    /// `Err(actionable message)` when the resolved model is known to
+    /// be text-only or when nothing is configured at all — caller
+    /// surfaces this directly to the user.
+    ///
+    /// Use this from anywhere that wants to drive a VLM-backed loop
+    /// (`computer_use ui_tars`).
+    pub(crate) fn resolve_vision_model_name(&self) -> Result<String, String> {
+        match resolve_vision_model_for(
+            &self.handle.config,
+            &self.config.agents.defaults,
+        ) {
+            VisionResolution::Configured(name) => Ok(name),
+            VisionResolution::FallbackToPrimary(name) => {
+                // 1. Honour the per-model `input` declaration in
+                //    `models.providers[].models[]` first. If the user
+                //    has listed `image` we trust them; if they
+                //    explicitly listed only `text` we surface that as
+                //    a config error.
+                match model_supports_image_input(&self.config.raw, &name) {
+                    Some(true) => return Ok(name),
+                    Some(false) => {
+                        return Err(vision_unavailable_message(&format!(
+                            "model `{name}` is declared as text-only \
+                             (`input: [\"text\"]`) in its provider config. \
+                             Add `\"image\"` to the model's `input` array \
+                             or set `agents.defaults.model.vision`."
+                        )));
+                    }
+                    None => {} // no declaration → fall through to heuristic
+                }
+
+                // 2. No declaration: fall back to a vision-allow-list.
+                //    Defaulting to text-only here is the safer choice
+                //    — an unknown model name is more likely text-only
+                //    than vision-capable, and a clear error pointing
+                //    at the config beats a cryptic API failure later.
+                if is_known_vision_model(&name) {
+                    Ok(name)
+                } else {
+                    Err(vision_unavailable_message(&format!(
+                        "primary model `{name}` is not in the built-in \
+                         vision allow-list and its provider config does \
+                         not declare `input: [\"image\"]`. Either set \
+                         `agents.defaults.model.vision` to a vision \
+                         model, or declare `input: [\"text\", \"image\"]` \
+                         on the `{name}` entry under \
+                         `models.providers.<provider>.models[]`."
+                    )))
+                }
+            }
+            VisionResolution::NoneConfigured => Err(vision_unavailable_message(
+                "no model is configured for this agent.",
+            )),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1823,7 +2166,6 @@ impl AgentRuntime {
                             parse_error_count: 0,
                             recalled_memory_ids: std::collections::HashSet::new(),
                             loop_warning_triggered: false,
-                            python_inline_streak: 0,
                             turn_metrics: super::turn_metrics::TurnMetrics::new(),
                             user_text: String::new(),
                         },
@@ -2340,29 +2682,6 @@ impl AgentRuntime {
             dynamic_ctx.push(btw_block);
         }
 
-        // [Cron Session Hard Rules] Prevent agent from claiming dispatched tasks
-        // without actual tool calls. This fixes the deception problem where agent
-        // returns "task dispatched, task_id: xxx" but never actually executes anything.
-        if session_key.starts_with("cron:") {
-            dynamic_ctx.push(
-                "[CRON SESSION — HARD RULES]\n\
-                1. You MUST execute the task yourself. DO NOT use `agent` tool action=task to delegate.\n\
-                2. DO NOT claim \"已派发\" / \"dispatched\" / \"task_id: xxx\" without an ACTUAL tool call.\n\
-                3. If you say you are running a script, there MUST be an `execute_command` tool call.\n\
-                4. If you say you are analyzing data, there MUST be `read_file` or `search_content` tool calls.\n\
-                5. The cron scheduler expects your reply text as the result. Background tasks will NOT deliver.\n\
-                6. Claiming actions without tool calls is DECEPTION. This will be detected and reported.\n\
-                \n\
-                Example of CORRECT behavior:\n\
-                - User: \"run script X\"\n\
-                - You: call execute_command(\"python X.py\"), wait for result, summarize output\n\
-                \n\
-                Example of WRONG behavior:\n\
-                - User: \"run script X\"\n\
-                - You: \"任务已派发，task_id: xxx\" (NO tool call — this is LYING)".to_owned()
-            );
-        }
-
         // Plugin hook: before_prompt_build (AGENTS.md §20).
         self.fire_hook(
             "before_prompt_build",
@@ -2454,11 +2773,6 @@ impl AgentRuntime {
             if is_minimal_context_session(session_key) {
                 const INTERNAL_ALLOWED: &[&str] = &["memory"];
                 all.retain(|t| INTERNAL_ALLOWED.contains(&t.name.as_str()));
-            }
-
-            // Summarize sessions: no tools allowed, LLM must return text directly
-            if session_key.starts_with("summarize:") {
-                all.clear();
             }
 
             // Channel-specific tool filtering: only keep the *_actions tool
@@ -2676,7 +2990,6 @@ impl AgentRuntime {
             parse_error_count: 0,
             recalled_memory_ids: auto_recalled_ids,
             loop_warning_triggered: false,
-            python_inline_streak: 0,
             turn_metrics: super::turn_metrics::TurnMetrics::new(),
             user_text: text.to_owned(),
         };
@@ -3442,14 +3755,9 @@ impl AgentRuntime {
         const MAX_SAME_CALL_STREAK: usize = 5;
         // Track consecutive tool errors — stop early when tools keep failing.
         let mut error_streak: usize = 0;
-const MAX_ERROR_STREAK: usize = 5;
+        const MAX_ERROR_STREAK: usize = 5;
         // Store last error info so we can surface it when the loop breaks.
         let mut last_error_info: Option<String> = None;
-        // Track consecutive iterations with empty text + tool calls (model not summarizing).
-        let mut empty_tool_streak: usize = 0;
-        const MAX_EMPTY_TOOL_STREAK: usize = 3;
-        // Track total web_search calls in this turn (to inject consolidation hint).
-        let mut web_search_count: usize = 0;
         let mut max_iterations = BASE_ITERATIONS;
         let mut iteration = 0usize;
 
@@ -4301,200 +4609,68 @@ const MAX_ERROR_STREAK: usize = 5;
                 text_len = text_buf.len(),
                 "agent_loop: stream finished"
             );
-
-            // Track consecutive empty text + tool calls: model is not summarizing results.
-            // When this happens repeatedly, inject a warning to prompt the model to respond.
-            if text_buf.trim().is_empty() && !tool_calls.is_empty() {
-                empty_tool_streak += 1;
-                tracing::warn!(
-                    session = %ctx.session_key,
-                    empty_tool_streak,
-                    tool_call_count = tool_calls.len(),
-                    "agent_loop: empty text with tool calls (model not summarizing)"
-                );
-                if empty_tool_streak >= MAX_EMPTY_TOOL_STREAK {
-                    tracing::warn!(
-                        session = %ctx.session_key,
-                        empty_tool_streak,
-                        "agent_loop: too many empty-tool iterations, injecting warning"
-                    );
-                    // Inject warning as a user message in scratchpad to prompt model to respond.
-                    let warning_msg = Message {
-                        role: Role::User,
-                        content: MessageContent::Text(
-                            "[System] You have made multiple tool calls without outputting any text. \
-                            Please now consolidate the search results and respond to the user in text. \
-                            Do not call more tools."
-                                .to_owned(),
-                        ),
-                    };
-                    turn_scratchpad.push(warning_msg);
-                }
-            } else if !text_buf.trim().is_empty() || tool_calls.is_empty() {
-                // Reset streak when model outputs text OR has no tool calls.
-                empty_tool_streak = 0;
-            }
-
             if tool_calls.is_empty() {
                 // Deception detection: model claims action but no tool was called.
                 // This is a critical trust violation that must be flagged to the user.
                 // IMPORTANT: Check turn_scratchpad for tool calls from earlier iterations,
                 // not just current iteration's tool_calls (which is empty at this point).
-                //
-
-                // Check if turn_scratchpad contains tool calls (from earlier iterations)
-                // Must be defined BEFORE user tool request check
-                let has_tool_in_turn = turn_scratchpad.iter().any(|msg| {
-                    if let crate::provider::MessageContent::Parts(parts) = &msg.content {
-                        parts.iter().any(|p| {
-                            matches!(p, crate::provider::ContentPart::ToolUse { name, .. }
-                                if name == "opencode" || name == "claudecode" || name == "codex"
-                                    || name == "openclaude"
-                                    || name == "web_search" || name == "execute_command"
-                                    || name == "web_browser" || name == "web_fetch"
-                                    || name == "cron" || name == "read_file" || name == "write_file")
-                        })
-                    } else {
-                        false
-                    }
-                });
-
-                // First: check if user explicitly requested a tool call.
-                // Skip this check for sessions where user_text is NOT a user request:
-                // - summarize: user_text is task output, no tools available by design
-                // - heartbeat/system: status reporting, no tool calling expected
-                let skip_user_tool_request_check = ctx.session_key.starts_with("summarize:")
-                    || ctx.session_key.starts_with("heartbeat:")
-                    || ctx.session_key.starts_with("system:");
-                if !skip_user_tool_request_check {
-                    let user_tool_request_keywords = [
-                        // Chinese: explicit tool call requests
-                        "用cron", "调用cron", "查cron", "cron list", "cron查询", "cron查",
-                        "用execute", "执行命令", "调用命令", "运行命令", "运行脚本",
-                        "用python", "调用python", "执行python", "运行python",
-                        "用opencode", "调用opencode", "opencode去", "opencode查",
-                        "帮我查", "帮我调用", "帮我执行", "帮我运行",
-                        "查一下", "查下", "看一下", "看下", "列一下", "列下",
-                        // English: explicit tool call requests
-                        "use cron", "call cron", "run cron", "cron list",
-                        "execute", "run script", "call tool",
-                        "help me check", "check for me", "list for me",
-                    ];
-                    let user_requests_tool = user_tool_request_keywords.iter().any(|kw| {
-                        ctx.user_text.to_lowercase().contains(&kw.to_lowercase()) || ctx.user_text.contains(kw)
-                    });
-
-                    // If user explicitly requested a tool but model returned text with no tool call,
-                    // this is deception - user asked for action, model gave text instead.
-                    if user_requests_tool && !text_buf.trim().is_empty() && !has_tool_in_turn {
-                        tracing::warn!(
-                            session = %ctx.session_key,
-                            user_text = %ctx.user_text.chars().take(100).collect::<String>(),
-                            text_preview = %text_buf.chars().take(100).collect::<String>(),
-                            "USER REQUESTED TOOL BUT MODEL DID NOT CALL IT - blocking response"
-                        );
-                        text_buf.clear();
-                        let correction_msg = Message {
-                            role: Role::User,
-                            content: MessageContent::Text(
-                                "[System Correction] User explicitly requested you to call a tool (cron/execute/etc).\n\
-                                You responded with text instead of calling the tool. This is a violation of user intent.\n\
-                                You MUST call the tool that the user requested:\n\
-                                - User said \"用cron list\" -> call cron tool with action=list\n\
-                                - User said \"查cron\" -> call cron tool\n\
-                                - User said \"执行命令\" -> call execute_command tool\n\
-                                Call the tool NOW. Do not explain or apologize."
-                                    .to_owned(),
-                            ),
-                        };
-                        turn_scratchpad.push(correction_msg);
-                        tracing::info!(
-                            session = %ctx.session_key,
-                            "USER TOOL REQUEST VIOLATION: injected forced message, continuing loop"
-                        );
-                        continue;
-                    }
-                }
-                // Skip deception detection for heartbeat/system/summarize sessions.
-                // - heartbeat/system: may legitimately report status without tools
-                // - Summarize: pure summary task with NO tools available by design
-                // - CRON SESSIONS are NOT skipped: they carry real user instructions
-                //   and MUST call tools when claiming actions (deception is serious here)
-                let skip_deception_check = ctx.session_key.starts_with("heartbeat:")
-                    || ctx.session_key.starts_with("system:")
-                    || ctx.session_key.starts_with("summarize:");
                 let deception_keywords = [
-                    // Chinese - claiming delegation/execution (NOT generic "已完成")
-                    "已委托", "已提交", "已用opencode", "已让opencode", "委托给opencode",
+                    "已委托", "已用opencode", "已让opencode", "委托给opencode",
                     "已检查", "已搜索", "已运行", "已执行",
-                    "已交给", "交给opencode", "opencode正在", "opencode已经", "opencode会",
-                    "已访问", "访问了", "用浏览器", "用cdp", "用CDP",
-                    "正在执行", "正在运行", "正在检查", "正在搜索",
-                    "我来执行", "我来运行", "我来检查", "我来搜索",
-                    "帮你执行", "帮你运行", "帮你检查", "帮你搜索",
-                    // CRON-specific: claiming task dispatch without actual tool call
-                    "已派发", "任务已派发", "派发到", "派发给了",
-                    // Chinese: claiming to have called/used/checked something
-                    "我通过", "我调用", "我查询", "我检查", "我搜索", "我运行", "我执行",
-                    "命令查询", "命令检查", "通过命令", "调用了", "查询了", "检查了",
-                    // Chinese: claiming specific results without tool call (data fabrication)
-                    "任务列表中", "cron 任务列表", "当前只有", "个任务", "确实不在",
-                    "列表中", "在列表", "不在列表", "任务有", "有任务",
-                    // English - claiming delegation/execution (NOT generic "I completed")
-                    "I delegated", "I submitted", "I asked opencode", "opencode is", "I ran",
-                    "I checked", "I searched", "I executed", "I visited",
-                    "I will", "I'm running", "I'm executing", "I'm checking",
-                    "using browser", "used browser", "using cdp", "used cdp",
-                    "let me", "help you",
-                    // CRON-specific: claiming task dispatch without actual tool call
-                    "dispatched", "task dispatched", "task_id:", "task id:",
-                    // English: claiming to have called/used something
-                    "I called", "I used", "I ran", "via command", "through",
-                    // English: claiming specific results without tool call (data fabrication)
-                    "task list", "cron jobs", "currently has", "tasks:", "in the list",
+                    "已交给", "交给opencode", "opencode正在", "opencode已经",
+                    "I delegated", "I asked opencode", "opencode is", "I ran",
+                    "I checked", "I searched", "I executed",
                 ];
                 let lower_text = text_buf.to_lowercase();
                 let claims_action = deception_keywords.iter().any(|kw| {
                     lower_text.contains(&kw.to_lowercase()) || text_buf.contains(kw)
                 });
 
-                // Only flag deception for regular sessions when model claims action
-                // AND no tool was called in entire turn.
-                // Internal/summarize sessions are exempt - they may legitimately report
-                // status without tool calls (summarize sessions have NO tools by design).
-                if !skip_deception_check && claims_action && !text_buf.trim().is_empty() && !has_tool_in_turn {
+                // Check if turn_scratchpad contains tool calls (from earlier iterations)
+                let has_tool_in_turn = turn_scratchpad.iter().any(|msg| {
+                    if let crate::provider::MessageContent::Parts(parts) = &msg.content {
+                        parts.iter().any(|p| {
+                            matches!(p, crate::provider::ContentPart::ToolUse { name, .. }
+                                if name == "opencode" || name == "claudecode" || name == "codex"
+                                    || name == "web_search" || name == "execute_command")
+                        })
+                    } else {
+                        false
+                    }
+                });
+
+                // Only flag deception if model claims action AND no tool was called in entire turn
+                if claims_action && !text_buf.trim().is_empty() && !has_tool_in_turn {
                     tracing::warn!(
                         session = %ctx.session_key,
-                        skip_deception_check = skip_deception_check,
                         text_preview = %text_buf.chars().take(200).collect::<String>(),
                         has_tool_in_turn = has_tool_in_turn,
                         "DECEPTION DETECTED: model claims action but no tool_call in turn"
                     );
-// CRITICAL: Do NOT return the deceptive text to user.
-                    // Instead, inject a correction message and continue the loop.
-                    // Clear the deceptive text and add a forced user message.
-                    text_buf.clear();
-                    let correction_msg = Message {
-                        role: Role::User,
-                        content: MessageContent::Text(
-                            "[System Correction] You claimed to have executed an action but did not call any tool. This is deception.\n\
-                            You must now actually call a tool to perform the action you claimed.\n\
-                            - If you said 'submitted to opencode', you must call the opencode tool\n\
-                            - If you said 'searched', you must call the web_search tool\n\
-                            - If you said 'executed', you must call the execute_command tool\n\
-                            Do not explain, just call the tool."
-                                .to_owned(),
-                        ),
-                    };
-                    turn_scratchpad.push(correction_msg);
-                    // Do NOT return here - continue the loop to force model to actually call tools
-                    tracing::info!(
-                        session = %ctx.session_key,
-                        "DECEPTION CORRECTION: injected forced message, continuing loop"
-                    );
-                    // Skip the rest of this iteration's final-reply processing
-                    // and continue to the next iteration where model must call tools
-                    continue;
+                    // Send warning via notification channel (streaming already sent original text).
+                    // Append warning to text_buf so it's persisted in session history.
+                    let warning = "\n\n⚠️ **警告**: 模型声称已执行操作但实际上没有调用任何工具。\
+                        这是欺骗行为。请回复「重试并实际调用工具」强制模型执行。";
+                    text_buf.push_str(warning);
+                    // Also send immediately via notification so user sees it.
+                    if let Some(ref ntx) = self.notification_tx {
+                        let notif_target = if !ctx.chat_id.is_empty() {
+                            ctx.chat_id.clone()
+                        } else {
+                            ctx.peer_id.clone()
+                        };
+                        let _ = ntx.send(crate::channel::OutboundMessage {
+                            target_id: notif_target,
+                            is_group: false,
+                            text: "⚠️ **欺骗警告**: 模型声称「已委托/已检查」但没有调用任何工具。\
+                                这是欺骗行为。\n\n请回复「重试」强制模型实际调用 opencode 工具。".to_owned(),
+                            reply_to: None,
+                            images: vec![],
+                            files: vec![],
+                            channel: Some(ctx.channel.clone()),
+                            account: None,
+                        });
+                    }
                 }
 
                 // Only persist non-empty assistant replies to session.
@@ -4631,6 +4807,11 @@ const MAX_ERROR_STREAK: usize = 5;
             if !text_buf.is_empty() && tool_calls.is_empty() {
                 // Only save text if there are no tool calls (final reply).
                 parts.push(crate::provider::ContentPart::Text { text: text_buf });
+            }
+            // Persist reasoning_content so providers that require it (e.g.
+            // kimi-for-coding) see it on subsequent turns.
+            if !reasoning_buf.is_empty() {
+                parts.push(crate::provider::ContentPart::Reasoning { text: reasoning_buf });
             }
             for (id, name, input) in &tool_calls {
                 parts.push(crate::provider::ContentPart::ToolUse {
@@ -4785,7 +4966,7 @@ const MAX_ERROR_STREAK: usize = 5;
 
                 // Upgrade iteration limit when complex or multi-step tools are used.
                 if matches!(tool_name.as_str(),
-                    "web_browser" | "opencode" | "claudecode" | "openclaude" | "agent"
+                    "web_browser" | "opencode" | "claudecode" | "agent"
                     | "search_content" | "search_file" | "execute_command" | "exec"
                 ) {
                     max_iterations = max_iterations.max(configured_complex);
@@ -4806,14 +4987,6 @@ const MAX_ERROR_STREAK: usize = 5;
                     }),
                 )
                 .await;
-
-                // [方案 E] Check python -c complexity BEFORE execution result processing
-                // Warn about complex inline Python to encourage file-based approach
-                let command_for_check = tool_input.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                let is_complex_python_inline = (command_for_check.starts_with("python -c")
-                    || command_for_check.starts_with("python3 -c")
-                    || command_for_check.starts_with("py -c"))
-                    && command_for_check.len() > 200;
 
                 let tool_input_str = tool_input.to_string();
                 // Clone for the per-turn metrics record (after dispatch
@@ -4868,8 +5041,6 @@ const MAX_ERROR_STREAK: usize = 5;
                         } else {
                             error_streak = 0;
                             last_error_info = None;
-                            // Reset python_inline_streak on successful execution
-                            ctx.python_inline_streak = 0;
                         }
                         // Record into per-turn metrics for workflow
                         // crystallization. Truncate args/result so we don't
@@ -4920,323 +5091,29 @@ const MAX_ERROR_STREAK: usize = 5;
                                 }
                             }
                         }
-                        // Track web_search count and inject consolidation hint when count > 3.
-                        // This prompts the model to summarize results instead of searching more.
-                        // Also inject error recovery hints when tool execution fails.
-                        let v_modified = if tool_name == "web_search" {
-                            web_search_count += 1;
-                            if web_search_count > 3 {
-                                tracing::warn!(
-                                    session = %ctx.session_key,
-                                    web_search_count,
-                                    "agent_loop: multiple web_search calls, injecting hint"
-                                );
-                                // Inject hint into result JSON
-                                let hint = format!(
-                                    "[Hint] This session has made {} searches. Please consolidate existing results and respond to the user. Do not search again.",
-                                    web_search_count
-                                );
-                                match &v {
-                                    serde_json::Value::Object(obj) => {
-                                        let mut modified = obj.clone();
-                                        modified.insert("_search_hint".to_owned(), json!(hint));
-                                        serde_json::Value::Object(modified)
-                                    }
-                                    other => other.clone()
-                                }
-                            } else {
-                                v.clone()
-                            }
-                        } else if has_error {
-                            // Inject error recovery hint into tool result
-                            // Detect specific error types and provide targeted guidance
-                            let stderr_text = v.get("stderr").and_then(|s| s.as_str()).unwrap_or("");
-                            let stdout_text = v.get("stdout").and_then(|s| s.as_str()).unwrap_or("");
-                            let command_text = v.get("command").and_then(|s| s.as_str()).unwrap_or("");
-
-                            // Detect python -c inline execution
-                            let is_python_inline = command_text.starts_with("python -c")
-                                || command_text.starts_with("python3 -c")
-                                || command_text.starts_with("py -c");
-
-                            // Track python_inline streak for better guidance
-                            if is_python_inline {
-                                ctx.python_inline_streak += 1;
-                            }
-
-                            // Detect Python syntax errors
-                            let is_python_syntax_error = stderr_text.contains("SyntaxError")
-                                || stderr_text.contains("IndentationError")
-                                || stderr_text.contains("TabError")
-                                || stderr_text.contains("NameError")
-                                || stderr_text.contains("ImportError")
-                                || stderr_text.contains("ModuleNotFoundError")
-                                || stderr_text.contains("TypeError")
-                                || stderr_text.contains("ValueError")
-                                || stderr_text.contains("AttributeError")
-                                || stderr_text.contains("KeyError")
-                                || stderr_text.contains("IndexError")
-                                || stderr_text.contains("ZeroDivisionError");
-
-                            // Detect shell/command errors
-                            let is_shell_error = stderr_text.contains("command not found")
-                                || stderr_text.contains("No such file or directory")
-                                || stderr_text.contains("Permission denied")
-                                || stderr_text.contains("syntax error")
-                                || stderr_text.contains("unexpected token")
-                                || stderr_text.contains("invalid syntax");
-
-                            let remaining = MAX_ERROR_STREAK.saturating_sub(error_streak);
-
-                            // Enhanced Python error diagnosis - extract line number and context
-                            let (error_line, error_context) = if is_python_syntax_error {
-                                // Parse stderr for line number and error context
-                                let line_num = stderr_text.lines()
-                                    .find_map(|line| {
-                                        // Patterns: "line X" or "File "...", line X"
-                                        let patterns = ["line ", "Line ", "line:"];
-                                        for pat in patterns {
-                                            if line.contains(pat) {
-                                                if let Some(pos) = line.find(pat) {
-                                                    let after = &line[pos + pat.len()..];
-                                                    if let Some(num_str) = after.split(|c: char| !c.is_numeric()).next() {
-                                                        if let Ok(n) = num_str.parse::<u32>() {
-                                                            return Some(n);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        None
-                                    });
-                                // Extract error context line (the ^ pointer line)
-                                let context = stderr_text.lines()
-                                    .skip_while(|l| !l.trim().starts_with('^'))
-                                    .next()
-                                    .map(|l| l.trim())
-                                    .unwrap_or("");
-                                (line_num, context)
-                            } else {
-                                (None, "")
-                            };
-
-                            let hint = if remaining == 0 {
-                                "[Warning] Tool execution failed consecutively. This session will end. Please summarize the methods you tried and the errors encountered.".to_owned()
-                            } else if is_python_inline && ctx.python_inline_streak >= 2 {
-                                // [方案 B] Guide LLM to use file-based execution after 2+ inline failures
-                                // [方案 C] Force reflection for repeated python -c attempts
-                                let base_hint = if is_python_syntax_error {
-                                    let error_type = if stderr_text.contains("SyntaxError") { "Syntax Error" }
-                                    else if stderr_text.contains("IndentationError") || stderr_text.contains("TabError") { "Indentation Error" }
-                                    else if stderr_text.contains("NameError") { "Name Error (undefined variable)" }
-                                    else if stderr_text.contains("ImportError") || stderr_text.contains("ModuleNotFoundError") { "Import Error (missing module)" }
-                                    else if stderr_text.contains("TypeError") { "Type Error" }
-                                    else if stderr_text.contains("ValueError") { "Value Error" }
-                                    else if stderr_text.contains("AttributeError") { "Attribute Error" }
-                                    else if stderr_text.contains("KeyError") { "Key Error" }
-                                    else if stderr_text.contains("IndexError") { "Index Error" }
-                                    else if stderr_text.contains("ZeroDivisionError") { "Zero Division Error" }
-                                    else { "Runtime Error" };
-
-                                    let line_info = error_line.map(|n| format!(" at line {}", n)).unwrap_or_default();
-                                    let pointer_info = if !error_context.is_empty() {
-                                        format!(" (error position: '{}')", error_context)
-                                    } else { String::new() };
-
-                                    format!(
-                                        "[Python Inline Execution Failed] {}{}\n\
-                                        Error type: {}{}\n\n\
-                                        [STOP AND REFLECT] You have tried 'python -c' {} times without success.\n\
-                                        Inline Python is hard to debug because you must rewrite the entire command.\n\n\
-                                        [RECOMMENDED APPROACH - Use _tmp/ directory]\n\
-                                        1. write_file('_tmp/debug.py', 'your code here') - temp scripts go in _tmp/\n\
-                                        2. execute_command('python _tmp/debug.py') - run the script\n\
-                                        3. read_file('_tmp/debug.py') + write_file to fix errors\n\
-                                        4. After success, clean up: execute_command('rm _tmp/debug.py')\n\
-                                        \n\
-                                        The _tmp/ directory is for disposable scripts. Clean them after use.\n\n\
-                                        stderr:\n{}\n\n\
-                                        You have {} attempts left. Switch to file-based execution NOW.",
-                                        error_type, line_info, error_type, pointer_info,
-                                        ctx.python_inline_streak,
-                                        stderr_text.lines().take(8).collect::<Vec<_>>().join("\n"),
-                                        remaining
-                                    )
-                                } else {
-                                    format!(
-                                        "[Python Inline Execution Failed] (attempt {}/{})\n\
-                                        [STOP AND REFLECT] You have tried 'python -c' {} times without success.\n\
-                                        Inline Python debugging is difficult - you must rewrite the entire command each time.\n\n\
-                                        [RECOMMENDED APPROACH - Use _tmp/ directory]\n\
-                                        1. write_file('_tmp/script.py', 'your code') - temp scripts in _tmp/\n\
-                                        2. execute_command('python _tmp/script.py') - run and iterate\n\
-                                        3. After success, clean up: execute_command('rm _tmp/script.py')\n\
-                                        \n\
-                                        The _tmp/ directory keeps your workspace clean. Delete temp files after use.\n\n\
-                                        stderr:\n{}\n\n\
-                                        You have {} attempts left. Switch to file-based execution NOW.",
-                                        error_streak, MAX_ERROR_STREAK,
-                                        ctx.python_inline_streak,
-                                        stderr_text.lines().take(8).collect::<Vec<_>>().join("\n"),
-                                        remaining
-                                    )
-                                };
-                                base_hint
-                            } else if is_python_syntax_error {
-                                // [方案 D] Enhanced Python error diagnosis
-                                let error_type = if stderr_text.contains("SyntaxError") { "Syntax Error" }
-                                else if stderr_text.contains("IndentationError") || stderr_text.contains("TabError") { "Indentation Error" }
-                                else if stderr_text.contains("NameError") { "Name Error (undefined variable)" }
-                                else if stderr_text.contains("ImportError") || stderr_text.contains("ModuleNotFoundError") { "Import Error (missing module)" }
-                                else if stderr_text.contains("TypeError") { "Type Error" }
-                                else if stderr_text.contains("ValueError") { "Value Error" }
-                                else if stderr_text.contains("AttributeError") { "Attribute Error" }
-                                else if stderr_text.contains("KeyError") { "Key Error" }
-                                else if stderr_text.contains("IndexError") { "Index Error" }
-                                else if stderr_text.contains("ZeroDivisionError") { "Zero Division Error" }
-                                else { "Runtime Error" };
-
-                                let line_info = error_line.map(|n| format!(" at line {}", n)).unwrap_or_default();
-                                let pointer_info = if !error_context.is_empty() {
-                                    format!(" (error position indicator: '{}')", error_context)
-                                } else { String::new() };
-
-                                let specific_fix = match error_type {
-                                    "Syntax Error" => "Check for: missing parentheses, quotes, commas, or invalid syntax around the error line.",
-                                    "Indentation Error" => "Check for: inconsistent indentation (mix of tabs/spaces) or missing indentation.",
-                                    "Name Error" => "Check for: undefined variable name. Did you misspell it or forget to define it?",
-                                    "Import Error" => "Check for: missing module. Install with pip or check module name spelling.",
-                                    "Type Error" => "Check for: wrong type passed to function (e.g. string to int operation).",
-                                    "Value Error" => "Check for: invalid value (e.g. int('abc'), negative index).",
-                                    "Attribute Error" => "Check for: method/property does not exist on object type.",
-                                    "Key Error" => "Check for: dictionary key does not exist. Use .get(key) for safe access.",
-                                    "Index Error" => "Check for: list index out of range. Verify list length before accessing.",
-                                    "Zero Division Error" => "Check for: division by zero. Add check before division.",
-                                    _ => "Read the error message carefully for the specific issue."
-                                };
-
-                                format!(
-                                    "[Python Error Fix Hint] Detected {}{}\n\
-                                    Error type: {}{}\n\
-                                    Specific fix: {}\n\n\
-                                    [Recommended Fix Steps]\n\
-                                    1. Read stderr carefully - find line number and error type\n\
-                                    2. If using python -c: write_file('_tmp/debug.py', 'your code') then execute_command('python _tmp/debug.py')\n\
-                                    3. Fix the specific error at the indicated line\n\
-                                    4. After success, clean up: execute_command('rm _tmp/debug.py')\n\n\
-                                    The _tmp/ directory is for disposable temp scripts.\n\n\
-                                    stderr:\n{}\n\n\
-                                    You have {} attempts left.",
-                                    error_type, line_info, error_type, pointer_info, specific_fix,
-                                    stderr_text.lines().take(6).collect::<Vec<_>>().join("\n"),
-                                    remaining
-                                )
-                            } else if is_shell_error {
-                                // Shell error - specific guidance
-                                format!(
-                                    "[Command Execution Error Hint] Command failed (attempt {}/{}).\n\
-                                    stderr shows: {}\n\n\
-                                    [Common Causes and Fixes]\n\
-                                    - \"command not found\": Command does not exist, check spelling or install the tool\n\
-                                    - \"No such file\": File does not exist, check if path is correct\n\
-                                    - \"Permission denied\": Permission insufficient, check file permissions\n\
-                                    \n\
-                                    Please fix the command and try again. You have {} attempts left.",
-                                    error_streak, MAX_ERROR_STREAK,
-                                    stderr_text.lines().take(3).collect::<Vec<_>>().join("\n"),
-                                    remaining
-                                )
-                            } else {
-                                // Generic error
-                                format!(
-                                    "[Hint] Tool execution failed (attempt {}/{}). Please check the error and try to fix.\
-                                    You have {} attempts left. Common fixes: check if path is correct, fix command syntax, or try other methods.",
-                                    error_streak, MAX_ERROR_STREAK, remaining
-                                )
-                            };
-
-                            match &v {
-                                serde_json::Value::Object(obj) => {
-                                    let mut modified = obj.clone();
-                                    // [方案 1] Inject hint directly into stderr so LLM sees it prominently
-                                    // instead of hidden in a separate JSON field
-                                    let hint_for_stderr = hint.clone();
-                                    if let Some(stderr) = modified.get("stderr").and_then(|s| s.as_str()) {
-                                        let enhanced_stderr = if stderr.is_empty() {
-                                            hint_for_stderr
-                                        } else {
-                                            format!(
-                                                "{}\n\n--- Original stderr ---\n{}",
-                                                hint_for_stderr,
-                                                stderr
-                                            )
-                                        };
-                                        modified.insert("stderr".to_owned(), json!(enhanced_stderr));
-                                    } else {
-                                        // No stderr field, add one with the hint
-                                        modified.insert("stderr".to_owned(), json!(hint_for_stderr));
-                                    }
-                                    // Keep _error_hint for logging/debugging purposes
-                                    modified.insert("_error_hint".to_owned(), json!(hint));
-                                    serde_json::Value::Object(modified)
-                                }
-                                other => other.clone()
-                            }
-                        } else if is_complex_python_inline {
-                            // [方案 E] Warn about complex inline Python even on success
-                            // Encourage file-based approach for easier debugging in future
-                            let complexity_hint = "[Complex Inline Python Notice] Your 'python -c' command is over 200 characters.\n\
-                            For complex scripts, using file-based execution in _tmp/ is recommended:\n\
-                            1. write_file('_tmp/script.py', 'your code') - easier to view and modify\n\
-                            2. execute_command('python _tmp/script.py') - clearer error messages with line numbers\n\
-                            3. read_file('_tmp/script.py') + write_file('_tmp/script.py', 'fixed code') - iterative debugging\n\
-                            4. After success, clean up: execute_command('rm _tmp/script.py')\n\
-                            \n\
-                            Inline Python is fine for simple one-liners, but _tmp/ files are much easier for debugging complex code.\n\
-                            The _tmp/ directory is for disposable temp scripts - clean them after use.";
-                            match &v {
-                                serde_json::Value::Object(obj) => {
-                                    let mut modified = obj.clone();
-                                    // Inject into stdout so LLM sees it even on success
-                                    if let Some(stdout) = modified.get("stdout").and_then(|s| s.as_str()) {
-                                        let enhanced_stdout = if stdout.is_empty() {
-                                            complexity_hint.to_string()
-                                        } else {
-                                            format!(
-                                                "{}\n\n--- Original output ---\n{}",
-                                                complexity_hint,
-                                                stdout
-                                            )
-                                        };
-                                        modified.insert("stdout".to_owned(), json!(enhanced_stdout));
-                                    } else {
-                                        modified.insert("stdout".to_owned(), json!(complexity_hint));
-                                    }
-                                    modified.insert("_complexity_hint".to_owned(), json!(complexity_hint));
-                                    serde_json::Value::Object(modified)
-                                }
-                                other => other.clone()
-                            }
-                        } else {
-                            v.clone()
-                        };
                         // Extract images from tool result to avoid passing large
                         // base64 back to LLM. Check "image" (data-URL screenshots
                         // and image-gen), "image_path" (new screenshot path), and
                         // "url" (image gen). File paths get forwarded as-is so
                         // the UI can load them via Tauri's asset protocol —
                         // much lighter than shipping base64 over WS.
-                        let img_data = v_modified.get("image").and_then(|i| i.as_str()).or_else(|| {
-                            v_modified.get("url")
+                        let img_data = v.get("image").and_then(|i| i.as_str()).or_else(|| {
+                            v.get("url")
                                 .and_then(|u| u.as_str())
                                 .filter(|u| u.starts_with("data:image/"))
                         });
-                        let img_path = v_modified.get("image_path").and_then(|p| p.as_str());
-                        if let Some(img) = img_data.or(img_path) {
-                            let desc = v_modified
+                        let img_path = v.get("image_path").and_then(|p| p.as_str());
+                        // computer_use screenshots are internal agent state —
+                        // never auto-send to the user. Only image-gen and explicit uploads
+                        // should forward images.
+                        let is_internal_screenshot = tool_name == "computer_use";
+                        if !is_internal_screenshot
+                            && let Some(img) = img_data.or(img_path)
+                        {
+                            let desc = v
                                 .get("revised_prompt")
                                 .and_then(|p| p.as_str())
-                                .or_else(|| v_modified.get("action").and_then(|a| a.as_str()))
+                                .or_else(|| v.get("action").and_then(|a| a.as_str()))
                                 .unwrap_or("image generated");
                             (
                                 format!(
@@ -5244,16 +5121,14 @@ const MAX_ERROR_STREAK: usize = 5;
                                 ),
                                 vec![img.to_owned()],
                             )
-                        } else if v_modified.is_string() {
-                            (v_modified.as_str().unwrap_or("").to_owned(), vec![])
+                        } else if v.is_string() {
+                            (v.as_str().unwrap_or("").to_owned(), vec![])
                         } else {
                             // Format structured tool results (exec, read, etc.) for better LLM comprehension
-                            (format_tool_result(&v_modified), vec![])
+                            (format_tool_result(&v), vec![])
                         }
                     }
                     Err(e) => {
-                        // Increment error streak - stop if too many consecutive failures
-                        error_streak += 1;
                         // Use {:#} (anyhow alternate Display) to include the
                         // full error chain — without this the LLM only sees
                         // the outermost with_context() wrapper and root cause
@@ -5265,21 +5140,10 @@ const MAX_ERROR_STREAK: usize = 5;
                         // Record error result for loop detection (errors count as results too).
                         ctx.loop_detector
                             .record_result(&serde_json::json!({"error": err_chain.clone()}));
-                        let remaining = MAX_ERROR_STREAK.saturating_sub(error_streak);
-                        let hint = if remaining > 0 {
-                            format!(
-                                "Tool execution failed (attempt {}/{}). Check the error and try to fix it. \
-                                You have {} more attempts before the turn ends. \
-                                Common fixes: check file paths, fix command syntax, or try a different approach.",
-                                error_streak, MAX_ERROR_STREAK, remaining
-                            )
-                        } else {
-                            "Tool execution failed repeatedly. This turn will end. \
-                            Summarize what you tried and the errors encountered.".to_owned()
-                        };
                         let payload = serde_json::json!({
                             "error": err_chain,
-                            "_retry_hint": hint,
+                            "_do_not_retry": true,
+                            "hint": "This tool call failed. Do NOT retry the same tool with the same arguments. Try a different approach or inform the user.",
                         });
                         (payload.to_string(), vec![])
                     }
@@ -5892,7 +5756,7 @@ const MAX_ERROR_STREAK: usize = 5;
             "web_fetch" => return self.tool_web_fetch(args).await,
             "web_download" => return self.tool_web_download(args).await,
             "web_browser" | "browser" => return self.tool_web_browser(ctx, args).await,
-            "computer_use" => return self.tool_computer_use(args).await,
+            "computer_use" => return self.tool_computer_use(ctx, args).await,
             "image_gen" | "image" => return self.tool_image(args).await,
             "video_gen" | "video" => return self.tool_video(args, ctx).await,
             "pdf" => return self.tool_pdf(args).await,
@@ -5927,7 +5791,6 @@ const MAX_ERROR_STREAK: usize = 5;
             "opencode" => return self.tool_opencode(ctx, args).await,
             "claudecode" => return self.tool_claudecode(ctx, args).await,
             "codex" => return self.tool_codex(ctx, args).await,
-            "openclaude" => return self.tool_openclaude(ctx, args).await,
             _ => {}
         }
 
@@ -6254,10 +6117,23 @@ const MAX_ERROR_STREAK: usize = 5;
     }
 
     pub(crate) fn tool_use_skill(&self, args: Value) -> Result<Value> {
+        // Try "name" first, then fall back to common alternatives the model
+        // sometimes emits when it confuses the parameter name.
         let name = args
             .get("name")
+            .or_else(|| args.get("skill"))
+            .or_else(|| args.get("skill_name"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("use_skill: 'name' is required"))?;
+            .ok_or_else(|| {
+                let available: Vec<String> =
+                    self.skills.all().map(|s| s.name.clone()).collect();
+                anyhow!(
+                    "use_skill: 'name' is required. Available skills: {}. \
+                     Received args: {}",
+                    available.join(", "),
+                    args
+                )
+            })?;
         let Some(skill) = self.skills.get(name) else {
             let available: Vec<&str> = self.skills.all().map(|s| s.name.as_str()).collect();
             return Ok(serde_json::json!({
@@ -6620,7 +6496,7 @@ fn is_likely_text_file(lower: &str) -> bool {
 
 /// Format a tool call result as human-readable markdown.
 fn format_tool_result(val: &serde_json::Value) -> String {
-    // exec tool: { exit_code, stdout, stderr, error_parsed }
+    // exec tool: { exit_code, stdout, stderr }
     if val.get("stdout").is_some() || val.get("stderr").is_some() {
         let stdout = val["stdout"].as_str().unwrap_or("").trim();
         let stderr = val["stderr"].as_str().unwrap_or("").trim();
@@ -6643,33 +6519,6 @@ fn format_tool_result(val: &serde_json::Value) -> String {
                 }
                 out.push_str(&format!("[exit code: {code}]"));
             }
-        }
-        // Include parsed error info for better LLM comprehension
-        if let Some(parsed) = val.get("error_parsed") {
-            if !out.is_empty() {
-                out.push_str("\n\n");
-            }
-            out.push_str("[Error Analysis]\n");
-            if let Some(err_type) = parsed.get("error_type").and_then(|v| v.as_str()) {
-                out.push_str(&format!("Error type: {err_type}\n"));
-            }
-            if let Some(msg) = parsed.get("message").and_then(|v| v.as_str()) {
-                out.push_str(&format!("Message: {msg}\n"));
-            }
-            if let Some(line) = parsed.get("line").and_then(|v| v.as_i64()) {
-                out.push_str(&format!("Line: {line}\n"));
-            }
-            if let Some(hint) = parsed.get("hint").and_then(|v| v.as_str()) {
-                out.push_str(&format!("Hint: {hint}\n"));
-            }
-            out.push_str("\n[FIX SUGGESTION] Review the error details above and modify your command/query accordingly.");
-        }
-        // Include hint if available (CLI did-you-mean suggestions)
-        if let Some(hint) = val.get("hint").and_then(|v| v.as_str()) {
-            if !out.is_empty() {
-                out.push_str("\n\n");
-            }
-            out.push_str(&format!("[Suggestion] {hint}"));
         }
         if out.is_empty() {
             "(no output)".to_owned()
@@ -7164,6 +7013,284 @@ mod tests {
         // "HEARTBEAT_OK" reply bug where cron jobs got the minimal prompt.
         assert!(!is_minimal_context_session("cron:morning-briefing"));
         assert!(!is_minimal_context_session("agent:main:telegram:direct:u1"));
+    }
+
+    // ------------------------------------------------------------------
+    // model_supports_image_input — schema-driven vision-capability lookup
+    // ------------------------------------------------------------------
+
+    fn build_config_with_models(
+        provider_name: &str,
+        models: Vec<crate::config::schema::ModelDef>,
+    ) -> crate::config::schema::Config {
+        use crate::config::schema::{
+            ApiFormat, Config, ModelsConfig, ProviderConfig,
+        };
+        let pc = ProviderConfig {
+            base_url: None,
+            api_key: None,
+            api: Some(ApiFormat::OpenAiCompletions),
+            models: Some(models),
+            enabled: Some(true),
+            user_agent: None,
+        };
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(provider_name.to_owned(), pc);
+        Config {
+            models: Some(ModelsConfig {
+                mode: None,
+                providers,
+            }),
+            ..Config::default()
+        }
+    }
+
+    fn model_def(id: &str, inputs: Option<Vec<crate::config::schema::InputType>>) -> crate::config::schema::ModelDef {
+        crate::config::schema::ModelDef {
+            id: id.to_owned(),
+            name: None,
+            reasoning: None,
+            input: inputs,
+            cost: None,
+            context_window: None,
+            max_tokens: None,
+            enabled: None,
+        }
+    }
+
+    #[test]
+    fn model_supports_image_input_explicit_image() {
+        use crate::config::schema::InputType;
+        let cfg = build_config_with_models(
+            "kimi",
+            vec![model_def("kimi-for-coding", Some(vec![InputType::Text, InputType::Image]))],
+        );
+        // Both qualified and unqualified lookups resolve.
+        assert_eq!(model_supports_image_input(&cfg, "kimi/kimi-for-coding"), Some(true));
+        assert_eq!(model_supports_image_input(&cfg, "kimi-for-coding"), Some(true));
+    }
+
+    #[test]
+    fn model_supports_image_input_text_only() {
+        use crate::config::schema::InputType;
+        let cfg = build_config_with_models(
+            "deepseek",
+            vec![model_def("deepseek-chat", Some(vec![InputType::Text]))],
+        );
+        assert_eq!(model_supports_image_input(&cfg, "deepseek/deepseek-chat"), Some(false));
+    }
+
+    #[test]
+    fn model_supports_image_input_no_input_field_returns_none() {
+        let cfg = build_config_with_models(
+            "kimi",
+            vec![model_def("kimi-for-coding", None)],
+        );
+        // input field absent → caller should fall back to blocklist.
+        assert_eq!(model_supports_image_input(&cfg, "kimi/kimi-for-coding"), None);
+    }
+
+    #[test]
+    fn model_supports_image_input_unknown_model_returns_none() {
+        use crate::config::schema::InputType;
+        let cfg = build_config_with_models(
+            "kimi",
+            vec![model_def("kimi-for-coding", Some(vec![InputType::Image]))],
+        );
+        assert_eq!(model_supports_image_input(&cfg, "openai/gpt-4"), None);
+    }
+
+    // ------------------------------------------------------------------
+    // is_known_vision_model — built-in allow-list
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn is_known_vision_model_kimi_family() {
+        // kimi-for-coding ships vision tuning.
+        assert!(is_known_vision_model("kimi/kimi-for-coding"));
+        assert!(is_known_vision_model("kimi-for-coding"));
+        // K2.5+ series is multimodal; older K2.x (K2.0..=K2.4) is not.
+        assert!(is_known_vision_model("kimi/kimi-k2.5"));
+        assert!(is_known_vision_model("kimi/kimi-k2.6-preview"));
+        assert!(is_known_vision_model("kimi/kimi-k2.7"));
+        // Pre-2.5 must NOT match.
+        assert!(!is_known_vision_model("kimi/kimi-k2.0"));
+        assert!(!is_known_vision_model("kimi/kimi-k1"));
+    }
+
+    #[test]
+    fn is_known_vision_model_major_vlms() {
+        for name in [
+            // International
+            "openai/gpt-4o",
+            "openai/gpt-4-vision-preview",
+            "openai/gpt-5",
+            "anthropic/claude-3-opus",
+            "anthropic/claude-sonnet-4-5",
+            "anthropic/claude-4-7",
+            "google/gemini-1.5-pro",
+            "google/gemini-3-ultra",
+            "google/gemma-3-27b-it",
+            "google/gemma-4-9b",
+            "google/paligemma-3b-mix",
+            "meta/llama-3.2-90b-vision-instruct",
+            "meta/llama-4-scout-17b",
+            "mistral/pixtral-12b",
+            "mistral/mistral-small-3.1-24b",
+            "cohere/aya-vision-32b",
+            "xai/grok-3", "xai/grok-4-fast",
+
+            // Chinese — ByteDance / Alibaba / Moonshot / Zhipu / Baidu / 01 / Baichuan / DeepSeek / Tencent / MiniMax / StepFun
+            "doubao/doubao-seed-1.5-vision-pro",
+            "doubao/doubao-seed-1.6-vision-thinking",
+            // Doubao Seed 2+ — entire 2.x / 3.x / ... subtree is multimodal
+            "doubao/doubao-seed-2.0-pro",
+            "doubao/doubao-seed-2.0-lite",
+            "doubao/doubao-seed-2.0-code",
+            "doubao/doubao-seed-2.0-vision",
+            "doubao/doubao-seed-2.0-flash",
+            "doubao/doubao-seed-2.5-pro",       // future minor
+            "doubao/doubao-seed-3.0-pro",       // future major (auto-covered)
+            "doubao/doubao-seed-4-omni",
+            "doubao/doubao-vision",
+            "doubao/seedream",
+            "qwen/qwen-vl-plus",
+            "qwen/qwen2.5-vl-72b",
+            "qwen/qwen3-vl-30b",
+            "qwen/qwen3.5-instruct",
+            "qwen/qwen-3.6-pro",
+            "qwen/qvq-72b-preview",
+            "kimi/kimi-for-coding",
+            "kimi/kimi-k2.5",
+            "kimi/kimi-k2.6-preview",
+            "kimi/kimi-vl-thinking",
+            "zhipu/glm-4v-9b",
+            "zhipu/glm-4.5v",
+            "zhipu/cogagent-9b",
+            "baidu/ernie-4.5-vl-424b",
+            "baidu/ernie-5-pro",
+            "sensetime/sensenova-v6-pro",
+            "01-ai/yi-vl-34b",
+            "baichuan/baichuan-omni-1.5",
+            "deepseek/deepseek-vl2",
+            "deepseek/janus-pro-7b",
+            "tencent/hunyuan-vision",
+            "minimax/minimax-vl-01",
+            "stepfun/step-1o-vision-32k",
+            "stepfun/step-3",
+
+            // Open-source
+            "liuhaotian/llava-1.6-34b",
+            "opengvlab/internvl3-78b",
+            "openbmb/minicpm-v-2.6",
+            "microsoft/phi-3-vision-128k",
+            "microsoft/florence-2-large",
+            "huggingfaceh4/idefics3-8b",
+            "huggingfaceh4/smolvlm-instruct",
+            "nvidia/nvila-15b",
+
+            // GUI-agent VLMs
+            "bytedance/ui-tars-1.5-7b",
+            "bytedance/ui-tars-2",
+            "showui-2b",
+            "os-atlas-pro-7b",
+
+            // Universal suffix matchers
+            "anything-with-vision-suffix",
+            "weird-foo-omni",
+        ] {
+            assert!(is_known_vision_model(name), "should match: {name}");
+        }
+    }
+
+    #[test]
+    fn is_known_vision_model_text_only_returns_false() {
+        for name in [
+            // OpenAI text-only
+            "openai/gpt-3.5-turbo",
+            "openai/gpt-4",                 // bare GPT-4 base is text-only
+            "openai/text-davinci-003",
+            // Anthropic legacy
+            "anthropic/claude-2.1",
+            "anthropic/claude-instant-1",
+            // DeepSeek non-VL
+            "deepseek/deepseek-chat",
+            "deepseek/deepseek-reasoner",
+            "deepseek/deepseek-coder",
+            "deepseek/deepseek-v3",
+            // Doubao text-only
+            "doubao/doubao-seed-1.6",       // text variant; only -vision suffix is multimodal
+            "doubao/doubao-pro-256k",
+            "doubao/doubao-lite",
+            // Qwen text-only (pre-3.5)
+            "qwen/qwen-turbo",
+            "qwen/qwen-max",
+            "qwen/qwen-plus",
+            "qwen/qwen3.0",
+            "qwen/qwen3.4",
+            "qwen/qwen-3.4-instruct",
+            "qwen/qwen3-coder",             // coder is text-only
+            // Pre-3 Gemma
+            "google/gemma-2-9b",
+            "google/gemma-1-7b",
+            // Llama text-only
+            "meta/llama-3-70b",
+            "meta/llama-3.1-405b",
+            "meta/llama-3.2-3b",            // small Llama 3.2 are text
+            // Mistral text-only
+            "mistral/mistral-7b-instruct",
+            "mistral/mixtral-8x7b",
+            "mistral/codestral-22b",
+            "mistral/mistral-large-2411",
+            // Kimi pre-2.5
+            "kimi/kimi-k1",
+            "kimi/kimi-k2.0",
+            "kimi/kimi-k2.4",
+            "kimi/moonshot-v1-128k",        // base v1 is text without -vision
+            // Zhipu text-only (no v suffix)
+            "zhipu/glm-4-flash",
+            "zhipu/glm-4.5",
+            "zhipu/glm-5",                  // bare GLM-5 (the VL variant is glm-5v)
+            // Baidu text-only
+            "baidu/ernie-3.5-128k",
+            "baidu/ernie-4.0-turbo",
+            "baidu/ernie-speed",
+            // Yi text-only
+            "01-ai/yi-large",
+            "01-ai/yi-lightning",
+            // Baichuan text-only
+            "baichuan/baichuan2-13b",
+            "baichuan/baichuan4",
+            // Hunyuan text-only
+            "tencent/hunyuan-large",
+            "tencent/hunyuan-t1",
+            // MiniMax text-only — including base M2 / M2.5 / M2.7
+            // (despite "native multimodal" marketing, third-party
+            // testing confirms text-only input).
+            "minimax/abab6.5-chat",
+            "minimax/minimax-m1",
+            "minimax/minimax-m2",
+            "minimax/minimax-m2.5",
+            "minimax/minimax-m2.7",
+            "minimax/minimax-m3-base",
+            // StepFun text-only
+            "stepfun/step-1-128k",
+            "stepfun/step-2-mini",
+            // SmolLM (NOT SmolVLM)
+            "huggingfaceh4/smollm-1.7b",
+            "huggingfaceh4/smollm2-1.7b",
+            // MiniCPM bare (NOT minicpm-v)
+            "openbmb/minicpm-2b",
+            "openbmb/minicpm3-4b",
+            // Phi text-only
+            "microsoft/phi-3-mini-4k",
+            "microsoft/phi-4",              // bare phi-4 is text; phi-4-multimodal is vision
+            // Generic / unknown model — defaults to text-only.
+            "some-new-llm/v1",
+            "future-vendor/futurelm-2030",
+        ] {
+            assert!(!is_known_vision_model(name), "should NOT match (false positive): {name}");
+        }
     }
 }
 

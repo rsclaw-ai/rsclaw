@@ -157,7 +157,7 @@ async fn http_401_error() {
     init_tls();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/messages"))
+        .and(path("/v1/messages"))
         .respond_with(
             ResponseTemplate::new(401).set_body_string(r#"{"error":"invalid_api_key"}"#),
         )
@@ -175,7 +175,7 @@ async fn http_429_error() {
     init_tls();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/messages"))
+        .and(path("/v1/messages"))
         .respond_with(
             ResponseTemplate::new(429).set_body_string(r#"{"error":"rate_limited"}"#),
         )
@@ -193,7 +193,7 @@ async fn http_500_error() {
     init_tls();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/messages"))
+        .and(path("/v1/messages"))
         .respond_with(ResponseTemplate::new(500).set_body_string("internal server error"))
         .mount(&server)
         .await;
@@ -214,7 +214,7 @@ async fn request_includes_correct_headers() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/messages"))
+        .and(path("/v1/messages"))
         .and(header("x-api-key", "my-secret-key"))
         .and(header("anthropic-version", "2023-06-01"))
         .and(header("content-type", "application/json"))
@@ -238,7 +238,7 @@ async fn request_body_maps_messages() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/messages"))
+        .and(path("/v1/messages"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n\ndata: [DONE]\n\n")

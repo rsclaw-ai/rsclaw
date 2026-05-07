@@ -514,83 +514,88 @@ impl CronRunner {
         self.parse_failed
     }
 
-    /// Save jobs to store file. Returns early without saving if parse_failed is true.
-    /// Before saving, checks if the file was modified externally and merges changes.
+    /// Save jobs after a cron task completion.
+    ///
+    /// **F2 semantics (redb-authoritative)**: each job is patched
+    /// individually in redb. From memory we ONLY write the `state`
+    /// sub-object (run statistics) plus a forced disable when memory
+    /// says `enabled=false` (covers auto-disable after
+    /// MAX_CONSECUTIVE_ERRORS and one-shot completion). User-config
+    /// fields (`enabled=true`, `schedule`, `payload`, `message`,
+    /// `delivery`, etc.) come from the redb-stored value and are
+    /// NEVER overwritten with the in-memory copy — that's what
+    /// produced the "I disabled it but cron keeps firing" race.
+    ///
+    /// After updating redb, the file `cron.json5` is re-exported as a
+    /// best-effort human-readable copy.
     pub(crate) async fn save_store(&self, jobs: &[CronJob]) -> Result<()> {
         if self.parse_failed {
-            // Don't save - file has syntax errors that user needs to fix
             return Ok(());
         }
 
-        // Check if file was modified externally since last load.
-        // Read current file content and compare job configurations.
-        let file_jobs = match tokio::fs::read(&self.store_path).await {
-            Ok(bytes) => {
-                match serde_json::from_slice::<CronStore>(&bytes) {
-                    Ok(store) => store.jobs,
-                    Err(e) => {
-                        // File has syntax errors - don't overwrite, warn and skip
-                        warn!(error = %e, "cron: file has syntax errors, skipping save to preserve user's manual edits");
-                        return Ok(());
+        // Fast path: redb available (production).
+        if let Some(store) = cron_store() {
+            for mem_job in jobs {
+                let merged = match store.cron_get(&mem_job.id) {
+                    Ok(Some(json)) => match serde_json::from_str::<CronJob>(&json) {
+                        Ok(mut redb_job) => {
+                            // state: memory wins (it's the authoritative
+                            // run-statistics source).
+                            redb_job.state = mem_job.state.clone();
+                            // enabled: memory can disable, never re-enable.
+                            if !mem_job.enabled {
+                                redb_job.enabled = false;
+                            }
+                            redb_job
+                        }
+                        Err(e) => {
+                            warn!(err = %e, job_id = %mem_job.id, "cron: redb job parse failed; using memory version");
+                            mem_job.clone()
+                        }
+                    },
+                    Ok(None) => {
+                        // First-time write for this job (e.g. cron.add
+                        // path before the next reload).
+                        mem_job.clone()
                     }
+                    Err(e) => {
+                        warn!(err = %e, job_id = %mem_job.id, "cron: redb cron_get failed; skipping");
+                        continue;
+                    }
+                };
+                let json = match serde_json::to_string(&merged) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(err = %e, job_id = %mem_job.id, "cron: serialize failed");
+                        continue;
+                    }
+                };
+                if let Err(e) = store.cron_put(&merged.id, &json) {
+                    warn!(err = %e, job_id = %merged.id, "cron: redb cron_put failed");
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // File doesn't exist, safe to write
-                Vec::new()
-            }
-            Err(e) => {
-                warn!(error = %e, "cron: failed to read file for merge check, proceeding with save");
-                jobs.to_vec()
-            }
-        };
 
-        // Detect external modifications: jobs with different configs (not just state).
-        // Compare configs (excluding state) to detect user edits.
-        let mut merged_jobs = jobs.to_vec();
-        let mut has_external_changes = false;
-
-        for file_job in &file_jobs {
-            // Find corresponding job in memory
-            if let Some(mem_job) = merged_jobs.iter_mut().find(|j| j.id == file_job.id) {
-                // Check if config changed (message, schedule, payload, enabled, etc. - NOT state)
-                if !cron_jobs_config_equal(mem_job, file_job) {
-                    has_external_changes = true;
-                    // Preserve state but update config from file
-                    let preserved_state = mem_job.state.clone();
-                    *mem_job = file_job.clone();
-                    mem_job.state = preserved_state;
-                    debug!(job_id = %file_job.id, "cron: merged external config change");
-                }
-            } else {
-                // New job added externally - include it
-                has_external_changes = true;
-                merged_jobs.push(file_job.clone());
-                debug!(job_id = %file_job.id, "cron: found new job from external edit");
+            // Best-effort export: read the canonical job set back from
+            // redb (so we capture any user-config preservation done
+            // above) and write `cron.json5` for human readability.
+            if let Ok(entries) = store.cron_list() {
+                let exported: Vec<CronJob> = entries
+                    .into_iter()
+                    .filter_map(|(_, j)| serde_json::from_str(&j).ok())
+                    .collect();
+                tokio::task::spawn_blocking(move || {
+                    export_cron_jobs_to_file(&exported);
+                });
             }
+            return Ok(());
         }
 
-        // Check for jobs deleted externally (in memory but not in file)
-        let file_ids: std::collections::HashSet<_> = file_jobs.iter().map(|j| &j.id).collect();
-        let deleted_ids: Vec<_> = merged_jobs.iter()
-            .filter(|j| !file_ids.contains(&j.id))
-            .map(|j| j.id.clone())
-            .collect();
-        if !deleted_ids.is_empty() {
-            has_external_changes = true;
-            merged_jobs.retain(|j| file_ids.contains(&j.id));
-            debug!(deleted_ids = ?deleted_ids, "cron: removed jobs deleted externally");
-        }
-
-        if has_external_changes {
-            info!("cron: file was modified externally, merged user changes before saving state");
-        }
-
-        let store = CronStore {
+        // Legacy fallback: file-only (tests, standalone tools).
+        let store_data = CronStore {
             version: 1,
-            jobs: merged_jobs,
+            jobs: jobs.to_vec(),
         };
-        let json = serde_json::to_string_pretty(&store)?;
+        let json = serde_json::to_string_pretty(&store_data)?;
         let tmp = format!("{}.tmp", self.store_path.display());
         tokio::fs::write(&tmp, &json).await?;
         tokio::fs::rename(&tmp, &self.store_path).await?;
@@ -1125,14 +1130,12 @@ impl CronRunner {
                         CronPayload::Structured { kind, .. } => kind.as_deref(),
                         _ => None,
                     }) == Some("systemEvent") {
-                        tracing::info!(job_id = %job.id, kind = "systemEvent", "cron: dispatching payload");
                         Ok(job.effective_message().to_owned())
                     } else if job.payload.as_ref().and_then(|p| match p {
                         CronPayload::Structured { kind, .. } => kind.as_deref(),
                         _ => None,
                     }) == Some("execCommand") {
                         // Execute command directly, bypassing agent to avoid session history pollution
-                        tracing::info!(job_id = %job.id, kind = "execCommand", command = %job.effective_message(), summarize = job.payload.as_ref().map(|p| p.summarize()).unwrap_or(false), "cron: dispatching execCommand");
                         run_exec_command(
                             job.effective_message(),
                             job.payload.as_ref().and_then(|p| match p {
@@ -1318,13 +1321,11 @@ impl CronRunner {
             CronPayload::Structured { kind, .. } => kind.as_deref(),
             _ => None,
         }) == Some("systemEvent") {
-            tracing::info!(job_id = %job.id, kind = "systemEvent", "cron manual: dispatching payload");
             Ok(job.effective_message().to_owned())
         } else if job.payload.as_ref().and_then(|p| match p {
             CronPayload::Structured { kind, .. } => kind.as_deref(),
             _ => None,
         }) == Some("execCommand") {
-            tracing::info!(job_id = %job.id, kind = "execCommand", command = %job.effective_message(), summarize = job.payload.as_ref().map(|p| p.summarize()).unwrap_or(false), "cron manual: dispatching execCommand");
             run_exec_command(
                 job.effective_message(),
                 job.payload.as_ref().and_then(|p| match p {
@@ -2038,7 +2039,7 @@ async fn run_exec_command(
         "command succeeded with no output".to_string()
     };
 
-// Detect saved file paths in output and read their content.
+    // Detect saved file paths in output and read their content.
     // Common patterns: "report saved: xxx", "saved to: xxx", "file saved: xxx"
     // (and the Chinese equivalents — see extract_saved_files_content).
     let saved_files_content = extract_saved_files_content(&raw_output);
@@ -2210,7 +2211,202 @@ pub fn resolve_cron_store_path() -> PathBuf {
 /// Auto-migrates legacy `cron/jobs.json` to `cron.json5` if needed.
 /// Returns a tuple of (jobs, parse_success). If the file exists but fails to
 /// parse, returns (empty_vec, false) so callers know NOT to overwrite the file.
+/// Load all cron jobs.
+///
+/// **Authoritative source: redb** (since 2026-05). Falls back to the
+/// legacy `cron.json5` file when `init_cron_store()` hasn't been
+/// called yet (tests, ad-hoc tools). The redb path also auto-migrates
+/// the cron.json5 contents on first read when redb is empty.
+///
+/// Returns `(jobs, parse_ok)` — `parse_ok=false` only when the legacy
+/// file path is in use AND the file has syntax errors. The redb path
+/// always returns `parse_ok=true`.
 pub fn load_cron_jobs() -> (Vec<CronJob>, bool) {
+    if let Some(store) = cron_store() {
+        // The boot-time reconcile already ran inside `init_cron_store`,
+        // so we just read what's in redb here.
+        match store.cron_list() {
+            Ok(entries) => {
+                let jobs: Vec<CronJob> = entries
+                    .into_iter()
+                    .filter_map(|(_, json)| serde_json::from_str::<CronJob>(&json).ok())
+                    .collect();
+                return (jobs, true);
+            }
+            Err(e) => {
+                warn!(err = %e, "cron: redb load failed; falling back to file");
+                return load_cron_jobs_from_file();
+            }
+        }
+    }
+    load_cron_jobs_from_file()
+}
+
+/// Save all cron jobs.
+///
+/// **Authoritative target: redb**. The cron.json5 file is also
+/// updated as a best-effort export so `cat` / `git diff` keep working.
+/// When the redb store is uninitialised (tests / standalone tools),
+/// falls back to file-only.
+///
+/// Note: this function performs a bulk replace of the entire job set.
+/// For per-job updates use `RedbStore::cron_put` directly via
+/// `cron_store()`.
+pub fn save_cron_jobs(jobs: &[CronJob]) -> anyhow::Result<()> {
+    if let Some(store) = cron_store() {
+        let entries: Vec<(String, String)> = jobs
+            .iter()
+            .filter_map(|j| serde_json::to_string(j).ok().map(|s| (j.id.clone(), s)))
+            .collect();
+        store.cron_bulk_replace(&entries)
+            .context("redb cron_bulk_replace failed")?;
+        // Best-effort export so users can still read / git-diff / hand-edit.
+        export_cron_jobs_to_file(jobs);
+        return Ok(());
+    }
+
+    // Fallback: legacy file-only path (tests, standalone tools).
+    let cron_file = resolve_cron_store_path();
+    let store = serde_json::json!({ "version": 1, "jobs": jobs });
+    let json = serde_json::to_string_pretty(&store)
+        .context("failed to serialize cron jobs to JSON")?;
+    if let Some(parent) = cron_file.parent() {
+        std::fs::create_dir_all(parent).context("failed to create cron directory")?;
+    }
+    let tmp = format!("{}.tmp", cron_file.display());
+    std::fs::write(&tmp, json).context("failed to write cron jobs tmp file")?;
+    std::fs::rename(&tmp, &cron_file).context("failed to rename cron jobs file")?;
+    Ok(())
+}
+
+/// Global mutex that serializes read-modify-write on the cron store file.
+/// Without this, concurrent `cron.add` calls (common when an LLM dispatches
+/// multiple tool calls in one turn) race and silently lose writes.
+pub static CRON_FILE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+// ---------------------------------------------------------------------------
+// Authoritative storage: redb (since 2026-05)
+// ---------------------------------------------------------------------------
+
+/// Process-wide handle to the redb instance backing cron storage.
+/// Initialised by `gateway/startup.rs::start_gateway` (and CLI subcommands
+/// that need cron access — see `cmd::cron`). When unset, `load_cron_jobs`
+/// / `save_cron_jobs` fall back to the legacy file-based path so existing
+/// tests and tools that don't go through full gateway boot keep working.
+static CRON_STORE: std::sync::OnceLock<std::sync::Arc<crate::store::RedbStore>> =
+    std::sync::OnceLock::new();
+
+/// Set the redb handle that future cron storage operations should use,
+/// and run a one-time boot reconcile from `cron.json5` so user
+/// hand-edits since the last shutdown take effect (file → redb merge,
+/// preserving runtime state). Idempotent — a second call is silently
+/// ignored (OnceLock semantics).
+pub fn init_cron_store(store: std::sync::Arc<crate::store::RedbStore>) {
+    if CRON_STORE.set(Arc::clone(&store)).is_err() {
+        return; // already initialised; do not re-reconcile
+    }
+    let count = reconcile_file_to_redb_on_boot(&store);
+    info!(count, "cron: storage bound to redb (post-reconcile)");
+}
+
+/// Returns the configured redb handle, or `None` for callers running
+/// without an initialised gateway (tests / standalone tools).
+pub fn cron_store() -> Option<std::sync::Arc<crate::store::RedbStore>> {
+    CRON_STORE.get().cloned()
+}
+
+/// Reconcile `cron.json5` with redb on each gateway boot.
+///
+/// Called from `load_cron_jobs` (the first time) so the cycle is:
+///   user hand-edits cron.json5 → user restarts gateway → file is
+///   imported here → cron runner sees the new config.
+///
+/// Merge rules (file = user intent, redb = runtime state):
+///   - **User-config fields** (enabled, schedule, payload, message,
+///     delivery, agent_id, name, …) → take from FILE.
+///     If the file omits a field and redb has it, keep redb's.
+///   - **`state` sub-object** (next_run_at_ms, last_run_at_ms,
+///     consecutive_errors, …) → take from REDB. Run statistics must
+///     not be reset by an unrelated config edit.
+///   - Job present in file but not in redb → add to redb.
+///   - Job present in redb but not in file → user deleted it →
+///     remove from redb.
+///   - File parse failure → skip the merge (don't wipe redb based on
+///     a broken file).
+///
+/// Returns the number of jobs in redb after the merge (for logging).
+pub(crate) fn reconcile_file_to_redb_on_boot(store: &crate::store::RedbStore) -> usize {
+    let (file_jobs, file_ok) = load_cron_jobs_from_file();
+
+    let redb_existing: std::collections::HashMap<String, CronJob> = match store.cron_list() {
+        Ok(entries) => entries
+            .into_iter()
+            .filter_map(|(id, json)| serde_json::from_str::<CronJob>(&json).ok().map(|j| (id, j)))
+            .collect(),
+        Err(e) => {
+            warn!(err = %e, "cron: redb cron_list failed during boot reconcile");
+            std::collections::HashMap::new()
+        }
+    };
+
+    if !file_ok {
+        // File parse error — do NOT touch redb. Tell the user.
+        warn!(
+            "cron: cron.json5 parse failed at boot; redb left untouched ({} jobs)",
+            redb_existing.len()
+        );
+        return redb_existing.len();
+    }
+
+    if file_jobs.is_empty() && redb_existing.is_empty() {
+        return 0;
+    }
+
+    let mut merged: Vec<(String, String)> = Vec::with_capacity(file_jobs.len());
+    for mut file_job in file_jobs {
+        if let Some(redb_job) = redb_existing.get(&file_job.id) {
+            // Merge: file owns user-config, redb owns state.
+            // The struct fields we keep from redb are exactly `state`.
+            file_job.state = redb_job.state.clone();
+        }
+        let json = match serde_json::to_string(&file_job) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(err = %e, job_id = %file_job.id, "cron: serialize failed during reconcile");
+                continue;
+            }
+        };
+        merged.push((file_job.id.clone(), json));
+    }
+
+    if let Err(e) = store.cron_bulk_replace(&merged) {
+        warn!(err = %e, "cron: reconcile bulk_replace failed");
+        return redb_existing.len();
+    }
+
+    let added = merged
+        .iter()
+        .filter(|(id, _)| !redb_existing.contains_key(id))
+        .count();
+    let removed = redb_existing
+        .keys()
+        .filter(|id| !merged.iter().any(|(mid, _)| mid == *id))
+        .count();
+    if added > 0 || removed > 0 {
+        info!(
+            total = merged.len(),
+            added,
+            removed,
+            "cron: boot reconcile cron.json5 -> redb"
+        );
+    }
+    merged.len()
+}
+
+/// File-only loader (legacy path). Kept for tests and as a one-time
+/// migration source. New code should call `load_cron_jobs()` which
+/// uses redb when available.
+fn load_cron_jobs_from_file() -> (Vec<CronJob>, bool) {
     let source = resolve_cron_store_path();
 
     // Auto-migrate legacy cron/jobs.json -> cron.json5
@@ -2222,7 +2418,6 @@ pub fn load_cron_jobs() -> (Vec<CronJob>, bool) {
             if let Err(e) = std::fs::copy(&legacy, &source) {
                 warn!(err = %e, "failed to migrate legacy cron/jobs.json");
             } else {
-                // Remove legacy file and empty directory
                 if let Err(e) = std::fs::remove_file(&legacy) {
                     tracing::debug!("failed to remove legacy cron file: {e}");
                 }
@@ -2234,27 +2429,22 @@ pub fn load_cron_jobs() -> (Vec<CronJob>, bool) {
     }
 
     if !source.exists() {
-        return (Vec::new(), true); // No file = success, empty list is valid
+        return (Vec::new(), true);
     }
-
     let raw = match std::fs::read_to_string(&source) {
         Ok(raw) => raw,
-        Err(_) => return (Vec::new(), true), // Can't read = treat as no file
+        Err(_) => return (Vec::new(), true),
     };
-
-    // Empty file is valid (no jobs)
     if raw.trim().is_empty() {
         return (Vec::new(), true);
     }
-
-    let parsed_result: Result<serde_json::Value, _> = json5::from_str(&raw).or_else(|_| serde_json::from_str(&raw));
+    let parsed_result: Result<serde_json::Value, _> =
+        json5::from_str(&raw).or_else(|_| serde_json::from_str(&raw));
     if parsed_result.is_err() {
-        // File exists with content but failed to parse - DO NOT overwrite!
-        warn!(file = %source.display(), "cron.json5 parse failed - keeping original file, fix syntax errors manually");
+        warn!(file = %source.display(), "cron.json5 parse failed - keeping original file");
         return (Vec::new(), false);
     }
     let parsed = parsed_result.unwrap();
-
     let jobs_array = if let Some(arr) = parsed.get("jobs").and_then(|v| v.as_array()) {
         arr.clone()
     } else if parsed.is_array() {
@@ -2262,55 +2452,45 @@ pub fn load_cron_jobs() -> (Vec<CronJob>, bool) {
     } else {
         Vec::new()
     };
-
     let total = jobs_array.len();
     let jobs: Vec<CronJob> = jobs_array
         .iter()
-        .filter_map(|v| match serde_json::from_value::<CronJob>(v.clone()) {
-            Ok(job) => Some(job),
-            Err(e) => {
-                warn!(err = %e, job_json = %serde_json::to_string_pretty(&v).unwrap_or_default(), "failed to parse cron job");
-                None
-            }
-        })
+        .filter_map(|v| serde_json::from_value::<CronJob>(v.clone()).ok())
         .collect();
     let loaded = jobs.len();
-    // If any job failed to parse, return false so the file won't be overwritten
-    // (we'd lose the unparsable jobs that user needs to fix manually)
     if loaded < total {
-        warn!(file = %source.display(), total, loaded, "some cron jobs have invalid fields - keeping original file, fix errors manually");
         return (jobs, false);
     }
-
     (jobs, true)
 }
 
-/// Save cron jobs to the cron store file (openclaw-compatible path).
-pub fn save_cron_jobs(jobs: &[CronJob]) -> anyhow::Result<()> {
+/// Best-effort export: write the redb-authoritative job list back to
+/// `cron.json5` so users can `cat` / `git diff` / hand-edit the file.
+/// On failure we log and continue — the redb write is what matters.
+/// Hand-edits to the file get re-imported via the file watcher in
+/// `gateway::startup` so this round-trip stays consistent.
+fn export_cron_jobs_to_file(jobs: &[CronJob]) {
     let cron_file = resolve_cron_store_path();
-    debug!(path = %cron_file.display(), "cron: saving jobs to file");
-
-    let store = serde_json::json!({
-        "version": 1,
-        "jobs": jobs,
-    });
-
-    let json = serde_json::to_string_pretty(&store)
-        .context("failed to serialize cron jobs to JSON")?;
-
-    // Ensure directory exists
+    let store = serde_json::json!({ "version": 1, "jobs": jobs });
+    let json = match serde_json::to_string_pretty(&store) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(err = %e, "cron: export serialize failed");
+            return;
+        }
+    };
     if let Some(parent) = cron_file.parent() {
-        std::fs::create_dir_all(parent).context("failed to create cron directory")?;
+        let _ = std::fs::create_dir_all(parent);
     }
-
-    std::fs::write(&cron_file, json).context("failed to write cron jobs file")?;
-    Ok(())
+    let tmp = format!("{}.tmp", cron_file.display());
+    if let Err(e) = std::fs::write(&tmp, &json) {
+        warn!(err = %e, "cron: export write failed");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &cron_file) {
+        warn!(err = %e, "cron: export rename failed");
+    }
 }
-
-/// Global mutex that serializes read-modify-write on the cron store file.
-/// Without this, concurrent `cron.add` calls (common when an LLM dispatches
-/// multiple tool calls in one turn) race and silently lose writes.
-pub static CRON_FILE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // ---------------------------------------------------------------------------
 // Cross-module reload signal

@@ -87,6 +87,13 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     };
     info!("store opened at {}", data_dir.display());
 
+    // 2b. Bind cron storage to redb. From this point on
+    // `crate::cron::load_cron_jobs` / `save_cron_jobs` and the
+    // CronRunner's `save_store` operate on redb instead of cron.json5.
+    // The file is still maintained as a best-effort export for
+    // `cat` / `git diff`.
+    crate::cron::init_cron_store(Arc::clone(&store.db));
+
     // 3. Build provider registry.
     let providers = Arc::new(build_providers(&config));
     info!("{} provider(s) registered", providers.names().len());
@@ -249,6 +256,19 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // Clone memory before passing to agent tasks so heartbeat can also use it.
     let heartbeat_memory = memory.clone();
 
+    // Shared computer_use permission store + broadcast channel.
+    // Bypass-all defaults to true today (no Tauri dialog yet); flip to
+    // false once `ComputerUsePermissionDialog.tsx` is wired.
+    let computer_permission = Arc::new(
+        crate::computer::permission::RedbPermissionStore::new(
+            Arc::clone(&store.db),
+            true,
+        ),
+    );
+    let (computer_permission_tx, _) = broadcast::channel::<
+        crate::computer::permission::PermissionRequest,
+    >(64);
+
     spawn_agent_tasks(
         receivers,
         Arc::clone(&registry),
@@ -264,6 +284,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Some(Arc::clone(&mcp_registry)),
         Some(notification_tx.clone()),
         Arc::clone(&wasm_plugins),
+        Arc::clone(&computer_permission),
+        computer_permission_tx.clone(),
     );
 
     // Set i18n default language from gateway config.
@@ -616,6 +638,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         agents: Arc::clone(&registry),
         store: Arc::clone(&store),
         event_bus: event_tx,
+        computer_permission: Arc::clone(&computer_permission),
+        computer_permission_tx: computer_permission_tx.clone(),
         devices,
         ws_conns,
         feishu: Arc::clone(&feishu_slot),
@@ -752,7 +776,31 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         });
     }
 
-    let result = serve(state, bind_addr).await;
+    // Run serve with a hard-timeout safety net. Axum's
+    // `with_graceful_shutdown` waits for ALL existing connections to
+    // close after the drain signal — but long-lived WS connections
+    // (the Tauri UI keeps one open indefinitely) never close on
+    // their own, so without an outer timeout the process can hang
+    // forever after SIGTERM. We give the drain 60s (mirrors the
+    // existing inflight-drain timeout in the restart branch below);
+    // after that we log a warning and bail so the process actually
+    // exits and the restart path (or systemd / CI) can proceed.
+    const SHUTDOWN_HARD_TIMEOUT_SECS: u64 = 60;
+    let shutdown_for_timeout = shutdown.clone();
+    let result = tokio::select! {
+        r = serve(state, bind_addr) => r,
+        _ = async {
+            // Wait for the drain to begin first — the timeout only
+            // makes sense once shutdown is requested. Before drain we
+            // never hit the sleep branch.
+            shutdown_for_timeout.notified().await;
+            tokio::time::sleep(Duration::from_secs(SHUTDOWN_HARD_TIMEOUT_SECS)).await;
+            warn!(
+                timeout_secs = SHUTDOWN_HARD_TIMEOUT_SECS,
+                "graceful shutdown hard timeout reached — connections still open, forcing serve to return"
+            );
+        } => Ok(()),
+    };
 
     // At this point `axum::serve` has returned, which means the listener has
     // been dropped — so the port is free for whatever runs next. Two paths:
@@ -909,6 +957,8 @@ fn spawn_agent_tasks(
     mcp: Option<Arc<crate::mcp::McpRegistry>>,
     notification_tx: Option<broadcast::Sender<crate::channel::OutboundMessage>>,
     wasm_plugins: Arc<Vec<crate::plugin::WasmPlugin>>,
+    computer_permission: Arc<crate::computer::permission::RedbPermissionStore>,
+    computer_permission_tx: broadcast::Sender<crate::computer::permission::PermissionRequest>,
 ) {
     for (agent_id, mut rx) in receivers {
         let handle = match registry.get(&agent_id) {
@@ -954,6 +1004,12 @@ fn spawn_agent_tasks(
 
         // Inject WASM plugins into the agent runtime.
         runtime.wasm_plugins = Arc::clone(&wasm_plugins);
+
+        // Share the computer_use permission store + broadcast channel
+        // so `tool_ui_tars` can register pending requests that the WS
+        // handler can resolve.
+        runtime.computer_permission = Some(Arc::clone(&computer_permission));
+        runtime.computer_permission_tx = Some(computer_permission_tx.clone());
 
         let event_tx_task = event_tx.clone();
         tokio::spawn(async move {
