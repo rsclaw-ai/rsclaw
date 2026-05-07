@@ -440,6 +440,7 @@ pub struct AgentRuntime {
     pub(crate) opencode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
     pub(crate) claudecode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
     pub(crate) codex_client: Arc<tokio::sync::OnceCell<crate::acp::CodexClient>>,
+    pub(crate) openclaude_client: Arc<tokio::sync::OnceCell<crate::acp::OpenClaudeClient>>,
     /// In-memory session alias cache: alias_key → canonical session_key.
     /// Loaded from redb on first use, avoids repeated DB lookups.
     session_aliases: std::collections::HashMap<String, String>,
@@ -531,6 +532,7 @@ impl AgentRuntime {
             opencode_client: Arc::new(tokio::sync::OnceCell::new()),
             claudecode_client: Arc::new(tokio::sync::OnceCell::new()),
             codex_client: Arc::new(tokio::sync::OnceCell::new()),
+            openclaude_client: Arc::new(tokio::sync::OnceCell::new()),
             session_aliases,
             exec_pool,
         };
