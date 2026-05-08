@@ -257,6 +257,24 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
         );
     }
 
+    // rsclaw-server — internal multi-provider gateway. Speaks OpenAI Chat
+    // Completions; clients send `Authorization: Bearer <client_key>` and
+    // upstream routing happens server-side.
+    //
+    //   RSCLAW_SERVER_KEY  — required, matches a `[[client_keys]]` entry
+    //                        in rsclaw-server's config.toml
+    //   RSCLAW_SERVER_URL  — optional override (default: http://localhost:8090/v1)
+    if !registry.names().contains(&"rsclaw_server")
+        && let Ok(key) = std::env::var("RSCLAW_SERVER_KEY")
+    {
+        let url = std::env::var("RSCLAW_SERVER_URL")
+            .unwrap_or_else(|_| "http://localhost:8090/v1".to_string());
+        registry.register(
+            "rsclaw_server",
+            Arc::new(OpenAiProvider::with_base_url(url, Some(key))),
+        );
+    }
+
     // Wire up model aliases from agents.defaults.models.
     if let Some(models) = &config.agents.defaults.models {
         let mut aliases = HashMap::new();
