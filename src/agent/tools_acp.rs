@@ -74,19 +74,15 @@ impl AgentRuntime {
         }
 
         // Find opencode executable.
-        // On Windows, npm packages have both shell scripts and .cmd wrappers.
-        // Git Bash/MSYS2's which finds the shell script, but it internally calls
-        // node with Unix-style paths like "/d/Program Files/nodejs/node" which
-        // Windows subprocesses cannot understand. Use the .cmd wrapper instead.
-        let command = if cfg!(target_os = "windows") {
-            // On Windows, search for opencode.cmd directly in PATH directories.
-            // Use Windows-native PATH format (split by ';' with backslash paths).
-            // Git Bash may convert PATH to Unix format, so we also check common locations.
+        // On Windows, directly use node to run the js file (not .cmd wrapper)
+        // to avoid stdin encoding issues with cmd.exe
+        let (command, args) = if cfg!(target_os = "windows") {
+            // Search PATH for the js file
             let path_env = std::env::var("PATH").ok().unwrap_or_default();
             // PATH may be Unix-style (from Git Bash) or Windows-style
             let separator = if path_env.contains(';') { ';' } else { ':' };
 
-            let cmd_found = path_env.split(separator).find_map(|dir| {
+            let js_found = path_env.split(separator).find_map(|dir| {
                 // Convert Unix-style path to Windows format if needed
                 let win_dir = if dir.starts_with('/') && dir.len() > 2 {
                     let parts: Vec<&str> = dir.splitn(3, '/').collect();
@@ -101,26 +97,96 @@ impl AgentRuntime {
                     dir.to_string()
                 };
 
-                let cmd_path = std::path::PathBuf::from(&win_dir).join("opencode.cmd");
-                if cmd_path.exists() {
-                    Some(cmd_path.to_string_lossy().to_string())
-                } else {
-                    None
+                // Look for the js file directly (opencode-ai package structure)
+                let js_path = std::path::PathBuf::from(&win_dir)
+                    .join("node_modules")
+                    .join("opencode-ai")
+                    .join("bin")
+                    .join("opencode");
+                if js_path.exists() {
+                    // Convert to Windows native path
+                    let path_str = js_path
+                        .canonicalize()
+                        .map(|c| c.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| js_path.to_string_lossy().to_string());
+                    return Some(("node".to_string(), vec![path_str, "acp".to_string()]));
                 }
+                None
             });
 
-            cmd_found
-                .or_else(|| std::env::var("OPENCODE_PATH").ok())
-                .unwrap_or_else(|| "opencode.cmd".to_string())
+            js_found
+                .or_else(|| {
+                    // Fallback: try OPENCODE_PATH env var
+                    std::env::var("OPENCODE_PATH").ok().map(|p| {
+                        if p.ends_with(".js") || p.ends_with("opencode") {
+                            ("node".to_string(), vec![p, "acp".to_string()])
+                        } else {
+                            (p, vec!["acp".to_string()])
+                        }
+                    })
+                })
+                .unwrap_or_else(|| ("node".to_string(), vec!["opencode".to_string(), "acp".to_string()]))
         } else {
-            which::which("opencode")
-                .map(|p| p.to_string_lossy().to_string())
-                .or_else(|_| std::env::var("OPENCODE_PATH"))
-                .unwrap_or_else(|_| "opencode".to_string())
-        };
+            // Non-Windows: use which::which
+            if let Ok(path) = which::which("opencode") {
+                (path.to_string_lossy().to_string(), vec!["acp".to_string()])
+            } else if let Ok(path) = std::env::var("OPENCODE_PATH") {
+                // If it's a .js file, run with node
+                if path.ends_with(".js") || path.ends_with("opencode") {
+                    ("node".to_string(), vec![path, "acp".to_string()])
+                } else {
+                    (path, vec!["acp".to_string()])
+                }
+            } else {
+                // Try common npm global install paths
+                let npm_global = std::env::var("npm_config_prefix").ok();
+                let js_path = npm_global
+                    .as_ref()
+                    .map(|p| {
+                        let mut path = std::path::PathBuf::from(p);
+                        path.push("node_modules");
+                        path.push("opencode-ai");
+                        path.push("bin");
+                        path.push("opencode");
+                        path
+                    })
+                    .or_else(|| {
+                        dirs_next::home_dir().map(|h| {
+                            let mut path = h;
+                            path.push(".npm-global");
+                            path.push("node_modules");
+                            path.push("opencode-ai");
+                            path.push("bin");
+                            path.push("opencode");
+                            path
+                        })
+                    })
+                    .or_else(|| {
+                        dirs_next::home_dir().map(|h| {
+                            let mut path = h;
+                            path.push("node_modules");
+                            path.push("opencode-ai");
+                            path.push("bin");
+                            path.push("opencode");
+                            path
+                        })
+                    });
 
-        // Use "acp" subcommand to start ACP protocol mode
-        let args: Vec<&str> = vec!["acp"];
+                match js_path {
+                    Some(p) if p.exists() => {
+                        let path_str = if cfg!(target_os = "windows") {
+                            p.canonicalize()
+                                .map(|c| c.to_string_lossy().to_string())
+                                .unwrap_or_else(|_| p.to_string_lossy().to_string())
+                        } else {
+                            p.to_string_lossy().to_string()
+                        };
+                        ("node".to_string(), vec![path_str, "acp".to_string()])
+                    }
+                    _ => ("opencode".to_string(), vec!["acp".to_string()])
+                }
+            }
+        };
 
         tracing::info!(command = %command, args = ?args, "OpenCode: starting subprocess");
 
@@ -158,9 +224,10 @@ impl AgentRuntime {
             .as_ref()
             .and_then(|c| c.init_timeout_seconds);
 
+        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let client = crate::acp::client::AcpClient::spawn_with_timeout(
             &command,
-            &args,
+            &args_ref,
             Arc::new(crate::acp::client::DefaultAcpHandler),
             Arc::new(tokio::sync::Mutex::new(crate::acp::notification::NotificationManager::new())),
             init_timeout_secs,
@@ -588,13 +655,14 @@ impl AgentRuntime {
         }
 
         // Find claude-agent-acp executable.
-        // On Windows, prefer .cmd wrapper to avoid MSYS2 path issues (same as opencode)
+        // On Windows, directly use node to run the js file (not .cmd wrapper)
+        // to avoid stdin encoding issues with cmd.exe
         let (command, args) = if cfg!(target_os = "windows") {
-            // Search PATH for claude-agent-acp.cmd directly
+            // Search PATH for the js file
             let path_env = std::env::var("PATH").ok().unwrap_or_default();
             let separator = if path_env.contains(';') { ';' } else { ':' };
 
-            let cmd_found = path_env.split(separator).find_map(|dir| {
+            let js_found = path_env.split(separator).find_map(|dir| {
                 let win_dir = if dir.starts_with('/') && dir.len() > 2 {
                     let parts: Vec<&str> = dir.splitn(3, '/').collect();
                     if parts.len() >= 3 && parts[0].is_empty() && parts[1].len() == 1 {
@@ -608,20 +676,25 @@ impl AgentRuntime {
                     dir.to_string()
                 };
 
-                // Try .cmd first
-                let cmd_path = std::path::PathBuf::from(&win_dir).join("claude-agent-acp.cmd");
-                if cmd_path.exists() {
-                    return Some((cmd_path.to_string_lossy().to_string(), vec![]));
-                }
-                // Then try without extension
-                let bin_path = std::path::PathBuf::from(&win_dir).join("claude-agent-acp");
-                if bin_path.exists() {
-                    return Some((bin_path.to_string_lossy().to_string(), vec![]));
+                // Look for the js file directly
+                let js_path = std::path::PathBuf::from(&win_dir)
+                    .join("node_modules")
+                    .join("@agentclientprotocol")
+                    .join("claude-agent-acp")
+                    .join("dist")
+                    .join("index.js");
+                if js_path.exists() {
+                    // Convert to Windows native path
+                    let path_str = js_path
+                        .canonicalize()
+                        .map(|c| c.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| js_path.to_string_lossy().to_string());
+                    return Some(("node".to_string(), vec![path_str]));
                 }
                 None
             });
 
-            cmd_found.unwrap_or_else(|| ("claude-agent-acp.cmd".to_string(), vec![]))
+            js_found.unwrap_or_else(|| ("node".to_string(), vec!["claude-agent-acp".to_string()]))
         } else {
             // Non-Windows: use which::which
             if let Ok(path) = which::which("claude-agent-acp") {
