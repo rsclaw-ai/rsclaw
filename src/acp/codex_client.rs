@@ -69,7 +69,7 @@ impl CodexClient {
 
         // MCP handshake
         let init_result = mcp_client.initialize().await?;
-        debug!(init = ?init_result, "Codex MCP initialized");
+        info!(init = ?init_result, "Codex MCP initialized");
 
         // Discover tools
         let tools = mcp_client.list_tools().await?;
