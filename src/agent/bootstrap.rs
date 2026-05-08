@@ -443,6 +443,7 @@ pub fn tool_prompts_for_system(base_dir: &Path, _lang: Option<&str>) -> String {
         ("exec", EN_TOOL_EXEC),
         ("web_search", EN_TOOL_WEB_SEARCH),
         ("web_fetch", EN_TOOL_WEB_FETCH),
+        ("computer_use", EN_TOOL_COMPUTER_USE),
     ];
     for (name, fallback) in short_tools {
         let path = base_dir.join("tools").join(name).join("prompt.md");
@@ -468,6 +469,7 @@ pub fn seed_tools(base_dir: &Path, lang: Option<&str>) -> Result<usize> {
             ("exec", ZH_TOOL_EXEC),
             ("web_search", ZH_TOOL_WEB_SEARCH),
             ("web_fetch", ZH_TOOL_WEB_FETCH),
+            ("computer_use", ZH_TOOL_COMPUTER_USE),
         ]
     } else {
         &[
@@ -475,6 +477,7 @@ pub fn seed_tools(base_dir: &Path, lang: Option<&str>) -> Result<usize> {
             ("exec", EN_TOOL_EXEC),
             ("web_search", EN_TOOL_WEB_SEARCH),
             ("web_fetch", EN_TOOL_WEB_FETCH),
+            ("computer_use", EN_TOOL_COMPUTER_USE),
         ]
     };
 
@@ -804,4 +807,52 @@ Example — authenticated POST:
 - path is relative to workspace/downloads/. Pass filename like `video.mp4` or `subdir/file.pdf`.
 - Do NOT use `~/`, `~/Downloads/`, or absolute paths.
 - After downloading, use `send_file` to send the file to the user.
+"#;
+
+const EN_TOOL_COMPUTER_USE: &str = r#"# computer_use Usage Guide
+
+## Desktop automation workflow
+
+Before controlling ANY desktop application (WeChat, Finder, Safari, etc.), you MUST load the relevant app-rule first:
+
+1. **List available app-rules**: `computer_use` action=`list_app_rules`
+2. **Load the specific rule**: `computer_use` action=`get_app_rule` name=`<app-name>`
+
+Available app-rules include:
+- **wechat** — WeChat (微信) desktop client automation: send messages, monitor group chats, auto-reply via Quote
+- **doubao** — Doubao (豆包) desktop client automation
+- **douyin** — Douyin (抖音) desktop client automation
+- **tonghuashun** — Tonghuashun (同花顺) desktop client automation
+
+## Critical rules
+
+- **ALWAYS load the app-rule BEFORE taking the first screenshot.** The app-rule contains version-specific workflows, coordinate heuristics, and failure recovery steps that you cannot guess.
+- **Never say "I cannot control the desktop"** — you have `computer_use` with screenshot, click, type, key, and get_app_rule. Use them.
+- After loading the app-rule, follow its instructions exactly. Do not improvise shortcuts unless the app-rule explicitly suggests them.
+- Re-activate the target app between every action. Screenshots capture whatever is frontmost at the moment of the call.
+- Trust the screenshot, not your assumption. Verify every step visually.
+"#;
+
+const ZH_TOOL_COMPUTER_USE: &str = r#"# computer_use 使用指南
+
+## 桌面自动化工作流
+
+在控制任何桌面应用（微信、Finder、Safari 等）之前，你必须先加载对应的 app-rule：
+
+1. **列出可用 app-rules**：`computer_use` action=`list_app_rules`
+2. **加载具体规则**：`computer_use` action=`get_app_rule` name=`<应用名>`
+
+可用 app-rules：
+- **wechat** — 微信桌面端自动化：发消息、监控群聊、引用回复
+- **doubao** — 豆包桌面端自动化
+- **douyin** — 抖音桌面端自动化
+- **tonghuashun** — 同花顺桌面端自动化
+
+## 关键规则
+
+- **必须在截第一张图之前先加载 app-rule。** app-rule 包含版本特定的工作流、坐标启发式、失败恢复步骤，这些你无法猜测。
+- **绝对不能说 "我无法控制桌面"** — 你有 `computer_use` 工具，支持 screenshot、click、type、key、get_app_rule。请使用它们。
+- 加载 app-rule 后，严格按其中的指令执行。不要擅自使用捷径，除非 app-rule 明确允许。
+- 每次动作之间重新激活目标应用。截图只会捕获调用瞬间最前端的窗口。
+- 相信截图，不要凭假设行事。每一步都要 visually 验证。
 "#;

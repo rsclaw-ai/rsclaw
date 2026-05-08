@@ -761,9 +761,10 @@ impl AgentRuntime {
             "Claude Code session created"
         );
 
-        // Set model explicitly after session creation (modelId in session/new doesn't switch model)
+        // Set model via session/set_config_option after session creation
+        // (ACP spec: session/new does not have modelId parameter)
         if let Some(ref m) = model {
-            tracing::info!(model = %m, "Claude Code: setting model after session creation");
+            tracing::info!(model = %m, "Claude Code: setting model via session/set_config_option");
             client.set_model(m).await?;
         }
 

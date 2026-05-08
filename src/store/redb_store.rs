@@ -59,6 +59,24 @@ const EXTERNAL_JOBS: TableDefinition<&str, &str> = TableDefinition::new("externa
 /// window passes.
 const IDEM_KEYS: TableDefinition<&str, i64> = TableDefinition::new("idem_keys");
 
+/// Computer-use permission grants: "<agent_id>\0<app>" → JSON
+/// `{ decision, granted_at }`. Only `AllowAlways` decisions land here;
+/// `Once`/`Session` are session-scoped and never persist.
+const COMPUTER_PERMISSIONS: TableDefinition<&str, &str> =
+    TableDefinition::new("computer_permissions");
+
+/// Cron jobs: `<job_id>` → full `CronJob` JSON.
+///
+/// This table is the **single source of truth** for cron state. The
+/// legacy `cron.json5` file was replaced as authoritative storage in
+/// 2026-05 to fix a 3-writer race (UI Tauri / ws cron.update / cron
+/// runner all wrote the file directly, in-flight runs would resurrect
+/// a job the user just disabled). cron.json5 is now an export format:
+/// the gateway re-exports it on every change so `git diff` and `cat`
+/// still work, and a file watcher imports any user hand-edits back
+/// into redb.
+const CRON_JOBS: TableDefinition<&str, &str> = TableDefinition::new("cron_jobs");
+
 // ---------------------------------------------------------------------------
 // RedbStore
 // ---------------------------------------------------------------------------
@@ -108,6 +126,9 @@ impl RedbStore {
             write
                 .open_table(IDEM_KEYS)
                 .context("init IDEM_KEYS")?;
+            write
+                .open_table(COMPUTER_PERMISSIONS)
+                .context("init COMPUTER_PERMISSIONS")?;
         }
         write.commit().context("commit init")?;
 
@@ -860,6 +881,123 @@ impl RedbStore {
         };
         write.commit()?;
         Ok(count)
+    }
+
+    // -----------------------------------------------------------------------
+    // Computer-use permission grants (persistent "Always allow" decisions)
+    // -----------------------------------------------------------------------
+
+    /// Look up a persisted permission grant. Returns the raw JSON string so
+    /// the caller (`computer::permission`) owns the schema.
+    pub fn permission_get(&self, key: &str) -> Result<Option<String>> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(COMPUTER_PERMISSIONS)?;
+        Ok(table.get(key)?.map(|g| g.value().to_owned()))
+    }
+
+    /// Insert/replace a persisted permission grant.
+    pub fn permission_put(&self, key: &str, value: &str) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(COMPUTER_PERMISSIONS)?;
+            table.insert(key, value)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Delete a persisted permission grant.
+    pub fn permission_delete(&self, key: &str) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(COMPUTER_PERMISSIONS)?;
+            table.remove(key)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Cron jobs (single source of truth, authoritative since 2026-05)
+    // -----------------------------------------------------------------------
+
+    /// Read one cron job by id. Returns the raw JSON; `crate::cron`
+    /// owns the schema.
+    pub fn cron_get(&self, id: &str) -> Result<Option<String>> {
+        let read = self.db.begin_read()?;
+        let table = match read.open_table(CRON_JOBS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(table.get(id)?.map(|g| g.value().to_owned()))
+    }
+
+    /// Read all cron jobs as a Vec<(id, json)>. Order is by key (id),
+    /// which is fine for cron — no inherent ordering requirement.
+    pub fn cron_list(&self) -> Result<Vec<(String, String)>> {
+        let read = self.db.begin_read()?;
+        let table = match read.open_table(CRON_JOBS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            out.push((k.value().to_owned(), v.value().to_owned()));
+        }
+        Ok(out)
+    }
+
+    /// Insert or replace one cron job. Single atomic write — pair this
+    /// with the global `CRON_FILE_LOCK` only when you ALSO need to
+    /// re-export to `cron.json5`; the redb write itself is already
+    /// transactional.
+    pub fn cron_put(&self, id: &str, value: &str) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(CRON_JOBS)?;
+            table.insert(id, value)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Delete one cron job.
+    pub fn cron_delete(&self, id: &str) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(CRON_JOBS)?;
+            table.remove(id)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Bulk replace — clear the table and write `entries`. Used by
+    /// `cron import` (CLI / file-watcher) to atomically swap in a
+    /// fresh set from `cron.json5`. The whole replacement happens in
+    /// one transaction so concurrent readers never see a partial set.
+    pub fn cron_bulk_replace(&self, entries: &[(String, String)]) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(CRON_JOBS)?;
+            // Drain old keys.
+            let existing: Vec<String> = table
+                .iter()?
+                .filter_map(|e| e.ok().map(|(k, _)| k.value().to_owned()))
+                .collect();
+            for k in existing {
+                table.remove(k.as_str())?;
+            }
+            // Insert new.
+            for (k, v) in entries {
+                table.insert(k.as_str(), v.as_str())?;
+            }
+        }
+        write.commit()?;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

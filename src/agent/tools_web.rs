@@ -1730,7 +1730,52 @@ impl AgentRuntime {
             // 3. Inject interceptor (page scripts may have already loaded, so also check performance).
             let _ = session.execute("evaluate", &json!({"js": inject_js})).await;
 
-            // 4. Wait for video to load/play.
+            // 3b. Kick the player into life. Many sites (Douyin, Bilibili,
+            //     Xiaohongshu, etc.) do not autoplay videos in CDP-driven
+            //     Chrome — without a play() / click() the <video> element
+            //     never requests its source segments and our interceptor
+            //     captures nothing. We try four ways: video.play(), a
+            //     simulated click on the <video>, a simulated click on the
+            //     player wrapper, and a final keypress (Space) as the
+            //     last-resort universal "toggle play" gesture. Each is
+            //     wrapped so any one failing doesn't break the others.
+            let kick_play_js = r#"(function(){
+                var tries = [];
+                try {
+                    var v = document.querySelector('video');
+                    if (v) {
+                        var p = v.play();
+                        if (p && p.catch) p.catch(function(){});
+                        tries.push('video.play()');
+                    }
+                } catch(_){}
+                var sel = [
+                    'video',
+                    '.player-container',
+                    '.xgplayer',
+                    '.bpx-player-container',
+                    '[class*="VideoPlayer"]',
+                    '[class*="video-player"]',
+                    '[class*="player-wrap"]',
+                ];
+                for (var i=0; i<sel.length; i++) {
+                    try {
+                        var el = document.querySelector(sel[i]);
+                        if (el) { el.click(); tries.push('click:'+sel[i]); }
+                    } catch(_){}
+                }
+                try {
+                    document.body.dispatchEvent(new KeyboardEvent('keydown',{key:' ',keyCode:32,code:'Space'}));
+                    tries.push('space');
+                } catch(_){}
+                return tries.join('|');
+            })()"#;
+            let _ = session.execute("evaluate", &json!({"js": kick_play_js})).await;
+
+            // 4. Wait for video to start streaming. We sleep BEFORE the
+            //    final collect, because the kick_play above only fires
+            //    the events; the actual XHR/fetch + segment loads happen
+            //    over the next several seconds.
             tokio::time::sleep(Duration::from_millis(wait_ms)).await;
 
             // 5. Collect captured URLs + performance entries + video element src.

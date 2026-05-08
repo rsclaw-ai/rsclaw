@@ -227,6 +227,9 @@ fn serialize_part(part: &ContentPart) -> Value {
                 "response": { "content": content },
             }
         }),
+        ContentPart::Reasoning { text } => json!({
+            "text": text,
+        }),
     }
 }
 
@@ -268,7 +271,7 @@ async fn parse_sse_chunk_buffered(
 
     let mut events = Vec::new();
     for line in complete_portion.lines() {
-        let data = if let Some(d) = line.strip_prefix("data: ") {
+        let data = if let Some(d) = line.strip_prefix("data:").map(|s| s.trim_start()) {
             d
         } else {
             continue;

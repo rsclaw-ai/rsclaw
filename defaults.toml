@@ -35,7 +35,7 @@ needs_key  = true
 name       = "deepseek"
 label      = "DeepSeek"
 env_var    = "DEEPSEEK_API_KEY"
-model      = "deepseek/deepseek-chat"
+model      = "deepseek/deepseek-v4-flash"
 base_url   = "https://api.deepseek.com/v1"
 needs_key  = true
 
@@ -43,9 +43,9 @@ needs_key  = true
 name       = "kimi"
 label      = "Kimi"
 env_var    = "MOONSHOT_API_KEY"
-model      = "kimi/kimi-k2.5"
+model      = "kimi/kimi-k2.6"
 base_url   = "https://api.moonshot.cn/v1"
-user_agent = "claude-code/0.1.0"
+user_agent = "rsclaw/2026.5.5"
 needs_key  = true
 
 [[providers]]
