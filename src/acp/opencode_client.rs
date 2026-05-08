@@ -81,7 +81,7 @@ impl OpenCodeClient {
         .context("Failed to send")?;
 
         let result = response.text().await.context("Failed to read response")?;
-        tracing::info!("[OpenCode ACP] Response: {}", result);
+        tracing::debug!("[OpenCode ACP] Response: {}", result);
         Ok(format!("[OpenCode ACP completed]\n\n{}", result))
     }
 

@@ -509,9 +509,6 @@ enum SubprocessCmd {
         request: String,
         response_tx: mpsc::Sender<Result<serde_json::Value>>,
     },
-    SendNotification {
-        notification: String,
-    },
     Shutdown,
 }
 
@@ -823,7 +820,7 @@ impl AcpClient {
         });
         // Use configurable init_timeout for initialization (can take long to load MCP servers)
         let resp = self.rpc_with_timeout(methods::INITIALIZE, params, self.init_timeout).await?;
-        tracing::info!(response = ?resp, "ACP initialize response");
+        tracing::debug!(response = ?resp, "ACP initialize response");
         let result = resp
             .get("result")
             .cloned()
@@ -841,7 +838,6 @@ impl AcpClient {
             agent_version = ?init_resp.agent_info.version,
             "ACP: connection initialized"
         );
-
         Ok(init_resp)
     }
 
@@ -853,16 +849,21 @@ impl AcpClient {
         mcp_servers: Option<Vec<McpServerConfig>>,
     ) -> Result<NewSessionResponse> {
         tracing::info!(cwd = %cwd, model = ?model, "ACP: creating session");
-        // Note: modelId is NOT a valid parameter for session/new per ACP spec.
-        // Model must be set via session/set_config_option after session creation.
-        let params = serde_json::json!({
+        let mut params = serde_json::json!({
             "cwd": cwd,
             "mcpServers": mcp_servers.unwrap_or_default()
         });
 
+        if let Some(m) = model {
+            params["modelId"] = serde_json::json!(m);
+            tracing::debug!(model = %m, params = ?params, "Adding modelId to session/new request");
+        } else {
+            tracing::warn!("create_session: no model provided, will use agent default");
+        }
+
         // Use configurable init_timeout for session creation (can take long to initialize)
         let resp = self.rpc_with_timeout(methods::SESSION_NEW, params, self.init_timeout).await?;
-        tracing::info!(response = ?resp, "ACP session/new response");
+        tracing::debug!(response = ?resp, "ACP session/new response");
         let result = resp
             .get("result")
             .cloned()
@@ -882,12 +883,12 @@ impl AcpClient {
         );
 
         if let Some(ref models) = session_resp.models {
-            tracing::info!("Available models: {:?}", models.available_models);
+            tracing::debug!("Available models: {:?}", models.available_models);
         }
         if let Some(ref opts) = session_resp.config_options {
-            tracing::info!("Config options available: {}", opts.len());
+            tracing::debug!("Config options available: {}", opts.len());
             for opt in opts {
-                tracing::info!(
+                tracing::debug!(
                     "  - {}: {} (current: {})",
                     opt.id,
                     opt.name,
@@ -955,8 +956,8 @@ impl AcpClient {
                 }
             })?;
 
-        tracing::info!("=== send_prompt raw response ===");
-        tracing::info!(
+        tracing::debug!("=== send_prompt raw response ===");
+        tracing::debug!(
             "Full response: {}",
             serde_json::to_string(&resp).unwrap_or_default()
         );
@@ -966,8 +967,8 @@ impl AcpClient {
             .cloned()
             .unwrap_or(serde_json::Value::Null);
 
-        tracing::info!("=== send_prompt result ===");
-        tracing::info!(
+        tracing::debug!("=== send_prompt result ===");
+        tracing::debug!(
             "Result: {}",
             serde_json::to_string(&result).unwrap_or_default()
         );
@@ -975,31 +976,31 @@ impl AcpClient {
         let prompt_resp: PromptResponse =
             serde_json::from_value(result.clone()).context("Failed to parse prompt response")?;
 
-        tracing::info!("=== send_prompt parsed ===");
-        tracing::info!("stop_reason: {:?}", prompt_resp.stop_reason);
-        tracing::info!("usage: {:?}", prompt_resp.usage);
+        tracing::debug!("=== send_prompt parsed ===");
+        tracing::debug!("stop_reason: {:?}", prompt_resp.stop_reason);
+        tracing::debug!("usage: {:?}", prompt_resp.usage);
         if let Some(ref r) = prompt_resp.result {
-            tracing::info!("content blocks: {}", r.content.len());
+            tracing::debug!("content blocks: {}", r.content.len());
             for (i, block) in r.content.iter().enumerate() {
                 match block {
                     crate::acp::types::ContentBlock::Text { text } => {
-                        tracing::info!("  [{}] Text: {}", i, text);
+                        tracing::debug!("  [{}] Text: {}", i, text);
                     }
                     crate::acp::types::ContentBlock::Image { .. } => {
-                        tracing::info!("  [{}] Image", i);
+                        tracing::debug!("  [{}] Image", i);
                     }
                     crate::acp::types::ContentBlock::Resource { .. } => {
-                        tracing::info!("  [{}] Resource", i);
+                        tracing::debug!("  [{}] Resource", i);
                     }
                     crate::acp::types::ContentBlock::ResourceLink { .. } => {
-                        tracing::info!("  [{}] ResourceLink", i);
+                        tracing::debug!("  [{}] ResourceLink", i);
                     }
                 }
             }
             if let Some(ref calls) = r.tool_calls {
-                tracing::info!("tool_calls: {} calls", calls.len());
+                tracing::debug!("tool_calls: {} calls", calls.len());
                 for (i, call) in calls.iter().enumerate() {
-                    tracing::info!("  [{}] tool_call: id={}, name={}", i, call.id, call.name);
+                    tracing::debug!("  [{}] tool_call: id={}, name={}", i, call.id, call.name);
                 }
             }
         }
@@ -1072,9 +1073,9 @@ impl AcpClient {
             "configId": "model",
             "value": model_id
         });
-        tracing::info!(model_id = %model_id, "Calling session/set_config_option");
+        tracing::debug!(model_id = %model_id, "Calling session/set_config_option");
         let resp = self.rpc(methods::SESSION_SET_CONFIG_OPTION, params).await?;
-        tracing::info!(response = ?resp, "set_model response");
+        tracing::debug!(response = ?resp, "set_model response");
 
         let result = resp
             .get("result")
@@ -1156,7 +1157,7 @@ impl AcpClient {
             "params": params
         }))?;
 
-        tracing::info!(method, id, request = %request, "ACP sending request");
+        tracing::debug!(method, id, request = %request, "ACP sending request");
 
         // Send request while holding the lock, then release lock before waiting for response
         {
@@ -1175,7 +1176,7 @@ impl AcpClient {
             .context("RPC timeout")?
             .context("Channel closed")?;
 
-        tracing::info!(method, id, response = ?resp, "ACP received response");
+        tracing::debug!(method, id, response = ?resp, "ACP received response");
         resp
     }
 
@@ -1256,7 +1257,7 @@ impl AcpClient {
             "params": params
         }))?;
 
-        tracing::info!(method, id, request = %request, "ACP sending request (no timeout)");
+        tracing::debug!(method, id, request = %request, "ACP sending request (no timeout)");
 
         // Send request while holding the lock, then release lock before waiting for response
         {
@@ -1276,7 +1277,7 @@ impl AcpClient {
             .await
             .context("Channel closed - subprocess died")?;
 
-        tracing::info!(method, id, response = ?resp, "ACP received response");
+        tracing::debug!(method, id, response = ?resp, "ACP received response");
         resp
     }
 
@@ -1288,12 +1289,16 @@ impl AcpClient {
             "params": params
         }))?;
 
-        // Send notification - no response expected
+        // Send as request but don't wait for response
+        let (resp_tx, _) = mpsc::channel(1);
+
+        // Send request while holding the lock, then release immediately
         {
             let guard = self.cmd_tx.lock().await;
             let tx = guard.as_ref().context("Subprocess task died")?;
-            tx.send(SubprocessCmd::SendNotification {
-                notification,
+            tx.send(SubprocessCmd::SendRequest {
+                request: notification,
+                response_tx: resp_tx,
             })
             .await
             .context("Failed to send notification")?;
@@ -1323,68 +1328,45 @@ async fn run_subprocess(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
-        // On Windows, ensure proper stdin/stdout handling
         .spawn()
         .with_context(|| format!("Failed to spawn ACP subprocess: {} {:?}", command, args))?;
 
     let mut stdin = child.stdin.take().context("Failed to get stdin")?;
     let stdout = child.stdout.take().context("Failed to get stdout")?;
     let stderr = child.stderr.take().context("Failed to get stderr")?;
-    // Use BufReader with a larger buffer for stdout
-    let mut reader = BufReader::with_capacity(8192, stdout);
-    let mut stderr_reader = BufReader::with_capacity(8192, stderr);
+    let mut reader = BufReader::new(stdout);
+    let mut stderr_reader = BufReader::new(stderr);
 
     tracing::info!("ACP subprocess started: {} {:?}", command, args);
 
     // Spawn a task to continuously read stderr
-    tracing::info!("ACP stderr: about to spawn reader task");
-    let stderr_task = tokio::spawn(async move {
-        tracing::info!("ACP stderr reader task: STARTED");
+    let _stderr_task = tokio::spawn(async move {
         let mut stderr_buf = Vec::new();
-        let mut stderr_attempts = 0u32;
         loop {
             stderr_buf.clear();
-            stderr_attempts += 1;
-            if stderr_attempts == 1 {
-                tracing::info!("ACP stderr reader: first poll starting");
-            }
-            if stderr_attempts % 20 == 0 {
-                tracing::info!("ACP stderr reader: polling, attempts={}", stderr_attempts);
-            }
-            // Use timeout to avoid blocking forever
-            match tokio::time::timeout(Duration::from_millis(100), stderr_reader.read_until(b'\n', &mut stderr_buf)).await {
-                Ok(result) => {
-                    match result {
-                        Ok(0) => {
-                            tracing::info!("ACP stderr EOF after {} attempts", stderr_attempts);
-                            break;
-                        }
-                        Ok(n) => {
-                            tracing::info!("ACP stderr: read {} bytes, content: {}", n, String::from_utf8_lossy(&stderr_buf).trim());
-                        }
-                        Err(e) => {
-                            tracing::error!("ACP stderr read error: {}", e);
-                            break;
-                        }
+            match stderr_reader.read_until(b'\n', &mut stderr_buf).await {
+                Ok(0) => {
+                    tracing::debug!("ACP stderr EOF");
+                    break;
+                }
+                Ok(_) => {
+                    let stderr_line = String::from_utf8_lossy(&stderr_buf).trim().to_string();
+                    if !stderr_line.is_empty() {
+                        tracing::warn!("ACP stderr: {}", stderr_line);
                     }
                 }
-                Err(_) => {
-                    // Timeout - continue polling
-                    if stderr_attempts % 50 == 0 {
-                        tracing::info!("ACP stderr reader: timeout, no data yet, attempts={}", stderr_attempts);
-                    }
+                Err(e) => {
+                    tracing::error!("ACP stderr read error: {}", e);
+                    break;
                 }
             }
         }
-        tracing::info!("ACP stderr reader task finished");
     });
-    tracing::info!("ACP stderr: task spawned, task_id={:?}", stderr_task.id());
 
     loop {
         tokio::select! {
             // Handle commands from AcpClient
             cmd = cmd_rx.recv() => {
-                tracing::info!("ACP subprocess: main loop received cmd event");
                 match cmd {
                     Some(SubprocessCmd::SendRequest { request, response_tx }) => {
                         tracing::info!("ACP subprocess: received request from client");
@@ -1403,20 +1385,14 @@ async fn run_subprocess(
                         // Single write for JSON + newline
                         let mut combined = request.as_bytes().to_vec();
                         combined.push(b'\n');
-                        if let Err(e) = stdin.write_all(&combined).await {
-                            tracing::error!("ACP subprocess: stdin write error: {}", e);
-                            let _ = response_tx.send(Err(anyhow::anyhow!("Write error: {}", e))).await;
+                        if stdin.write_all(&combined).await.is_err() {
+                            tracing::error!("ACP subprocess: stdin write error");
+                            let _ = response_tx.send(Err(anyhow::anyhow!("Write error"))).await;
                             break;
                         }
-                        if let Err(e) = stdin.flush().await {
-                            tracing::error!("ACP subprocess: stdin flush error: {}", e);
-                            // Check if child process is still alive
-                            let status = child.try_wait();
-                            tracing::error!(
-                                child_status = ?status,
-                                "ACP subprocess: stdin flush failed - child may have exited"
-                            );
-                            let _ = response_tx.send(Err(anyhow::anyhow!("Flush error: {} (child status: {:?})", e, status))).await;
+                        if stdin.flush().await.is_err() {
+                            tracing::error!("ACP subprocess: stdin flush error");
+                            let _ = response_tx.send(Err(anyhow::anyhow!("Flush error"))).await;
                             break;
                         }
 
@@ -1424,97 +1400,65 @@ async fn run_subprocess(
 
                         // Read response and notifications until we get the matching response
                         let mut line_buf = Vec::new(); // Use byte buffer to handle non-UTF8
-                        let mut read_attempts = 0u32;
 
                         // Read until we get the response for this request (no timeout - can take very long!)
-                        tracing::info!("ACP subprocess: entering read loop for request_id={}", request_id.unwrap_or(-1));
                         loop {
                             line_buf.clear();
-                            read_attempts += 1;
-                            if read_attempts % 100 == 0 {
-                                tracing::info!("ACP subprocess: still waiting for response, read_attempts={}", read_attempts);
-                                // Check if subprocess is still alive
-                                let status = child.try_wait();
-                                match status {
-                                    Ok(Some(s)) => {
-                                        tracing::error!("ACP subprocess: process exited with status {:?}", s);
-                                        let _ = response_tx.send(Err(anyhow::anyhow!("Subprocess exited: {:?}", s))).await;
-                                        break;
-                                    }
-                                    Ok(None) => {
-                                        tracing::info!("ACP subprocess: process still running");
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("ACP subprocess: try_wait error: {}", e);
-                                    }
-                                }
-                            }
                             tokio::select! {
-                                result = tokio::time::timeout(Duration::from_millis(50), reader.read_until(b'\n', &mut line_buf)) => {
+                                result = reader.read_until(b'\n', &mut line_buf) => {
                                     match result {
-                                        Ok(inner_result) => {
-                                            tracing::info!("ACP subprocess: read_until returned, result={:?}", inner_result);
-                                            match inner_result {
-                                                Ok(0) => {
-                                                    tracing::error!("ACP subprocess: EOF received");
-                                                    let _ = response_tx.send(Err(anyhow::anyhow!("EOF"))).await;
-                                                    break;
+                                        Ok(0) => {
+                                            tracing::error!("ACP subprocess: EOF received");
+                                            let _ = response_tx.send(Err(anyhow::anyhow!("EOF"))).await;
+                                            break;
+                                        }
+                                        Ok(_) => {
+                                            // Convert to string, replacing invalid UTF-8 sequences
+                                            let line = String::from_utf8_lossy(&line_buf).trim().to_string();
+                                            if line.is_empty() {
+                                                continue;
+                                            }
+
+                                            if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
+                                                let method_field = msg.get("method").and_then(|m| m.as_str());
+                                                let resp_id = msg.get("id").and_then(|i| i.as_i64());
+
+                                                // Log all incoming messages
+                                                if let Some(method) = method_field {
+                                                    tracing::info!("ACP subprocess: received notification method={} id={:?}", method, resp_id);
+                                                } else if resp_id.is_some() {
+                                                    tracing::info!("ACP subprocess: received response id={:?} preview={}", resp_id, &line[..line.len().min(200)]);
+                                                } else {
+                                                    tracing::debug!("ACP subprocess: received message: {}", line);
                                                 }
-                                                Ok(n) => {
-                                                    tracing::info!("ACP subprocess: read {} bytes from stdout", n);
-                                                    // Convert to string, replacing invalid UTF-8 sequences
-                                                    let line = String::from_utf8_lossy(&line_buf).trim().to_string();
-                                                    if line.is_empty() {
-                                                        tracing::info!("ACP subprocess: empty line received, continuing");
+
+                                                // Handle session/update notification
+                                                if method_field == Some(methods::SESSION_UPDATE) {
+                                                    handle_session_update(&msg, &collected_content, &event_tx, &notification_manager).await;
+                                                    continue;
+                                                }
+
+                                                // Handle Agent → Client requests
+                                                if let Some(method) = method_field {
+                                                    tracing::info!("ACP subprocess: handling agent request method={}", method);
+                                                    if handle_agent_request(&mut stdin, &msg, method, &handler).await {
                                                         continue;
                                                     }
-
-                                                    tracing::info!("ACP subprocess: raw line: {}", line.chars().take(500).collect::<String>());
-                                                    if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
-                                                        let method_field = msg.get("method").and_then(|m| m.as_str());
-                                                        let resp_id = msg.get("id").and_then(|i| i.as_i64());
-
-                                                        // Log all incoming messages
-                                                        if let Some(method) = method_field {
-                                                            tracing::info!("ACP subprocess: received notification method={} id={:?}", method, resp_id);
-                                                        } else if resp_id.is_some() {
-                                                            tracing::info!("ACP subprocess: received response id={:?} preview={}", resp_id, &line[..line.len().min(200)]);
-                                                        } else {
-                                                            tracing::info!("ACP subprocess: received message: {}", line);
-                                                        }
-
-                                                        // Handle session/update notification
-                                                        if method_field == Some(methods::SESSION_UPDATE) {
-                                                            handle_session_update(&msg, &collected_content, &event_tx, &notification_manager).await;
-                                                            continue;
-                                                        }
-
-                                                        // Handle Agent → Client requests
-                                                        if let Some(method) = method_field {
-                                                            tracing::info!("ACP subprocess: handling agent request method={}", method);
-                                                            if handle_agent_request(&mut stdin, &msg, method, &handler).await {
-                                                                continue;
-                                                            }
-                                                        }
-
-                                                        // Check if this is the response to our request
-                                                        if resp_id == request_id {
-                                                            tracing::info!("ACP subprocess: matched response id={} to request_id={}", resp_id.unwrap_or(-1), request_id.unwrap_or(-1));
-                                                            let _ = response_tx.send(Ok(msg)).await;
-                                                            tracing::info!("ACP subprocess: response sent to client");
-                                                            break;
-                                                        }
-                                                    }
                                                 }
-                                                Err(e) => {
-                                                    tracing::error!("ACP subprocess: read error: {}", e);
-                                                    let _ = response_tx.send(Err(anyhow::anyhow!("{}", e))).await;
+
+                                                // Check if this is the response to our request
+                                                if resp_id == request_id {
+                                                    tracing::info!("ACP subprocess: matched response id={} to request_id={}", resp_id.unwrap_or(-1), request_id.unwrap_or(-1));
+                                                    let _ = response_tx.send(Ok(msg)).await;
+                                                    tracing::info!("ACP subprocess: response sent to client");
                                                     break;
                                                 }
                                             }
                                         }
-                                        Err(_) => {
-                                            // Timeout - continue polling
+                                        Err(e) => {
+                                            tracing::error!("ACP subprocess: JSON parse error: {}", e);
+                                            let _ = response_tx.send(Err(anyhow::anyhow!("{}", e))).await;
+                                            break;
                                         }
                                     }
                                 }
@@ -1523,19 +1467,6 @@ async fn run_subprocess(
                                 }
                             }
                         }
-                    }
-                    Some(SubprocessCmd::SendNotification { notification }) => {
-                        tracing::info!("ACP subprocess: received notification from client");
-                        // Write notification without waiting for response
-                        let mut combined = notification.as_bytes().to_vec();
-                        combined.push(b'\n');
-                        if let Err(e) = stdin.write_all(&combined).await {
-                            tracing::error!("ACP subprocess: notification write error: {}", e);
-                        }
-                        if let Err(e) = stdin.flush().await {
-                            tracing::error!("ACP subprocess: notification flush error: {}", e);
-                        }
-                        tracing::info!("ACP subprocess: notification sent");
                     }
                     Some(SubprocessCmd::Shutdown) => {
                         tracing::info!("ACP subprocess shutting down");
@@ -1547,10 +1478,8 @@ async fn run_subprocess(
                     }
                 }
             }
-            // Prevent tight loop - also serves as heartbeat
-            _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                // Just a brief sleep to prevent tight loop
-            }
+            // Prevent tight loop
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
         }
     }
 
@@ -1576,17 +1505,17 @@ async fn handle_session_update(
 
         match session_update {
             Some("plan") => {
-                tracing::info!("ACP plan received");
+                tracing::debug!("ACP plan received");
                 if let Some(entries) = update.get("entries").and_then(|e| e.as_array()) {
                     for entry in entries {
                         if let Some(content) = entry.get("content").and_then(|c| c.as_str()) {
-                            tracing::info!("Plan entry: {}", content);
+                            tracing::debug!("Plan entry: {}", content);
                         }
                     }
                 }
             }
             Some("user_message") | Some("user_message_chunk") => {
-                tracing::info!("ACP user_message received");
+                tracing::debug!("ACP user_message received");
             }
             Some("agent_message") => {
                 if let Some(content) = update.get("content") {
@@ -1606,7 +1535,7 @@ async fn handle_session_update(
             Some("agent_thought_chunk") => {
                 if let Some(content) = update.get("content") {
                     if let Some(text) = content.get("text").and_then(|t| t.as_str()) {
-                        tracing::info!("ACP thought: {}", text);
+                        tracing::debug!("ACP thought: {}", text);
                         let _ = event_tx.send(SessionEvent::AgentThoughtChunk {
                             content: text.to_string(),
                         });
@@ -1626,7 +1555,7 @@ async fn handle_session_update(
                 let kind = parse_tool_kind(update.get("kind").and_then(|k| k.as_str()));
                 let status = update.get("status").and_then(|s| s.as_str());
 
-                tracing::info!(
+                tracing::debug!(
                     "ACP tool_call: {} - {:?} ({:?})",
                     tool_call_id,
                     title,
@@ -1705,7 +1634,7 @@ async fn handle_session_update(
             }
             Some("mode_change") => {
                 if let Some(mode_id) = update.get("modeId").and_then(|m| m.as_str()) {
-                    tracing::info!("ACP mode_change: {}", mode_id);
+                    tracing::debug!("ACP mode_change: {}", mode_id);
                     let _ = event_tx.send(SessionEvent::ModeChanged {
                         mode_id: mode_id.to_string(),
                     });
@@ -1765,7 +1694,7 @@ async fn handle_session_update(
                 }
             }
             _ => {
-                tracing::info!("ACP session_update: {:?}", session_update);
+                tracing::debug!("ACP session_update: {:?}", session_update);
             }
         }
     }
@@ -1963,7 +1892,7 @@ async fn handle_agent_request(
         };
 
         let response_str = serde_json::to_string(&response).unwrap_or_default();
-        tracing::info!("ACP response to agent: {}", response_str);
+        tracing::debug!("ACP response to agent: {}", response_str);
 
         let mut combined = response_str.as_bytes().to_vec();
         combined.push(b'\n');
@@ -1977,7 +1906,7 @@ async fn handle_agent_request(
             tracing::error!("ACP response flush failed: {}", e);
         }
 
-        tracing::info!("ACP response sent successfully for method {}", method);
+        tracing::debug!("ACP response sent successfully for method {}", method);
     }
 
     true
