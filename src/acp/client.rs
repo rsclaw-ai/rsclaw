@@ -1385,14 +1385,20 @@ async fn run_subprocess(
                         // Single write for JSON + newline
                         let mut combined = request.as_bytes().to_vec();
                         combined.push(b'\n');
-                        if stdin.write_all(&combined).await.is_err() {
-                            tracing::error!("ACP subprocess: stdin write error");
-                            let _ = response_tx.send(Err(anyhow::anyhow!("Write error"))).await;
+                        if let Err(e) = stdin.write_all(&combined).await {
+                            tracing::error!("ACP subprocess: stdin write error: {}", e);
+                            let _ = response_tx.send(Err(anyhow::anyhow!("Write error: {}", e))).await;
                             break;
                         }
-                        if stdin.flush().await.is_err() {
-                            tracing::error!("ACP subprocess: stdin flush error");
-                            let _ = response_tx.send(Err(anyhow::anyhow!("Flush error"))).await;
+                        if let Err(e) = stdin.flush().await {
+                            tracing::error!("ACP subprocess: stdin flush error: {}", e);
+                            // Check if child process is still alive
+                            let status = child.try_wait();
+                            tracing::error!(
+                                child_status = ?status,
+                                "ACP subprocess: stdin flush failed - child may have exited"
+                            );
+                            let _ = response_tx.send(Err(anyhow::anyhow!("Flush error: {} (child status: {:?})", e, status))).await;
                             break;
                         }
 
