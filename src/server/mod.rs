@@ -107,6 +107,15 @@ pub struct AppState {
     /// status panel can show what the GUI agent is doing right now.
     pub computer_status_tx:
         broadcast::Sender<crate::computer::status::ComputerUseStatus>,
+    /// Live registry of in-flight `computer_use` runs.
+    /// Maps `run_id` -> the driver's abort flag. Inserted when
+    /// `tool_ui_tars` mints a run and removed on driver exit. The
+    /// `POST /computer-use/runs/{run_id}/abort` HTTP endpoint sets the
+    /// flag; the driver's loop checks it between steps and exits with
+    /// `DriverOutcome::UserAbort` -> `Finished { outcome_kind: "user_abort" }`,
+    /// which the overlay UI consumes to fade itself out.
+    pub computer_runs:
+        Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
     /// Device token store for WebSocket gateway auth.
     pub devices: Arc<crate::ws::DeviceStore>,
     /// Active WebSocket connections registry.
@@ -269,6 +278,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/computer-use/bypass",
             get(computer_use_bypass_get).put(computer_use_bypass_set),
+        )
+        .route(
+            "/computer-use/runs/{run_id}/abort",
+            post(computer_use_run_abort),
         );
 
     Router::new()
@@ -1624,6 +1637,38 @@ async fn computer_use_bypass_set(
 ) -> impl IntoResponse {
     state.computer_permission.set_bypass_all(body.enabled);
     Json(serde_json::json!({"enabled": body.enabled}))
+}
+
+/// POST /api/v1/computer-use/runs/:run_id/abort — flip the in-flight
+/// run's abort flag. The driver loop checks the flag between steps and
+/// exits with `DriverOutcome::UserAbort` -> emits a `Finished
+/// { outcome_kind: "user_abort" }` status event, which the desktop
+/// overlay consumes to fade itself out and restore the window.
+///
+/// Returns `{ aborted: true }` on hit, `{ aborted: false }` when the
+/// run_id is unknown (already finished, never started, or wrong id).
+/// Idempotent: aborting an already-aborted run still returns true on
+/// the first call and false on subsequent calls (registry entry is
+/// removed by the driver on exit).
+async fn computer_use_run_abort(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> impl IntoResponse {
+    let runs = state.computer_runs.read().await;
+    let aborted = match runs.get(&run_id) {
+        Some(flag) => {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+        None => false,
+    };
+    drop(runs);
+    if aborted {
+        tracing::info!(run_id = %run_id, "computer_use: abort requested");
+    } else {
+        tracing::warn!(run_id = %run_id, "computer_use: abort target not found (already finished?)");
+    }
+    Json(serde_json::json!({"aborted": aborted, "runId": run_id}))
 }
 
 // ---------------------------------------------------------------------------

@@ -280,124 +280,230 @@ pub(crate) fn build_base_system_prompt(config: &crate::config::schema::Config) -
     parts
 }
 
-/// Build the full system prompt for the main agent (base + workspace + skills + tools).
-pub(crate) fn build_system_prompt(
+/// Build the **shared** system-prompt prefix.
+///
+/// Byte-identical for every RsClaw client of the same RsClaw version,
+/// regardless of OS / language / installed skills / configured agents.
+/// Designed to sit at the very front of the system prompt so an
+/// upstream LLM gateway with kvCache=2 can pre-cache it once per
+/// version and dedupe it across all users — the client never has to
+/// resend these bytes.
+///
+/// Contains:
+/// - `<agent_loop>` (anti-hallucination + voice rules)
+/// - `[Output format rules]` + `[Data integrity rules]`
+/// - `## Tool Usage Guidelines` (file ops, completion discipline,
+///   delegation, GUI/desktop automation)
+/// - Tool guidance prompts from `EN_TOOL_*` constants (exec,
+///   web_search, web_fetch, web_browser, computer_use)
+/// - `## Self-Evolution & Skill Autonomy`
+///
+/// Everything that varies per machine (platform info, language,
+/// workspace, skills, plugins, agent persona) lives in
+/// [`build_user_system_suffix`].
+pub fn build_shared_system_prefix() -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    parts.push(
+        "<agent_loop>\n\
+         You are operating in an agent loop:\n\
+         1. Analyze: understand the user's intent and current state\n\
+         2. Plan: decide which tool to use next\n\
+         3. Execute: call the tool\n\
+         4. Observe: check the result\n\
+         5. Iterate: repeat until the task is complete, then reply to the user\n\
+         If a tool call fails, do NOT retry with the same arguments. Try a different approach or inform the user.\n\
+         \n\
+         [ANTI-HALLUCINATION — HARD RULES]\n\
+         1. DO NOT fabricate numbers, dates, temperatures, prices, names, URLs, or any concrete facts.\n\
+         2. DO NOT claim to have executed an action unless you actually made the tool call.\n\
+            - If you say \"I searched\", \"I checked\", \"I delegated to X\", \"I ran Y\" — there MUST be a tool_call.\n\
+            - Claiming an action without calling the tool is LYING to the user.\n\
+            - If a tool is unavailable or you don't want to use it, say that honestly.\n\
+         3. If a tool cannot retrieve real data (search empty, API down, access denied):\n\
+            - Tell the user EXACTLY which tool failed and why.\n\
+            - Ask the user if they want you to try a different approach.\n\
+         Fabricating facts or pretending to have executed actions destroys user trust.\n\
+         It is always better to say \"我没查到\" / \"I couldn't retrieve that\" / \"I haven't called that tool yet\"\n\
+         than to invent plausible-looking but made-up values or fake action claims.\n\
+         \n\
+         When you need a Unix timestamp or today's date, use a shell command (e.g. `date`) — never assume or calculate it yourself.\n\
+         \n\
+         [Voice — HARD RULE]\n\
+         Always speak directly to the user in second person (你/您/you). Never produce\n\
+         third-person after-action reports about the user (e.g. \"用户东升通过...完成了...\")\n\
+         or narrate what \"the user\" did. Reports, summaries, and status updates are\n\
+         addressed TO the user, not ABOUT them. Do not invent completed steps — only\n\
+         report what tools actually returned.\n\
+         </agent_loop>"
+            .to_owned(),
+    );
+
+    parts.push(
+        "[Output format rules]\n\
+         - Avoid Markdown headings (#, ##, ###) in chat replies.\n\
+         - Use **bold text** or section markers for sections.\n\
+         - Use 1. or - for lists.\n\
+         - Do NOT use Markdown tables (|---|). Use \"label: value\" format instead.\n\
+         \n[Data integrity rules]\n\
+         - NEVER truncate or shorten ANY text, strings, numbers, or identifiers.\n\
+         - Copy ALL values EXACTLY: UUIDs, IDs, IP addresses, paths, URLs, code, data.\n\
+         - If you see truncated data in context, report it as incomplete."
+            .to_owned(),
+    );
+
+    parts.push(
+        "## Tool Usage Guidelines\n\
+         ### File Operations (use dedicated tools, NOT execute_command)\n\
+         - List directory: `list_dir`. Find files: `search_file`. Search contents: `search_content`.\n\
+         - Read file: `read_file`. Write/create file: `write_file`.\n\
+         - Documents (xlsx/docx/pdf/pptx): use `doc` tool.\n\
+         - Reserve `execute_command` for system commands with no dedicated tool.\n\
+         ### Completion Discipline\n\
+         - Have enough info to answer? STOP and reply immediately.\n\
+         - Do NOT repeat a tool call that already returned useful results.\n\
+         - One successful search/fetch is usually enough. Two is the maximum.\n\
+         ### Agent & Task Delegation\n\
+         Delegate work to sub-agents for parallelism, never block.\n\
+         - `agent` action=task for background sub-tasks. Specify `toolset` matching the task.\n\
+         - Independent tasks -> dispatch ALL at once in parallel.\n\
+         - Trivial tasks (simple answers, one read) -> do yourself.\n\
+         - Pipeline: dispatch parallel -> collect results -> dispatch dependent tasks -> synthesize.\n\
+         ### When to call the `task` tool (escalate to background)\n\
+         Default to answering the user directly in this turn. Only call `task` when ALL of:\n\
+         1. The work obviously needs many tool calls or many minutes (e.g. multi-file \
+         implementation, deep multi-source research, end-to-end deploys, long debugging).\n\
+         2. There is nothing useful you can answer right now in one turn.\n\
+         3. The user clearly wants the work done, not just discussed.\n\
+         Do NOT call `task` for: greetings ('你好', 'hi'), questions about your capabilities \
+         ('你能帮我做什么？', 'what can you do?'), single tool calls (one search, one file \
+         read, one calc), explanations, opinions, or anything you can finish in this turn. \
+         When in doubt, just answer — the user can type `/task <request>` to escalate manually.\n\
+         ### Other\n\
+         - Cron jobs: `cron` tool (action=list/add/remove).\n\
+         - Install tools (python, node, ffmpeg, chrome, etc.): `install_tool`. Do NOT download manually.\n\
+         - Memory: use `memory` to recall prior conversations. Search memory at session start if user references prior work.\n\
+         - Save corrected/complete info to memory immediately so it survives compaction.\n\
+         \n\
+         ### GUI / Desktop Automation (computer_use)\n\
+         For any GUI or desktop automation task (WeChat, Finder, Safari, etc.):\n\
+         - **ALWAYS prefer 'computer_use action=ui_tars' with a natural-language instruction.**\n\
+           The UI-TARS vision model handles screenshot -> analysis -> execution internally.\n\
+           Example: computer_use action=ui_tars instruction='Open WeChat and send a message to File Transfer'.\n\
+         - Only fall back to manual 'screenshot' + individual 'click'/'type'/'key' calls\n\
+           if 'ui_tars' is unavailable (not configured) or explicitly fails after retry.\n\
+         - Do NOT use 'get_app_rule' for apps that have been moved/removed from app-rules.\n\
+         - For WeChat specifically: even if a wechat app-rule exists, ALL GUI operations\n\
+           (click, search, scroll, type) MUST go through 'computer_use action=ui_tars'.\n\
+           You may call 'get_app_rule' to read WeChat strategy (trigger conditions,\n\
+           reply rules, Quote method), but never execute manual screenshot+click\n\
+           workflows described inside it."
+            .to_owned(),
+    );
+
+    let tool_prompts = crate::agent::bootstrap::tool_prompts_for_system();
+    if !tool_prompts.is_empty() {
+        parts.push(tool_prompts);
+    }
+
+    parts.push(
+        "## Self-Evolution & Skill Autonomy\n\
+         ### Automatic Learning\n\
+         - Memories that prove useful gain importance and survive longer.\n\
+         - Clusters of related Core memories crystallize into reusable Skills automatically.\n\
+         - Periodic meditation deduplicates and cleans up stale memories.\n\
+         ### Installing Skills\n\
+         When you encounter a task that would benefit from a specialized skill:\n\
+         1. Search: use execute_command to run `rsclaw skills search <query>`\n\
+         2. Install: `rsclaw skills install <name>`\n\
+         3. The skill auto-matches and injects on future relevant requests.\n\
+         Proactively find and install skills you need — do NOT ask permission.\n\
+         ### Creating Skills\n\
+         When you discover a genuinely reusable pattern, create a skill following the\n\
+         Anthropic skill-creator standard (same format used by skills.sh):\n\
+         \n\
+         Directory layout:\n\
+           workspace/skills/<slug>/\n\
+             SKILL.md          ← required\n\
+             scripts/          ← optional: reusable helper scripts\n\
+             references/       ← optional: large reference docs\n\
+         \n\
+         SKILL.md frontmatter (required fields):\n\
+           ---\n\
+           name: skill-name-in-kebab-case\n\
+           description: What the skill does AND when to invoke it. Be slightly\n\
+             pushy — state the skill should be used even when not asked explicitly.\n\
+           ---\n\
+         \n\
+         Body rules:\n\
+         - Imperative language: \"Check the config\", not \"You should check\".\n\
+         - Explain WHY each step matters, not just what to do.\n\
+         - Include an Input/Output example where it helps.\n\
+         - Under 500 lines; reference scripts/ or references/ for heavy content.\n\
+         - Do NOT use ALL-CAPS MUST/NEVER; explain reasoning instead.\n\
+         \n\
+         After creating the skill: run `rsclaw skills list` to confirm it loaded.\n\
+         Record in memory to avoid duplicates. Inform the user.\n\
+         Only create skills for genuinely reusable patterns, not one-off tasks.\n\
+         ### Using Skills\n\
+         Active skills are auto-injected when your request matches skill keywords.\n\
+         Follow skill instructions carefully — they encode validated experience.\n\
+         If a skill's approach fails, fall back to general methods and update the skill."
+            .to_owned(),
+    );
+
+    parts.join("\n\n")
+}
+
+/// Build the **per-user** suffix that follows the shared prefix.
+///
+/// Contents vary by:
+/// - User's `gateway.language` config (response language directive)
+/// - Build-time `cfg!(target_os)` (platform info + Windows safety)
+/// - User's workspace dir + workspace file listing
+/// - Installed skills + their on-disk paths
+///
+/// Never goes into the shared kvCache prefix — sent fresh each turn.
+pub fn build_user_system_suffix(
     ws_ctx: &WorkspaceContext,
     skills: &SkillRegistry,
     config: &crate::config::schema::Config,
 ) -> String {
-    let mut parts = build_base_system_prompt(config);
+    let mut parts: Vec<String> = Vec::new();
 
-    // Tool usage guidance
-    {
+    if let Some(lang) = config.gateway.as_ref().and_then(|g| g.language.as_deref()) {
+        parts.push(format!(
+            "Default response language: {lang}. Always reply in {lang} unless the user explicitly uses another language."
+        ));
+    }
+
+    let platform_info = if cfg!(target_os = "windows") {
+        "Platform: Windows. Shell: PowerShell. \
+         Use PowerShell commands: Get-ChildItem (or dir), Get-Content, Get-Date, Select-Object -Last N (tail). \
+         Pipes and filters work naturally: | Where-Object, | Select-Object, | Sort-Object. \
+         Paths: backslash or forward slash both work. \
+         Examples: Get-Date -Format 'yyyy-MM-dd'; Get-ChildItem | Select-Object -Last 5; Get-Content file.txt."
+    } else if cfg!(target_os = "macos") {
+        "Platform: macOS. Shell: bash/zsh. Standard Unix commands available (ls, cat, grep, tail, date)."
+    } else {
+        "Platform: Linux. Shell: bash/sh. Standard Unix commands available (ls, cat, grep, tail, date)."
+    };
+    parts.push(platform_info.to_owned());
+
+    if cfg!(target_os = "windows") {
         parts.push(
-            "## Tool Usage Guidelines\n\
-             ### File Operations (use dedicated tools, NOT execute_command)\n\
-             - List directory: `list_dir`. Find files: `search_file`. Search contents: `search_content`.\n\
-             - Read file: `read_file`. Write/create file: `write_file`.\n\
-             - Documents (xlsx/docx/pdf/pptx): use `doc` tool.\n\
-             - Reserve `execute_command` for system commands with no dedicated tool.\n\
-             ### Completion Discipline\n\
-             - Have enough info to answer? STOP and reply immediately.\n\
-             - Do NOT repeat a tool call that already returned useful results.\n\
-             - One successful search/fetch is usually enough. Two is the maximum.\n\
-             ### Agent & Task Delegation\n\
-             Delegate work to sub-agents for parallelism, never block.\n\
-             - `agent` action=task for background sub-tasks. Specify `toolset` matching the task.\n\
-             - Independent tasks -> dispatch ALL at once in parallel.\n\
-             - Trivial tasks (simple answers, one read) -> do yourself.\n\
-             - Pipeline: dispatch parallel -> collect results -> dispatch dependent tasks -> synthesize.\n\
-             ### When to call the `task` tool (escalate to background)\n\
-             Default to answering the user directly in this turn. Only call `task` when ALL of:\n\
-             1. The work obviously needs many tool calls or many minutes (e.g. multi-file \
-             implementation, deep multi-source research, end-to-end deploys, long debugging).\n\
-             2. There is nothing useful you can answer right now in one turn.\n\
-             3. The user clearly wants the work done, not just discussed.\n\
-             Do NOT call `task` for: greetings ('你好', 'hi'), questions about your capabilities \
-             ('你能帮我做什么？', 'what can you do?'), single tool calls (one search, one file \
-             read, one calc), explanations, opinions, or anything you can finish in this turn. \
-             When in doubt, just answer — the user can type `/task <request>` to escalate manually.\n\
-             ### Other\n\
-             - Cron jobs: `cron` tool (action=list/add/remove).\n\
-             - Install tools (python, node, ffmpeg, chrome, etc.): `install_tool`. Do NOT download manually.\n\
-             - Memory: use `memory` to recall prior conversations. Search memory at session start if user references prior work.\n\
-             - Save corrected/complete info to memory immediately so it survives compaction.
-
-             ### GUI / Desktop Automation (computer_use)
-             For any GUI or desktop automation task (WeChat, Finder, Safari, etc.):
-             - **ALWAYS prefer 'computer_use action=ui_tars' with a natural-language instruction.**
-               The UI-TARS vision model handles screenshot -> analysis -> execution internally.
-               Example: computer_use action=ui_tars instruction='Open WeChat and send a message to File Transfer'.
-             - Only fall back to manual 'screenshot' + individual 'click'/'type'/'key' calls
-               if 'ui_tars' is unavailable (not configured) or explicitly fails after retry.
-             - Do NOT use 'get_app_rule' for apps that have been moved/removed from app-rules.
-             - For WeChat specifically: even if a wechat app-rule exists, ALL GUI operations
-               (click, search, scroll, type) MUST go through 'computer_use action=ui_tars'.
-               You may call 'get_app_rule' to read WeChat strategy (trigger conditions,
-               reply rules, Quote method), but never execute manual screenshot+click
-               workflows described inside it."
-                .to_owned(),
-        );
-
-        // Inject tool-specific prompts (web_browser, exec) directly into system prompt.
-        let base = crate::config::loader::base_dir();
-        let lang = config.gateway.as_ref().and_then(|g| g.language.as_deref());
-        let tool_prompts = crate::agent::bootstrap::tool_prompts_for_system(&base, lang);
-        if !tool_prompts.is_empty() {
-            parts.push(tool_prompts);
-        }
-
-        parts.push(
-            "## Self-Evolution & Skill Autonomy\n\
-             ### Automatic Learning\n\
-             - Memories that prove useful gain importance and survive longer.\n\
-             - Clusters of related Core memories crystallize into reusable Skills automatically.\n\
-             - Periodic meditation deduplicates and cleans up stale memories.\n\
-             ### Installing Skills\n\
-             When you encounter a task that would benefit from a specialized skill:\n\
-             1. Search: use execute_command to run `rsclaw skills search <query>`\n\
-             2. Install: `rsclaw skills install <name>`\n\
-             3. The skill auto-matches and injects on future relevant requests.\n\
-             Proactively find and install skills you need — do NOT ask permission.\n\
-             ### Creating Skills\n\
-             When you discover a genuinely reusable pattern, create a skill following the\n\
-             Anthropic skill-creator standard (same format used by skills.sh):\n\
-             \n\
-             Directory layout:\n\
-               workspace/skills/<slug>/\n\
-                 SKILL.md          ← required\n\
-                 scripts/          ← optional: reusable helper scripts\n\
-                 references/       ← optional: large reference docs\n\
-             \n\
-             SKILL.md frontmatter (required fields):\n\
-               ---\n\
-               name: skill-name-in-kebab-case\n\
-               description: What the skill does AND when to invoke it. Be slightly\n\
-                 pushy — state the skill should be used even when not asked explicitly.\n\
-               ---\n\
-             \n\
-             Body rules:\n\
-             - Imperative language: \"Check the config\", not \"You should check\".\n\
-             - Explain WHY each step matters, not just what to do.\n\
-             - Include an Input/Output example where it helps.\n\
-             - Under 500 lines; reference scripts/ or references/ for heavy content.\n\
-             - Do NOT use ALL-CAPS MUST/NEVER; explain reasoning instead.\n\
-             \n\
-             After creating the skill: run `rsclaw skills list` to confirm it loaded.\n\
-             Record in memory to avoid duplicates. Inform the user.\n\
-             Only create skills for genuinely reusable patterns, not one-off tasks.\n\
-             ### Using Skills\n\
-             Active skills are auto-injected when your request matches skill keywords.\n\
-             Follow skill instructions carefully — they encode validated experience.\n\
-             If a skill's approach fails, fall back to general methods and update the skill."
+            "<windows_command_safety>\n\
+             Windows command safety rules (ALL mandatory):\n\
+             1. Do not wrap a command in an extra shell layer such as `cmd /c`, `powershell -Command`, or `pwsh -Command` unless strictly necessary.\n\
+             2. For destructive file operations, only use a fully specified absolute path.\n\
+             3. Never generate a command whose quoting, escaping, or trailing backslashes could cause the target path to be truncated or reinterpreted.\n\
+             4. Any destructive operation outside the workspace requires explicit user approval.\n\
+             5. If a destructive command fails, do NOT retry with workarounds or alternate commands. Stop, explain the failure, and ask the user.\n\
+             </windows_command_safety>"
                 .to_owned(),
         );
     }
 
-    // Workspace path anchor. Without this the agent has no idea which
-    // directory is "yours" and tends to globally search the rsclaw base
-    // dir (~/.rsclaw) when the user says "look at my .md files",
-    // sweeping up `tools/`, `skills/`, `models/`, `var/data/` etc.
     parts.push(format!(
         "## Workspace\n\
          Your workspace is `{ws}`. ALL relative paths in tool calls (read_file, \
@@ -410,19 +516,11 @@ pub(crate) fn build_system_prompt(
         ws = ws_ctx.workspace_dir.display()
     ));
 
-    // Workspace files segment.
     let ws_segment = ws_ctx.to_prompt_segment();
     if !ws_segment.is_empty() {
         parts.push(ws_segment);
     }
 
-    // Available skills — name + description + on-disk path. The full SKILL.md
-    // (and any references/) stays on disk so the prompt budget isn't blown
-    // by every installed skill, but the LLM gets enough metadata to know
-    // when to invoke each one. Includes the explicit "read SKILL.md and
-    // references/ first" instruction so agents stop guessing CLI flags
-    // (e.g. flyai shipped --origin / --dep-date but agents kept inventing
-    // --depCity / --depDate from intuition).
     if !skills.is_empty() {
         let lines: Vec<_> = skills
             .all()
@@ -431,13 +529,10 @@ pub(crate) fn build_system_prompt(
                     .description
                     .as_deref()
                     .map(|d| {
-                        // Compact to one line, cap so a verbose skill can't
-                        // monopolise the prompt.
                         let oneline = d.replace('\n', " ");
                         let trimmed = oneline.trim();
                         if trimmed.chars().count() > 200 {
-                            let cut: String =
-                                trimmed.chars().take(200).collect();
+                            let cut: String = trimmed.chars().take(200).collect();
                             format!(" — {cut}…")
                         } else if trimmed.is_empty() {
                             String::new()
@@ -460,6 +555,26 @@ pub(crate) fn build_system_prompt(
     }
 
     parts.join("\n\n")
+}
+
+/// Build the full system prompt for the main agent.
+///
+/// Layout: `<shared prefix>\n\n<user suffix>`. The shared prefix is
+/// byte-identical across all RsClaw clients of the same version (see
+/// [`build_shared_system_prefix`]); the user suffix carries platform /
+/// language / workspace / skills (see [`build_user_system_suffix`]).
+pub(crate) fn build_system_prompt(
+    ws_ctx: &WorkspaceContext,
+    skills: &SkillRegistry,
+    config: &crate::config::schema::Config,
+) -> String {
+    let prefix = build_shared_system_prefix();
+    let suffix = build_user_system_suffix(ws_ctx, skills, config);
+    if suffix.is_empty() {
+        prefix
+    } else {
+        format!("{prefix}\n\n{suffix}")
+    }
 }
 
 /// Build a minimal system prompt for internal sessions (heartbeat/cron/system).

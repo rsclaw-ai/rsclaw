@@ -282,6 +282,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let (computer_status_tx, _) = broadcast::channel::<
         crate::computer::status::ComputerUseStatus,
     >(256);
+    let computer_runs: Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    > = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
 
     spawn_agent_tasks(
         receivers,
@@ -301,6 +304,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Arc::clone(&computer_permission),
         computer_permission_tx.clone(),
         computer_status_tx.clone(),
+        Arc::clone(&computer_runs),
     );
 
     // Set i18n default language from gateway config.
@@ -656,6 +660,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         computer_permission: Arc::clone(&computer_permission),
         computer_permission_tx: computer_permission_tx.clone(),
         computer_status_tx: computer_status_tx.clone(),
+        computer_runs: Arc::clone(&computer_runs),
         devices,
         ws_conns,
         feishu: Arc::clone(&feishu_slot),
@@ -976,6 +981,9 @@ fn spawn_agent_tasks(
     computer_permission: Arc<crate::computer::permission::RedbPermissionStore>,
     computer_permission_tx: broadcast::Sender<crate::computer::permission::PermissionRequest>,
     computer_status_tx: broadcast::Sender<crate::computer::status::ComputerUseStatus>,
+    computer_runs: Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    >,
 ) {
     for (agent_id, mut rx) in receivers {
         let handle = match registry.get(&agent_id) {
@@ -1028,6 +1036,7 @@ fn spawn_agent_tasks(
         runtime.computer_permission = Some(Arc::clone(&computer_permission));
         runtime.computer_permission_tx = Some(computer_permission_tx.clone());
         runtime.computer_status_tx = Some(computer_status_tx.clone());
+        runtime.computer_runs = Some(Arc::clone(&computer_runs));
 
         let event_tx_task = event_tx.clone();
         tokio::spawn(async move {

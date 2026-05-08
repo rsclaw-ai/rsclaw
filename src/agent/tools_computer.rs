@@ -467,6 +467,14 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
         // UI status panel can correlate Started → Step* → Finished.
         let run_id = format!("ui_tars-{}", uuid::Uuid::new_v4().simple());
 
+        // Register this run's abort flag so the HTTP abort endpoint can
+        // flip it. Cleared in a guard pattern at every driver-exit path
+        // (ok / err / timeout / panic). Outside the gateway
+        // (`computer_runs == None`) this is a no-op.
+        if let Some(reg) = self.computer_runs.as_ref() {
+            reg.write().await.insert(run_id.clone(), Arc::clone(&abort));
+        }
+
         // ---------- ASYNC PATH (fire-and-forget) ----------
         if async_mode {
             // Reuse `run_id` as the task id so logs / status events / wake
@@ -480,6 +488,8 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
             let permission_emit_clone = permission_emit.clone();
             let status_emit_clone = status_emit.clone();
             let run_id_clone = run_id.clone();
+            let run_id_for_dereg = run_id.clone();
+            let computer_runs_clone = self.computer_runs.clone();
             let self_handle = Arc::clone(&self.handle);
             let notification_tx = self.notification_tx.clone();
             let session_key = ctx.session_key.clone();
@@ -521,6 +531,11 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                         message: format!("driver run failed: {e}"),
                         steps: 0,
                     });
+                // Driver has exited — drop the abort-flag registry entry
+                // so the run_id is no longer abortable.
+                if let Some(reg) = computer_runs_clone.as_ref() {
+                    reg.write().await.remove(&run_id_for_dereg);
+                }
 
                 // Build a human-readable result for the wake message.
                 let result_text = match &outcome {
@@ -632,6 +647,7 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
         //    or AdbOperator.
         let operator = NativeOperator::new();
 
+        let run_id_for_dereg = run_id.clone();
         let driver = VlmDriver {
             operator: &operator,
             provider,
@@ -656,12 +672,19 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
         // The async path above is the proper fix; this safety net
         // covers the (legacy) sync path.
         const UI_TARS_HARD_TIMEOUT_SECS: u64 = 240;
-        let outcome = match tokio::time::timeout(
+        let driver_result = tokio::time::timeout(
             std::time::Duration::from_secs(UI_TARS_HARD_TIMEOUT_SECS),
             driver.run(instruction),
         )
-        .await
-        {
+        .await;
+        // Driver has exited (or hard-timed out) — drop the abort-flag
+        // registry entry. Done here, before unwrapping the result, so
+        // the entry never outlives the driver regardless of which exit
+        // path fires.
+        if let Some(reg) = self.computer_runs.as_ref() {
+            reg.write().await.remove(&run_id_for_dereg);
+        }
+        let outcome = match driver_result {
             Ok(res) => res?,
             Err(_) => {
                 abort.store(true, std::sync::atomic::Ordering::SeqCst);

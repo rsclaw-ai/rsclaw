@@ -242,9 +242,20 @@ impl VlmDriver<'_> {
                 session_key: None,
             };
 
-            // 3c. Stream the prediction.
-            let prediction = match stream_prediction(self.provider.as_ref(), req).await {
+            // 3c. Stream the prediction. Abort flag is polled per
+            //     chunk so a stop click takes effect within ~one
+            //     roundtrip instead of waiting for the 30s tail.
+            let prediction = match stream_prediction(
+                self.provider.as_ref(),
+                req,
+                self.abort.as_ref(),
+            )
+            .await
+            {
                 Ok(p) => p,
+                Err(e) if e.to_string().contains(STREAM_ABORTED) => {
+                    return Ok(DriverOutcome::UserAbort { steps });
+                }
                 Err(e) => {
                     warn!(error = %e, "VLM stream failed");
                     return Ok(DriverOutcome::OperatorError {
@@ -624,12 +635,23 @@ fn summarize_parsed(p: &ParsedAction) -> String {
     format!("{}({pretty_args})", p.action_type)
 }
 
+/// Sentinel error string returned by `stream_prediction` when the
+/// caller's abort flag flipped mid-stream. The driver's outer loop
+/// recognises it and exits with `DriverOutcome::UserAbort` instead of
+/// surfacing it as an operator error to the user.
+const STREAM_ABORTED: &str = "vlm stream: aborted by user";
+
 /// Stream a request to completion and return the accumulated assistant
 /// text. Reasoning deltas are folded in as a fallback when the content
 /// channel is empty (some models emit only thinking).
+///
+/// `abort` is polled between every chunk: a single user-initiated stop
+/// drops the in-flight stream within ~one chunk roundtrip rather than
+/// waiting up to 30s for the full prediction to land.
 async fn stream_prediction(
     provider: &dyn LlmProvider,
     req: LlmRequest,
+    abort: &AtomicBool,
 ) -> Result<String> {
     let mut stream = provider
         .stream(req)
@@ -638,6 +660,9 @@ async fn stream_prediction(
     let mut text = String::new();
     let mut reasoning = String::new();
     while let Some(event) = stream.next().await {
+        if abort.load(Ordering::SeqCst) {
+            anyhow::bail!(STREAM_ABORTED);
+        }
         match event? {
             StreamEvent::TextDelta(d) => text.push_str(&d),
             StreamEvent::ReasoningDelta(d) => reasoning.push_str(&d),

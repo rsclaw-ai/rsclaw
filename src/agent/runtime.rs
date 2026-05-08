@@ -395,6 +395,13 @@ pub struct AgentRuntime {
     /// for the live status panel. `None` outside the gateway.
     pub computer_status_tx:
         Option<broadcast::Sender<crate::computer::status::ComputerUseStatus>>,
+    /// Shared registry of in-flight `computer_use` run abort flags.
+    /// `tool_ui_tars` inserts on driver start and removes on exit; the
+    /// HTTP abort endpoint flips the bool to wake the driver loop.
+    /// `None` outside the gateway.
+    pub computer_runs: Option<
+        Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+    >,
     /// Dynamic agent spawner — None when running outside the gateway.
     pub spawner: Option<Arc<crate::agent::AgentSpawner>>,
     /// Plugin registry — None when running outside the gateway or with no
@@ -511,6 +518,7 @@ impl AgentRuntime {
             computer_permission: None,
             computer_permission_tx: None,
             computer_status_tx: None,
+            computer_runs: None,
             spawner,
             plugins,
             mcp,
@@ -2813,6 +2821,94 @@ impl AgentRuntime {
 
         // Cache tools for compaction KV cache reuse.
         self.cached_tools = tools.clone();
+
+        // DEBUG: when RSCLAW_DUMP_PROMPT is set, dump a JSON document
+        // describing this turn's prompt + tool list, split into the
+        // shared (cacheable across all RsClaw clients of this version)
+        // and user (per-machine) halves. Lets an upstream LLM gateway
+        // (rsclaw-llm with kvCacheMode=2) seed its global cache with
+        // the shared bytes once per version and dedupe across users.
+        // Per session_key in the filename so multiple inspected
+        // sessions don't clobber.
+        if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
+            let safe_key = session_key
+                .chars()
+                .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .collect::<String>();
+            let dump_path = crate::config::loader::base_dir()
+                .join(format!("debug_prompt_spec.{safe_key}.json"));
+
+            // Built-in tools = stable across machines: 37 names compiled
+            // into the RsClaw binary. Anything else (sub-agent
+            // `agent_<id>` tools registered from the user's config,
+            // plugin tools, MCP tools, WASM tools) is per-machine.
+            const BUILTIN_TOOLS: &[&str] = &[
+                "memory","use_skill","task","read_file","write_file","send_file",
+                "execute_command","agent","install_tool","list_dir","search_file",
+                "search_content","web_search","web_fetch","web_download","web_browser",
+                "computer_use","image_gen","video_gen","pdf","text_to_voice",
+                "send_message","cron","session","gateway","opencode","claudecode",
+                "codex","channel","anycli","clarify","pairing",
+                "create_docx","create_pdf","create_xlsx","create_pptx","doc",
+            ];
+            let tool_json = |t: &crate::provider::ToolDef| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.parameters,
+                })
+            };
+            let mut builtin_tools = Vec::new();
+            let mut user_tools = Vec::new();
+            for t in &tools {
+                if BUILTIN_TOOLS.contains(&t.name.as_str()) {
+                    builtin_tools.push(tool_json(t));
+                } else {
+                    user_tools.push(tool_json(t));
+                }
+            }
+
+            let shared_prefix = crate::agent::prompt_builder::build_shared_system_prefix();
+            // user_suffix is what's left after the shared prefix +
+            // "\n\n". Recompute by trimming since the prompt was built
+            // by concatenation with that exact separator.
+            let user_suffix = system_prompt
+                .strip_prefix(&shared_prefix)
+                .map(|rest| rest.trim_start_matches("\n\n").to_owned())
+                .unwrap_or_else(|| system_prompt.clone());
+
+            let payload = serde_json::json!({
+                "session_key": session_key,
+                "agent_id": self.handle.id,
+                "model": model,
+                "rsclaw_version": env!("CARGO_PKG_VERSION"),
+                // SHARED: cacheable, byte-identical for every client of this version.
+                "shared_prefix": shared_prefix,
+                "builtin_tools": builtin_tools,
+                // USER: per-machine, never cached.
+                "user_suffix": user_suffix,
+                "user_tools": user_tools,
+                // Convenience: full reconstructed prompt.
+                "system_prompt": system_prompt,
+            });
+            match serde_json::to_string_pretty(&payload) {
+                Ok(s) => {
+                    if let Err(e) = std::fs::write(&dump_path, &s) {
+                        tracing::warn!("failed to dump prompt-spec: {e}");
+                    } else {
+                        tracing::info!(
+                            path = %dump_path.display(),
+                            builtin_tool_count = builtin_tools.len(),
+                            user_tool_count = user_tools.len(),
+                            shared_prefix_len = shared_prefix.len(),
+                            user_suffix_len = user_suffix.len(),
+                            "dumped prompt-spec JSON"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!("prompt-spec serialize failed: {e}"),
+            }
+        }
 
         // Check vision support before loading session (avoids borrow conflict).
         let kv_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
