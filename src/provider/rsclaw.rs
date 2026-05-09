@@ -621,9 +621,29 @@ fn split_request<'a>(req: &'a LlmRequest) -> Result<SplitRequest<'a>> {
 /// message except the trailing delta (which `turn()` will re-send).
 /// Empty input returns an empty slice — replay can still hydrate a
 /// fresh session with no prior turns.
+///
+/// When the assistant calls N tools in parallel the runtime queues N
+/// consecutive `Role::Tool` messages, and `TurnDelta::from_request`
+/// folds ALL of them into a single tool_results delta (protocol §2.3
+/// requires it). To keep the two sides symmetric the history slice
+/// must drop every consecutive trailing `Role::Tool` — dropping just
+/// one would leave the other N-1 in history, the server would replay
+/// them into the KV, and then the turn would re-send the same
+/// tool_results, hydrating duplicates.
+///
+/// For a User-trailing list (the iter-1 case after
+/// `normalize_trailing_system` ran) we drop exactly one message.
 fn history_for_replay(messages: &[Message]) -> &[Message] {
     if messages.is_empty() {
-        messages
+        return messages;
+    }
+    let last = &messages[messages.len() - 1];
+    if matches!(last.role, Role::Tool) {
+        let mut keep = messages.len();
+        while keep > 0 && matches!(messages[keep - 1].role, Role::Tool) {
+            keep -= 1;
+        }
+        &messages[..keep]
     } else {
         &messages[..messages.len() - 1]
     }
@@ -1101,6 +1121,73 @@ mod tests {
             content: MessageContent::Text("solo".into()),
         }];
         assert!(history_for_replay(&one).is_empty());
+    }
+
+    #[test]
+    fn history_for_replay_drops_all_consecutive_trailing_tools() {
+        // Parallel-tool case: assistant emits N tool_use blocks, runtime
+        // queues N consecutive Role::Tool messages, from_request folds
+        // them into a single Tools delta. history_for_replay must drop
+        // ALL N — dropping just one leaves N-1 tool_results in history,
+        // server replays them into KV, then turn() re-sends them as the
+        // delta, hydrating duplicates.
+        let m = |role, txt: &str| Message {
+            role,
+            content: MessageContent::Text(txt.into()),
+        };
+        let tool = |id: &str| Message {
+            role: Role::Tool,
+            content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                tool_use_id: id.into(),
+                content: "ok".into(),
+                is_error: None,
+            }]),
+        };
+        let msgs = vec![
+            m(Role::User, "do all three"),
+            m(Role::Assistant, "calling tools"),
+            tool("toolu_1"),
+            tool("toolu_2"),
+            tool("toolu_3"),
+        ];
+        let slice = history_for_replay(&msgs);
+        assert_eq!(slice.len(), 2);
+        assert!(matches!(slice[0].role, Role::User));
+        assert!(matches!(slice[1].role, Role::Assistant));
+    }
+
+    #[test]
+    fn history_for_replay_keeps_earlier_tool_messages() {
+        // Sequential-tool case across a multi-iteration turn:
+        // [..., User, Asst, Tool, Asst, Tool, Asst, Tool] — only the
+        // FINAL contiguous Tool run belongs to the current step's delta;
+        // earlier Tool messages are part of completed sub-iterations and
+        // stay in history.
+        let m = |role, txt: &str| Message {
+            role,
+            content: MessageContent::Text(txt.into()),
+        };
+        let tool = |id: &str| Message {
+            role: Role::Tool,
+            content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                tool_use_id: id.into(),
+                content: "ok".into(),
+                is_error: None,
+            }]),
+        };
+        let msgs = vec![
+            m(Role::User, "go"),
+            m(Role::Assistant, "step1"),
+            tool("a"),
+            m(Role::Assistant, "step2"),
+            tool("b"),
+        ];
+        let slice = history_for_replay(&msgs);
+        assert_eq!(slice.len(), 4);
+        // The earlier Tool stays in history.
+        assert!(matches!(slice[2].role, Role::Tool));
+        // Trailing Tool dropped.
+        assert!(matches!(slice[3].role, Role::Assistant));
     }
 
     #[test]
