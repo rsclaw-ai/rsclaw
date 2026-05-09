@@ -302,11 +302,13 @@ impl RsclawProvider {
 
         let byte_stream = resp.bytes_stream();
         let line_buffer = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let utf8_remainder = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
         let event_stream = byte_stream
             .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
             .then(move |chunk| {
                 let line_buffer = line_buffer.clone();
-                async move { parse_sse_chunk(chunk, &line_buffer).await }
+                let utf8_remainder = utf8_remainder.clone();
+                async move { parse_sse_chunk(chunk, &line_buffer, &utf8_remainder).await }
             })
             .flat_map(futures::stream::iter);
 
@@ -571,6 +573,7 @@ fn serialize_history_message(msg: &Message) -> Value {
 async fn parse_sse_chunk(
     chunk: Result<bytes::Bytes>,
     line_buffer: &Arc<tokio::sync::Mutex<String>>,
+    utf8_remainder: &Arc<tokio::sync::Mutex<Vec<u8>>>,
 ) -> Vec<Result<StreamEvent>> {
     let mut events: Vec<Result<StreamEvent>> = Vec::new();
     let bytes = match chunk {
@@ -580,8 +583,37 @@ async fn parse_sse_chunk(
             return events;
         }
     };
+
+    // Stitch this chunk onto any partial UTF-8 left over from the
+    // previous chunk; decode strict; stash the trailing invalid bytes
+    // (an incomplete multi-byte sequence at the chunk boundary) for
+    // the next call. from_utf8_lossy would corrupt CJK / emoji deltas
+    // that straddle chunk boundaries by inserting U+FFFD.
+    let mut remainder = utf8_remainder.lock().await;
+    let stitched: Vec<u8> = if remainder.is_empty() {
+        bytes.to_vec()
+    } else {
+        let mut combined = std::mem::take(&mut *remainder);
+        combined.extend_from_slice(&bytes);
+        combined
+    };
+    let decoded: String = match std::str::from_utf8(&stitched) {
+        Ok(s) => s.to_owned(),
+        Err(e) => {
+            let valid_up_to = e.valid_up_to();
+            *remainder = stitched[valid_up_to..].to_vec();
+            if valid_up_to == 0 {
+                return events;
+            }
+            std::str::from_utf8(&stitched[..valid_up_to])
+                .expect("valid_up_to guarantees valid UTF-8")
+                .to_owned()
+        }
+    };
+    drop(remainder);
+
     let mut buf = line_buffer.lock().await;
-    buf.push_str(&String::from_utf8_lossy(&bytes));
+    buf.push_str(&decoded);
     while let Some(idx) = buf.find('\n') {
         let line = buf[..idx].trim_end_matches('\r').to_string();
         buf.drain(..=idx);
@@ -668,6 +700,39 @@ fn is_session_evicted(status: StatusCode, body: &str) -> bool {
 mod tests {
     use super::*;
     use crate::provider::ToolDef;
+
+    #[tokio::test]
+    async fn parse_sse_chunk_recovers_split_utf8() {
+        // SSE delta line carrying "你好" (U+4F60 = E4 BD A0, U+597D =
+        // E5 A5 BD), with the byte split landing in the middle of the
+        // first character.
+        let line_full = b"data: {\"type\":\"delta\",\"content\":\"\xe4\xbd\xa0\xe5\xa5\xbd\"}\n";
+        let split = 14; // "data: {\"type\":" prefix is 14 bytes
+        let (a, b) = line_full.split_at(split);
+        let (b, c) = b.split_at(11); // straddles the first 你 (E4 BD A0)
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+
+        for piece in [a, b, c] {
+            let _ = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(piece)), &buf, &rem).await;
+        }
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::from_static(b"")), &buf, &rem).await;
+
+        let texts: Vec<_> = evs
+            .into_iter()
+            .filter_map(|e| match e {
+                Ok(StreamEvent::TextDelta(t)) => Some(t),
+                _ => None,
+            })
+            .collect();
+        // Either fully delivered now or already delivered in an earlier piece.
+        let all_text: String = texts.into_iter().collect();
+        // The final newline-terminated event must produce 你好 verbatim, no U+FFFD.
+        assert!(
+            !all_text.contains('\u{FFFD}'),
+            "expected no replacement char, got {all_text:?}"
+        );
+    }
 
     #[test]
     fn is_session_evicted_recognizes_version_drift() {
