@@ -692,7 +692,11 @@ async fn parse_sse_chunk(
     while let Some(idx) = buf.find('\n') {
         let line = buf[..idx].trim_end_matches('\r').to_string();
         buf.drain(..=idx);
-        let Some(payload) = line.strip_prefix("data: ") else {
+        // Per WHATWG SSE the space after the colon is optional, so
+        // `data:{...}` is just as valid as `data: {...}`. Accept both
+        // — matches the openai/anthropic/gemini providers in this
+        // crate. Strip the colon, then trim leading ASCII spaces.
+        let Some(payload) = line.strip_prefix("data:").map(|s| s.trim_start_matches(' ')) else {
             continue;
         };
         if payload == "[DONE]" {
@@ -807,6 +811,26 @@ mod tests {
             !all_text.contains('\u{FFFD}'),
             "expected no replacement char, got {all_text:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_accepts_data_without_leading_space() {
+        // SSE field syntax allows the space after the colon to be
+        // omitted; rsclaw-server (or any node that routes through
+        // hyper / nginx with comp-stripping middleware) may emit
+        // `data:{...}` without a space. Both forms must parse.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = b"data:{\"type\":\"delta\",\"content\":\"hi\"}\n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let texts: Vec<_> = evs
+            .into_iter()
+            .filter_map(|e| match e {
+                Ok(StreamEvent::TextDelta(t)) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["hi".to_string()]);
     }
 
     #[tokio::test]
