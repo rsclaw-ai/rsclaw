@@ -87,8 +87,15 @@ impl RsclawProvider {
     }
 
     fn auth_header(&self) -> Option<(String, String)> {
+        // `Some("")` slips in when `RSCLAW_KEY` is set but blank (env
+        // var present, value empty) — `std::env::var` returns `Ok("")`,
+        // gateway/providers.rs `.ok()`s that into `Some("")`. Sending
+        // `Authorization: Bearer ` with an empty token gets rejected
+        // by stricter proxies and obscures the real "no auth
+        // configured" error, so treat empty as absent here.
         self.bearer
             .as_ref()
+            .filter(|k| !k.is_empty())
             .map(|k| ("authorization".to_string(), format!("Bearer {k}")))
     }
 
@@ -1308,6 +1315,27 @@ mod tests {
         // server hang the runtime indefinitely.
         let s = TURN_HEADERS_TIMEOUT.as_secs();
         assert!((30..=120).contains(&s), "TURN_HEADERS_TIMEOUT={s}s out of range");
+    }
+
+    #[test]
+    fn auth_header_omits_when_bearer_is_none_or_empty() {
+        // `RSCLAW_KEY=""` (env var set but blank) flows in as
+        // `Some("")` from `std::env::var(...).ok()` — sending
+        // `Authorization: Bearer ` would be rejected by stricter
+        // proxies. Treat None and Some("") as the same "no auth"
+        // signal at the wire boundary.
+        let p = RsclawProvider::new("http://x", None);
+        assert!(p.auth_header().is_none());
+        let p = RsclawProvider::new("http://x", Some(String::new()));
+        assert!(p.auth_header().is_none());
+    }
+
+    #[test]
+    fn auth_header_emits_bearer_when_populated() {
+        let p = RsclawProvider::new("http://x", Some("sk-abc".into()));
+        let (k, v) = p.auth_header().expect("bearer set");
+        assert_eq!(k, "authorization");
+        assert_eq!(v, "Bearer sk-abc");
     }
 
     #[test]
