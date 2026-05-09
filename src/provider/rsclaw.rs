@@ -942,6 +942,16 @@ async fn parse_sse_chunk(
         if payload == "[DONE]" {
             continue;
         }
+        // Skip empty `data:` payloads silently. SSE keep-alives sometimes
+        // surface as `data:\n\n` (no body) when proxies translate
+        // `:keepalive` comments. Pushing a parse error here would
+        // surface as `Err(...)` down the stream — and runtime's
+        // `match event?` (agent/runtime.rs ~4356) propagates that with
+        // `?`, killing the whole turn. The empty line carries no model
+        // signal; drop it the same way `[DONE]` is dropped.
+        if payload.is_empty() {
+            continue;
+        }
         let value: Value = match serde_json::from_str(payload) {
             Ok(v) => v,
             Err(e) => {
@@ -1078,6 +1088,44 @@ mod tests {
             !all_text.contains('\u{FFFD}'),
             "expected no replacement char, got {all_text:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_skips_empty_data_payload() {
+        // Empty `data:` lines (a heartbeat shape some proxies emit when
+        // translating `:keepalive` comments) MUST NOT surface as Err in
+        // the stream — the runtime propagates Err with `?` and would
+        // kill an otherwise-healthy turn. Mix an empty line with a real
+        // event and assert: only the real text delta fires, no Err.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = b"data:\ndata: {\"type\":\"delta\",\"content\":\"hi\"}\n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let mut texts: Vec<String> = Vec::new();
+        for e in evs {
+            match e {
+                Ok(StreamEvent::TextDelta(t)) => texts.push(t),
+                Err(err) => panic!("empty data: must not surface as Err — got {err}"),
+                _ => {}
+            }
+        }
+        assert_eq!(texts, vec!["hi".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_skips_data_with_only_spaces() {
+        // `data:    \n` (whitespace-only after the colon) trims to "" via
+        // `trim_start_matches(' ')` and lands in the same empty-skip path.
+        // Verify the same: no Err, no spurious event.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = b"data:    \n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        for e in evs {
+            if let Err(err) = e {
+                panic!("whitespace-only data: must not surface as Err — got {err}");
+            }
+        }
     }
 
     #[tokio::test]
