@@ -912,7 +912,16 @@ async fn parse_sse_chunk(
             Some("tool_call") => {
                 let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let name = value.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let input = value.get("input").cloned().unwrap_or(Value::Null);
+                // Default to an empty JSON object — `Value::Null` would
+                // make downstream `input.as_object()` calls return None
+                // and force every consumer to `unwrap_or(&empty_map)`.
+                // The other three providers in this crate (anthropic,
+                // gemini, openai) all default to an empty object; align
+                // here so the runtime can treat the field uniformly.
+                let input = match value.get("input").cloned() {
+                    Some(Value::Null) | None => Value::Object(Default::default()),
+                    Some(other) => other,
+                };
                 events.push(Ok(StreamEvent::ToolCall { id, name, input }));
             }
             Some("done") => {
@@ -1068,6 +1077,77 @@ mod tests {
             }
         }
         assert!(saw_done, "expected Done event even without usage");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_tool_call_defaults_input_to_empty_object() {
+        // Tools without parameters legitimately ship `input: {}`, which
+        // already arrives as Value::Object — verify pass-through.
+        // But missing input or null input should ALSO produce an empty
+        // object, matching the anthropic/gemini/openai providers, so
+        // runtime consumers can call .as_object() without first
+        // matching Null.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = b"data: {\"type\":\"tool_call\",\"id\":\"toolu_xyz\",\"name\":\"get_time\"}\n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let input = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::ToolCall { input, .. }) => Some(input),
+                _ => None,
+            })
+            .expect("expected one ToolCall event");
+        assert!(
+            input.as_object().is_some_and(|m| m.is_empty()),
+            "expected empty object, got {input:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_tool_call_normalizes_explicit_null_input() {
+        // A misbehaving server might emit `"input": null`. Don't pass
+        // the Null through — coerce to {} so downstream stays uniform.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line =
+            b"data: {\"type\":\"tool_call\",\"id\":\"t\",\"name\":\"n\",\"input\":null}\n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let input = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::ToolCall { input, .. }) => Some(input),
+                _ => None,
+            })
+            .expect("expected one ToolCall event");
+        assert!(
+            input.as_object().is_some_and(|m| m.is_empty()),
+            "explicit null should normalize to empty object, got {input:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_tool_call_preserves_populated_input() {
+        // Round-trip a real input — the normalization must NOT clobber
+        // a non-null object. Regression test for the obvious foot-gun
+        // of a too-eager fallback.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = br#"data: {"type":"tool_call","id":"t","name":"read_file","input":{"path":"x.rs"}}
+"#;
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let input = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::ToolCall { input, .. }) => Some(input),
+                _ => None,
+            })
+            .expect("expected one ToolCall event");
+        assert_eq!(
+            input.get("path").and_then(Value::as_str),
+            Some("x.rs"),
+            "populated input must round-trip; got {input:?}"
+        );
     }
 
     #[tokio::test]
