@@ -27,7 +27,13 @@ use super::{
     TokenUsage,
 };
 
-pub const RSCLAW_DEFAULT_BASE: &str = "http://localhost:8090";
+/// Default base for an rsclaw-server running on the same host. The
+/// `/v1/agent` suffix is the external API mount inside rsclaw-server —
+/// the rsclaw-llm `/sessions/...` protocol paths are exposed to clients
+/// under that prefix, distinct from `/v1/chat/completions` etc. Setting
+/// `RSCLAW_URL` overrides this; that variable should also include the
+/// `/v1/agent` segment.
+pub const RSCLAW_DEFAULT_BASE: &str = "http://localhost:8090/v1/agent";
 
 // ---------------------------------------------------------------------------
 // Provider

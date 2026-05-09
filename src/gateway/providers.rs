@@ -282,7 +282,8 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
     // rejects requests with kv_cache_mode != 2.
     //
     //   RSCLAW_KEY  — bearer token (optional if rsclaw-server has auth disabled)
-    //   RSCLAW_URL  — base URL without trailing path (default: http://localhost:8090)
+    //   RSCLAW_URL  — full base URL including the `/v1/agent` mount
+    //                 (default: http://localhost:8090/v1/agent)
     if !registry.names().contains(&"rsclaw") {
         let key = std::env::var("RSCLAW_KEY")
             .ok()
