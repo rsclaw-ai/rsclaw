@@ -186,7 +186,7 @@ impl LlmProvider for RsclawProvider {
                     };
                     let entry = SessionEntry {
                         session_id: resp.session_id.clone(),
-                        rsclaw_version: resp.rsclaw_version.clone(),
+                        rsclaw_version: resp.rsclaw_version_or(split.rsclaw_version),
                         last_seen_msgs_len: req.messages.len(),
                     };
                     self.store(&session_key, entry.clone());
@@ -209,7 +209,7 @@ impl LlmProvider for RsclawProvider {
                     let replayed = self.replay(&split, replay_history).await?;
                     let entry = SessionEntry {
                         session_id: replayed.session_id.clone(),
-                        rsclaw_version: replayed.rsclaw_version.clone(),
+                        rsclaw_version: replayed.rsclaw_version_or(split.rsclaw_version),
                         last_seen_msgs_len: req.messages.len(),
                     };
                     self.store(&session_key, entry.clone());
@@ -437,7 +437,29 @@ struct ReplayReq<'a> {
 #[derive(Debug, Deserialize, Clone)]
 struct CreateSessionResp {
     session_id: String,
+    /// Per protocol §2.1 the create response includes `rsclaw_version`
+    /// (the registered/canonical version on the chosen node, which may
+    /// differ from the requested alias). Per §2.2 the **replay**
+    /// response does NOT include it — and rsclaw-server's backend
+    /// passes the upstream JSON straight through, so the field is
+    /// absent on replay. Default to empty here; the caller falls back
+    /// to the request's `rsclaw_version` when this is empty.
+    #[serde(default)]
     rsclaw_version: String,
+}
+
+impl CreateSessionResp {
+    /// Returns the response's `rsclaw_version` if non-empty, else
+    /// `fallback` (typically `split.rsclaw_version`). Replay responses
+    /// per §2.2 don't carry the field, so the request's version is
+    /// the authoritative value for cache-key comparison.
+    fn rsclaw_version_or(&self, fallback: &str) -> String {
+        if self.rsclaw_version.is_empty() {
+            fallback.to_owned()
+        } else {
+            self.rsclaw_version.clone()
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1501,6 +1523,58 @@ mod tests {
             panic!()
         };
         assert_eq!(t, "hi\n\nnon-empty");
+    }
+
+    #[test]
+    fn create_session_resp_parses_replay_shape_without_rsclaw_version() {
+        // Protocol §2.2 replay response carries session_id but NOT
+        // rsclaw_version. Without #[serde(default)] this fails with
+        // "missing field rsclaw_version" and breaks every replay path.
+        let body = r#"{
+            "session_id": "rs_w7_8a3c1f2b",
+            "n_prefix_tokens": 27981,
+            "n_user_tokens": 612,
+            "n_history_tokens": 8420,
+            "n_tokens": 37013,
+            "instance_id": "llama-worker-7",
+            "replay_ms": 2340
+        }"#;
+        let resp: CreateSessionResp = serde_json::from_str(body).expect("replay shape parses");
+        assert_eq!(resp.session_id, "rs_w7_8a3c1f2b");
+        assert!(resp.rsclaw_version.is_empty());
+    }
+
+    #[test]
+    fn create_session_resp_parses_create_shape_with_rsclaw_version() {
+        // Protocol §2.1 create response DOES carry rsclaw_version.
+        let body = r#"{
+            "session_id": "rs_w7_8a3c1f2b",
+            "rsclaw_version": "2026.5.5"
+        }"#;
+        let resp: CreateSessionResp = serde_json::from_str(body).expect("create shape parses");
+        assert_eq!(resp.rsclaw_version, "2026.5.5");
+    }
+
+    #[test]
+    fn rsclaw_version_or_falls_back_when_empty() {
+        let empty = CreateSessionResp {
+            session_id: "id".into(),
+            rsclaw_version: String::new(),
+        };
+        assert_eq!(empty.rsclaw_version_or("2026.5.5"), "2026.5.5");
+    }
+
+    #[test]
+    fn rsclaw_version_or_keeps_response_value_when_present() {
+        // If the upstream (e.g. an open() response, or a future replay
+        // response that adds the field) DOES include the field, prefer
+        // it over the fallback — that's the canonical/registered name
+        // and it may differ from the requested alias.
+        let canonical = CreateSessionResp {
+            session_id: "id".into(),
+            rsclaw_version: "2026.5.5".into(),
+        };
+        assert_eq!(canonical.rsclaw_version_or("alias-name"), "2026.5.5");
     }
 
     #[test]
