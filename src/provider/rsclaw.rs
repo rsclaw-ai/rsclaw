@@ -386,38 +386,63 @@ impl TurnDelta {
                 last.role
             );
         }
-        let mut tool_results: Vec<ToolResultDelta> = Vec::new();
+
+        // When the assistant calls N tools in parallel, the runtime
+        // queues N consecutive Role::Tool messages (one per result).
+        // Protocol §2.3 requires a single turn() carry ALL of them in
+        // one tool_results array, else server bails with 400
+        // tool_results_incomplete. Walk back from the tail collecting
+        // every consecutive Tool message; stop at the first non-Tool.
+        if matches!(last.role, Role::Tool) {
+            let mut tail: Vec<&Message> = Vec::new();
+            for m in req.messages.iter().rev() {
+                if matches!(m.role, Role::Tool) {
+                    tail.push(m);
+                } else {
+                    break;
+                }
+            }
+            tail.reverse();
+            let mut tool_results: Vec<ToolResultDelta> = Vec::new();
+            for m in tail {
+                if let MessageContent::Parts(parts) = &m.content {
+                    for p in parts {
+                        if let ContentPart::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } = p
+                        {
+                            tool_results.push(ToolResultDelta {
+                                tool_use_id: tool_use_id.clone(),
+                                content: content.clone(),
+                                is_error: is_error.unwrap_or(false),
+                            });
+                        }
+                    }
+                }
+            }
+            if tool_results.is_empty() {
+                anyhow::bail!("rsclaw: trailing Tool message(s) carried no tool_result parts");
+            }
+            return Ok(TurnDelta::Tools { tool_results });
+        }
+
+        // Role::User branch — the trailing message is treated as one
+        // user_message; multiple consecutive User messages aren't a
+        // supported delta shape.
         let mut user_text: Option<String> = None;
         match &last.content {
             MessageContent::Text(t) => user_text = Some(t.clone()),
             MessageContent::Parts(parts) => {
                 for p in parts {
-                    match p {
-                        ContentPart::ToolResult {
-                            tool_use_id,
-                            content,
-                            is_error,
-                        } => tool_results.push(ToolResultDelta {
-                            tool_use_id: tool_use_id.clone(),
-                            content: content.clone(),
-                            is_error: is_error.unwrap_or(false),
-                        }),
-                        ContentPart::Text { text } => {
-                            user_text.get_or_insert_with(String::new).push_str(text);
-                        }
-                        _ => {}
+                    if let ContentPart::Text { text } = p {
+                        user_text.get_or_insert_with(String::new).push_str(text);
                     }
                 }
             }
         }
-        if !tool_results.is_empty() && user_text.is_some() {
-            anyhow::bail!(
-                "rsclaw: turn delta must be either user_message or tool_results, not both"
-            );
-        }
-        if !tool_results.is_empty() {
-            Ok(TurnDelta::Tools { tool_results })
-        } else if let Some(t) = user_text {
+        if let Some(t) = user_text {
             Ok(TurnDelta::User { user_message: t })
         } else {
             anyhow::bail!("rsclaw: last message has no usable content for delta")
@@ -861,6 +886,76 @@ mod tests {
         let delta = TurnDelta::from_request(&req).unwrap();
         let body = serde_json::to_value(&delta).unwrap();
         assert_eq!(body["tool_results"][0]["tool_use_id"], "toolu_1");
+    }
+
+    #[test]
+    fn turn_delta_collects_parallel_tool_results() {
+        // Assistant called 3 tools in parallel → 3 trailing Tool messages.
+        let tool_msg = |id: &str, body: &str| Message {
+            role: Role::Tool,
+            content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                tool_use_id: id.into(),
+                content: body.into(),
+                is_error: None,
+            }]),
+        };
+        let req = req_with(
+            vec![
+                Message {
+                    role: Role::User,
+                    content: MessageContent::Text("do three things".into()),
+                },
+                tool_msg("toolu_a", "result a"),
+                tool_msg("toolu_b", "result b"),
+                tool_msg("toolu_c", "result c"),
+            ],
+            2,
+            Some("k"),
+        );
+        let delta = TurnDelta::from_request(&req).unwrap();
+        let body = serde_json::to_value(&delta).unwrap();
+        let arr = body["tool_results"].as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["tool_use_id"], "toolu_a");
+        assert_eq!(arr[1]["tool_use_id"], "toolu_b");
+        assert_eq!(arr[2]["tool_use_id"], "toolu_c");
+    }
+
+    #[test]
+    fn turn_delta_does_not_cross_user_boundary() {
+        // A non-Tool message between User and the trailing Tool must
+        // stop the back-walk — the earlier Tool belongs to a prior turn.
+        let req = req_with(
+            vec![
+                Message {
+                    role: Role::Tool,
+                    content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                        tool_use_id: "toolu_old".into(),
+                        content: "stale".into(),
+                        is_error: None,
+                    }]),
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: MessageContent::Text("ack".into()),
+                },
+                Message {
+                    role: Role::Tool,
+                    content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                        tool_use_id: "toolu_new".into(),
+                        content: "fresh".into(),
+                        is_error: None,
+                    }]),
+                },
+            ],
+            2,
+            Some("k"),
+        );
+        let delta = TurnDelta::from_request(&req).unwrap();
+        let body = serde_json::to_value(&delta).unwrap();
+        let arr = body["tool_results"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["tool_use_id"], "toolu_new");
     }
 
     #[test]
