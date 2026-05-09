@@ -144,8 +144,13 @@ impl LlmProvider for RsclawProvider {
                 TurnOutcome::Stream(s) => s,
                 TurnOutcome::SessionNotFound => {
                     // Recover via /sessions/replay then retry the turn.
+                    // History excludes the trailing delta — turn() below
+                    // re-sends it. Including it in replay would hydrate
+                    // the same message twice (once batched, once as the
+                    // turn input) and confuse the model.
                     self.forget(&session_key);
-                    let replayed = self.replay(&split, &req.messages).await?;
+                    let replay_history = history_for_replay(&req.messages);
+                    let replayed = self.replay(&split, replay_history).await?;
                     let entry = SessionEntry {
                         session_id: replayed.session_id.clone(),
                         rsclaw_version: replayed.rsclaw_version.clone(),
@@ -494,6 +499,18 @@ fn split_request<'a>(req: &'a LlmRequest) -> Result<SplitRequest<'a>> {
     })
 }
 
+/// Returns the history slice to send to `/sessions/replay`: every
+/// message except the trailing delta (which `turn()` will re-send).
+/// Empty input returns an empty slice — replay can still hydrate a
+/// fresh session with no prior turns.
+fn history_for_replay(messages: &[Message]) -> &[Message] {
+    if messages.is_empty() {
+        messages
+    } else {
+        &messages[..messages.len() - 1]
+    }
+}
+
 fn serialize_history_message(msg: &Message) -> Value {
     let role = match msg.role {
         Role::System => "system",
@@ -708,6 +725,34 @@ mod tests {
         assert_eq!(split.user_tools.len(), 1);
         assert_eq!(split.user_tools[0]["name"], "search");
         assert!(split.user_tools[0].get("input_schema").is_some());
+    }
+
+    #[test]
+    fn history_for_replay_drops_trailing_delta() {
+        let m = |role, txt: &str| Message {
+            role,
+            content: MessageContent::Text(txt.into()),
+        };
+        let msgs = vec![
+            m(Role::User, "hi"),
+            m(Role::Assistant, "yo"),
+            m(Role::User, "again"),
+        ];
+        let slice = history_for_replay(&msgs);
+        assert_eq!(slice.len(), 2);
+        assert!(matches!(slice[0].role, Role::User));
+        assert!(matches!(slice[1].role, Role::Assistant));
+    }
+
+    #[test]
+    fn history_for_replay_handles_empty_and_singleton() {
+        let empty: Vec<Message> = Vec::new();
+        assert!(history_for_replay(&empty).is_empty());
+        let one = vec![Message {
+            role: Role::User,
+            content: MessageContent::Text("solo".into()),
+        }];
+        assert!(history_for_replay(&one).is_empty());
     }
 
     #[test]
