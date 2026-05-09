@@ -264,10 +264,33 @@ impl RsclawProvider {
         messages: &[Message],
     ) -> Result<CreateSessionResp> {
         let url = format!("{}/sessions/replay", self.base_url);
-        let history: Vec<Value> = messages.iter().map(serialize_history_message).collect();
+        // Protocol §2.2 history accepts only `role: "user"` and
+        // `role: "assistant"`. The runtime, however, threads
+        // `Role::System` messages into the conversation list for
+        // plugins/skills prefixes, just-installed skills, and
+        // dynamic /ctx blocks (see agent/runtime.rs ~4054). Sending
+        // those through as-is would trigger `400 invalid_history`
+        // and tank every replay. Pull them out and append their
+        // text to `user_suffix` so the content still reaches the
+        // server — at the static-prefix slot, the only place the
+        // protocol allows non-conversational system content.
+        let (filtered, extra_suffix) = split_system_messages(messages);
+        let user_suffix_owned: String = if extra_suffix.is_empty() {
+            String::new()
+        } else if split.user_suffix.is_empty() {
+            extra_suffix
+        } else {
+            format!("{}\n\n{}", split.user_suffix, extra_suffix)
+        };
+        let user_suffix: &str = if user_suffix_owned.is_empty() {
+            split.user_suffix
+        } else {
+            &user_suffix_owned
+        };
+        let history: Vec<Value> = filtered.iter().map(|m| serialize_history_message(m)).collect();
         let body = ReplayReq {
             rsclaw_version: split.rsclaw_version,
-            user_suffix: split.user_suffix,
+            user_suffix,
             user_tools: &split.user_tools,
             plugins_system: split.plugins_system,
             skills_system: split.skills_system,
@@ -595,6 +618,41 @@ fn history_for_replay(messages: &[Message]) -> &[Message] {
     } else {
         &messages[..messages.len() - 1]
     }
+}
+
+/// Partition a history slice into (non-system messages, concatenated
+/// system text). The runtime threads `Role::System` messages through
+/// the conversation list for plugins/skills/ctx blocks, but protocol
+/// §2.2 only accepts `user` / `assistant` in history — so we lift the
+/// system text out and let the caller append it to `user_suffix`.
+/// Order of system blocks is preserved within the returned String;
+/// blocks are joined with a blank line. Non-text content on a
+/// `Role::System` message is dropped (system messages are documented
+/// as text-only in the runtime).
+fn split_system_messages(messages: &[Message]) -> (Vec<&Message>, String) {
+    let mut filtered: Vec<&Message> = Vec::with_capacity(messages.len());
+    let mut sys_parts: Vec<String> = Vec::new();
+    for m in messages {
+        if matches!(m.role, Role::System) {
+            match &m.content {
+                MessageContent::Text(t) => sys_parts.push(t.clone()),
+                MessageContent::Parts(parts) => {
+                    let mut joined = String::new();
+                    for p in parts {
+                        if let ContentPart::Text { text } = p {
+                            joined.push_str(text);
+                        }
+                    }
+                    if !joined.is_empty() {
+                        sys_parts.push(joined);
+                    }
+                }
+            }
+        } else {
+            filtered.push(m);
+        }
+    }
+    (filtered, sys_parts.join("\n\n"))
 }
 
 fn serialize_history_message(msg: &Message) -> Value {
@@ -1098,6 +1156,56 @@ mod tests {
         let arr = body["tool_results"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["tool_use_id"], "toolu_new");
+    }
+
+    #[test]
+    fn split_system_messages_lifts_system_to_suffix() {
+        // Mid-conversation Role::System blocks (plugins, skills,
+        // /ctx) must NOT appear in /sessions/replay history — the
+        // protocol rejects role:"system" with 400 invalid_history.
+        let m = |role: Role, txt: &str| Message {
+            role,
+            content: MessageContent::Text(txt.into()),
+        };
+        let msgs = vec![
+            m(Role::System, "PLUGINS"),
+            m(Role::System, "SKILLS"),
+            m(Role::User, "hi"),
+            m(Role::Assistant, "yo"),
+            m(Role::System, "## New Skill Installed\nfoo"),
+            m(Role::User, "again"),
+        ];
+        let (filtered, suffix) = split_system_messages(&msgs);
+        assert_eq!(filtered.len(), 3);
+        for m in &filtered {
+            assert!(!matches!(m.role, Role::System));
+        }
+        assert_eq!(suffix, "PLUGINS\n\nSKILLS\n\n## New Skill Installed\nfoo");
+    }
+
+    #[test]
+    fn split_system_messages_handles_text_parts() {
+        let msgs = vec![Message {
+            role: Role::System,
+            content: MessageContent::Parts(vec![
+                ContentPart::Text { text: "hello ".into() },
+                ContentPart::Text { text: "world".into() },
+            ]),
+        }];
+        let (filtered, suffix) = split_system_messages(&msgs);
+        assert!(filtered.is_empty());
+        assert_eq!(suffix, "hello world");
+    }
+
+    #[test]
+    fn split_system_messages_empty_when_no_system() {
+        let msgs = vec![Message {
+            role: Role::User,
+            content: MessageContent::Text("hi".into()),
+        }];
+        let (filtered, suffix) = split_system_messages(&msgs);
+        assert_eq!(filtered.len(), 1);
+        assert!(suffix.is_empty());
     }
 
     #[test]
