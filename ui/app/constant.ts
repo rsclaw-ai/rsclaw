@@ -55,6 +55,7 @@ export enum Path {
   AgentManager = "/agents",
   ChannelConfig = "/channels",
   CronManager = "/cron",
+  ComputerUseControl = "/computer-use",
   RsClawPanel = "/rsclaw",
   Onboarding = "/onboarding",
 }
