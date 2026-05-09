@@ -296,7 +296,7 @@ impl RsclawProvider {
         } else {
             &user_suffix_owned
         };
-        let history: Vec<Value> = filtered.iter().map(|m| serialize_history_message(m)).collect();
+        let history: Vec<Value> = serialize_replay_history(&filtered);
         let body = ReplayReq {
             rsclaw_version: split.rsclaw_version,
             user_suffix,
@@ -800,38 +800,78 @@ fn serialize_history_message(msg: &Message) -> Value {
     let content = match &msg.content {
         MessageContent::Text(t) => json!(t),
         MessageContent::Parts(parts) => {
-            let mapped: Vec<Value> = parts
-                .iter()
-                .map(|p| match p {
-                    ContentPart::Text { text } => json!({"type":"text","text":text}),
-                    ContentPart::Image { url } => {
-                        json!({"type":"image","source":{"type":"url","url":url}})
-                    }
-                    ContentPart::ToolUse { id, name, input } => {
-                        json!({"type":"tool_use","id":id,"name":name,"input":input})
-                    }
-                    ContentPart::ToolResult {
-                        tool_use_id,
-                        content,
-                        is_error,
-                    } => {
-                        let mut obj = json!({
-                            "type":"tool_result",
-                            "tool_use_id":tool_use_id,
-                            "content":content,
-                        });
-                        if let Some(e) = is_error {
-                            obj["is_error"] = json!(e);
-                        }
-                        obj
-                    }
-                    ContentPart::Reasoning { text } => json!({"type":"thinking","text":text}),
-                })
-                .collect();
+            let mapped: Vec<Value> = parts.iter().map(serialize_history_part).collect();
             json!(mapped)
         }
     };
     json!({ "role": role, "content": content })
+}
+
+fn serialize_history_part(p: &ContentPart) -> Value {
+    match p {
+        ContentPart::Text { text } => json!({"type":"text","text":text}),
+        ContentPart::Image { url } => {
+            json!({"type":"image","source":{"type":"url","url":url}})
+        }
+        ContentPart::ToolUse { id, name, input } => {
+            json!({"type":"tool_use","id":id,"name":name,"input":input})
+        }
+        ContentPart::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => {
+            let mut obj = json!({
+                "type":"tool_result",
+                "tool_use_id":tool_use_id,
+                "content":content,
+            });
+            if let Some(e) = is_error {
+                obj["is_error"] = json!(e);
+            }
+            obj
+        }
+        ContentPart::Reasoning { text } => json!({"type":"thinking","text":text}),
+    }
+}
+
+/// Serialize replay history with consecutive `Role::Tool` messages
+/// coalesced into one `user`-role entry whose `content` array carries
+/// every `tool_result` part.
+///
+/// Why: when the assistant calls N tools in parallel, the runtime queues
+/// N consecutive `Role::Tool` messages (one per result). `from_request`
+/// already merges them into a single `tool_results` array on a live
+/// turn; replay history needs the same shape per protocol §2.2 — the
+/// example there shows tool_results inside ONE user-role entry, and
+/// shipping N separate entries would either tokenize wrong or trip
+/// `400 invalid_history` on stricter chat templates.
+fn serialize_replay_history(messages: &[&Message]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    let mut i = 0;
+    while i < messages.len() {
+        let m = messages[i];
+        if !matches!(m.role, Role::Tool) {
+            out.push(serialize_history_message(m));
+            i += 1;
+            continue;
+        }
+        let mut combined: Vec<Value> = Vec::new();
+        while i < messages.len() && matches!(messages[i].role, Role::Tool) {
+            if let MessageContent::Parts(parts) = &messages[i].content {
+                for p in parts {
+                    if matches!(p, ContentPart::ToolResult { .. }) {
+                        combined.push(serialize_history_part(p));
+                    }
+                }
+            }
+            i += 1;
+        }
+        if !combined.is_empty() {
+            out.push(json!({ "role": "user", "content": combined }));
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1427,6 +1467,96 @@ mod tests {
         assert!(matches!(slice[2].role, Role::Tool));
         // Trailing Tool dropped.
         assert!(matches!(slice[3].role, Role::Assistant));
+    }
+
+    #[test]
+    fn serialize_replay_history_coalesces_parallel_tools() {
+        // Assistant called 3 tools in parallel → runtime queued 3 Tool
+        // messages. In replay history they MUST collapse into one
+        // user-role entry whose content[] carries all three tool_results,
+        // matching the protocol §2.2 example shape.
+        let mk_tool = |id: &str, body: &str| Message {
+            role: Role::Tool,
+            content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                tool_use_id: id.into(),
+                content: body.into(),
+                is_error: None,
+            }]),
+        };
+        let user = Message {
+            role: Role::User,
+            content: MessageContent::Text("go".into()),
+        };
+        let asst = Message {
+            role: Role::Assistant,
+            content: MessageContent::Text("calling tools".into()),
+        };
+        let ta = mk_tool("a", "ra");
+        let tb = mk_tool("b", "rb");
+        let tc = mk_tool("c", "rc");
+        let msgs = vec![&user, &asst, &ta, &tb, &tc];
+        let out = serialize_replay_history(&msgs);
+        assert_eq!(out.len(), 3, "user + assistant + 1 coalesced tool entry: {out:?}");
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(out[1]["role"], "assistant");
+        assert_eq!(out[2]["role"], "user");
+        let parts = out[2]["content"].as_array().expect("content array");
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0]["tool_use_id"], "a");
+        assert_eq!(parts[1]["tool_use_id"], "b");
+        assert_eq!(parts[2]["tool_use_id"], "c");
+        for p in parts {
+            assert_eq!(p["type"], "tool_result");
+        }
+    }
+
+    #[test]
+    fn serialize_replay_history_keeps_separated_tool_runs_separate() {
+        // Sequential-tool sub-iterations: Tool, Asst, Tool → two distinct
+        // user-role entries (one per tool run), with the assistant block
+        // between them.
+        let mk_tool = |id: &str| Message {
+            role: Role::Tool,
+            content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                tool_use_id: id.into(),
+                content: "ok".into(),
+                is_error: None,
+            }]),
+        };
+        let asst = Message {
+            role: Role::Assistant,
+            content: MessageContent::Text("step".into()),
+        };
+        let ta = mk_tool("a");
+        let tb = mk_tool("b");
+        let msgs = vec![&ta, &asst, &tb];
+        let out = serialize_replay_history(&msgs);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(out[0]["content"][0]["tool_use_id"], "a");
+        assert_eq!(out[1]["role"], "assistant");
+        assert_eq!(out[2]["role"], "user");
+        assert_eq!(out[2]["content"][0]["tool_use_id"], "b");
+    }
+
+    #[test]
+    fn serialize_replay_history_drops_tool_run_with_no_tool_result_parts() {
+        // Defensive: a stray Role::Tool message carrying non-ToolResult
+        // parts (Text/Image/etc) should not produce an empty user-role
+        // entry — that would be `{"role":"user","content":[]}`, which
+        // some chat templates reject.
+        let bad = Message {
+            role: Role::Tool,
+            content: MessageContent::Parts(vec![ContentPart::Text { text: "noise".into() }]),
+        };
+        let user = Message {
+            role: Role::User,
+            content: MessageContent::Text("hi".into()),
+        };
+        let msgs = vec![&user, &bad];
+        let out = serialize_replay_history(&msgs);
+        assert_eq!(out.len(), 1, "only the User survives: {out:?}");
+        assert_eq!(out[0]["role"], "user");
     }
 
     #[test]
