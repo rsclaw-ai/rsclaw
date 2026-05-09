@@ -366,16 +366,16 @@ impl RsclawProvider {
             ),
         };
         let status = resp.status();
-        if status == StatusCode::NOT_FOUND {
-            return Ok(TurnOutcome::SessionNotFound);
-        }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            // 409 version_drift (pinned node upgraded past our
-            // rsclaw_version) and 503 backend_unavailable (pinned node
-            // gone via heartbeat timeout) are documented session-
-            // eviction signals — same recovery path as 404, replay
-            // against current rsclaw_version and retry.
+            // 404 session_not_found (slot evicted), 409 version_drift
+            // (pinned node upgraded past our rsclaw_version) and 503
+            // backend_unavailable (pinned node gone via heartbeat
+            // timeout) all share the same recovery path: replay against
+            // current rsclaw_version and retry. Other 404s — typically
+            // a misrouted request hitting a CDN/proxy 404 page — should
+            // bail with the upstream body so operators can see the real
+            // error instead of looping forever in replay.
             if is_session_evicted(status, &body) {
                 return Ok(TurnOutcome::SessionNotFound);
             }
@@ -1008,6 +1008,8 @@ async fn parse_sse_chunk(
 
 /// True when the (status, body) pair is a documented session-eviction
 /// signal that the gateway should recover from via replay:
+/// - `404 session_not_found` — slot evicted (LRU, idle TTL) or upstream
+///   restart; per protocol §5 the recovery is `POST /sessions/replay`
 /// - `409 version_drift` — pinned node upgraded past our rsclaw_version
 /// - `503 backend_unavailable` — pinned node gone (heartbeat timeout)
 ///
@@ -1022,6 +1024,7 @@ fn is_session_evicted(status: StatusCode, body: &str) -> bool {
         .and_then(Value::as_str)
         .map(str::to_owned);
     match (status, code.as_deref()) {
+        (StatusCode::NOT_FOUND, Some("session_not_found")) => true,
         (StatusCode::CONFLICT, Some("version_drift")) => true,
         (StatusCode::SERVICE_UNAVAILABLE, Some("backend_unavailable")) => true,
         _ => false,
@@ -1305,6 +1308,29 @@ mod tests {
         // server hang the runtime indefinitely.
         let s = TURN_HEADERS_TIMEOUT.as_secs();
         assert!((30..=120).contains(&s), "TURN_HEADERS_TIMEOUT={s}s out of range");
+    }
+
+    #[test]
+    fn is_session_evicted_recognizes_session_not_found() {
+        let body = r#"{"error":{"code":"session_not_found","detail":"slot evicted"}}"#;
+        assert!(is_session_evicted(StatusCode::NOT_FOUND, body));
+    }
+
+    #[test]
+    fn is_session_evicted_rejects_404_with_other_code() {
+        // A 404 from a misrouted request (e.g. wrong path → CDN 404
+        // page or `404 unknown_version` from /sessions/replay) MUST NOT
+        // be treated as a session eviction. Earlier code blindly
+        // short-circuited any 404 to SessionNotFound, which would loop
+        // forever in replay; the unified `is_session_evicted` check
+        // requires the body to confirm the eviction code.
+        let body = r#"{"error":{"code":"unknown_version","detail":"v not registered"}}"#;
+        assert!(!is_session_evicted(StatusCode::NOT_FOUND, body));
+        assert!(!is_session_evicted(StatusCode::NOT_FOUND, ""));
+        assert!(!is_session_evicted(
+            StatusCode::NOT_FOUND,
+            "<html>not found</html>",
+        ));
     }
 
     #[test]
