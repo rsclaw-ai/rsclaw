@@ -36,9 +36,11 @@ impl NotificationSink for ChannelNotifier {
     }
 
     fn priority_filter(&self) -> NotificationPriority {
-        // Only forward HIGH priority notifications to user channel.
-        // Medium/Low (tool progress, thoughts) stay in logs only.
-        NotificationPriority::High
+        // Forward Medium+ priority notifications to user channel.
+        // High: errors, session events
+        // Medium: tool progress, completions
+        // Low: detailed debug info (not forwarded)
+        NotificationPriority::Medium
     }
 
     fn send(&self, notification: &Notification) -> BoxFuture<'_, Result<()>> {
@@ -209,40 +211,7 @@ impl AgentRuntime {
         let target_id = ctx.peer_id.clone();
         let channel_name = ctx.channel.clone();
 
-        // Try to get client, send error notification if failed
-        let client = match self.get_opencode_client().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("tool_opencode: get_client failed: {}", e);
-                if let Some(ref tx) = notif_tx {
-                    let _ = tx.send(crate::channel::OutboundMessage {
-                        target_id: target_id.clone(),
-                        is_group: false,
-                        text: crate::i18n::t_fmt("acp_start_failed", lang, &[("name", "OpenCode"), ("error", &e.to_string())]),
-                        reply_to: None,
-                        images: vec![],
-                        files: vec![],
-                        channel: Some(channel_name.clone()),
-                        account: None,
-                    });
-                }
-                return Err(e);
-            }
-        };
-
-        // Add notification sink to client for real-time progress updates
-        if let Some(ref tx) = notif_tx {
-            let sink = Arc::new(ChannelNotifier::new(tx.clone(), target_id.clone(), channel_name.clone()));
-            client.add_notification_sink(sink);
-            tracing::info!("tool_opencode: added notification sink for {}", target_id);
-        }
-
-        let session_id = client.session_id().await.unwrap_or_default();
-        let session_id_clone = session_id.clone();
-
-        let task_str = task.to_string();
-
-        // Send initial notification
+        // Send initial notification immediately (before spawning background task)
         tracing::info!("tool_opencode: sending initial notification to {}", target_id);
         if let Some(ref tx) = notif_tx {
             let _ = tx.send(crate::channel::OutboundMessage {
@@ -255,23 +224,172 @@ impl AgentRuntime {
                 channel: Some(channel_name.clone()),
                 account: None,
             });
-        } else {
-            tracing::warn!("tool_opencode: no notification_tx for initial notification");
         }
 
-        // Spawn background task - collect events AND send prompt in parallel
+        let task_str = task.to_string();
         let notif_tx_bg = notif_tx.clone();
         let target_id_bg = target_id.clone();
         let channel_bg = channel_name.clone();
         let lang_bg = lang;
+
+        // Clone Arc references needed for background task (not the entire AgentRuntime)
+        let opencode_client_cell = self.opencode_client.clone();
+        let handle = self.handle.clone();
+        let config = self.config.clone();
+
         // Clone agent's own inbox for result injection after completion.
         let self_tx = self.handle.tx.clone();
         let self_session = ctx.session_key.clone();
         let self_channel = ctx.channel.clone();
         let self_peer_id = ctx.peer_id.clone();
         let self_chat_id = ctx.chat_id.clone();
+
+        // Spawn background task - do EVERYTHING in background including client initialization
         tokio::spawn(async move {
             tracing::info!("tool_opencode: background task started");
+
+            // Get or create client (inline version of get_opencode_client)
+            let client = if let Some(c) = opencode_client_cell.get() {
+                c.clone()
+            } else {
+                // Create client inline
+                let command = if cfg!(target_os = "windows") {
+                    let path_env = std::env::var("PATH").ok().unwrap_or_default();
+                    let separator = if path_env.contains(';') { ';' } else { ':' };
+                    let cmd_found = path_env.split(separator).find_map(|dir| {
+                        let win_dir = if dir.starts_with('/') && dir.len() > 2 {
+                            let parts: Vec<&str> = dir.splitn(3, '/').collect();
+                            if parts.len() >= 3 && parts[0].is_empty() && parts[1].len() == 1 {
+                                let drive = parts[1].to_uppercase();
+                                let rest = parts[2];
+                                format!("{}:\\{}", drive, rest.replace('/', "\\"))
+                            } else {
+                                dir.replace('/', "\\")
+                            }
+                        } else {
+                            dir.to_string()
+                        };
+                        let cmd_path = std::path::PathBuf::from(&win_dir).join("opencode.cmd");
+                        if cmd_path.exists() {
+                            Some(cmd_path.to_string_lossy().to_string())
+                        } else {
+                            None
+                        }
+                    });
+                    cmd_found
+                        .or_else(|| std::env::var("OPENCODE_PATH").ok())
+                        .unwrap_or_else(|| "opencode.cmd".to_string())
+                } else {
+                    which::which("opencode")
+                        .map(|p| p.to_string_lossy().to_string())
+                        .or_else(|_| std::env::var("OPENCODE_PATH"))
+                        .unwrap_or_else(|_| "opencode".to_string())
+                };
+
+                let args: Vec<&str> = vec!["acp"];
+                let cwd = handle.config.workspace
+                    .as_deref()
+                    .or(config.agents.defaults.workspace.as_deref())
+                    .map(expand_tilde)
+                    .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+                let cwd_str = if cfg!(target_os = "windows") {
+                    let abs_path = if cwd.is_absolute() { cwd.clone() } else {
+                        std::env::current_dir().unwrap_or_default().join(&cwd)
+                    };
+                    abs_path.to_string_lossy().to_string()
+                } else {
+                    cwd.to_string_lossy().to_string()
+                };
+
+                let init_timeout_secs = handle.config.opencode.as_ref().and_then(|c| c.init_timeout_seconds);
+
+                let new_client = match crate::acp::client::AcpClient::spawn_with_timeout(
+                    &command,
+                    &args,
+                    Arc::new(crate::acp::client::DefaultAcpHandler),
+                    Arc::new(tokio::sync::Mutex::new(crate::acp::notification::NotificationManager::new())),
+                    init_timeout_secs,
+                    "OpenCode",
+                ).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("tool_opencode: spawn failed: {}", e);
+                        if let Some(ref tx) = notif_tx_bg {
+                            let _ = tx.send(crate::channel::OutboundMessage {
+                                target_id: target_id_bg.clone(),
+                                is_group: false,
+                                text: crate::i18n::t_fmt("acp_start_failed", lang_bg, &[("name", "OpenCode"), ("error", &e.to_string())]),
+                                reply_to: None,
+                                images: vec![],
+                                files: vec![],
+                                channel: Some(channel_bg.clone()),
+                                account: None,
+                            });
+                        }
+                        return;
+                    }
+                };
+
+                match new_client.initialize("rsclaw", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")).await {
+                    Ok(_) => (),
+                    Err(e) => {
+                        tracing::error!("tool_opencode: initialize failed: {}", e);
+                        if let Some(ref tx) = notif_tx_bg {
+                            let _ = tx.send(crate::channel::OutboundMessage {
+                                target_id: target_id_bg.clone(),
+                                is_group: false,
+                                text: crate::i18n::t_fmt("acp_start_failed", lang_bg, &[("name", "OpenCode"), ("error", &e.to_string())]),
+                                reply_to: None,
+                                images: vec![],
+                                files: vec![],
+                                channel: Some(channel_bg.clone()),
+                                account: None,
+                            });
+                        }
+                        return;
+                    }
+                }
+
+                let model = handle.config.opencode.as_ref().and_then(|c| c.model.clone())
+                    .or_else(|| std::env::var("OPENCODE_MODEL").ok());
+                let session_resp = match new_client.create_session(&cwd_str, model.as_deref(), None).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("tool_opencode: create_session failed: {}", e);
+                        if let Some(ref tx) = notif_tx_bg {
+                            let _ = tx.send(crate::channel::OutboundMessage {
+                                target_id: target_id_bg.clone(),
+                                is_group: false,
+                                text: crate::i18n::t_fmt("acp_start_failed", lang_bg, &[("name", "OpenCode"), ("error", &e.to_string())]),
+                                reply_to: None,
+                                images: vec![],
+                                files: vec![],
+                                channel: Some(channel_bg.clone()),
+                                account: None,
+                            });
+                        }
+                        return;
+                    }
+                };
+
+                tracing::info!(
+                    session_id = %session_resp.session_id,
+                    "OpenCode session created"
+                );
+
+                opencode_client_cell.set(new_client.clone()).ok();
+                new_client
+            };
+
+            // Add notification sink to client for real-time progress updates
+            if let Some(ref tx) = notif_tx_bg {
+                let sink = Arc::new(ChannelNotifier::new(tx.clone(), target_id_bg.clone(), channel_bg.clone()));
+                client.add_notification_sink(sink);
+                tracing::info!("tool_opencode: added notification sink for {}", target_id_bg);
+            }
+
+            let session_id = client.session_id().await.unwrap_or_default();
+
             // Start event collection FIRST (in parallel with send_prompt)
             let mut event_rx = client.subscribe_events();
             let events = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
@@ -571,8 +689,7 @@ impl AgentRuntime {
 
         Ok(serde_json::json!({
             "output": crate::i18n::t_fmt("acp_queued", lang, &[("name", "OpenCode")]),
-            "status": "submitted",
-            "session_id": session_id_clone
+            "status": "submitted"
         }))
     }
 
@@ -772,7 +889,8 @@ impl AgentRuntime {
         Ok(client)
     }
 
-    /// Tool handler for Claude Code ACP calls - runs asynchronously.
+    /// Tool handler for Claude Code ACP calls - runs fully asynchronously.
+    /// Initialization and prompt execution happen in background task to avoid blocking main loop.
     /// Results are delivered via notification channel when complete.
     pub(crate) async fn tool_claudecode(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let task = args["task"]
@@ -791,40 +909,7 @@ impl AgentRuntime {
         let target_id = ctx.peer_id.clone();
         let channel_name = ctx.channel.clone();
 
-        // Try to get client, send error notification if failed
-        let client = match self.get_claudecode_client().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("tool_claudecode: get_client failed: {}", e);
-                if let Some(ref tx) = notif_tx {
-                    let _ = tx.send(crate::channel::OutboundMessage {
-                        target_id: target_id.clone(),
-                        is_group: false,
-                        text: crate::i18n::t_fmt("acp_start_failed", lang, &[("name", "Claude Code"), ("error", &e.to_string())]),
-                        reply_to: None,
-                        images: vec![],
-                        files: vec![],
-                        channel: Some(channel_name.clone()),
-                        account: None,
-                    });
-                }
-                return Err(e);
-            }
-        };
-
-        // Add notification sink to client for real-time progress updates
-        if let Some(ref tx) = notif_tx {
-            let sink = Arc::new(ChannelNotifier::new(tx.clone(), target_id.clone(), channel_name.clone()));
-            client.add_notification_sink(sink);
-            tracing::info!("tool_claudecode: added notification sink for {}", target_id);
-        }
-
-        let session_id = client.session_id().await.unwrap_or_default();
-        let session_id_clone = session_id.clone();
-
-        let task_str = task.to_string();
-
-        // Send initial notification
+        // Send initial notification immediately (before spawning background task)
         tracing::info!("tool_claudecode: sending initial notification to {}", target_id);
         if let Some(ref tx) = notif_tx {
             let _ = tx.send(crate::channel::OutboundMessage {
@@ -837,78 +922,234 @@ impl AgentRuntime {
                 channel: Some(channel_name.clone()),
                 account: None,
             });
-        } else {
-            tracing::warn!("tool_claudecode: no notification_tx for initial notification");
         }
 
-        // Spawn background task - collect events AND send prompt in parallel
+        let task_str = task.to_string();
         let notif_tx_bg = notif_tx.clone();
         let target_id_bg = target_id.clone();
         let channel_bg = channel_name.clone();
         let lang_bg = lang;
+
+        // Clone Arc references needed for background task (not the entire AgentRuntime)
+        let claudecode_client_cell = self.claudecode_client.clone();
+        let handle = self.handle.clone();
+        let config = self.config.clone();
+
+        // Clone agent's own inbox for result injection after completion.
+        let self_tx = self.handle.tx.clone();
+        let self_session = ctx.session_key.clone();
+        let self_channel = ctx.channel.clone();
+        let self_peer_id = ctx.peer_id.clone();
+        let self_chat_id = ctx.chat_id.clone();
+
+        // Spawn background task - do EVERYTHING in background including client initialization
         tokio::spawn(async move {
             tracing::info!("tool_claudecode: background task started");
+
+            // Get or create client (inline version of get_claudecode_client)
+            let client = if let Some(c) = claudecode_client_cell.get() {
+                c.clone()
+            } else {
+                // Create client inline
+                let (command, args) = if cfg!(target_os = "windows") {
+                    let path_env = std::env::var("PATH").ok().unwrap_or_default();
+                    let separator = if path_env.contains(';') { ';' } else { ':' };
+
+                    let cmd_found = path_env.split(separator).find_map(|dir| {
+                        let win_dir = if dir.starts_with('/') && dir.len() > 2 {
+                            let parts: Vec<&str> = dir.splitn(3, '/').collect();
+                            if parts.len() >= 3 && parts[0].is_empty() && parts[1].len() == 1 {
+                                let drive = parts[1].to_uppercase();
+                                let rest = parts[2];
+                                format!("{}:\\{}", drive, rest.replace('/', "\\"))
+                            } else {
+                                dir.replace('/', "\\")
+                            }
+                        } else {
+                            dir.to_string()
+                        };
+
+                        let cmd_path = std::path::PathBuf::from(&win_dir).join("claude-agent-acp.cmd");
+                        if cmd_path.exists() {
+                            return Some((cmd_path.to_string_lossy().to_string(), vec![]));
+                        }
+                        let bin_path = std::path::PathBuf::from(&win_dir).join("claude-agent-acp");
+                        if bin_path.exists() {
+                            return Some((bin_path.to_string_lossy().to_string(), vec![]));
+                        }
+                        None
+                    });
+
+                    cmd_found.unwrap_or_else(|| ("claude-agent-acp.cmd".to_string(), vec![]))
+                } else {
+                    if let Ok(path) = which::which("claude-agent-acp") {
+                        (path.to_string_lossy().to_string(), vec![])
+                    } else if let Ok(path) = std::env::var("CLAUDE_AGENT_ACP_PATH") {
+                        if path.ends_with(".js") {
+                            ("node".to_string(), vec![path])
+                        } else {
+                            (path, vec![])
+                        }
+                    } else {
+                        ("claude-agent-acp".to_string(), vec![])
+                    }
+                };
+
+                let cwd = handle.config.workspace
+                    .as_deref()
+                    .or(config.agents.defaults.workspace.as_deref())
+                    .map(expand_tilde)
+                    .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+                let cwd_str = if cfg!(target_os = "windows") {
+                    let abs_path = if cwd.is_absolute() { cwd.clone() } else {
+                        std::env::current_dir().unwrap_or_default().join(&cwd)
+                    };
+                    abs_path.to_string_lossy().to_string()
+                } else {
+                    cwd.to_string_lossy().to_string()
+                };
+
+                let init_timeout_secs = handle.config.claudecode.as_ref().and_then(|c| c.init_timeout_seconds);
+                let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+                let new_client = match crate::acp::client::AcpClient::spawn_with_timeout(
+                    &command,
+                    &args_ref,
+                    Arc::new(crate::acp::client::DefaultAcpHandler),
+                    Arc::new(tokio::sync::Mutex::new(crate::acp::notification::NotificationManager::new())),
+                    init_timeout_secs,
+                    "Claude Code",
+                ).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("tool_claudecode: spawn failed: {}", e);
+                        if let Some(ref tx) = notif_tx_bg {
+                            let _ = tx.send(crate::channel::OutboundMessage {
+                                target_id: target_id_bg.clone(),
+                                is_group: false,
+                                text: crate::i18n::t_fmt("acp_start_failed", lang_bg, &[("name", "Claude Code"), ("error", &e.to_string())]),
+                                reply_to: None,
+                                images: vec![],
+                                files: vec![],
+                                channel: Some(channel_bg.clone()),
+                                account: None,
+                            });
+                        }
+                        return;
+                    }
+                };
+
+                match new_client.initialize("rsclaw", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")).await {
+                    Ok(_) => (),
+                    Err(e) => {
+                        tracing::error!("tool_claudecode: initialize failed: {}", e);
+                        if let Some(ref tx) = notif_tx_bg {
+                            let _ = tx.send(crate::channel::OutboundMessage {
+                                target_id: target_id_bg.clone(),
+                                is_group: false,
+                                text: crate::i18n::t_fmt("acp_start_failed", lang_bg, &[("name", "Claude Code"), ("error", &e.to_string())]),
+                                reply_to: None,
+                                images: vec![],
+                                files: vec![],
+                                channel: Some(channel_bg.clone()),
+                                account: None,
+                            });
+                        }
+                        return;
+                    }
+                }
+
+                let model = handle.config.claudecode.as_ref().and_then(|c| c.model.clone())
+                    .or_else(|| std::env::var("CLAUDE_CODE_MODEL").ok());
+                let session_resp = match new_client.create_session(&cwd_str, model.as_deref(), None).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("tool_claudecode: create_session failed: {}", e);
+                        if let Some(ref tx) = notif_tx_bg {
+                            let _ = tx.send(crate::channel::OutboundMessage {
+                                target_id: target_id_bg.clone(),
+                                is_group: false,
+                                text: crate::i18n::t_fmt("acp_start_failed", lang_bg, &[("name", "Claude Code"), ("error", &e.to_string())]),
+                                reply_to: None,
+                                images: vec![],
+                                files: vec![],
+                                channel: Some(channel_bg.clone()),
+                                account: None,
+                            });
+                        }
+                        return;
+                    }
+                };
+
+                tracing::info!(
+                    session_id = %session_resp.session_id,
+                    "Claude Code session created"
+                );
+
+                if let Some(ref m) = model {
+                    tracing::info!(model = %m, "Claude Code: setting model via session/set_config_option");
+                    if let Err(e) = new_client.set_model(m).await {
+                        tracing::warn!("Claude Code: set_model failed: {}", e);
+                    }
+                }
+
+                claudecode_client_cell.set(new_client.clone()).ok();
+                new_client
+            };
+
+            // Add notification sink to client for real-time progress updates
+            if let Some(ref tx) = notif_tx_bg {
+                let sink = Arc::new(ChannelNotifier::new(tx.clone(), target_id_bg.clone(), channel_bg.clone()));
+                client.add_notification_sink(sink);
+                tracing::info!("tool_claudecode: added notification sink for {}", target_id_bg);
+            }
+
+            let session_id = client.session_id().await.unwrap_or_default();
+
             // Start event collection FIRST (in parallel with send_prompt)
             let mut event_rx = client.subscribe_events();
             let events = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
             let events_clone = Arc::clone(&events);
 
-            // Event collection task - collects events for final summary, NO intermediate notifications
+            // Event collection task - collects events for final summary
             let _event_collector = tokio::spawn(async move {
                 loop {
                     match event_rx.recv().await {
                         Ok(event) => {
-                            // Only collect tool call events for summary, skip thoughts (AgentThoughtChunk)
                             let event_str = match &event {
-                                crate::acp::client::SessionEvent::ToolCallStarted {
-                                    title, ..
-                                } => {
-                                    let s = format!("🔧 {}", title.as_deref().unwrap_or("tool"));
-                                    tracing::info!("OpenCode event: {}", s);
-                                    s
-                                }
-                                crate::acp::client::SessionEvent::ToolCallCompleted {
-                                    result,
-                                    ..
-                                } => {
-                                    let s = result
-                                        .as_ref()
-                                        .map(|r| {
-                                            if r.chars().count() > 100 {
-                                                let cutoff = r
-                                                    .char_indices()
-                                                    .nth(100)
-                                                    .map(|(i, _)| i)
-                                                    .unwrap_or(r.len());
-                                                format!("✅ {}...", &r[..cutoff])
-                                            } else {
-                                                format!("✅ {}", r)
-                                            }
-                                        })
-                                        .unwrap_or_default();
-                                    tracing::info!("OpenCode event: {}", s);
-                                    s
-                                }
-                                crate::acp::client::SessionEvent::ToolCallFailed {
-                                    error, ..
-                                } => {
-                                    let s = format!("❌ {}", error);
-                                    tracing::info!("OpenCode event: {}", s);
-                                    s
-                                }
-                                crate::acp::client::SessionEvent::AgentMessageChunk {
-                                    content,
-                                } => {
-                                    // Log message chunks for visibility
-                                    tracing::debug!("OpenCode message: {}", content);
+                                crate::acp::client::SessionEvent::AgentMessageChunk { content } => {
+                                    tracing::debug!("Claude Code message: {}", content);
                                     String::new()
                                 }
-                                // Skip AgentThoughtChunk - don't send thinking messages to user
+                                crate::acp::client::SessionEvent::AgentThoughtChunk { content } => {
+                                    tracing::debug!("Claude Code thought: {}", content);
+                                    String::new()
+                                }
+                                crate::acp::client::SessionEvent::ToolCallStarted { title, .. } => {
+                                    let s = format!("🔧 {}", title.as_deref().unwrap_or("tool"));
+                                    tracing::info!("Claude Code event: {}", s);
+                                    s
+                                }
+                                crate::acp::client::SessionEvent::ToolCallCompleted { result, .. } => {
+                                    let s = result.as_ref().map(|r| {
+                                        if r.chars().count() > 100 {
+                                            format!("✅ {}...", &r[..r.char_indices().nth(100).map(|(i,_)| i).unwrap_or(r.len())])
+                                        } else {
+                                            format!("✅ {}", r)
+                                        }
+                                    }).unwrap_or_default();
+                                    tracing::info!("Claude Code event: {}", s);
+                                    s
+                                }
+                                crate::acp::client::SessionEvent::ToolCallFailed { error, .. } => {
+                                    let s = format!("❌ {}", error);
+                                    tracing::info!("Claude Code event: {}", s);
+                                    s
+                                }
                                 _ => String::new(),
                             };
-
                             if !event_str.is_empty() {
-                                events_clone.lock().await.push(event_str.clone());
+                                events_clone.lock().await.push(event_str);
                             }
                         }
                         Err(_) => break,
@@ -930,23 +1171,14 @@ impl AgentRuntime {
 
                     let events_list = events.lock().await.clone();
                     let collected = client.get_collected_content().await;
-                    tracing::info!(
-                        "tool_claudecode: events count={}, collected len={}",
-                        events_list.len(),
-                        collected.len()
-                    );
 
                     // Get the final result content
                     let result_content = if !collected.is_empty() {
                         collected
                     } else if let Some(result) = resp.result {
-                        result
-                            .content
-                            .iter()
+                        result.content.iter()
                             .filter_map(|b| match b {
-                                crate::acp::types::ContentBlock::Text { text } => {
-                                    Some(text.clone())
-                                }
+                                crate::acp::types::ContentBlock::Text { text } => Some(text.clone()),
                                 _ => None,
                             })
                             .collect::<Vec<_>>()
@@ -955,7 +1187,6 @@ impl AgentRuntime {
                         String::new()
                     };
 
-                    // Build a concise summary instead of dumping all events
                     let tool_count = events_list.iter().filter(|e| e.starts_with("🔧")).count();
                     let status_icon = match resp.stop_reason {
                         crate::acp::types::StopReason::EndTurn => "✅",
@@ -964,58 +1195,11 @@ impl AgentRuntime {
                         crate::acp::types::StopReason::Incomplete => "❓",
                     };
 
-                    // Scan result_content for downloadable file paths.
-                    let notif_files: Vec<(String, String, String)> = {
-                        let sendable_exts = [".mp4", ".mp3", ".zip", ".pdf", ".xlsx", ".docx", ".pptx", ".csv", ".tar.gz"];
-                        let mut found = Vec::new();
-                        for token in result_content.split_whitespace() {
-                            let trimmed = token.trim_matches(|c: char| "\"'.,;:()[]{}".contains(c));
-                            // Strip any leading non-path characters (e.g. Chinese prefix like "路径：")
-                            // by finding the first '/' or '~' in the token.
-                            let trimmed = if let Some(pos) = trimmed.find(|c| c == '/' || c == '~') {
-                                &trimmed[pos..]
-                            } else {
-                                trimmed
-                            };
-                            let lower = trimmed.to_lowercase();
-                            if sendable_exts.iter().any(|ext| lower.ends_with(ext)) {
-                                let path = expand_tilde(trimmed);
-                                if path.exists() {
-                                    if let Ok(meta) = path.metadata() {
-                                        if meta.len() <= 50_000_000 {
-                                            let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                                            let mime = if lower.ends_with(".mp4") { "video/mp4" }
-                                                else if lower.ends_with(".mp3") { "audio/mpeg" }
-                                                else if lower.ends_with(".pdf") { "application/pdf" }
-                                                else if lower.ends_with(".zip") || lower.ends_with(".tar.gz") { "application/zip" }
-                                                else if lower.ends_with(".xlsx") { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }
-                                                else if lower.ends_with(".docx") { "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
-                                                else if lower.ends_with(".pptx") { "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
-                                                else { "text/csv" };
-                                            let path_str = path.to_string_lossy().to_string();
-                                            if !found.iter().any(|(_, _, p): &(String, String, String)| p == &path_str) {
-                                                tracing::info!(path = %path_str, "tool_claudecode: attaching file to notification");
-                                                found.push((filename, mime.to_owned(), path_str));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        found
-                    };
-
                     let summary = if !result_content.is_empty() {
-                        // Show result, truncated if too long (character-safe truncation)
                         let truncated = if result_content.chars().count() > 2000 {
-                            let cutoff = result_content
-                                .char_indices()
-                                .nth(2000)
-                                .map(|(i, _)| i)
-                                .unwrap_or(result_content.len());
-                            crate::i18n::t_fmt("acp_truncated", lang_bg, &[("content", &result_content[..cutoff])])
+                            crate::i18n::t_fmt("acp_truncated", lang_bg, &[("content", &result_content[..result_content.char_indices().nth(2000).map(|(i,_)| i).unwrap_or(result_content.len())])])
                         } else {
-                            result_content
+                            result_content.clone()
                         };
                         crate::i18n::t_fmt("acp_done_result", lang_bg, &[
                             ("status", status_icon), ("name", "Claude Code"),
@@ -1033,36 +1217,22 @@ impl AgentRuntime {
                     };
 
                     // Send notification to user
-                    tracing::info!(
-                        "tool_claudecode: sending completion notification, summary_len={}, files={}",
-                        summary.len(), notif_files.len()
-                    );
                     if let Some(ref tx) = notif_tx_bg {
-                        match tx.send(crate::channel::OutboundMessage {
+                        let _ = tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
                             text: summary,
                             reply_to: None,
                             images: vec![],
-                            files: notif_files,
+                            files: vec![],
                             channel: Some(channel_bg.clone()),
                             account: None,
-                        }) {
-                            Ok(_) => {
-                                tracing::info!("tool_claudecode: notification sent successfully to {}", target_id_bg)
-                            }
-                            Err(e) => {
-                                tracing::error!("tool_claudecode: failed to send notification: {}", e)
-                            }
-                        }
-                    } else {
-                        tracing::warn!("tool_claudecode: no notification channel available");
+                        });
                     }
                 }
                 Err(e) => {
                     tracing::error!("tool_claudecode: send_prompt failed: {}", e);
                     if let Some(ref tx) = notif_tx_bg {
-                        tracing::info!("tool_claudecode: sending error notification to {}", target_id_bg);
                         let _ = tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
@@ -1077,13 +1247,12 @@ impl AgentRuntime {
                 }
             }
             tracing::info!("tool_claudecode: background task finished");
-            // DON'T await event_collector - it runs forever
         });
 
+        // Return immediately with "submitted" status
         Ok(serde_json::json!({
             "output": crate::i18n::t_fmt("acp_queued", lang, &[("name", "Claude Code")]),
-            "status": "submitted",
-            "session_id": session_id_clone
+            "status": "submitted"
         }))
     }
 

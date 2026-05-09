@@ -810,13 +810,27 @@ impl AcpClient {
         client_version: &str,
     ) -> Result<InitializeResponse> {
         tracing::info!("ACP: initializing connection");
+        // Check if we have gateway auth environment variables
+        let has_gateway_auth = std::env::var("ANTHROPIC_AUTH_TOKEN").is_ok()
+            && std::env::var("ANTHROPIC_BASE_URL").is_ok();
+
+        let client_capabilities = if has_gateway_auth {
+            serde_json::json!({
+                "fs": { "readTextFile": true, "writeTextFile": true },
+                "terminal": true,
+                "auth": { "_meta": { "gateway": true } }
+            })
+        } else {
+            serde_json::json!({
+                "fs": { "readTextFile": true, "writeTextFile": true },
+                "terminal": true
+            })
+        };
+
         let params = serde_json::json!({
             "protocolVersion": PROTOCOL_VERSION,
             "clientInfo": {"name": client_name, "version": client_version},
-            "clientCapabilities": {
-                "fs": { "readTextFile": true, "writeTextFile": true },
-                "terminal": true
-            }
+            "clientCapabilities": client_capabilities
         });
         // Use configurable init_timeout for initialization (can take long to load MCP servers)
         let resp = self.rpc_with_timeout(methods::INITIALIZE, params, self.init_timeout).await?;
@@ -838,6 +852,35 @@ impl AcpClient {
             agent_version = ?init_resp.agent_info.version,
             "ACP: connection initialized"
         );
+
+        // If we have gateway auth environment variables, authenticate with gateway
+        if has_gateway_auth {
+            let base_url = std::env::var("ANTHROPIC_BASE_URL")
+                .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+            let auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN")
+                .unwrap_or_default();
+
+            tracing::info!(
+                base_url = %base_url,
+                "ACP: authenticating with gateway"
+            );
+
+            let auth_params = serde_json::json!({
+                "methodId": "gateway",
+                "_meta": {
+                    "gateway": {
+                        "baseUrl": base_url,
+                        "headers": {
+                            "Authorization": format!("Bearer {}", auth_token)
+                        }
+                    }
+                }
+            });
+
+            let auth_resp = self.rpc(methods::AUTHENTICATE, auth_params).await?;
+            tracing::debug!(auth_response = ?auth_resp, "ACP authenticate response");
+        }
+
         Ok(init_resp)
     }
 
@@ -849,17 +892,12 @@ impl AcpClient {
         mcp_servers: Option<Vec<McpServerConfig>>,
     ) -> Result<NewSessionResponse> {
         tracing::info!(cwd = %cwd, model = ?model, "ACP: creating session");
-        let mut params = serde_json::json!({
+        // ACP spec: session/new does not have modelId parameter
+        // Model is set via session/set_config_option after session creation
+        let params = serde_json::json!({
             "cwd": cwd,
             "mcpServers": mcp_servers.unwrap_or_default()
         });
-
-        if let Some(m) = model {
-            params["modelId"] = serde_json::json!(m);
-            tracing::debug!(model = %m, params = ?params, "Adding modelId to session/new request");
-        } else {
-            tracing::warn!("create_session: no model provided, will use agent default");
-        }
 
         // Use configurable init_timeout for session creation (can take long to initialize)
         let resp = self.rpc_with_timeout(methods::SESSION_NEW, params, self.init_timeout).await?;
@@ -1499,6 +1537,18 @@ async fn handle_session_update(
         .and_then(|s| s.as_str())
         .map(String::from);
     let update = params.and_then(|p| p.get("update"));
+
+    // Log the session_update type for debugging
+    if let Some(update) = update {
+        let session_update_type = update.get("sessionUpdate").and_then(|s| s.as_str());
+        tracing::info!(
+            "ACP session/update: type={} session_id={}",
+            session_update_type.unwrap_or("?"),
+            session_id.as_deref().unwrap_or("?")
+        );
+    } else {
+        tracing::warn!("ACP session/update: missing update field in params");
+    }
 
     if let Some(update) = update {
         let session_update = update.get("sessionUpdate").and_then(|s| s.as_str());
