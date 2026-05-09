@@ -562,13 +562,28 @@ struct ToolResultDelta {
     is_error: bool,
 }
 
+/// Serializer for `Option<f32>` that routes the value through
+/// `super::json_f32` (rounds to 2 decimal places) instead of the default
+/// f32 → f64 path which leaks IEEE 754 precision artefacts (0.6_f32 →
+/// 0.6000000238418579 in JSON output). Mirrors what every other provider
+/// in this crate does manually with `body["temperature"] = json_f32(t)`.
+fn ser_opt_f32<S: serde::Serializer>(
+    v: &Option<f32>,
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match v {
+        None => s.serialize_none(),
+        Some(f) => super::json_f32(*f).serialize(s),
+    }
+}
+
 #[derive(Debug, Serialize, Clone, Default)]
 struct TurnOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "ser_opt_f32")]
     temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "ser_opt_f32")]
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     enable_thinking: Option<bool>,
@@ -1523,6 +1538,54 @@ mod tests {
             panic!()
         };
         assert_eq!(t, "hi\n\nnon-empty");
+    }
+
+    #[test]
+    fn turn_options_temperature_clamps_to_two_decimals() {
+        // Default serde f32 serialization leaks IEEE 754 noise:
+        // `0.6_f32` lifts to f64 `0.6000000238418579`, which makes the
+        // request body ugly, breaks request hashing for caching layers,
+        // and confuses anyone tailing logs. ser_opt_f32 routes through
+        // super::json_f32 which rounds to 2 decimals.
+        let opts = TurnOptions {
+            max_tokens: None,
+            temperature: Some(0.6),
+            top_p: Some(0.95),
+            enable_thinking: None,
+            stop: None,
+            idle_ttl_secs: None,
+        };
+        let body = serde_json::to_value(&opts).unwrap();
+        // serde_json compares numbers by value not by string repr, so
+        // an Eq against json!(0.6) would succeed even with the buggy
+        // path. Compare the serialized text instead.
+        let s = serde_json::to_string(&opts).unwrap();
+        assert!(
+            s.contains("\"temperature\":0.6"),
+            "expected temperature:0.6, got {s}"
+        );
+        assert!(!s.contains("0.6000000238418579"), "leaked f32→f64 noise: {s}");
+        assert!(
+            s.contains("\"top_p\":0.95"),
+            "expected top_p:0.95, got {s}"
+        );
+        // sanity — body is still well-formed JSON.
+        assert!(body.is_object());
+    }
+
+    #[test]
+    fn turn_options_temperature_none_omits_field() {
+        let opts = TurnOptions {
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            enable_thinking: None,
+            stop: None,
+            idle_ttl_secs: None,
+        };
+        let body = serde_json::to_value(&opts).unwrap();
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
     }
 
     #[test]
