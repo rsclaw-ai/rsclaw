@@ -138,7 +138,7 @@ impl LlmProvider for RsclawProvider {
         "rsclaw"
     }
 
-    fn stream(&self, req: LlmRequest) -> BoxFuture<'_, Result<LlmStream>> {
+    fn stream(&self, mut req: LlmRequest) -> BoxFuture<'_, Result<LlmStream>> {
         Box::pin(async move {
             if req.kv_cache_mode != 2 {
                 anyhow::bail!(
@@ -151,6 +151,15 @@ impl LlmProvider for RsclawProvider {
                 .session_key
                 .clone()
                 .context("rsclaw kv_cache_mode=2 requires session_key on the request")?;
+
+            // The runtime appends `Role::System` messages AFTER the
+            // User/Tool delta on the first iteration of any turn that
+            // has dynamic /ctx or just-installed-skill blocks (see
+            // agent/runtime.rs ~4068-4082). Without this, `from_request`
+            // sees `Role::System` as the last message and aborts the
+            // entire turn. Fold trailing System text back into the
+            // preceding User delta so the model still gets the context.
+            normalize_trailing_system(&mut req.messages);
 
             let split = split_request(&req)?;
 
@@ -653,6 +662,69 @@ fn split_system_messages(messages: &[Message]) -> (Vec<&Message>, String) {
         }
     }
     (filtered, sys_parts.join("\n\n"))
+}
+
+/// Pull any trailing `Role::System` messages off the end of `messages`
+/// and fold their text into the preceding `Role::User` message.
+///
+/// The runtime appends `Role::System` blocks (dynamic /ctx, just-
+/// installed skills) AFTER the User delta on the first iteration of
+/// each turn (`turn_scratchpad` empty — see agent/runtime.rs). On
+/// later iterations the scratchpad's Assistant/Tool entries follow,
+/// so trailing-System only happens iter-1. `TurnDelta::from_request`
+/// rejects a trailing System ("last message must be User or Tool"),
+/// failing the whole turn — fold the text inline so the model still
+/// sees the dynamic context, just as part of the user_message body.
+///
+/// If the message immediately before the trailing System block(s) is
+/// `Role::Tool` (parallel tool_results case, theoretical — runtime
+/// doesn't currently inject System after Tool, but defend anyway),
+/// drop the System text. Persistent system content already lives in
+/// `user_suffix` from the prior open/replay; only the per-iteration
+/// dynamic context would be lost, which the protocol has no slot
+/// for in a tool_results delta.
+fn normalize_trailing_system(messages: &mut Vec<Message>) {
+    let mut trailing: Vec<String> = Vec::new();
+    while matches!(messages.last(), Some(m) if matches!(m.role, Role::System)) {
+        let m = messages.pop().expect("matched Some above");
+        let txt = match m.content {
+            MessageContent::Text(t) => t,
+            MessageContent::Parts(parts) => parts
+                .into_iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        };
+        if !txt.is_empty() {
+            trailing.push(txt);
+        }
+    }
+    if trailing.is_empty() {
+        return;
+    }
+    trailing.reverse();
+    let combined = trailing.join("\n\n");
+    match messages.last_mut() {
+        Some(last) if matches!(last.role, Role::User) => match &mut last.content {
+            MessageContent::Text(t) => {
+                if t.is_empty() {
+                    *t = combined;
+                } else {
+                    t.push_str("\n\n");
+                    t.push_str(&combined);
+                }
+            }
+            MessageContent::Parts(parts) => {
+                parts.push(ContentPart::Text { text: combined });
+            }
+        },
+        _ => {
+            // Tool / empty — nothing to fold into. Drop silently.
+        }
+    }
 }
 
 fn serialize_history_message(msg: &Message) -> Value {
@@ -1206,6 +1278,142 @@ mod tests {
         let (filtered, suffix) = split_system_messages(&msgs);
         assert_eq!(filtered.len(), 1);
         assert!(suffix.is_empty());
+    }
+
+    #[test]
+    fn normalize_trailing_system_folds_into_user_text() {
+        // Runtime appended a dynamic-ctx Role::System after the User
+        // delta — fold it into the user_message body so from_request
+        // sees a User-trailing list.
+        let m = |role: Role, txt: &str| Message {
+            role,
+            content: MessageContent::Text(txt.into()),
+        };
+        let mut msgs = vec![
+            m(Role::User, "fix the bug"),
+            m(Role::System, "## Dynamic /ctx\nworking on handler.py"),
+        ];
+        normalize_trailing_system(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(msgs[0].role, Role::User));
+        let MessageContent::Text(t) = &msgs[0].content else {
+            panic!("expected Text content")
+        };
+        assert_eq!(t, "fix the bug\n\n## Dynamic /ctx\nworking on handler.py");
+    }
+
+    #[test]
+    fn normalize_trailing_system_concatenates_multiple_in_order() {
+        // Two runtime-appended System blocks (e.g. new_skills_tail +
+        // dynamic_ctx) concatenated in original order, joined by \n\n.
+        let m = |role: Role, txt: &str| Message {
+            role,
+            content: MessageContent::Text(txt.into()),
+        };
+        let mut msgs = vec![
+            m(Role::User, "go"),
+            m(Role::System, "FIRST"),
+            m(Role::System, "SECOND"),
+        ];
+        normalize_trailing_system(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        let MessageContent::Text(t) = &msgs[0].content else {
+            panic!("expected Text content")
+        };
+        assert_eq!(t, "go\n\nFIRST\n\nSECOND");
+    }
+
+    #[test]
+    fn normalize_trailing_system_noop_without_trailing_system() {
+        // No System anywhere — list is unchanged.
+        let m = |role: Role, txt: &str| Message {
+            role,
+            content: MessageContent::Text(txt.into()),
+        };
+        let original = vec![m(Role::User, "hi"), m(Role::Assistant, "yo")];
+        let mut msgs = original.clone();
+        normalize_trailing_system(&mut msgs);
+        assert_eq!(msgs.len(), 2);
+        let MessageContent::Text(last) = &msgs[1].content else {
+            panic!()
+        };
+        assert_eq!(last, "yo");
+    }
+
+    #[test]
+    fn normalize_trailing_system_folds_into_user_parts() {
+        // User content already in Parts form (text + image) — fold
+        // System text by appending a new Text part rather than mutating
+        // an existing part.
+        let mut msgs = vec![
+            Message {
+                role: Role::User,
+                content: MessageContent::Parts(vec![
+                    ContentPart::Text { text: "look at this".into() },
+                    ContentPart::Image { url: "https://x/y.png".into() },
+                ]),
+            },
+            Message {
+                role: Role::System,
+                content: MessageContent::Text("CTX".into()),
+            },
+        ];
+        normalize_trailing_system(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        let MessageContent::Parts(parts) = &msgs[0].content else {
+            panic!("expected Parts content")
+        };
+        assert_eq!(parts.len(), 3);
+        match &parts[2] {
+            ContentPart::Text { text } => assert_eq!(text, "CTX"),
+            _ => panic!("expected appended Text part"),
+        }
+    }
+
+    #[test]
+    fn normalize_trailing_system_drops_when_preceded_by_tool() {
+        // Defensive — runtime doesn't currently inject System after
+        // Tool, but if it ever did, we can't fold into a tool_results
+        // delta. Drop the System text, leave the Tool tail intact so
+        // from_request can build a Tools delta.
+        let mut msgs = vec![
+            Message {
+                role: Role::Tool,
+                content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                    tool_use_id: "toolu_1".into(),
+                    content: "result".into(),
+                    is_error: None,
+                }]),
+            },
+            Message {
+                role: Role::System,
+                content: MessageContent::Text("dynamic ctx".into()),
+            },
+        ];
+        normalize_trailing_system(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(msgs[0].role, Role::Tool));
+    }
+
+    #[test]
+    fn normalize_trailing_system_skips_empty_system_blocks() {
+        // An empty Role::System (text=="") shouldn't add stray "\n\n"
+        // separators. Drop empty ones; fold non-empty ones.
+        let m = |role: Role, txt: &str| Message {
+            role,
+            content: MessageContent::Text(txt.into()),
+        };
+        let mut msgs = vec![
+            m(Role::User, "hi"),
+            m(Role::System, ""),
+            m(Role::System, "non-empty"),
+        ];
+        normalize_trailing_system(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        let MessageContent::Text(t) = &msgs[0].content else {
+            panic!()
+        };
+        assert_eq!(t, "hi\n\nnon-empty");
     }
 
     #[test]
