@@ -180,7 +180,15 @@ impl RsclawProvider {
             skills_system: split.skills_system,
             options: Some(split.options.clone()),
         };
-        let mut builder = self.client.post(&url).json(&body);
+        // 180s caps the worst-case prefix-decode time for a fresh
+        // session; without an explicit timeout reqwest hangs forever
+        // on a stalled server (the 20s connect_timeout only covers TCP
+        // establishment, not response wait).
+        let mut builder = self
+            .client
+            .post(&url)
+            .timeout(Duration::from_secs(180))
+            .json(&body);
         if let Some((k, v)) = self.auth_header() {
             builder = builder.header(k, v);
         }
@@ -213,7 +221,15 @@ impl RsclawProvider {
             history,
             options: Some(split.options.clone()),
         };
-        let mut builder = self.client.post(&url).json(&body);
+        // 300s — replay re-decodes prefix + full history, which is
+        // strictly slower than open()'s prefix-only decode (180s).
+        // Without an explicit timeout reqwest hangs forever on a
+        // stalled server (connect_timeout only covers TCP setup).
+        let mut builder = self
+            .client
+            .post(&url)
+            .timeout(Duration::from_secs(300))
+            .json(&body);
         if let Some((k, v)) = self.auth_header() {
             builder = builder.header(k, v);
         }
