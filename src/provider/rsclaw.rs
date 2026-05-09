@@ -700,8 +700,12 @@ fn split_system_messages(messages: &[Message]) -> (Vec<&Message>, String) {
     let mut sys_parts: Vec<String> = Vec::new();
     for m in messages {
         if matches!(m.role, Role::System) {
-            match &m.content {
-                MessageContent::Text(t) => sys_parts.push(t.clone()),
+            // Text(t) and Parts(...) must skip empties symmetrically —
+            // otherwise an empty System(Text("")) leaks a blank entry
+            // into sys_parts and pollutes user_suffix with a leading
+            // `\n\n` once `sys_parts.join("\n\n")` runs.
+            let txt = match &m.content {
+                MessageContent::Text(t) => t.clone(),
                 MessageContent::Parts(parts) => {
                     let mut joined = String::new();
                     for p in parts {
@@ -709,10 +713,11 @@ fn split_system_messages(messages: &[Message]) -> (Vec<&Message>, String) {
                             joined.push_str(text);
                         }
                     }
-                    if !joined.is_empty() {
-                        sys_parts.push(joined);
-                    }
+                    joined
                 }
+            };
+            if !txt.is_empty() {
+                sys_parts.push(txt);
             }
         } else {
             filtered.push(m);
@@ -1598,6 +1603,51 @@ mod tests {
         let (filtered, suffix) = split_system_messages(&msgs);
         assert_eq!(filtered.len(), 1);
         assert!(suffix.is_empty());
+    }
+
+    #[test]
+    fn split_system_messages_drops_empty_text_system() {
+        // An empty System(Text("")) used to leak into sys_parts and
+        // produce a stray "\n\n" prefix once joined. Verify it now
+        // drops cleanly, matching the Parts path's behavior.
+        let msgs = vec![
+            Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".into()),
+            },
+            Message {
+                role: Role::System,
+                content: MessageContent::Text(String::new()),
+            },
+            Message {
+                role: Role::System,
+                content: MessageContent::Text("real ctx".into()),
+            },
+        ];
+        let (filtered, suffix) = split_system_messages(&msgs);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            suffix, "real ctx",
+            "leading empty System must not produce a blank-line prefix; got {suffix:?}"
+        );
+    }
+
+    #[test]
+    fn split_system_messages_drops_parts_with_only_empty_text() {
+        // Same symmetry check on the Parts path — ensure there's no
+        // regression from the unification.
+        let msgs = vec![Message {
+            role: Role::System,
+            content: MessageContent::Parts(vec![
+                ContentPart::Text { text: String::new() },
+                ContentPart::Image { url: "https://x/i".into() },
+            ]),
+        }];
+        let (_filtered, suffix) = split_system_messages(&msgs);
+        assert!(
+            suffix.is_empty(),
+            "Parts whose only Text was empty must not leak; got {suffix:?}"
+        );
     }
 
     #[test]
