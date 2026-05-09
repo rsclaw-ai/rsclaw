@@ -53,6 +53,12 @@ struct SessionEntry {
     /// rsclaw_version this session was opened against. Bump triggers
     /// re-open since prefix cache layout changes invalidate the session.
     rsclaw_version: String,
+    /// Largest `req.messages.len()` we've observed on this session.
+    /// A subsequent call with a smaller list means the runtime trimmed
+    /// history (compaction, repair, reset) and the server-side KV no
+    /// longer matches what the gateway thinks the conversation is —
+    /// trigger a re-hydrate via /sessions/replay.
+    last_seen_msgs_len: usize,
 }
 
 impl RsclawProvider {
@@ -80,8 +86,28 @@ impl RsclawProvider {
             .map(|k| ("authorization".to_string(), format!("Bearer {k}")))
     }
 
-    fn lookup(&self, session_key: &str) -> Option<SessionEntry> {
-        self.sessions.lock().ok()?.get(session_key).cloned()
+    /// Atomically look up a cached session AND validate its freshness.
+    /// Returns `None` (forcing a re-hydrate) when the entry is missing,
+    /// has a stale `rsclaw_version`, or its `last_seen_msgs_len` exceeds
+    /// the incoming `msgs_len` (history was trimmed under our feet).
+    /// On success bumps `last_seen_msgs_len` to the new value so the
+    /// next call's comparison is against the most recent state.
+    fn lookup_and_bump(
+        &self,
+        session_key: &str,
+        rsclaw_version: &str,
+        msgs_len: usize,
+    ) -> Option<SessionEntry> {
+        let mut map = self.sessions.lock().ok()?;
+        let entry = map.get_mut(session_key)?;
+        if entry.rsclaw_version != rsclaw_version {
+            return None;
+        }
+        if msgs_len < entry.last_seen_msgs_len {
+            return None;
+        }
+        entry.last_seen_msgs_len = msgs_len;
+        Some(entry.clone())
     }
 
     fn store(&self, session_key: &str, entry: SessionEntry) {
@@ -122,15 +148,20 @@ impl LlmProvider for RsclawProvider {
 
             let split = split_request(&req)?;
 
-            // Lookup or hydrate. Cache miss happens on first call,
-            // version drift, or after a prior replay failure — all
-            // cases where `req.messages` may carry prior turns the
-            // server doesn't have. open() can't hydrate, so when
-            // history exists we go straight to replay; an empty
+            // Lookup or hydrate. Cache miss / mutation happens on first
+            // call, version drift, after a prior replay failure, or
+            // after the runtime trimmed history (compaction, repair,
+            // reset) — all cases where `req.messages` may not match
+            // what the server has hydrated. open() can't hydrate, so
+            // when history exists we go straight to replay; an empty
             // history list takes the cheaper open() path.
-            let entry = match self.lookup(&session_key) {
-                Some(e) if e.rsclaw_version == split.rsclaw_version => e,
-                _ => {
+            let entry = match self.lookup_and_bump(
+                &session_key,
+                split.rsclaw_version,
+                req.messages.len(),
+            ) {
+                Some(e) => e,
+                None => {
                     self.forget(&session_key);
                     let history = history_for_replay(&req.messages);
                     let resp = if history.is_empty() {
@@ -141,6 +172,7 @@ impl LlmProvider for RsclawProvider {
                     let entry = SessionEntry {
                         session_id: resp.session_id.clone(),
                         rsclaw_version: resp.rsclaw_version.clone(),
+                        last_seen_msgs_len: req.messages.len(),
                     };
                     self.store(&session_key, entry.clone());
                     entry
@@ -163,6 +195,7 @@ impl LlmProvider for RsclawProvider {
                     let entry = SessionEntry {
                         session_id: replayed.session_id.clone(),
                         rsclaw_version: replayed.rsclaw_version.clone(),
+                        last_seen_msgs_len: req.messages.len(),
                     };
                     self.store(&session_key, entry.clone());
                     match self.turn(&entry.session_id, &delta, &req).await? {
@@ -886,6 +919,29 @@ mod tests {
         let delta = TurnDelta::from_request(&req).unwrap();
         let body = serde_json::to_value(&delta).unwrap();
         assert_eq!(body["tool_results"][0]["tool_use_id"], "toolu_1");
+    }
+
+    #[test]
+    fn lookup_and_bump_evicts_on_history_shrink() {
+        let provider = RsclawProvider::new("http://x", None);
+        provider.store(
+            "k",
+            SessionEntry {
+                session_id: "rs_w7_abc".into(),
+                rsclaw_version: "2026.5.5".into(),
+                last_seen_msgs_len: 12,
+            },
+        );
+        // Same len → cached entry returned, last_seen unchanged.
+        assert!(provider.lookup_and_bump("k", "2026.5.5", 12).is_some());
+        // Growth → bumped, returned.
+        assert!(provider.lookup_and_bump("k", "2026.5.5", 14).is_some());
+        // Shrink (compaction trimmed history) → None, caller re-hydrates.
+        assert!(provider.lookup_and_bump("k", "2026.5.5", 8).is_none());
+        // Version drift → None even if len matches.
+        assert!(provider.lookup_and_bump("k", "2026.5.6", 14).is_none());
+        // Missing key → None.
+        assert!(provider.lookup_and_bump("missing", "2026.5.5", 14).is_none());
     }
 
     #[test]
