@@ -933,7 +933,20 @@ async fn parse_sse_chunk(
         Ok(s) => s.to_owned(),
         Err(e) => {
             let valid_up_to = e.valid_up_to();
-            *remainder = stitched[valid_up_to..].to_vec();
+            // Two distinct error shapes per `Utf8Error`:
+            //   error_len() == None    → trailing bytes are an
+            //     INCOMPLETE multi-byte sequence; stash them so the
+            //     next chunk completes the codepoint.
+            //   error_len() == Some(n) → the next n bytes are
+            //     INVALID and will never become valid; advance past
+            //     them. Without this advance, every subsequent chunk
+            //     stitches onto the bad prefix and fails at the same
+            //     position — remainder grows unboundedly and the
+            //     stream stalls forever (a single stray 0xFF from a
+            //     buggy proxy is enough to wedge the turn). The lost
+            //     bytes are unrecoverable garbage in either reading.
+            let advance_past_invalid = e.error_len().unwrap_or(0);
+            *remainder = stitched[valid_up_to + advance_past_invalid..].to_vec();
             if valid_up_to == 0 {
                 return events;
             }
@@ -1104,6 +1117,76 @@ mod tests {
         assert!(
             !all_text.contains('\u{FFFD}'),
             "expected no replacement char, got {all_text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_advances_past_invalid_utf8_byte() {
+        // A stray 0xFF (or any byte that's *invalid as a UTF-8 start*,
+        // not just incomplete) MUST be skipped, not pinned in
+        // `utf8_remainder`. Without this, every subsequent chunk
+        // stitches onto the bad prefix, fails at the same position,
+        // and remainder grows unboundedly while no events ever fire —
+        // the stream stalls forever on a single bad byte.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+
+        // Chunk 1: just an invalid byte. error_len() = Some(1).
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::from_static(b"\xff")), &buf, &rem).await;
+        assert!(
+            evs.iter().all(|e| e.is_ok()),
+            "stray 0xFF must not surface as Err — got {evs:?}"
+        );
+        {
+            let r = rem.lock().await;
+            assert!(
+                !r.contains(&0xff),
+                "0xFF must be advanced past, not pinned in remainder; got {:?}",
+                *r
+            );
+        }
+
+        // Chunk 2: a complete SSE event. The stream must recover and
+        // emit it normally — no contamination from the prior bad byte.
+        let evs = parse_sse_chunk(
+            Ok(bytes::Bytes::from_static(
+                b"data: {\"type\":\"delta\",\"content\":\"hi\"}\n",
+            )),
+            &buf,
+            &rem,
+        )
+        .await;
+        let texts: Vec<_> = evs
+            .into_iter()
+            .filter_map(|e| match e {
+                Ok(StreamEvent::TextDelta(t)) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["hi".to_string()],
+            "stream must recover and emit subsequent events after a bad byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_invalid_byte_does_not_unbounded_grow_remainder() {
+        // Regression: feeding the same invalid byte over and over MUST
+        // NOT grow `utf8_remainder` linearly. Pre-fix, every call
+        // appended the bad byte and re-saved the entire stitched buffer;
+        // 1000 chunks → 1000-byte remainder → eventual OOM in long
+        // streams. Post-fix the remainder stays empty after each call.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        for _ in 0..50 {
+            let _ = parse_sse_chunk(Ok(bytes::Bytes::from_static(b"\xff")), &buf, &rem).await;
+        }
+        let r = rem.lock().await;
+        assert!(
+            r.len() <= 3,
+            "remainder must not accumulate invalid bytes (cap 3 for trailing incomplete UTF-8); got {} bytes",
+            r.len()
         );
     }
 
