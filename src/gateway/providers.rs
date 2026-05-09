@@ -14,6 +14,7 @@ use crate::{
         gemini::{self as gemini, GeminiProvider},
         openai::OpenAiProvider,
         registry::ProviderRegistry,
+        rsclaw::RsclawProvider,
     },
 };
 
@@ -273,6 +274,22 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
             "rsclaw_server",
             Arc::new(OpenAiProvider::with_base_url(url, Some(key))),
         );
+    }
+
+    // rsclaw — kvCacheMode=2 incremental session protocol (rsclaw-protocol.md).
+    // Distinct from `rsclaw_server` above: that one speaks OpenAI Chat for
+    // mode 0/1 traffic; this one speaks the stateful session protocol and
+    // rejects requests with kv_cache_mode != 2.
+    //
+    //   RSCLAW_KEY  — bearer token (optional if rsclaw-server has auth disabled)
+    //   RSCLAW_URL  — base URL without trailing path (default: http://localhost:8090)
+    if !registry.names().contains(&"rsclaw") {
+        let key = std::env::var("RSCLAW_KEY")
+            .ok()
+            .or_else(|| std::env::var("RSCLAW_SERVER_KEY").ok());
+        let url = std::env::var("RSCLAW_URL")
+            .unwrap_or_else(|_| crate::provider::rsclaw::RSCLAW_DEFAULT_BASE.to_string());
+        registry.register("rsclaw", Arc::new(RsclawProvider::new(url, key)));
     }
 
     // Wire up model aliases from agents.defaults.models.
