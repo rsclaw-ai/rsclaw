@@ -122,16 +122,25 @@ impl LlmProvider for RsclawProvider {
 
             let split = split_request(&req)?;
 
-            // Lookup or open. If lookup returns a session_id but the
-            // server later 404s, we replay with full history and retry.
+            // Lookup or hydrate. Cache miss happens on first call,
+            // version drift, or after a prior replay failure — all
+            // cases where `req.messages` may carry prior turns the
+            // server doesn't have. open() can't hydrate, so when
+            // history exists we go straight to replay; an empty
+            // history list takes the cheaper open() path.
             let entry = match self.lookup(&session_key) {
                 Some(e) if e.rsclaw_version == split.rsclaw_version => e,
                 _ => {
                     self.forget(&session_key);
-                    let opened = self.open(&split).await?;
+                    let history = history_for_replay(&req.messages);
+                    let resp = if history.is_empty() {
+                        self.open(&split).await?
+                    } else {
+                        self.replay(&split, history).await?
+                    };
                     let entry = SessionEntry {
-                        session_id: opened.session_id.clone(),
-                        rsclaw_version: opened.rsclaw_version.clone(),
+                        session_id: resp.session_id.clone(),
+                        rsclaw_version: resp.rsclaw_version.clone(),
                     };
                     self.store(&session_key, entry.clone());
                     entry
