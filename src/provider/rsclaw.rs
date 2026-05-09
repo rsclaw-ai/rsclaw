@@ -533,24 +533,25 @@ impl TurnDelta {
         }
 
         // Role::User branch — the trailing message is treated as one
-        // user_message; multiple consecutive User messages aren't a
-        // supported delta shape.
-        let mut user_text: Option<String> = None;
+        // user_message. Empty content (Text("") or Parts with only
+        // empty Text fragments) bails: protocol §2.3 requires a real
+        // delta, and silently shipping "" still bills a prefill on the
+        // upstream slot. Mirrors the empty-tool_results bail above.
+        let mut user_text = String::new();
         match &last.content {
-            MessageContent::Text(t) => user_text = Some(t.clone()),
+            MessageContent::Text(t) => user_text.push_str(t),
             MessageContent::Parts(parts) => {
                 for p in parts {
                     if let ContentPart::Text { text } = p {
-                        user_text.get_or_insert_with(String::new).push_str(text);
+                        user_text.push_str(text);
                     }
                 }
             }
         }
-        if let Some(t) = user_text {
-            Ok(TurnDelta::User { user_message: t })
-        } else {
+        if user_text.is_empty() {
             anyhow::bail!("rsclaw: last message has no usable content for delta")
         }
+        Ok(TurnDelta::User { user_message: user_text })
     }
 }
 
@@ -1441,6 +1442,55 @@ mod tests {
         let delta = TurnDelta::from_request(&req).unwrap();
         let body = serde_json::to_value(&delta).unwrap();
         assert_eq!(body["user_message"], "hello");
+    }
+
+    #[test]
+    fn turn_delta_user_text_empty_bails() {
+        let req = req_with(
+            vec![Message {
+                role: Role::User,
+                content: MessageContent::Text(String::new()),
+            }],
+            2,
+            Some("k"),
+        );
+        let err = TurnDelta::from_request(&req).unwrap_err().to_string();
+        assert!(err.contains("no usable content"), "got: {err}");
+    }
+
+    #[test]
+    fn turn_delta_user_parts_with_only_empty_text_bails() {
+        let req = req_with(
+            vec![Message {
+                role: Role::User,
+                content: MessageContent::Parts(vec![
+                    ContentPart::Text { text: String::new() },
+                    ContentPart::Text { text: String::new() },
+                ]),
+            }],
+            2,
+            Some("k"),
+        );
+        let err = TurnDelta::from_request(&req).unwrap_err().to_string();
+        assert!(err.contains("no usable content"), "got: {err}");
+    }
+
+    #[test]
+    fn turn_delta_user_parts_concatenates_text_fragments() {
+        let req = req_with(
+            vec![Message {
+                role: Role::User,
+                content: MessageContent::Parts(vec![
+                    ContentPart::Text { text: "hello ".into() },
+                    ContentPart::Text { text: "world".into() },
+                ]),
+            }],
+            2,
+            Some("k"),
+        );
+        let delta = TurnDelta::from_request(&req).unwrap();
+        let body = serde_json::to_value(&delta).unwrap();
+        assert_eq!(body["user_message"], "hello world");
     }
 
     #[test]
