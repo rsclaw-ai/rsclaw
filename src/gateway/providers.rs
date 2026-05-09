@@ -265,11 +265,19 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
     //   RSCLAW_SERVER_KEY  — required, matches a `[[client_keys]]` entry
     //                        in rsclaw-server's config.toml
     //   RSCLAW_SERVER_URL  — optional override (default: http://localhost:8090/v1)
+    //
+    // `nonempty_env` (not `std::env::var(...).ok()`) so a placeholder
+    // `RSCLAW_SERVER_KEY=` in a dotenv template doesn't register the
+    // provider with an empty bearer (silent 401s upstream), and a blank
+    // `RSCLAW_SERVER_URL=` doesn't defeat the localhost default by
+    // returning `Ok("")` and falling through to register an
+    // unparseable empty base URL. Same rationale as the rsclaw block
+    // below.
     if !registry.names().contains(&"rsclaw_server")
-        && let Ok(key) = std::env::var("RSCLAW_SERVER_KEY")
+        && let Some(key) = nonempty_env("RSCLAW_SERVER_KEY")
     {
-        let url = std::env::var("RSCLAW_SERVER_URL")
-            .unwrap_or_else(|_| "http://localhost:8090/v1".to_string());
+        let url = nonempty_env("RSCLAW_SERVER_URL")
+            .unwrap_or_else(|| "http://localhost:8090/v1".to_string());
         registry.register(
             "rsclaw_server",
             Arc::new(OpenAiProvider::with_base_url(url, Some(key))),
