@@ -210,7 +210,25 @@ impl LlmProvider for RsclawProvider {
                     };
                     let entry = SessionEntry {
                         session_id: resp.session_id.clone(),
-                        rsclaw_version: resp.rsclaw_version_or(split.rsclaw_version),
+                        // Cache key MUST be the request value, not the
+                        // upstream canonical. open()'s response carries
+                        // the registered/canonical version (per §2.1),
+                        // which can differ from the requested alias —
+                        // e.g. request `rsclaw/latest`, response
+                        // `2026.5.5`. `lookup_and_bump` compares the
+                        // cached value against the next call's
+                        // `split.rsclaw_version` (also the alias), so
+                        // caching the canonical guarantees a miss on
+                        // every subsequent call: re-hydrate every turn,
+                        // defeating kvCacheMode=2 entirely. Replay's
+                        // response per §2.2 omits the field, which
+                        // happened to make recovery-path entries
+                        // self-consistent — but open()-path entries
+                        // were always broken. Version drift is
+                        // detected server-side via 409 (handled by
+                        // is_session_evicted), so we don't need the
+                        // canonical here for freshness.
+                        rsclaw_version: split.rsclaw_version.to_owned(),
                         last_seen_msgs_len: req.messages.len(),
                     };
                     self.store(&session_key, entry.clone());
@@ -233,7 +251,15 @@ impl LlmProvider for RsclawProvider {
                     let replayed = self.replay(&split, replay_history).await?;
                     let entry = SessionEntry {
                         session_id: replayed.session_id.clone(),
-                        rsclaw_version: replayed.rsclaw_version_or(split.rsclaw_version),
+                        // Same rationale as the open/replay path above:
+                        // cache key is the request alias, not the
+                        // upstream canonical. (Replay's response per
+                        // §2.2 doesn't even include rsclaw_version, so
+                        // this site happened to be self-consistent
+                        // before — but normalising both sites on
+                        // `split.rsclaw_version` keeps the cache-key
+                        // contract single-sourced.)
+                        rsclaw_version: split.rsclaw_version.to_owned(),
                         last_seen_msgs_len: req.messages.len(),
                     };
                     self.store(&session_key, entry.clone());
@@ -480,22 +506,13 @@ struct CreateSessionResp {
     /// `rsclaw open: parse response` error to the caller. Upstream
     /// nodes occasionally emit `"rsclaw_version": null` when the
     /// version registry is mid-roll — accept that gracefully.
+    ///
+    /// Parsed for forward compat / observability only. NOT used as the
+    /// session cache key — see the SessionEntry construction sites for
+    /// why caching the upstream canonical breaks alias-based requests.
     #[serde(default)]
+    #[allow(dead_code)]
     rsclaw_version: Option<String>,
-}
-
-impl CreateSessionResp {
-    /// Returns the response's `rsclaw_version` if non-empty, else
-    /// `fallback` (typically `split.rsclaw_version`). Replay responses
-    /// per §2.2 don't carry the field, so the request's version is
-    /// the authoritative value for cache-key comparison.
-    fn rsclaw_version_or(&self, fallback: &str) -> String {
-        self.rsclaw_version
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| fallback.to_owned())
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -2344,54 +2361,30 @@ mod tests {
     }
 
     #[test]
-    fn rsclaw_version_or_falls_back_when_empty() {
-        let empty = CreateSessionResp {
-            session_id: "id".into(),
-            rsclaw_version: Some(String::new()),
-        };
-        assert_eq!(empty.rsclaw_version_or("2026.5.5"), "2026.5.5");
-    }
-
-    #[test]
-    fn rsclaw_version_or_keeps_response_value_when_present() {
-        // If the upstream (e.g. an open() response, or a future replay
-        // response that adds the field) DOES include the field, prefer
-        // it over the fallback — that's the canonical/registered name
-        // and it may differ from the requested alias.
-        let canonical = CreateSessionResp {
-            session_id: "id".into(),
-            rsclaw_version: Some("2026.5.5".into()),
-        };
-        assert_eq!(canonical.rsclaw_version_or("alias-name"), "2026.5.5");
-    }
-
-    #[test]
     fn create_session_resp_parses_explicit_null_rsclaw_version() {
-        // Pre-fix: `rsclaw_version: String` with `#[serde(default)]` —
-        // missing field defaults to "", but explicit JSON null FAILS
-        // parsing with "invalid type: null, expected a string", tanking
-        // the whole `/sessions` (or `/sessions/replay`) response and
-        // surfacing as an opaque "parse response" error to the caller.
-        // Upstream nodes occasionally emit null while the version
-        // registry is mid-roll. Post-fix: Option<String> accepts null
-        // → None → fallback kicks in via rsclaw_version_or.
+        // `rsclaw_version: String` with `#[serde(default)]` would FAIL
+        // parsing on explicit JSON null with "invalid type: null,
+        // expected a string", tanking the whole `/sessions` (or
+        // `/sessions/replay`) response and surfacing as an opaque
+        // "parse response" error to the caller. Upstream nodes
+        // occasionally emit null while the version registry is
+        // mid-roll. Option<String> accepts null → None and keeps the
+        // rest of the response usable.
         let body = r#"{"session_id":"rs_a_b","rsclaw_version":null}"#;
         let resp: CreateSessionResp =
             serde_json::from_str(body).expect("null rsclaw_version must parse");
         assert_eq!(resp.session_id, "rs_a_b");
         assert!(resp.rsclaw_version.is_none());
-        assert_eq!(resp.rsclaw_version_or("v-fallback"), "v-fallback");
     }
 
     #[test]
     fn create_session_resp_parses_missing_rsclaw_version() {
         // The replay response per §2.2 omits rsclaw_version entirely.
         // Behaviour must match the explicit-null case: parse cleanly,
-        // surface None, fall back to the request's version.
+        // surface None.
         let body = r#"{"session_id":"rs_a_b"}"#;
         let resp: CreateSessionResp = serde_json::from_str(body).expect("missing field must parse");
         assert!(resp.rsclaw_version.is_none());
-        assert_eq!(resp.rsclaw_version_or("v-fallback"), "v-fallback");
     }
 
     #[test]
@@ -2400,7 +2393,7 @@ mod tests {
         // doesn't accidentally start coercing real values to None.
         let body = r#"{"session_id":"rs_a_b","rsclaw_version":"2026.5.5"}"#;
         let resp: CreateSessionResp = serde_json::from_str(body).expect("string field must parse");
-        assert_eq!(resp.rsclaw_version_or("v-fallback"), "2026.5.5");
+        assert_eq!(resp.rsclaw_version.as_deref(), Some("2026.5.5"));
     }
 
     #[test]
