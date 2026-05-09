@@ -78,9 +78,26 @@ impl RsclawProvider {
         bearer: Option<String>,
         user_agent: Option<String>,
     ) -> Self {
+        // Trim whitespace before trimming trailing slashes — env vars
+        // loaded from a dotenv file frequently carry a trailing newline
+        // (`RSCLAW_KEY=sk-abc\n`), and reqwest rejects header values
+        // containing `\n` outright (RFC 7230 forbids CTLs in field
+        // values). Without this, every signed request 500s with
+        // "invalid HTTP header value" from inside the client builder
+        // before it ever leaves the process. Same hazard applies to
+        // base_url where stray whitespace flips reqwest into
+        // url-parse-error territory.
+        let base_url = base_url
+            .into()
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        let bearer = bearer
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty());
         Self {
             client: super::http_client_with_ua(user_agent.as_deref()),
-            base_url: base_url.into().trim_end_matches('/').to_string(),
+            base_url,
             bearer,
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1384,6 +1401,35 @@ mod tests {
         let (k, v) = p.auth_header().expect("bearer set");
         assert_eq!(k, "authorization");
         assert_eq!(v, "Bearer sk-abc");
+    }
+
+    #[test]
+    fn ctor_trims_whitespace_from_base_url_and_bearer() {
+        // dotenv-loaded env vars routinely carry a trailing newline —
+        // `RSCLAW_KEY=sk-abc\n` round-trips into the provider as
+        // `Some("sk-abc\n")`. reqwest rejects HTTP header values
+        // containing `\n` (RFC 7230), so without trimming every signed
+        // request fails before leaving the process. Same hazard for
+        // base_url where leading/trailing whitespace breaks URL parse.
+        let p = RsclawProvider::new(
+            "  http://x:8090/v1/agent/  ",
+            Some("  sk-abc\n  ".into()),
+        );
+        assert_eq!(p.base_url, "http://x:8090/v1/agent");
+        let (k, v) = p.auth_header().expect("bearer survived trim");
+        assert_eq!(k, "authorization");
+        assert_eq!(v, "Bearer sk-abc");
+    }
+
+    #[test]
+    fn ctor_blank_after_trim_bearer_becomes_none() {
+        // `RSCLAW_KEY="   "` (whitespace-only) MUST NOT survive as
+        // `Some("   ")` — that would emit `Authorization: Bearer    `
+        // which stricter proxies reject the same way they reject the
+        // empty-string form covered by `auth_header_omits_when_*`.
+        let p = RsclawProvider::new("http://x", Some("   \n\t".into()));
+        assert!(p.bearer.is_none());
+        assert!(p.auth_header().is_none());
     }
 
     #[test]
