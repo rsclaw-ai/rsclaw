@@ -257,18 +257,16 @@ impl RsclawProvider {
         if status == StatusCode::NOT_FOUND {
             return Ok(TurnOutcome::SessionNotFound);
         }
-        // 409 version_drift: pinned node has been upgraded and no
-        // longer registers our rsclaw_version. Same recovery path as
-        // 404 — replay against current rsclaw_version, retry the turn.
-        if status == StatusCode::CONFLICT {
-            let body = resp.text().await.unwrap_or_default();
-            if is_version_drift(&body) {
-                return Ok(TurnOutcome::SessionNotFound);
-            }
-            anyhow::bail!("rsclaw turn failed {status}: {body}");
-        }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            // 409 version_drift (pinned node upgraded past our
+            // rsclaw_version) and 503 backend_unavailable (pinned node
+            // gone via heartbeat timeout) are documented session-
+            // eviction signals — same recovery path as 404, replay
+            // against current rsclaw_version and retry.
+            if is_session_evicted(status, &body) {
+                return Ok(TurnOutcome::SessionNotFound);
+            }
             anyhow::bail!("rsclaw turn failed {status}: {body}");
         }
 
@@ -598,17 +596,26 @@ async fn parse_sse_chunk(
     events
 }
 
-/// True when the body is a rsclaw-server `error_response` envelope with
-/// `error.code = "version_drift"`. Lenient on shape — anything else
-/// returns false and the caller surfaces the original 409.
-fn is_version_drift(body: &str) -> bool {
-    serde_json::from_str::<Value>(body)
+/// True when the (status, body) pair is a documented session-eviction
+/// signal that the gateway should recover from via replay:
+/// - `409 version_drift` — pinned node upgraded past our rsclaw_version
+/// - `503 backend_unavailable` — pinned node gone (heartbeat timeout)
+///
+/// `503 no_backend_available` (capacity exhaustion) is intentionally NOT
+/// recoverable here — replay would just hit the same wall.
+fn is_session_evicted(status: StatusCode, body: &str) -> bool {
+    let code = serde_json::from_str::<Value>(body)
         .ok()
         .as_ref()
         .and_then(|v| v.get("error"))
         .and_then(|e| e.get("code"))
         .and_then(Value::as_str)
-        == Some("version_drift")
+        .map(str::to_owned);
+    match (status, code.as_deref()) {
+        (StatusCode::CONFLICT, Some("version_drift")) => true,
+        (StatusCode::SERVICE_UNAVAILABLE, Some("backend_unavailable")) => true,
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -621,19 +628,41 @@ mod tests {
     use crate::provider::ToolDef;
 
     #[test]
-    fn is_version_drift_recognizes_server_envelope() {
+    fn is_session_evicted_recognizes_version_drift() {
         let body = r#"{"error":{"code":"version_drift","detail":"node has been upgraded"}}"#;
-        assert!(is_version_drift(body));
+        assert!(is_session_evicted(StatusCode::CONFLICT, body));
     }
 
     #[test]
-    fn is_version_drift_rejects_other_codes() {
+    fn is_session_evicted_recognizes_backend_unavailable() {
+        let body = r#"{"error":{"code":"backend_unavailable","detail":"heartbeat timeout"}}"#;
+        assert!(is_session_evicted(StatusCode::SERVICE_UNAVAILABLE, body));
+    }
+
+    #[test]
+    fn is_session_evicted_excludes_no_backend_available() {
+        // Capacity exhaustion — replay won't help, must bail.
+        let body = r#"{"error":{"code":"no_backend_available","detail":"all GPUs saturated"}}"#;
+        assert!(!is_session_evicted(StatusCode::SERVICE_UNAVAILABLE, body));
+    }
+
+    #[test]
+    fn is_session_evicted_rejects_status_code_mismatch() {
+        // Right code, wrong status — don't recover.
+        let body = r#"{"error":{"code":"version_drift","detail":"x"}}"#;
+        assert!(!is_session_evicted(StatusCode::SERVICE_UNAVAILABLE, body));
         let body = r#"{"error":{"code":"backend_unavailable","detail":"x"}}"#;
-        assert!(!is_version_drift(body));
-        let bad_shape = r#"{"code":"version_drift"}"#;
-        assert!(!is_version_drift(bad_shape));
-        assert!(!is_version_drift(""));
-        assert!(!is_version_drift("not json"));
+        assert!(!is_session_evicted(StatusCode::CONFLICT, body));
+    }
+
+    #[test]
+    fn is_session_evicted_rejects_malformed_body() {
+        assert!(!is_session_evicted(StatusCode::CONFLICT, ""));
+        assert!(!is_session_evicted(StatusCode::CONFLICT, "not json"));
+        assert!(!is_session_evicted(
+            StatusCode::CONFLICT,
+            r#"{"code":"version_drift"}"#,
+        ));
     }
 
     fn req_with(messages: Vec<Message>, mode: u8, key: Option<&str>) -> LlmRequest {
