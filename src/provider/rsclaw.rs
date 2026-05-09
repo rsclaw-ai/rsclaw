@@ -1030,17 +1030,27 @@ async fn parse_sse_chunk(
                 events.push(Ok(StreamEvent::ToolCall { id, name, input }));
             }
             Some("done") => {
-                // If the `usage` object is present, surface it — even
-                // partially. Defaulting missing fields to 0 (rather than
-                // dropping the entire TokenUsage on a single missing
+                // If `usage` is present AND a JSON object, surface it —
+                // even partially. Defaulting missing fields to 0 (rather
+                // than dropping the entire TokenUsage on a single missing
                 // field) matches the anthropic provider's pattern and
                 // means a server that ships e.g. `input_tokens` without
                 // `output_tokens` still gets the input count through to
                 // cost-tracking instead of losing both.
-                let usage = value.get("usage").map(|u| TokenUsage {
-                    input: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
-                    output: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
-                });
+                //
+                // The `as_object` filter is load-bearing: a plain
+                // `value.get("usage").map(...)` would treat `"usage":
+                // null` as present, yielding `Some(TokenUsage{0,0})` —
+                // a phantom zero-token turn that corrupts accounting.
+                // `null` is the explicit "no usage data" signal and must
+                // collapse to `None`, same as the field being absent.
+                let usage = value
+                    .get("usage")
+                    .and_then(Value::as_object)
+                    .map(|u| TokenUsage {
+                        input: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+                        output: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+                    });
                 events.push(Ok(StreamEvent::Done { usage }));
             }
             Some("error") => {
@@ -1387,6 +1397,52 @@ mod tests {
             .expect("usage should survive partial fields");
         assert_eq!(usage.input, 17);
         assert_eq!(usage.output, 0);
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_done_treats_null_usage_as_absent() {
+        // `"usage": null` must collapse to `None`, identical to the
+        // field being missing. The pre-fix code emitted
+        // `Some(TokenUsage{0,0})` for null usage, which downstream
+        // cost-tracking recorded as a real zero-token turn — a phantom
+        // accounting entry that diluted average usage stats and faked
+        // a successful "free" turn from a buggy / older server build.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = b"data: {\"type\":\"done\",\"usage\":null}\n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let mut saw_done = false;
+        for e in evs {
+            if let Ok(StreamEvent::Done { usage }) = e {
+                assert!(
+                    usage.is_none(),
+                    "null usage must collapse to None, got {usage:?}"
+                );
+                saw_done = true;
+            }
+        }
+        assert!(saw_done, "expected Done event with usage=None");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_done_treats_non_object_usage_as_absent() {
+        // Defensive: a malformed server that ships `"usage": [1,2]` or
+        // `"usage": "0"` (wrong JSON type) must NOT yield a phantom
+        // Some(TokenUsage{0,0}). Fall back to None and let downstream
+        // accounting record the turn as "usage unknown" instead of
+        // "usage was zero".
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = b"data: {\"type\":\"done\",\"usage\":[1,2,3]}\n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let mut saw_done = false;
+        for e in evs {
+            if let Ok(StreamEvent::Done { usage }) = e {
+                assert!(usage.is_none(), "non-object usage must collapse to None");
+                saw_done = true;
+            }
+        }
+        assert!(saw_done, "expected Done event");
     }
 
     #[tokio::test]
