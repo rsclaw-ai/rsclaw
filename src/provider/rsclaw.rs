@@ -315,15 +315,7 @@ struct ReplayReq<'a> {
 #[derive(Debug, Deserialize, Clone)]
 struct CreateSessionResp {
     session_id: String,
-    #[allow(dead_code)]
-    n_prefix_tokens: u32,
-    #[allow(dead_code)]
-    n_user_tokens: u32,
-    #[allow(dead_code)]
-    n_tokens: u32,
     rsclaw_version: String,
-    #[allow(dead_code)]
-    instance_id: String,
 }
 
 #[derive(Debug, Serialize)]
