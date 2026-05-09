@@ -257,6 +257,16 @@ impl RsclawProvider {
         if status == StatusCode::NOT_FOUND {
             return Ok(TurnOutcome::SessionNotFound);
         }
+        // 409 version_drift: pinned node has been upgraded and no
+        // longer registers our rsclaw_version. Same recovery path as
+        // 404 — replay against current rsclaw_version, retry the turn.
+        if status == StatusCode::CONFLICT {
+            let body = resp.text().await.unwrap_or_default();
+            if is_version_drift(&body) {
+                return Ok(TurnOutcome::SessionNotFound);
+            }
+            anyhow::bail!("rsclaw turn failed {status}: {body}");
+        }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("rsclaw turn failed {status}: {body}");
@@ -588,6 +598,19 @@ async fn parse_sse_chunk(
     events
 }
 
+/// True when the body is a rsclaw-server `error_response` envelope with
+/// `error.code = "version_drift"`. Lenient on shape — anything else
+/// returns false and the caller surfaces the original 409.
+fn is_version_drift(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(|e| e.get("code"))
+        .and_then(Value::as_str)
+        == Some("version_drift")
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -596,6 +619,22 @@ async fn parse_sse_chunk(
 mod tests {
     use super::*;
     use crate::provider::ToolDef;
+
+    #[test]
+    fn is_version_drift_recognizes_server_envelope() {
+        let body = r#"{"error":{"code":"version_drift","detail":"node has been upgraded"}}"#;
+        assert!(is_version_drift(body));
+    }
+
+    #[test]
+    fn is_version_drift_rejects_other_codes() {
+        let body = r#"{"error":{"code":"backend_unavailable","detail":"x"}}"#;
+        assert!(!is_version_drift(body));
+        let bad_shape = r#"{"code":"version_drift"}"#;
+        assert!(!is_version_drift(bad_shape));
+        assert!(!is_version_drift(""));
+        assert!(!is_version_drift("not json"));
+    }
 
     fn req_with(messages: Vec<Message>, mode: u8, key: Option<&str>) -> LlmRequest {
         LlmRequest {
