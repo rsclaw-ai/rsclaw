@@ -35,6 +35,12 @@ use super::{
 /// `/v1/agent` segment.
 pub const RSCLAW_DEFAULT_BASE: &str = "http://localhost:8090/v1/agent";
 
+/// How long to wait for `/sessions/<id>/turn` to start responding
+/// (TCP connect + TLS + send body + receive headers + first byte).
+/// Once the body stream begins this deadline no longer applies — the
+/// SSE body is allowed to take as long as the model needs.
+const TURN_HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
+
 // ---------------------------------------------------------------------------
 // Provider
 // ---------------------------------------------------------------------------
@@ -305,17 +311,28 @@ impl RsclawProvider {
             options: Some(TurnOptions::from_request(req)),
             stream: true,
         };
-        let mut builder = self
-            .client
-            .post(&url)
-            .timeout(Duration::from_secs(180))
-            .json(&body);
+        // No `.timeout()` on the builder: reqwest's `.timeout()` is a
+        // total deadline that includes the streaming body, so a 180s
+        // cap would kill long generations (reasoning models with
+        // extended thinking + large outputs routinely run past three
+        // minutes). Instead bound only the time-to-response-headers
+        // with `tokio::time::timeout` around the send so a wedged
+        // server still surfaces fast — once headers arrive, the body
+        // stream is allowed to take as long as it needs. Connection
+        // liveness during streaming is covered by the client-level
+        // `tcp_keepalive(30s)` configured in `http_client_with_ua`.
+        let mut builder = self.client.post(&url).json(&body);
         if let Some((k, v)) = self.auth_header() {
             builder = builder.header(k, v);
         }
-        let resp = super::send_with_transport_retry(builder)
-            .await
-            .with_context(|| format!("rsclaw POST {url}"))?;
+        let send_fut = super::send_with_transport_retry(builder);
+        let resp = match tokio::time::timeout(TURN_HEADERS_TIMEOUT, send_fut).await {
+            Ok(r) => r.with_context(|| format!("rsclaw POST {url}"))?,
+            Err(_) => anyhow::bail!(
+                "rsclaw turn: timed out waiting for response headers after {}s ({url})",
+                TURN_HEADERS_TIMEOUT.as_secs()
+            ),
+        };
         let status = resp.status();
         if status == StatusCode::NOT_FOUND {
             return Ok(TurnOutcome::SessionNotFound);
@@ -790,6 +807,51 @@ mod tests {
             !all_text.contains('\u{FFFD}'),
             "expected no replacement char, got {all_text:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_emits_done_with_usage() {
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = b"data: {\"type\":\"done\",\"usage\":{\"input_tokens\":17,\"output_tokens\":42}}\n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let mut saw_done = false;
+        for e in evs {
+            if let Ok(StreamEvent::Done { usage }) = e {
+                let u = usage.expect("usage should be populated");
+                assert_eq!(u.input, 17);
+                assert_eq!(u.output, 42);
+                saw_done = true;
+            }
+        }
+        assert!(saw_done, "expected one Done event");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_emits_done_without_usage() {
+        // Server may omit usage on early termination — Done must still fire.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = b"data: {\"type\":\"done\"}\n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let mut saw_done = false;
+        for e in evs {
+            if let Ok(StreamEvent::Done { usage }) = e {
+                assert!(usage.is_none());
+                saw_done = true;
+            }
+        }
+        assert!(saw_done, "expected Done event even without usage");
+    }
+
+    #[test]
+    fn turn_headers_timeout_is_bounded_and_finite() {
+        // Sanity-check the constant: streaming turns rely on this for
+        // wedged-server detection. Too short would cause spurious
+        // failures on a slow TLS handshake; too long would let a dead
+        // server hang the runtime indefinitely.
+        let s = TURN_HEADERS_TIMEOUT.as_secs();
+        assert!((30..=120).contains(&s), "TURN_HEADERS_TIMEOUT={s}s out of range");
     }
 
     #[test]
