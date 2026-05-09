@@ -466,10 +466,22 @@ struct CreateSessionResp {
     /// differ from the requested alias). Per §2.2 the **replay**
     /// response does NOT include it — and rsclaw-server's backend
     /// passes the upstream JSON straight through, so the field is
-    /// absent on replay. Default to empty here; the caller falls back
-    /// to the request's `rsclaw_version` when this is empty.
+    /// absent on replay.
+    ///
+    /// Modeled as `Option<String>` rather than `#[serde(default)]
+    /// String` so we accept three shapes:
+    ///   - field absent              → `None` (replay path)
+    ///   - field present, string     → `Some(v)` (open path)
+    ///   - field present, JSON null  → `None`
+    ///
+    /// The third case is the trap: serde's `String` deserializer
+    /// rejects `null` outright (`invalid type: null, expected a
+    /// string`), tanking the entire response parse and surfacing as a
+    /// `rsclaw open: parse response` error to the caller. Upstream
+    /// nodes occasionally emit `"rsclaw_version": null` when the
+    /// version registry is mid-roll — accept that gracefully.
     #[serde(default)]
-    rsclaw_version: String,
+    rsclaw_version: Option<String>,
 }
 
 impl CreateSessionResp {
@@ -478,11 +490,11 @@ impl CreateSessionResp {
     /// per §2.2 don't carry the field, so the request's version is
     /// the authoritative value for cache-key comparison.
     fn rsclaw_version_or(&self, fallback: &str) -> String {
-        if self.rsclaw_version.is_empty() {
-            fallback.to_owned()
-        } else {
-            self.rsclaw_version.clone()
-        }
+        self.rsclaw_version
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| fallback.to_owned())
     }
 }
 
@@ -2261,7 +2273,7 @@ mod tests {
         }"#;
         let resp: CreateSessionResp = serde_json::from_str(body).expect("replay shape parses");
         assert_eq!(resp.session_id, "rs_w7_8a3c1f2b");
-        assert!(resp.rsclaw_version.is_empty());
+        assert!(resp.rsclaw_version.is_none());
     }
 
     #[test]
@@ -2272,14 +2284,14 @@ mod tests {
             "rsclaw_version": "2026.5.5"
         }"#;
         let resp: CreateSessionResp = serde_json::from_str(body).expect("create shape parses");
-        assert_eq!(resp.rsclaw_version, "2026.5.5");
+        assert_eq!(resp.rsclaw_version.as_deref(), Some("2026.5.5"));
     }
 
     #[test]
     fn rsclaw_version_or_falls_back_when_empty() {
         let empty = CreateSessionResp {
             session_id: "id".into(),
-            rsclaw_version: String::new(),
+            rsclaw_version: Some(String::new()),
         };
         assert_eq!(empty.rsclaw_version_or("2026.5.5"), "2026.5.5");
     }
@@ -2292,9 +2304,47 @@ mod tests {
         // and it may differ from the requested alias.
         let canonical = CreateSessionResp {
             session_id: "id".into(),
-            rsclaw_version: "2026.5.5".into(),
+            rsclaw_version: Some("2026.5.5".into()),
         };
         assert_eq!(canonical.rsclaw_version_or("alias-name"), "2026.5.5");
+    }
+
+    #[test]
+    fn create_session_resp_parses_explicit_null_rsclaw_version() {
+        // Pre-fix: `rsclaw_version: String` with `#[serde(default)]` —
+        // missing field defaults to "", but explicit JSON null FAILS
+        // parsing with "invalid type: null, expected a string", tanking
+        // the whole `/sessions` (or `/sessions/replay`) response and
+        // surfacing as an opaque "parse response" error to the caller.
+        // Upstream nodes occasionally emit null while the version
+        // registry is mid-roll. Post-fix: Option<String> accepts null
+        // → None → fallback kicks in via rsclaw_version_or.
+        let body = r#"{"session_id":"rs_a_b","rsclaw_version":null}"#;
+        let resp: CreateSessionResp =
+            serde_json::from_str(body).expect("null rsclaw_version must parse");
+        assert_eq!(resp.session_id, "rs_a_b");
+        assert!(resp.rsclaw_version.is_none());
+        assert_eq!(resp.rsclaw_version_or("v-fallback"), "v-fallback");
+    }
+
+    #[test]
+    fn create_session_resp_parses_missing_rsclaw_version() {
+        // The replay response per §2.2 omits rsclaw_version entirely.
+        // Behaviour must match the explicit-null case: parse cleanly,
+        // surface None, fall back to the request's version.
+        let body = r#"{"session_id":"rs_a_b"}"#;
+        let resp: CreateSessionResp = serde_json::from_str(body).expect("missing field must parse");
+        assert!(resp.rsclaw_version.is_none());
+        assert_eq!(resp.rsclaw_version_or("v-fallback"), "v-fallback");
+    }
+
+    #[test]
+    fn create_session_resp_parses_populated_rsclaw_version() {
+        // Round-trip the happy path so the Option<String> change
+        // doesn't accidentally start coercing real values to None.
+        let body = r#"{"session_id":"rs_a_b","rsclaw_version":"2026.5.5"}"#;
+        let resp: CreateSessionResp = serde_json::from_str(body).expect("string field must parse");
+        assert_eq!(resp.rsclaw_version_or("v-fallback"), "2026.5.5");
     }
 
     #[test]
