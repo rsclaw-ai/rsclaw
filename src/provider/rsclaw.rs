@@ -924,11 +924,20 @@ async fn parse_sse_chunk(
                 events.push(Ok(StreamEvent::Done { usage }));
             }
             Some("error") => {
-                let detail = value
-                    .get("detail")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("rsclaw stream error");
-                events.push(Ok(StreamEvent::Error(detail.to_string())));
+                // Protocol §2.3: error event carries both `code` and
+                // `detail`. Preserve both so downstream consumers can
+                // discriminate by code (e.g. `slot_evicted` →
+                // replay-and-retry) and operators see the full message
+                // in tail logs.
+                let code = value.get("code").and_then(|v| v.as_str()).unwrap_or("");
+                let detail = value.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+                let msg = match (code.is_empty(), detail.is_empty()) {
+                    (false, false) => format!("rsclaw stream error [{code}]: {detail}"),
+                    (false, true) => format!("rsclaw stream error [{code}]"),
+                    (true, false) => format!("rsclaw stream error: {detail}"),
+                    (true, true) => "rsclaw stream error".to_string(),
+                };
+                events.push(Ok(StreamEvent::Error(msg)));
             }
             _ => {}
         }
@@ -1053,6 +1062,84 @@ mod tests {
             }
         }
         assert!(saw_done, "expected Done event even without usage");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_error_preserves_code_and_detail() {
+        // Protocol §2.3: error frame is `{type:"error", code, detail}`.
+        // Both fields must survive into StreamEvent::Error so callers
+        // can branch on code (e.g. slot_evicted → replay) and humans
+        // see the detail in tail logs.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = br#"data: {"type":"error","code":"slot_evicted","detail":"slot was reclaimed mid-decode"}
+"#;
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let mut msgs = Vec::new();
+        for e in evs {
+            if let Ok(StreamEvent::Error(m)) = e {
+                msgs.push(m);
+            }
+        }
+        assert_eq!(msgs.len(), 1, "expected exactly one Error event");
+        assert!(msgs[0].contains("slot_evicted"), "missing code: {}", msgs[0]);
+        assert!(
+            msgs[0].contains("slot was reclaimed mid-decode"),
+            "missing detail: {}",
+            msgs[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_error_falls_back_when_code_missing() {
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = br#"data: {"type":"error","detail":"upstream hung up"}
+"#;
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let msg = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::Error(m)) => Some(m),
+                _ => None,
+            })
+            .expect("expected one Error event");
+        assert!(msg.contains("upstream hung up"), "missing detail: {msg}");
+        assert!(!msg.contains("[]"), "empty-code marker leaked: {msg}");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_error_falls_back_when_detail_missing() {
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = br#"data: {"type":"error","code":"version_drift"}
+"#;
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let msg = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::Error(m)) => Some(m),
+                _ => None,
+            })
+            .expect("expected one Error event");
+        assert!(msg.contains("version_drift"), "missing code: {msg}");
+        assert!(!msg.ends_with(": "), "trailing empty-detail leaked: {msg}");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_error_uses_default_when_both_missing() {
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = b"data: {\"type\":\"error\"}\n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let msg = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::Error(m)) => Some(m),
+                _ => None,
+            })
+            .expect("expected one Error event");
+        assert_eq!(msg, "rsclaw stream error");
     }
 
     #[test]
