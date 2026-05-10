@@ -4290,7 +4290,20 @@ impl AgentRuntime {
                     .unwrap_or_default();
             }
 
-            let kv_cache_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
+            // Single live-config read per LLM iteration. Previously this
+            // call site held two independent `self.live.agents.read().await`
+            // acquisitions (kv_cache_mode + frequency_penalty) — minor
+            // contention on the hot path, and a refactor hazard if more
+            // defaults migrate in. Pull every default this iteration
+            // needs at once; drop the guard before constructing the
+            // request so the LLM call doesn't hold the lock.
+            let (kv_cache_mode, frequency_penalty) = {
+                let agents = self.live.agents.read().await;
+                (
+                    agents.defaults.kv_cache_mode.unwrap_or(1),
+                    agents.defaults.frequency_penalty,
+                )
+            };
             // For kvCacheMode=2 expose the shared/user split so the rsclaw
             // provider can populate `dynamic_prefix.system` (cacheable across
             // every client of this RsClaw version) separately from
@@ -4320,7 +4333,7 @@ impl AgentRuntime {
                 system: Some(effective_system.clone()),
                 max_tokens: configured_max_tokens,
                 temperature,
-                frequency_penalty: self.live.agents.read().await.defaults.frequency_penalty,
+                frequency_penalty,
                 thinking_budget,
                 kv_cache_mode,
                 session_key: if kv_cache_mode >= 2 { Some(ctx.session_key.clone()) } else { None },

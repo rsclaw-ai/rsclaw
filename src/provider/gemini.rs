@@ -64,6 +64,7 @@ impl LlmProvider for GeminiProvider {
 
     fn stream(&self, req: LlmRequest) -> BoxFuture<'_, Result<LlmStream>> {
         Box::pin(async move {
+            super::warn_unsupported_kv_cache_mode_2(self.name(), &req);
             let body = build_request_body(&req)?;
             let url = format!(
                 "{}/models/{}:streamGenerateContent?alt=sse",

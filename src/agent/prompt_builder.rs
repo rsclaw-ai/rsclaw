@@ -2,8 +2,18 @@
 //!
 //! Extracted from `runtime.rs` to reduce file size.
 
+use std::sync::LazyLock;
+
 use super::workspace::WorkspaceContext;
 use crate::skill::SkillRegistry;
+
+/// Cached output of [`build_shared_system_prefix`]. The shared prefix is
+/// byte-stable across the gateway lifetime (no dynamic inputs — only
+/// hardcoded literals + compile-time tool guidance constants), so the
+/// rsclaw kvCacheMode=2 hot path was rebuilding ~3KB of identical
+/// string per LLM iteration. Memoising keeps the first-call cost the
+/// same and turns subsequent calls into a clone of the cached String.
+static SHARED_SYSTEM_PREFIX: LazyLock<String> = LazyLock::new(build_shared_system_prefix_uncached);
 
 /// Read-only commands that are always allowed for any agent (regardless of
 /// allowedCommands).
@@ -301,7 +311,17 @@ pub(crate) fn build_base_system_prompt(config: &crate::config::schema::Config) -
 /// Everything that varies per machine (platform info, language,
 /// workspace, skills, plugins, agent persona) lives in
 /// [`build_user_system_suffix`].
+///
+/// Backed by [`SHARED_SYSTEM_PREFIX`] (a `LazyLock<String>`) — first
+/// call builds the prefix; every subsequent call clones the cached
+/// String. Returning `String` rather than `&'static str` keeps the
+/// existing `format!("{prefix}\n\n{suffix}")` and
+/// `effective_system.strip_prefix(&shared)` callers source-compatible.
 pub fn build_shared_system_prefix() -> String {
+    SHARED_SYSTEM_PREFIX.clone()
+}
+
+fn build_shared_system_prefix_uncached() -> String {
     let mut parts: Vec<String> = Vec::new();
 
     parts.push(

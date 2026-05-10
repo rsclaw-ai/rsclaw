@@ -157,6 +157,8 @@ impl LlmProvider for OpenAiProvider {
                 "openai: preparing LLM request"
             );
 
+            super::warn_unsupported_kv_cache_mode_2(self.name(), &req);
+
             // Ollama: if base_url does NOT contain "/v1", use native /api/chat.
             // If it has "/v1" (e.g. http://localhost:11434/v1), fall through to
             // OpenAI-compatible /chat/completions path.

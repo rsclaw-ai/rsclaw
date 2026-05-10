@@ -41,6 +41,23 @@ pub const RSCLAW_DEFAULT_BASE: &str = "http://localhost:8090/v1/agent";
 /// SSE body is allowed to take as long as the model needs.
 const TURN_HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Hard cap on the in-memory `sessions` cache. Each entry is a few
+/// dozen bytes (`session_id` + `prefix_id` + counter), so 10_000 caps
+/// the per-process footprint at ~1MB even under churn. When the cap is
+/// hit, [`evict_if_oversized`] drops half the entries — picked by
+/// HashMap iteration order, which is good enough since we lack
+/// last-access timestamps and the alternative (LRU bookkeeping) would
+/// add a synchronisation hot spot. Evicted entries cause one extra
+/// replay on their next access, which is the same recovery path used
+/// for server-side eviction (§2.2).
+///
+/// Without this cap a long-running gateway with high session churn
+/// (every WeChat user = one session_key) accumulates entries forever
+/// and bleeds memory until OOM. Mirrors the pre-existing safeguard in
+/// the previous OpenAI-provider implementation that this provider
+/// replaced.
+const MAX_SESSIONS: usize = 10_000;
+
 // ---------------------------------------------------------------------------
 // Provider
 // ---------------------------------------------------------------------------
@@ -117,6 +134,42 @@ impl RsclawProvider {
             .map(|k| ("authorization".to_string(), format!("Bearer {k}")))
     }
 
+    /// Acquire the sessions lock, recovering from poison rather than
+    /// silently dropping the call.
+    ///
+    /// `Mutex::lock()` returns `Err` only after a panic occurred while
+    /// some other thread held the lock. The pre-poison helpers used
+    /// `.ok()?` / `if let Ok(...)`, which silently turned every
+    /// post-poison call into a no-op — the provider went brain-dead
+    /// (lookups always missed, store/forget became unobservable
+    /// drops) but emitted no signal, so operators couldn't tell from
+    /// logs that anything was wrong. Recovering with `into_inner()` on
+    /// poison preserves the data (HashMap state is itself well-defined
+    /// — only an in-flight insert/remove could leave logical staleness,
+    /// and that staleness is bounded by the same eviction signals that
+    /// already drive replay) and lets us flag the post-mortem in logs.
+    fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionEntry>> {
+        match self.sessions.lock() {
+            Ok(g) => g,
+            Err(p) => {
+                // Use a static `OnceLock` to log only once per process
+                // lifetime — poison is a permanent condition, no need
+                // to spam every subsequent call.
+                use std::sync::OnceLock;
+                static LOGGED: OnceLock<()> = OnceLock::new();
+                if LOGGED.set(()).is_ok() {
+                    tracing::error!(
+                        "rsclaw: sessions mutex poisoned — a prior thread \
+                         panicked while holding it. Recovering inner data \
+                         and continuing; expect possible session-state \
+                         drift until restart."
+                    );
+                }
+                p.into_inner()
+            }
+        }
+    }
+
     /// Atomically look up a cached session AND validate its freshness.
     /// Returns `None` (forcing a re-hydrate) when the entry is missing,
     /// has a stale `prefix_id`, or its `last_seen_msgs_len` exceeds the
@@ -129,7 +182,7 @@ impl RsclawProvider {
         prefix_id: &str,
         msgs_len: usize,
     ) -> Option<SessionEntry> {
-        let mut map = self.sessions.lock().ok()?;
+        let mut map = self.lock_sessions();
         let entry = map.get_mut(session_key)?;
         if entry.prefix_id != prefix_id {
             return None;
@@ -142,16 +195,43 @@ impl RsclawProvider {
     }
 
     fn store(&self, session_key: &str, entry: SessionEntry) {
-        if let Ok(mut map) = self.sessions.lock() {
-            map.insert(session_key.to_string(), entry);
-        }
+        let mut map = self.lock_sessions();
+        map.insert(session_key.to_string(), entry);
+        // Cap memory after every insert. Done inline (not on a timer
+        // or a separate task) so a sudden churn burst can't tip over
+        // the high-water mark while waiting for an external sweeper.
+        evict_if_oversized(&mut map);
     }
 
     fn forget(&self, session_key: &str) {
-        if let Ok(mut map) = self.sessions.lock() {
-            map.remove(session_key);
-        }
+        let mut map = self.lock_sessions();
+        map.remove(session_key);
     }
+}
+
+/// Evict roughly half the entries when the cache exceeds [`MAX_SESSIONS`].
+/// Iteration order on a `HashMap` is non-deterministic but stable
+/// enough within one call to give a consistent set of victims; the
+/// alternative (true LRU) would need an auxiliary data structure and a
+/// per-call timestamp update on the read path. Evicted sessions cost
+/// one extra replay round-trip the next time they're touched — the
+/// same code path that handles upstream-side eviction.
+fn evict_if_oversized(map: &mut HashMap<String, SessionEntry>) {
+    if map.len() <= MAX_SESSIONS {
+        return;
+    }
+    let target_drop = map.len() - MAX_SESSIONS / 2;
+    let victims: Vec<String> = map.keys().take(target_drop).cloned().collect();
+    let dropped = victims.len();
+    for k in victims {
+        map.remove(&k);
+    }
+    tracing::info!(
+        cap = MAX_SESSIONS,
+        dropped,
+        remaining = map.len(),
+        "rsclaw: sessions cache over cap, evicted batch"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -237,7 +317,28 @@ impl LlmProvider for RsclawProvider {
             };
 
             let delta = TurnDelta::from_request(&req)?;
-            let resp = self.turn(&entry.session_id, &delta, &req).await?;
+            // Forget the cached session entry on any non-recoverable
+            // turn failure. Without this, an Err here leaves the
+            // SessionEntry in cache with a `last_seen_msgs_len` that
+            // already counts the delta we tried to send. Failover
+            // routes the user-facing turn through another provider,
+            // the runtime stores that provider's assistant in session,
+            // and on the next rsclaw call `lookup_and_bump` happily
+            // returns the stale entry — `turn()` then sends only the
+            // *next* delta, so the assistant generated by the fallback
+            // never reaches rsclaw-server. Server-side history
+            // diverges silently from the runtime's mental model;
+            // subsequent generations base their reasoning on a partial
+            // log. Forgetting forces a full /sessions/replay on the
+            // next rsclaw call, which re-anchors server state to the
+            // runtime's complete history.
+            let resp = match self.turn(&entry.session_id, &delta, &req).await {
+                Ok(o) => o,
+                Err(e) => {
+                    self.forget(&session_key);
+                    return Err(e);
+                }
+            };
             let resp = match resp {
                 TurnOutcome::Stream(s) => s,
                 TurnOutcome::SessionNotFound => {
@@ -263,18 +364,79 @@ impl LlmProvider for RsclawProvider {
                         last_seen_msgs_len: req.messages.len(),
                     };
                     self.store(&session_key, entry.clone());
-                    match self.turn(&entry.session_id, &delta, &req).await? {
-                        TurnOutcome::Stream(s) => s,
-                        TurnOutcome::SessionNotFound => anyhow::bail!(
-                            "rsclaw: session vanished immediately after replay (id={})",
-                            entry.session_id
-                        ),
+                    // Same forget-on-Err treatment as the primary
+                    // turn() path above — recovery doesn't grant
+                    // immunity from divergence.
+                    match self.turn(&entry.session_id, &delta, &req).await {
+                        Ok(TurnOutcome::Stream(s)) => s,
+                        Ok(TurnOutcome::SessionNotFound) => {
+                            self.forget(&session_key);
+                            anyhow::bail!(
+                                "rsclaw: session vanished immediately after replay (id={})",
+                                entry.session_id
+                            );
+                        }
+                        Err(e) => {
+                            self.forget(&session_key);
+                            return Err(e);
+                        }
                     }
                 }
             };
-            Ok(resp)
+            // Wrap the stream so that the FIRST transport error or
+            // explicit `StreamEvent::Error` evicts the session entry.
+            // If the stream tears down mid-turn, the runtime sees the
+            // error and aborts the iteration — but the rsclaw provider
+            // would otherwise keep the session cached, and rsclaw-
+            // server's view of that turn could be partially-committed
+            // or rolled back depending on where the failure landed.
+            // Forcing a fresh replay on the next call re-anchors both
+            // sides to the runtime's confirmed history.
+            Ok(invalidate_on_error(
+                resp,
+                Arc::clone(&self.sessions),
+                session_key,
+            ))
         })
     }
+}
+
+/// Wrap an `LlmStream` so the first error item evicts `session_key`
+/// from the shared session cache. `errored` flips on the first
+/// error to make the eviction idempotent — multiple `Err` items in
+/// the same stream don't try to re-acquire the lock unnecessarily.
+fn invalidate_on_error(
+    inner: LlmStream,
+    sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
+    session_key: String,
+) -> LlmStream {
+    use futures::StreamExt;
+    let mut errored = false;
+    Box::pin(inner.inspect(move |item| {
+        if errored {
+            return;
+        }
+        let invalidate = match item {
+            Err(_) => true,
+            Ok(StreamEvent::Error(_)) => true,
+            _ => false,
+        };
+        if !invalidate {
+            return;
+        }
+        errored = true;
+        // Best-effort lock; if poisoned, the parent provider's
+        // `lock_sessions` already logged the original poison —
+        // don't compound the noise here.
+        match sessions.lock() {
+            Ok(mut map) => {
+                map.remove(&session_key);
+            }
+            Err(p) => {
+                p.into_inner().remove(&session_key);
+            }
+        }
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -989,11 +1151,32 @@ fn serialize_replay_history(messages: &[&Message]) -> Vec<Value> {
         }
         let mut combined: Vec<Value> = Vec::new();
         while i < messages.len() && matches!(messages[i].role, Role::Tool) {
-            if let MessageContent::Parts(parts) = &messages[i].content {
-                for p in parts {
-                    if matches!(p, ContentPart::ToolResult { .. }) {
-                        combined.push(serialize_history_part(p));
+            match &messages[i].content {
+                MessageContent::Parts(parts) => {
+                    for p in parts {
+                        if matches!(p, ContentPart::ToolResult { .. }) {
+                            combined.push(serialize_history_part(p));
+                        }
                     }
+                }
+                MessageContent::Text(_) => {
+                    // Defensive: today's runtime always emits
+                    // `Role::Tool` with `Parts(vec![ToolResult{..}])`,
+                    // so this branch should never trigger. If it ever
+                    // does — e.g. a future runtime path or a plugin
+                    // injecting a synthesised tool message — the text
+                    // has no `tool_use_id` to anchor it server-side
+                    // (protocol §2.2 requires `tool_result` parts to
+                    // pair with prior `tool_use` ids). Drop and surface
+                    // a warning so we notice the contract change rather
+                    // than silently producing a turn whose model
+                    // response is shaped by missing context.
+                    tracing::warn!(
+                        "rsclaw: dropping Role::Tool with text-only content during \
+                         replay (no tool_use_id to pair with — runtime contract \
+                         expects Parts(ToolResult{{..}}))",
+                    );
+                    debug_assert!(false, "Role::Tool must carry Parts(ToolResult{{..}}); got Text");
                 }
             }
             i += 1;
@@ -2153,6 +2336,126 @@ mod tests {
         assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.6", 14).is_none());
         // Missing key → None.
         assert!(provider.lookup_and_bump("missing", "rsclaw/2026.5.5", 14).is_none());
+    }
+
+    #[test]
+    fn evict_if_oversized_culls_to_half_cap_when_over() {
+        // Construct a HashMap larger than MAX_SESSIONS to verify the
+        // batched eviction policy actually drops entries (not all, not
+        // none) when the cache exceeds the cap. Cap is 10_000 so use a
+        // synthetic over-cap fill.
+        let mut map: HashMap<String, SessionEntry> = HashMap::new();
+        let total = MAX_SESSIONS + 100;
+        for i in 0..total {
+            map.insert(
+                format!("k{i}"),
+                SessionEntry {
+                    session_id: format!("rs_w_{i}"),
+                    prefix_id: "rsclaw/test".into(),
+                    last_seen_msgs_len: 1,
+                },
+            );
+        }
+        evict_if_oversized(&mut map);
+        // After culling we expect ~MAX_SESSIONS/2 retained: the formula
+        // drops (total - MAX_SESSIONS/2) entries.
+        assert_eq!(map.len(), MAX_SESSIONS / 2);
+    }
+
+    #[test]
+    fn evict_if_oversized_no_op_when_under_cap() {
+        // Below the cap the function must NOT touch the map — eviction
+        // is purely a memory-safety measure, not a routine GC.
+        let mut map: HashMap<String, SessionEntry> = HashMap::new();
+        for i in 0..100 {
+            map.insert(
+                format!("k{i}"),
+                SessionEntry {
+                    session_id: format!("rs_{i}"),
+                    prefix_id: "rsclaw/test".into(),
+                    last_seen_msgs_len: 1,
+                },
+            );
+        }
+        evict_if_oversized(&mut map);
+        assert_eq!(map.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn invalidate_on_error_evicts_session_on_first_err() {
+        // Wrap a stream that yields one Ok then an Err; the wrapper
+        // must remove the session entry when the Err lands. Subsequent
+        // Err items don't re-evict (idempotency by `errored` flag).
+        let provider = RsclawProvider::new("http://x", None);
+        provider.store(
+            "session-key",
+            SessionEntry {
+                session_id: "rs_w7_xyz".into(),
+                prefix_id: "rsclaw/test".into(),
+                last_seen_msgs_len: 5,
+            },
+        );
+        let inner: LlmStream = Box::pin(futures::stream::iter(vec![
+            Ok(StreamEvent::TextDelta("hi".into())),
+            Err(anyhow::anyhow!("boom")),
+        ]));
+        let wrapped = invalidate_on_error(
+            inner,
+            Arc::clone(&provider.sessions),
+            "session-key".to_owned(),
+        );
+        let collected: Vec<_> = wrapped.collect().await;
+        assert_eq!(collected.len(), 2);
+        assert!(matches!(collected[0], Ok(StreamEvent::TextDelta(_))));
+        assert!(collected[1].is_err());
+        // Session must be gone after the error item passed through.
+        assert!(provider.lock_sessions().get("session-key").is_none());
+    }
+
+    #[tokio::test]
+    async fn invalidate_on_error_evicts_on_stream_event_error() {
+        // Protocol §2.3 `error` events surface as `Ok(StreamEvent::Error)`
+        // — these MUST also force eviction, otherwise a server-issued
+        // error mid-stream leaves the cached session pointing at a
+        // partially-committed turn.
+        let provider = RsclawProvider::new("http://x", None);
+        provider.store(
+            "k",
+            SessionEntry {
+                session_id: "rs_w7_abc".into(),
+                prefix_id: "rsclaw/test".into(),
+                last_seen_msgs_len: 5,
+            },
+        );
+        let inner: LlmStream = Box::pin(futures::stream::iter(vec![
+            Ok(StreamEvent::Error("model_overloaded".into())),
+        ]));
+        let wrapped = invalidate_on_error(inner, Arc::clone(&provider.sessions), "k".into());
+        let _: Vec<_> = wrapped.collect().await;
+        assert!(provider.lock_sessions().get("k").is_none());
+    }
+
+    #[tokio::test]
+    async fn invalidate_on_error_keeps_session_on_clean_stream() {
+        // Stream with no errors → session stays cached. Otherwise we'd
+        // pay an unnecessary replay round-trip on every successful
+        // turn, defeating kvCacheMode=2.
+        let provider = RsclawProvider::new("http://x", None);
+        provider.store(
+            "k",
+            SessionEntry {
+                session_id: "rs_w7_abc".into(),
+                prefix_id: "rsclaw/test".into(),
+                last_seen_msgs_len: 5,
+            },
+        );
+        let inner: LlmStream = Box::pin(futures::stream::iter(vec![
+            Ok(StreamEvent::TextDelta("hello".into())),
+            Ok(StreamEvent::Done { usage: None }),
+        ]));
+        let wrapped = invalidate_on_error(inner, Arc::clone(&provider.sessions), "k".into());
+        let _: Vec<_> = wrapped.collect().await;
+        assert!(provider.lock_sessions().get("k").is_some());
     }
 
     #[test]

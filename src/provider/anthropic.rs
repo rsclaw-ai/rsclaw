@@ -59,6 +59,7 @@ impl LlmProvider for AnthropicProvider {
 
     fn stream(&self, req: LlmRequest) -> BoxFuture<'_, Result<LlmStream>> {
         Box::pin(async move {
+            super::warn_unsupported_kv_cache_mode_2(self.name(), &req);
             let body = build_request_body(&req)?;
             let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
             // Capture model + URL up-front so the failure path can

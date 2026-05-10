@@ -19,6 +19,27 @@ use super::default_dm_scope;
 // Feishu (飞书)
 // ---------------------------------------------------------------------------
 
+/// Pick the Feishu identifier the bot should send replies to.
+///
+/// - Groups address by `chat_id` (`oc_xxx`).
+/// - P2P addresses by `open_id` (`ou_xxx` — the same value the runtime
+///   tracks as `sender_id` on inbound events).
+///
+/// P2P over `chat_id` is technically accepted by the Feishu API but
+/// returns `230002` ("Bot/User can NOT be out of the chat") whenever
+/// the per-user p2p chat session has been GC'd / rebuilt by the
+/// platform — most visibly on delayed proactive pushes (plugin
+/// notifications fired minutes after the user's last message).
+/// `open_id` is identity-keyed and survives p2p session lifecycle
+/// changes, so it's the safe address for any deferred outbound work.
+fn outbound_addr_for(is_group: bool, chat_id: &str, sender_id: &str) -> String {
+    if is_group {
+        chat_id.to_owned()
+    } else {
+        sender_id.to_owned()
+    }
+}
+
 pub(crate) fn start_feishu_if_configured(
     config: &RuntimeConfig,
     registry: Arc<AgentRegistry>,
@@ -205,20 +226,7 @@ pub(crate) fn start_feishu_if_configured(
                 let tq = Arc::clone(&tq);
                 let w_acct_outer = w_acct_outer.clone();
                 tokio::spawn(async move {
-                    // Outbound target: groups address by `chat_id` (oc_xxx),
-                    // p2p addresses by user `open_id` (ou_xxx). Sending p2p
-                    // via the chat_id is technically supported by the API
-                    // but gets 230002 ("Bot/User can NOT be out of the
-                    // chat") whenever the per-user p2p session has been
-                    // GC'd / rebuilt — most visibly on delayed proactive
-                    // pushes (plugin notifications minutes after the
-                    // user's message). open_id is identity-keyed and
-                    // survives session lifecycle changes.
-                    let outbound_target = if is_group {
-                        chat_id.clone()
-                    } else {
-                        sender_id.clone()
-                    };
+                    let outbound_target = outbound_addr_for(is_group, &chat_id, &sender_id);
                     // Group policy check.
                     if is_group {
                         match group_policy.as_ref() {
@@ -388,23 +396,22 @@ pub(crate) fn start_feishu_if_configured(
                                     // `account` carries the originating Feishu app name so the
                                     // task worker can route the reply via the same app's API
                                     // token (multi-account routing fix for 230002).
-                                    // For p2p, address by `open_id` (sender_id /
-                                    // ou_xxx) — see outbound_target comment in
-                                    // on_message. The session_key above still
-                                    // uses the original `chat_id` for group
-                                    // disambiguation; only the outbound routing
-                                    // needs to be identity-keyed.
-                                    let queued_target = if is_group {
-                                        chat_id.clone()
-                                    } else {
-                                        sender_id.clone()
-                                    };
+                                    //
+                                    // `outbound_addr_for` resolves the
+                                    // identity-keyed outbound target (groups
+                                    // → chat_id, p2p → open_id/sender_id).
+                                    // `chat_id` and `sender_id` here are the
+                                    // per-message values flowing through the
+                                    // worker channel — the outer-scope
+                                    // `outbound_target` is owned by a
+                                    // different spawn and isn't visible from
+                                    // inside this worker, so we recompute.
                                     let qmsg = crate::gateway::task_queue::QueuedMessage {
                                         text,
                                         sender: sender_id.clone(),
                                         channel: "feishu".to_string(),
                                         account: Some(w_acct.clone()),
-                                        chat_id: queued_target,
+                                        chat_id: outbound_addr_for(is_group, &chat_id, &sender_id),
                                         is_group,
                                         reply_to: None,
                                         timestamp: chrono::Utc::now().timestamp(),
