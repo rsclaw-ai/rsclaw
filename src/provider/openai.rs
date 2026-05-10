@@ -1741,15 +1741,7 @@ mod tests {
     fn make_request() -> LlmRequest {
         LlmRequest {
             model: "gpt-4o".to_owned(),
-            messages: vec![],
-            tools: vec![],
-            system: None,
-            max_tokens: None,
-            temperature: None,
-            frequency_penalty: None,
-            thinking_budget: None,
-            kv_cache_mode: 0,
-            session_key: None,
+            ..Default::default()
         }
     }
 
@@ -1784,15 +1776,7 @@ mod tests {
         fn make_responses_request() -> LlmRequest {
             LlmRequest {
                 model: "doubao-seed-2-0-pro-260215".to_owned(),
-                messages: vec![],
-                tools: vec![],
-                system: None,
-                max_tokens: None,
-                temperature: None,
-                frequency_penalty: None,
-                thinking_budget: None,
-                kv_cache_mode: 0,
-                session_key: None,
+                ..Default::default()
             }
         }
 

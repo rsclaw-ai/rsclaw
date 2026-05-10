@@ -536,15 +536,7 @@ mod tests {
     fn make_request() -> LlmRequest {
         LlmRequest {
             model: "claude-3-5-sonnet-20241022".to_owned(),
-            messages: vec![],
-            tools: vec![],
-            system: None,
-            max_tokens: None,
-            temperature: None,
-            frequency_penalty: None,
-            thinking_budget: None,
-            kv_cache_mode: 0,
-            session_key: None,
+            ..Default::default()
         }
     }
 

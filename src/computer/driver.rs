@@ -240,6 +240,8 @@ impl VlmDriver<'_> {
                 thinking_budget: None,
                 kv_cache_mode: 0,
                 session_key: None,
+                system_shared: None,
+                system_user: None,
             };
 
             // 3c. Stream the prediction. Abort flag is polled per

@@ -1094,6 +1094,8 @@ impl AgentRuntime {
             thinking_budget: None,
             kv_cache_mode: 0,
             session_key: None,
+            system_shared: None,
+            system_user: None,
         };
 
         let providers = Arc::clone(&self.providers);
@@ -1211,6 +1213,8 @@ impl AgentRuntime {
             thinking_budget: None,
             kv_cache_mode: 0,
             session_key: None,
+            system_shared: None,
+            system_user: None,
         };
 
         let providers = Arc::clone(&self.providers);
@@ -2838,19 +2842,6 @@ impl AgentRuntime {
             let dump_path = crate::config::loader::base_dir()
                 .join(format!("debug_prompt_spec.{safe_key}.json"));
 
-            // Built-in tools = stable across machines: 37 names compiled
-            // into the RsClaw binary. Anything else (sub-agent
-            // `agent_<id>` tools registered from the user's config,
-            // plugin tools, MCP tools, WASM tools) is per-machine.
-            const BUILTIN_TOOLS: &[&str] = &[
-                "memory","use_skill","task","read_file","write_file","send_file",
-                "execute_command","agent","install_tool","list_dir","search_file",
-                "search_content","web_search","web_fetch","web_download","web_browser",
-                "computer_use","image_gen","video_gen","pdf","text_to_voice",
-                "send_message","cron","session","gateway","opencode","claudecode",
-                "codex","channel","anycli","clarify","pairing",
-                "create_docx","create_pdf","create_xlsx","create_pptx","doc",
-            ];
             let tool_json = |t: &crate::provider::ToolDef| {
                 serde_json::json!({
                     "name": t.name,
@@ -2861,7 +2852,7 @@ impl AgentRuntime {
             let mut builtin_tools = Vec::new();
             let mut user_tools = Vec::new();
             for t in &tools {
-                if BUILTIN_TOOLS.contains(&t.name.as_str()) {
+                if crate::agent::prompt_builder::BUILTIN_TOOL_NAMES.contains(&t.name.as_str()) {
                     builtin_tools.push(tool_json(t));
                 } else {
                     user_tools.push(tool_json(t));
@@ -4300,6 +4291,28 @@ impl AgentRuntime {
             }
 
             let kv_cache_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
+            // For kvCacheMode=2 expose the shared/user split so the rsclaw
+            // provider can populate `dynamic_prefix.system` (cacheable across
+            // every client of this RsClaw version) separately from
+            // `dynamic_prefix.user_suffix` (per-client). Only the rsclaw
+            // provider reads these; openai/anthropic ignore them. Internal
+            // sessions use a minimal prompt that doesn't follow the
+            // shared-prefix layout — leave the split unset for those (the
+            // provider falls back to `system` as a single blob, with no
+            // cross-client cache reuse, which matches today's behaviour).
+            let (system_shared, system_user) = if kv_cache_mode >= 2
+                && !is_minimal_context_session(&ctx.session_key)
+            {
+                let shared = crate::agent::prompt_builder::build_shared_system_prefix();
+                if let Some(rest) = effective_system.strip_prefix(&shared) {
+                    let user = rest.trim_start_matches("\n\n").to_owned();
+                    (Some(shared), Some(user))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
             let req = LlmRequest {
                 model: model.to_owned(),
                 messages,
@@ -4311,6 +4324,8 @@ impl AgentRuntime {
                 thinking_budget,
                 kv_cache_mode,
                 session_key: if kv_cache_mode >= 2 { Some(ctx.session_key.clone()) } else { None },
+                system_shared,
+                system_user,
             };
 
             // Update live status: LLM call starting.

@@ -162,7 +162,7 @@ pub struct ToolDef {
 }
 
 /// Full request to an LLM provider.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LlmRequest {
     pub model: String,
     pub messages: Vec<Message>,
@@ -177,6 +177,19 @@ pub struct LlmRequest {
     pub kv_cache_mode: u8,
     /// Session key for cache_id tracking (used when kv_cache_mode=2).
     pub session_key: Option<String>,
+    /// (kvCacheMode=2 only) Pre-split shared system prefix —
+    /// byte-identical across all RsClaw clients of this version. The
+    /// rsclaw provider sends this as `dynamic_prefix.system` so the
+    /// upstream LRU dedupes the cacheable bytes across clients. When
+    /// `None`, the provider falls back to deriving everything from
+    /// `system` (loses cross-client cache reuse but stays correct).
+    /// Other providers ignore this field.
+    pub system_shared: Option<String>,
+    /// (kvCacheMode=2 only) Per-client system suffix — workspace,
+    /// language, skills, platform info. Sent as
+    /// `dynamic_prefix.user_suffix` and is the slot's per-session text.
+    /// Other providers ignore this field.
+    pub system_user: Option<String>,
 }
 
 /// Serialize an `f32` to a JSON number with 2 decimal places.

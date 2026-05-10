@@ -334,6 +334,8 @@ pub async fn distill_with_llm(
         thinking_budget: None,
         kv_cache_mode: 0,
         session_key: None,
+        system_shared: None,
+        system_user: None,
     };
 
     let mut stream = provider

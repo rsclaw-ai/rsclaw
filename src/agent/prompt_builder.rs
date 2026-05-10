@@ -577,6 +577,24 @@ pub(crate) fn build_system_prompt(
     }
 }
 
+/// Names of tools compiled into the RsClaw binary — byte-stable across
+/// every client of the same version. The remainder (sub-agent `agent_<id>`
+/// tools, plugin tools, MCP tools, WASM tools) is per-machine.
+///
+/// Used by the rsclaw kvCacheMode=2 provider to split the tool list into
+/// `dynamic_prefix.tools` (the shared, cacheable subset) versus top-level
+/// `user_tools` (the per-client subset). Also dumped in the
+/// `RSCLAW_DUMP_PROMPT` debug payload.
+pub const BUILTIN_TOOL_NAMES: &[&str] = &[
+    "memory","use_skill","task","read_file","write_file","send_file",
+    "execute_command","agent","install_tool","list_dir","search_file",
+    "search_content","web_search","web_fetch","web_download","web_browser",
+    "computer_use","image_gen","video_gen","pdf","text_to_voice",
+    "send_message","cron","session","gateway","opencode","claudecode",
+    "codex","channel","anycli","clarify","pairing",
+    "create_docx","create_pdf","create_xlsx","create_pptx","doc",
+];
+
 /// Build a minimal system prompt for internal sessions (heartbeat/cron/system).
 ///
 /// Internal sessions only have the `memory` tool available (see

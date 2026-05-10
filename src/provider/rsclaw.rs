@@ -56,9 +56,10 @@ pub struct RsclawProvider {
 struct SessionEntry {
     /// Server-issued, format `rs_<instance>_<random>`.
     session_id: String,
-    /// rsclaw_version this session was opened against. Bump triggers
-    /// re-open since prefix cache layout changes invalidate the session.
-    rsclaw_version: String,
+    /// `prefix_id` (post-rename, was `rsclaw_version` pre-spec-v1.7) this
+    /// session was opened against. A bump triggers re-open since prefix
+    /// cache layout changes invalidate the session.
+    prefix_id: String,
     /// Largest `req.messages.len()` we've observed on this session.
     /// A subsequent call with a smaller list means the runtime trimmed
     /// history (compaction, repair, reset) and the server-side KV no
@@ -118,19 +119,19 @@ impl RsclawProvider {
 
     /// Atomically look up a cached session AND validate its freshness.
     /// Returns `None` (forcing a re-hydrate) when the entry is missing,
-    /// has a stale `rsclaw_version`, or its `last_seen_msgs_len` exceeds
-    /// the incoming `msgs_len` (history was trimmed under our feet).
-    /// On success bumps `last_seen_msgs_len` to the new value so the
-    /// next call's comparison is against the most recent state.
+    /// has a stale `prefix_id`, or its `last_seen_msgs_len` exceeds the
+    /// incoming `msgs_len` (history was trimmed under our feet). On
+    /// success bumps `last_seen_msgs_len` to the new value so the next
+    /// call's comparison is against the most recent state.
     fn lookup_and_bump(
         &self,
         session_key: &str,
-        rsclaw_version: &str,
+        prefix_id: &str,
         msgs_len: usize,
     ) -> Option<SessionEntry> {
         let mut map = self.sessions.lock().ok()?;
         let entry = map.get_mut(session_key)?;
-        if entry.rsclaw_version != rsclaw_version {
+        if entry.prefix_id != prefix_id {
             return None;
         }
         if msgs_len < entry.last_seen_msgs_len {
@@ -196,7 +197,7 @@ impl LlmProvider for RsclawProvider {
             // history list takes the cheaper open() path.
             let entry = match self.lookup_and_bump(
                 &session_key,
-                split.rsclaw_version,
+                &split.prefix_id,
                 req.messages.len(),
             ) {
                 Some(e) => e,
@@ -211,24 +212,23 @@ impl LlmProvider for RsclawProvider {
                     let entry = SessionEntry {
                         session_id: resp.session_id.clone(),
                         // Cache key MUST be the request value, not the
-                        // upstream canonical. open()'s response carries
-                        // the registered/canonical version (per §2.1),
-                        // which can differ from the requested alias —
-                        // e.g. request `rsclaw/latest`, response
-                        // `2026.5.5`. `lookup_and_bump` compares the
-                        // cached value against the next call's
-                        // `split.rsclaw_version` (also the alias), so
-                        // caching the canonical guarantees a miss on
-                        // every subsequent call: re-hydrate every turn,
-                        // defeating kvCacheMode=2 entirely. Replay's
-                        // response per §2.2 omits the field, which
-                        // happened to make recovery-path entries
-                        // self-consistent — but open()-path entries
-                        // were always broken. Version drift is
+                        // upstream canonical. open()'s response echoes
+                        // the resolved prefix_id (per §2.1.6), which can
+                        // differ from the requested alias — e.g. request
+                        // `rsclaw/latest`, response `rsclaw/2026.5.5`.
+                        // `lookup_and_bump` compares the cached value
+                        // against the next call's `split.prefix_id` (also
+                        // the alias), so caching the canonical
+                        // guarantees a miss on every subsequent call:
+                        // re-hydrate every turn, defeating kvCacheMode=2
+                        // entirely. Replay's response per §2.2 omits the
+                        // field, which happened to make recovery-path
+                        // entries self-consistent — but open()-path
+                        // entries were always broken. Version drift is
                         // detected server-side via 409 (handled by
                         // is_session_evicted), so we don't need the
                         // canonical here for freshness.
-                        rsclaw_version: split.rsclaw_version.to_owned(),
+                        prefix_id: split.prefix_id.clone(),
                         last_seen_msgs_len: req.messages.len(),
                     };
                     self.store(&session_key, entry.clone());
@@ -254,12 +254,12 @@ impl LlmProvider for RsclawProvider {
                         // Same rationale as the open/replay path above:
                         // cache key is the request alias, not the
                         // upstream canonical. (Replay's response per
-                        // §2.2 doesn't even include rsclaw_version, so
-                        // this site happened to be self-consistent
-                        // before — but normalising both sites on
-                        // `split.rsclaw_version` keeps the cache-key
-                        // contract single-sourced.)
-                        rsclaw_version: split.rsclaw_version.to_owned(),
+                        // §2.2 doesn't even include prefix_id, so this
+                        // site happened to be self-consistent before —
+                        // but normalising both sites on
+                        // `split.prefix_id` keeps the cache-key contract
+                        // single-sourced.)
+                        prefix_id: split.prefix_id.clone(),
                         last_seen_msgs_len: req.messages.len(),
                     };
                     self.store(&session_key, entry.clone());
@@ -285,11 +285,12 @@ impl RsclawProvider {
     async fn open(&self, split: &SplitRequest<'_>) -> Result<CreateSessionResp> {
         let url = format!("{}/sessions", self.base_url);
         let body = CreateSessionReq {
-            rsclaw_version: split.rsclaw_version,
-            user_suffix: split.user_suffix,
-            user_tools: &split.user_tools,
-            plugins_system: split.plugins_system,
-            skills_system: split.skills_system,
+            prefix_id: &split.prefix_id,
+            dynamic_prefix: DynamicPrefixWire {
+                system: split.dynamic_system,
+                tools: &split.dynamic_tools,
+                user_suffix: split.dynamic_user_suffix,
+            },
             options: Some(split.options.clone()),
         };
         // 180s caps the worst-case prefix-decode time for a fresh
@@ -334,25 +335,31 @@ impl RsclawProvider {
         // server — at the static-prefix slot, the only place the
         // protocol allows non-conversational system content.
         let (filtered, extra_suffix) = split_system_messages(messages);
+        // System-Role messages threaded through the conversation list
+        // (plugins/skills/ctx blocks — see comment above) get folded
+        // back into `dynamic_prefix.user_suffix`, the only protocol
+        // slot that accepts non-conversational system content. Without
+        // this they'd hit `400 invalid_history` on the worker side.
         let user_suffix_owned: String = if extra_suffix.is_empty() {
             String::new()
-        } else if split.user_suffix.is_empty() {
+        } else if split.dynamic_user_suffix.is_empty() {
             extra_suffix
         } else {
-            format!("{}\n\n{}", split.user_suffix, extra_suffix)
+            format!("{}\n\n{}", split.dynamic_user_suffix, extra_suffix)
         };
         let user_suffix: &str = if user_suffix_owned.is_empty() {
-            split.user_suffix
+            split.dynamic_user_suffix
         } else {
             &user_suffix_owned
         };
         let history: Vec<Value> = serialize_replay_history(&filtered);
         let body = ReplayReq {
-            rsclaw_version: split.rsclaw_version,
-            user_suffix,
-            user_tools: &split.user_tools,
-            plugins_system: split.plugins_system,
-            skills_system: split.skills_system,
+            prefix_id: &split.prefix_id,
+            dynamic_prefix: DynamicPrefixWire {
+                system: split.dynamic_system,
+                tools: &split.dynamic_tools,
+                user_suffix,
+            },
             history,
             options: Some(split.options.clone()),
         };
@@ -457,28 +464,43 @@ enum TurnOutcome {
 // Wire types — mirror rsclaw-protocol.md §2
 // ---------------------------------------------------------------------------
 
+/// Wire shape of `dynamic_prefix` per protocol §2.1.2.
+#[derive(Debug, Serialize)]
+struct DynamicPrefixWire<'a> {
+    #[serde(skip_serializing_if = "str::is_empty")]
+    system: &'a str,
+    /// All tools — builtin first, then per-client. rsclaw-server's
+    /// post-rename contract does NOT carry a separate top-level
+    /// `user_tools` field (its `backend/rsclaw_llm.rs` tests assert
+    /// `body.get("user_tools").is_none()`), so the split is encoded
+    /// purely as an ORDERING within this array. Builtins-first means
+    /// the chat-template-rendered byte prefix is stable across every
+    /// client of this RsClaw version, giving the worker's suffix-stable
+    /// LCP trim something to share between clients whose only
+    /// difference is per-machine MCP / plugin tools.
+    tools: &'a [Value],
+    #[serde(skip_serializing_if = "str::is_empty")]
+    user_suffix: &'a str,
+}
+
 #[derive(Debug, Serialize)]
 struct CreateSessionReq<'a> {
-    rsclaw_version: &'a str,
-    user_suffix: &'a str,
-    user_tools: &'a [Value],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    plugins_system: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    skills_system: Option<&'a str>,
+    /// Protocol §2.1.1 — namespaced `<ns>/<ver>`. rsclaw-server still
+    /// accepts the legacy `rsclaw_version` field name as an alias, but
+    /// we always send the post-rename name on new traffic.
+    prefix_id: &'a str,
+    /// Hybrid mode (§2.1.3) — always sent. When `prefix_id` hits the
+    /// static registry the worker forks from there; otherwise the
+    /// dynamic-LRU keyed by hash of `system + tools` is used.
+    dynamic_prefix: DynamicPrefixWire<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<TurnOptions>,
 }
 
 #[derive(Debug, Serialize)]
 struct ReplayReq<'a> {
-    rsclaw_version: &'a str,
-    user_suffix: &'a str,
-    user_tools: &'a [Value],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    plugins_system: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    skills_system: Option<&'a str>,
+    prefix_id: &'a str,
+    dynamic_prefix: DynamicPrefixWire<'a>,
     history: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<TurnOptions>,
@@ -487,12 +509,15 @@ struct ReplayReq<'a> {
 #[derive(Debug, Deserialize, Clone)]
 struct CreateSessionResp {
     session_id: String,
-    /// Per protocol §2.1 the create response includes `rsclaw_version`
-    /// (the registered/canonical version on the chosen node, which may
-    /// differ from the requested alias). Per §2.2 the **replay**
-    /// response does NOT include it — and rsclaw-server's backend
-    /// passes the upstream JSON straight through, so the field is
-    /// absent on replay.
+    /// Per protocol §2.1.6 the create response carries `prefix_id` (the
+    /// resolved canonical id, possibly different from the requested
+    /// alias). Per §2.2 the **replay** response does NOT include it —
+    /// rsclaw-server's backend passes the upstream JSON straight
+    /// through, so the field is absent on replay.
+    ///
+    /// Pre-rename clients receive `rsclaw_version` instead; we accept
+    /// either spelling via `serde alias` until the field is removed
+    /// upstream in v2.0.
     ///
     /// Modeled as `Option<String>` rather than `#[serde(default)]
     /// String` so we accept three shapes:
@@ -504,15 +529,15 @@ struct CreateSessionResp {
     /// rejects `null` outright (`invalid type: null, expected a
     /// string`), tanking the entire response parse and surfacing as a
     /// `rsclaw open: parse response` error to the caller. Upstream
-    /// nodes occasionally emit `"rsclaw_version": null` when the
-    /// version registry is mid-roll — accept that gracefully.
+    /// nodes occasionally emit `"prefix_id": null` when the version
+    /// registry is mid-roll — accept that gracefully.
     ///
     /// Parsed for forward compat / observability only. NOT used as the
     /// session cache key — see the SessionEntry construction sites for
     /// why caching the upstream canonical breaks alias-based requests.
-    #[serde(default)]
+    #[serde(default, alias = "rsclaw_version")]
     #[allow(dead_code)]
-    rsclaw_version: Option<String>,
+    prefix_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -664,46 +689,99 @@ impl TurnOptions {
 // Request splitting (LlmRequest → protocol fields)
 // ---------------------------------------------------------------------------
 
-/// Maps an existing `LlmRequest` (whose system prompt is one combined
-/// string) onto the protocol's split fields.
+/// Maps an `LlmRequest` onto the protocol's split fields per
+/// rsclaw-protocol §2.1 (post-rename, hybrid path).
 ///
-/// TODO: once `prompt_builder` exposes the constituent pieces
-/// (shared_prefix, user_suffix, plugins_system, skills_system,
-/// builtin_tools vs user_tools split), wire those through directly
-/// instead of reusing `req.system` as `user_suffix`. Until then, this
-/// shim keeps everything functional but burns the prefix cache slot
-/// since `shared_prefix == ""` means the version registry never has
-/// a hit.
+/// When the runtime populated `req.system_shared` / `req.system_user`
+/// (kvCacheMode=2 path on the main agent loop), the split lands in the
+/// "real" hybrid shape:
+/// - `dynamic_system`        ← shared system prefix (byte-stable across
+///   every RsClaw client of this version) → wire `dynamic_prefix.system`
+/// - `dynamic_user_suffix`   ← per-machine user suffix → wire
+///   `dynamic_prefix.user_suffix`
+/// - `dynamic_tools`         ← all tools, builtin-first then per-client.
+///   Encoded as a single array because rsclaw-server's post-rename
+///   contract drops top-level `user_tools` (verified by its own
+///   `body.get("user_tools").is_none()` test). The ordering preserves a
+///   byte-stable rendered prefix across clients of the same RsClaw
+///   version regardless of their per-machine MCP/plugin tools.
+///
+/// When the split fields are missing (internal sessions / non-runtime
+/// callers) we degrade gracefully: stuff `req.system` into
+/// `dynamic_system`, every tool into `dynamic_tools` in input order,
+/// leave `dynamic_user_suffix` empty. Same effective cache behaviour
+/// as before this change.
 struct SplitRequest<'a> {
-    rsclaw_version: &'a str,
-    user_suffix: &'a str,
-    user_tools: Vec<Value>,
-    plugins_system: Option<&'a str>,
-    skills_system: Option<&'a str>,
+    /// Namespaced `rsclaw/<id>` per protocol §2.10.1.
+    prefix_id: String,
+    dynamic_system: &'a str,
+    dynamic_user_suffix: &'a str,
+    dynamic_tools: Vec<Value>,
     options: TurnOptions,
 }
 
 fn split_request<'a>(req: &'a LlmRequest) -> Result<SplitRequest<'a>> {
-    // The model field doubles as the rsclaw_version handle for now —
-    // rsclaw-server resolves it. Once prompt_builder splits the prompt
-    // we can put the proper version digest here.
-    let user_tools: Vec<Value> = req
-        .tools
-        .iter()
-        .map(|t| {
-            json!({
-                "name": t.name,
-                "description": t.description,
-                "input_schema": t.parameters,
-            })
+    // `parse_model` strips any leading `rsclaw/` before the request
+    // reaches this provider, so by the time we see `req.model` it's
+    // typically the bare id (`qwen3-235b`). Re-namespace it before
+    // putting it on the wire — protocol §2.10.1 mandates exactly one
+    // `/` separator, and `400 prefix_id_invalid` rejects unprefixed
+    // ids at the worker layer.
+    let prefix_id = if req.model.contains('/') {
+        req.model.clone()
+    } else {
+        format!("rsclaw/{}", req.model)
+    };
+
+    let tool_json = |t: &super::ToolDef| {
+        json!({
+            "name": t.name,
+            "description": t.description,
+            "input_schema": t.parameters,
         })
-        .collect();
+    };
+
+    let (dynamic_system, dynamic_user_suffix, dynamic_tools) =
+        if req.system_shared.is_some() || req.system_user.is_some() {
+            // Real split — sort tools [builtin..., per-client...] so
+            // the rendered chat-template prefix is byte-stable across
+            // every client of this version up to the per-client tool
+            // boundary.
+            let mut builtin_t = Vec::new();
+            let mut user_t = Vec::new();
+            for t in &req.tools {
+                if crate::agent::prompt_builder::BUILTIN_TOOL_NAMES
+                    .contains(&t.name.as_str())
+                {
+                    builtin_t.push(tool_json(t));
+                } else {
+                    user_t.push(tool_json(t));
+                }
+            }
+            builtin_t.extend(user_t);
+            (
+                req.system_shared.as_deref().unwrap_or(""),
+                req.system_user.as_deref().unwrap_or(""),
+                builtin_t,
+            )
+        } else {
+            // No split available — collapse everything into the
+            // dynamic prefix in input order. Per-client LRU key is over
+            // the full system + tools, so every distinct caller still
+            // gets its own slot (same as pre-split behaviour).
+            let all_tools: Vec<Value> = req.tools.iter().map(tool_json).collect();
+            (
+                req.system.as_deref().unwrap_or(""),
+                "",
+                all_tools,
+            )
+        };
+
     Ok(SplitRequest {
-        rsclaw_version: &req.model,
-        user_suffix: req.system.as_deref().unwrap_or(""),
-        user_tools,
-        plugins_system: None,
-        skills_system: None,
+        prefix_id,
+        dynamic_system,
+        dynamic_user_suffix,
+        dynamic_tools,
         options: TurnOptions::from_request(req),
     })
 }
@@ -1665,29 +1743,125 @@ mod tests {
         LlmRequest {
             model: "2026.5.5".into(),
             messages,
-            tools: vec![],
             system: Some("you are an agent".into()),
-            max_tokens: None,
-            temperature: None,
-            frequency_penalty: None,
-            thinking_budget: None,
             kv_cache_mode: mode,
             session_key: key.map(str::to_string),
+            ..Default::default()
         }
     }
 
     #[test]
-    fn split_request_maps_tools() {
+    fn split_request_namespaces_bare_model_id() {
+        // `parse_model` strips the `rsclaw/` prefix before reaching the
+        // provider, so by the time we see `req.model` it's the bare id.
+        // `split_request` MUST re-namespace it — protocol §2.10.1 rejects
+        // `prefix_id` without exactly one `/` separator.
+        let req = req_with(vec![], 2, Some("k"));
+        let split = split_request(&req).unwrap();
+        assert_eq!(split.prefix_id, "rsclaw/2026.5.5");
+    }
+
+    #[test]
+    fn split_request_keeps_already_namespaced_model() {
+        // If the caller already gave a namespaced id (e.g. configured a
+        // direct prefix_id, no alias), don't double-prefix.
         let mut req = req_with(vec![], 2, Some("k"));
+        req.model = "myorg/qwen3-235b".into();
+        let split = split_request(&req).unwrap();
+        assert_eq!(split.prefix_id, "myorg/qwen3-235b");
+    }
+
+    #[test]
+    fn split_request_orders_builtin_before_user_tools_when_split_present() {
+        // With `system_shared` populated, the runtime is in real-split
+        // mode: tools are ordered [builtin..., user...] inside
+        // `dynamic_prefix.tools` so the chat-template-rendered byte
+        // prefix stays stable across every client of this RsClaw
+        // version up to the per-client tool boundary. Top-level
+        // `user_tools` is GONE in the post-rename protocol — verified
+        // by rsclaw-server's own
+        // `v1 top-level user_tools must not be sent` test.
+        let mut req = req_with(vec![], 2, Some("k"));
+        req.system_shared = Some("<shared system>".into());
+        req.system_user = Some("<user suffix>".into());
+        // Push user-tool first to prove the split sorts it after the
+        // builtin regardless of input order.
         req.tools.push(ToolDef {
-            name: "search".into(),
+            name: "search".into(), // not in BUILTIN_TOOL_NAMES
             description: "search the web".into(),
             parameters: json!({"type":"object","properties":{}}),
         });
+        req.tools.push(ToolDef {
+            name: "memory".into(), // builtin
+            description: "memory tool".into(),
+            parameters: json!({"type":"object","properties":{}}),
+        });
         let split = split_request(&req).unwrap();
-        assert_eq!(split.user_tools.len(), 1);
-        assert_eq!(split.user_tools[0]["name"], "search");
-        assert!(split.user_tools[0].get("input_schema").is_some());
+        assert_eq!(split.dynamic_tools.len(), 2);
+        assert_eq!(
+            split.dynamic_tools[0]["name"], "memory",
+            "builtin must sort before user tool"
+        );
+        assert_eq!(split.dynamic_tools[1]["name"], "search");
+        assert_eq!(split.dynamic_system, "<shared system>");
+        assert_eq!(split.dynamic_user_suffix, "<user suffix>");
+    }
+
+    #[test]
+    fn split_request_collapses_to_dynamic_when_no_split() {
+        // Internal sessions / non-runtime callers don't populate the
+        // shared/user split. Everything collapses into `dynamic_prefix`
+        // in input order — per-client cache sharing is forfeit but
+        // that's the no-regression baseline.
+        let mut req = req_with(vec![], 2, Some("k"));
+        req.tools.push(ToolDef {
+            name: "search".into(),
+            description: "search".into(),
+            parameters: json!({"type":"object"}),
+        });
+        let split = split_request(&req).unwrap();
+        assert_eq!(split.dynamic_tools.len(), 1);
+        assert_eq!(split.dynamic_tools[0]["name"], "search");
+        assert_eq!(split.dynamic_system, "you are an agent");
+        assert_eq!(split.dynamic_user_suffix, "");
+    }
+
+    #[test]
+    fn create_session_req_serialises_post_rename_shape() {
+        // Matches the wire body rsclaw-server's backend/rsclaw_llm.rs
+        // tests assert: `prefix_id` + `dynamic_prefix{system,tools,
+        // user_suffix}` + `options`, and explicitly NO top-level
+        // `user_tools` / `rsclaw_version` / `user_suffix` /
+        // `plugins_system` / `skills_system`. Those are all pre-rename
+        // fields that the user said will be retired soon.
+        let mut req = req_with(vec![], 2, Some("k"));
+        req.system_shared = Some("<sys>".into());
+        req.system_user = Some("<suf>".into());
+        req.tools.push(ToolDef {
+            name: "memory".into(),
+            description: "memory tool".into(),
+            parameters: json!({"type":"object"}),
+        });
+        let split = split_request(&req).unwrap();
+        let body = CreateSessionReq {
+            prefix_id: &split.prefix_id,
+            dynamic_prefix: DynamicPrefixWire {
+                system: split.dynamic_system,
+                tools: &split.dynamic_tools,
+                user_suffix: split.dynamic_user_suffix,
+            },
+            options: Some(split.options.clone()),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["prefix_id"], "rsclaw/2026.5.5");
+        assert_eq!(v["dynamic_prefix"]["system"], "<sys>");
+        assert_eq!(v["dynamic_prefix"]["user_suffix"], "<suf>");
+        assert_eq!(v["dynamic_prefix"]["tools"][0]["name"], "memory");
+        assert!(v.get("user_tools").is_none(), "post-rename body must omit top-level user_tools");
+        assert!(v.get("rsclaw_version").is_none(), "rsclaw_version is the pre-rename name; never send");
+        assert!(v.get("user_suffix").is_none(), "user_suffix lives inside dynamic_prefix");
+        assert!(v.get("plugins_system").is_none(), "pre-rename field; folded into dynamic_prefix.system");
+        assert!(v.get("skills_system").is_none(), "pre-rename field; folded into dynamic_prefix.system");
     }
 
     #[test]
@@ -1965,20 +2139,20 @@ mod tests {
             "k",
             SessionEntry {
                 session_id: "rs_w7_abc".into(),
-                rsclaw_version: "2026.5.5".into(),
+                prefix_id: "rsclaw/2026.5.5".into(),
                 last_seen_msgs_len: 12,
             },
         );
         // Same len → cached entry returned, last_seen unchanged.
-        assert!(provider.lookup_and_bump("k", "2026.5.5", 12).is_some());
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.5", 12).is_some());
         // Growth → bumped, returned.
-        assert!(provider.lookup_and_bump("k", "2026.5.5", 14).is_some());
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.5", 14).is_some());
         // Shrink (compaction trimmed history) → None, caller re-hydrates.
-        assert!(provider.lookup_and_bump("k", "2026.5.5", 8).is_none());
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.5", 8).is_none());
         // Version drift → None even if len matches.
-        assert!(provider.lookup_and_bump("k", "2026.5.6", 14).is_none());
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.6", 14).is_none());
         // Missing key → None.
-        assert!(provider.lookup_and_bump("missing", "2026.5.5", 14).is_none());
+        assert!(provider.lookup_and_bump("missing", "rsclaw/2026.5.5", 14).is_none());
     }
 
     #[test]
@@ -2331,10 +2505,10 @@ mod tests {
     }
 
     #[test]
-    fn create_session_resp_parses_replay_shape_without_rsclaw_version() {
+    fn create_session_resp_parses_replay_shape_without_prefix_id() {
         // Protocol §2.2 replay response carries session_id but NOT
-        // rsclaw_version. Without #[serde(default)] this fails with
-        // "missing field rsclaw_version" and breaks every replay path.
+        // prefix_id. Without #[serde(default)] this fails with
+        // "missing field prefix_id" and breaks every replay path.
         let body = r#"{
             "session_id": "rs_w7_8a3c1f2b",
             "n_prefix_tokens": 27981,
@@ -2346,23 +2520,38 @@ mod tests {
         }"#;
         let resp: CreateSessionResp = serde_json::from_str(body).expect("replay shape parses");
         assert_eq!(resp.session_id, "rs_w7_8a3c1f2b");
-        assert!(resp.rsclaw_version.is_none());
+        assert!(resp.prefix_id.is_none());
     }
 
     #[test]
-    fn create_session_resp_parses_create_shape_with_rsclaw_version() {
-        // Protocol §2.1 create response DOES carry rsclaw_version.
+    fn create_session_resp_parses_create_shape_with_prefix_id() {
+        // Protocol §2.1.6 (post-rename) create response carries
+        // `prefix_id`. New servers send this name natively.
+        let body = r#"{
+            "session_id": "rs_w7_8a3c1f2b",
+            "prefix_id": "rsclaw/2026.5.5"
+        }"#;
+        let resp: CreateSessionResp = serde_json::from_str(body).expect("create shape parses");
+        assert_eq!(resp.prefix_id.as_deref(), Some("rsclaw/2026.5.5"));
+    }
+
+    #[test]
+    fn create_session_resp_accepts_legacy_rsclaw_version_alias() {
+        // Pre-rename servers (and rsclaw-server's auto-assembly path
+        // for very old workers) still emit `rsclaw_version`. The
+        // `#[serde(alias = "rsclaw_version")]` on the field keeps both
+        // spellings working until v2.0 drops the alias.
         let body = r#"{
             "session_id": "rs_w7_8a3c1f2b",
             "rsclaw_version": "2026.5.5"
         }"#;
-        let resp: CreateSessionResp = serde_json::from_str(body).expect("create shape parses");
-        assert_eq!(resp.rsclaw_version.as_deref(), Some("2026.5.5"));
+        let resp: CreateSessionResp = serde_json::from_str(body).expect("legacy alias parses");
+        assert_eq!(resp.prefix_id.as_deref(), Some("2026.5.5"));
     }
 
     #[test]
-    fn create_session_resp_parses_explicit_null_rsclaw_version() {
-        // `rsclaw_version: String` with `#[serde(default)]` would FAIL
+    fn create_session_resp_parses_explicit_null_prefix_id() {
+        // `prefix_id: String` with `#[serde(default)]` would FAIL
         // parsing on explicit JSON null with "invalid type: null,
         // expected a string", tanking the whole `/sessions` (or
         // `/sessions/replay`) response and surfacing as an opaque
@@ -2370,30 +2559,30 @@ mod tests {
         // occasionally emit null while the version registry is
         // mid-roll. Option<String> accepts null → None and keeps the
         // rest of the response usable.
-        let body = r#"{"session_id":"rs_a_b","rsclaw_version":null}"#;
+        let body = r#"{"session_id":"rs_a_b","prefix_id":null}"#;
         let resp: CreateSessionResp =
-            serde_json::from_str(body).expect("null rsclaw_version must parse");
+            serde_json::from_str(body).expect("null prefix_id must parse");
         assert_eq!(resp.session_id, "rs_a_b");
-        assert!(resp.rsclaw_version.is_none());
+        assert!(resp.prefix_id.is_none());
     }
 
     #[test]
-    fn create_session_resp_parses_missing_rsclaw_version() {
-        // The replay response per §2.2 omits rsclaw_version entirely.
+    fn create_session_resp_parses_missing_prefix_id() {
+        // The replay response per §2.2 omits prefix_id entirely.
         // Behaviour must match the explicit-null case: parse cleanly,
         // surface None.
         let body = r#"{"session_id":"rs_a_b"}"#;
         let resp: CreateSessionResp = serde_json::from_str(body).expect("missing field must parse");
-        assert!(resp.rsclaw_version.is_none());
+        assert!(resp.prefix_id.is_none());
     }
 
     #[test]
-    fn create_session_resp_parses_populated_rsclaw_version() {
+    fn create_session_resp_parses_populated_prefix_id() {
         // Round-trip the happy path so the Option<String> change
         // doesn't accidentally start coercing real values to None.
-        let body = r#"{"session_id":"rs_a_b","rsclaw_version":"2026.5.5"}"#;
+        let body = r#"{"session_id":"rs_a_b","prefix_id":"rsclaw/2026.5.5"}"#;
         let resp: CreateSessionResp = serde_json::from_str(body).expect("string field must parse");
-        assert_eq!(resp.rsclaw_version.as_deref(), Some("2026.5.5"));
+        assert_eq!(resp.prefix_id.as_deref(), Some("rsclaw/2026.5.5"));
     }
 
     #[test]
