@@ -96,6 +96,19 @@ async fn start_server(addr: SocketAddr) {
     let store = Arc::new(Store::open(data_dir.path(), MemoryTier::Low).expect("store"));
     let agents = Arc::new(AgentRegistry::from_config(&config));
     let (event_tx, _) = broadcast::channel(16);
+    let computer_permission = Arc::new(
+        rsclaw::computer::permission::RedbPermissionStore::new(
+            Arc::clone(&store.db),
+            false,
+        ),
+    );
+    let (computer_permission_tx, _) =
+        broadcast::channel::<rsclaw::computer::permission::PermissionRequest>(64);
+    let (computer_status_tx, _) =
+        broadcast::channel::<rsclaw::computer::status::ComputerUseStatus>(256);
+    let computer_runs: Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    > = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
 
     let state = AppState {
         config,
@@ -103,6 +116,10 @@ async fn start_server(addr: SocketAddr) {
         agents,
         store,
         event_bus: event_tx,
+        computer_permission,
+        computer_permission_tx,
+        computer_status_tx,
+        computer_runs,
         devices: Arc::new(rsclaw::ws::DeviceStore::new(std::path::PathBuf::from(
             "/tmp/test-devices.json",
         ))),
@@ -191,12 +208,29 @@ async fn auth_token_gates_non_health_endpoints() {
     let store = Arc::new(Store::open(data_dir.path(), MemoryTier::Low).expect("store"));
     let agents = Arc::new(AgentRegistry::from_config(&config));
     let (event_tx, _) = broadcast::channel(16);
+    let computer_permission = Arc::new(
+        rsclaw::computer::permission::RedbPermissionStore::new(
+            Arc::clone(&store.db),
+            false,
+        ),
+    );
+    let (computer_permission_tx, _) =
+        broadcast::channel::<rsclaw::computer::permission::PermissionRequest>(64);
+    let (computer_status_tx, _) =
+        broadcast::channel::<rsclaw::computer::status::ComputerUseStatus>(256);
+    let computer_runs: Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    > = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let state = AppState {
         config,
         live,
         agents,
         store,
         event_bus: event_tx,
+        computer_permission,
+        computer_permission_tx,
+        computer_status_tx,
+        computer_runs,
         devices: Arc::new(rsclaw::ws::DeviceStore::new(std::path::PathBuf::from(
             "/tmp/test-devices.json",
         ))),
