@@ -5,25 +5,17 @@
 //! translates between the legacy `serde_json::Value` tool-call schema
 //! and those typed building blocks.
 //!
-//! Action routing
-//! - `screenshot`                     — `tool_screenshot` (kept here so we
-//!                                       preserve the resize / disk-save
-//!                                       contract used by chat history).
-//! - `mouse_*` / `click` / `drag` /
-//!   `scroll` / `type` / `key` /
-//!   `hold_key` / `wait`              — translated to [`Action`] and
-//!                                       executed via [`NativeOperator`].
-//! - `triple_click` /
-//!   `cursor_position` /
-//!   `get_active_window` / `ui_tree`  — kept as inline subprocess helpers
-//!                                       (they're queries, not really
-//!                                       part of the operator action
-//!                                       space).
-//! - `list_app_rules` /
-//!   `get_app_rule`                   — backed by [`AppRuleSet`].
-//! - `ui_tars`                        — end-to-end VLM loop via
-//!                                       [`VlmDriver`]; supports any
-//!                                       vision-capable LLM provider.
+//! Action routing:
+//! - `screenshot` → `tool_screenshot`. Kept here so the resize / disk-save
+//!   contract used by chat history is preserved.
+//! - `mouse_*` / `click` / `drag` / `scroll` / `type` / `key` / `hold_key` /
+//!   `wait` → translated to [`Action`] and executed via [`NativeOperator`].
+//! - `triple_click` / `cursor_position` / `get_active_window` / `ui_tree`
+//!   → inline subprocess helpers; they're queries, not part of the
+//!   operator action space.
+//! - `list_app_rules` / `get_app_rule` → backed by [`AppRuleSet`].
+//! - `ui_tars` → end-to-end VLM loop via [`VlmDriver`]; supports any
+//!   vision-capable LLM provider.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;

@@ -718,11 +718,11 @@ pub fn resolve_vision_model_for(
 /// Look up `model_name` (e.g. `"kimi/kimi-for-coding"` or just
 /// `"kimi-for-coding"`) in the provider config and return whether its
 /// `input` array contains `image`. Returns:
-///   - `Some(true)`  — explicitly declared as image-capable.
-///   - `Some(false)` — explicitly declared as text-only (no `image`
-///                     in the array).
-///   - `None`        — no `models[].input` entry found; caller should
-///                     fall back to the blocklist heuristic.
+///   - `Some(true)` — explicitly declared as image-capable.
+///   - `Some(false)` — explicitly declared as text-only (no `image` in the
+///     array).
+///   - `None` — no `models[].input` entry found; caller should fall back
+///     to the blocklist heuristic.
 ///
 /// The lookup is fuzzy: it tries `provider/model_id` first (when the
 /// name contains `/`), then falls back to scanning every provider for a

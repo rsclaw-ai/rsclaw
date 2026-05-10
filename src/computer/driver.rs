@@ -10,20 +10,12 @@
 //!   2. Build the system prompt: base GUI-agent skeleton + operator's
 //!      `action_spaces()` + matched app-rules.
 //!   3. Loop:
-//!        a. `operator.screenshot()` — capture the current screen / window.
-//!        b. Compose a fresh `LlmRequest` with the screenshot + history
-//!           summary as a single user message. The system prompt stays
-//!           the same across the loop (the model sees the same rules).
-//!        c. `provider.stream(req)` and accumulate the assistant text
-//!           until `StreamEvent::Done`.
-//!        d. `parser::parse_vlm_response()` — extract a `Vec<ParsedAction>`.
-//!        e. For each parsed action:
-//!             - Map to an executable [`Action`] via `parsed_to_action`.
-//!             - `finished` / `call_user` terminate the loop with the
-//!               corresponding [`DriverOutcome`].
-//!             - `operator.execute(action)` for everything else; record
-//!               the result in history.
-//!        f. Bump the loop counter and check abort flag + max_loop.
+//!     a. `operator.screenshot()` captures the current screen / window.
+//!     b. Compose a fresh `LlmRequest` with the screenshot + history summary as a single user message — the system prompt stays the same across iterations.
+//!     c. `provider.stream(req)` accumulates assistant text until `StreamEvent::Done`.
+//!     d. `parser::parse_vlm_response()` extracts a `Vec<ParsedAction>`.
+//!     e. Each parsed action maps to an executable [`Action`] via `parsed_to_action` — `finished` / `call_user` terminate with the matching [`DriverOutcome`], everything else runs through `operator.execute(action)` with the result appended to history.
+//!     f. Bump the loop counter, then check the abort flag + max_loop.
 //!
 //! The driver is fully model-agnostic — it works with any vision model
 //! that follows the Thought/Action format the prompt asks for. Providers
