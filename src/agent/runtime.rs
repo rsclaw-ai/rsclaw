@@ -1739,8 +1739,19 @@ impl AgentRuntime {
                                 None
                             } else {
                                 let model = self.resolve_model_name();
-                                let context_tokens = self.live.agents.read().await.defaults.context_tokens.unwrap_or(64_000) as usize;
-                                let cfg = self.live.agents.read().await.defaults.compaction.clone().unwrap_or_default();
+                                // Single read guard for both defaults — the
+                                // prior code held two consecutive
+                                // `self.live.agents.read().await` calls a few
+                                // tokens apart. Compaction-on-/clear runs on
+                                // the user-input path so the contention is
+                                // observable, not theoretical.
+                                let (context_tokens, cfg) = {
+                                    let agents = self.live.agents.read().await;
+                                    (
+                                        agents.defaults.context_tokens.unwrap_or(64_000) as usize,
+                                        agents.defaults.compaction.clone().unwrap_or_default(),
+                                    )
+                                };
                                 let default_transcript = (context_tokens * 7 / 10).max(16_000);
                                 let max_transcript = cfg.max_transcript_tokens.map(|t| t as usize).unwrap_or(default_transcript);
                                 // Render transcript (reuse the same logic as compaction).
@@ -3679,7 +3690,18 @@ impl AgentRuntime {
         dynamic_ctx: Vec<String>,
         new_skills_tail: Vec<String>,
     ) -> Result<AgentReply> {
-        let pruning_cfg = self.live.agents.read().await.defaults.context_pruning.clone();
+        // Pull both defaults the agent loop's prelude needs under a
+        // single read guard. Previously these were two adjacent
+        // `self.live.agents.read().await` calls — once for
+        // `context_pruning`, once for `context_tokens` — paying the
+        // RwLock acquisition cost twice on every agent_loop entry.
+        let (pruning_cfg, defaults_context_tokens) = {
+            let agents = self.live.agents.read().await;
+            (
+                agents.defaults.context_pruning.clone(),
+                agents.defaults.context_tokens,
+            )
+        };
 
         // Resolve context budget (tokens) for history trimming.
         // Priority: agent model config > defaults.contextTokens >
@@ -3690,7 +3712,7 @@ impl AgentRuntime {
             .model
             .as_ref()
             .and_then(|m| m.context_tokens)
-            .or(self.live.agents.read().await.defaults.context_tokens)
+            .or(defaults_context_tokens)
             .or_else(|| {
                 self.config
                     .agents
@@ -4222,19 +4244,33 @@ impl AgentRuntime {
                 );
             }
 
+            // Resolve temperature + context_limit under one read guard.
+            // Both blocks consult the same `agents_live` snapshot
+            // (per-agent overrides + global defaults) and run
+            // back-to-back with no await in between, so a single
+            // acquisition is strictly correct and halves RwLock
+            // traffic on the hot path.
+            //
             // Temperature resolution order (read live so hot-reload takes
             // effect on the next turn without a restart):
             //   1. Per-agent override (live.agents.list[id].temperature)
             //   2. Global defaults (live.agents.defaults.temperature)
             //   3. "Auto" heuristic — 0.6 with tools, 0.7 chat, None for thinking
-            let temperature = {
+            //
+            // context_limit chain (matches AgentHandle.context_window so
+            // /status and the pre-flight emergency compact agree):
+            // per-agent model.context_tokens → defaults.context_tokens
+            // → 64000. Previously read defaults only, so a per-agent
+            // override of 200_000 was ignored here and emergency
+            // compaction kicked in too early.
+            let (temperature, context_limit) = {
                 let agents_live = self.live.agents.read().await;
-                let per_agent = agents_live
+                let per_agent_entry = agents_live
                     .list
                     .iter()
-                    .find(|a| a.id == self.handle.id)
-                    .and_then(|a| a.temperature);
-                per_agent
+                    .find(|a| a.id == self.handle.id);
+                let per_agent_temp = per_agent_entry.and_then(|a| a.temperature);
+                let temperature = per_agent_temp
                     .or(agents_live.defaults.temperature)
                     .map(Some)
                     .unwrap_or_else(|| {
@@ -4245,26 +4281,16 @@ impl AgentRuntime {
                         } else {
                             Some(0.6)
                         }
-                    })
+                    });
+                let per_agent_ctx = per_agent_entry
+                    .and_then(|a| a.model.as_ref().and_then(|m| m.context_tokens));
+                let context_limit = per_agent_ctx
+                    .or(agents_live.defaults.context_tokens)
+                    .unwrap_or(64_000) as usize;
+                (temperature, context_limit)
             };
 
-// Pre-flight check: emergency compact if we'd exceed context.
-            // Same resolution chain as AgentHandle.context_window (the
-            // value /status displays): per-agent model.contextTokens →
-            // agents.defaults.contextTokens → 64000. Previously this only
-            // read defaults, so a per-agent override of 200_000 was
-            // ignored here and emergency compaction kicked in too early.
-            let context_limit = {
-                let agents_live = self.live.agents.read().await;
-                let per_agent = agents_live
-                    .list
-                    .iter()
-                    .find(|a| a.id == self.handle.id)
-                    .and_then(|a| a.model.as_ref().and_then(|m| m.context_tokens));
-                per_agent
-                    .or(agents_live.defaults.context_tokens)
-                    .unwrap_or(64_000) as usize
-            };
+            // Pre-flight check: emergency compact if we'd exceed context.
             let overhead = self.estimate_fixed_overhead();
             let session_tokens: usize = self.sessions
                 .get(&ctx.session_key)

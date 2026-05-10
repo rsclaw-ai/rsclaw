@@ -613,7 +613,13 @@ mod tests {
 
     #[test]
     fn default_constructs() {
-        let _op = NativeOperator::default();
+        // Calls Default explicitly through the trait so the test
+        // catches accidental removal of `impl Default for
+        // NativeOperator`. `<T as Default>::default()` keeps the trait
+        // dispatch path visible without tripping
+        // clippy::default_constructed_unit_structs (the lint targets
+        // the field-syntax `T::default()` shorthand on unit structs).
+        let _op: NativeOperator = <NativeOperator as Default>::default();
         let _op2 = NativeOperator::new();
     }
 
