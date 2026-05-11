@@ -1023,7 +1023,7 @@ pub(crate) fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "codex".to_owned(),
-        description: "Execute coding tasks using OpenAI Codex CLI (MCP Server mode). Uses OpenAI's coding capabilities with sandboxed file operations. IMPORTANT: When creating new projects or files, ALWAYS create a dedicated project directory first. Requires Codex CLI installation: npm install -g @openai/codex. The task will run asynchronously and results will be sent when complete.".to_owned(),
+        description: "Execute coding tasks using OpenAI Codex via ACP protocol (@agentclientprotocol/codex-acp). Uses OpenAI's coding capabilities with sandboxed file operations. IMPORTANT: When creating new projects or files, ALWAYS create a dedicated project directory first. Requires codex-acp installation: npm install -g @agentclientprotocol/codex-acp. The task will run asynchronously with real-time progress updates and results will be sent when complete.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {

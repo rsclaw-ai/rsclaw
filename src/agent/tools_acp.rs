@@ -1257,55 +1257,15 @@ impl AgentRuntime {
     }
 
     // -----------------------------------------------------------------------
-    // Codex MCP integration
+    // Codex ACP integration
     // -----------------------------------------------------------------------
 
-    /// Get or create the Codex MCP client.
-    /// Uses Codex CLI's MCP server mode (codex mcp-server).
+    /// Get or create the Codex ACP client.
+    /// Uses @agentclientprotocol/codex-acp adapter for ACP protocol.
     pub(crate) async fn get_codex_client(&self) -> Result<crate::acp::CodexClient> {
         if let Some(client) = self.codex_client.get() {
             return Ok(client.clone());
         }
-
-        // Find codex executable
-        // On Windows, prefer .cmd wrapper over shell script (same reason as opencode)
-        let command = if cfg!(target_os = "windows") {
-            self.handle
-                .config
-                .codex
-                .as_ref()
-                .and_then(|c| c.command.clone())
-                .or_else(|| {
-                    which::which("codex.cmd")
-                        .or_else(|_| which::which("codex"))
-                        .map(|p| {
-                            let path_str = p.to_string_lossy().to_string();
-                            if path_str.starts_with('/') {
-                                let parts: Vec<&str> = path_str.splitn(3, '/').collect();
-                                if parts.len() >= 3 && parts[0].is_empty() && parts[1].len() == 1 {
-                                    let drive = parts[1].to_uppercase();
-                                    let rest = parts[2];
-                                    format!("{}:\\{}", drive, rest.replace('/', "\\"))
-                                } else {
-                                    path_str
-                                }
-                            } else {
-                                path_str
-                            }
-                        }).ok()
-                })
-                .or_else(|| std::env::var("CODEX_PATH").ok())
-                .unwrap_or_else(|| "codex.cmd".to_string())
-        } else {
-            self.handle
-                .config
-                .codex
-                .as_ref()
-                .and_then(|c| c.command.clone())
-                .or_else(|| which::which("codex").map(|p| p.to_string_lossy().to_string()).ok())
-                .or_else(|| std::env::var("CODEX_PATH").ok())
-                .unwrap_or_else(|| "codex".to_string())
-        };
 
         // Use agent's workspace directory
         let cwd = self
@@ -1317,6 +1277,27 @@ impl AgentRuntime {
             .map(expand_tilde)
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
 
+        // Convert to Windows native path string (avoid MSYS2/Git Bash Unix-style paths)
+        let cwd_str = if cfg!(target_os = "windows") {
+            let abs_path = if cwd.is_absolute() {
+                cwd.clone()
+            } else {
+                std::env::current_dir().unwrap_or_default().join(&cwd)
+            };
+            abs_path.to_string_lossy().to_string()
+        } else {
+            cwd.to_string_lossy().to_string()
+        };
+
+        // Get command from config or environment
+        let command = self
+            .handle
+            .config
+            .codex
+            .as_ref()
+            .and_then(|c| c.command.clone())
+            .or_else(|| std::env::var("CODEX_ACP_PATH").ok());
+
         // Get model from config or environment
         let model = self
             .handle
@@ -1326,17 +1307,17 @@ impl AgentRuntime {
             .and_then(|c| c.model.clone())
             .or_else(|| std::env::var("CODEX_MODEL").ok());
 
-        tracing::info!(command = %command, cwd = %cwd.display(), model = ?model, "Codex: starting MCP server");
+        tracing::info!(command = ?command, cwd = %cwd_str, model = ?model, "Codex: starting ACP adapter");
 
-        let client = crate::acp::CodexClient::spawn(cwd, Some(&command), model.as_deref()).await?;
+        let client = crate::acp::CodexClient::spawn(&cwd_str, command.as_deref(), model.as_deref()).await?;
 
         self.codex_client.set(client.clone()).ok();
         Ok(client)
     }
 
-    /// Tool handler for Codex MCP calls - runs asynchronously.
+    /// Tool handler for Codex ACP calls - runs fully asynchronously.
+    /// Initialization and prompt execution happen in background task to avoid blocking main loop.
     /// Results are delivered via notification channel when complete.
-    /// Codex uses MCP protocol (not ACP), so it's simpler - no event streaming.
     pub(crate) async fn tool_codex(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let task = args["task"]
             .as_str()
@@ -1354,30 +1335,8 @@ impl AgentRuntime {
         let target_id = ctx.peer_id.clone();
         let channel_name = ctx.channel.clone();
 
-        // Try to get client, send error notification if failed
-        let client = match self.get_codex_client().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("tool_codex: get_client failed: {}", e);
-                if let Some(ref tx) = notif_tx {
-                    let _ = tx.send(crate::channel::OutboundMessage {
-                        target_id: target_id.clone(),
-                        is_group: false,
-                        text: crate::i18n::t_fmt("acp_start_failed", lang, &[("name", "Codex"), ("error", &e.to_string())]),
-                        reply_to: None,
-                        images: vec![],
-                        files: vec![],
-                        channel: Some(channel_name.clone()),
-                        account: None,
-                    });
-                }
-                return Err(e);
-            }
-        };
-
-        let task_str = task.to_string();
-
-        // Send initial notification
+        // Send initial notification immediately (before spawning background task)
+        tracing::info!("tool_codex: sending initial notification to {}", target_id);
         if let Some(ref tx) = notif_tx {
             let _ = tx.send(crate::channel::OutboundMessage {
                 target_id: target_id.clone(),
@@ -1391,63 +1350,311 @@ impl AgentRuntime {
             });
         }
 
-        // Spawn background task
+        let task_str = task.to_string();
         let notif_tx_bg = notif_tx.clone();
         let target_id_bg = target_id.clone();
         let channel_bg = channel_name.clone();
         let lang_bg = lang;
-        tokio::spawn(async move {
-            tracing::info!("tool_codex: background task started, calling execute");
 
+        // Clone Arc references needed for background task (not the entire AgentRuntime)
+        let codex_client_cell = self.codex_client.clone();
+        let handle = self.handle.clone();
+        let config = self.config.clone();
+
+        // Clone agent's own inbox for result injection after completion.
+        let self_tx = self.handle.tx.clone();
+        let self_session = ctx.session_key.clone();
+        let self_channel = ctx.channel.clone();
+        let self_peer_id = ctx.peer_id.clone();
+        let self_chat_id = ctx.chat_id.clone();
+
+        // Spawn background task - do EVERYTHING in background including client initialization
+        tokio::spawn(async move {
+            tracing::info!("tool_codex: background task started");
+
+            // Get or create client (inline version of get_codex_client)
+            let client = if let Some(c) = codex_client_cell.get() {
+                c.clone()
+            } else {
+                // Create client inline
+                let cwd = handle.config.workspace
+                    .as_deref()
+                    .or(config.agents.defaults.workspace.as_deref())
+                    .map(expand_tilde)
+                    .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+                let cwd_str = if cfg!(target_os = "windows") {
+                    let abs_path = if cwd.is_absolute() { cwd.clone() } else {
+                        std::env::current_dir().unwrap_or_default().join(&cwd)
+                    };
+                    abs_path.to_string_lossy().to_string()
+                } else {
+                    cwd.to_string_lossy().to_string()
+                };
+
+                let command = handle.config.codex.as_ref().and_then(|c| c.command.clone())
+                    .or_else(|| std::env::var("CODEX_ACP_PATH").ok());
+                let model = handle.config.codex.as_ref().and_then(|c| c.model.clone())
+                    .or_else(|| std::env::var("CODEX_MODEL").ok());
+
+                let new_client = match crate::acp::CodexClient::spawn(&cwd_str, command.as_deref(), model.as_deref()).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("tool_codex: spawn failed: {}", e);
+                        if let Some(ref tx) = notif_tx_bg {
+                            let _ = tx.send(crate::channel::OutboundMessage {
+                                target_id: target_id_bg.clone(),
+                                is_group: false,
+                                text: crate::i18n::t_fmt("acp_start_failed", lang_bg, &[("name", "Codex"), ("error", &e.to_string())]),
+                                reply_to: None,
+                                images: vec![],
+                                files: vec![],
+                                channel: Some(channel_bg.clone()),
+                                account: None,
+                            });
+                        }
+                        return;
+                    }
+                };
+
+                codex_client_cell.set(new_client.clone()).ok();
+                new_client
+            };
+
+            // Add notification sink to client for real-time progress updates
+            if let Some(ref tx) = notif_tx_bg {
+                let sink = Arc::new(ChannelNotifier::new(tx.clone(), target_id_bg.clone(), channel_bg.clone()));
+                client.add_notification_sink(sink);
+                tracing::info!("tool_codex: added notification sink for {}", target_id_bg);
+            }
+
+            // Start event collection FIRST (in parallel with execute)
+            let mut event_rx = client.subscribe_events();
+            let events = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+            let events_clone = Arc::clone(&events);
+
+            // Event collection task - collects events for final summary
+            let _event_collector = tokio::spawn(async move {
+                loop {
+                    match event_rx.recv().await {
+                        Ok(event) => {
+                            let event_str = match &event {
+                                crate::acp::client::SessionEvent::ToolCallStarted { title, .. } => {
+                                    let s = format!("🔧 {}", title.as_deref().unwrap_or("tool"));
+                                    tracing::info!("Codex event: {}", s);
+                                    s
+                                }
+                                crate::acp::client::SessionEvent::ToolCallCompleted { result, .. } => {
+                                    let s = result.as_ref().map(|r| {
+                                        if r.chars().count() > 100 {
+                                            let cutoff = r.char_indices().nth(100).map(|(i,_)| i).unwrap_or(r.len());
+                                            format!("✅ {}...", &r[..cutoff])
+                                        } else {
+                                            format!("✅ {}", r)
+                                        }
+                                    }).unwrap_or_default();
+                                    tracing::info!("Codex event: {}", s);
+                                    s
+                                }
+                                crate::acp::client::SessionEvent::ToolCallFailed { error, .. } => {
+                                    let s = format!("❌ {}", error);
+                                    tracing::info!("Codex event: {}", s);
+                                    s
+                                }
+                                crate::acp::client::SessionEvent::AgentMessageChunk { content } => {
+                                    tracing::debug!("Codex message: {}", content);
+                                    String::new()
+                                }
+                                crate::acp::client::SessionEvent::AgentThoughtChunk { content } => {
+                                    tracing::debug!("Codex thought: {}", content);
+                                    String::new()
+                                }
+                                _ => String::new(),
+                            };
+                            if !event_str.is_empty() {
+                                events_clone.lock().await.push(event_str);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            // Execute prompt (runs in parallel with event collection)
+            tracing::info!("tool_codex: executing prompt");
             let result = client.execute(&task_str).await;
 
+            // Process the result
             match result {
                 Ok(codex_result) => {
                     tracing::info!(
-                        thread_id = ?codex_result.thread_id,
-                        content_len = codex_result.content.len(),
+                        stop_reason = ?codex_result.stop_reason,
                         "tool_codex: execute completed"
                     );
 
-                    // Build summary
-                    let content = codex_result.content;
-                    let truncated = if content.chars().count() > 2000 {
-                        let cutoff = content
-                            .char_indices()
-                            .nth(2000)
-                            .map(|(i, _)| i)
-                            .unwrap_or(content.len());
-                        crate::i18n::t_fmt("acp_truncated", lang_bg, &[("content", &content[..cutoff])])
+                    let events_list = events.lock().await.clone();
+                    let acp_client = client.acp_client();
+                    let collected = acp_client.get_collected_content().await;
+
+                    // Get the final result content
+                    let result_content = if !collected.is_empty() {
+                        collected
                     } else {
-                        content.clone()
+                        codex_result.content.clone()
                     };
 
-                    let summary = if content.is_empty() {
-                        crate::i18n::t_fmt("acp_done_empty", lang_bg, &[("status", "✅"), ("name", "Codex")])
-                    } else {
+                    let tool_count = events_list.iter().filter(|e| e.starts_with("🔧")).count();
+                    let status_icon = match codex_result.stop_reason {
+                        crate::acp::types::StopReason::EndTurn => "✅",
+                        crate::acp::types::StopReason::MaxTokens => "⚠️",
+                        crate::acp::types::StopReason::Cancelled => "⏹️",
+                        crate::acp::types::StopReason::Incomplete => "❓",
+                    };
+
+                    // Scan result_content for downloadable file paths
+                    let notif_files: Vec<(String, String, String)> = {
+                        let sendable_exts = [".mp4", ".mp3", ".zip", ".pdf", ".xlsx", ".docx", ".pptx", ".csv", ".tar.gz"];
+                        let mut found = Vec::new();
+                        for token in result_content.split_whitespace() {
+                            let trimmed = token.trim_matches(|c: char| "\"'.,;:()[]{}".contains(c));
+                            let trimmed = if let Some(pos) = trimmed.find(|c| c == '/' || c == '~') {
+                                &trimmed[pos..]
+                            } else {
+                                trimmed
+                            };
+                            let lower = trimmed.to_lowercase();
+                            if sendable_exts.iter().any(|ext| lower.ends_with(ext)) {
+                                let path = expand_tilde(trimmed);
+                                if path.exists() {
+                                    if let Ok(meta) = path.metadata() {
+                                        if meta.len() <= 50_000_000 {
+                                            let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                            let mime = if lower.ends_with(".mp4") { "video/mp4" }
+                                                else if lower.ends_with(".mp3") { "audio/mpeg" }
+                                                else if lower.ends_with(".pdf") { "application/pdf" }
+                                                else if lower.ends_with(".zip") || lower.ends_with(".tar.gz") { "application/zip" }
+                                                else if lower.ends_with(".xlsx") { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }
+                                                else if lower.ends_with(".docx") { "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+                                                else if lower.ends_with(".pptx") { "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
+                                                else { "text/csv" };
+                                            let path_str = path.to_string_lossy().to_string();
+                                            if !found.iter().any(|(_, _, p): &(String, String, String)| p == &path_str) {
+                                                tracing::info!(path = %path_str, "tool_codex: attaching file to notification");
+                                                found.push((filename, mime.to_owned(), path_str));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        found
+                    };
+
+                    let summary = if !result_content.is_empty() {
+                        let truncated = if result_content.chars().count() > 2000 {
+                            let cutoff = result_content.char_indices().nth(2000).map(|(i,_)| i).unwrap_or(result_content.len());
+                            crate::i18n::t_fmt("acp_truncated", lang_bg, &[("content", &result_content[..cutoff])])
+                        } else {
+                            result_content.clone()
+                        };
                         crate::i18n::t_fmt("acp_done_result", lang_bg, &[
-                            ("status", "✅"), ("name", "Codex"),
-                            ("count", "0"), ("result", &truncated),
+                            ("status", status_icon), ("name", "Codex"),
+                            ("count", &tool_count.to_string()), ("result", &truncated),
+                        ])
+                    } else if tool_count > 0 {
+                        crate::i18n::t_fmt("acp_done_summary", lang_bg, &[
+                            ("status", status_icon), ("name", "Codex"),
+                            ("count", &tool_count.to_string()), ("summary", &events_list.join("\n")),
+                        ])
+                    } else {
+                        crate::i18n::t_fmt("acp_done_empty", lang_bg, &[
+                            ("status", status_icon), ("name", "Codex"),
                         ])
                     };
 
+                    // Store for agent re-inject after notification.
+                    let result_summary = summary.clone();
+                    let result_files = notif_files.clone();
+
                     // Send notification to user
+                    tracing::info!(
+                        summary_preview = %summary.chars().take(100).collect::<String>(),
+                        files_count = notif_files.len(),
+                        target = %target_id_bg,
+                        channel = %channel_bg,
+                        "tool_codex: sending completion notification"
+                    );
                     if let Some(ref tx) = notif_tx_bg {
-                        let _ = tx.send(crate::channel::OutboundMessage {
+                        match tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
                             text: summary,
                             reply_to: None,
                             images: vec![],
-                            files: vec![],
+                            files: notif_files,
                             channel: Some(channel_bg.clone()),
                             account: None,
-                        });
+                        }) {
+                            Ok(_) => {
+                                tracing::info!("tool_codex: notification sent successfully to {}", target_id_bg);
+                            }
+                            Err(e) => {
+                                tracing::error!("tool_codex: failed to send notification: {}", e);
+                            }
+                        }
+                    }
+
+                    // Inject result back into main agent's inbox
+                    let file_paths: Vec<String> = result_files.iter().map(|(_, _, p)| p.clone()).collect();
+                    let inject_text = if file_paths.is_empty() {
+                        format!("[Codex completed] {}", if result_summary.is_empty() { "Task finished.".to_owned() } else { result_summary })
+                    } else {
+                        format!("[Codex completed] Files ready: {}. Please send them to the user with send_file.",
+                            file_paths.join(", "))
+                    };
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
+                    let inject_msg = AgentMessage {
+                        session_key: self_session,
+                        text: inject_text,
+                        channel: self_channel.clone(),
+                        peer_id: self_peer_id,
+                        chat_id: self_chat_id,
+                        reply_tx,
+                        extra_tools: vec![],
+                        images: vec![],
+                        files: vec![],
+                        account: None,
+                    };
+                    if self_tx.send(inject_msg).await.is_err() {
+                        tracing::warn!("tool_codex: failed to inject result back to agent inbox");
+                    } else {
+                        tracing::info!("tool_codex: result injected back to agent, waiting for reply");
+                        match tokio::time::timeout(Duration::from_secs(300), reply_rx).await {
+                            Ok(Ok(reply)) => {
+                                if !reply.text.is_empty() || !reply.files.is_empty() || !reply.images.is_empty() {
+                                    if let Some(ref tx) = notif_tx_bg {
+                                        let _ = tx.send(crate::channel::OutboundMessage {
+                                            target_id: target_id_bg.clone(),
+                                            is_group: false,
+                                            text: reply.text,
+                                            reply_to: None,
+                                            images: reply.images,
+                                            files: reply.files,
+                                            channel: Some(self_channel),
+                                            account: None,
+                                        });
+                                        tracing::info!("tool_codex: forwarded agent reply to user");
+                                    }
+                                }
+                            }
+                            Ok(Err(_)) => tracing::warn!("tool_codex: reply channel dropped"),
+                            Err(_) => tracing::warn!("tool_codex: reply timed out after 300s"),
+                        }
                     }
                 }
                 Err(e) => {
                     tracing::error!("tool_codex: execute failed: {}", e);
                     if let Some(ref tx) = notif_tx_bg {
+                        tracing::info!("tool_codex: sending error notification to {}", target_id_bg);
                         let _ = tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
