@@ -5,8 +5,8 @@
 //!   1. `<|box_start|>(x, y)<|box_end|>`  (UI-TARS native, single point)
 //!   2. `<point>x y</point>`              (Doubao, space-separated point)
 //!   3. `(x, y)`                          (plain parenthesised tuple)
-//!   4. `[x1, y1, x2, y2]`                (UI-TARS-desktop bbox; we collapse
-//!                                          to the centre point)
+//!   4. `[x1, y1, x2, y2]` — UI-TARS-desktop bbox; the parser collapses to
+//!      the centre point so downstream actions stay scalar.
 //!
 //! And the action types: click / left_double / right_single / drag /
 //! hotkey / type / scroll / wait / finished / call_user / ... .

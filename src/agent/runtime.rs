@@ -390,6 +390,18 @@ pub struct AgentRuntime {
     /// outside the gateway.
     pub computer_permission_tx:
         Option<broadcast::Sender<crate::computer::permission::PermissionRequest>>,
+    /// Broadcast channel that surfaces VlmDriver progress
+    /// (`ComputerUseStatus::Started/Step/Finished`) to the WS gateway
+    /// for the live status panel. `None` outside the gateway.
+    pub computer_status_tx:
+        Option<broadcast::Sender<crate::computer::status::ComputerUseStatus>>,
+    /// Shared registry of in-flight `computer_use` run abort flags.
+    /// `tool_ui_tars` inserts on driver start and removes on exit; the
+    /// HTTP abort endpoint flips the bool to wake the driver loop.
+    /// `None` outside the gateway.
+    pub computer_runs: Option<
+        Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+    >,
     /// Dynamic agent spawner — None when running outside the gateway.
     pub spawner: Option<Arc<crate::agent::AgentSpawner>>,
     /// Plugin registry — None when running outside the gateway or with no
@@ -506,6 +518,8 @@ impl AgentRuntime {
             event_bus,
             computer_permission: None,
             computer_permission_tx: None,
+            computer_status_tx: None,
+            computer_runs: None,
             spawner,
             plugins,
             mcp,
@@ -706,11 +720,11 @@ pub fn resolve_vision_model_for(
 /// Look up `model_name` (e.g. `"kimi/kimi-for-coding"` or just
 /// `"kimi-for-coding"`) in the provider config and return whether its
 /// `input` array contains `image`. Returns:
-///   - `Some(true)`  — explicitly declared as image-capable.
-///   - `Some(false)` — explicitly declared as text-only (no `image`
-///                     in the array).
-///   - `None`        — no `models[].input` entry found; caller should
-///                     fall back to the blocklist heuristic.
+///   - `Some(true)` — explicitly declared as image-capable.
+///   - `Some(false)` — explicitly declared as text-only (no `image` in the
+///     array).
+///   - `None` — no `models[].input` entry found; caller should fall back
+///     to the blocklist heuristic.
 ///
 /// The lookup is fuzzy: it tries `provider/model_id` first (when the
 /// name contains `/`), then falls back to scanning every provider for a
@@ -1082,6 +1096,8 @@ impl AgentRuntime {
             thinking_budget: None,
             kv_cache_mode: 0,
             session_key: None,
+            system_shared: None,
+            system_user: None,
         };
 
         let providers = Arc::clone(&self.providers);
@@ -1199,6 +1215,8 @@ impl AgentRuntime {
             thinking_budget: None,
             kv_cache_mode: 0,
             session_key: None,
+            system_shared: None,
+            system_user: None,
         };
 
         let providers = Arc::clone(&self.providers);
@@ -1723,8 +1741,19 @@ impl AgentRuntime {
                                 None
                             } else {
                                 let model = self.resolve_model_name();
-                                let context_tokens = self.live.agents.read().await.defaults.context_tokens.unwrap_or(64_000) as usize;
-                                let cfg = self.live.agents.read().await.defaults.compaction.clone().unwrap_or_default();
+                                // Single read guard for both defaults — the
+                                // prior code held two consecutive
+                                // `self.live.agents.read().await` calls a few
+                                // tokens apart. Compaction-on-/clear runs on
+                                // the user-input path so the contention is
+                                // observable, not theoretical.
+                                let (context_tokens, cfg) = {
+                                    let agents = self.live.agents.read().await;
+                                    (
+                                        agents.defaults.context_tokens.unwrap_or(64_000) as usize,
+                                        agents.defaults.compaction.clone().unwrap_or_default(),
+                                    )
+                                };
                                 let default_transcript = (context_tokens * 7 / 10).max(16_000);
                                 let max_transcript = cfg.max_transcript_tokens.map(|t| t as usize).unwrap_or(default_transcript);
                                 // Render transcript (reuse the same logic as compaction).
@@ -2810,6 +2839,81 @@ impl AgentRuntime {
         // Cache tools for compaction KV cache reuse.
         self.cached_tools = tools.clone();
 
+        // DEBUG: when RSCLAW_DUMP_PROMPT is set, dump a JSON document
+        // describing this turn's prompt + tool list, split into the
+        // shared (cacheable across all RsClaw clients of this version)
+        // and user (per-machine) halves. Lets an upstream LLM gateway
+        // (rsclaw-llm with kvCacheMode=2) seed its global cache with
+        // the shared bytes once per version and dedupe across users.
+        // Per session_key in the filename so multiple inspected
+        // sessions don't clobber.
+        if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
+            let safe_key = session_key
+                .chars()
+                .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .collect::<String>();
+            let dump_path = crate::config::loader::base_dir()
+                .join(format!("debug_prompt_spec.{safe_key}.json"));
+
+            let tool_json = |t: &crate::provider::ToolDef| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.parameters,
+                })
+            };
+            let mut builtin_tools = Vec::new();
+            let mut user_tools = Vec::new();
+            for t in &tools {
+                if crate::agent::prompt_builder::BUILTIN_TOOL_NAMES.contains(&t.name.as_str()) {
+                    builtin_tools.push(tool_json(t));
+                } else {
+                    user_tools.push(tool_json(t));
+                }
+            }
+
+            let shared_prefix = crate::agent::prompt_builder::build_shared_system_prefix();
+            // user_suffix is what's left after the shared prefix +
+            // "\n\n". Recompute by trimming since the prompt was built
+            // by concatenation with that exact separator.
+            let user_suffix = system_prompt
+                .strip_prefix(&shared_prefix)
+                .map(|rest| rest.trim_start_matches("\n\n").to_owned())
+                .unwrap_or_else(|| system_prompt.clone());
+
+            let payload = serde_json::json!({
+                "session_key": session_key,
+                "agent_id": self.handle.id,
+                "model": model,
+                "rsclaw_version": env!("CARGO_PKG_VERSION"),
+                // SHARED: cacheable, byte-identical for every client of this version.
+                "shared_prefix": shared_prefix,
+                "builtin_tools": builtin_tools,
+                // USER: per-machine, never cached.
+                "user_suffix": user_suffix,
+                "user_tools": user_tools,
+                // Convenience: full reconstructed prompt.
+                "system_prompt": system_prompt,
+            });
+            match serde_json::to_string_pretty(&payload) {
+                Ok(s) => {
+                    if let Err(e) = std::fs::write(&dump_path, &s) {
+                        tracing::warn!("failed to dump prompt-spec: {e}");
+                    } else {
+                        tracing::info!(
+                            path = %dump_path.display(),
+                            builtin_tool_count = builtin_tools.len(),
+                            user_tool_count = user_tools.len(),
+                            shared_prefix_len = shared_prefix.len(),
+                            user_suffix_len = user_suffix.len(),
+                            "dumped prompt-spec JSON"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!("prompt-spec serialize failed: {e}"),
+            }
+        }
+
         // Check vision support before loading session (avoids borrow conflict).
         let kv_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
         // Always detect vision capability — used to decide which model describes images.
@@ -3588,7 +3692,18 @@ impl AgentRuntime {
         dynamic_ctx: Vec<String>,
         new_skills_tail: Vec<String>,
     ) -> Result<AgentReply> {
-        let pruning_cfg = self.live.agents.read().await.defaults.context_pruning.clone();
+        // Pull both defaults the agent loop's prelude needs under a
+        // single read guard. Previously these were two adjacent
+        // `self.live.agents.read().await` calls — once for
+        // `context_pruning`, once for `context_tokens` — paying the
+        // RwLock acquisition cost twice on every agent_loop entry.
+        let (pruning_cfg, defaults_context_tokens) = {
+            let agents = self.live.agents.read().await;
+            (
+                agents.defaults.context_pruning.clone(),
+                agents.defaults.context_tokens,
+            )
+        };
 
         // Resolve context budget (tokens) for history trimming.
         // Priority: agent model config > defaults.contextTokens >
@@ -3599,7 +3714,7 @@ impl AgentRuntime {
             .model
             .as_ref()
             .and_then(|m| m.context_tokens)
-            .or(self.live.agents.read().await.defaults.context_tokens)
+            .or(defaults_context_tokens)
             .or_else(|| {
                 self.config
                     .agents
@@ -4131,19 +4246,33 @@ impl AgentRuntime {
                 );
             }
 
+            // Resolve temperature + context_limit under one read guard.
+            // Both blocks consult the same `agents_live` snapshot
+            // (per-agent overrides + global defaults) and run
+            // back-to-back with no await in between, so a single
+            // acquisition is strictly correct and halves RwLock
+            // traffic on the hot path.
+            //
             // Temperature resolution order (read live so hot-reload takes
             // effect on the next turn without a restart):
             //   1. Per-agent override (live.agents.list[id].temperature)
             //   2. Global defaults (live.agents.defaults.temperature)
             //   3. "Auto" heuristic — 0.6 with tools, 0.7 chat, None for thinking
-            let temperature = {
+            //
+            // context_limit chain (matches AgentHandle.context_window so
+            // /status and the pre-flight emergency compact agree):
+            // per-agent model.context_tokens → defaults.context_tokens
+            // → 64000. Previously read defaults only, so a per-agent
+            // override of 200_000 was ignored here and emergency
+            // compaction kicked in too early.
+            let (temperature, context_limit) = {
                 let agents_live = self.live.agents.read().await;
-                let per_agent = agents_live
+                let per_agent_entry = agents_live
                     .list
                     .iter()
-                    .find(|a| a.id == self.handle.id)
-                    .and_then(|a| a.temperature);
-                per_agent
+                    .find(|a| a.id == self.handle.id);
+                let per_agent_temp = per_agent_entry.and_then(|a| a.temperature);
+                let temperature = per_agent_temp
                     .or(agents_live.defaults.temperature)
                     .map(Some)
                     .unwrap_or_else(|| {
@@ -4154,26 +4283,16 @@ impl AgentRuntime {
                         } else {
                             Some(0.6)
                         }
-                    })
+                    });
+                let per_agent_ctx = per_agent_entry
+                    .and_then(|a| a.model.as_ref().and_then(|m| m.context_tokens));
+                let context_limit = per_agent_ctx
+                    .or(agents_live.defaults.context_tokens)
+                    .unwrap_or(64_000) as usize;
+                (temperature, context_limit)
             };
 
-// Pre-flight check: emergency compact if we'd exceed context.
-            // Same resolution chain as AgentHandle.context_window (the
-            // value /status displays): per-agent model.contextTokens →
-            // agents.defaults.contextTokens → 64000. Previously this only
-            // read defaults, so a per-agent override of 200_000 was
-            // ignored here and emergency compaction kicked in too early.
-            let context_limit = {
-                let agents_live = self.live.agents.read().await;
-                let per_agent = agents_live
-                    .list
-                    .iter()
-                    .find(|a| a.id == self.handle.id)
-                    .and_then(|a| a.model.as_ref().and_then(|m| m.context_tokens));
-                per_agent
-                    .or(agents_live.defaults.context_tokens)
-                    .unwrap_or(64_000) as usize
-            };
+            // Pre-flight check: emergency compact if we'd exceed context.
             let overhead = self.estimate_fixed_overhead();
             let session_tokens: usize = self.sessions
                 .get(&ctx.session_key)
@@ -4199,7 +4318,42 @@ impl AgentRuntime {
                     .unwrap_or_default();
             }
 
-            let kv_cache_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
+            // Single live-config read per LLM iteration. Previously this
+            // call site held two independent `self.live.agents.read().await`
+            // acquisitions (kv_cache_mode + frequency_penalty) — minor
+            // contention on the hot path, and a refactor hazard if more
+            // defaults migrate in. Pull every default this iteration
+            // needs at once; drop the guard before constructing the
+            // request so the LLM call doesn't hold the lock.
+            let (kv_cache_mode, frequency_penalty) = {
+                let agents = self.live.agents.read().await;
+                (
+                    agents.defaults.kv_cache_mode.unwrap_or(1),
+                    agents.defaults.frequency_penalty,
+                )
+            };
+            // For kvCacheMode=2 expose the shared/user split so the rsclaw
+            // provider can populate `dynamic_prefix.system` (cacheable across
+            // every client of this RsClaw version) separately from
+            // `dynamic_prefix.user_suffix` (per-client). Only the rsclaw
+            // provider reads these; openai/anthropic ignore them. Internal
+            // sessions use a minimal prompt that doesn't follow the
+            // shared-prefix layout — leave the split unset for those (the
+            // provider falls back to `system` as a single blob, with no
+            // cross-client cache reuse, which matches today's behaviour).
+            let (system_shared, system_user) = if kv_cache_mode >= 2
+                && !is_minimal_context_session(&ctx.session_key)
+            {
+                let shared = crate::agent::prompt_builder::build_shared_system_prefix();
+                if let Some(rest) = effective_system.strip_prefix(&shared) {
+                    let user = rest.trim_start_matches("\n\n").to_owned();
+                    (Some(shared), Some(user))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
             let req = LlmRequest {
                 model: model.to_owned(),
                 messages,
@@ -4207,10 +4361,12 @@ impl AgentRuntime {
                 system: Some(effective_system.clone()),
                 max_tokens: configured_max_tokens,
                 temperature,
-                frequency_penalty: self.live.agents.read().await.defaults.frequency_penalty,
+                frequency_penalty,
                 thinking_budget,
                 kv_cache_mode,
                 session_key: if kv_cache_mode >= 2 { Some(ctx.session_key.clone()) } else { None },
+                system_shared,
+                system_user,
             };
 
             // Update live status: LLM call starting.

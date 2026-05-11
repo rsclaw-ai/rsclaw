@@ -62,13 +62,21 @@ fn prompt_includes_all_sections() {
     assert!(prompt.contains("You are a GUI agent"));
     assert!(prompt.contains("## Output Format"));
     assert!(prompt.contains("## Action Space"));
-    assert!(prompt.contains("click(start_box='[x1,y1,x2,y2]')"));
+    // Action Space samples wrap coordinates in `<|box_start|>...<|box_end|>`
+    // markers — that's the chat-template tokenizer's bbox sentinel format,
+    // distinct from the older `[x1,y1,x2,y2]` shape some VLMs accept. The
+    // worker's tokenizer relies on the markers being present verbatim.
+    assert!(prompt.contains("click(start_box='<|box_start|>(x1,y1)<|box_end|>')"));
     assert!(prompt.contains("## Note"));
     assert!(prompt.contains("Use Chinese in `Thought` part"));
     assert!(prompt.contains("## Thought Examples"));
     assert!(prompt.contains("RsClaw 测试群"));
     assert!(prompt.contains("## Coordinate Space"));
-    assert!(prompt.contains("2880×1800 physical pixels"));
+    // Coordinate Space switched to a resolution-independent 0-1000
+    // normalized grid; the prompt no longer leaks the host's physical
+    // pixel size since most VLM checkpoints train on the normalized
+    // shape and don't need (or want) the raw screen extent.
+    assert!(prompt.contains("0-1000 normalized grid"));
     assert!(prompt.contains("## Output Examples"));
     assert!(prompt.contains("## User Instruction"));
     assert!(prompt.contains("微信群里看看新消息"));

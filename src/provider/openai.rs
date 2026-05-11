@@ -6,39 +6,10 @@
 //!   - Ollama (same completions wire format, custom base_url)
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
 
 use anyhow::{Context, Result};
-use dashmap::DashMap;
 use futures::{StreamExt, TryStreamExt, future::BoxFuture};
 use serde_json::{Value, json};
-
-/// Per-session cache for kv_cache_mode=2 (incremental messages).
-struct SessionMessageCache {
-    cache_id: String,
-    messages: Vec<Value>,
-}
-
-static SESSION_CACHES: LazyLock<DashMap<String, SessionMessageCache>> =
-    LazyLock::new(DashMap::new);
-
-/// Cap SESSION_CACHES to avoid unbounded memory growth.
-const SESSION_CACHES_MAX: usize = 10_000;
-
-fn evict_session_caches_if_needed() {
-    if SESSION_CACHES.len() > SESSION_CACHES_MAX {
-        // Remove roughly half the entries to amortize eviction cost.
-        let to_remove: Vec<String> = SESSION_CACHES
-            .iter()
-            .take(SESSION_CACHES_MAX / 2)
-            .map(|e| e.key().clone())
-            .collect();
-        for key in to_remove {
-            SESSION_CACHES.remove(&key);
-        }
-        tracing::info!(remaining = SESSION_CACHES.len(), "evicted stale session caches");
-    }
-}
 
 use super::{
     ContentPart, LlmProvider, LlmRequest, LlmStream, Message, MessageContent, Role, StreamEvent,
@@ -186,6 +157,8 @@ impl LlmProvider for OpenAiProvider {
                 "openai: preparing LLM request"
             );
 
+            super::warn_unsupported_kv_cache_mode_2(self.name(), &req);
+
             // Ollama: if base_url does NOT contain "/v1", use native /api/chat.
             // If it has "/v1" (e.g. http://localhost:11434/v1), fall through to
             // OpenAI-compatible /chat/completions path.
@@ -197,41 +170,7 @@ impl LlmProvider for OpenAiProvider {
                 return self.stream_responses(&req).await;
             }
 
-            let mut body = build_request_body(&req)?;
-
-            // kv_cache_mode=2: incremental messages via cache_id (server-generated).
-            let kv2_session_key = if req.kv_cache_mode >= 2 { req.session_key.clone() } else { None };
-            if let Some(ref session_key) = kv2_session_key {
-                let current_messages = body["messages"].as_array().cloned().unwrap_or_default();
-
-                if let Some(cached) = SESSION_CACHES.get(session_key) {
-                    // We have a server-assigned cache_id from a previous response.
-                    // Clamp to current length to avoid out-of-bounds if messages were truncated.
-                    let cached_len = cached.messages.len().min(current_messages.len());
-                    if current_messages.len() > cached_len
-                        && current_messages[..cached_len] == cached.messages[..cached_len]
-                    {
-                        // Prefix matches — send only the new messages.
-                        let append = current_messages[cached_len..].to_vec();
-                        body.as_object_mut().map(|m| m.remove("messages"));
-                        body["cache_id"] = json!(cached.cache_id);
-                        body["messages_append"] = json!(append);
-                        tracing::debug!(
-                            session_key,
-                            cache_id = cached.cache_id.as_str(),
-                            cached = cached_len,
-                            append = append.len(),
-                            "kv_cache=2: sending incremental"
-                        );
-                    } else {
-                        // Prefix changed (compaction) — send full with same cache_id.
-                        body["cache_id"] = json!(cached.cache_id);
-                        tracing::debug!(session_key, "kv_cache=2: prefix changed, sending full");
-                    }
-                }
-                // else: first request — no cache_id, send full messages.
-                // Server will generate cache_id and return it in X-Cache-Id header.
-            }
+            let body = build_request_body(&req)?;
 
             let body_str = serde_json::to_string(&body).unwrap_or_default();
             tracing::debug!(
@@ -262,36 +201,6 @@ impl LlmProvider for OpenAiProvider {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_owned();
-
-            // kv_cache_mode=2: extract server-generated cache_id and update local cache.
-            if let Some(ref session_key) = kv2_session_key {
-                let server_cache_id = resp.headers()
-                    .get("x-cache-id")
-                    .and_then(|v| v.to_str().ok())
-                    .map(String::from);
-                if let Some(cache_id) = server_cache_id {
-                    let current_messages = body.get("messages")
-                        .and_then(|m| m.as_array())
-                        .cloned()
-                        .or_else(|| {
-                            // Incremental mode: reconstruct from cached + append.
-                            SESSION_CACHES.get(session_key).map(|c| {
-                                let mut msgs = c.messages.clone();
-                                if let Some(append) = body.get("messages_append").and_then(|a| a.as_array()) {
-                                    msgs.extend(append.iter().cloned());
-                                }
-                                msgs
-                            })
-                        })
-                        .unwrap_or_default();
-
-                    evict_session_caches_if_needed();
-                    SESSION_CACHES.insert(session_key.clone(), SessionMessageCache {
-                        cache_id,
-                        messages: current_messages,
-                    });
-                }
-            }
 
             tracing::info!(
                 %status,
@@ -1834,15 +1743,7 @@ mod tests {
     fn make_request() -> LlmRequest {
         LlmRequest {
             model: "gpt-4o".to_owned(),
-            messages: vec![],
-            tools: vec![],
-            system: None,
-            max_tokens: None,
-            temperature: None,
-            frequency_penalty: None,
-            thinking_budget: None,
-            kv_cache_mode: 0,
-            session_key: None,
+            ..Default::default()
         }
     }
 
@@ -1877,15 +1778,7 @@ mod tests {
         fn make_responses_request() -> LlmRequest {
             LlmRequest {
                 model: "doubao-seed-2-0-pro-260215".to_owned(),
-                messages: vec![],
-                tools: vec![],
-                system: None,
-                max_tokens: None,
-                temperature: None,
-                frequency_penalty: None,
-                thinking_budget: None,
-                kv_cache_mode: 0,
-                session_key: None,
+                ..Default::default()
             }
         }
 

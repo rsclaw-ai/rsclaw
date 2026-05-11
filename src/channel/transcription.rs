@@ -1489,9 +1489,9 @@ fn find_sherpa_offline_bin() -> Option<std::path::PathBuf> {
 ///
 /// Two model families are supported:
 ///   - **whisper**: split encoder/decoder ONNX + tokens.txt
-///       (`*-encoder.onnx`, `*-decoder.onnx`, `*-tokens.txt`)
+///    (`*-encoder.onnx`, `*-decoder.onnx`, `*-tokens.txt`)
 ///   - **paraformer**: single `model.onnx` (or `model.int8.onnx`) +
-///       `tokens.txt`
+///    `tokens.txt`
 enum SherpaSttSetup {
     Whisper {
         bin: std::path::PathBuf,

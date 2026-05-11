@@ -59,6 +59,7 @@ impl LlmProvider for AnthropicProvider {
 
     fn stream(&self, req: LlmRequest) -> BoxFuture<'_, Result<LlmStream>> {
         Box::pin(async move {
+            super::warn_unsupported_kv_cache_mode_2(self.name(), &req);
             let body = build_request_body(&req)?;
             let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
             // Capture model + URL up-front so the failure path can
@@ -84,9 +85,23 @@ impl LlmProvider for AnthropicProvider {
 
             let status = resp.status();
             if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
+                let resp_body = resp.text().await.unwrap_or_default();
+                let req_body_str = serde_json::to_string(&body).unwrap_or_default();
+                let req_body_preview = if req_body_str.len() > 4000 {
+                    format!("{}...[truncated, total {} bytes]", &req_body_str[..4000], req_body_str.len())
+                } else {
+                    req_body_str
+                };
+                tracing::warn!(
+                    url = %url,
+                    model = %model_for_log,
+                    status = %status,
+                    request_body = %req_body_preview,
+                    response_body = %resp_body,
+                    "Anthropic provider non-2xx response"
+                );
                 anyhow::bail!(
-                    "Anthropic API error {status} at {url} (model={model_for_log}): {body}"
+                    "Anthropic API error {status} at {url} (model={model_for_log}): {resp_body}"
                 );
             }
 
@@ -522,15 +537,7 @@ mod tests {
     fn make_request() -> LlmRequest {
         LlmRequest {
             model: "claude-3-5-sonnet-20241022".to_owned(),
-            messages: vec![],
-            tools: vec![],
-            system: None,
-            max_tokens: None,
-            temperature: None,
-            frequency_penalty: None,
-            thinking_budget: None,
-            kv_cache_mode: 0,
-            session_key: None,
+            ..Default::default()
         }
     }
 

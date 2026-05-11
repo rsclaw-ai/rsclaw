@@ -1501,6 +1501,11 @@ pub struct WebBrowserConfig {
 #[serde(rename_all = "camelCase")]
 pub struct ComputerUseConfig {
     pub enabled: Option<bool>,
+    /// Bypass the permission gate — every action auto-approved. Defaults
+    /// to `false`. Used by power users / CI runs. `RedbPermissionStore`
+    /// also exposes a runtime toggle (`set_bypass_all`) for the settings
+    /// UI; this field is the value applied at gateway startup.
+    pub bypass_all: Option<bool>,
     // Note: `ui_analyze_*` fields were removed when the standalone
     // ui_analyze tool was deleted. The new VlmDriver consumes the
     // screenshot directly via the configured vision model — no

@@ -139,12 +139,30 @@ async fn start_echo_server(addr: SocketAddr) {
         });
     }
 
+    let computer_permission = Arc::new(
+        rsclaw::computer::permission::RedbPermissionStore::new(
+            Arc::clone(&store.db),
+            false,
+        ),
+    );
+    let (computer_permission_tx, _) =
+        broadcast::channel::<rsclaw::computer::permission::PermissionRequest>(64);
+    let (computer_status_tx, _) =
+        broadcast::channel::<rsclaw::computer::status::ComputerUseStatus>(256);
+    let computer_runs: Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    > = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+
     let state = AppState {
         config,
         live,
         agents: Arc::new(registry),
         store,
         event_bus: event_tx,
+        computer_permission,
+        computer_permission_tx,
+        computer_status_tx,
+        computer_runs,
         devices: Arc::new(rsclaw::ws::DeviceStore::new(std::path::PathBuf::from(
             "/tmp/test-devices.json",
         ))),

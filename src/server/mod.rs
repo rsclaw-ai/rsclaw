@@ -42,7 +42,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
     extract::Multipart,
-    routing::{get, patch, post, put},
+    routing::{delete, get, patch, post, put},
 };
 use futures::{Stream, StreamExt as _};
 use serde::{Deserialize, Serialize};
@@ -101,6 +101,21 @@ pub struct AppState {
     /// frames).
     pub computer_permission_tx:
         broadcast::Sender<crate::computer::permission::PermissionRequest>,
+    /// Broadcast channel for `ComputerUseStatus` events (Started/Step/
+    /// Finished). Same WS plumbing as `computer_permission_tx`; delivered
+    /// to the desktop UI as `computer_use_status` frames so the live
+    /// status panel can show what the GUI agent is doing right now.
+    pub computer_status_tx:
+        broadcast::Sender<crate::computer::status::ComputerUseStatus>,
+    /// Live registry of in-flight `computer_use` runs.
+    /// Maps `run_id` -> the driver's abort flag. Inserted when
+    /// `tool_ui_tars` mints a run and removed on driver exit. The
+    /// `POST /computer-use/runs/{run_id}/abort` HTTP endpoint sets the
+    /// flag; the driver's loop checks it between steps and exits with
+    /// `DriverOutcome::UserAbort` -> `Finished { outcome_kind: "user_abort" }`,
+    /// which the overlay UI consumes to fade itself out.
+    pub computer_runs:
+        Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
     /// Device token store for WebSocket gateway auth.
     pub devices: Arc<crate::ws::DeviceStore>,
     /// Active WebSocket connections registry.
@@ -254,7 +269,20 @@ pub fn build_router(state: AppState) -> Router {
         .route("/workspace/files/{*path}", get(read_workspace_file).put(write_workspace_file))
         .route("/stream", get(stream_sse))
         .route("/a2a", post(crate::a2a::server::a2a_rpc_handler))
-        .route("/tools/execute", post(execute_tool));
+        .route("/tools/execute", post(execute_tool))
+        .route("/computer-use/permissions", get(computer_use_permissions_list))
+        .route(
+            "/computer-use/permissions/{agent_id}/{app}",
+            delete(computer_use_permissions_revoke),
+        )
+        .route(
+            "/computer-use/bypass",
+            get(computer_use_bypass_get).put(computer_use_bypass_set),
+        )
+        .route(
+            "/computer-use/runs/{run_id}/abort",
+            post(computer_use_run_abort),
+        );
 
     Router::new()
         .nest("/api/v1", api)
@@ -1542,6 +1570,108 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
     )
         .into_response()
 }
+
+// ---------------------------------------------------------------------------
+// Computer-use control endpoints (settings panel: bypass toggle +
+// saved permissions list / revoke).
+// ---------------------------------------------------------------------------
+
+/// GET /api/v1/computer-use/permissions — list every persisted
+/// "Always allow" grant for the settings UI.
+async fn computer_use_permissions_list(State(state): State<AppState>) -> Response {
+    match state.computer_permission.list_grants().await {
+        Ok(grants) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"grants": grants})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/v1/computer-use/permissions/:agent_id/:app — revoke one
+/// persisted grant. Idempotent: deleting a non-existent grant is
+/// reported as 200 with `revoked: false`.
+async fn computer_use_permissions_revoke(
+    State(state): State<AppState>,
+    Path((agent_id, app)): Path<(String, String)>,
+) -> Response {
+    use crate::computer::permission::PermissionStore as _;
+    match state.computer_permission.revoke(&agent_id, &app).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"revoked": true, "agent_id": agent_id, "app": app})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/v1/computer-use/bypass — read the current runtime value of
+/// the bypass switch.
+async fn computer_use_bypass_get(State(state): State<AppState>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "enabled": state.computer_permission.is_bypass_all(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct BypassToggleBody {
+    enabled: bool,
+}
+
+/// PUT /api/v1/computer-use/bypass — flip the bypass switch at runtime.
+/// Does NOT write to the config file; restart reloads the config-defined
+/// default.
+async fn computer_use_bypass_set(
+    State(state): State<AppState>,
+    Json(body): Json<BypassToggleBody>,
+) -> impl IntoResponse {
+    state.computer_permission.set_bypass_all(body.enabled);
+    Json(serde_json::json!({"enabled": body.enabled}))
+}
+
+/// POST /api/v1/computer-use/runs/:run_id/abort — flip the in-flight
+/// run's abort flag. The driver loop checks the flag between steps and
+/// exits with `DriverOutcome::UserAbort` -> emits a `Finished
+/// { outcome_kind: "user_abort" }` status event, which the desktop
+/// overlay consumes to fade itself out and restore the window.
+///
+/// Returns `{ aborted: true }` on hit, `{ aborted: false }` when the
+/// run_id is unknown (already finished, never started, or wrong id).
+/// Idempotent: aborting an already-aborted run still returns true on
+/// the first call and false on subsequent calls (registry entry is
+/// removed by the driver on exit).
+async fn computer_use_run_abort(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> impl IntoResponse {
+    let runs = state.computer_runs.read().await;
+    let aborted = match runs.get(&run_id) {
+        Some(flag) => {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+        None => false,
+    };
+    drop(runs);
+    if aborted {
+        tracing::info!(run_id = %run_id, "computer_use: abort requested");
+    } else {
+        tracing::warn!(run_id = %run_id, "computer_use: abort target not found (already finished?)");
+    }
+    Json(serde_json::json!({"aborted": aborted, "runId": run_id}))
+}
+
+// ---------------------------------------------------------------------------
 
 /// GET /api/v1/cron/:id/history — get run history for a cron job.
 async fn cron_history(Path(id): Path<String>) -> impl IntoResponse {

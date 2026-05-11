@@ -130,14 +130,8 @@ fn simple_request(model: &str) -> LlmRequest {
             role: Role::User,
             content: MessageContent::Text("test".to_owned()),
         }],
-        tools: vec![],
-        system: None,
         max_tokens: Some(64),
-        temperature: None,
-        frequency_penalty: None,
-        thinking_budget: None,
-        kv_cache_mode: 0,
-        session_key: None,
+        ..Default::default()
     }
 }
 

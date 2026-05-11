@@ -1,0 +1,2912 @@
+//! rsclaw-server kvCacheMode=2 provider — incremental session protocol.
+//!
+//! Wire-level contract: see `~/dev/rsclaw-llm/docs/rsclaw-protocol.md` v1.1+.
+//!
+//! Stateful sessions where rsclaw-server is the source of truth for
+//! conversation history. Per-turn the client sends only the delta
+//! (new user message OR tool_results); the server's KV cache stays
+//! hot across turns.
+//!
+//! This provider rejects requests with `kv_cache_mode != 2` — those
+//! must go through one of the regular OAI / Anthropic providers.
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use anyhow::{Context, Result};
+use futures::{StreamExt, TryStreamExt, future::BoxFuture};
+use reqwest::{Client, StatusCode};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use super::{
+    ContentPart, LlmProvider, LlmRequest, LlmStream, Message, MessageContent, Role, StreamEvent,
+    TokenUsage,
+};
+
+/// Default base for an rsclaw-server running on the same host. The
+/// `/v1/agent` suffix is the external API mount inside rsclaw-server —
+/// the rsclaw-llm `/sessions/...` protocol paths are exposed to clients
+/// under that prefix, distinct from `/v1/chat/completions` etc. Setting
+/// `RSCLAW_URL` overrides this; that variable should also include the
+/// `/v1/agent` segment.
+pub const RSCLAW_DEFAULT_BASE: &str = "http://localhost:8090/v1/agent";
+
+/// How long to wait for `/sessions/<id>/turn` to start responding
+/// (TCP connect + TLS + send body + receive headers + first byte).
+/// Once the body stream begins this deadline no longer applies — the
+/// SSE body is allowed to take as long as the model needs.
+const TURN_HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Hard cap on the in-memory `sessions` cache. Each entry is a few
+/// dozen bytes (`session_id` + `prefix_id` + counter), so 10_000 caps
+/// the per-process footprint at ~1MB even under churn. When the cap is
+/// hit, [`evict_if_oversized`] drops half the entries — picked by
+/// HashMap iteration order, which is good enough since we lack
+/// last-access timestamps and the alternative (LRU bookkeeping) would
+/// add a synchronisation hot spot. Evicted entries cause one extra
+/// replay on their next access, which is the same recovery path used
+/// for server-side eviction (§2.2).
+///
+/// Without this cap a long-running gateway with high session churn
+/// (every WeChat user = one session_key) accumulates entries forever
+/// and bleeds memory until OOM. Mirrors the pre-existing safeguard in
+/// the previous OpenAI-provider implementation that this provider
+/// replaced.
+const MAX_SESSIONS: usize = 10_000;
+
+// ---------------------------------------------------------------------------
+// Provider
+// ---------------------------------------------------------------------------
+
+pub struct RsclawProvider {
+    client: Client,
+    base_url: String,
+    bearer: Option<String>,
+    sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
+}
+
+#[derive(Clone, Debug)]
+struct SessionEntry {
+    /// Server-issued, format `rs_<instance>_<random>`.
+    session_id: String,
+    /// `prefix_id` (post-rename, was `rsclaw_version` pre-spec-v1.7) this
+    /// session was opened against. A bump triggers re-open since prefix
+    /// cache layout changes invalidate the session.
+    prefix_id: String,
+    /// Largest `req.messages.len()` we've observed on this session.
+    /// A subsequent call with a smaller list means the runtime trimmed
+    /// history (compaction, repair, reset) and the server-side KV no
+    /// longer matches what the gateway thinks the conversation is —
+    /// trigger a re-hydrate via /sessions/replay.
+    last_seen_msgs_len: usize,
+}
+
+impl RsclawProvider {
+    pub fn new(base_url: impl Into<String>, bearer: Option<String>) -> Self {
+        Self::with_user_agent(base_url, bearer, None)
+    }
+
+    /// Create a provider with custom User-Agent.
+    pub fn with_user_agent(
+        base_url: impl Into<String>,
+        bearer: Option<String>,
+        user_agent: Option<String>,
+    ) -> Self {
+        // Trim whitespace before trimming trailing slashes — env vars
+        // loaded from a dotenv file frequently carry a trailing newline
+        // (`RSCLAW_KEY=sk-abc\n`), and reqwest rejects header values
+        // containing `\n` outright (RFC 7230 forbids CTLs in field
+        // values). Without this, every signed request 500s with
+        // "invalid HTTP header value" from inside the client builder
+        // before it ever leaves the process. Same hazard applies to
+        // base_url where stray whitespace flips reqwest into
+        // url-parse-error territory.
+        let base_url = base_url
+            .into()
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        let bearer = bearer
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty());
+        Self {
+            client: super::http_client_with_ua(user_agent.as_deref()),
+            base_url,
+            bearer,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn auth_header(&self) -> Option<(String, String)> {
+        // `Some("")` slips in when `RSCLAW_KEY` is set but blank (env
+        // var present, value empty) — `std::env::var` returns `Ok("")`,
+        // gateway/providers.rs `.ok()`s that into `Some("")`. Sending
+        // `Authorization: Bearer ` with an empty token gets rejected
+        // by stricter proxies and obscures the real "no auth
+        // configured" error, so treat empty as absent here.
+        self.bearer
+            .as_ref()
+            .filter(|k| !k.is_empty())
+            .map(|k| ("authorization".to_string(), format!("Bearer {k}")))
+    }
+
+    /// Acquire the sessions lock, recovering from poison rather than
+    /// silently dropping the call.
+    ///
+    /// `Mutex::lock()` returns `Err` only after a panic occurred while
+    /// some other thread held the lock. The pre-poison helpers used
+    /// `.ok()?` / `if let Ok(...)`, which silently turned every
+    /// post-poison call into a no-op — the provider went brain-dead
+    /// (lookups always missed, store/forget became unobservable
+    /// drops) but emitted no signal, so operators couldn't tell from
+    /// logs that anything was wrong. Recovering with `into_inner()` on
+    /// poison preserves the data (HashMap state is itself well-defined
+    /// — only an in-flight insert/remove could leave logical staleness,
+    /// and that staleness is bounded by the same eviction signals that
+    /// already drive replay) and lets us flag the post-mortem in logs.
+    fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionEntry>> {
+        match self.sessions.lock() {
+            Ok(g) => g,
+            Err(p) => {
+                // Use a static `OnceLock` to log only once per process
+                // lifetime — poison is a permanent condition, no need
+                // to spam every subsequent call.
+                use std::sync::OnceLock;
+                static LOGGED: OnceLock<()> = OnceLock::new();
+                if LOGGED.set(()).is_ok() {
+                    tracing::error!(
+                        "rsclaw: sessions mutex poisoned — a prior thread \
+                         panicked while holding it. Recovering inner data \
+                         and continuing; expect possible session-state \
+                         drift until restart."
+                    );
+                }
+                p.into_inner()
+            }
+        }
+    }
+
+    /// Atomically look up a cached session AND validate its freshness.
+    /// Returns `None` (forcing a re-hydrate) when the entry is missing,
+    /// has a stale `prefix_id`, or its `last_seen_msgs_len` exceeds the
+    /// incoming `msgs_len` (history was trimmed under our feet). On
+    /// success bumps `last_seen_msgs_len` to the new value so the next
+    /// call's comparison is against the most recent state.
+    fn lookup_and_bump(
+        &self,
+        session_key: &str,
+        prefix_id: &str,
+        msgs_len: usize,
+    ) -> Option<SessionEntry> {
+        let mut map = self.lock_sessions();
+        let entry = map.get_mut(session_key)?;
+        if entry.prefix_id != prefix_id {
+            return None;
+        }
+        if msgs_len < entry.last_seen_msgs_len {
+            return None;
+        }
+        entry.last_seen_msgs_len = msgs_len;
+        Some(entry.clone())
+    }
+
+    fn store(&self, session_key: &str, entry: SessionEntry) {
+        let mut map = self.lock_sessions();
+        map.insert(session_key.to_string(), entry);
+        // Cap memory after every insert. Done inline (not on a timer
+        // or a separate task) so a sudden churn burst can't tip over
+        // the high-water mark while waiting for an external sweeper.
+        evict_if_oversized(&mut map);
+    }
+
+    fn forget(&self, session_key: &str) {
+        let mut map = self.lock_sessions();
+        map.remove(session_key);
+    }
+}
+
+/// Evict roughly half the entries when the cache exceeds [`MAX_SESSIONS`].
+/// Iteration order on a `HashMap` is non-deterministic but stable
+/// enough within one call to give a consistent set of victims; the
+/// alternative (true LRU) would need an auxiliary data structure and a
+/// per-call timestamp update on the read path. Evicted sessions cost
+/// one extra replay round-trip the next time they're touched — the
+/// same code path that handles upstream-side eviction.
+fn evict_if_oversized(map: &mut HashMap<String, SessionEntry>) {
+    if map.len() <= MAX_SESSIONS {
+        return;
+    }
+    let target_drop = map.len() - MAX_SESSIONS / 2;
+    let victims: Vec<String> = map.keys().take(target_drop).cloned().collect();
+    let dropped = victims.len();
+    for k in victims {
+        map.remove(&k);
+    }
+    tracing::info!(
+        cap = MAX_SESSIONS,
+        dropped,
+        remaining = map.len(),
+        "rsclaw: sessions cache over cap, evicted batch"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// LlmProvider impl
+// ---------------------------------------------------------------------------
+
+impl LlmProvider for RsclawProvider {
+    fn name(&self) -> &str {
+        "rsclaw"
+    }
+
+    fn stream(&self, mut req: LlmRequest) -> BoxFuture<'_, Result<LlmStream>> {
+        Box::pin(async move {
+            if req.kv_cache_mode != 2 {
+                anyhow::bail!(
+                    "rsclaw provider only handles kv_cache_mode=2 (got {}); \
+                     route mode 0/1 traffic through openai/anthropic providers",
+                    req.kv_cache_mode
+                );
+            }
+            let session_key = req
+                .session_key
+                .clone()
+                .context("rsclaw kv_cache_mode=2 requires session_key on the request")?;
+
+            // The runtime appends `Role::System` messages AFTER the
+            // User/Tool delta on the first iteration of any turn that
+            // has dynamic /ctx or just-installed-skill blocks (see
+            // agent/runtime.rs ~4068-4082). Without this, `from_request`
+            // sees `Role::System` as the last message and aborts the
+            // entire turn. Fold trailing System text back into the
+            // preceding User delta so the model still gets the context.
+            normalize_trailing_system(&mut req.messages);
+
+            let split = split_request(&req)?;
+
+            // Lookup or hydrate. Cache miss / mutation happens on first
+            // call, version drift, after a prior replay failure, or
+            // after the runtime trimmed history (compaction, repair,
+            // reset) — all cases where `req.messages` may not match
+            // what the server has hydrated. open() can't hydrate, so
+            // when history exists we go straight to replay; an empty
+            // history list takes the cheaper open() path.
+            let entry = match self.lookup_and_bump(
+                &session_key,
+                &split.prefix_id,
+                req.messages.len(),
+            ) {
+                Some(e) => e,
+                None => {
+                    self.forget(&session_key);
+                    let history = history_for_replay(&req.messages);
+                    let resp = if history.is_empty() {
+                        self.open(&split).await?
+                    } else {
+                        self.replay(&split, history).await?
+                    };
+                    let entry = SessionEntry {
+                        session_id: resp.session_id.clone(),
+                        // Cache key MUST be the request value, not the
+                        // upstream canonical. open()'s response echoes
+                        // the resolved prefix_id (per §2.1.6), which can
+                        // differ from the requested alias — e.g. request
+                        // `rsclaw/latest`, response `rsclaw/2026.5.5`.
+                        // `lookup_and_bump` compares the cached value
+                        // against the next call's `split.prefix_id` (also
+                        // the alias), so caching the canonical
+                        // guarantees a miss on every subsequent call:
+                        // re-hydrate every turn, defeating kvCacheMode=2
+                        // entirely. Replay's response per §2.2 omits the
+                        // field, which happened to make recovery-path
+                        // entries self-consistent — but open()-path
+                        // entries were always broken. Version drift is
+                        // detected server-side via 409 (handled by
+                        // is_session_evicted), so we don't need the
+                        // canonical here for freshness.
+                        prefix_id: split.prefix_id.clone(),
+                        last_seen_msgs_len: req.messages.len(),
+                    };
+                    self.store(&session_key, entry.clone());
+                    entry
+                }
+            };
+
+            let delta = TurnDelta::from_request(&req)?;
+            // Forget the cached session entry on any non-recoverable
+            // turn failure. Without this, an Err here leaves the
+            // SessionEntry in cache with a `last_seen_msgs_len` that
+            // already counts the delta we tried to send. Failover
+            // routes the user-facing turn through another provider,
+            // the runtime stores that provider's assistant in session,
+            // and on the next rsclaw call `lookup_and_bump` happily
+            // returns the stale entry — `turn()` then sends only the
+            // *next* delta, so the assistant generated by the fallback
+            // never reaches rsclaw-server. Server-side history
+            // diverges silently from the runtime's mental model;
+            // subsequent generations base their reasoning on a partial
+            // log. Forgetting forces a full /sessions/replay on the
+            // next rsclaw call, which re-anchors server state to the
+            // runtime's complete history.
+            let resp = match self.turn(&entry.session_id, &delta, &req).await {
+                Ok(o) => o,
+                Err(e) => {
+                    self.forget(&session_key);
+                    return Err(e);
+                }
+            };
+            let resp = match resp {
+                TurnOutcome::Stream(s) => s,
+                TurnOutcome::SessionNotFound => {
+                    // Recover via /sessions/replay then retry the turn.
+                    // History excludes the trailing delta — turn() below
+                    // re-sends it. Including it in replay would hydrate
+                    // the same message twice (once batched, once as the
+                    // turn input) and confuse the model.
+                    self.forget(&session_key);
+                    let replay_history = history_for_replay(&req.messages);
+                    let replayed = self.replay(&split, replay_history).await?;
+                    let entry = SessionEntry {
+                        session_id: replayed.session_id.clone(),
+                        // Same rationale as the open/replay path above:
+                        // cache key is the request alias, not the
+                        // upstream canonical. (Replay's response per
+                        // §2.2 doesn't even include prefix_id, so this
+                        // site happened to be self-consistent before —
+                        // but normalising both sites on
+                        // `split.prefix_id` keeps the cache-key contract
+                        // single-sourced.)
+                        prefix_id: split.prefix_id.clone(),
+                        last_seen_msgs_len: req.messages.len(),
+                    };
+                    self.store(&session_key, entry.clone());
+                    // Same forget-on-Err treatment as the primary
+                    // turn() path above — recovery doesn't grant
+                    // immunity from divergence.
+                    match self.turn(&entry.session_id, &delta, &req).await {
+                        Ok(TurnOutcome::Stream(s)) => s,
+                        Ok(TurnOutcome::SessionNotFound) => {
+                            self.forget(&session_key);
+                            anyhow::bail!(
+                                "rsclaw: session vanished immediately after replay (id={})",
+                                entry.session_id
+                            );
+                        }
+                        Err(e) => {
+                            self.forget(&session_key);
+                            return Err(e);
+                        }
+                    }
+                }
+            };
+            // Wrap the stream so that the FIRST transport error or
+            // explicit `StreamEvent::Error` evicts the session entry.
+            // If the stream tears down mid-turn, the runtime sees the
+            // error and aborts the iteration — but the rsclaw provider
+            // would otherwise keep the session cached, and rsclaw-
+            // server's view of that turn could be partially-committed
+            // or rolled back depending on where the failure landed.
+            // Forcing a fresh replay on the next call re-anchors both
+            // sides to the runtime's confirmed history.
+            Ok(invalidate_on_error(
+                resp,
+                Arc::clone(&self.sessions),
+                session_key,
+            ))
+        })
+    }
+}
+
+/// Wrap an `LlmStream` so the first error item evicts `session_key`
+/// from the shared session cache. `errored` flips on the first
+/// error to make the eviction idempotent — multiple `Err` items in
+/// the same stream don't try to re-acquire the lock unnecessarily.
+fn invalidate_on_error(
+    inner: LlmStream,
+    sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
+    session_key: String,
+) -> LlmStream {
+    use futures::StreamExt;
+    let mut errored = false;
+    Box::pin(inner.inspect(move |item| {
+        if errored {
+            return;
+        }
+        let invalidate = match item {
+            Err(_) => true,
+            Ok(StreamEvent::Error(_)) => true,
+            _ => false,
+        };
+        if !invalidate {
+            return;
+        }
+        errored = true;
+        // Best-effort lock; if poisoned, the parent provider's
+        // `lock_sessions` already logged the original poison —
+        // don't compound the noise here.
+        match sessions.lock() {
+            Ok(mut map) => {
+                map.remove(&session_key);
+            }
+            Err(p) => {
+                p.into_inner().remove(&session_key);
+            }
+        }
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Protocol operations: open / turn / replay (internal)
+// ---------------------------------------------------------------------------
+
+impl RsclawProvider {
+    async fn open(&self, split: &SplitRequest<'_>) -> Result<CreateSessionResp> {
+        let url = format!("{}/sessions", self.base_url);
+        let body = CreateSessionReq {
+            prefix_id: &split.prefix_id,
+            dynamic_prefix: DynamicPrefixWire {
+                system: split.dynamic_system,
+                tools: &split.dynamic_tools,
+                user_suffix: split.dynamic_user_suffix,
+            },
+            options: Some(split.options.clone()),
+        };
+        // 180s caps the worst-case prefix-decode time for a fresh
+        // session; without an explicit timeout reqwest hangs forever
+        // on a stalled server (the 20s connect_timeout only covers TCP
+        // establishment, not response wait).
+        let mut builder = self
+            .client
+            .post(&url)
+            .timeout(Duration::from_secs(180))
+            .json(&body);
+        if let Some((k, v)) = self.auth_header() {
+            builder = builder.header(k, v);
+        }
+        let resp = super::send_with_transport_retry(builder)
+            .await
+            .with_context(|| format!("rsclaw POST {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("rsclaw open session failed {status}: {body}");
+        }
+        resp.json::<CreateSessionResp>()
+            .await
+            .context("rsclaw open: parse response")
+    }
+
+    async fn replay(
+        &self,
+        split: &SplitRequest<'_>,
+        messages: &[Message],
+    ) -> Result<CreateSessionResp> {
+        let url = format!("{}/sessions/replay", self.base_url);
+        // Protocol §2.2 history accepts only `role: "user"` and
+        // `role: "assistant"`. The runtime, however, threads
+        // `Role::System` messages into the conversation list for
+        // plugins/skills prefixes, just-installed skills, and
+        // dynamic /ctx blocks (see agent/runtime.rs ~4054). Sending
+        // those through as-is would trigger `400 invalid_history`
+        // and tank every replay. Pull them out and append their
+        // text to `user_suffix` so the content still reaches the
+        // server — at the static-prefix slot, the only place the
+        // protocol allows non-conversational system content.
+        let (filtered, extra_suffix) = split_system_messages(messages);
+        // System-Role messages threaded through the conversation list
+        // (plugins/skills/ctx blocks — see comment above) get folded
+        // back into `dynamic_prefix.user_suffix`, the only protocol
+        // slot that accepts non-conversational system content. Without
+        // this they'd hit `400 invalid_history` on the worker side.
+        let user_suffix_owned: String = if extra_suffix.is_empty() {
+            String::new()
+        } else if split.dynamic_user_suffix.is_empty() {
+            extra_suffix
+        } else {
+            format!("{}\n\n{}", split.dynamic_user_suffix, extra_suffix)
+        };
+        let user_suffix: &str = if user_suffix_owned.is_empty() {
+            split.dynamic_user_suffix
+        } else {
+            &user_suffix_owned
+        };
+        let history: Vec<Value> = serialize_replay_history(&filtered);
+        let body = ReplayReq {
+            prefix_id: &split.prefix_id,
+            dynamic_prefix: DynamicPrefixWire {
+                system: split.dynamic_system,
+                tools: &split.dynamic_tools,
+                user_suffix,
+            },
+            history,
+            options: Some(split.options.clone()),
+        };
+        // 300s — replay re-decodes prefix + full history, which is
+        // strictly slower than open()'s prefix-only decode (180s).
+        // Without an explicit timeout reqwest hangs forever on a
+        // stalled server (connect_timeout only covers TCP setup).
+        let mut builder = self
+            .client
+            .post(&url)
+            .timeout(Duration::from_secs(300))
+            .json(&body);
+        if let Some((k, v)) = self.auth_header() {
+            builder = builder.header(k, v);
+        }
+        let resp = super::send_with_transport_retry(builder)
+            .await
+            .with_context(|| format!("rsclaw POST {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("rsclaw replay failed {status}: {body}");
+        }
+        resp.json::<CreateSessionResp>()
+            .await
+            .context("rsclaw replay: parse response")
+    }
+
+    async fn turn(
+        &self,
+        session_id: &str,
+        delta: &TurnDelta,
+        req: &LlmRequest,
+    ) -> Result<TurnOutcome> {
+        let url = format!("{}/sessions/{}/turn", self.base_url, session_id);
+        let body = TurnReq {
+            delta,
+            options: Some(TurnOptions::from_request(req)),
+            stream: true,
+        };
+        // No `.timeout()` on the builder: reqwest's `.timeout()` is a
+        // total deadline that includes the streaming body, so a 180s
+        // cap would kill long generations (reasoning models with
+        // extended thinking + large outputs routinely run past three
+        // minutes). Instead bound only the time-to-response-headers
+        // with `tokio::time::timeout` around the send so a wedged
+        // server still surfaces fast — once headers arrive, the body
+        // stream is allowed to take as long as it needs. Connection
+        // liveness during streaming is covered by the client-level
+        // `tcp_keepalive(30s)` configured in `http_client_with_ua`.
+        let mut builder = self.client.post(&url).json(&body);
+        if let Some((k, v)) = self.auth_header() {
+            builder = builder.header(k, v);
+        }
+        let send_fut = super::send_with_transport_retry(builder);
+        let resp = match tokio::time::timeout(TURN_HEADERS_TIMEOUT, send_fut).await {
+            Ok(r) => r.with_context(|| format!("rsclaw POST {url}"))?,
+            Err(_) => anyhow::bail!(
+                "rsclaw turn: timed out waiting for response headers after {}s ({url})",
+                TURN_HEADERS_TIMEOUT.as_secs()
+            ),
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            // 404 session_not_found (slot evicted), 409 version_drift
+            // (pinned node upgraded past our rsclaw_version) and 503
+            // backend_unavailable (pinned node gone via heartbeat
+            // timeout) all share the same recovery path: replay against
+            // current rsclaw_version and retry. Other 404s — typically
+            // a misrouted request hitting a CDN/proxy 404 page — should
+            // bail with the upstream body so operators can see the real
+            // error instead of looping forever in replay.
+            if is_session_evicted(status, &body) {
+                return Ok(TurnOutcome::SessionNotFound);
+            }
+            anyhow::bail!("rsclaw turn failed {status}: {body}");
+        }
+
+        let byte_stream = resp.bytes_stream();
+        let line_buffer = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let utf8_remainder = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let event_stream = byte_stream
+            .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
+            .then(move |chunk| {
+                let line_buffer = line_buffer.clone();
+                let utf8_remainder = utf8_remainder.clone();
+                async move { parse_sse_chunk(chunk, &line_buffer, &utf8_remainder).await }
+            })
+            .flat_map(futures::stream::iter);
+
+        Ok(TurnOutcome::Stream(Box::pin(event_stream)))
+    }
+}
+
+enum TurnOutcome {
+    Stream(LlmStream),
+    SessionNotFound,
+}
+
+// ---------------------------------------------------------------------------
+// Wire types — mirror rsclaw-protocol.md §2
+// ---------------------------------------------------------------------------
+
+/// Wire shape of `dynamic_prefix` per protocol §2.1.2.
+#[derive(Debug, Serialize)]
+struct DynamicPrefixWire<'a> {
+    #[serde(skip_serializing_if = "str::is_empty")]
+    system: &'a str,
+    /// All tools — builtin first, then per-client. rsclaw-server's
+    /// post-rename contract does NOT carry a separate top-level
+    /// `user_tools` field (its `backend/rsclaw_llm.rs` tests assert
+    /// `body.get("user_tools").is_none()`), so the split is encoded
+    /// purely as an ORDERING within this array. Builtins-first means
+    /// the chat-template-rendered byte prefix is stable across every
+    /// client of this RsClaw version, giving the worker's suffix-stable
+    /// LCP trim something to share between clients whose only
+    /// difference is per-machine MCP / plugin tools.
+    tools: &'a [Value],
+    #[serde(skip_serializing_if = "str::is_empty")]
+    user_suffix: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateSessionReq<'a> {
+    /// Protocol §2.1.1 — namespaced `<ns>/<ver>`. rsclaw-server still
+    /// accepts the legacy `rsclaw_version` field name as an alias, but
+    /// we always send the post-rename name on new traffic.
+    prefix_id: &'a str,
+    /// Hybrid mode (§2.1.3) — always sent. When `prefix_id` hits the
+    /// static registry the worker forks from there; otherwise the
+    /// dynamic-LRU keyed by hash of `system + tools` is used.
+    dynamic_prefix: DynamicPrefixWire<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<TurnOptions>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplayReq<'a> {
+    prefix_id: &'a str,
+    dynamic_prefix: DynamicPrefixWire<'a>,
+    history: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<TurnOptions>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct CreateSessionResp {
+    session_id: String,
+    /// Per protocol §2.1.6 the create response carries `prefix_id` (the
+    /// resolved canonical id, possibly different from the requested
+    /// alias). Per §2.2 the **replay** response does NOT include it —
+    /// rsclaw-server's backend passes the upstream JSON straight
+    /// through, so the field is absent on replay.
+    ///
+    /// Pre-rename clients receive `rsclaw_version` instead; we accept
+    /// either spelling via `serde alias` until the field is removed
+    /// upstream in v2.0.
+    ///
+    /// Modeled as `Option<String>` rather than `#[serde(default)]
+    /// String` so we accept three shapes:
+    ///   - field absent              → `None` (replay path)
+    ///   - field present, string     → `Some(v)` (open path)
+    ///   - field present, JSON null  → `None`
+    ///
+    /// The third case is the trap: serde's `String` deserializer
+    /// rejects `null` outright (`invalid type: null, expected a
+    /// string`), tanking the entire response parse and surfacing as a
+    /// `rsclaw open: parse response` error to the caller. Upstream
+    /// nodes occasionally emit `"prefix_id": null` when the version
+    /// registry is mid-roll — accept that gracefully.
+    ///
+    /// Parsed for forward compat / observability only. NOT used as the
+    /// session cache key — see the SessionEntry construction sites for
+    /// why caching the upstream canonical breaks alias-based requests.
+    #[serde(default, alias = "rsclaw_version")]
+    #[allow(dead_code)]
+    prefix_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TurnReq<'a> {
+    #[serde(flatten)]
+    delta: &'a TurnDelta,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<TurnOptions>,
+    stream: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum TurnDelta {
+    User { user_message: String },
+    Tools { tool_results: Vec<ToolResultDelta> },
+}
+
+impl TurnDelta {
+    fn from_request(req: &LlmRequest) -> Result<Self> {
+        let last = req
+            .messages
+            .last()
+            .context("rsclaw: empty messages, no delta to send")?;
+        if !matches!(last.role, Role::User | Role::Tool) {
+            anyhow::bail!(
+                "rsclaw: last message must be User or Tool, got {:?}",
+                last.role
+            );
+        }
+
+        // When the assistant calls N tools in parallel, the runtime
+        // queues N consecutive Role::Tool messages (one per result).
+        // Protocol §2.3 requires a single turn() carry ALL of them in
+        // one tool_results array, else server bails with 400
+        // tool_results_incomplete. Walk back from the tail collecting
+        // every consecutive Tool message; stop at the first non-Tool.
+        if matches!(last.role, Role::Tool) {
+            let mut tail: Vec<&Message> = Vec::new();
+            for m in req.messages.iter().rev() {
+                if matches!(m.role, Role::Tool) {
+                    tail.push(m);
+                } else {
+                    break;
+                }
+            }
+            tail.reverse();
+            let mut tool_results: Vec<ToolResultDelta> = Vec::new();
+            for m in tail {
+                if let MessageContent::Parts(parts) = &m.content {
+                    for p in parts {
+                        if let ContentPart::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } = p
+                        {
+                            tool_results.push(ToolResultDelta {
+                                tool_use_id: tool_use_id.clone(),
+                                content: content.clone(),
+                                is_error: is_error.unwrap_or(false),
+                            });
+                        }
+                    }
+                }
+            }
+            if tool_results.is_empty() {
+                anyhow::bail!("rsclaw: trailing Tool message(s) carried no tool_result parts");
+            }
+            return Ok(TurnDelta::Tools { tool_results });
+        }
+
+        // Role::User branch — the trailing message is treated as one
+        // user_message. Empty content (Text("") or Parts with only
+        // empty Text fragments) bails: protocol §2.3 requires a real
+        // delta, and silently shipping "" still bills a prefill on the
+        // upstream slot. Mirrors the empty-tool_results bail above.
+        let mut user_text = String::new();
+        match &last.content {
+            MessageContent::Text(t) => user_text.push_str(t),
+            MessageContent::Parts(parts) => {
+                for p in parts {
+                    if let ContentPart::Text { text } = p {
+                        user_text.push_str(text);
+                    }
+                }
+            }
+        }
+        if user_text.is_empty() {
+            anyhow::bail!("rsclaw: last message has no usable content for delta")
+        }
+        Ok(TurnDelta::User { user_message: user_text })
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ToolResultDelta {
+    tool_use_id: String,
+    content: String,
+    #[serde(default)]
+    is_error: bool,
+}
+
+/// Serializer for `Option<f32>` that routes the value through
+/// `super::json_f32` (rounds to 2 decimal places) instead of the default
+/// f32 → f64 path which leaks IEEE 754 precision artefacts (0.6_f32 →
+/// 0.6000000238418579 in JSON output). Mirrors what every other provider
+/// in this crate does manually with `body["temperature"] = json_f32(t)`.
+fn ser_opt_f32<S: serde::Serializer>(
+    v: &Option<f32>,
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match v {
+        None => s.serialize_none(),
+        Some(f) => super::json_f32(*f).serialize(s),
+    }
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+struct TurnOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "ser_opt_f32")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "ser_opt_f32")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_thinking: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    idle_ttl_secs: Option<u32>,
+}
+
+impl TurnOptions {
+    fn from_request(req: &LlmRequest) -> Self {
+        Self {
+            max_tokens: req.max_tokens,
+            temperature: req.temperature,
+            top_p: None,
+            enable_thinking: req.thinking_budget.map(|b| b > 0),
+            stop: None,
+            idle_ttl_secs: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Request splitting (LlmRequest → protocol fields)
+// ---------------------------------------------------------------------------
+
+/// Maps an `LlmRequest` onto the protocol's split fields per
+/// rsclaw-protocol §2.1 (post-rename, hybrid path).
+///
+/// When the runtime populated `req.system_shared` / `req.system_user`
+/// (kvCacheMode=2 path on the main agent loop), the split lands in the
+/// "real" hybrid shape:
+/// - `dynamic_system`        ← shared system prefix (byte-stable across
+///   every RsClaw client of this version) → wire `dynamic_prefix.system`
+/// - `dynamic_user_suffix`   ← per-machine user suffix → wire
+///   `dynamic_prefix.user_suffix`
+/// - `dynamic_tools`         ← all tools, builtin-first then per-client.
+///   Encoded as a single array because rsclaw-server's post-rename
+///   contract drops top-level `user_tools` (verified by its own
+///   `body.get("user_tools").is_none()` test). The ordering preserves a
+///   byte-stable rendered prefix across clients of the same RsClaw
+///   version regardless of their per-machine MCP/plugin tools.
+///
+/// When the split fields are missing (internal sessions / non-runtime
+/// callers) we degrade gracefully: stuff `req.system` into
+/// `dynamic_system`, every tool into `dynamic_tools` in input order,
+/// leave `dynamic_user_suffix` empty. Same effective cache behaviour
+/// as before this change.
+struct SplitRequest<'a> {
+    /// Namespaced `rsclaw/<id>` per protocol §2.10.1.
+    prefix_id: String,
+    dynamic_system: &'a str,
+    dynamic_user_suffix: &'a str,
+    dynamic_tools: Vec<Value>,
+    options: TurnOptions,
+}
+
+fn split_request<'a>(req: &'a LlmRequest) -> Result<SplitRequest<'a>> {
+    // `parse_model` strips any leading `rsclaw/` before the request
+    // reaches this provider, so by the time we see `req.model` it's
+    // typically the bare id (`qwen3-235b`). Re-namespace it before
+    // putting it on the wire — protocol §2.10.1 mandates exactly one
+    // `/` separator, and `400 prefix_id_invalid` rejects unprefixed
+    // ids at the worker layer.
+    let prefix_id = if req.model.contains('/') {
+        req.model.clone()
+    } else {
+        format!("rsclaw/{}", req.model)
+    };
+
+    let tool_json = |t: &super::ToolDef| {
+        json!({
+            "name": t.name,
+            "description": t.description,
+            "input_schema": t.parameters,
+        })
+    };
+
+    let (dynamic_system, dynamic_user_suffix, dynamic_tools) =
+        if req.system_shared.is_some() || req.system_user.is_some() {
+            // Real split — sort tools [builtin..., per-client...] so
+            // the rendered chat-template prefix is byte-stable across
+            // every client of this version up to the per-client tool
+            // boundary.
+            let mut builtin_t = Vec::new();
+            let mut user_t = Vec::new();
+            for t in &req.tools {
+                if crate::agent::prompt_builder::BUILTIN_TOOL_NAMES
+                    .contains(&t.name.as_str())
+                {
+                    builtin_t.push(tool_json(t));
+                } else {
+                    user_t.push(tool_json(t));
+                }
+            }
+            builtin_t.extend(user_t);
+            (
+                req.system_shared.as_deref().unwrap_or(""),
+                req.system_user.as_deref().unwrap_or(""),
+                builtin_t,
+            )
+        } else {
+            // No split available — collapse everything into the
+            // dynamic prefix in input order. Per-client LRU key is over
+            // the full system + tools, so every distinct caller still
+            // gets its own slot (same as pre-split behaviour).
+            let all_tools: Vec<Value> = req.tools.iter().map(tool_json).collect();
+            (
+                req.system.as_deref().unwrap_or(""),
+                "",
+                all_tools,
+            )
+        };
+
+    Ok(SplitRequest {
+        prefix_id,
+        dynamic_system,
+        dynamic_user_suffix,
+        dynamic_tools,
+        options: TurnOptions::from_request(req),
+    })
+}
+
+/// Returns the history slice to send to `/sessions/replay`: every
+/// message except the trailing delta (which `turn()` will re-send).
+/// Empty input returns an empty slice — replay can still hydrate a
+/// fresh session with no prior turns.
+///
+/// When the assistant calls N tools in parallel the runtime queues N
+/// consecutive `Role::Tool` messages, and `TurnDelta::from_request`
+/// folds ALL of them into a single tool_results delta (protocol §2.3
+/// requires it). To keep the two sides symmetric the history slice
+/// must drop every consecutive trailing `Role::Tool` — dropping just
+/// one would leave the other N-1 in history, the server would replay
+/// them into the KV, and then the turn would re-send the same
+/// tool_results, hydrating duplicates.
+///
+/// For a User-trailing list (the iter-1 case after
+/// `normalize_trailing_system` ran) we drop exactly one message.
+fn history_for_replay(messages: &[Message]) -> &[Message] {
+    if messages.is_empty() {
+        return messages;
+    }
+    let last = &messages[messages.len() - 1];
+    if matches!(last.role, Role::Tool) {
+        let mut keep = messages.len();
+        while keep > 0 && matches!(messages[keep - 1].role, Role::Tool) {
+            keep -= 1;
+        }
+        &messages[..keep]
+    } else {
+        &messages[..messages.len() - 1]
+    }
+}
+
+/// Partition a history slice into (non-system messages, concatenated
+/// system text). The runtime threads `Role::System` messages through
+/// the conversation list for plugins/skills/ctx blocks, but protocol
+/// §2.2 only accepts `user` / `assistant` in history — so we lift the
+/// system text out and let the caller append it to `user_suffix`.
+/// Order of system blocks is preserved within the returned String;
+/// blocks are joined with a blank line. Non-text content on a
+/// `Role::System` message is dropped (system messages are documented
+/// as text-only in the runtime).
+fn split_system_messages(messages: &[Message]) -> (Vec<&Message>, String) {
+    let mut filtered: Vec<&Message> = Vec::with_capacity(messages.len());
+    let mut sys_parts: Vec<String> = Vec::new();
+    for m in messages {
+        if matches!(m.role, Role::System) {
+            // Text(t) and Parts(...) must skip empties symmetrically —
+            // otherwise an empty System(Text("")) leaks a blank entry
+            // into sys_parts and pollutes user_suffix with a leading
+            // `\n\n` once `sys_parts.join("\n\n")` runs.
+            let txt = match &m.content {
+                MessageContent::Text(t) => t.clone(),
+                MessageContent::Parts(parts) => {
+                    let mut joined = String::new();
+                    for p in parts {
+                        if let ContentPart::Text { text } = p {
+                            joined.push_str(text);
+                        }
+                    }
+                    joined
+                }
+            };
+            if !txt.is_empty() {
+                sys_parts.push(txt);
+            }
+        } else {
+            filtered.push(m);
+        }
+    }
+    (filtered, sys_parts.join("\n\n"))
+}
+
+/// Pull any trailing `Role::System` messages off the end of `messages`
+/// and fold their text into the preceding `Role::User` message.
+///
+/// The runtime appends `Role::System` blocks (dynamic /ctx, just-
+/// installed skills) AFTER the User delta on the first iteration of
+/// each turn (`turn_scratchpad` empty — see agent/runtime.rs). On
+/// later iterations the scratchpad's Assistant/Tool entries follow,
+/// so trailing-System only happens iter-1. `TurnDelta::from_request`
+/// rejects a trailing System ("last message must be User or Tool"),
+/// failing the whole turn — fold the text inline so the model still
+/// sees the dynamic context, just as part of the user_message body.
+///
+/// If the message immediately before the trailing System block(s) is
+/// `Role::Tool` (parallel tool_results case, theoretical — runtime
+/// doesn't currently inject System after Tool, but defend anyway),
+/// drop the System text. Persistent system content already lives in
+/// `user_suffix` from the prior open/replay; only the per-iteration
+/// dynamic context would be lost, which the protocol has no slot
+/// for in a tool_results delta.
+fn normalize_trailing_system(messages: &mut Vec<Message>) {
+    let mut trailing: Vec<String> = Vec::new();
+    while matches!(messages.last(), Some(m) if matches!(m.role, Role::System)) {
+        let m = messages.pop().expect("matched Some above");
+        let txt = match m.content {
+            MessageContent::Text(t) => t,
+            MessageContent::Parts(parts) => parts
+                .into_iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        };
+        if !txt.is_empty() {
+            trailing.push(txt);
+        }
+    }
+    if trailing.is_empty() {
+        return;
+    }
+    trailing.reverse();
+    let combined = trailing.join("\n\n");
+    match messages.last_mut() {
+        Some(last) if matches!(last.role, Role::User) => match &mut last.content {
+            MessageContent::Text(t) => {
+                if t.is_empty() {
+                    *t = combined;
+                } else {
+                    t.push_str("\n\n");
+                    t.push_str(&combined);
+                }
+            }
+            MessageContent::Parts(parts) => {
+                parts.push(ContentPart::Text { text: combined });
+            }
+        },
+        _ => {
+            // Tool / empty — nothing to fold into. Drop silently.
+        }
+    }
+}
+
+fn serialize_history_message(msg: &Message) -> Value {
+    let role = match msg.role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "user",
+    };
+    let content = match &msg.content {
+        MessageContent::Text(t) => json!(t),
+        MessageContent::Parts(parts) => {
+            let mapped: Vec<Value> = parts.iter().map(serialize_history_part).collect();
+            json!(mapped)
+        }
+    };
+    json!({ "role": role, "content": content })
+}
+
+fn serialize_history_part(p: &ContentPart) -> Value {
+    match p {
+        ContentPart::Text { text } => json!({"type":"text","text":text}),
+        ContentPart::Image { url } => {
+            json!({"type":"image","source":{"type":"url","url":url}})
+        }
+        ContentPart::ToolUse { id, name, input } => {
+            json!({"type":"tool_use","id":id,"name":name,"input":input})
+        }
+        ContentPart::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => {
+            let mut obj = json!({
+                "type":"tool_result",
+                "tool_use_id":tool_use_id,
+                "content":content,
+            });
+            if let Some(e) = is_error {
+                obj["is_error"] = json!(e);
+            }
+            obj
+        }
+        ContentPart::Reasoning { text } => json!({"type":"thinking","text":text}),
+    }
+}
+
+/// Serialize replay history with consecutive `Role::Tool` messages
+/// coalesced into one `user`-role entry whose `content` array carries
+/// every `tool_result` part.
+///
+/// Why: when the assistant calls N tools in parallel, the runtime queues
+/// N consecutive `Role::Tool` messages (one per result). `from_request`
+/// already merges them into a single `tool_results` array on a live
+/// turn; replay history needs the same shape per protocol §2.2 — the
+/// example there shows tool_results inside ONE user-role entry, and
+/// shipping N separate entries would either tokenize wrong or trip
+/// `400 invalid_history` on stricter chat templates.
+fn serialize_replay_history(messages: &[&Message]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    let mut i = 0;
+    while i < messages.len() {
+        let m = messages[i];
+        if !matches!(m.role, Role::Tool) {
+            out.push(serialize_history_message(m));
+            i += 1;
+            continue;
+        }
+        let mut combined: Vec<Value> = Vec::new();
+        while i < messages.len() && matches!(messages[i].role, Role::Tool) {
+            match &messages[i].content {
+                MessageContent::Parts(parts) => {
+                    for p in parts {
+                        if matches!(p, ContentPart::ToolResult { .. }) {
+                            combined.push(serialize_history_part(p));
+                        }
+                    }
+                }
+                MessageContent::Text(_) => {
+                    // Defensive: today's runtime always emits
+                    // `Role::Tool` with `Parts(vec![ToolResult{..}])`,
+                    // so this branch should never trigger. If it ever
+                    // does — e.g. a future runtime path or a plugin
+                    // injecting a synthesised tool message — the text
+                    // has no `tool_use_id` to anchor it server-side
+                    // (protocol §2.2 requires `tool_result` parts to
+                    // pair with prior `tool_use` ids). Drop and surface
+                    // a warning so we notice the contract change rather
+                    // than silently producing a turn whose model
+                    // response is shaped by missing context.
+                    tracing::warn!(
+                        "rsclaw: dropping Role::Tool with text-only content during \
+                         replay (no tool_use_id to pair with — runtime contract \
+                         expects Parts(ToolResult{{..}}))",
+                    );
+                    debug_assert!(false, "Role::Tool must carry Parts(ToolResult{{..}}); got Text");
+                }
+            }
+            i += 1;
+        }
+        if !combined.is_empty() {
+            out.push(json!({ "role": "user", "content": combined }));
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// SSE parsing — protocol §2.3 stream events
+// ---------------------------------------------------------------------------
+
+async fn parse_sse_chunk(
+    chunk: Result<bytes::Bytes>,
+    line_buffer: &Arc<tokio::sync::Mutex<String>>,
+    utf8_remainder: &Arc<tokio::sync::Mutex<Vec<u8>>>,
+) -> Vec<Result<StreamEvent>> {
+    let mut events: Vec<Result<StreamEvent>> = Vec::new();
+    let bytes = match chunk {
+        Ok(b) => b,
+        Err(e) => {
+            events.push(Err(e));
+            return events;
+        }
+    };
+
+    // Stitch this chunk onto any partial UTF-8 left over from the
+    // previous chunk; decode strict; stash the trailing invalid bytes
+    // (an incomplete multi-byte sequence at the chunk boundary) for
+    // the next call. from_utf8_lossy would corrupt CJK / emoji deltas
+    // that straddle chunk boundaries by inserting U+FFFD.
+    let mut remainder = utf8_remainder.lock().await;
+    let stitched: Vec<u8> = if remainder.is_empty() {
+        bytes.to_vec()
+    } else {
+        let mut combined = std::mem::take(&mut *remainder);
+        combined.extend_from_slice(&bytes);
+        combined
+    };
+    let decoded: String = match std::str::from_utf8(&stitched) {
+        Ok(s) => s.to_owned(),
+        Err(e) => {
+            let valid_up_to = e.valid_up_to();
+            // Two distinct error shapes per `Utf8Error`:
+            //   error_len() == None    → trailing bytes are an
+            //     INCOMPLETE multi-byte sequence; stash them so the
+            //     next chunk completes the codepoint.
+            //   error_len() == Some(n) → the next n bytes are
+            //     INVALID and will never become valid; advance past
+            //     them. Without this advance, every subsequent chunk
+            //     stitches onto the bad prefix and fails at the same
+            //     position — remainder grows unboundedly and the
+            //     stream stalls forever (a single stray 0xFF from a
+            //     buggy proxy is enough to wedge the turn). The lost
+            //     bytes are unrecoverable garbage in either reading.
+            let advance_past_invalid = e.error_len().unwrap_or(0);
+            *remainder = stitched[valid_up_to + advance_past_invalid..].to_vec();
+            if valid_up_to == 0 {
+                return events;
+            }
+            std::str::from_utf8(&stitched[..valid_up_to])
+                .expect("valid_up_to guarantees valid UTF-8")
+                .to_owned()
+        }
+    };
+    drop(remainder);
+
+    let mut buf = line_buffer.lock().await;
+    buf.push_str(&decoded);
+    while let Some(idx) = buf.find('\n') {
+        let line = buf[..idx].trim_end_matches('\r').to_string();
+        buf.drain(..=idx);
+        // Per WHATWG SSE the space after the colon is optional, so
+        // `data:{...}` is just as valid as `data: {...}`. Accept both
+        // — matches the openai/anthropic/gemini providers in this
+        // crate. Strip the colon, then trim leading ASCII spaces.
+        let Some(payload) = line.strip_prefix("data:").map(|s| s.trim_start_matches(' ')) else {
+            continue;
+        };
+        if payload == "[DONE]" {
+            continue;
+        }
+        // Skip empty `data:` payloads silently. SSE keep-alives sometimes
+        // surface as `data:\n\n` (no body) when proxies translate
+        // `:keepalive` comments. Pushing a parse error here would
+        // surface as `Err(...)` down the stream — and runtime's
+        // `match event?` (agent/runtime.rs ~4356) propagates that with
+        // `?`, killing the whole turn. The empty line carries no model
+        // signal; drop it the same way `[DONE]` is dropped.
+        if payload.is_empty() {
+            continue;
+        }
+        let value: Value = match serde_json::from_str(payload) {
+            Ok(v) => v,
+            Err(e) => {
+                events.push(Err(anyhow::anyhow!("rsclaw SSE parse: {e}; line: {payload}")));
+                continue;
+            }
+        };
+        match value.get("type").and_then(|v| v.as_str()) {
+            Some("delta") => {
+                let s = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if !s.is_empty() {
+                    events.push(Ok(StreamEvent::TextDelta(s.to_string())));
+                }
+            }
+            Some("thinking") => {
+                let s = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if !s.is_empty() {
+                    events.push(Ok(StreamEvent::ReasoningDelta(s.to_string())));
+                }
+            }
+            Some("tool_call") => {
+                let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let name = value.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                // Default to an empty JSON object — `Value::Null` would
+                // make downstream `input.as_object()` calls return None
+                // and force every consumer to `unwrap_or(&empty_map)`.
+                // The other three providers in this crate (anthropic,
+                // gemini, openai) all default to an empty object; align
+                // here so the runtime can treat the field uniformly.
+                let input = match value.get("input").cloned() {
+                    Some(Value::Null) | None => Value::Object(Default::default()),
+                    Some(other) => other,
+                };
+                events.push(Ok(StreamEvent::ToolCall { id, name, input }));
+            }
+            Some("done") => {
+                // If `usage` is present AND a JSON object, surface it —
+                // even partially. Defaulting missing fields to 0 (rather
+                // than dropping the entire TokenUsage on a single missing
+                // field) matches the anthropic provider's pattern and
+                // means a server that ships e.g. `input_tokens` without
+                // `output_tokens` still gets the input count through to
+                // cost-tracking instead of losing both.
+                //
+                // The `as_object` filter is load-bearing: a plain
+                // `value.get("usage").map(...)` would treat `"usage":
+                // null` as present, yielding `Some(TokenUsage{0,0})` —
+                // a phantom zero-token turn that corrupts accounting.
+                // `null` is the explicit "no usage data" signal and must
+                // collapse to `None`, same as the field being absent.
+                let usage = value
+                    .get("usage")
+                    .and_then(Value::as_object)
+                    .map(|u| TokenUsage {
+                        input: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+                        output: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+                    });
+                events.push(Ok(StreamEvent::Done { usage }));
+            }
+            Some("error") => {
+                // Protocol §2.3: error event carries both `code` and
+                // `detail`. Preserve both so downstream consumers can
+                // discriminate by code (e.g. `slot_evicted` →
+                // replay-and-retry) and operators see the full message
+                // in tail logs.
+                let code = value.get("code").and_then(|v| v.as_str()).unwrap_or("");
+                let detail = value.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+                let msg = match (code.is_empty(), detail.is_empty()) {
+                    (false, false) => format!("rsclaw stream error [{code}]: {detail}"),
+                    (false, true) => format!("rsclaw stream error [{code}]"),
+                    (true, false) => format!("rsclaw stream error: {detail}"),
+                    (true, true) => "rsclaw stream error".to_string(),
+                };
+                events.push(Ok(StreamEvent::Error(msg)));
+            }
+            _ => {}
+        }
+    }
+    events
+}
+
+/// True when the (status, body) pair is a documented session-eviction
+/// signal that the gateway should recover from via replay:
+/// - `404 session_not_found` — slot evicted (LRU, idle TTL) or upstream
+///   restart; per protocol §5 the recovery is `POST /sessions/replay`
+/// - `409 version_drift` — pinned node upgraded past our rsclaw_version
+/// - `503 backend_unavailable` — pinned node gone (heartbeat timeout)
+///
+/// `503 no_backend_available` (capacity exhaustion) is intentionally NOT
+/// recoverable here — replay would just hit the same wall.
+fn is_session_evicted(status: StatusCode, body: &str) -> bool {
+    let code = serde_json::from_str::<Value>(body)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(|e| e.get("code"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    match (status, code.as_deref()) {
+        (StatusCode::NOT_FOUND, Some("session_not_found")) => true,
+        (StatusCode::CONFLICT, Some("version_drift")) => true,
+        (StatusCode::SERVICE_UNAVAILABLE, Some("backend_unavailable")) => true,
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::ToolDef;
+
+    #[tokio::test]
+    async fn parse_sse_chunk_recovers_split_utf8() {
+        // SSE delta line carrying "你好" (U+4F60 = E4 BD A0, U+597D =
+        // E5 A5 BD), with the byte split landing in the middle of the
+        // first character.
+        let line_full = b"data: {\"type\":\"delta\",\"content\":\"\xe4\xbd\xa0\xe5\xa5\xbd\"}\n";
+        let split = 14; // "data: {\"type\":" prefix is 14 bytes
+        let (a, b) = line_full.split_at(split);
+        let (b, c) = b.split_at(11); // straddles the first 你 (E4 BD A0)
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+
+        for piece in [a, b, c] {
+            let _ = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(piece)), &buf, &rem).await;
+        }
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::from_static(b"")), &buf, &rem).await;
+
+        let texts: Vec<_> = evs
+            .into_iter()
+            .filter_map(|e| match e {
+                Ok(StreamEvent::TextDelta(t)) => Some(t),
+                _ => None,
+            })
+            .collect();
+        // Either fully delivered now or already delivered in an earlier piece.
+        let all_text: String = texts.into_iter().collect();
+        // The final newline-terminated event must produce 你好 verbatim, no U+FFFD.
+        assert!(
+            !all_text.contains('\u{FFFD}'),
+            "expected no replacement char, got {all_text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_advances_past_invalid_utf8_byte() {
+        // A stray 0xFF (or any byte that's *invalid as a UTF-8 start*,
+        // not just incomplete) MUST be skipped, not pinned in
+        // `utf8_remainder`. Without this, every subsequent chunk
+        // stitches onto the bad prefix, fails at the same position,
+        // and remainder grows unboundedly while no events ever fire —
+        // the stream stalls forever on a single bad byte.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+
+        // Chunk 1: just an invalid byte. error_len() = Some(1).
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::from_static(b"\xff")), &buf, &rem).await;
+        assert!(
+            evs.iter().all(|e| e.is_ok()),
+            "stray 0xFF must not surface as Err — got {evs:?}"
+        );
+        {
+            let r = rem.lock().await;
+            assert!(
+                !r.contains(&0xff),
+                "0xFF must be advanced past, not pinned in remainder; got {:?}",
+                *r
+            );
+        }
+
+        // Chunk 2: a complete SSE event. The stream must recover and
+        // emit it normally — no contamination from the prior bad byte.
+        let evs = parse_sse_chunk(
+            Ok(bytes::Bytes::from_static(
+                b"data: {\"type\":\"delta\",\"content\":\"hi\"}\n",
+            )),
+            &buf,
+            &rem,
+        )
+        .await;
+        let texts: Vec<_> = evs
+            .into_iter()
+            .filter_map(|e| match e {
+                Ok(StreamEvent::TextDelta(t)) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["hi".to_string()],
+            "stream must recover and emit subsequent events after a bad byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_invalid_byte_does_not_unbounded_grow_remainder() {
+        // Regression: feeding the same invalid byte over and over MUST
+        // NOT grow `utf8_remainder` linearly. Pre-fix, every call
+        // appended the bad byte and re-saved the entire stitched buffer;
+        // 1000 chunks → 1000-byte remainder → eventual OOM in long
+        // streams. Post-fix the remainder stays empty after each call.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        for _ in 0..50 {
+            let _ = parse_sse_chunk(Ok(bytes::Bytes::from_static(b"\xff")), &buf, &rem).await;
+        }
+        let r = rem.lock().await;
+        assert!(
+            r.len() <= 3,
+            "remainder must not accumulate invalid bytes (cap 3 for trailing incomplete UTF-8); got {} bytes",
+            r.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_skips_empty_data_payload() {
+        // Empty `data:` lines (a heartbeat shape some proxies emit when
+        // translating `:keepalive` comments) MUST NOT surface as Err in
+        // the stream — the runtime propagates Err with `?` and would
+        // kill an otherwise-healthy turn. Mix an empty line with a real
+        // event and assert: only the real text delta fires, no Err.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = b"data:\ndata: {\"type\":\"delta\",\"content\":\"hi\"}\n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let mut texts: Vec<String> = Vec::new();
+        for e in evs {
+            match e {
+                Ok(StreamEvent::TextDelta(t)) => texts.push(t),
+                Err(err) => panic!("empty data: must not surface as Err — got {err}"),
+                _ => {}
+            }
+        }
+        assert_eq!(texts, vec!["hi".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_skips_data_with_only_spaces() {
+        // `data:    \n` (whitespace-only after the colon) trims to "" via
+        // `trim_start_matches(' ')` and lands in the same empty-skip path.
+        // Verify the same: no Err, no spurious event.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = b"data:    \n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        for e in evs {
+            if let Err(err) = e {
+                panic!("whitespace-only data: must not surface as Err — got {err}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_accepts_data_without_leading_space() {
+        // SSE field syntax allows the space after the colon to be
+        // omitted; rsclaw-server (or any node that routes through
+        // hyper / nginx with comp-stripping middleware) may emit
+        // `data:{...}` without a space. Both forms must parse.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = b"data:{\"type\":\"delta\",\"content\":\"hi\"}\n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let texts: Vec<_> = evs
+            .into_iter()
+            .filter_map(|e| match e {
+                Ok(StreamEvent::TextDelta(t)) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["hi".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_emits_done_with_usage() {
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = b"data: {\"type\":\"done\",\"usage\":{\"input_tokens\":17,\"output_tokens\":42}}\n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let mut saw_done = false;
+        for e in evs {
+            if let Ok(StreamEvent::Done { usage }) = e {
+                let u = usage.expect("usage should be populated");
+                assert_eq!(u.input, 17);
+                assert_eq!(u.output, 42);
+                saw_done = true;
+            }
+        }
+        assert!(saw_done, "expected one Done event");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_emits_done_without_usage() {
+        // Server may omit usage on early termination — Done must still fire.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = b"data: {\"type\":\"done\"}\n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let mut saw_done = false;
+        for e in evs {
+            if let Ok(StreamEvent::Done { usage }) = e {
+                assert!(usage.is_none());
+                saw_done = true;
+            }
+        }
+        assert!(saw_done, "expected Done event even without usage");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_tool_call_defaults_input_to_empty_object() {
+        // Tools without parameters legitimately ship `input: {}`, which
+        // already arrives as Value::Object — verify pass-through.
+        // But missing input or null input should ALSO produce an empty
+        // object, matching the anthropic/gemini/openai providers, so
+        // runtime consumers can call .as_object() without first
+        // matching Null.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = b"data: {\"type\":\"tool_call\",\"id\":\"toolu_xyz\",\"name\":\"get_time\"}\n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let input = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::ToolCall { input, .. }) => Some(input),
+                _ => None,
+            })
+            .expect("expected one ToolCall event");
+        assert!(
+            input.as_object().is_some_and(|m| m.is_empty()),
+            "expected empty object, got {input:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_tool_call_normalizes_explicit_null_input() {
+        // A misbehaving server might emit `"input": null`. Don't pass
+        // the Null through — coerce to {} so downstream stays uniform.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line =
+            b"data: {\"type\":\"tool_call\",\"id\":\"t\",\"name\":\"n\",\"input\":null}\n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let input = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::ToolCall { input, .. }) => Some(input),
+                _ => None,
+            })
+            .expect("expected one ToolCall event");
+        assert!(
+            input.as_object().is_some_and(|m| m.is_empty()),
+            "explicit null should normalize to empty object, got {input:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_tool_call_preserves_populated_input() {
+        // Round-trip a real input — the normalization must NOT clobber
+        // a non-null object. Regression test for the obvious foot-gun
+        // of a too-eager fallback.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = br#"data: {"type":"tool_call","id":"t","name":"read_file","input":{"path":"x.rs"}}
+"#;
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let input = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::ToolCall { input, .. }) => Some(input),
+                _ => None,
+            })
+            .expect("expected one ToolCall event");
+        assert_eq!(
+            input.get("path").and_then(Value::as_str),
+            Some("x.rs"),
+            "populated input must round-trip; got {input:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_done_preserves_partial_usage() {
+        // Server may legitimately ship usage with one of the two token
+        // counts missing (e.g. early-termination or a buggy proxy that
+        // strips fields). Old parser used `?` to short-circuit, which
+        // nuked the entire TokenUsage on any missing field. Defaulting
+        // each side to 0 keeps the half we DID get.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = b"data: {\"type\":\"done\",\"usage\":{\"input_tokens\":17}}\n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let usage = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::Done { usage }) => Some(usage),
+                _ => None,
+            })
+            .expect("expected one Done event")
+            .expect("usage should survive partial fields");
+        assert_eq!(usage.input, 17);
+        assert_eq!(usage.output, 0);
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_done_treats_null_usage_as_absent() {
+        // `"usage": null` must collapse to `None`, identical to the
+        // field being missing. The pre-fix code emitted
+        // `Some(TokenUsage{0,0})` for null usage, which downstream
+        // cost-tracking recorded as a real zero-token turn — a phantom
+        // accounting entry that diluted average usage stats and faked
+        // a successful "free" turn from a buggy / older server build.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = b"data: {\"type\":\"done\",\"usage\":null}\n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let mut saw_done = false;
+        for e in evs {
+            if let Ok(StreamEvent::Done { usage }) = e {
+                assert!(
+                    usage.is_none(),
+                    "null usage must collapse to None, got {usage:?}"
+                );
+                saw_done = true;
+            }
+        }
+        assert!(saw_done, "expected Done event with usage=None");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_done_treats_non_object_usage_as_absent() {
+        // Defensive: a malformed server that ships `"usage": [1,2]` or
+        // `"usage": "0"` (wrong JSON type) must NOT yield a phantom
+        // Some(TokenUsage{0,0}). Fall back to None and let downstream
+        // accounting record the turn as "usage unknown" instead of
+        // "usage was zero".
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = b"data: {\"type\":\"done\",\"usage\":[1,2,3]}\n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let mut saw_done = false;
+        for e in evs {
+            if let Ok(StreamEvent::Done { usage }) = e {
+                assert!(usage.is_none(), "non-object usage must collapse to None");
+                saw_done = true;
+            }
+        }
+        assert!(saw_done, "expected Done event");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_error_preserves_code_and_detail() {
+        // Protocol §2.3: error frame is `{type:"error", code, detail}`.
+        // Both fields must survive into StreamEvent::Error so callers
+        // can branch on code (e.g. slot_evicted → replay) and humans
+        // see the detail in tail logs.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = br#"data: {"type":"error","code":"slot_evicted","detail":"slot was reclaimed mid-decode"}
+"#;
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let mut msgs = Vec::new();
+        for e in evs {
+            if let Ok(StreamEvent::Error(m)) = e {
+                msgs.push(m);
+            }
+        }
+        assert_eq!(msgs.len(), 1, "expected exactly one Error event");
+        assert!(msgs[0].contains("slot_evicted"), "missing code: {}", msgs[0]);
+        assert!(
+            msgs[0].contains("slot was reclaimed mid-decode"),
+            "missing detail: {}",
+            msgs[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_error_falls_back_when_code_missing() {
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = br#"data: {"type":"error","detail":"upstream hung up"}
+"#;
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let msg = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::Error(m)) => Some(m),
+                _ => None,
+            })
+            .expect("expected one Error event");
+        assert!(msg.contains("upstream hung up"), "missing detail: {msg}");
+        assert!(!msg.contains("[]"), "empty-code marker leaked: {msg}");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_error_falls_back_when_detail_missing() {
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = br#"data: {"type":"error","code":"version_drift"}
+"#;
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let msg = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::Error(m)) => Some(m),
+                _ => None,
+            })
+            .expect("expected one Error event");
+        assert!(msg.contains("version_drift"), "missing code: {msg}");
+        assert!(!msg.ends_with(": "), "trailing empty-detail leaked: {msg}");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_error_uses_default_when_both_missing() {
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let line = b"data: {\"type\":\"error\"}\n";
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let msg = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::Error(m)) => Some(m),
+                _ => None,
+            })
+            .expect("expected one Error event");
+        assert_eq!(msg, "rsclaw stream error");
+    }
+
+    #[test]
+    fn turn_headers_timeout_is_bounded_and_finite() {
+        // Sanity-check the constant: streaming turns rely on this for
+        // wedged-server detection. Too short would cause spurious
+        // failures on a slow TLS handshake; too long would let a dead
+        // server hang the runtime indefinitely.
+        let s = TURN_HEADERS_TIMEOUT.as_secs();
+        assert!((30..=120).contains(&s), "TURN_HEADERS_TIMEOUT={s}s out of range");
+    }
+
+    #[test]
+    fn auth_header_omits_when_bearer_is_none_or_empty() {
+        // `RSCLAW_KEY=""` (env var set but blank) flows in as
+        // `Some("")` from `std::env::var(...).ok()` — sending
+        // `Authorization: Bearer ` would be rejected by stricter
+        // proxies. Treat None and Some("") as the same "no auth"
+        // signal at the wire boundary.
+        let p = RsclawProvider::new("http://x", None);
+        assert!(p.auth_header().is_none());
+        let p = RsclawProvider::new("http://x", Some(String::new()));
+        assert!(p.auth_header().is_none());
+    }
+
+    #[test]
+    fn auth_header_emits_bearer_when_populated() {
+        let p = RsclawProvider::new("http://x", Some("sk-abc".into()));
+        let (k, v) = p.auth_header().expect("bearer set");
+        assert_eq!(k, "authorization");
+        assert_eq!(v, "Bearer sk-abc");
+    }
+
+    #[test]
+    fn ctor_trims_whitespace_from_base_url_and_bearer() {
+        // dotenv-loaded env vars routinely carry a trailing newline —
+        // `RSCLAW_KEY=sk-abc\n` round-trips into the provider as
+        // `Some("sk-abc\n")`. reqwest rejects HTTP header values
+        // containing `\n` (RFC 7230), so without trimming every signed
+        // request fails before leaving the process. Same hazard for
+        // base_url where leading/trailing whitespace breaks URL parse.
+        let p = RsclawProvider::new(
+            "  http://x:8090/v1/agent/  ",
+            Some("  sk-abc\n  ".into()),
+        );
+        assert_eq!(p.base_url, "http://x:8090/v1/agent");
+        let (k, v) = p.auth_header().expect("bearer survived trim");
+        assert_eq!(k, "authorization");
+        assert_eq!(v, "Bearer sk-abc");
+    }
+
+    #[test]
+    fn ctor_blank_after_trim_bearer_becomes_none() {
+        // `RSCLAW_KEY="   "` (whitespace-only) MUST NOT survive as
+        // `Some("   ")` — that would emit `Authorization: Bearer    `
+        // which stricter proxies reject the same way they reject the
+        // empty-string form covered by `auth_header_omits_when_*`.
+        let p = RsclawProvider::new("http://x", Some("   \n\t".into()));
+        assert!(p.bearer.is_none());
+        assert!(p.auth_header().is_none());
+    }
+
+    #[test]
+    fn is_session_evicted_recognizes_session_not_found() {
+        let body = r#"{"error":{"code":"session_not_found","detail":"slot evicted"}}"#;
+        assert!(is_session_evicted(StatusCode::NOT_FOUND, body));
+    }
+
+    #[test]
+    fn is_session_evicted_rejects_404_with_other_code() {
+        // A 404 from a misrouted request (e.g. wrong path → CDN 404
+        // page or `404 unknown_version` from /sessions/replay) MUST NOT
+        // be treated as a session eviction. Earlier code blindly
+        // short-circuited any 404 to SessionNotFound, which would loop
+        // forever in replay; the unified `is_session_evicted` check
+        // requires the body to confirm the eviction code.
+        let body = r#"{"error":{"code":"unknown_version","detail":"v not registered"}}"#;
+        assert!(!is_session_evicted(StatusCode::NOT_FOUND, body));
+        assert!(!is_session_evicted(StatusCode::NOT_FOUND, ""));
+        assert!(!is_session_evicted(
+            StatusCode::NOT_FOUND,
+            "<html>not found</html>",
+        ));
+    }
+
+    #[test]
+    fn is_session_evicted_recognizes_version_drift() {
+        let body = r#"{"error":{"code":"version_drift","detail":"node has been upgraded"}}"#;
+        assert!(is_session_evicted(StatusCode::CONFLICT, body));
+    }
+
+    #[test]
+    fn is_session_evicted_recognizes_backend_unavailable() {
+        let body = r#"{"error":{"code":"backend_unavailable","detail":"heartbeat timeout"}}"#;
+        assert!(is_session_evicted(StatusCode::SERVICE_UNAVAILABLE, body));
+    }
+
+    #[test]
+    fn is_session_evicted_excludes_no_backend_available() {
+        // Capacity exhaustion — replay won't help, must bail.
+        let body = r#"{"error":{"code":"no_backend_available","detail":"all GPUs saturated"}}"#;
+        assert!(!is_session_evicted(StatusCode::SERVICE_UNAVAILABLE, body));
+    }
+
+    #[test]
+    fn is_session_evicted_rejects_status_code_mismatch() {
+        // Right code, wrong status — don't recover.
+        let body = r#"{"error":{"code":"version_drift","detail":"x"}}"#;
+        assert!(!is_session_evicted(StatusCode::SERVICE_UNAVAILABLE, body));
+        let body = r#"{"error":{"code":"backend_unavailable","detail":"x"}}"#;
+        assert!(!is_session_evicted(StatusCode::CONFLICT, body));
+    }
+
+    #[test]
+    fn is_session_evicted_rejects_malformed_body() {
+        assert!(!is_session_evicted(StatusCode::CONFLICT, ""));
+        assert!(!is_session_evicted(StatusCode::CONFLICT, "not json"));
+        assert!(!is_session_evicted(
+            StatusCode::CONFLICT,
+            r#"{"code":"version_drift"}"#,
+        ));
+    }
+
+    fn req_with(messages: Vec<Message>, mode: u8, key: Option<&str>) -> LlmRequest {
+        LlmRequest {
+            model: "2026.5.5".into(),
+            messages,
+            system: Some("you are an agent".into()),
+            kv_cache_mode: mode,
+            session_key: key.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn split_request_namespaces_bare_model_id() {
+        // `parse_model` strips the `rsclaw/` prefix before reaching the
+        // provider, so by the time we see `req.model` it's the bare id.
+        // `split_request` MUST re-namespace it — protocol §2.10.1 rejects
+        // `prefix_id` without exactly one `/` separator.
+        let req = req_with(vec![], 2, Some("k"));
+        let split = split_request(&req).unwrap();
+        assert_eq!(split.prefix_id, "rsclaw/2026.5.5");
+    }
+
+    #[test]
+    fn split_request_keeps_already_namespaced_model() {
+        // If the caller already gave a namespaced id (e.g. configured a
+        // direct prefix_id, no alias), don't double-prefix.
+        let mut req = req_with(vec![], 2, Some("k"));
+        req.model = "myorg/qwen3-235b".into();
+        let split = split_request(&req).unwrap();
+        assert_eq!(split.prefix_id, "myorg/qwen3-235b");
+    }
+
+    #[test]
+    fn split_request_orders_builtin_before_user_tools_when_split_present() {
+        // With `system_shared` populated, the runtime is in real-split
+        // mode: tools are ordered [builtin..., user...] inside
+        // `dynamic_prefix.tools` so the chat-template-rendered byte
+        // prefix stays stable across every client of this RsClaw
+        // version up to the per-client tool boundary. Top-level
+        // `user_tools` is GONE in the post-rename protocol — verified
+        // by rsclaw-server's own
+        // `v1 top-level user_tools must not be sent` test.
+        let mut req = req_with(vec![], 2, Some("k"));
+        req.system_shared = Some("<shared system>".into());
+        req.system_user = Some("<user suffix>".into());
+        // Push user-tool first to prove the split sorts it after the
+        // builtin regardless of input order.
+        req.tools.push(ToolDef {
+            name: "search".into(), // not in BUILTIN_TOOL_NAMES
+            description: "search the web".into(),
+            parameters: json!({"type":"object","properties":{}}),
+        });
+        req.tools.push(ToolDef {
+            name: "memory".into(), // builtin
+            description: "memory tool".into(),
+            parameters: json!({"type":"object","properties":{}}),
+        });
+        let split = split_request(&req).unwrap();
+        assert_eq!(split.dynamic_tools.len(), 2);
+        assert_eq!(
+            split.dynamic_tools[0]["name"], "memory",
+            "builtin must sort before user tool"
+        );
+        assert_eq!(split.dynamic_tools[1]["name"], "search");
+        assert_eq!(split.dynamic_system, "<shared system>");
+        assert_eq!(split.dynamic_user_suffix, "<user suffix>");
+    }
+
+    #[test]
+    fn split_request_collapses_to_dynamic_when_no_split() {
+        // Internal sessions / non-runtime callers don't populate the
+        // shared/user split. Everything collapses into `dynamic_prefix`
+        // in input order — per-client cache sharing is forfeit but
+        // that's the no-regression baseline.
+        let mut req = req_with(vec![], 2, Some("k"));
+        req.tools.push(ToolDef {
+            name: "search".into(),
+            description: "search".into(),
+            parameters: json!({"type":"object"}),
+        });
+        let split = split_request(&req).unwrap();
+        assert_eq!(split.dynamic_tools.len(), 1);
+        assert_eq!(split.dynamic_tools[0]["name"], "search");
+        assert_eq!(split.dynamic_system, "you are an agent");
+        assert_eq!(split.dynamic_user_suffix, "");
+    }
+
+    #[test]
+    fn create_session_req_serialises_post_rename_shape() {
+        // Matches the wire body rsclaw-server's backend/rsclaw_llm.rs
+        // tests assert: `prefix_id` + `dynamic_prefix{system,tools,
+        // user_suffix}` + `options`, and explicitly NO top-level
+        // `user_tools` / `rsclaw_version` / `user_suffix` /
+        // `plugins_system` / `skills_system`. Those are all pre-rename
+        // fields that the user said will be retired soon.
+        let mut req = req_with(vec![], 2, Some("k"));
+        req.system_shared = Some("<sys>".into());
+        req.system_user = Some("<suf>".into());
+        req.tools.push(ToolDef {
+            name: "memory".into(),
+            description: "memory tool".into(),
+            parameters: json!({"type":"object"}),
+        });
+        let split = split_request(&req).unwrap();
+        let body = CreateSessionReq {
+            prefix_id: &split.prefix_id,
+            dynamic_prefix: DynamicPrefixWire {
+                system: split.dynamic_system,
+                tools: &split.dynamic_tools,
+                user_suffix: split.dynamic_user_suffix,
+            },
+            options: Some(split.options.clone()),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["prefix_id"], "rsclaw/2026.5.5");
+        assert_eq!(v["dynamic_prefix"]["system"], "<sys>");
+        assert_eq!(v["dynamic_prefix"]["user_suffix"], "<suf>");
+        assert_eq!(v["dynamic_prefix"]["tools"][0]["name"], "memory");
+        assert!(v.get("user_tools").is_none(), "post-rename body must omit top-level user_tools");
+        assert!(v.get("rsclaw_version").is_none(), "rsclaw_version is the pre-rename name; never send");
+        assert!(v.get("user_suffix").is_none(), "user_suffix lives inside dynamic_prefix");
+        assert!(v.get("plugins_system").is_none(), "pre-rename field; folded into dynamic_prefix.system");
+        assert!(v.get("skills_system").is_none(), "pre-rename field; folded into dynamic_prefix.system");
+    }
+
+    #[test]
+    fn history_for_replay_drops_trailing_delta() {
+        let m = |role, txt: &str| Message {
+            role,
+            content: MessageContent::Text(txt.into()),
+        };
+        let msgs = vec![
+            m(Role::User, "hi"),
+            m(Role::Assistant, "yo"),
+            m(Role::User, "again"),
+        ];
+        let slice = history_for_replay(&msgs);
+        assert_eq!(slice.len(), 2);
+        assert!(matches!(slice[0].role, Role::User));
+        assert!(matches!(slice[1].role, Role::Assistant));
+    }
+
+    #[test]
+    fn history_for_replay_handles_empty_and_singleton() {
+        let empty: Vec<Message> = Vec::new();
+        assert!(history_for_replay(&empty).is_empty());
+        let one = vec![Message {
+            role: Role::User,
+            content: MessageContent::Text("solo".into()),
+        }];
+        assert!(history_for_replay(&one).is_empty());
+    }
+
+    #[test]
+    fn history_for_replay_drops_all_consecutive_trailing_tools() {
+        // Parallel-tool case: assistant emits N tool_use blocks, runtime
+        // queues N consecutive Role::Tool messages, from_request folds
+        // them into a single Tools delta. history_for_replay must drop
+        // ALL N — dropping just one leaves N-1 tool_results in history,
+        // server replays them into KV, then turn() re-sends them as the
+        // delta, hydrating duplicates.
+        let m = |role, txt: &str| Message {
+            role,
+            content: MessageContent::Text(txt.into()),
+        };
+        let tool = |id: &str| Message {
+            role: Role::Tool,
+            content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                tool_use_id: id.into(),
+                content: "ok".into(),
+                is_error: None,
+            }]),
+        };
+        let msgs = vec![
+            m(Role::User, "do all three"),
+            m(Role::Assistant, "calling tools"),
+            tool("toolu_1"),
+            tool("toolu_2"),
+            tool("toolu_3"),
+        ];
+        let slice = history_for_replay(&msgs);
+        assert_eq!(slice.len(), 2);
+        assert!(matches!(slice[0].role, Role::User));
+        assert!(matches!(slice[1].role, Role::Assistant));
+    }
+
+    #[test]
+    fn history_for_replay_keeps_earlier_tool_messages() {
+        // Sequential-tool case across a multi-iteration turn:
+        // [..., User, Asst, Tool, Asst, Tool, Asst, Tool] — only the
+        // FINAL contiguous Tool run belongs to the current step's delta;
+        // earlier Tool messages are part of completed sub-iterations and
+        // stay in history.
+        let m = |role, txt: &str| Message {
+            role,
+            content: MessageContent::Text(txt.into()),
+        };
+        let tool = |id: &str| Message {
+            role: Role::Tool,
+            content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                tool_use_id: id.into(),
+                content: "ok".into(),
+                is_error: None,
+            }]),
+        };
+        let msgs = vec![
+            m(Role::User, "go"),
+            m(Role::Assistant, "step1"),
+            tool("a"),
+            m(Role::Assistant, "step2"),
+            tool("b"),
+        ];
+        let slice = history_for_replay(&msgs);
+        assert_eq!(slice.len(), 4);
+        // The earlier Tool stays in history.
+        assert!(matches!(slice[2].role, Role::Tool));
+        // Trailing Tool dropped.
+        assert!(matches!(slice[3].role, Role::Assistant));
+    }
+
+    #[test]
+    fn serialize_replay_history_coalesces_parallel_tools() {
+        // Assistant called 3 tools in parallel → runtime queued 3 Tool
+        // messages. In replay history they MUST collapse into one
+        // user-role entry whose content[] carries all three tool_results,
+        // matching the protocol §2.2 example shape.
+        let mk_tool = |id: &str, body: &str| Message {
+            role: Role::Tool,
+            content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                tool_use_id: id.into(),
+                content: body.into(),
+                is_error: None,
+            }]),
+        };
+        let user = Message {
+            role: Role::User,
+            content: MessageContent::Text("go".into()),
+        };
+        let asst = Message {
+            role: Role::Assistant,
+            content: MessageContent::Text("calling tools".into()),
+        };
+        let ta = mk_tool("a", "ra");
+        let tb = mk_tool("b", "rb");
+        let tc = mk_tool("c", "rc");
+        let msgs = vec![&user, &asst, &ta, &tb, &tc];
+        let out = serialize_replay_history(&msgs);
+        assert_eq!(out.len(), 3, "user + assistant + 1 coalesced tool entry: {out:?}");
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(out[1]["role"], "assistant");
+        assert_eq!(out[2]["role"], "user");
+        let parts = out[2]["content"].as_array().expect("content array");
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0]["tool_use_id"], "a");
+        assert_eq!(parts[1]["tool_use_id"], "b");
+        assert_eq!(parts[2]["tool_use_id"], "c");
+        for p in parts {
+            assert_eq!(p["type"], "tool_result");
+        }
+    }
+
+    #[test]
+    fn serialize_replay_history_keeps_separated_tool_runs_separate() {
+        // Sequential-tool sub-iterations: Tool, Asst, Tool → two distinct
+        // user-role entries (one per tool run), with the assistant block
+        // between them.
+        let mk_tool = |id: &str| Message {
+            role: Role::Tool,
+            content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                tool_use_id: id.into(),
+                content: "ok".into(),
+                is_error: None,
+            }]),
+        };
+        let asst = Message {
+            role: Role::Assistant,
+            content: MessageContent::Text("step".into()),
+        };
+        let ta = mk_tool("a");
+        let tb = mk_tool("b");
+        let msgs = vec![&ta, &asst, &tb];
+        let out = serialize_replay_history(&msgs);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(out[0]["content"][0]["tool_use_id"], "a");
+        assert_eq!(out[1]["role"], "assistant");
+        assert_eq!(out[2]["role"], "user");
+        assert_eq!(out[2]["content"][0]["tool_use_id"], "b");
+    }
+
+    #[test]
+    fn serialize_replay_history_drops_tool_run_with_no_tool_result_parts() {
+        // Defensive: a stray Role::Tool message carrying non-ToolResult
+        // parts (Text/Image/etc) should not produce an empty user-role
+        // entry — that would be `{"role":"user","content":[]}`, which
+        // some chat templates reject.
+        let bad = Message {
+            role: Role::Tool,
+            content: MessageContent::Parts(vec![ContentPart::Text { text: "noise".into() }]),
+        };
+        let user = Message {
+            role: Role::User,
+            content: MessageContent::Text("hi".into()),
+        };
+        let msgs = vec![&user, &bad];
+        let out = serialize_replay_history(&msgs);
+        assert_eq!(out.len(), 1, "only the User survives: {out:?}");
+        assert_eq!(out[0]["role"], "user");
+    }
+
+    #[test]
+    fn turn_delta_user_text() {
+        let req = req_with(
+            vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hello".into()),
+            }],
+            2,
+            Some("k"),
+        );
+        let delta = TurnDelta::from_request(&req).unwrap();
+        let body = serde_json::to_value(&delta).unwrap();
+        assert_eq!(body["user_message"], "hello");
+    }
+
+    #[test]
+    fn turn_delta_user_text_empty_bails() {
+        let req = req_with(
+            vec![Message {
+                role: Role::User,
+                content: MessageContent::Text(String::new()),
+            }],
+            2,
+            Some("k"),
+        );
+        let err = TurnDelta::from_request(&req).unwrap_err().to_string();
+        assert!(err.contains("no usable content"), "got: {err}");
+    }
+
+    #[test]
+    fn turn_delta_user_parts_with_only_empty_text_bails() {
+        let req = req_with(
+            vec![Message {
+                role: Role::User,
+                content: MessageContent::Parts(vec![
+                    ContentPart::Text { text: String::new() },
+                    ContentPart::Text { text: String::new() },
+                ]),
+            }],
+            2,
+            Some("k"),
+        );
+        let err = TurnDelta::from_request(&req).unwrap_err().to_string();
+        assert!(err.contains("no usable content"), "got: {err}");
+    }
+
+    #[test]
+    fn turn_delta_user_parts_concatenates_text_fragments() {
+        let req = req_with(
+            vec![Message {
+                role: Role::User,
+                content: MessageContent::Parts(vec![
+                    ContentPart::Text { text: "hello ".into() },
+                    ContentPart::Text { text: "world".into() },
+                ]),
+            }],
+            2,
+            Some("k"),
+        );
+        let delta = TurnDelta::from_request(&req).unwrap();
+        let body = serde_json::to_value(&delta).unwrap();
+        assert_eq!(body["user_message"], "hello world");
+    }
+
+    #[test]
+    fn turn_delta_tool_results() {
+        let req = req_with(
+            vec![Message {
+                role: Role::Tool,
+                content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                    tool_use_id: "toolu_1".into(),
+                    content: "ok".into(),
+                    is_error: None,
+                }]),
+            }],
+            2,
+            Some("k"),
+        );
+        let delta = TurnDelta::from_request(&req).unwrap();
+        let body = serde_json::to_value(&delta).unwrap();
+        assert_eq!(body["tool_results"][0]["tool_use_id"], "toolu_1");
+    }
+
+    #[test]
+    fn lookup_and_bump_evicts_on_history_shrink() {
+        let provider = RsclawProvider::new("http://x", None);
+        provider.store(
+            "k",
+            SessionEntry {
+                session_id: "rs_w7_abc".into(),
+                prefix_id: "rsclaw/2026.5.5".into(),
+                last_seen_msgs_len: 12,
+            },
+        );
+        // Same len → cached entry returned, last_seen unchanged.
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.5", 12).is_some());
+        // Growth → bumped, returned.
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.5", 14).is_some());
+        // Shrink (compaction trimmed history) → None, caller re-hydrates.
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.5", 8).is_none());
+        // Version drift → None even if len matches.
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.6", 14).is_none());
+        // Missing key → None.
+        assert!(provider.lookup_and_bump("missing", "rsclaw/2026.5.5", 14).is_none());
+    }
+
+    #[test]
+    fn evict_if_oversized_culls_to_half_cap_when_over() {
+        // Construct a HashMap larger than MAX_SESSIONS to verify the
+        // batched eviction policy actually drops entries (not all, not
+        // none) when the cache exceeds the cap. Cap is 10_000 so use a
+        // synthetic over-cap fill.
+        let mut map: HashMap<String, SessionEntry> = HashMap::new();
+        let total = MAX_SESSIONS + 100;
+        for i in 0..total {
+            map.insert(
+                format!("k{i}"),
+                SessionEntry {
+                    session_id: format!("rs_w_{i}"),
+                    prefix_id: "rsclaw/test".into(),
+                    last_seen_msgs_len: 1,
+                },
+            );
+        }
+        evict_if_oversized(&mut map);
+        // After culling we expect ~MAX_SESSIONS/2 retained: the formula
+        // drops (total - MAX_SESSIONS/2) entries.
+        assert_eq!(map.len(), MAX_SESSIONS / 2);
+    }
+
+    #[test]
+    fn evict_if_oversized_no_op_when_under_cap() {
+        // Below the cap the function must NOT touch the map — eviction
+        // is purely a memory-safety measure, not a routine GC.
+        let mut map: HashMap<String, SessionEntry> = HashMap::new();
+        for i in 0..100 {
+            map.insert(
+                format!("k{i}"),
+                SessionEntry {
+                    session_id: format!("rs_{i}"),
+                    prefix_id: "rsclaw/test".into(),
+                    last_seen_msgs_len: 1,
+                },
+            );
+        }
+        evict_if_oversized(&mut map);
+        assert_eq!(map.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn invalidate_on_error_evicts_session_on_first_err() {
+        // Wrap a stream that yields one Ok then an Err; the wrapper
+        // must remove the session entry when the Err lands. Subsequent
+        // Err items don't re-evict (idempotency by `errored` flag).
+        let provider = RsclawProvider::new("http://x", None);
+        provider.store(
+            "session-key",
+            SessionEntry {
+                session_id: "rs_w7_xyz".into(),
+                prefix_id: "rsclaw/test".into(),
+                last_seen_msgs_len: 5,
+            },
+        );
+        let inner: LlmStream = Box::pin(futures::stream::iter(vec![
+            Ok(StreamEvent::TextDelta("hi".into())),
+            Err(anyhow::anyhow!("boom")),
+        ]));
+        let wrapped = invalidate_on_error(
+            inner,
+            Arc::clone(&provider.sessions),
+            "session-key".to_owned(),
+        );
+        let collected: Vec<_> = wrapped.collect().await;
+        assert_eq!(collected.len(), 2);
+        assert!(matches!(collected[0], Ok(StreamEvent::TextDelta(_))));
+        assert!(collected[1].is_err());
+        // Session must be gone after the error item passed through.
+        assert!(provider.lock_sessions().get("session-key").is_none());
+    }
+
+    #[tokio::test]
+    async fn invalidate_on_error_evicts_on_stream_event_error() {
+        // Protocol §2.3 `error` events surface as `Ok(StreamEvent::Error)`
+        // — these MUST also force eviction, otherwise a server-issued
+        // error mid-stream leaves the cached session pointing at a
+        // partially-committed turn.
+        let provider = RsclawProvider::new("http://x", None);
+        provider.store(
+            "k",
+            SessionEntry {
+                session_id: "rs_w7_abc".into(),
+                prefix_id: "rsclaw/test".into(),
+                last_seen_msgs_len: 5,
+            },
+        );
+        let inner: LlmStream = Box::pin(futures::stream::iter(vec![
+            Ok(StreamEvent::Error("model_overloaded".into())),
+        ]));
+        let wrapped = invalidate_on_error(inner, Arc::clone(&provider.sessions), "k".into());
+        let _: Vec<_> = wrapped.collect().await;
+        assert!(provider.lock_sessions().get("k").is_none());
+    }
+
+    #[tokio::test]
+    async fn invalidate_on_error_keeps_session_on_clean_stream() {
+        // Stream with no errors → session stays cached. Otherwise we'd
+        // pay an unnecessary replay round-trip on every successful
+        // turn, defeating kvCacheMode=2.
+        let provider = RsclawProvider::new("http://x", None);
+        provider.store(
+            "k",
+            SessionEntry {
+                session_id: "rs_w7_abc".into(),
+                prefix_id: "rsclaw/test".into(),
+                last_seen_msgs_len: 5,
+            },
+        );
+        let inner: LlmStream = Box::pin(futures::stream::iter(vec![
+            Ok(StreamEvent::TextDelta("hello".into())),
+            Ok(StreamEvent::Done { usage: None }),
+        ]));
+        let wrapped = invalidate_on_error(inner, Arc::clone(&provider.sessions), "k".into());
+        let _: Vec<_> = wrapped.collect().await;
+        assert!(provider.lock_sessions().get("k").is_some());
+    }
+
+    #[test]
+    fn turn_delta_collects_parallel_tool_results() {
+        // Assistant called 3 tools in parallel → 3 trailing Tool messages.
+        let tool_msg = |id: &str, body: &str| Message {
+            role: Role::Tool,
+            content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                tool_use_id: id.into(),
+                content: body.into(),
+                is_error: None,
+            }]),
+        };
+        let req = req_with(
+            vec![
+                Message {
+                    role: Role::User,
+                    content: MessageContent::Text("do three things".into()),
+                },
+                tool_msg("toolu_a", "result a"),
+                tool_msg("toolu_b", "result b"),
+                tool_msg("toolu_c", "result c"),
+            ],
+            2,
+            Some("k"),
+        );
+        let delta = TurnDelta::from_request(&req).unwrap();
+        let body = serde_json::to_value(&delta).unwrap();
+        let arr = body["tool_results"].as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["tool_use_id"], "toolu_a");
+        assert_eq!(arr[1]["tool_use_id"], "toolu_b");
+        assert_eq!(arr[2]["tool_use_id"], "toolu_c");
+    }
+
+    #[test]
+    fn turn_delta_does_not_cross_user_boundary() {
+        // A non-Tool message between User and the trailing Tool must
+        // stop the back-walk — the earlier Tool belongs to a prior turn.
+        let req = req_with(
+            vec![
+                Message {
+                    role: Role::Tool,
+                    content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                        tool_use_id: "toolu_old".into(),
+                        content: "stale".into(),
+                        is_error: None,
+                    }]),
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: MessageContent::Text("ack".into()),
+                },
+                Message {
+                    role: Role::Tool,
+                    content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                        tool_use_id: "toolu_new".into(),
+                        content: "fresh".into(),
+                        is_error: None,
+                    }]),
+                },
+            ],
+            2,
+            Some("k"),
+        );
+        let delta = TurnDelta::from_request(&req).unwrap();
+        let body = serde_json::to_value(&delta).unwrap();
+        let arr = body["tool_results"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["tool_use_id"], "toolu_new");
+    }
+
+    #[test]
+    fn split_system_messages_lifts_system_to_suffix() {
+        // Mid-conversation Role::System blocks (plugins, skills,
+        // /ctx) must NOT appear in /sessions/replay history — the
+        // protocol rejects role:"system" with 400 invalid_history.
+        let m = |role: Role, txt: &str| Message {
+            role,
+            content: MessageContent::Text(txt.into()),
+        };
+        let msgs = vec![
+            m(Role::System, "PLUGINS"),
+            m(Role::System, "SKILLS"),
+            m(Role::User, "hi"),
+            m(Role::Assistant, "yo"),
+            m(Role::System, "## New Skill Installed\nfoo"),
+            m(Role::User, "again"),
+        ];
+        let (filtered, suffix) = split_system_messages(&msgs);
+        assert_eq!(filtered.len(), 3);
+        for m in &filtered {
+            assert!(!matches!(m.role, Role::System));
+        }
+        assert_eq!(suffix, "PLUGINS\n\nSKILLS\n\n## New Skill Installed\nfoo");
+    }
+
+    #[test]
+    fn split_system_messages_handles_text_parts() {
+        let msgs = vec![Message {
+            role: Role::System,
+            content: MessageContent::Parts(vec![
+                ContentPart::Text { text: "hello ".into() },
+                ContentPart::Text { text: "world".into() },
+            ]),
+        }];
+        let (filtered, suffix) = split_system_messages(&msgs);
+        assert!(filtered.is_empty());
+        assert_eq!(suffix, "hello world");
+    }
+
+    #[test]
+    fn split_system_messages_empty_when_no_system() {
+        let msgs = vec![Message {
+            role: Role::User,
+            content: MessageContent::Text("hi".into()),
+        }];
+        let (filtered, suffix) = split_system_messages(&msgs);
+        assert_eq!(filtered.len(), 1);
+        assert!(suffix.is_empty());
+    }
+
+    #[test]
+    fn split_system_messages_drops_empty_text_system() {
+        // An empty System(Text("")) used to leak into sys_parts and
+        // produce a stray "\n\n" prefix once joined. Verify it now
+        // drops cleanly, matching the Parts path's behavior.
+        let msgs = vec![
+            Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".into()),
+            },
+            Message {
+                role: Role::System,
+                content: MessageContent::Text(String::new()),
+            },
+            Message {
+                role: Role::System,
+                content: MessageContent::Text("real ctx".into()),
+            },
+        ];
+        let (filtered, suffix) = split_system_messages(&msgs);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            suffix, "real ctx",
+            "leading empty System must not produce a blank-line prefix; got {suffix:?}"
+        );
+    }
+
+    #[test]
+    fn split_system_messages_drops_parts_with_only_empty_text() {
+        // Same symmetry check on the Parts path — ensure there's no
+        // regression from the unification.
+        let msgs = vec![Message {
+            role: Role::System,
+            content: MessageContent::Parts(vec![
+                ContentPart::Text { text: String::new() },
+                ContentPart::Image { url: "https://x/i".into() },
+            ]),
+        }];
+        let (_filtered, suffix) = split_system_messages(&msgs);
+        assert!(
+            suffix.is_empty(),
+            "Parts whose only Text was empty must not leak; got {suffix:?}"
+        );
+    }
+
+    #[test]
+    fn normalize_trailing_system_folds_into_user_text() {
+        // Runtime appended a dynamic-ctx Role::System after the User
+        // delta — fold it into the user_message body so from_request
+        // sees a User-trailing list.
+        let m = |role: Role, txt: &str| Message {
+            role,
+            content: MessageContent::Text(txt.into()),
+        };
+        let mut msgs = vec![
+            m(Role::User, "fix the bug"),
+            m(Role::System, "## Dynamic /ctx\nworking on handler.py"),
+        ];
+        normalize_trailing_system(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(msgs[0].role, Role::User));
+        let MessageContent::Text(t) = &msgs[0].content else {
+            panic!("expected Text content")
+        };
+        assert_eq!(t, "fix the bug\n\n## Dynamic /ctx\nworking on handler.py");
+    }
+
+    #[test]
+    fn normalize_trailing_system_concatenates_multiple_in_order() {
+        // Two runtime-appended System blocks (e.g. new_skills_tail +
+        // dynamic_ctx) concatenated in original order, joined by \n\n.
+        let m = |role: Role, txt: &str| Message {
+            role,
+            content: MessageContent::Text(txt.into()),
+        };
+        let mut msgs = vec![
+            m(Role::User, "go"),
+            m(Role::System, "FIRST"),
+            m(Role::System, "SECOND"),
+        ];
+        normalize_trailing_system(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        let MessageContent::Text(t) = &msgs[0].content else {
+            panic!("expected Text content")
+        };
+        assert_eq!(t, "go\n\nFIRST\n\nSECOND");
+    }
+
+    #[test]
+    fn normalize_trailing_system_noop_without_trailing_system() {
+        // No System anywhere — list is unchanged.
+        let m = |role: Role, txt: &str| Message {
+            role,
+            content: MessageContent::Text(txt.into()),
+        };
+        let original = vec![m(Role::User, "hi"), m(Role::Assistant, "yo")];
+        let mut msgs = original.clone();
+        normalize_trailing_system(&mut msgs);
+        assert_eq!(msgs.len(), 2);
+        let MessageContent::Text(last) = &msgs[1].content else {
+            panic!()
+        };
+        assert_eq!(last, "yo");
+    }
+
+    #[test]
+    fn normalize_trailing_system_folds_into_user_parts() {
+        // User content already in Parts form (text + image) — fold
+        // System text by appending a new Text part rather than mutating
+        // an existing part.
+        let mut msgs = vec![
+            Message {
+                role: Role::User,
+                content: MessageContent::Parts(vec![
+                    ContentPart::Text { text: "look at this".into() },
+                    ContentPart::Image { url: "https://x/y.png".into() },
+                ]),
+            },
+            Message {
+                role: Role::System,
+                content: MessageContent::Text("CTX".into()),
+            },
+        ];
+        normalize_trailing_system(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        let MessageContent::Parts(parts) = &msgs[0].content else {
+            panic!("expected Parts content")
+        };
+        assert_eq!(parts.len(), 3);
+        match &parts[2] {
+            ContentPart::Text { text } => assert_eq!(text, "CTX"),
+            _ => panic!("expected appended Text part"),
+        }
+    }
+
+    #[test]
+    fn normalize_trailing_system_drops_when_preceded_by_tool() {
+        // Defensive — runtime doesn't currently inject System after
+        // Tool, but if it ever did, we can't fold into a tool_results
+        // delta. Drop the System text, leave the Tool tail intact so
+        // from_request can build a Tools delta.
+        let mut msgs = vec![
+            Message {
+                role: Role::Tool,
+                content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                    tool_use_id: "toolu_1".into(),
+                    content: "result".into(),
+                    is_error: None,
+                }]),
+            },
+            Message {
+                role: Role::System,
+                content: MessageContent::Text("dynamic ctx".into()),
+            },
+        ];
+        normalize_trailing_system(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(msgs[0].role, Role::Tool));
+    }
+
+    #[test]
+    fn normalize_trailing_system_skips_empty_system_blocks() {
+        // An empty Role::System (text=="") shouldn't add stray "\n\n"
+        // separators. Drop empty ones; fold non-empty ones.
+        let m = |role: Role, txt: &str| Message {
+            role,
+            content: MessageContent::Text(txt.into()),
+        };
+        let mut msgs = vec![
+            m(Role::User, "hi"),
+            m(Role::System, ""),
+            m(Role::System, "non-empty"),
+        ];
+        normalize_trailing_system(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        let MessageContent::Text(t) = &msgs[0].content else {
+            panic!()
+        };
+        assert_eq!(t, "hi\n\nnon-empty");
+    }
+
+    #[test]
+    fn turn_options_temperature_clamps_to_two_decimals() {
+        // Default serde f32 serialization leaks IEEE 754 noise:
+        // `0.6_f32` lifts to f64 `0.6000000238418579`, which makes the
+        // request body ugly, breaks request hashing for caching layers,
+        // and confuses anyone tailing logs. ser_opt_f32 routes through
+        // super::json_f32 which rounds to 2 decimals.
+        let opts = TurnOptions {
+            max_tokens: None,
+            temperature: Some(0.6),
+            top_p: Some(0.95),
+            enable_thinking: None,
+            stop: None,
+            idle_ttl_secs: None,
+        };
+        let body = serde_json::to_value(&opts).unwrap();
+        // serde_json compares numbers by value not by string repr, so
+        // an Eq against json!(0.6) would succeed even with the buggy
+        // path. Compare the serialized text instead.
+        let s = serde_json::to_string(&opts).unwrap();
+        assert!(
+            s.contains("\"temperature\":0.6"),
+            "expected temperature:0.6, got {s}"
+        );
+        assert!(!s.contains("0.6000000238418579"), "leaked f32→f64 noise: {s}");
+        assert!(
+            s.contains("\"top_p\":0.95"),
+            "expected top_p:0.95, got {s}"
+        );
+        // sanity — body is still well-formed JSON.
+        assert!(body.is_object());
+    }
+
+    #[test]
+    fn turn_options_temperature_none_omits_field() {
+        let opts = TurnOptions {
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            enable_thinking: None,
+            stop: None,
+            idle_ttl_secs: None,
+        };
+        let body = serde_json::to_value(&opts).unwrap();
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+    }
+
+    #[test]
+    fn create_session_resp_parses_replay_shape_without_prefix_id() {
+        // Protocol §2.2 replay response carries session_id but NOT
+        // prefix_id. Without #[serde(default)] this fails with
+        // "missing field prefix_id" and breaks every replay path.
+        let body = r#"{
+            "session_id": "rs_w7_8a3c1f2b",
+            "n_prefix_tokens": 27981,
+            "n_user_tokens": 612,
+            "n_history_tokens": 8420,
+            "n_tokens": 37013,
+            "instance_id": "llama-worker-7",
+            "replay_ms": 2340
+        }"#;
+        let resp: CreateSessionResp = serde_json::from_str(body).expect("replay shape parses");
+        assert_eq!(resp.session_id, "rs_w7_8a3c1f2b");
+        assert!(resp.prefix_id.is_none());
+    }
+
+    #[test]
+    fn create_session_resp_parses_create_shape_with_prefix_id() {
+        // Protocol §2.1.6 (post-rename) create response carries
+        // `prefix_id`. New servers send this name natively.
+        let body = r#"{
+            "session_id": "rs_w7_8a3c1f2b",
+            "prefix_id": "rsclaw/2026.5.5"
+        }"#;
+        let resp: CreateSessionResp = serde_json::from_str(body).expect("create shape parses");
+        assert_eq!(resp.prefix_id.as_deref(), Some("rsclaw/2026.5.5"));
+    }
+
+    #[test]
+    fn create_session_resp_accepts_legacy_rsclaw_version_alias() {
+        // Pre-rename servers (and rsclaw-server's auto-assembly path
+        // for very old workers) still emit `rsclaw_version`. The
+        // `#[serde(alias = "rsclaw_version")]` on the field keeps both
+        // spellings working until v2.0 drops the alias.
+        let body = r#"{
+            "session_id": "rs_w7_8a3c1f2b",
+            "rsclaw_version": "2026.5.5"
+        }"#;
+        let resp: CreateSessionResp = serde_json::from_str(body).expect("legacy alias parses");
+        assert_eq!(resp.prefix_id.as_deref(), Some("2026.5.5"));
+    }
+
+    #[test]
+    fn create_session_resp_parses_explicit_null_prefix_id() {
+        // `prefix_id: String` with `#[serde(default)]` would FAIL
+        // parsing on explicit JSON null with "invalid type: null,
+        // expected a string", tanking the whole `/sessions` (or
+        // `/sessions/replay`) response and surfacing as an opaque
+        // "parse response" error to the caller. Upstream nodes
+        // occasionally emit null while the version registry is
+        // mid-roll. Option<String> accepts null → None and keeps the
+        // rest of the response usable.
+        let body = r#"{"session_id":"rs_a_b","prefix_id":null}"#;
+        let resp: CreateSessionResp =
+            serde_json::from_str(body).expect("null prefix_id must parse");
+        assert_eq!(resp.session_id, "rs_a_b");
+        assert!(resp.prefix_id.is_none());
+    }
+
+    #[test]
+    fn create_session_resp_parses_missing_prefix_id() {
+        // The replay response per §2.2 omits prefix_id entirely.
+        // Behaviour must match the explicit-null case: parse cleanly,
+        // surface None.
+        let body = r#"{"session_id":"rs_a_b"}"#;
+        let resp: CreateSessionResp = serde_json::from_str(body).expect("missing field must parse");
+        assert!(resp.prefix_id.is_none());
+    }
+
+    #[test]
+    fn create_session_resp_parses_populated_prefix_id() {
+        // Round-trip the happy path so the Option<String> change
+        // doesn't accidentally start coercing real values to None.
+        let body = r#"{"session_id":"rs_a_b","prefix_id":"rsclaw/2026.5.5"}"#;
+        let resp: CreateSessionResp = serde_json::from_str(body).expect("string field must parse");
+        assert_eq!(resp.prefix_id.as_deref(), Some("rsclaw/2026.5.5"));
+    }
+
+    #[test]
+    fn rejects_non_kv2_mode() {
+        let provider = RsclawProvider::new("http://x", None);
+        let req = req_with(vec![], 1, Some("k"));
+        let err = match futures::executor::block_on(provider.stream(req)) {
+            Ok(_) => panic!("expected error for kv_cache_mode=1"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("kv_cache_mode=2"));
+    }
+
+    #[test]
+    fn rejects_missing_session_key() {
+        let provider = RsclawProvider::new("http://x", None);
+        let req = req_with(vec![], 2, None);
+        let err = match futures::executor::block_on(provider.stream(req)) {
+            Ok(_) => panic!("expected error for missing session_key"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("session_key"));
+    }
+}

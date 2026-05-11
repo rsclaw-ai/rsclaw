@@ -11,6 +11,7 @@ pub mod gemini;
 pub mod model_defaults;
 pub mod openai;
 pub mod registry;
+pub mod rsclaw;
 
 use std::pin::Pin;
 
@@ -18,6 +19,46 @@ use anyhow::Result;
 
 /// Default User-Agent for all LLM provider HTTP requests.
 pub(crate) const DEFAULT_USER_AGENT: &str = concat!("rsclaw/", env!("CARGO_PKG_VERSION"));
+
+/// Warn (at most once per `(provider, session_key)` pair across the
+/// process lifetime) when a non-`rsclaw` provider receives a request
+/// with `kv_cache_mode=2`. Mode 2 is the rsclaw-server stateful
+/// session protocol — every other provider treats the field as a no-op
+/// and silently degrades to mode 0, so an operator who configured
+/// `kvCacheMode: 2` against an OpenAI/Anthropic/Gemini-routed model
+/// would lose every benefit of the setting without seeing an error.
+/// Without this warning the misconfiguration is invisible.
+///
+/// Dedup is per-session so a long-running session doesn't re-warn on
+/// every iteration; the `provider` segment of the key keeps openai vs
+/// anthropic vs gemini distinct.
+pub(crate) fn warn_unsupported_kv_cache_mode_2(provider: &str, req: &LlmRequest) {
+    if req.kv_cache_mode < 2 {
+        return;
+    }
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let session = req.session_key.as_deref().unwrap_or("<no-session>");
+    let key = format!("{provider}:{session}");
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = match seen.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if !guard.insert(key) {
+        return;
+    }
+    drop(guard);
+    tracing::warn!(
+        provider,
+        session = session,
+        "kv_cache_mode=2 requested but {} provider does not support it; \
+         degrading to mode 0 — route mode 2 traffic through the rsclaw \
+         provider (RSCLAW_KEY/RSCLAW_URL) for incremental session caching",
+        provider,
+    );
+}
 
 /// Build a `reqwest::Client` with the shared User-Agent header.
 pub(crate) fn http_client() -> reqwest::Client {
@@ -161,7 +202,7 @@ pub struct ToolDef {
 }
 
 /// Full request to an LLM provider.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LlmRequest {
     pub model: String,
     pub messages: Vec<Message>,
@@ -176,6 +217,19 @@ pub struct LlmRequest {
     pub kv_cache_mode: u8,
     /// Session key for cache_id tracking (used when kv_cache_mode=2).
     pub session_key: Option<String>,
+    /// (kvCacheMode=2 only) Pre-split shared system prefix —
+    /// byte-identical across all RsClaw clients of this version. The
+    /// rsclaw provider sends this as `dynamic_prefix.system` so the
+    /// upstream LRU dedupes the cacheable bytes across clients. When
+    /// `None`, the provider falls back to deriving everything from
+    /// `system` (loses cross-client cache reuse but stays correct).
+    /// Other providers ignore this field.
+    pub system_shared: Option<String>,
+    /// (kvCacheMode=2 only) Per-client system suffix — workspace,
+    /// language, skills, platform info. Sent as
+    /// `dynamic_prefix.user_suffix` and is the slot's per-session text.
+    /// Other providers ignore this field.
+    pub system_user: Option<String>,
 }
 
 /// Serialize an `f32` to a JSON number with 2 decimal places.

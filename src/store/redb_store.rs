@@ -917,6 +917,22 @@ impl RedbStore {
         Ok(())
     }
 
+    /// Scan every persisted permission grant. Returned as `(key, value)`
+    /// pairs so the caller (`computer::permission::list_grants`) owns
+    /// the schema. Sized for the settings UI — fine to read the whole
+    /// table since users typically have a handful of "Always allow"
+    /// entries.
+    pub fn permission_list_all(&self) -> Result<Vec<(String, String)>> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(COMPUTER_PERMISSIONS)?;
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            out.push((k.value().to_owned(), v.value().to_owned()));
+        }
+        Ok(out)
+    }
+
     // -----------------------------------------------------------------------
     // Cron jobs (single source of truth, authoritative since 2026-05)
     // -----------------------------------------------------------------------

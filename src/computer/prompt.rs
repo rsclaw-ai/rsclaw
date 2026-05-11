@@ -19,10 +19,11 @@ pub struct PromptInputs<'a> {
     pub action_spaces: &'a [ActionSpec],
     pub matched_rules: &'a [&'a AppRule],
     /// Physical pixel dimensions of the screenshot the VLM will see
-    /// each turn. When provided, the prompt explicitly tells the model
-    /// the coordinate space is absolute pixels in this `WxH` plane —
-    /// critical for general-purpose LLMs (kimi-for-coding, gpt-4o,
-    /// claude vision) that don't know any normalized convention.
+    /// each turn. Currently kept for forward compatibility — the
+    /// coordinate convention is now a fixed 0-1000 normalized grid
+    /// (matching ui-tars-desktop) so the actual screen size doesn't
+    /// need to be in the prompt for coord anchoring. Drivers handle
+    /// the rescale to physical pixels.
     pub screen_size: Option<(u32, u32)>,
 }
 
@@ -41,16 +42,16 @@ pub fn build_system_prompt(inputs: &PromptInputs) -> String {
         "You are a GUI agent driving the user's desktop directly. Each turn you receive a screenshot of the current screen and your action history, and you must output ONE next action to advance the task. You ARE the executor — there is no other tool / sub-agent to call.\n\n",
     );
 
-    // Emit the coordinate-space contract FIRST so it precedes every
-    // mention of x/y in the Action Space.
-    if let Some((w, h)) = inputs.screen_size {
-        let _ = writeln!(
-            out,
-            "## Coordinate Space\nThe screenshot you see each turn is {w}×{h} physical pixels. ALL coordinates in your Action output (`start_box`, `end_box`, etc.) MUST be absolute pixel values within this 0..{w} × 0..{h} plane. Do NOT use normalized 0-1000 ranges, percentages, or ratios. A click target at the very top-left of the screen is `[0, 0, ...]`; a target near the centre is `[{}, {}, ...]`.\n\n",
-            w / 2,
-            h / 2,
-        );
-    }
+    // Coordinate-space contract: 0-1000 normalized grid. Anchor with
+    // a few concrete examples so the model in-context-learns the
+    // convention regardless of training (mirrors ui-tars-desktop's
+    // approach which works across UI-TARS, Doubao-vision, Claude,
+    // GPT-4o, kimi, etc.).
+    let _ = inputs.screen_size; // kept for forward compatibility; not in prompt
+    out.push_str(
+        "## Coordinate Space\n\
+         All `(x, y)` you write inside `start_box` / `end_box` are on a fixed **0-1000 normalized grid**, regardless of the actual screen resolution. Top-left of the screen is `(0, 0)`, centre is `(500, 500)`, bottom-right is `(1000, 1000)`. Use integers in this range; fractions, percentages, or raw screen pixels will be rejected.\n\n",
+    );
 
     out.push_str("## Output Format\n");
     out.push_str("Every reply MUST be exactly two lines:\n");
@@ -124,16 +125,16 @@ Thought: 屏幕上是 Claude 桌面和几个终端窗口，看不到微信。任
 Action: activate_app(app='WeChat')
 
 Example 2 — Click search box to find group:
-Thought: 微信主界面已打开，左侧最上方有搜索框，placeholder 是 \"搜索\"，坐标大约在屏幕左上角。任务是进 \"RsClaw 测试群\"，点搜索框输入群名比滚动会话列表更快。
-Action: click(start_box='[60, 80, 200, 110]')
+Thought: 微信主界面已打开，左侧最上方有搜索框，placeholder 是 \"搜索\"，位置大约屏幕的左上角，约在 (40, 50) 这一带（0-1000 grid 中）。点搜索框比滚动会话列表更快。
+Action: click(start_box='<|box_start|>(40, 50)<|box_end|>')
 
 Example 3 — Type group name (Chinese):
 Thought: 搜索框已经获得焦点（光标在闪），下一步直接敲群名。中文输入用 type(content='...')，enigo 会原样投递。
 Action: type(content='RsClaw测试群')
 
-Example 4 — Reply with quote, keyboard navigation:
-Thought: 已经进入研发群，最新一条是 12:03 张三 \"@我 螃蟹有 bug\"。\"@我\" 命中关键词，需要引用回复。先在消息气泡上右键唤出菜单。
-Action: right_single(start_box='[420, 360, 760, 410]')
+Example 4 — Reply with quote, right-click on message bubble:
+Thought: 已经进入研发群，最新一条是 12:03 张三 \"@我 螃蟹有 bug\"，气泡大约在屏幕中间偏上 (400, 300) 附近。\"@我\" 命中关键词，需要引用回复，先右键唤出菜单。
+Action: right_single(start_box='<|box_start|>(400, 300)<|box_end|>')
 
 Example 5 — Wait for context menu after right-click:
 Thought: 刚才 right_single 之后 0.5s 内菜单还没渲染完，直接按 down 可能漏选。先等一下。
@@ -150,16 +151,16 @@ Thought: The screenshot shows Claude desktop and a few Terminal windows; WeChat 
 Action: activate_app(app='WeChat')
 
 Example 2 — Click search box to find group:
-Thought: WeChat's main window is up with the search box at the top of the left sidebar (placeholder \"搜索\"), roughly top-left of the screen. Clicking the search box and typing the group name is faster than scrolling the conversation list.
-Action: click(start_box='[60, 80, 200, 110]')
+Thought: WeChat's main window is up with the search box at the top of the left sidebar, around (40, 50) on the 0-1000 grid. Clicking the search box and typing the group name is faster than scrolling the conversation list.
+Action: click(start_box='<|box_start|>(40, 50)<|box_end|>')
 
 Example 3 — Type a search query:
 Thought: The search box is focused (cursor visible). Type the group name directly. type(content='...') passes the string through to enigo as-is.
 Action: type(content='RsClaw test group')
 
-Example 4 — Reply with quote, keyboard navigation:
-Thought: Inside the R&D group, the latest message is 12:03 Zhang San \"@me crab bug\". The \"@me\" mention triggers reply mode. First, right-click the message bubble to open the context menu.
-Action: right_single(start_box='[420, 360, 760, 410]')
+Example 4 — Right-click on message bubble:
+Thought: Inside the R&D group, the latest message is 12:03 Zhang San \"@me crab bug\". The bubble sits roughly mid-screen, around (400, 300) on the 0-1000 grid. The \"@me\" mention triggers reply mode — first right-click the bubble to open the context menu.
+Action: right_single(start_box='<|box_start|>(400, 300)<|box_end|>')
 
 Example 5 — Wait for context menu after right-click:
 Thought: Half a second after right_single the menu may still be rendering; pressing down immediately could miss the first item. Wait briefly.
@@ -172,12 +173,12 @@ Action: finished(content='Scanned all visible messages; no new @-mentions for me
 
 const OUTPUT_EXAMPLE_ZH: &str = "\
 Thought: 这里写中文思考，按上面的 Thought Examples 风格 …
-Action: click(start_box='[120, 80, 220, 110]')
+Action: click(start_box='<|box_start|>(120, 90)<|box_end|>')
 ";
 
 const OUTPUT_EXAMPLE_EN: &str = "\
 Thought: Write your English thought here, following the style of the Thought Examples above ...
-Action: click(start_box='[120, 80, 220, 110]')
+Action: click(start_box='<|box_start|>(120, 90)<|box_end|>')
 ";
 
 /// True if the string contains any common CJK / Hiragana / Katakana

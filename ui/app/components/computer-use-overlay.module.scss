@@ -1,0 +1,351 @@
+// Computer-use overlay — visual layer shown while a GUI agent run is
+// active. See computer-use-overlay.tsx for the component logic.
+//
+// Design notes:
+//   - The outer wrapper covers the entire viewport with `pointer-events:
+//     none` so it never blocks the user's normal interaction. Only the
+//     status pill itself is interactive (we keep that auto so the user
+//     can hover for tooltips later if we add them).
+//   - The orange glow lives on a separate child element so we can
+//     animate it independently of the pill's fade-in.
+//   - All colors are hex literals scoped to this file rather than CSS
+//     vars because the overlay needs to look the same in both light and
+//     dark themes — it's a status warning, not a chrome element.
+
+// Tier palette. Running = brand orange (matches the icon and the
+// user's "桌面四周出现橙色阴影" mental model). The three outcome
+// tiers (ok / attention / bad) borrow the traffic-light pattern
+// because the overlay is on screen for ~1.8s — anything subtler
+// won't read in time.
+$brand: #f97316;
+$brand-glow: rgba(249, 115, 22, 0.55);
+$brand-glow-soft: rgba(249, 115, 22, 0.18);
+$brand-edge: rgba(249, 115, 22, 0.92);
+
+$ok: #2dd4a0;
+$ok-glow: rgba(45, 212, 160, 0.5);
+$ok-glow-soft: rgba(45, 212, 160, 0.18);
+$ok-edge: rgba(45, 212, 160, 0.92);
+
+$attn: #f59e0b;
+$attn-glow: rgba(245, 158, 11, 0.55);
+$attn-glow-soft: rgba(245, 158, 11, 0.18);
+$attn-edge: rgba(245, 158, 11, 0.92);
+
+$bad: #ef4444;
+$bad-glow: rgba(239, 68, 68, 0.55);
+$bad-glow-soft: rgba(239, 68, 68, 0.18);
+$bad-edge: rgba(239, 68, 68, 0.92);
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+
+  &[data-visible="true"] {
+    opacity: 1;
+  }
+}
+
+// ---------- Edge glow ----------
+//
+// Two stacked inset shadows on a single layer give a soft outer halo
+// plus a sharper inner ring. The keyframe pulses the brand color so
+// the user sees a heartbeat rather than a static frame.
+.glow {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  box-shadow:
+    inset 0 0 80px 8px $brand-glow,
+    inset 0 0 200px 60px $brand-glow-soft;
+  animation: cu-glow-pulse 2.4s ease-in-out infinite;
+}
+
+// Tier-specific edge glow overrides. The base (`.glow`) keeps the
+// brand pulse; outcome states freeze the glow on a static tier color
+// so the user notices the transition.
+.overlay[data-status="ok"] .glow {
+  animation: none;
+  box-shadow:
+    inset 0 0 80px 8px $ok-glow,
+    inset 0 0 200px 60px $ok-glow-soft;
+}
+
+.overlay[data-status="attention"] .glow {
+  animation: none;
+  box-shadow:
+    inset 0 0 80px 8px $attn-glow,
+    inset 0 0 200px 60px $attn-glow-soft;
+}
+
+.overlay[data-status="bad"] .glow {
+  animation: none;
+  box-shadow:
+    inset 0 0 80px 8px $bad-glow,
+    inset 0 0 200px 60px $bad-glow-soft;
+}
+
+@keyframes cu-glow-pulse {
+  0%, 100% {
+    box-shadow:
+      inset 0 0 70px 6px $brand-glow,
+      inset 0 0 180px 50px $brand-glow-soft;
+  }
+  50% {
+    box-shadow:
+      inset 0 0 110px 14px $brand-glow,
+      inset 0 0 240px 80px $brand-glow-soft;
+  }
+}
+
+// ---------- Status pill ----------
+
+.pill {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: auto;
+
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 360px;
+  max-width: min(560px, calc(100vw - 80px));
+  padding: 14px 18px;
+
+  background: rgba(15, 17, 22, 0.86);
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  box-shadow:
+    0 0 0 1px $brand-edge,
+    0 12px 40px rgba(0, 0, 0, 0.55),
+    0 0 60px $brand-glow;
+
+  color: #f5f5f7;
+  animation: cu-pill-in 0.32s cubic-bezier(0.2, 0.8, 0.2, 1.05);
+  transition: box-shadow 0.3s ease;
+}
+
+.overlay[data-status="ok"] .pill {
+  box-shadow:
+    0 0 0 1px $ok-edge,
+    0 12px 40px rgba(0, 0, 0, 0.55),
+    0 0 60px $ok-glow;
+}
+
+.overlay[data-status="attention"] .pill {
+  box-shadow:
+    0 0 0 1px $attn-edge,
+    0 12px 40px rgba(0, 0, 0, 0.55),
+    0 0 60px $attn-glow;
+}
+
+.overlay[data-status="bad"] .pill {
+  box-shadow:
+    0 0 0 1px $bad-edge,
+    0 12px 40px rgba(0, 0, 0, 0.55),
+    0 0 60px $bad-glow;
+}
+
+@keyframes cu-pill-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, calc(-50% + 14px)) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+
+.iconWrap {
+  position: relative;
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+
+  // The icon itself is an SVG — render it inside a rounded clip so it
+  // visually echoes the macOS Dock squircle without the user needing
+  // to know that's our app icon.
+  svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+    border-radius: 9px;
+  }
+}
+
+.dot {
+  position: absolute;
+  bottom: -2px;
+  right: -2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #2dd4a0;
+  border: 2px solid rgba(15, 17, 22, 0.86);
+  box-shadow: 0 0 0 4px rgba(45, 212, 160, 0.25);
+  animation: cu-dot-blink 1.4s ease-in-out infinite;
+}
+
+.overlay[data-status="ok"] .dot {
+  background: $ok;
+  box-shadow: 0 0 0 4px rgba(45, 212, 160, 0.25);
+}
+
+.overlay[data-status="attention"] .dot {
+  background: $attn;
+  box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.25);
+}
+
+.overlay[data-status="bad"] .dot {
+  background: $bad;
+  box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.25);
+}
+
+@keyframes cu-dot-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.title {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: #f5f5f7;
+  letter-spacing: 0.01em;
+}
+
+.meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 1.3;
+  color: rgba(245, 245, 247, 0.6);
+  font-variant-numeric: tabular-nums;
+}
+
+.metaAgent,
+.metaApp,
+.metaSteps {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 160px;
+}
+
+.metaSep {
+  opacity: 0.5;
+}
+
+.action {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: rgba(245, 245, 247, 0.85);
+  font-family: var(--font-family-mono, ui-monospace, monospace);
+  // Truncate to two lines — long bash output etc. would otherwise
+  // make the pill grow tall and ugly.
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+// ---------- Outcome badge (after `finished`) ----------
+
+.outcome {
+  flex-shrink: 0;
+  align-self: flex-start;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.outcomeOk {
+  background: rgba(45, 212, 160, 0.16);
+  color: $ok;
+  border: 1px solid rgba(45, 212, 160, 0.4);
+}
+
+.outcomeAttention {
+  background: rgba(245, 158, 11, 0.16);
+  color: $attn;
+  border: 1px solid rgba(245, 158, 11, 0.4);
+}
+
+.outcomeBad {
+  background: rgba(239, 68, 68, 0.16);
+  color: #fca5a5;
+  border: 1px solid rgba(239, 68, 68, 0.4);
+}
+
+// ---------- Stop button (visible while a run is active) ----------
+//
+// Sits where the outcome badge appears post-finish. Subtle outlined
+// style on the dark pill, brightens on hover, brand-orange accent on
+// the icon to echo the running edge glow.
+.stopBtn {
+  flex-shrink: 0;
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.04);
+  color: rgba(245, 245, 247, 0.9);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+
+  svg {
+    color: $brand;
+    transition: color 0.15s ease;
+  }
+
+  &:hover:not(:disabled) {
+    background: rgba(239, 68, 68, 0.16);
+    border-color: rgba(239, 68, 68, 0.5);
+    color: #fca5a5;
+
+    svg {
+      color: #fca5a5;
+    }
+  }
+
+  &:active:not(:disabled) {
+    background: rgba(239, 68, 68, 0.24);
+  }
+
+  &:disabled {
+    opacity: 0.5;
+    cursor: progress;
+
+    svg {
+      color: rgba(245, 245, 247, 0.5);
+    }
+  }
+}

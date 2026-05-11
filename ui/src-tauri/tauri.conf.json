@@ -10,6 +10,7 @@
     "frontendDist": "../out"
   },
   "app": {
+    "macOSPrivateApi": true,
     "withGlobalTauri": true,
     "security": {
       "csp": null,
@@ -28,8 +29,8 @@
         "fullscreen": false,
         "width": 1000,
         "height": 720,
-        "minWidth": 700,
-        "minHeight": 500,
+        "minWidth": 320,
+        "minHeight": 400,
         "resizable": true,
         "title": "RsClaw",
         "hiddenTitle": true,

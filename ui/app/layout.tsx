@@ -47,7 +47,9 @@ export default function RootLayout({
           href="/site.webmanifest"
           crossOrigin="use-credentials"
         ></link>
-        <script src="/serviceWorkerRegister.js" defer></script>
+        {process.env.NODE_ENV === "production" && (
+          <script src="/serviceWorkerRegister.js" defer></script>
+        )}
       </head>
       <body>
         {children}

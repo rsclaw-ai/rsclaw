@@ -43,6 +43,7 @@ pub mod operators;
 pub mod parser;
 pub mod permission;
 pub mod prompt;
+pub mod status;
 
 pub use action::{Action, ActionSpec, ExecCtx, MouseButton, ParsedAction, Screenshot, ScrollDir};
 pub use driver::{DriverOutcome, VlmDriver};

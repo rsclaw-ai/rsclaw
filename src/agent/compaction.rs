@@ -674,6 +674,7 @@ impl AgentRuntime {
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None, kv_cache_mode: 0, session_key: None,
+            system_shared: None, system_user: None,
         };
 
         let providers = Arc::clone(&self.providers);
@@ -788,6 +789,7 @@ impl AgentRuntime {
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None, kv_cache_mode: 0, session_key: None,
+            system_shared: None, system_user: None,
         };
 
         let providers = Arc::clone(&self.providers);
@@ -855,6 +857,7 @@ impl AgentRuntime {
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None, kv_cache_mode: 0, session_key: None,
+            system_shared: None, system_user: None,
         };
 
         let providers = Arc::clone(&self.providers);

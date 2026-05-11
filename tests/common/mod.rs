@@ -136,12 +136,35 @@ pub async fn start_server_with_handles(addr: SocketAddr) -> ServerHandles {
         .keep()
         .expect("keep device path");
 
+    // computer_use plumbing — production fills these in
+    // `gateway::startup::serve_with_runtime`. Tests don't drive a UI
+    // dialog, so the permission store starts in non-bypass mode (every
+    // request would prompt) and the broadcast channels exist purely so
+    // dependent handlers don't blow up if they touch the field.
+    let computer_permission = Arc::new(
+        rsclaw::computer::permission::RedbPermissionStore::new(
+            Arc::clone(&store.db),
+            false,
+        ),
+    );
+    let (computer_permission_tx, _) =
+        broadcast::channel::<rsclaw::computer::permission::PermissionRequest>(64);
+    let (computer_status_tx, _) =
+        broadcast::channel::<rsclaw::computer::status::ComputerUseStatus>(256);
+    let computer_runs: Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    > = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+
     let state = AppState {
         config,
         live,
         agents,
         store,
         event_bus: event_tx,
+        computer_permission,
+        computer_permission_tx,
+        computer_status_tx,
+        computer_runs,
         devices: Arc::new(rsclaw::ws::DeviceStore::new(device_path)),
         ws_conns: Arc::new(rsclaw::ws::ConnRegistry::new()),
         feishu: Arc::new(tokio::sync::OnceCell::new()),

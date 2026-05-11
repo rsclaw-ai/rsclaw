@@ -46,6 +46,44 @@ export type PermissionDecision =
   | "allow_always"
   | "deny";
 
+/**
+ * Payload of a `computer_use_status` frame, mirrors
+ * `crate::computer::status::ComputerUseStatus`. The discriminator is
+ * `kind` (snake_case). Surfaced to the live status panel in the
+ * settings UI so the user can see what the GUI agent is doing.
+ */
+export type ComputerUseStatusPayload =
+  | {
+      kind: "started";
+      run_id: string;
+      agent_id: string;
+      app: string;
+      instruction: string;
+      max_steps: number;
+    }
+  | {
+      kind: "step";
+      run_id: string;
+      step_index: number;
+      action_summary: string;
+      thought: string;
+      result_ok: boolean;
+      result_message: string | null;
+    }
+  | {
+      kind: "finished";
+      run_id: string;
+      outcome_kind:
+        | "finished"
+        | "call_user"
+        | "max_loop"
+        | "user_abort"
+        | "permission_denied"
+        | "operator_error";
+      steps: number;
+      summary: string;
+    };
+
 /** Payload of a `restart.required` frame, mirrors src/events.rs RestartRequest. */
 export type RestartRequiredPayload = {
   at_ms: number;
@@ -76,6 +114,7 @@ class RsClawWsClient {
   private notificationHandlers = new Set<(text: string, kind?: string) => void>();
   private restartHandlers = new Set<(payload: RestartRequiredPayload) => void>();
   private permissionHandlers = new Set<(payload: PermissionRequestPayload) => void>();
+  private statusHandlers = new Set<(payload: ComputerUseStatusPayload) => void>();
   private connectHandlers = new Set<() => void>();
   private tokenRefresh: Promise<void> | null = null;
 
@@ -141,6 +180,18 @@ class RsClawWsClient {
   ): () => void {
     this.permissionHandlers.add(handler);
     return () => this.permissionHandlers.delete(handler);
+  }
+
+  /**
+   * Register a handler for `computer_use_status` event frames the
+   * gateway broadcasts as the GUI agent progresses through its loop.
+   * Returns an unsubscribe function.
+   */
+  onComputerUseStatus(
+    handler: (payload: ComputerUseStatusPayload) => void,
+  ): () => void {
+    this.statusHandlers.add(handler);
+    return () => this.statusHandlers.delete(handler);
   }
 
   /**
@@ -326,6 +377,12 @@ class RsClawWsClient {
     if (event === "permission_request") {
       const payload = (data.payload || data.data || {}) as PermissionRequestPayload;
       this.permissionHandlers.forEach((h) => h(payload));
+      return;
+    }
+
+    if (event === "computer_use_status") {
+      const payload = (data.payload || data.data || {}) as ComputerUseStatusPayload;
+      this.statusHandlers.forEach((h) => h(payload));
       return;
     }
 
