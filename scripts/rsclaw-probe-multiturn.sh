@@ -136,6 +136,19 @@ print(r[:200])
     return
   fi
 
+  # The gateway turns provider / runtime failures into HTTP 200
+  # responses whose `reply` body is `[error: <detail>]` rather than
+  # propagating a 5xx status (see `/api/v1/message` handler — it
+  # wraps internal errors so OpenAI-compatible clients see a parseable
+  # response). For probe purposes those are real failures: the model
+  # produced no usable text. Match the literal `[error:` prefix and
+  # bump $FAILED so the exit code reflects reality.
+  if [[ "${reply}" == \[error:* ]]; then
+    printf "T%-2d [%-9s] %6d ms | %s\n" "${TURN}" "${label}" "${ms}" "${reply}"
+    FAILED=$((FAILED + 1))
+    return
+  fi
+
   printf "T%-2d [%-9s] %6d ms | %s\n" "${TURN}" "${label}" "${ms}" "${reply}"
 }
 
