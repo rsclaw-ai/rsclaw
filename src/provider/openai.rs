@@ -274,8 +274,14 @@ impl OpenAiProvider {
         if let Some(ref sys) = req.system {
             messages.push(json!({"role": "system", "content": sys}));
         }
+        // Ollama native path: pass `thinking_enabled` so the assistant
+        // history is shaped the same way as the OpenAI-compat path.
+        // Ollama itself doesn't currently enforce the `reasoning_content`
+        // field, but staying consistent avoids quietly diverging
+        // history shapes between providers a user may switch between.
+        let thinking_enabled = matches!(req.thinking_budget, Some(b) if b > 0);
         for msg in &req.messages {
-            let mut m = serialize_message(msg);
+            let mut m = serialize_message(msg, thinking_enabled);
             // ollama native API requires arguments as JSON object, not string.
             if let Some(tcs) = m.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
                 for tc in tcs {
@@ -680,7 +686,17 @@ impl OpenAiProvider {
 // ---------------------------------------------------------------------------
 
 fn build_request_body(req: &LlmRequest) -> Result<Value> {
-    let messages: Vec<Value> = req.messages.iter().map(serialize_message).collect();
+    // Thinking-enabled gates how assistant messages serialise — see
+    // `serialize_message` and the call site for the field-presence
+    // contract (DeepSeek / kimi-style providers reject any assistant
+    // history entry that omits `reasoning_content` when the request
+    // also carries `enable_thinking: true`).
+    let thinking_enabled = matches!(req.thinking_budget, Some(b) if b > 0);
+    let messages: Vec<Value> = req
+        .messages
+        .iter()
+        .map(|m| serialize_message(m, thinking_enabled))
+        .collect();
 
     let mut body = json!({
         "model":      req.model,
@@ -950,7 +966,7 @@ fn reorder_tool_messages(messages: &mut Vec<Value>) {
     }
 }
 
-fn serialize_message(msg: &Message) -> Value {
+fn serialize_message(msg: &Message, thinking_enabled: bool) -> Value {
     let role_str = match msg.role {
         Role::System => "system",
         Role::User => "user",
@@ -985,8 +1001,28 @@ fn serialize_message(msg: &Message) -> Value {
     }
 
     // Assistant messages: extract tool_calls and reasoning_content if present.
-    // Some providers (e.g. kimi-for-coding) require reasoning_content on every
-    // assistant message when thinking is enabled.
+    //
+    // `reasoning_content` field-presence contract when thinking is on
+    // ---------------------------------------------------------------
+    // DeepSeek (`deepseek-reasoner`) and kimi-for-coding require EVERY
+    // assistant message in the conversation history to carry a
+    // `reasoning_content` field once the request body sets
+    // `enable_thinking: true`. Send it absent and the API 400s with
+    // `The reasoning_content in the thinking mode must be passed back
+    // to the API.`
+    //
+    // The captured reasoning may legitimately be empty (a single SSE
+    // chunk that carries both `reasoning_content` and `tool_calls`
+    // returns the tool_call event first and the reasoning is dropped;
+    // some models also produce zero-token thinking on simple
+    // tool-call turns). When `thinking_enabled` is true we therefore
+    // emit `reasoning_content` ALWAYS — populated when we captured
+    // anything, otherwise the empty string — so the contract survives
+    // even our own capture gaps.
+    //
+    // When thinking is off we keep the prior behaviour (omit the
+    // field entirely) to avoid leaking a `reasoning_content` key to
+    // providers that don't speak that dialect.
     if msg.role == Role::Assistant {
         if let MessageContent::Parts(parts) = &msg.content {
             let mut text_parts = Vec::new();
@@ -1011,7 +1047,8 @@ fn serialize_message(msg: &Message) -> Value {
             }
             let text = text_parts.join("");
             let reasoning = reasoning_parts.join("");
-            if !tool_calls.is_empty() || !reasoning.is_empty() {
+            let needs_obj = !tool_calls.is_empty() || !reasoning.is_empty() || thinking_enabled;
+            if needs_obj {
                 let mut obj = json!({
                     "role": "assistant",
                     "content": text,
@@ -1020,12 +1057,24 @@ fn serialize_message(msg: &Message) -> Value {
                     if !tool_calls.is_empty() {
                         obj_map.insert("tool_calls".to_owned(), json!(tool_calls));
                     }
-                    if !reasoning.is_empty() {
+                    if thinking_enabled || !reasoning.is_empty() {
                         obj_map.insert("reasoning_content".to_owned(), json!(reasoning));
                     }
                 }
                 return obj;
             }
+        }
+        // Assistant + Text content in thinking mode: still owes a
+        // `reasoning_content` field per the contract above. Emit
+        // empty so the next-turn request validates.
+        if thinking_enabled
+            && let MessageContent::Text(t) = &msg.content
+        {
+            return json!({
+                "role": "assistant",
+                "content": t,
+                "reasoning_content": "",
+            });
         }
     }
 
@@ -1766,6 +1815,98 @@ mod tests {
         let body = build_request_body(&req).unwrap();
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"].as_str().unwrap(), "user");
+    }
+
+    #[test]
+    fn assistant_with_tool_calls_includes_reasoning_content_when_thinking_enabled() {
+        // Regression test for the DeepSeek 400 the user hit on
+        // web_search: "The reasoning_content in the thinking mode
+        // must be passed back to the API." When thinking is enabled
+        // and the assistant message holds a tool_call but no captured
+        // reasoning (single SSE chunk carrying both fields drops one;
+        // some models produce zero reasoning on simple tool turns),
+        // the serializer must STILL emit `reasoning_content` — empty
+        // string is fine — so the next-turn body validates.
+        //
+        // Tested via `serialize_message` directly rather than
+        // `build_request_body` because the latter runs
+        // `fix_tool_call_pairing`, which strips tool_calls that
+        // lack a matching tool_result in the same batch — not what
+        // we're exercising here.
+        let msg = Message {
+            role: Role::Assistant,
+            content: MessageContent::Parts(vec![ContentPart::ToolUse {
+                id: "call_1".into(),
+                name: "web_search".into(),
+                input: serde_json::json!({"q": "rust"}),
+            }]),
+        };
+        let out = serialize_message(&msg, true);
+        assert_eq!(out["role"], "assistant");
+        assert!(out["tool_calls"].is_array());
+        assert!(
+            out.get("reasoning_content").is_some(),
+            "thinking-enabled assistant MUST emit reasoning_content field; got {out}"
+        );
+        assert_eq!(out["reasoning_content"], "");
+    }
+
+    #[test]
+    fn assistant_with_text_only_includes_reasoning_content_when_thinking_enabled() {
+        // The text-only path also owes the field — DeepSeek rejects
+        // any assistant history entry without it once thinking is on,
+        // not just the tool-call entries.
+        let msg = Message {
+            role: Role::Assistant,
+            content: MessageContent::Text("hello".into()),
+        };
+        let out = serialize_message(&msg, true);
+        assert_eq!(out["role"], "assistant");
+        assert_eq!(out["content"], "hello");
+        assert_eq!(out["reasoning_content"], "");
+    }
+
+    #[test]
+    fn assistant_preserves_captured_reasoning_when_thinking_enabled() {
+        // When we DID capture reasoning, send the real text — not the
+        // empty-string fallback.
+        let msg = Message {
+            role: Role::Assistant,
+            content: MessageContent::Parts(vec![
+                ContentPart::Reasoning {
+                    text: "Let me think...".into(),
+                },
+                ContentPart::ToolUse {
+                    id: "call_2".into(),
+                    name: "web_search".into(),
+                    input: serde_json::json!({}),
+                },
+            ]),
+        };
+        let out = serialize_message(&msg, true);
+        assert_eq!(out["reasoning_content"], "Let me think...");
+    }
+
+    #[test]
+    fn assistant_omits_reasoning_content_when_thinking_disabled() {
+        // The reciprocal: leaking `reasoning_content` to a provider
+        // that doesn't speak that dialect could trip strict-schema
+        // validators downstream. Without thinking_budget, the
+        // serializer's old behaviour (only emit when non-empty) must
+        // still hold.
+        let msg = Message {
+            role: Role::Assistant,
+            content: MessageContent::Parts(vec![ContentPart::ToolUse {
+                id: "call_3".into(),
+                name: "x".into(),
+                input: serde_json::json!({}),
+            }]),
+        };
+        let out = serialize_message(&msg, false);
+        assert!(
+            out.get("reasoning_content").is_none(),
+            "non-thinking assistant must NOT emit reasoning_content; got {out}"
+        );
     }
 
     // -----------------------------------------------------------------------
