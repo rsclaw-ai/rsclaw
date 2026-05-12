@@ -1191,10 +1191,13 @@ async fn parse_sse_chunk_with_buffer(
                     events.push(Ok(StreamEvent::Done { usage: None }));
                     continue;
                 }
-                if let Some(event) = parse_event(data) {
-                    events.push(Ok(event));
-                } else {
+                let parsed = parse_event(data);
+                if parsed.is_empty() {
                     tracing::debug!(data, "openai: unparsed SSE data");
+                } else {
+                    for ev in parsed {
+                        events.push(Ok(ev));
+                    }
                 }
             }
         }
@@ -1226,10 +1229,13 @@ fn parse_sse_chunk(chunk: Result<bytes::Bytes>) -> Vec<Result<StreamEvent>> {
                 events.push(Ok(StreamEvent::Done { usage: None }));
                 continue;
             }
-            if let Some(event) = parse_event(data) {
-                events.push(Ok(event));
-            } else {
+            let parsed = parse_event(data);
+            if parsed.is_empty() {
                 tracing::debug!(data, "openai: unparsed SSE data");
+            } else {
+                for ev in parsed {
+                    events.push(Ok(ev));
+                }
             }
         }
     }
@@ -1270,39 +1276,81 @@ fn strip_think_tags(text: &str) -> String {
     result
 }
 
-fn parse_event(data: &str) -> Option<StreamEvent> {
+/// Parse one SSE `data:` line into ALL applicable `StreamEvent`s.
+///
+/// A single chunk can carry several deltas at once — `deepseek-reasoner`
+/// in particular emits chunks shaped like:
+///   `{"choices":[{"delta":{"reasoning_content":"...","tool_calls":[...]}}]}`
+/// (Anthropic and other OAI-compats also occasionally combine
+/// `reasoning_content` with `content`.) An earlier version returned
+/// the first applicable event and dropped the rest; on tool-call
+/// turns this silently lost the `reasoning_content`, leaving the
+/// runtime's reasoning_buf empty. The serialised follow-up request
+/// then omitted `reasoning_content` from the assistant history entry,
+/// and DeepSeek 400'd with
+/// `The reasoning_content in the thinking mode must be passed back
+/// to the API` — even when our request explicitly set
+/// `enable_thinking: false`, because `deepseek-reasoner` ignores the
+/// flag and always reasons.
+///
+/// Returning `Vec<StreamEvent>` means the runtime sees every delta
+/// the upstream actually sent. Order matches the canonical Anthropic
+/// SDK accumulator pattern: reasoning → text → tool_call → done.
+fn parse_event(data: &str) -> Vec<StreamEvent> {
     let v: Value = match serde_json::from_str(data) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(data, error = %e, "openai: failed to parse SSE JSON");
-            return None;
+            return Vec::new();
         }
     };
 
     // Check for error response embedded in SSE stream
     if let Some(err) = v.get("error") {
         let msg = err["message"].as_str().unwrap_or("unknown API error");
-        return Some(StreamEvent::Error(msg.to_owned()));
+        return vec![StreamEvent::Error(msg.to_owned())];
     }
 
     let choices = match v["choices"].as_array() {
         Some(c) => c,
         None => {
-            // Log when choices is missing or not an array
             tracing::warn!(data, "openai: SSE response missing choices array");
-            return None;
+            return Vec::new();
         }
     };
     let choice = match choices.first() {
         Some(c) => c,
         None => {
             tracing::warn!(data, "openai: SSE response has empty choices array");
-            return None;
+            return Vec::new();
         }
     };
     let delta = &choice["delta"];
 
-    // Tool call
+    let mut events = Vec::new();
+
+    // Reasoning content first — match the wire ordering Anthropic
+    // documents and that the runtime's `<think>` boundary logic
+    // expects (reasoning chunks must arrive before the text content
+    // they're reasoning about).
+    if let Some(text) = delta["reasoning_content"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    {
+        events.push(StreamEvent::ReasoningDelta(text.to_owned()));
+    }
+
+    // Content text. Separate from reasoning so a chunk that carries
+    // both lands two events (the model spent some thinking tokens
+    // and started emitting visible text in the same step).
+    if let Some(text) = delta["content"].as_str().filter(|s| !s.is_empty()) {
+        events.push(StreamEvent::TextDelta(text.to_owned()));
+    }
+
+    // Tool call. `delta.tool_calls` is an array but each chunk
+    // currently carries one entry; the prior single-event return
+    // already only read `.first()` so behaviour for callers that
+    // accumulate by id is unchanged.
     if let Some(tool_calls) = delta["tool_calls"].as_array()
         && let Some(tc) = tool_calls.first()
     {
@@ -1310,39 +1358,24 @@ fn parse_event(data: &str) -> Option<StreamEvent> {
         let id = tc["id"].as_str().unwrap_or("").to_owned();
         let name = func["name"].as_str().unwrap_or("").to_owned();
         let args_str = func["arguments"].as_str().unwrap_or("");
-        // In streaming mode, arguments arrive as partial JSON fragments.
-        // Always keep as raw string — never parse fragments, because
-        // serde_json::from_str(" 3") parses to Number(3), silently
-        // dropping the leading space and corrupting the reassembled JSON.
+        // Streaming arguments arrive as partial JSON fragments. Keep
+        // as raw string — never parse fragments, because
+        // `serde_json::from_str(" 3")` parses to Number(3), silently
+        // dropping the leading space and corrupting the reassembled
+        // JSON when fragments concatenate.
         let input = if args_str.is_empty() {
             Value::Object(Default::default())
         } else {
             Value::String(args_str.to_owned())
         };
         tracing::debug!(id = %id, name = %name, args_len = args_str.len(), "openai: tool call chunk");
-        return Some(StreamEvent::ToolCall { id, name, input });
+        events.push(StreamEvent::ToolCall { id, name, input });
     }
 
-    // Text / reasoning deltas — stateless: emit ReasoningDelta or TextDelta
-    // based solely on which field is present in this chunk. No cross-chunk state
-    // needed (the old thread_local IN_REASONING was unsafe with concurrent streams
-    // on the same tokio thread).
-    let reasoning_text = delta["reasoning_content"]
-        .as_str()
-        .filter(|s| !s.is_empty());
-    let content_text = delta["content"].as_str().filter(|s| !s.is_empty());
-    let is_done = choice["finish_reason"].is_string();
-
-    if let Some(text) = reasoning_text {
-        return Some(StreamEvent::ReasoningDelta(text.to_owned()));
-    }
-
-    if let Some(text) = content_text {
-        return Some(StreamEvent::TextDelta(text.to_owned()));
-    }
-
-    // Finish
-    if is_done {
+    // Done last — `finish_reason` is the upstream's "no more
+    // deltas for this turn" signal, so any deltas in the same chunk
+    // must precede it.
+    if choice["finish_reason"].is_string() {
         let usage = v["usage"].as_object().map(|u| TokenUsage {
             input: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
             output: u
@@ -1350,10 +1383,10 @@ fn parse_event(data: &str) -> Option<StreamEvent> {
                 .and_then(Value::as_u64)
                 .unwrap_or(0) as u32,
         });
-        return Some(StreamEvent::Done { usage });
+        events.push(StreamEvent::Done { usage });
     }
 
-    None
+    events
 }
 
 // ---------------------------------------------------------------------------
@@ -1885,6 +1918,77 @@ mod tests {
         };
         let out = serialize_message(&msg, true);
         assert_eq!(out["reasoning_content"], "Let me think...");
+    }
+
+    #[test]
+    fn parse_event_emits_both_reasoning_and_tool_call_in_one_chunk() {
+        // Regression for the DeepSeek `deepseek-reasoner` bug: the
+        // model emits SSE chunks that carry `reasoning_content` AND
+        // `tool_calls` in the SAME delta. The prior single-return
+        // parse_event picked tool_call and dropped reasoning, leaving
+        // the runtime's reasoning_buf empty. Follow-up requests then
+        // omitted `reasoning_content` from the assistant history
+        // entry, and DeepSeek 400'd with "must be passed back to the
+        // API." Returning Vec<StreamEvent> lets both deltas reach the
+        // accumulator.
+        let data = r#"{"choices":[{"delta":{"reasoning_content":"Let me think","tool_calls":[{"id":"call_1","type":"function","function":{"name":"web_search","arguments":"{\"q\":\"rust\"}"}}]}}]}"#;
+        let events = parse_event(data);
+        assert_eq!(events.len(), 2, "expected reasoning + tool_call; got {events:?}");
+        match &events[0] {
+            StreamEvent::ReasoningDelta(t) => assert_eq!(t, "Let me think"),
+            other => panic!("expected ReasoningDelta first, got {other:?}"),
+        }
+        match &events[1] {
+            StreamEvent::ToolCall { id, name, .. } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "web_search");
+            }
+            other => panic!("expected ToolCall second, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_event_emits_reasoning_then_text_in_one_chunk() {
+        // Some upstreams transition reasoning → text within one
+        // chunk: trailing reasoning fragment plus the start of the
+        // visible answer. Both must reach the runtime so the
+        // <think>...</think> boundary fires correctly.
+        let data = r#"{"choices":[{"delta":{"reasoning_content":"...so the answer is","content":"42"}}]}"#;
+        let events = parse_event(data);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], StreamEvent::ReasoningDelta(t) if t == "...so the answer is"));
+        assert!(matches!(&events[1], StreamEvent::TextDelta(t) if t == "42"));
+    }
+
+    #[test]
+    fn parse_event_emits_done_with_usage_after_deltas() {
+        // Final chunk with finish_reason + content. Both must fire,
+        // text first then Done, so usage isn't recorded before the
+        // last token reaches the runtime.
+        let data = r#"{"choices":[{"delta":{"content":"!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":3}}"#;
+        let events = parse_event(data);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], StreamEvent::TextDelta(t) if t == "!"));
+        match &events[1] {
+            StreamEvent::Done { usage } => {
+                let u = usage.as_ref().expect("usage populated");
+                assert_eq!(u.input, 10);
+                assert_eq!(u.output, 3);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_event_drops_empty_reasoning_and_empty_content() {
+        // `reasoning_content: ""` and `content: ""` should not
+        // produce events — they're keep-alive padding the upstream
+        // sometimes ships between real deltas. Spurious empty deltas
+        // would otherwise leak into the runtime as `<think></think>`
+        // boundary toggles or zero-width text chunks.
+        let data = r#"{"choices":[{"delta":{"reasoning_content":"","content":""}}]}"#;
+        let events = parse_event(data);
+        assert!(events.is_empty(), "empty fields should produce no events, got {events:?}");
     }
 
     #[test]
