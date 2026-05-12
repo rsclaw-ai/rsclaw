@@ -27,13 +27,20 @@ use super::{
     TokenUsage,
 };
 
-/// Default base for an rsclaw-server running on the same host. The
-/// `/v1/agent` suffix is the external API mount inside rsclaw-server —
-/// the rsclaw-llm `/sessions/...` protocol paths are exposed to clients
-/// under that prefix, distinct from `/v1/chat/completions` etc. Setting
+/// Default base for the rsclaw-server fleet. The `/v1/agent` suffix
+/// is the external API mount inside rsclaw-server — the rsclaw-llm
+/// `/sessions/...` protocol paths are exposed to clients under that
+/// prefix, distinct from `/v1/chat/completions` etc. Setting
 /// `RSCLAW_URL` overrides this; that variable should also include the
 /// `/v1/agent` segment.
-pub const RSCLAW_DEFAULT_BASE: &str = "http://localhost:8090/v1/agent";
+///
+/// `api.rsclaw.ai` fronts the fleet behind a 308-emitting LB that
+/// pins clients (via the [`RedirectCache`] in this module) to their
+/// resolved worker host for the response's `Cache-Control: max-age`
+/// window (1h by default). First request through any provider
+/// instance pays the redirect cost; everything within the TTL after
+/// goes direct, so steady-state latency matches a direct deployment.
+pub const RSCLAW_DEFAULT_BASE: &str = "https://api.rsclaw.ai/v1/agent";
 
 /// How long to wait for `/sessions/<id>/turn` to start responding
 /// (TCP connect + TLS + send body + receive headers + first byte).
@@ -58,15 +65,161 @@ const TURN_HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
 /// replaced.
 const MAX_SESSIONS: usize = 10_000;
 
+/// Maximum redirect hops we'll follow before bailing. 5 is generous —
+/// a healthy rsclaw-server topology should be at most ONE 308 hop
+/// (LB / API gateway → real worker), but multi-region or canary fleet
+/// setups can stack two. Above five we're almost certainly in a loop
+/// or fighting a misconfigured DNS round-robin returning 308 forever.
+const MAX_REDIRECT_HOPS: usize = 5;
+
+/// Fallback redirect-cache TTL when the 308 response omits a
+/// `Cache-Control: max-age=N` directive. We deliberately set this
+/// SHORT (5 min) rather than long: a server that forgets to declare
+/// its TTL probably has buggy 308 emission too, so we should
+/// re-validate often enough that we don't get pinned to a stale
+/// target. Servers that want longer caching MUST set `max-age=3600`
+/// (or whatever they prefer) explicitly. rsclaw-server's documented
+/// default is `max-age=3600` (1h).
+const DEFAULT_REDIRECT_TTL: Duration = Duration::from_secs(300);
+
 // ---------------------------------------------------------------------------
 // Provider
 // ---------------------------------------------------------------------------
 
 pub struct RsclawProvider {
+    /// Reqwest client with redirects DISABLED — we manage 307/308
+    /// ourselves so we can capture the `Cache-Control` directive on
+    /// 308 responses (reqwest's auto-redirect strips the response
+    /// headers before we can read them). Other providers in this
+    /// crate still use the default redirect policy via
+    /// `http_client_with_ua` — this is rsclaw-specific because only
+    /// rsclaw-server is part of OUR infrastructure (other providers
+    /// are arbitrary upstreams where redirect-caching would let an
+    /// attacker pin us to a malicious host).
     client: Client,
     base_url: String,
     bearer: Option<String>,
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
+    /// Cache of 308 redirects, keyed by *origin* (scheme + host + port)
+    /// of the requested URL. Lets a single LB call amortise across the
+    /// whole session (and across sessions, since this is per-provider-
+    /// instance and providers are global). See [`RedirectCache`].
+    redirect_cache: Arc<Mutex<RedirectCache>>,
+}
+
+/// Entry in [`RedirectCache`] — where to actually send requests that
+/// target this origin, and until when this rerouting is valid.
+#[derive(Debug, Clone)]
+struct RedirectEntry {
+    /// Scheme + host + port to send to. The path portion of any
+    /// request is appended verbatim; e.g. `(api.rsclaw.ai/v1/agent/...
+    /// → server.rsclaw.ai:8443/v1/agent/...)`.
+    target_origin: String,
+    /// Instant after which this entry is ignored. Computed from
+    /// `Cache-Control: max-age=N` on the 308 response, or
+    /// [`DEFAULT_REDIRECT_TTL`] if the directive was absent.
+    expires_at: std::time::Instant,
+}
+
+#[derive(Debug, Default)]
+struct RedirectCache {
+    entries: HashMap<String, RedirectEntry>,
+}
+
+impl RedirectCache {
+    /// Look up `origin`. Returns the target origin only when the entry
+    /// is fresh; expired entries are removed lazily.
+    fn lookup(&mut self, origin: &str) -> Option<String> {
+        let now = std::time::Instant::now();
+        match self.entries.get(origin) {
+            Some(e) if e.expires_at > now => Some(e.target_origin.clone()),
+            Some(_) => {
+                // Lazy eviction — drop the stale entry so subsequent
+                // lookups don't keep re-checking the same dead row.
+                self.entries.remove(origin);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn store(&mut self, origin: String, target_origin: String, ttl: Duration) {
+        let expires_at = std::time::Instant::now() + ttl;
+        self.entries.insert(origin, RedirectEntry {
+            target_origin,
+            expires_at,
+        });
+    }
+
+    fn invalidate(&mut self, origin: &str) {
+        self.entries.remove(origin);
+    }
+}
+
+/// Extract the origin (`scheme://host[:port]`) prefix from a URL.
+/// Returns `None` for inputs that don't look like absolute URLs.
+fn origin_of(url: &str) -> Option<&str> {
+    let scheme_end = url.find("://")? + 3;
+    let path_start = url[scheme_end..]
+        .find('/')
+        .map(|i| scheme_end + i)
+        .unwrap_or(url.len());
+    Some(&url[..path_start])
+}
+
+/// Rewrite the origin portion of `url` to `new_origin`, preserving the
+/// path / query / fragment.
+fn rewrite_origin(url: &str, new_origin: &str) -> String {
+    match origin_of(url) {
+        Some(orig) => format!("{}{}", new_origin, &url[orig.len()..]),
+        None => url.to_owned(),
+    }
+}
+
+/// Resolve a possibly-relative `Location` header value against `base`
+/// per RFC 3986 §5.3 (minimal — only handles the cases real
+/// rsclaw-server emits: absolute URL, absolute path, or empty).
+fn resolve_location(base: &str, location: &str) -> Option<String> {
+    if location.is_empty() {
+        return None;
+    }
+    if location.contains("://") {
+        return Some(location.to_owned());
+    }
+    let base_origin = origin_of(base)?;
+    if location.starts_with('/') {
+        Some(format!("{base_origin}{location}"))
+    } else {
+        // Relative-to-current-path is intentionally not supported.
+        // rsclaw-server doesn't emit such Location headers and
+        // supporting them would invite path-confusion bugs. Treat as
+        // unrecognised and let the caller fall through to error.
+        None
+    }
+}
+
+/// Parse `Cache-Control: ..., max-age=N, ...` returning the number
+/// of seconds, or `None` if missing / malformed. Also returns `None`
+/// when `no-store` or `no-cache` is present — those directives
+/// explicitly forbid caching and override any `max-age` in the same
+/// header. Multiple `Cache-Control` headers (rare) are caller's
+/// responsibility to concat before calling.
+fn parse_max_age(cache_control: Option<&str>) -> Option<Duration> {
+    let header = cache_control?;
+    let mut max_age: Option<u64> = None;
+    for directive in header.split(',') {
+        let d = directive.trim();
+        let d_lower = d.to_ascii_lowercase();
+        if d_lower == "no-store" || d_lower == "no-cache" {
+            return None;
+        }
+        if let Some(value) = d_lower.strip_prefix("max-age=") {
+            if let Ok(n) = value.trim().parse::<u64>() {
+                max_age = Some(n);
+            }
+        }
+    }
+    max_age.map(Duration::from_secs)
 }
 
 #[derive(Clone, Debug)]
@@ -113,11 +266,30 @@ impl RsclawProvider {
         let bearer = bearer
             .map(|b| b.trim().to_string())
             .filter(|b| !b.is_empty());
+        // Build a reqwest client with redirects DISABLED so the
+        // 307/308 capture loop in `send_following_redirects` can read
+        // each redirect response's `Cache-Control` header before
+        // following. reqwest's default policy follows transparently
+        // and discards intermediate headers, which would defeat the
+        // 308 TTL caching the LB-aware routing depends on. The other
+        // tuning (UA, connect timeout, keep-alive, idle pool window)
+        // mirrors `http_client_with_ua` since rsclaw-server lives in
+        // the same operational envelope as the OAI-compat upstreams
+        // that helper was tuned for.
+        let client = reqwest::Client::builder()
+            .user_agent(user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT))
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(20))
+            .pool_idle_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Duration::from_secs(30))
+            .build()
+            .expect("failed to build rsclaw HTTP client");
         Self {
-            client: super::http_client_with_ua(user_agent.as_deref()),
+            client,
             base_url,
             bearer,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            redirect_cache: Arc::new(Mutex::new(RedirectCache::default())),
         }
     }
 
@@ -444,8 +616,168 @@ fn invalidate_on_error(
 // ---------------------------------------------------------------------------
 
 impl RsclawProvider {
+    /// Resolve a request URL via the redirect cache.
+    ///
+    /// Strips the configured `base_url`'s origin off the front, looks
+    /// the origin up in [`RedirectCache`], and if there's a fresh 308
+    /// cached, rewrites the URL to point at the cached target instead.
+    /// This is what lets the very first request through the LB pay
+    /// the redirect cost ONCE, then route directly for the cache TTL
+    /// (1h by rsclaw-server's default).
+    fn resolve_url(&self, path: &str) -> String {
+        let full = format!("{}{}", self.base_url, path);
+        let Some(origin) = origin_of(&full) else {
+            return full;
+        };
+        if let Ok(mut cache) = self.redirect_cache.lock() {
+            if let Some(target) = cache.lookup(origin) {
+                return rewrite_origin(&full, &target);
+            }
+        }
+        full
+    }
+
+    /// Invalidate any cached redirect entry whose origin matches `url`.
+    /// Called by request paths that observe target-host failure
+    /// (connection refused, 5xx, timeout) so a dead target doesn't
+    /// keep getting hammered for the rest of the cache window.
+    fn invalidate_redirect_for(&self, url: &str) {
+        let Some(origin) = origin_of(url) else { return };
+        if let Ok(mut cache) = self.redirect_cache.lock() {
+            cache.invalidate(origin);
+        }
+    }
+
+    /// POST `body` to `path` (e.g. `/sessions`) under `base_url`,
+    /// transparently capturing 307/308 redirects.
+    ///
+    /// - 308 responses: extract `Location` + `Cache-Control: max-age`,
+    ///   record the target origin in [`RedirectCache`] with that TTL
+    ///   (or [`DEFAULT_REDIRECT_TTL`] if absent), then follow once.
+    ///   Subsequent calls through [`resolve_url`] go DIRECT to the
+    ///   target until the TTL expires — amortising the LB cost across
+    ///   the whole cache window instead of paying it per request.
+    /// - 307 responses: follow without caching (temporary by spec).
+    /// - All other statuses: returned as-is to the caller, even
+    ///   error statuses. Callers decide how to interpret them
+    ///   (e.g. turn() recognises 404/409/503 as session-evicted and
+    ///   triggers replay).
+    ///
+    /// `body_max_age_fallback` is the per-request override for the
+    /// "no Cache-Control on 308" fallback TTL. Passing `None` uses
+    /// [`DEFAULT_REDIRECT_TTL`]. Currently always `None`, but the
+    /// hook exists for callers that want a different policy.
+    ///
+    /// `builder_timeout` controls reqwest's total request deadline
+    /// per individual hop (NOT cumulative across redirects). `None`
+    /// = no builder timeout, used by streaming `turn()` which wraps
+    /// the headers phase externally with `tokio::time::timeout`.
+    async fn send_following_redirects<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+        builder_timeout: Option<Duration>,
+    ) -> Result<reqwest::Response> {
+        let mut current_url = self.resolve_url(path);
+        let mut hops = 0;
+
+        loop {
+            let mut builder = self.client.post(&current_url).json(body);
+            if let Some(t) = builder_timeout {
+                builder = builder.timeout(t);
+            }
+            if let Some((k, v)) = self.auth_header() {
+                builder = builder.header(k, v);
+            }
+            let resp = match super::send_with_transport_retry(builder).await {
+                Ok(r) => r,
+                Err(e) => {
+                    // Transport-level failure against a redirected
+                    // target → invalidate so the next attempt goes
+                    // back through the LB. Connection refused / DNS
+                    // failure on the cached target is the canonical
+                    // "target host is dead, LB should reroute" signal.
+                    self.invalidate_redirect_for(&current_url);
+                    return Err(anyhow::Error::from(e)
+                        .context(format!("rsclaw POST {current_url}")));
+                }
+            };
+
+            let status = resp.status();
+            if status != StatusCode::TEMPORARY_REDIRECT
+                && status != StatusCode::PERMANENT_REDIRECT
+            {
+                return Ok(resp);
+            }
+
+            // Redirect path. Pull Location + Cache-Control before
+            // consuming the response.
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let cache_control = resp
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+
+            let Some(loc) = location else {
+                anyhow::bail!(
+                    "rsclaw: {status} redirect from {current_url} omitted Location header"
+                );
+            };
+            let Some(next_url) = resolve_location(&current_url, &loc) else {
+                anyhow::bail!(
+                    "rsclaw: {status} redirect from {current_url} had unsupported Location {loc:?}"
+                );
+            };
+
+            // 308 only: cache the target origin so future requests
+            // skip the LB. 307 is temporary by spec and explicitly
+            // must NOT be cached (otherwise we'd defeat the whole
+            // point of the LB using 307 for ephemeral moves).
+            if status == StatusCode::PERMANENT_REDIRECT {
+                if let (Some(current_origin), Some(next_origin)) =
+                    (origin_of(&current_url), origin_of(&next_url))
+                {
+                    // Only cache when the origin actually changed —
+                    // a 308 that points back at the same origin is a
+                    // server misconfiguration (would cause an infinite
+                    // loop), surface it via the hop counter below
+                    // rather than caching the self-loop.
+                    if current_origin != next_origin {
+                        let ttl = parse_max_age(cache_control.as_deref())
+                            .unwrap_or(DEFAULT_REDIRECT_TTL);
+                        if let Ok(mut cache) = self.redirect_cache.lock() {
+                            cache.store(
+                                current_origin.to_owned(),
+                                next_origin.to_owned(),
+                                ttl,
+                            );
+                        }
+                        tracing::info!(
+                            from = %current_origin,
+                            to = %next_origin,
+                            ttl_secs = ttl.as_secs(),
+                            "rsclaw: cached 308 redirect"
+                        );
+                    }
+                }
+            }
+
+            hops += 1;
+            if hops > MAX_REDIRECT_HOPS {
+                anyhow::bail!(
+                    "rsclaw: too many redirects ({MAX_REDIRECT_HOPS} hops) starting from {path}"
+                );
+            }
+            current_url = next_url;
+        }
+    }
+
     async fn open(&self, split: &SplitRequest<'_>) -> Result<CreateSessionResp> {
-        let url = format!("{}/sessions", self.base_url);
         let body = CreateSessionReq {
             prefix_id: &split.prefix_id,
             dynamic_prefix: DynamicPrefixWire {
@@ -458,18 +790,12 @@ impl RsclawProvider {
         // 180s caps the worst-case prefix-decode time for a fresh
         // session; without an explicit timeout reqwest hangs forever
         // on a stalled server (the 20s connect_timeout only covers TCP
-        // establishment, not response wait).
-        let mut builder = self
-            .client
-            .post(&url)
-            .timeout(Duration::from_secs(180))
-            .json(&body);
-        if let Some((k, v)) = self.auth_header() {
-            builder = builder.header(k, v);
-        }
-        let resp = super::send_with_transport_retry(builder)
-            .await
-            .with_context(|| format!("rsclaw POST {url}"))?;
+        // establishment, not response wait). The deadline is per-hop
+        // so a redirected open still gets the full budget against the
+        // ultimate target rather than splitting it.
+        let resp = self
+            .send_following_redirects("/sessions", &body, Some(Duration::from_secs(180)))
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -485,7 +811,6 @@ impl RsclawProvider {
         split: &SplitRequest<'_>,
         messages: &[Message],
     ) -> Result<CreateSessionResp> {
-        let url = format!("{}/sessions/replay", self.base_url);
         // Protocol §2.2 history accepts only `role: "user"` and
         // `role: "assistant"`. The runtime, however, threads
         // `Role::System` messages into the conversation list for
@@ -529,17 +854,15 @@ impl RsclawProvider {
         // strictly slower than open()'s prefix-only decode (180s).
         // Without an explicit timeout reqwest hangs forever on a
         // stalled server (connect_timeout only covers TCP setup).
-        let mut builder = self
-            .client
-            .post(&url)
-            .timeout(Duration::from_secs(300))
-            .json(&body);
-        if let Some((k, v)) = self.auth_header() {
-            builder = builder.header(k, v);
-        }
-        let resp = super::send_with_transport_retry(builder)
-            .await
-            .with_context(|| format!("rsclaw POST {url}"))?;
+        // Deadline applies per redirect hop so a redirected replay
+        // still gets the full budget against the ultimate target.
+        let resp = self
+            .send_following_redirects(
+                "/sessions/replay",
+                &body,
+                Some(Duration::from_secs(300)),
+            )
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -556,32 +879,31 @@ impl RsclawProvider {
         delta: &TurnDelta,
         req: &LlmRequest,
     ) -> Result<TurnOutcome> {
-        let url = format!("{}/sessions/{}/turn", self.base_url, session_id);
+        let path = format!("/sessions/{}/turn", session_id);
         let body = TurnReq {
             delta,
             options: Some(TurnOptions::from_request(req)),
             stream: true,
         };
-        // No `.timeout()` on the builder: reqwest's `.timeout()` is a
+        // No per-hop builder timeout: reqwest's `.timeout()` is a
         // total deadline that includes the streaming body, so a 180s
         // cap would kill long generations (reasoning models with
         // extended thinking + large outputs routinely run past three
         // minutes). Instead bound only the time-to-response-headers
-        // with `tokio::time::timeout` around the send so a wedged
-        // server still surfaces fast — once headers arrive, the body
-        // stream is allowed to take as long as it needs. Connection
-        // liveness during streaming is covered by the client-level
-        // `tcp_keepalive(30s)` configured in `http_client_with_ua`.
-        let mut builder = self.client.post(&url).json(&body);
-        if let Some((k, v)) = self.auth_header() {
-            builder = builder.header(k, v);
-        }
-        let send_fut = super::send_with_transport_retry(builder);
+        // (PLUS any redirect-following hops along the way) with
+        // `tokio::time::timeout` around the entire helper call so a
+        // wedged server still surfaces fast — once headers arrive,
+        // the body stream is allowed to take as long as it needs.
+        // Connection liveness during streaming is covered by the
+        // client-level `tcp_keepalive(30s)` configured above.
+        let send_fut = self.send_following_redirects(&path, &body, None);
         let resp = match tokio::time::timeout(TURN_HEADERS_TIMEOUT, send_fut).await {
-            Ok(r) => r.with_context(|| format!("rsclaw POST {url}"))?,
+            Ok(r) => r?,
             Err(_) => anyhow::bail!(
-                "rsclaw turn: timed out waiting for response headers after {}s ({url})",
-                TURN_HEADERS_TIMEOUT.as_secs()
+                "rsclaw turn: timed out waiting for response headers after {}s ({}{})",
+                TURN_HEADERS_TIMEOUT.as_secs(),
+                self.base_url,
+                path,
             ),
         };
         let status = resp.status();
@@ -1544,6 +1866,145 @@ fn is_session_evicted(status: StatusCode, body: &str) -> bool {
 mod tests {
     use super::*;
     use crate::provider::ToolDef;
+
+    #[test]
+    fn origin_of_extracts_origin() {
+        assert_eq!(origin_of("https://api.rsclaw.ai/v1/agent/sessions"), Some("https://api.rsclaw.ai"));
+        assert_eq!(origin_of("http://localhost:8443/path"), Some("http://localhost:8443"));
+        assert_eq!(origin_of("https://host"), Some("https://host"));
+        assert_eq!(origin_of("not-a-url"), None);
+    }
+
+    #[test]
+    fn rewrite_origin_preserves_path_and_query() {
+        let url = "https://api.rsclaw.ai/v1/agent/sessions/rs_w7_abc/turn";
+        let new = rewrite_origin(url, "https://server.rsclaw.ai:8443");
+        assert_eq!(new, "https://server.rsclaw.ai:8443/v1/agent/sessions/rs_w7_abc/turn");
+    }
+
+    #[test]
+    fn resolve_location_handles_absolute_and_relative() {
+        // Absolute URL: returned as-is.
+        assert_eq!(
+            resolve_location(
+                "https://api.rsclaw.ai/v1/agent/sessions",
+                "https://server.rsclaw.ai:8443/v1/agent/sessions",
+            ),
+            Some("https://server.rsclaw.ai:8443/v1/agent/sessions".into()),
+        );
+        // Absolute path: rebased on caller origin.
+        assert_eq!(
+            resolve_location("https://api.rsclaw.ai/v1/agent/sessions", "/other/path"),
+            Some("https://api.rsclaw.ai/other/path".into()),
+        );
+        // Empty / relative-to-current-path explicitly unsupported —
+        // rsclaw-server doesn't emit those and supporting them invites
+        // path-confusion bugs.
+        assert_eq!(
+            resolve_location("https://api.rsclaw.ai/v1/agent/sessions", ""),
+            None,
+        );
+        assert_eq!(
+            resolve_location("https://api.rsclaw.ai/v1/agent/sessions", "other"),
+            None,
+        );
+    }
+
+    #[test]
+    fn parse_max_age_extracts_seconds() {
+        assert_eq!(parse_max_age(Some("max-age=3600")), Some(Duration::from_secs(3600)));
+        assert_eq!(parse_max_age(Some("public, max-age=300, must-revalidate")), Some(Duration::from_secs(300)));
+        assert_eq!(parse_max_age(Some("MAX-AGE=120")), Some(Duration::from_secs(120))); // case-insensitive
+    }
+
+    #[test]
+    fn parse_max_age_returns_none_when_missing() {
+        assert_eq!(parse_max_age(None), None);
+        assert_eq!(parse_max_age(Some("public")), None);
+        assert_eq!(parse_max_age(Some("private, must-revalidate")), None);
+    }
+
+    #[test]
+    fn parse_max_age_returns_none_on_no_store_or_no_cache() {
+        // RFC 7234 says no-store / no-cache forbid the response from
+        // being stored regardless of max-age. Honour that override so
+        // a server that wants to forcibly disable our redirect cache
+        // can do so by adding `no-store` to the 308's Cache-Control.
+        assert_eq!(parse_max_age(Some("no-store")), None);
+        assert_eq!(parse_max_age(Some("max-age=3600, no-store")), None);
+        assert_eq!(parse_max_age(Some("no-cache, max-age=300")), None);
+    }
+
+    #[test]
+    fn redirect_cache_lookup_returns_target_when_fresh() {
+        let mut cache = RedirectCache::default();
+        cache.store(
+            "https://api.rsclaw.ai".into(),
+            "https://server.rsclaw.ai:8443".into(),
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            cache.lookup("https://api.rsclaw.ai"),
+            Some("https://server.rsclaw.ai:8443".into()),
+        );
+        // Miss key → None.
+        assert_eq!(cache.lookup("https://other.example.com"), None);
+    }
+
+    #[test]
+    fn redirect_cache_expires_stale_entries_lazily() {
+        let mut cache = RedirectCache::default();
+        // Negative TTL → immediately expired. (`Instant::now()` already
+        // past the computed `expires_at`.)
+        cache.entries.insert(
+            "https://api.rsclaw.ai".into(),
+            RedirectEntry {
+                target_origin: "https://server.rsclaw.ai:8443".into(),
+                expires_at: std::time::Instant::now() - Duration::from_secs(1),
+            },
+        );
+        assert!(cache.lookup("https://api.rsclaw.ai").is_none());
+        // Entry should be evicted as a side-effect — subsequent
+        // lookups don't keep re-walking a dead row.
+        assert!(!cache.entries.contains_key("https://api.rsclaw.ai"));
+    }
+
+    #[test]
+    fn redirect_cache_invalidate_removes_entry() {
+        let mut cache = RedirectCache::default();
+        cache.store(
+            "https://api.rsclaw.ai".into(),
+            "https://server.rsclaw.ai:8443".into(),
+            Duration::from_secs(3600),
+        );
+        cache.invalidate("https://api.rsclaw.ai");
+        assert!(cache.lookup("https://api.rsclaw.ai").is_none());
+    }
+
+    #[test]
+    fn provider_resolve_url_returns_origin_when_cache_empty() {
+        let provider = RsclawProvider::new("https://api.rsclaw.ai/v1/agent", None);
+        assert_eq!(
+            provider.resolve_url("/sessions"),
+            "https://api.rsclaw.ai/v1/agent/sessions",
+        );
+    }
+
+    #[test]
+    fn provider_resolve_url_rewrites_when_cache_fresh() {
+        let provider = RsclawProvider::new("https://api.rsclaw.ai/v1/agent", None);
+        if let Ok(mut cache) = provider.redirect_cache.lock() {
+            cache.store(
+                "https://api.rsclaw.ai".into(),
+                "https://server.rsclaw.ai:8443".into(),
+                Duration::from_secs(3600),
+            );
+        }
+        assert_eq!(
+            provider.resolve_url("/sessions/rs_w7_abc/turn"),
+            "https://server.rsclaw.ai:8443/v1/agent/sessions/rs_w7_abc/turn",
+        );
+    }
 
     /// Test wrapper: most tests don't care about per-stream tool_use
     /// state (they exercise one event in isolation), so mint a fresh
