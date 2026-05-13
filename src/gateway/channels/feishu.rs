@@ -314,7 +314,7 @@ pub(crate) fn start_feishu_if_configured(
                                 Err(_) => return,
                             }
                         };
-                        if let Some(mut reply) = try_preparse_locally(&text, &handle, "feishu", &sender_id).await {
+                        if let Some(mut reply) = try_preparse_locally(&text, &handle, "feishu", &sender_id, crate::gateway::preparse::PreparseOrigin::User).await {
                             reply.target_id = outbound_target.clone();
                             reply.is_group = is_group;
                             if !reply.text.is_empty() || !reply.images.is_empty() {
@@ -509,7 +509,7 @@ pub(crate) fn start_feishu_if_configured(
                                 peer_id: sender_id.clone(),
                                 dm_scope,
                             });
-                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "feishu", &sender_id).await {
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "feishu", &sender_id, crate::gateway::preparse::PreparseOrigin::User).await {
                                 reply.target_id = outbound_target.clone();
                                 reply.is_group = is_group;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {

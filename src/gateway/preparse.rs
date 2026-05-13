@@ -17,19 +17,30 @@ use crate::{
     },
 };
 
+/// Where a `/...` command text came from. `/watch` uses this to suppress
+/// dedup-hit replies fired by /loop's cron-replayed text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparseOrigin {
+    User,
+    Cron,
+}
+
 /// Handle certain fast preparse commands locally — without going through the agent queue.
 /// Returns `Some(reply_text)` for commands that can be answered immediately, `None` otherwise.
 /// This avoids blocking on the agent's sequential LLM loop for simple commands like /ls, /status.
 ///
 /// `channel` (e.g. "telegram", "wechat") and `peer_id` are passed through so commands
 /// that need to schedule deliveries back to the originating channel/peer (e.g. `/loop`)
-/// can populate a `CronDelivery` correctly.
+/// can populate a `CronDelivery` correctly. `origin` tells preparse whether the call
+/// came from a real user or from cron's replay of `/loop`-scheduled text.
 pub(crate) async fn try_preparse_locally(
     text: &str,
     handle: &crate::agent::AgentHandle,
     channel: &str,
     peer_id: &str,
+    origin: PreparseOrigin,
 ) -> Option<OutboundMessage> {
+    let _ = origin; // used by /watch dispatch (Task 19); suppress unused-var warning until then
     use std::sync::atomic::Ordering;
     let t = text.trim();
     let lower = t.to_lowercase();

@@ -1705,11 +1705,19 @@ CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
             handle.as_ref(),
             preparse_channel,
             preparse_peer,
+            crate::gateway::preparse::PreparseOrigin::Cron,
         )
         .await
         {
             // Clear the abort flag (we never dispatched to the agent).
             abort_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+            // Empty reply text = preparse handled silently (e.g. /watch dedup-hit
+            // triggered by /loop replay). Skip delivery — don't send blank chat
+            // messages or fall through to the agent.
+            if reply.text.is_empty() && reply.images.is_empty() {
+                info!(job_id = %job.id, "cron job handled silently by preparse");
+                return Ok(String::new());
+            }
             info!(
                 job_id = %job.id,
                 len = reply.text.len(),

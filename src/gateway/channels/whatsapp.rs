@@ -292,7 +292,7 @@ pub(crate) fn start_whatsapp_if_configured(
                                 peer_id: from.clone(),
                                 dm_scope,
                             });
-                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "whatsapp", &from).await {
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "whatsapp", &from, crate::gateway::preparse::PreparseOrigin::User).await {
                                 reply.target_id = from.clone();
                                 reply.is_group = false;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {

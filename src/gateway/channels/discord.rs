@@ -374,7 +374,7 @@ pub(crate) fn start_discord_if_configured(
                                 peer_id: peer_id.clone(),
                                 dm_scope,
                             });
-                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "discord", &peer_id).await {
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "discord", &peer_id, crate::gateway::preparse::PreparseOrigin::User).await {
                                 reply.target_id = channel_id.clone();
                                 reply.is_group = is_guild;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {
