@@ -2,6 +2,39 @@
 
 All notable changes to RsClaw will be documented in this file.
 
+## Unreleased
+
+### `/watch` — live event stream → chat slash command
+
+- `/watch <source>` subscribes to a file tail, SSE stream, or shell
+  subprocess and streams events directly back to chat — does **not**
+  invoke the agent, so zero LLM cost and near-realtime delivery.
+- Source kinds auto-detect from the first token: URLs route to SSE,
+  paths route to file, raw commands require explicit `shell` prefix.
+  Cross-platform `file` source uses 200 ms polling + inode/size
+  rotation detection (works on Linux/macOS/Windows without `tail`).
+- Composition with `/loop`: `/loop 10m /watch /var/log/x.log`
+  re-spawns the watch after gateway restarts via `/loop`'s cron
+  replay; dedup keyed on `(channel, peer, normalize(source))` so
+  repeat invocations are no-ops.
+- SSE client compatible with `quick_stream.py`: standard wire-format
+  parser, `${VAR}` substitution in URL + headers (empty values rejected),
+  2s→30s exponential backoff with no retry cap, `Last-Event-ID` client
+  support, `4xx` fatal, 90s no-byte heartbeat watchdog, `Accept-Encoding:
+  identity` to forbid gzip buffering.
+- Rate limit defaults to 1 event / 2s + batching (`N more events in 2s`);
+  override with `--rate 0` for unfiltered streams. `--grep <regex>`
+  for line-level filtering. Per-(channel, peer) cap of 5 concurrent
+  watches.
+- Adds `PreparseOrigin::{User, Cron}` to `try_preparse_locally` so
+  cron-replayed `/watch` dedup-hits are delivered silently (no chat
+  spam). Empty `OutboundMessage` from preparse is the silent signal;
+  the existing empty-text short-circuits in all 14 channel callsites
+  already suppress delivery.
+- `/watch list`, `/watch stop <id>`, `/watch stop all` for management.
+  In-memory only — restart clears registry; cross-restart durability
+  comes from `/loop` composition, not from `/watch` itself.
+
 ## [2026.5.1] - 2026-05-01
 
 ### Voice end-to-end via sherpa-onnx
