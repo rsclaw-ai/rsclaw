@@ -799,6 +799,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 }
                 info!("Ctrl-C received, beginning graceful shutdown");
             }
+            // Stop /watch source/processor tasks before draining HTTP so SSE
+            // and subprocesses get a clean exit instead of dangling.
+            if let Some(reg) = crate::gateway::watch::WatchRegistry::global() {
+                reg.shutdown_all().await;
+            }
             sd.begin_drain();
         });
     }

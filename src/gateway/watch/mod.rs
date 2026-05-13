@@ -43,16 +43,6 @@ pub struct WatchInfo {
     pub error_count: u64,
 }
 
-#[derive(Debug)]
-pub enum StartOutcome {
-    Started(WatchId),
-    AlreadyRunning {
-        id: WatchId,
-        started_at_ms: u64,
-        event_count: u64,
-    },
-}
-
 /// Single point of entry for `/watch` slash command.
 pub enum WatchCommandReply {
     /// Send this string to chat.
@@ -125,82 +115,87 @@ impl WatchRegistry {
         origin: Origin,
     ) -> WatchCommandReply {
         let key = dedup_key(channel, peer, &spec.raw_source);
-        {
-            let inner = self.inner.lock().await;
-            if let Some(existing) = inner.get(&key) {
-                let id = existing.id.clone();
-                let started = existing.started_at_ms;
-                let count = existing.event_count.load(std::sync::atomic::Ordering::Relaxed);
-                if origin == Origin::Cron {
-                    return WatchCommandReply::Silent;
-                }
-                let elapsed_ms = now_ms().saturating_sub(started);
-                let secs = elapsed_ms / 1000;
-                return WatchCommandReply::Reply(format!(
-                    "Watch {id} already running ({}s, {count} events). Stop with: /watch stop {id}",
-                    secs
-                ));
+
+        // Single critical section: dedup check + cap + reserve slot + insert.
+        // Holding the lock across the whole sequence prevents two concurrent
+        // /watch <same-source> calls from both missing dedup and double-spawning.
+        let mut inner = self.inner.lock().await;
+
+        // Dedup.
+        if let Some(existing) = inner.get(&key) {
+            let id = existing.id.clone();
+            let started = existing.started_at_ms;
+            let count = existing.event_count.load(std::sync::atomic::Ordering::Relaxed);
+            drop(inner);
+            if origin == Origin::Cron {
+                return WatchCommandReply::Silent;
             }
+            let secs = now_ms().saturating_sub(started) / 1000;
+            return WatchCommandReply::Reply(format!(
+                "Watch {id} already running ({secs}s, {count} events). Stop with: /watch stop {id}"
+            ));
         }
 
-        match self.spawn_watch(channel, peer, spec, key, origin).await {
-            Ok(StartOutcome::Started(id)) => WatchCommandReply::Reply(if origin == Origin::Cron {
-                format!("Watch (re)started: {id}")
-            } else {
-                format!("Watch started: {id}")
-            }),
-            Ok(StartOutcome::AlreadyRunning { .. }) => WatchCommandReply::Silent, // unreachable
-            Err(e) => WatchCommandReply::Reply(format!("/watch failed: {e}")),
-        }
-    }
-
-    async fn spawn_watch(
-        self: Arc<Self>,
-        channel: &str,
-        peer: &str,
-        spec: WatchSpec,
-        key: DedupKey,
-        _origin: Origin,
-    ) -> Result<StartOutcome, WatchStartError> {
         // Concurrency cap.
-        {
-            let inner = self.inner.lock().await;
-            let count_for_peer = inner
-                .keys()
-                .filter(|(ch, pe, _)| ch == channel && pe == peer)
-                .count();
-            if count_for_peer >= MAX_WATCHES_PER_PEER {
-                return Err(WatchStartError::LimitReached {
-                    current: count_for_peer,
-                    max: MAX_WATCHES_PER_PEER,
-                });
-            }
+        let count_for_peer = inner
+            .keys()
+            .filter(|(ch, pe, _)| ch == channel && pe == peer)
+            .count();
+        if count_for_peer >= MAX_WATCHES_PER_PEER {
+            drop(inner);
+            return WatchCommandReply::Reply(format!(
+                "/watch failed: limit reached ({count_for_peer}/{MAX_WATCHES_PER_PEER}). Stop one with /watch stop <id>"
+            ));
         }
 
-        // Build the source impl (validates path / SSE substitution).
-        let source_impl = build_source_impl(&spec)?;
-        let filter = Filter::from_spec(spec.grep.as_deref(), spec.jq.as_deref())
-            .map_err(|e| WatchStartError::InvalidRegex(e.to_string()))?;
+        // Build source impl + filter (both sync — path existence check,
+        // ${VAR} substitution, regex compile). Errors map back to user.
+        let source_impl = match build_source_impl(&spec) {
+            Ok(s) => s,
+            Err(e) => {
+                drop(inner);
+                return WatchCommandReply::Reply(format!("/watch failed: {e}"));
+            }
+        };
+        let filter = match Filter::from_spec(spec.grep.as_deref(), spec.jq.as_deref()) {
+            Ok(f) => f,
+            Err(e) => {
+                drop(inner);
+                return WatchCommandReply::Reply(format!("/watch failed: invalid filter: {e}"));
+            }
+        };
 
+        // Reserve the slot BEFORE spawning tasks. A concurrent /watch on the
+        // same source will now dedup-hit this entry.
         let id = generate_id();
         let event_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let error_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (stop_tx, stop_rx) = oneshot::channel();
         let (src_tx, src_rx) = mpsc::channel::<EventRecord>(PROCESSOR_BUFFER);
-
-        // Source task.
         let src_kind = source_impl.kind();
+
+        inner.insert(
+            key,
+            WatchTask {
+                id: id.clone(),
+                raw_source: spec.raw_source.clone(),
+                kind: src_kind,
+                started_at_ms: now_ms(),
+                event_count: event_count.clone(),
+                error_count: error_count.clone(),
+                stop_tx: Some(stop_tx),
+            },
+        );
+        drop(inner); // Release the lock BEFORE we spawn long-running tasks.
+
+        // Spawn the source + processor tasks.
         tokio::spawn(async move { source_impl.run(src_tx, stop_rx).await });
 
-        // Processor task.
         let registry = self.clone();
         let channel_s = channel.to_owned();
         let peer_s = peer.to_owned();
-        let ev_count = event_count.clone();
-        let err_count = error_count.clone();
         let id_clone = id.clone();
         let rate_ms = spec.rate_ms;
-
         tokio::spawn(async move {
             registry
                 .processor_loop(
@@ -210,25 +205,34 @@ impl WatchRegistry {
                     filter,
                     rate_ms,
                     src_rx,
-                    ev_count,
-                    err_count,
+                    event_count,
+                    error_count,
                 )
                 .await;
         });
 
-        let task = WatchTask {
-            id: id.clone(),
-            raw_source: spec.raw_source.clone(),
-            kind: src_kind,
-            started_at_ms: now_ms(),
-            event_count,
-            error_count,
-            stop_tx: Some(stop_tx),
-        };
-        let mut inner = self.inner.lock().await;
-        inner.insert(key, task);
         info!(channel = %channel, peer = %peer, id = %id, "watch started");
-        Ok(StartOutcome::Started(id))
+        if origin == Origin::Cron {
+            WatchCommandReply::Reply(format!("Watch (re)started: {id}"))
+        } else {
+            WatchCommandReply::Reply(format!("Watch started: {id}"))
+        }
+    }
+
+    /// Signal every active watch to stop. Idempotent. Called by gateway
+    /// shutdown so SSE / subprocess tasks get a clean exit instead of
+    /// dangling until process termination.
+    pub async fn shutdown_all(&self) {
+        let mut inner = self.inner.lock().await;
+        let count = inner.len();
+        for (_, mut task) in inner.drain() {
+            if let Some(tx) = task.stop_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+        if count > 0 {
+            info!(stopped = count, "watch registry shutdown");
+        }
     }
 
     async fn processor_loop(

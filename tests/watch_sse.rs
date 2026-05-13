@@ -110,10 +110,20 @@ async fn sse_source_reconnects_after_disconnect() {
     let src = SourceImpl::Sse(SseSource { url, headers: vec![] });
     let handle = tokio::spawn(async move { src.run(tx, stop_rx).await });
 
-    let e1 = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
-    assert_eq!(e1.data, serde_json::json!({"a": 1}));
-    let e2 = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
-    assert_eq!(e2.data, serde_json::json!({"a": 2}));
+    // Drain past lifecycle events (`_disconnect` is emitted between the
+    // first connection ending and the reconnect starting).
+    let mut got: Vec<serde_json::Value> = Vec::new();
+    while got.len() < 2 {
+        let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if !ev.event.starts_with('_') {
+            got.push(ev.data);
+        }
+    }
+    assert_eq!(got[0], serde_json::json!({"a": 1}));
+    assert_eq!(got[1], serde_json::json!({"a": 2}));
 
     let _ = stop_tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;

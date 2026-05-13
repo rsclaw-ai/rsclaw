@@ -252,7 +252,16 @@ pub(super) async fn run_sse(
                     .await;
                 return;
             }
-            SseOutcome::Disconnect(_msg) => {
+            SseOutcome::Disconnect(reason) => {
+                // Surface lifecycle event so users see when streams reset
+                // (spec §"Server clean close" — emit _disconnect before retry).
+                let _ = tx
+                    .send(EventRecord::lifecycle(
+                        "_disconnect",
+                        serde_json::json!({ "reason": reason }),
+                        now_ms(),
+                    ))
+                    .await;
                 // Wait `backoff_ms` (capped at 30s) before reconnecting,
                 // unless a `retry:` header overrode it inside the connection.
                 let delay = backoff_ms.min(30_000);
