@@ -99,11 +99,8 @@ fn parse_start(body: &str) -> Result<WatchSpec> {
         rate_ms: 2000,
     };
 
-    // Flag parsing is done in Task 4; for now if flag_tail is non-empty, just
-    // store the rest into raw_source so the test for first-token routing passes,
-    // then Task 4 will replace this.
     if !flag_tail.is_empty() {
-        spec.raw_source = format!("{} {}", spec.raw_source, flag_tail).trim().to_owned();
+        apply_flags(&mut spec, flag_tail)?;
     }
 
     if spec.raw_source.is_empty() {
@@ -164,6 +161,87 @@ fn split_source_and_flags(s: &str) -> (&str, &str) {
         (&s[..best_idx], s[best_idx + 1..].trim_start())
         // Note: best_idx points at the leading space, so +1 skips it.
     }
+}
+
+fn apply_flags(spec: &mut WatchSpec, tail: &str) -> Result<()> {
+    // Tokenize the tail respecting single- and double-quoted values so
+    // `-H 'Auth: Bearer x'` keeps the quoted value as one token.
+    let tokens = tokenize_flags(tail)?;
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = &tokens[i];
+        i += 1;
+        match tok.as_str() {
+            "-H" => {
+                let val = tokens.get(i).ok_or_else(|| anyhow!("-H needs a value"))?.clone();
+                i += 1;
+                let (name, value) = val
+                    .split_once(':')
+                    .ok_or_else(|| anyhow!("-H value must be `Name: value`, got `{val}`"))?;
+                spec.headers.push((name.trim().to_owned(), value.trim().to_owned()));
+            }
+            "--grep" => {
+                let val = tokens.get(i).ok_or_else(|| anyhow!("--grep needs a regex"))?.clone();
+                i += 1;
+                // Validate regex compiles now so the user gets a clean error.
+                regex::Regex::new(&val).map_err(|e| anyhow!("invalid regex: {e}"))?;
+                spec.grep = Some(val);
+            }
+            "--jq" => {
+                let val = tokens.get(i).ok_or_else(|| anyhow!("--jq needs an expression"))?.clone();
+                i += 1;
+                spec.jq = Some(val); // Compile-time validation deferred (jq is stretch).
+            }
+            "--rate" => {
+                let val = tokens.get(i).ok_or_else(|| anyhow!("--rate needs a number"))?.clone();
+                i += 1;
+                spec.rate_ms = val.parse::<u64>().map_err(|_| anyhow!("--rate must be a number, got `{val}`"))?;
+            }
+            "--only" | "--tee" => {
+                // Stretch — accept but ignore in v1 so the command still parses.
+                tokens.get(i).ok_or_else(|| anyhow!("{tok} needs a value"))?;
+                i += 1;
+            }
+            unknown => return Err(anyhow!("unknown flag: `{unknown}`")),
+        }
+    }
+    Ok(())
+}
+
+/// Split a flag tail into tokens, honoring single- and double-quoted strings.
+/// `-H 'Auth: Bearer x' --grep "ERR"` → ["-H", "Auth: Bearer x", "--grep", "ERR"]
+fn tokenize_flags(s: &str) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => {
+                quote = None;
+                // Closing quote — emit the buffered token even if empty.
+                out.push(std::mem::take(&mut buf));
+            }
+            (Some(_), c) => buf.push(c),
+            (None, c) if c == '\'' || c == '"' => {
+                quote = Some(c);
+            }
+            (None, c) if c.is_whitespace() => {
+                if !buf.is_empty() {
+                    out.push(std::mem::take(&mut buf));
+                }
+            }
+            (None, c) => buf.push(c),
+        }
+    }
+    if quote.is_some() {
+        return Err(anyhow!("unterminated quoted string in flags"));
+    }
+    if !buf.is_empty() {
+        out.push(buf);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -243,5 +321,71 @@ mod tests {
     fn raw_command_without_kind_errors() {
         // `tail -f x` doesn't auto-detect (not URL, not path) and has no explicit kind.
         assert!(parse("tail -f x").is_err());
+    }
+
+    #[test]
+    fn flag_parsing_grep() {
+        let p = parse("/var/log/x --grep ERR").unwrap();
+        if let ParsedCommand::Start(spec) = p {
+            assert_eq!(spec.grep, Some("ERR".to_owned()));
+            assert_eq!(spec.raw_source, "/var/log/x");
+        }
+    }
+
+    #[test]
+    fn flag_parsing_rate() {
+        let p = parse("/var/log/x --rate 5000").unwrap();
+        if let ParsedCommand::Start(spec) = p {
+            assert_eq!(spec.rate_ms, 5000);
+        }
+    }
+
+    #[test]
+    fn flag_parsing_rate_zero() {
+        let p = parse("/var/log/x --rate 0").unwrap();
+        if let ParsedCommand::Start(spec) = p {
+            assert_eq!(spec.rate_ms, 0);
+        }
+    }
+
+    #[test]
+    fn flag_parsing_header_quoted() {
+        let p = parse("https://x -H 'Authorization: Bearer abc def'").unwrap();
+        if let ParsedCommand::Start(spec) = p {
+            assert_eq!(spec.headers, vec![("Authorization".to_owned(), "Bearer abc def".to_owned())]);
+        }
+    }
+
+    #[test]
+    fn flag_parsing_multiple_headers() {
+        let p = parse("https://x -H 'A: 1' -H 'B: 2'").unwrap();
+        if let ParsedCommand::Start(spec) = p {
+            assert_eq!(spec.headers.len(), 2);
+            assert_eq!(spec.headers[0], ("A".to_owned(), "1".to_owned()));
+            assert_eq!(spec.headers[1], ("B".to_owned(), "2".to_owned()));
+        }
+    }
+
+    #[test]
+    fn flag_parsing_invalid_regex_errors() {
+        assert!(parse("/var/log/x --grep [unclosed").is_err());
+    }
+
+    #[test]
+    fn flag_parsing_unknown_flag_errors() {
+        assert!(parse("/var/log/x --bogus value").is_err());
+    }
+
+    #[test]
+    fn flag_parsing_unterminated_quote_errors() {
+        assert!(parse("https://x -H 'unclosed").is_err());
+    }
+
+    #[test]
+    fn flag_parsing_default_rate_is_2000() {
+        let p = parse("/var/log/x").unwrap();
+        if let ParsedCommand::Start(spec) = p {
+            assert_eq!(spec.rate_ms, 2000);
+        }
     }
 }
