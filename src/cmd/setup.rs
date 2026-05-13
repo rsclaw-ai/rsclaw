@@ -3,7 +3,9 @@ use dialoguer::{Input, Password, Select};
 use serde_json::json;
 use tracing::info;
 
-use super::config_json::{get_nested_value, load_config_json, set_nested_value};
+use super::config_json::{
+    get_nested_value, load_config_json, remove_nested_value, set_nested_value,
+};
 use crate::{
     agent,
     cli::{ConfigureArgs, OnboardArgs, SetupArgs},
@@ -426,6 +428,10 @@ struct ChannelDef {
     /// If true, run `channels login` flow (QR/OAuth) instead of prompting fields.
     #[serde(default)]
     login: bool,
+    /// If true, gateway reads `channels.<name>.accounts.<acct>.<field>` and the
+    /// editor exposes add/edit/remove account UI on top of the single-account flow.
+    #[serde(default)]
+    multi_account: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1959,7 +1965,164 @@ fn channel_is_configured(val: &serde_json::Value, ch_name: &str) -> bool {
     val.get("channels")
         .and_then(|c| c.get(ch_name))
         .and_then(|ch| ch.as_object())
-        .is_some_and(|obj| obj.keys().any(|k| k != "enabled"))
+        .is_some_and(|obj| {
+            obj.iter().any(|(k, v)| {
+                if k == "enabled" {
+                    return false;
+                }
+                if k == "accounts" {
+                    return v.as_object().is_some_and(|a| !a.is_empty());
+                }
+                true
+            })
+        })
+}
+
+/// Sorted account names under `channels.<ch>.accounts`. Empty if none.
+fn account_names(val: &serde_json::Value, ch_name: &str) -> Vec<String> {
+    val.get("channels")
+        .and_then(|c| c.get(ch_name))
+        .and_then(|ch| ch.get("accounts"))
+        .and_then(|a| a.as_object())
+        .map(|m| {
+            let mut names: Vec<String> = m.keys().cloned().collect();
+            names.sort();
+            names
+        })
+        .unwrap_or_default()
+}
+
+/// Returns true if any field listed in `fields` is set at the top-level
+/// `channels.<ch>.<field>` path (i.e. single-account legacy layout).
+fn has_top_level_fields(
+    val: &serde_json::Value,
+    ch_name: &str,
+    fields: &[ChannelFieldDef],
+) -> bool {
+    fields.iter().any(|f| {
+        let path = format!("channels.{}.{}", ch_name, f.key);
+        get_nested_value(val, &path)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty())
+    })
+}
+
+/// Move `channels.<ch>.<field>` values to `channels.<ch>.accounts.default.<field>`,
+/// leaving non-account keys (enabled / dmPolicy / groupPolicy / accounts) intact.
+fn migrate_top_to_accounts(
+    val: &mut serde_json::Value,
+    ch_name: &str,
+    fields: &[ChannelFieldDef],
+    account_name: &str,
+) {
+    ensure_json_path(val, &["channels"]);
+    ensure_json_path(val, &["channels", ch_name]);
+    ensure_json_path(val, &["channels", ch_name, "accounts"]);
+    ensure_json_path(val, &["channels", ch_name, "accounts", account_name]);
+
+    for f in fields {
+        let src = format!("channels.{}.{}", ch_name, f.key);
+        let Some(v) = get_nested_value(val, &src).cloned() else { continue };
+        let dst = format!("channels.{}.accounts.{}.{}", ch_name, account_name, f.key);
+        let _ = set_nested_value(val, &dst, v);
+        remove_nested_value(val, &src);
+    }
+}
+
+/// Remove `channels.<ch>.accounts.<acct>`. Also drops the `accounts` key
+/// itself if it becomes empty.
+fn remove_account(val: &mut serde_json::Value, ch_name: &str, acct: &str) {
+    let acct_path = format!("channels.{}.accounts.{}", ch_name, acct);
+    remove_nested_value(val, &acct_path);
+
+    let still_has_accts = val
+        .get("channels")
+        .and_then(|c| c.get(ch_name))
+        .and_then(|ch| ch.get("accounts"))
+        .and_then(|a| a.as_object())
+        .is_some_and(|m| !m.is_empty());
+    if !still_has_accts {
+        remove_nested_value(val, &format!("channels.{}.accounts", ch_name));
+    }
+}
+
+fn mask_secret(current: &str) -> String {
+    if current.starts_with("${") {
+        current.to_owned()
+    } else if current.chars().count() > 8 {
+        let prefix: String = current.chars().take(4).collect();
+        let suffix: String = current
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("{prefix}...{suffix}")
+    } else {
+        "*".repeat(current.len().min(8))
+    }
+}
+
+/// Edit `fields` at JSON path `<prefix>.<field.key>` for each field. Prompts
+/// reuse the existing input/password/keep helpers; secrets are masked.
+/// Returns true if any field changed.
+fn edit_fields_at_prefix(
+    val: &mut serde_json::Value,
+    fields: &[ChannelFieldDef],
+    prefix: &str,
+    lang: &str,
+) -> bool {
+    let mut changed = false;
+    let prefix_parts: Vec<String> = prefix.split('.').map(|s| s.to_owned()).collect();
+
+    for field in fields {
+        let path = format!("{}.{}", prefix, field.key);
+        let current = get_nested_value(val, &path)
+            .and_then(|v| v.as_str().map(|s| s.to_owned()))
+            .unwrap_or_default();
+
+        let result = if field.secret && !current.is_empty() {
+            let masked = mask_secret(&current);
+            let keep_label = crate::i18n::t_fmt("cli_keep", lang, &[("value", &masked)]);
+            let edit_label = crate::i18n::t("cli_edit", lang);
+            let back_label = crate::i18n::t("cli_back", lang);
+            let items = &[
+                keep_label.as_str(),
+                edit_label.as_str(),
+                back_label.as_str(),
+            ];
+            match Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+                .with_prompt(&format!("  {}", field.prompt))
+                .items(items)
+                .default(0)
+                .interact_opt()
+            {
+                Ok(Some(0)) => continue,
+                Ok(Some(1)) => password_step(&format!("  {}", field.prompt)),
+                _ => StepResult::Back,
+            }
+        } else {
+            input_step(&format!("  {}", field.prompt), current.clone())
+        };
+
+        match result {
+            StepResult::Next(new_val) => {
+                if new_val != current && !new_val.is_empty() {
+                    let parts_ref: Vec<&str> =
+                        prefix_parts.iter().map(|s| s.as_str()).collect();
+                    for i in 1..=parts_ref.len() {
+                        ensure_json_path(val, &parts_ref[..i]);
+                    }
+                    let _ = set_nested_value(val, &path, serde_json::json!(new_val));
+                    changed = true;
+                }
+            }
+            StepResult::Back | StepResult::Cancel => break,
+        }
+    }
+    changed
 }
 
 async fn edit_channel_config(
@@ -2030,12 +2193,33 @@ async fn edit_channel_config(
     }
 
     let mut changed = false;
-    let is_configured = ch.fields.iter().any(|f| {
-        let path = format!("channels.{}.{}", ch.name, f.key);
-        get_nested_value(val, &path)
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.is_empty())
-    });
+    let has_accounts = !account_names(val, &ch.name).is_empty();
+    let has_top = has_top_level_fields(val, &ch.name, &ch.fields);
+
+    // Multi-account routing: enter multi-account UI when supported and either
+    // (a) accounts.* already exists, or (b) user opts in via "Add another".
+    if ch.multi_account && (has_accounts || has_top) {
+        let want_multi = if has_accounts {
+            true
+        } else {
+            prompt_add_another_account(&ch.label, lang)
+        };
+        if want_multi {
+            if !has_accounts && has_top {
+                migrate_top_to_accounts(val, &ch.name, &ch.fields, "default");
+                changed = true;
+            }
+            if edit_channel_multi_account(val, ch, lang) {
+                changed = true;
+            }
+            if edit_channel_policies(val, &ch.name, lang) {
+                changed = true;
+            }
+            return changed;
+        }
+    }
+
+    let is_configured = has_top;
 
     println!();
     if is_configured {
@@ -2044,61 +2228,22 @@ async fn edit_channel_config(
         println!("  {}", crate::i18n::t_fmt("cli_config_label", lang, &[("label", &ch.label)]));
     }
 
-    for field in &ch.fields {
-        let path = format!("channels.{}.{}", ch.name, field.key);
-        let current = get_nested_value(val, &path)
-            .and_then(|v| v.as_str().map(|s| s.to_owned()))
-            .unwrap_or_default();
-
-        let result = if field.secret && !current.is_empty() {
-            // Show masked value for secrets, ask to change
-            let masked = if current.starts_with("${") {
-                current.clone()
-            } else if current.chars().count() > 8 {
-                let prefix: String = current.chars().take(4).collect();
-                let suffix: String = current.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
-                format!("{prefix}...{suffix}")
-            } else {
-                "*".repeat(current.len().min(8))
-            };
-            let keep_label = crate::i18n::t_fmt("cli_keep", lang, &[("value", &masked)]);
-            let edit_label = crate::i18n::t("cli_edit", lang);
-            let back_label = crate::i18n::t("cli_back", lang);
-            let items = &[
-                keep_label.as_str(),
-                edit_label.as_str(),
-                back_label.as_str(),
-            ];
-            match Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
-                .with_prompt(&format!("  {}", field.prompt))
-                .items(items)
-                .default(0)
-                .interact_opt()
-            {
-                Ok(Some(0)) => continue,  // Keep
-                Ok(Some(1)) => password_step(&format!("  {}", field.prompt)),
-                _ => StepResult::Back,
-            }
-        } else {
-            input_step(&format!("  {}", field.prompt), current.clone())
-        };
-
-        match result {
-            StepResult::Next(new_val) => {
-                if new_val != current && !new_val.is_empty() {
-                    ensure_json_path(val, &["channels"]);
-                    ensure_json_path(val, &["channels", &ch.name]);
-                    let _ = set_nested_value(val, &path, serde_json::json!(new_val));
-                    // Don't auto-enable; user controls enabled via Space toggle
-                    changed = true;
-                }
-            }
-            StepResult::Back | StepResult::Cancel => break,
-        }
+    if edit_fields_at_prefix(val, &ch.fields, &format!("channels.{}", ch.name), lang) {
+        changed = true;
     }
 
-    // DM Policy selector (common to all channels)
-    let dm_path = format!("channels.{}.dmPolicy", ch.name);
+    if edit_channel_policies(val, &ch.name, lang) {
+        changed = true;
+    }
+
+    changed
+}
+
+/// DM + Group policy selectors. Returns true if either changed.
+fn edit_channel_policies(val: &mut serde_json::Value, ch_name: &str, lang: &str) -> bool {
+    let mut changed = false;
+
+    let dm_path = format!("channels.{}.dmPolicy", ch_name);
     let current_dm = get_nested_value(val, &dm_path)
         .and_then(|v| v.as_str())
         .unwrap_or("pairing")
@@ -2106,25 +2251,17 @@ async fn edit_channel_config(
     let dm_policies = &["pairing", "open", "allowlist", "disabled"];
     let dm_idx = dm_policies.iter().position(|&p| p == current_dm).unwrap_or(0);
     let dm_prompt = crate::i18n::t_fmt("cli_dm_policy", lang, &[("policy", &current_dm)]);
-    match select_step(
-        &format!("  {dm_prompt}"),
-        dm_policies,
-        dm_idx,
-    ) {
-        StepResult::Next(idx) => {
-            let new_policy = dm_policies[idx];
-            if new_policy != current_dm {
-                ensure_json_path(val, &["channels"]);
-                ensure_json_path(val, &["channels", &ch.name]);
-                let _ = set_nested_value(val, &dm_path, serde_json::json!(new_policy));
-                changed = true;
-            }
+    if let StepResult::Next(idx) = select_step(&format!("  {dm_prompt}"), dm_policies, dm_idx) {
+        let new_policy = dm_policies[idx];
+        if new_policy != current_dm {
+            ensure_json_path(val, &["channels"]);
+            ensure_json_path(val, &["channels", ch_name]);
+            let _ = set_nested_value(val, &dm_path, serde_json::json!(new_policy));
+            changed = true;
         }
-        _ => {}
     }
 
-    // Group Policy selector
-    let gp_path = format!("channels.{}.groupPolicy", ch.name);
+    let gp_path = format!("channels.{}.groupPolicy", ch_name);
     let current_gp = get_nested_value(val, &gp_path)
         .and_then(|v| v.as_str())
         .unwrap_or("allowlist")
@@ -2132,23 +2269,109 @@ async fn edit_channel_config(
     let gp_policies = &["allowlist", "open", "disabled"];
     let gp_idx = gp_policies.iter().position(|&p| p == current_gp).unwrap_or(0);
     let gp_prompt = crate::i18n::t_fmt("cli_group_policy", lang, &[("policy", &current_gp)]);
-    match select_step(
-        &format!("  {gp_prompt}"),
-        gp_policies,
-        gp_idx,
-    ) {
-        StepResult::Next(idx) => {
-            let new_policy = gp_policies[idx];
-            if new_policy != current_gp {
-                ensure_json_path(val, &["channels"]);
-                ensure_json_path(val, &["channels", &ch.name]);
-                let _ = set_nested_value(val, &gp_path, serde_json::json!(new_policy));
-                changed = true;
-            }
+    if let StepResult::Next(idx) = select_step(&format!("  {gp_prompt}"), gp_policies, gp_idx) {
+        let new_policy = gp_policies[idx];
+        if new_policy != current_gp {
+            ensure_json_path(val, &["channels"]);
+            ensure_json_path(val, &["channels", ch_name]);
+            let _ = set_nested_value(val, &gp_path, serde_json::json!(new_policy));
+            changed = true;
         }
-        _ => {}
     }
 
+    changed
+}
+
+/// Asks the user whether to migrate a single-account config to multi-account
+/// layout. Returns true when the user picks "Add another account".
+fn prompt_add_another_account(label: &str, lang: &str) -> bool {
+    let keep = crate::i18n::t("cli_account_keep_single", lang);
+    let add = crate::i18n::t("cli_account_add_another", lang);
+    let prompt = crate::i18n::t_fmt("cli_account_choose_mode", lang, &[("label", label)]);
+    matches!(
+        select_step(&format!("  {prompt}"), &[keep.as_str(), add.as_str()], 0),
+        StepResult::Next(1)
+    )
+}
+
+/// Multi-account editor: list accounts under `channels.<ch>.accounts`, with
+/// Add / Edit / Remove / Back actions. Returns true if anything changed.
+fn edit_channel_multi_account(
+    val: &mut serde_json::Value,
+    ch: &ChannelDef,
+    lang: &str,
+) -> bool {
+    let mut changed = false;
+    loop {
+        let names = account_names(val, &ch.name);
+        let add_label = crate::i18n::t("cli_account_add_new", lang);
+        let back_label = crate::i18n::t("cli_back", lang);
+
+        let mut items: Vec<String> = names.clone();
+        items.push(add_label);
+        items.push(back_label);
+        let items_ref: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
+        let title = crate::i18n::t_fmt("cli_account_list_title", lang, &[("label", &ch.label)]);
+
+        let sel = match select_step(&format!("  {title}"), &items_ref, 0) {
+            StepResult::Next(i) => i,
+            _ => break,
+        };
+
+        if sel == names.len() {
+            // [+ Add account]
+            let name_prompt = crate::i18n::t("cli_account_name_prompt", lang);
+            let new_name = match input_step(&format!("  {name_prompt}"), String::new()) {
+                StepResult::Next(s) => s.trim().to_owned(),
+                _ => continue,
+            };
+            if new_name.is_empty() {
+                continue;
+            }
+            if new_name.contains('.') || new_name.contains(' ') {
+                println!(
+                    "  [!] {}",
+                    crate::i18n::t("cli_account_name_invalid", lang)
+                );
+                continue;
+            }
+            if names.iter().any(|n| n == &new_name) {
+                println!(
+                    "  [!] {}",
+                    crate::i18n::t_fmt("cli_account_exists", lang, &[("name", &new_name)])
+                );
+                continue;
+            }
+            let prefix = format!("channels.{}.accounts.{}", ch.name, new_name);
+            if edit_fields_at_prefix(val, &ch.fields, &prefix, lang) {
+                changed = true;
+            }
+        } else if sel == names.len() + 1 {
+            // Back
+            break;
+        } else {
+            let acct = names[sel].clone();
+            let edit_label = crate::i18n::t("cli_edit", lang);
+            let remove_label = crate::i18n::t("cli_account_remove", lang);
+            let back_label2 = crate::i18n::t("cli_back", lang);
+            let inner = [edit_label.as_str(), remove_label.as_str(), back_label2.as_str()];
+            let inner_prompt =
+                crate::i18n::t_fmt("cli_account_action", lang, &[("name", &acct)]);
+            match select_step(&format!("  {inner_prompt}"), &inner, 0) {
+                StepResult::Next(0) => {
+                    let prefix = format!("channels.{}.accounts.{}", ch.name, acct);
+                    if edit_fields_at_prefix(val, &ch.fields, &prefix, lang) {
+                        changed = true;
+                    }
+                }
+                StepResult::Next(1) => {
+                    remove_account(val, &ch.name, &acct);
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+    }
     changed
 }
 
@@ -2172,8 +2395,15 @@ async fn configure_channels(val: &mut serde_json::Value, defs: &Defaults) -> Res
                 let enabled = get_channel_enabled(val, &ch.name);
                 let configured = channel_is_configured(val, &ch.name);
                 let check = if enabled { "\x1b[32m\u{25c9}\x1b[0m" } else { "\u{25cb}" };
-                let tag = if configured { &configured_label } else { "" };
-                format!("{} {}{}", check, ch.label, if tag.is_empty() { String::new() } else { format!(" ({})", tag.trim()) })
+                let accts = if ch.multi_account { account_names(val, &ch.name).len() } else { 0 };
+                let tag: String = if accts > 0 {
+                    crate::i18n::t_fmt("cli_accounts_count", lang, &[("n", &accts.to_string())])
+                } else if configured {
+                    configured_label.clone()
+                } else {
+                    String::new()
+                };
+                format!("{} {}{}", check, ch.label, if tag.trim().is_empty() { String::new() } else { format!(" ({})", tag.trim()) })
             }));
 
         // Render list
@@ -2612,5 +2842,112 @@ fn ensure_json_path(val: &mut serde_json::Value, keys: &[&str]) {
             Some(v) => v,
             None => return,
         };
+    }
+}
+
+#[cfg(test)]
+mod account_helper_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fields() -> Vec<ChannelFieldDef> {
+        vec![
+            ChannelFieldDef {
+                key: "appId".into(),
+                prompt: "App ID".into(),
+                secret: false,
+            },
+            ChannelFieldDef {
+                key: "appSecret".into(),
+                prompt: "App Secret".into(),
+                secret: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn account_names_empty_when_no_channels() {
+        let v = json!({});
+        assert!(account_names(&v, "feishu").is_empty());
+    }
+
+    #[test]
+    fn account_names_sorted() {
+        let v = json!({
+            "channels": { "feishu": { "accounts": {
+                "zeta": { "appId": "z" },
+                "alpha": { "appId": "a" },
+                "mu":    { "appId": "m" },
+            } } }
+        });
+        assert_eq!(account_names(&v, "feishu"), vec!["alpha", "mu", "zeta"]);
+    }
+
+    #[test]
+    fn has_top_level_fields_detects_legacy_layout() {
+        let v = json!({ "channels": { "feishu": { "appId": "x" } } });
+        assert!(has_top_level_fields(&v, "feishu", &fields()));
+        let v2 = json!({ "channels": { "feishu": { "enabled": true } } });
+        assert!(!has_top_level_fields(&v2, "feishu", &fields()));
+    }
+
+    #[test]
+    fn migrate_top_to_accounts_moves_fields_under_default() {
+        let mut v = json!({
+            "channels": { "feishu": {
+                "appId": "id1",
+                "appSecret": "sec1",
+                "enabled": true,
+            } }
+        });
+        migrate_top_to_accounts(&mut v, "feishu", &fields(), "default");
+
+        let feishu = &v["channels"]["feishu"];
+        assert_eq!(feishu["accounts"]["default"]["appId"], "id1");
+        assert_eq!(feishu["accounts"]["default"]["appSecret"], "sec1");
+        assert!(feishu.get("appId").is_none(), "appId should have moved");
+        assert!(feishu.get("appSecret").is_none(), "appSecret should have moved");
+        assert_eq!(feishu["enabled"], true, "enabled should stay top-level");
+    }
+
+    #[test]
+    fn remove_account_drops_accounts_key_when_last() {
+        let mut v = json!({
+            "channels": { "feishu": { "accounts": {
+                "work": { "appId": "w" }
+            } } }
+        });
+        remove_account(&mut v, "feishu", "work");
+        assert!(
+            v["channels"]["feishu"].get("accounts").is_none(),
+            "accounts key should be dropped when empty"
+        );
+    }
+
+    #[test]
+    fn remove_account_keeps_accounts_key_when_others_remain() {
+        let mut v = json!({
+            "channels": { "feishu": { "accounts": {
+                "work":     { "appId": "w" },
+                "personal": { "appId": "p" }
+            } } }
+        });
+        remove_account(&mut v, "feishu", "work");
+        assert!(v["channels"]["feishu"]["accounts"].get("work").is_none());
+        assert_eq!(v["channels"]["feishu"]["accounts"]["personal"]["appId"], "p");
+    }
+
+    #[test]
+    fn channel_is_configured_recognises_accounts() {
+        let v = json!({
+            "channels": { "feishu": { "accounts": { "work": { "appId": "w" } } } }
+        });
+        assert!(channel_is_configured(&v, "feishu"));
+
+        let v2 = json!({ "channels": { "feishu": { "accounts": {} } } });
+        assert!(!channel_is_configured(&v2, "feishu"));
+
+        let v3 = json!({ "channels": { "feishu": { "enabled": true } } });
+        assert!(!channel_is_configured(&v3, "feishu"));
     }
 }

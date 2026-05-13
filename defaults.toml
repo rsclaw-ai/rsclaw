@@ -155,6 +155,7 @@ needs_key  = false
 name  = "feishu"
 label = "Feishu / Lark"
 login = true
+multi_account = true
 fields = [
   { key = "appId",     prompt = "App ID",     secret = false },
   { key = "appSecret", prompt = "App Secret", secret = true  },
@@ -164,6 +165,7 @@ fields = [
 name  = "wechat"
 label = "Weixin"
 login = true
+multi_account = true
 fields = [
   { key = "botToken", prompt = "Bot Token (from QR login)", secret = true  },
   { key = "botId",    prompt = "Bot ID",                     secret = false },
@@ -172,6 +174,7 @@ fields = [
 [[channels]]
 name  = "wecom"
 label = "WeCom"
+multi_account = true
 fields = [
   { key = "botId",  prompt = "Bot ID",  secret = false },
   { key = "secret",  prompt = "Secret",  secret = true  },
@@ -196,6 +199,7 @@ fields = [
 [[channels]]
 name  = "telegram"
 label = "Telegram"
+multi_account = true
 fields = [
   { key = "botToken", prompt = "Bot Token", secret = true },
 ]
@@ -203,6 +207,7 @@ fields = [
 [[channels]]
 name  = "matrix"
 label = "Matrix"
+multi_account = true
 fields = [
   { key = "homeserver",  prompt = "Homeserver URL (e.g. https://matrix.org)", secret = false },
   { key = "accessToken", prompt = "Access Token", secret = true },
@@ -221,6 +226,7 @@ fields = [
 [[channels]]
 name  = "slack"
 label = "Slack"
+multi_account = true
 fields = [
   { key = "botToken", prompt = "Bot Token", secret = true },
   { key = "appToken", prompt = "App Token", secret = true },
@@ -229,6 +235,7 @@ fields = [
 [[channels]]
 name  = "whatsapp"
 label = "WhatsApp"
+multi_account = true
 fields = [
   { key = "phoneNumberId", prompt = "Phone Number ID", secret = false },
   { key = "accessToken",   prompt = "Access Token",    secret = true  },

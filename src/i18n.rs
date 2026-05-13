@@ -1270,6 +1270,51 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "ko" => "구성됨",
         "ru" => "настроено",
     );
+    // Setup: multi-account editor
+    msg!("cli_accounts_count",
+        "en" => "{n} accounts",
+        "zh" => "{n} 个账号",
+    );
+    msg!("cli_account_choose_mode",
+        "en" => "{label}: already configured. Keep single account or add another?",
+        "zh" => "{label}: 已配置。保持单账号，还是再加一个？",
+    );
+    msg!("cli_account_keep_single",
+        "en" => "Keep single account (edit fields)",
+        "zh" => "保持单账号（编辑字段）",
+    );
+    msg!("cli_account_add_another",
+        "en" => "Add another account",
+        "zh" => "添加另一个账号",
+    );
+    msg!("cli_account_list_title",
+        "en" => "{label} accounts",
+        "zh" => "{label} 账号列表",
+    );
+    msg!("cli_account_add_new",
+        "en" => "[+ Add account]",
+        "zh" => "[+ 添加账号]",
+    );
+    msg!("cli_account_name_prompt",
+        "en" => "Account name (e.g. work, personal)",
+        "zh" => "账号名（例如 work、personal）",
+    );
+    msg!("cli_account_name_invalid",
+        "en" => "Invalid name. Avoid dots and spaces.",
+        "zh" => "账号名非法，不能含点号或空格。",
+    );
+    msg!("cli_account_exists",
+        "en" => "Account '{name}' already exists.",
+        "zh" => "账号 '{name}' 已存在。",
+    );
+    msg!("cli_account_action",
+        "en" => "Account '{name}': edit / remove?",
+        "zh" => "账号 '{name}'：编辑还是删除？",
+    );
+    msg!("cli_account_remove",
+        "en" => "Remove account",
+        "zh" => "删除账号",
+    );
     msg!("cli_starting_login",
         "en" => "Starting login flow...",
         "zh" => "正在启动登录流程...",
