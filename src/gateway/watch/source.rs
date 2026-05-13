@@ -93,12 +93,9 @@ pub struct SseSource {
 impl SourceImpl {
     /// Drive the source. Send each emitted event to `tx`; exit on either
     /// `stop` signal or natural EOF / fatal error.
-    ///
-    /// **Source-specific implementations live in `Task 8/9/10–14`.**
-    pub async fn run(self, _tx: mpsc::Sender<EventRecord>, _stop: oneshot::Receiver<()>) {
-        // Tasks 8/9/10–14 fill in match arms.
+    pub async fn run(self, tx: mpsc::Sender<EventRecord>, stop: oneshot::Receiver<()>) {
         match self {
-            SourceImpl::File(_) => unimplemented!("Task 8: FileSource"),
+            SourceImpl::File(s) => run_file(s, tx, stop).await,
             SourceImpl::Shell(_) => unimplemented!("Task 9: ShellSource"),
             SourceImpl::Sse(_) => unimplemented!("Task 10–14: SseSource"),
         }
@@ -111,4 +108,95 @@ impl SourceImpl {
             SourceImpl::Sse(_) => SourceKind::Sse,
         }
     }
+}
+
+async fn run_file(
+    src: FileSource,
+    tx: mpsc::Sender<EventRecord>,
+    mut stop: oneshot::Receiver<()>,
+) {
+    use tokio::fs::File;
+    use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader, SeekFrom};
+
+    let open = File::open(&src.path).await;
+    let file = match open {
+        Ok(mut f) => {
+            let _ = f.seek(SeekFrom::End(0)).await;
+            f
+        }
+        Err(e) => {
+            let _ = tx
+                .send(EventRecord::lifecycle(
+                    "_error",
+                    serde_json::json!({ "msg": format!("open failed: {e}") }),
+                    now_ms(),
+                ))
+                .await;
+            return;
+        }
+    };
+    let mut current_inode = inode_of(&file).await;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
+
+    loop {
+        tokio::select! {
+            _ = &mut stop => return,
+            _ = interval.tick() => {}
+        }
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    let stripped = line.trim_end_matches(&['\r', '\n'][..]).to_owned();
+                    if tx.send(EventRecord::from_line(stripped, now_ms())).await.is_err() {
+                        return;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        if let Ok(metadata) = tokio::fs::metadata(&src.path).await {
+            let now_size = metadata.len();
+            let pos = reader.get_mut().stream_position().await.unwrap_or(0);
+            let new_inode = inode_from_metadata(&metadata);
+            let inode_changed = current_inode.is_some()
+                && new_inode.is_some()
+                && current_inode != new_inode;
+            if inode_changed || now_size < pos {
+                if let Ok(f) = File::open(&src.path).await {
+                    current_inode = inode_from_metadata(&metadata);
+                    reader = BufReader::new(f);
+                }
+            }
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+async fn inode_of(file: &tokio::fs::File) -> Option<u64> {
+    let metadata = file.metadata().await.ok()?;
+    inode_from_metadata(&metadata)
+}
+
+#[cfg(unix)]
+fn inode_from_metadata(m: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(m.ino())
+}
+
+#[cfg(not(unix))]
+fn inode_from_metadata(_m: &std::fs::Metadata) -> Option<u64> {
+    None
 }
