@@ -144,3 +144,7 @@ async fn sse_source_terminates_on_403() {
     assert_eq!(ev.data["fatal"], serde_json::Value::Bool(true));
     let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
 }
+
+// Heartbeat-timeout (90s no-byte) is tested manually; CI skips it to
+// keep test runtime under 1 minute. To exercise: boot a server that
+// sends the response headers but no body, then watch for `_timeout` on rx.

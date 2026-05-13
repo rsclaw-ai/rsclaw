@@ -76,12 +76,28 @@ async fn run_sse_single_tracking(
 
     let mut stream = resp.bytes_stream();
     let mut parser = SseParser::default();
+    let mut last_byte = tokio::time::Instant::now();
+    let mut watchdog = tokio::time::interval(Duration::from_secs(5));
+    watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
             _ = &mut *stop => return SseOutcome::Stopped,
+            _ = watchdog.tick() => {
+                if last_byte.elapsed() > Duration::from_secs(90) {
+                    let _ = tx
+                        .send(EventRecord::lifecycle(
+                            "_timeout",
+                            serde_json::json!({"msg": "no bytes for 90s"}),
+                            now_ms(),
+                        ))
+                        .await;
+                    return SseOutcome::Disconnect("heartbeat_timeout".into());
+                }
+            }
             chunk = stream.next() => match chunk {
                 Some(Ok(bytes)) => {
+                    last_byte = tokio::time::Instant::now();
                     for ev in parser.feed(&bytes) {
                         if let Some(id) = &ev.event_id {
                             *out_last_id = Some(id.clone());
