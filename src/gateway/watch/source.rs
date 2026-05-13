@@ -96,7 +96,7 @@ impl SourceImpl {
     pub async fn run(self, tx: mpsc::Sender<EventRecord>, stop: oneshot::Receiver<()>) {
         match self {
             SourceImpl::File(s) => run_file(s, tx, stop).await,
-            SourceImpl::Shell(_) => unimplemented!("Task 9: ShellSource"),
+            SourceImpl::Shell(s) => run_shell(s, tx, stop).await,
             SourceImpl::Sse(_) => unimplemented!("Task 10–14: SseSource"),
         }
     }
@@ -175,6 +175,97 @@ async fn run_file(
             }
         }
     }
+}
+
+async fn run_shell(
+    src: ShellSource,
+    tx: mpsc::Sender<EventRecord>,
+    mut stop: oneshot::Receiver<()>,
+) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+
+    let (program, arg) = if cfg!(target_os = "windows") {
+        ("powershell", "-Command")
+    } else {
+        ("sh", "-c")
+    };
+    let mut cmd = Command::new(program);
+    cmd.arg(arg)
+        .arg(&src.cmd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx
+                .send(EventRecord::lifecycle(
+                    "_error",
+                    serde_json::json!({ "msg": format!("spawn failed: {e}") }),
+                    now_ms(),
+                ))
+                .await;
+            return;
+        }
+    };
+
+    let stdout = child.stdout.take().expect("piped");
+    let stderr = child.stderr.take().expect("piped");
+    let (line_tx, mut line_rx) = mpsc::channel::<String>(64);
+
+    let lt1 = line_tx.clone();
+    let r1 = tokio::spawn(async move {
+        let mut r = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = r.next_line().await {
+            if lt1.send(line).await.is_err() {
+                break;
+            }
+        }
+    });
+    let r2 = tokio::spawn(async move {
+        let mut r = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = r.next_line().await {
+            if line_tx.send(line).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        tokio::select! {
+            _ = &mut stop => {
+                let _ = child.start_kill();
+                break;
+            }
+            line = line_rx.recv() => {
+                match line {
+                    Some(l) => {
+                        if tx.send(EventRecord::from_line(l, now_ms())).await.is_err() {
+                            let _ = child.start_kill();
+                            break;
+                        }
+                    }
+                    None => {
+                        let exit = child.wait().await.ok().and_then(|s| s.code());
+                        let _ = tx
+                            .send(EventRecord::lifecycle(
+                                "_disconnect",
+                                serde_json::json!({ "reason": "process_exited", "code": exit }),
+                                now_ms(),
+                            ))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = r1.await;
+    let _ = r2.await;
 }
 
 fn now_ms() -> u64 {
