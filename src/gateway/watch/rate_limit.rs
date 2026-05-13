@@ -1,0 +1,1 @@
+//! Per-window event batching.
