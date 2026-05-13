@@ -25,10 +25,18 @@ use crate::gateway::watch::source::{
     EventRecord, FileSource, ShellSource, SourceImpl, SseSource, WatchStartError,
 };
 
+/// Per (channel, peer) concurrent watch cap. Spec §"并发上限". Prevents a
+/// user from spawning enough watches to overwhelm the chat or the gateway.
 pub const MAX_WATCHES_PER_PEER: usize = 5;
+
+/// Per-watch source→processor mpsc buffer. Bigger than a typical SSE event
+/// rate so bursts don't block the source reader; if it fills, the source
+/// `try_send` drops events and bumps a counter (visible in /watch list).
 const PROCESSOR_BUFFER: usize = 256;
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(600); // 10 min
-const RATE_TICK: Duration = Duration::from_secs(2);
+
+/// How often the processor checks "no events seen in this window — still alive?"
+/// Spec §"心跳": 10 min silent ⇒ emit a heartbeat note.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Unique watch identifier shown to users (`w_<8 hex>`).
 pub type WatchId = String;
@@ -79,6 +87,20 @@ impl WatchRegistry {
 
     pub fn global() -> Option<Arc<WatchRegistry>> {
         GLOBAL.get().cloned()
+    }
+
+    /// Build a fresh, non-global registry for integration tests. Real callers
+    /// always use `init()` + `global()` — but tests can't share the OnceLock
+    /// (any test that lands first would freeze the state for the rest).
+    #[doc(hidden)]
+    pub fn init_for_test() -> Arc<Self> {
+        let channels = Arc::new(crate::channel::ChannelManager::new(
+            crate::sys::MemoryTier::Standard,
+        ));
+        Arc::new(WatchRegistry {
+            inner: Mutex::new(HashMap::new()),
+            channels,
+        })
     }
 
     pub async fn handle_command(
@@ -247,7 +269,15 @@ impl WatchRegistry {
         _error_count: Arc<std::sync::atomic::AtomicU64>,
     ) {
         let mut limiter = RateLimiter::new(rate_ms);
-        let mut rate_tick = tokio::time::interval(RATE_TICK);
+        // Flush-pending tick rides on the user's --rate window. With rate=0
+        // (unlimited) every admit() short-circuits to Single, so the tick has
+        // nothing to do — back off to once per minute to keep the task quiet.
+        let tick_interval = if rate_ms == 0 {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_millis(rate_ms.max(100))
+        };
+        let mut rate_tick = tokio::time::interval(tick_interval);
         rate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut heartbeat_tick = tokio::time::interval(HEARTBEAT_INTERVAL);
         heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

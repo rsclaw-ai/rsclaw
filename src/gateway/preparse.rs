@@ -754,15 +754,18 @@ fn loop_help_text(lang: &str) -> String {
     }
 }
 
-/// Help text for /watch. Localized en/zh.
+/// Help text for /watch. Localized en/zh. Lists only flags actually
+/// implemented in v1 — `--jq`, `--only`, `--tee` are stretch goals
+/// (see plan §Stretch); they're documented in the spec but rejected at
+/// parse time today.
 fn watch_help_text(lang: &str) -> String {
     if lang == "zh" {
         "/watch <源> [flags]      实时把事件推回 chat（不过 agent）\n\n\
          源类型（auto-detect 或显式前缀）：\n\
          \u{0020}\u{0020}/watch /path/to/file.log               跟踪文件（跨平台 tail -f）\n\
          \u{0020}\u{0020}/watch https://api/events              订阅 SSE 流\n\
-         \u{0020}\u{0020}/watch shell tail -f x | grep ERR      原生 shell\n\n\
-         常用 flags：\n\
+         \u{0020}\u{0020}/watch shell tail -f x                 原生 shell\n\n\
+         Flags：\n\
          \u{0020}\u{0020}--grep <regex>             仅推送匹配的事件\n\
          \u{0020}\u{0020}--rate <ms>                限流（默认 2000；0 = 不限）\n\
          \u{0020}\u{0020}-H 'Header: value'         SSE auth/header；value 可含 ${VAR}\n\n\
@@ -777,7 +780,7 @@ fn watch_help_text(lang: &str) -> String {
          Sources (auto-detected or explicit prefix):\n\
          \u{0020}\u{0020}/watch /path/to/file.log              follow file (cross-platform tail -f)\n\
          \u{0020}\u{0020}/watch https://api/events             subscribe SSE\n\
-         \u{0020}\u{0020}/watch shell tail -f x | grep ERR     raw shell\n\n\
+         \u{0020}\u{0020}/watch shell tail -f x                raw shell\n\n\
          Flags:\n\
          \u{0020}\u{0020}--grep <regex>            push only matching events\n\
          \u{0020}\u{0020}--rate <ms>               rate limit (default 2000; 0 = unlimited)\n\

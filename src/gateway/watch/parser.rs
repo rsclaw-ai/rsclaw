@@ -205,9 +205,13 @@ fn apply_flags(spec: &mut WatchSpec, tail: &str) -> Result<()> {
                 spec.grep = Some(val);
             }
             "--jq" => {
-                let val = tokens.get(i).ok_or_else(|| anyhow!("--jq needs an expression"))?.clone();
-                i += 1;
-                spec.jq = Some(val); // Compile-time validation deferred (jq is stretch).
+                // jq runtime is a stretch goal (plan §Task S1). Reject up
+                // front — silently passing events through a stub gives users
+                // a fake-working filter. Use `--grep <regex>` until jaq lands.
+                tokens.get(i).ok_or_else(|| anyhow!("--jq needs an expression"))?;
+                return Err(anyhow!(
+                    "--jq not implemented yet (v1); use --grep <regex>"
+                ));
             }
             "--rate" => {
                 let val = tokens.get(i).ok_or_else(|| anyhow!("--rate needs a number"))?.clone();
@@ -396,6 +400,13 @@ mod tests {
     #[test]
     fn flag_parsing_unterminated_quote_errors() {
         assert!(parse("https://x -H 'unclosed").is_err());
+    }
+
+    #[test]
+    fn flag_parsing_jq_is_rejected_in_v1() {
+        let err = parse("/var/log/x --jq '.code'").unwrap_err();
+        assert!(err.to_string().contains("--jq"), "got: {err}");
+        assert!(err.to_string().contains("not implemented"), "got: {err}");
     }
 
     #[test]
