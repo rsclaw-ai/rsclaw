@@ -40,7 +40,6 @@ pub(crate) async fn try_preparse_locally(
     peer_id: &str,
     origin: PreparseOrigin,
 ) -> Option<OutboundMessage> {
-    let _ = origin; // used by /watch dispatch (Task 19); suppress unused-var warning until then
     use std::sync::atomic::Ordering;
     let t = text.trim();
     let lower = t.to_lowercase();
@@ -467,6 +466,32 @@ $g.Dispose();$b.Dispose()"#
             format!("Scheduled loop (every {human}): {prompt}\nID: {id}\nStop with: /cron remove {id} (via agent)")
         }));
     }
+    // /watch — live event stream → chat. See docs/superpowers/specs/2026-05-13-watch-design.md
+    if lower == "/watch" || lower == "/watch -h" || lower == "/watch --help" || lower == "/watch help" {
+        return Some(txt(watch_help_text(crate::i18n::default_lang())));
+    }
+    if let Some(body) = t.strip_prefix("/watch ") {
+        let body = body.trim();
+        let registry = match crate::gateway::watch::WatchRegistry::global() {
+            Some(r) => r,
+            None => {
+                return Some(txt(
+                    "/watch: registry not initialized (gateway still starting?)".to_owned(),
+                ))
+            }
+        };
+        let origin_for_watch = match origin {
+            PreparseOrigin::User => crate::gateway::watch::Origin::User,
+            PreparseOrigin::Cron => crate::gateway::watch::Origin::Cron,
+        };
+        return match registry
+            .handle_command(channel, peer_id, body, origin_for_watch)
+            .await
+        {
+            crate::gateway::watch::WatchCommandReply::Reply(s) => Some(txt(s)),
+            crate::gateway::watch::WatchCommandReply::Silent => Some(OutboundMessage::default()),
+        };
+    }
     // /task with no args or -h/--help → print task help (short-circuit;
     // otherwise it would route into the task queue with an empty message).
     if lower == "/task" || lower == "/task -h" || lower == "/task --help" || lower == "/task help" {
@@ -554,7 +579,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
         lower.as_str(),
         "/ls" | "/status" | "/version" | "/help" | "/?" | "/health" | "/uptime"
             | "/model" | "/models" | "/cron" | "/clear" | "/new" | "/reset" | "/abort" | "/sessions"
-            | "/loop" | "/task"
+            | "/loop" | "/task" | "/watch"
     )
     // Commands with optional/required args
     || lower.starts_with("/ls ")
@@ -570,6 +595,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
     || lower.starts_with("/sh ")
     || lower.starts_with("/exec ")
     || lower.starts_with("/loop ")
+    || lower.starts_with("/watch ")
     // /task only short-circuits on help variants; non-help forms must NOT
     // bypass the queue (the task queue worker owns the multi-turn flow).
     || lower == "/task -h"
@@ -724,6 +750,43 @@ fn loop_help_text(lang: &str) -> String {
          \u{0020}\u{0020}/loop 5m check for new mail\n\
          \u{0020}\u{0020}/loop 1h /status\n\n\
          List: /cron list    Stop: ask the agent to /cron remove <id>"
+            .to_owned()
+    }
+}
+
+/// Help text for /watch. Localized en/zh.
+fn watch_help_text(lang: &str) -> String {
+    if lang == "zh" {
+        "/watch <源> [flags]      实时把事件推回 chat（不过 agent）\n\n\
+         源类型（auto-detect 或显式前缀）：\n\
+         \u{0020}\u{0020}/watch /path/to/file.log               跟踪文件（跨平台 tail -f）\n\
+         \u{0020}\u{0020}/watch https://api/events              订阅 SSE 流\n\
+         \u{0020}\u{0020}/watch shell tail -f x | grep ERR      原生 shell\n\n\
+         常用 flags：\n\
+         \u{0020}\u{0020}--grep <regex>             仅推送匹配的事件\n\
+         \u{0020}\u{0020}--rate <ms>                限流（默认 2000；0 = 不限）\n\
+         \u{0020}\u{0020}-H 'Header: value'         SSE auth/header；value 可含 ${VAR}\n\n\
+         管理：\n\
+         \u{0020}\u{0020}/watch list                列出当前活跃 watch\n\
+         \u{0020}\u{0020}/watch stop <id>           停一个\n\
+         \u{0020}\u{0020}/watch stop all            全停\n\n\
+         持久化：本身不持久（重启即清）；要跨重启用 /loop 10m /watch <源>。"
+            .to_owned()
+    } else {
+        "/watch <source> [flags]    Push live events back to chat (no agent involved)\n\n\
+         Sources (auto-detected or explicit prefix):\n\
+         \u{0020}\u{0020}/watch /path/to/file.log              follow file (cross-platform tail -f)\n\
+         \u{0020}\u{0020}/watch https://api/events             subscribe SSE\n\
+         \u{0020}\u{0020}/watch shell tail -f x | grep ERR     raw shell\n\n\
+         Flags:\n\
+         \u{0020}\u{0020}--grep <regex>            push only matching events\n\
+         \u{0020}\u{0020}--rate <ms>               rate limit (default 2000; 0 = unlimited)\n\
+         \u{0020}\u{0020}-H 'Header: value'        SSE auth/header; value may contain ${VAR}\n\n\
+         Management:\n\
+         \u{0020}\u{0020}/watch list               list active watches\n\
+         \u{0020}\u{0020}/watch stop <id>          stop one\n\
+         \u{0020}\u{0020}/watch stop all           stop everything\n\n\
+         Persistence: in-memory only. Cross-restart via /loop 10m /watch <source>."
             .to_owned()
     }
 }

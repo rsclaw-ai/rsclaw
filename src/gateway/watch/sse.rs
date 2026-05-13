@@ -208,6 +208,7 @@ impl SseParser {
         Some(ev)
     }
 
+    #[cfg(test)]
     pub fn last_id_seen(&self) -> Option<&str> {
         self.last_id_seen.as_deref()
     }
