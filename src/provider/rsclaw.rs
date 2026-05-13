@@ -27,13 +27,20 @@ use super::{
     TokenUsage,
 };
 
-/// Default base for an rsclaw-server running on the same host. The
-/// `/v1/agent` suffix is the external API mount inside rsclaw-server —
-/// the rsclaw-llm `/sessions/...` protocol paths are exposed to clients
-/// under that prefix, distinct from `/v1/chat/completions` etc. Setting
+/// Default base for the rsclaw-server fleet. The `/v1/agent` suffix
+/// is the external API mount inside rsclaw-server — the rsclaw-llm
+/// `/sessions/...` protocol paths are exposed to clients under that
+/// prefix, distinct from `/v1/chat/completions` etc. Setting
 /// `RSCLAW_URL` overrides this; that variable should also include the
 /// `/v1/agent` segment.
-pub const RSCLAW_DEFAULT_BASE: &str = "http://localhost:8090/v1/agent";
+///
+/// `api.rsclaw.ai` fronts the fleet behind a 308-emitting LB that
+/// pins clients (via the [`RedirectCache`] in this module) to their
+/// resolved worker host for the response's `Cache-Control: max-age`
+/// window (1h by default). First request through any provider
+/// instance pays the redirect cost; everything within the TTL after
+/// goes direct, so steady-state latency matches a direct deployment.
+pub const RSCLAW_DEFAULT_BASE: &str = "https://api.rsclaw.ai/v1/agent";
 
 /// How long to wait for `/sessions/<id>/turn` to start responding
 /// (TCP connect + TLS + send body + receive headers + first byte).
@@ -58,15 +65,161 @@ const TURN_HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
 /// replaced.
 const MAX_SESSIONS: usize = 10_000;
 
+/// Maximum redirect hops we'll follow before bailing. 5 is generous —
+/// a healthy rsclaw-server topology should be at most ONE 308 hop
+/// (LB / API gateway → real worker), but multi-region or canary fleet
+/// setups can stack two. Above five we're almost certainly in a loop
+/// or fighting a misconfigured DNS round-robin returning 308 forever.
+const MAX_REDIRECT_HOPS: usize = 5;
+
+/// Fallback redirect-cache TTL when the 308 response omits a
+/// `Cache-Control: max-age=N` directive. We deliberately set this
+/// SHORT (5 min) rather than long: a server that forgets to declare
+/// its TTL probably has buggy 308 emission too, so we should
+/// re-validate often enough that we don't get pinned to a stale
+/// target. Servers that want longer caching MUST set `max-age=3600`
+/// (or whatever they prefer) explicitly. rsclaw-server's documented
+/// default is `max-age=3600` (1h).
+const DEFAULT_REDIRECT_TTL: Duration = Duration::from_secs(300);
+
 // ---------------------------------------------------------------------------
 // Provider
 // ---------------------------------------------------------------------------
 
 pub struct RsclawProvider {
+    /// Reqwest client with redirects DISABLED — we manage 307/308
+    /// ourselves so we can capture the `Cache-Control` directive on
+    /// 308 responses (reqwest's auto-redirect strips the response
+    /// headers before we can read them). Other providers in this
+    /// crate still use the default redirect policy via
+    /// `http_client_with_ua` — this is rsclaw-specific because only
+    /// rsclaw-server is part of OUR infrastructure (other providers
+    /// are arbitrary upstreams where redirect-caching would let an
+    /// attacker pin us to a malicious host).
     client: Client,
     base_url: String,
     bearer: Option<String>,
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
+    /// Cache of 308 redirects, keyed by *origin* (scheme + host + port)
+    /// of the requested URL. Lets a single LB call amortise across the
+    /// whole session (and across sessions, since this is per-provider-
+    /// instance and providers are global). See [`RedirectCache`].
+    redirect_cache: Arc<Mutex<RedirectCache>>,
+}
+
+/// Entry in [`RedirectCache`] — where to actually send requests that
+/// target this origin, and until when this rerouting is valid.
+#[derive(Debug, Clone)]
+struct RedirectEntry {
+    /// Scheme + host + port to send to. The path portion of any
+    /// request is appended verbatim; e.g. `(api.rsclaw.ai/v1/agent/...
+    /// → server.rsclaw.ai:8443/v1/agent/...)`.
+    target_origin: String,
+    /// Instant after which this entry is ignored. Computed from
+    /// `Cache-Control: max-age=N` on the 308 response, or
+    /// [`DEFAULT_REDIRECT_TTL`] if the directive was absent.
+    expires_at: std::time::Instant,
+}
+
+#[derive(Debug, Default)]
+struct RedirectCache {
+    entries: HashMap<String, RedirectEntry>,
+}
+
+impl RedirectCache {
+    /// Look up `origin`. Returns the target origin only when the entry
+    /// is fresh; expired entries are removed lazily.
+    fn lookup(&mut self, origin: &str) -> Option<String> {
+        let now = std::time::Instant::now();
+        match self.entries.get(origin) {
+            Some(e) if e.expires_at > now => Some(e.target_origin.clone()),
+            Some(_) => {
+                // Lazy eviction — drop the stale entry so subsequent
+                // lookups don't keep re-checking the same dead row.
+                self.entries.remove(origin);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn store(&mut self, origin: String, target_origin: String, ttl: Duration) {
+        let expires_at = std::time::Instant::now() + ttl;
+        self.entries.insert(origin, RedirectEntry {
+            target_origin,
+            expires_at,
+        });
+    }
+
+    fn invalidate(&mut self, origin: &str) {
+        self.entries.remove(origin);
+    }
+}
+
+/// Extract the origin (`scheme://host[:port]`) prefix from a URL.
+/// Returns `None` for inputs that don't look like absolute URLs.
+fn origin_of(url: &str) -> Option<&str> {
+    let scheme_end = url.find("://")? + 3;
+    let path_start = url[scheme_end..]
+        .find('/')
+        .map(|i| scheme_end + i)
+        .unwrap_or(url.len());
+    Some(&url[..path_start])
+}
+
+/// Rewrite the origin portion of `url` to `new_origin`, preserving the
+/// path / query / fragment.
+fn rewrite_origin(url: &str, new_origin: &str) -> String {
+    match origin_of(url) {
+        Some(orig) => format!("{}{}", new_origin, &url[orig.len()..]),
+        None => url.to_owned(),
+    }
+}
+
+/// Resolve a possibly-relative `Location` header value against `base`
+/// per RFC 3986 §5.3 (minimal — only handles the cases real
+/// rsclaw-server emits: absolute URL, absolute path, or empty).
+fn resolve_location(base: &str, location: &str) -> Option<String> {
+    if location.is_empty() {
+        return None;
+    }
+    if location.contains("://") {
+        return Some(location.to_owned());
+    }
+    let base_origin = origin_of(base)?;
+    if location.starts_with('/') {
+        Some(format!("{base_origin}{location}"))
+    } else {
+        // Relative-to-current-path is intentionally not supported.
+        // rsclaw-server doesn't emit such Location headers and
+        // supporting them would invite path-confusion bugs. Treat as
+        // unrecognised and let the caller fall through to error.
+        None
+    }
+}
+
+/// Parse `Cache-Control: ..., max-age=N, ...` returning the number
+/// of seconds, or `None` if missing / malformed. Also returns `None`
+/// when `no-store` or `no-cache` is present — those directives
+/// explicitly forbid caching and override any `max-age` in the same
+/// header. Multiple `Cache-Control` headers (rare) are caller's
+/// responsibility to concat before calling.
+fn parse_max_age(cache_control: Option<&str>) -> Option<Duration> {
+    let header = cache_control?;
+    let mut max_age: Option<u64> = None;
+    for directive in header.split(',') {
+        let d = directive.trim();
+        let d_lower = d.to_ascii_lowercase();
+        if d_lower == "no-store" || d_lower == "no-cache" {
+            return None;
+        }
+        if let Some(value) = d_lower.strip_prefix("max-age=") {
+            if let Ok(n) = value.trim().parse::<u64>() {
+                max_age = Some(n);
+            }
+        }
+    }
+    max_age.map(Duration::from_secs)
 }
 
 #[derive(Clone, Debug)]
@@ -113,11 +266,30 @@ impl RsclawProvider {
         let bearer = bearer
             .map(|b| b.trim().to_string())
             .filter(|b| !b.is_empty());
+        // Build a reqwest client with redirects DISABLED so the
+        // 307/308 capture loop in `send_following_redirects` can read
+        // each redirect response's `Cache-Control` header before
+        // following. reqwest's default policy follows transparently
+        // and discards intermediate headers, which would defeat the
+        // 308 TTL caching the LB-aware routing depends on. The other
+        // tuning (UA, connect timeout, keep-alive, idle pool window)
+        // mirrors `http_client_with_ua` since rsclaw-server lives in
+        // the same operational envelope as the OAI-compat upstreams
+        // that helper was tuned for.
+        let client = reqwest::Client::builder()
+            .user_agent(user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT))
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(20))
+            .pool_idle_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Duration::from_secs(30))
+            .build()
+            .expect("failed to build rsclaw HTTP client");
         Self {
-            client: super::http_client_with_ua(user_agent.as_deref()),
+            client,
             base_url,
             bearer,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            redirect_cache: Arc::new(Mutex::new(RedirectCache::default())),
         }
     }
 
@@ -444,8 +616,168 @@ fn invalidate_on_error(
 // ---------------------------------------------------------------------------
 
 impl RsclawProvider {
+    /// Resolve a request URL via the redirect cache.
+    ///
+    /// Strips the configured `base_url`'s origin off the front, looks
+    /// the origin up in [`RedirectCache`], and if there's a fresh 308
+    /// cached, rewrites the URL to point at the cached target instead.
+    /// This is what lets the very first request through the LB pay
+    /// the redirect cost ONCE, then route directly for the cache TTL
+    /// (1h by rsclaw-server's default).
+    fn resolve_url(&self, path: &str) -> String {
+        let full = format!("{}{}", self.base_url, path);
+        let Some(origin) = origin_of(&full) else {
+            return full;
+        };
+        if let Ok(mut cache) = self.redirect_cache.lock() {
+            if let Some(target) = cache.lookup(origin) {
+                return rewrite_origin(&full, &target);
+            }
+        }
+        full
+    }
+
+    /// Invalidate any cached redirect entry whose origin matches `url`.
+    /// Called by request paths that observe target-host failure
+    /// (connection refused, 5xx, timeout) so a dead target doesn't
+    /// keep getting hammered for the rest of the cache window.
+    fn invalidate_redirect_for(&self, url: &str) {
+        let Some(origin) = origin_of(url) else { return };
+        if let Ok(mut cache) = self.redirect_cache.lock() {
+            cache.invalidate(origin);
+        }
+    }
+
+    /// POST `body` to `path` (e.g. `/sessions`) under `base_url`,
+    /// transparently capturing 307/308 redirects.
+    ///
+    /// - 308 responses: extract `Location` + `Cache-Control: max-age`,
+    ///   record the target origin in [`RedirectCache`] with that TTL
+    ///   (or [`DEFAULT_REDIRECT_TTL`] if absent), then follow once.
+    ///   Subsequent calls through [`resolve_url`] go DIRECT to the
+    ///   target until the TTL expires — amortising the LB cost across
+    ///   the whole cache window instead of paying it per request.
+    /// - 307 responses: follow without caching (temporary by spec).
+    /// - All other statuses: returned as-is to the caller, even
+    ///   error statuses. Callers decide how to interpret them
+    ///   (e.g. turn() recognises 404/409/503 as session-evicted and
+    ///   triggers replay).
+    ///
+    /// `body_max_age_fallback` is the per-request override for the
+    /// "no Cache-Control on 308" fallback TTL. Passing `None` uses
+    /// [`DEFAULT_REDIRECT_TTL`]. Currently always `None`, but the
+    /// hook exists for callers that want a different policy.
+    ///
+    /// `builder_timeout` controls reqwest's total request deadline
+    /// per individual hop (NOT cumulative across redirects). `None`
+    /// = no builder timeout, used by streaming `turn()` which wraps
+    /// the headers phase externally with `tokio::time::timeout`.
+    async fn send_following_redirects<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+        builder_timeout: Option<Duration>,
+    ) -> Result<reqwest::Response> {
+        let mut current_url = self.resolve_url(path);
+        let mut hops = 0;
+
+        loop {
+            let mut builder = self.client.post(&current_url).json(body);
+            if let Some(t) = builder_timeout {
+                builder = builder.timeout(t);
+            }
+            if let Some((k, v)) = self.auth_header() {
+                builder = builder.header(k, v);
+            }
+            let resp = match super::send_with_transport_retry(builder).await {
+                Ok(r) => r,
+                Err(e) => {
+                    // Transport-level failure against a redirected
+                    // target → invalidate so the next attempt goes
+                    // back through the LB. Connection refused / DNS
+                    // failure on the cached target is the canonical
+                    // "target host is dead, LB should reroute" signal.
+                    self.invalidate_redirect_for(&current_url);
+                    return Err(anyhow::Error::from(e)
+                        .context(format!("rsclaw POST {current_url}")));
+                }
+            };
+
+            let status = resp.status();
+            if status != StatusCode::TEMPORARY_REDIRECT
+                && status != StatusCode::PERMANENT_REDIRECT
+            {
+                return Ok(resp);
+            }
+
+            // Redirect path. Pull Location + Cache-Control before
+            // consuming the response.
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let cache_control = resp
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+
+            let Some(loc) = location else {
+                anyhow::bail!(
+                    "rsclaw: {status} redirect from {current_url} omitted Location header"
+                );
+            };
+            let Some(next_url) = resolve_location(&current_url, &loc) else {
+                anyhow::bail!(
+                    "rsclaw: {status} redirect from {current_url} had unsupported Location {loc:?}"
+                );
+            };
+
+            // 308 only: cache the target origin so future requests
+            // skip the LB. 307 is temporary by spec and explicitly
+            // must NOT be cached (otherwise we'd defeat the whole
+            // point of the LB using 307 for ephemeral moves).
+            if status == StatusCode::PERMANENT_REDIRECT {
+                if let (Some(current_origin), Some(next_origin)) =
+                    (origin_of(&current_url), origin_of(&next_url))
+                {
+                    // Only cache when the origin actually changed —
+                    // a 308 that points back at the same origin is a
+                    // server misconfiguration (would cause an infinite
+                    // loop), surface it via the hop counter below
+                    // rather than caching the self-loop.
+                    if current_origin != next_origin {
+                        let ttl = parse_max_age(cache_control.as_deref())
+                            .unwrap_or(DEFAULT_REDIRECT_TTL);
+                        if let Ok(mut cache) = self.redirect_cache.lock() {
+                            cache.store(
+                                current_origin.to_owned(),
+                                next_origin.to_owned(),
+                                ttl,
+                            );
+                        }
+                        tracing::info!(
+                            from = %current_origin,
+                            to = %next_origin,
+                            ttl_secs = ttl.as_secs(),
+                            "rsclaw: cached 308 redirect"
+                        );
+                    }
+                }
+            }
+
+            hops += 1;
+            if hops > MAX_REDIRECT_HOPS {
+                anyhow::bail!(
+                    "rsclaw: too many redirects ({MAX_REDIRECT_HOPS} hops) starting from {path}"
+                );
+            }
+            current_url = next_url;
+        }
+    }
+
     async fn open(&self, split: &SplitRequest<'_>) -> Result<CreateSessionResp> {
-        let url = format!("{}/sessions", self.base_url);
         let body = CreateSessionReq {
             prefix_id: &split.prefix_id,
             dynamic_prefix: DynamicPrefixWire {
@@ -458,18 +790,12 @@ impl RsclawProvider {
         // 180s caps the worst-case prefix-decode time for a fresh
         // session; without an explicit timeout reqwest hangs forever
         // on a stalled server (the 20s connect_timeout only covers TCP
-        // establishment, not response wait).
-        let mut builder = self
-            .client
-            .post(&url)
-            .timeout(Duration::from_secs(180))
-            .json(&body);
-        if let Some((k, v)) = self.auth_header() {
-            builder = builder.header(k, v);
-        }
-        let resp = super::send_with_transport_retry(builder)
-            .await
-            .with_context(|| format!("rsclaw POST {url}"))?;
+        // establishment, not response wait). The deadline is per-hop
+        // so a redirected open still gets the full budget against the
+        // ultimate target rather than splitting it.
+        let resp = self
+            .send_following_redirects("/sessions", &body, Some(Duration::from_secs(180)))
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -485,7 +811,6 @@ impl RsclawProvider {
         split: &SplitRequest<'_>,
         messages: &[Message],
     ) -> Result<CreateSessionResp> {
-        let url = format!("{}/sessions/replay", self.base_url);
         // Protocol §2.2 history accepts only `role: "user"` and
         // `role: "assistant"`. The runtime, however, threads
         // `Role::System` messages into the conversation list for
@@ -529,17 +854,15 @@ impl RsclawProvider {
         // strictly slower than open()'s prefix-only decode (180s).
         // Without an explicit timeout reqwest hangs forever on a
         // stalled server (connect_timeout only covers TCP setup).
-        let mut builder = self
-            .client
-            .post(&url)
-            .timeout(Duration::from_secs(300))
-            .json(&body);
-        if let Some((k, v)) = self.auth_header() {
-            builder = builder.header(k, v);
-        }
-        let resp = super::send_with_transport_retry(builder)
-            .await
-            .with_context(|| format!("rsclaw POST {url}"))?;
+        // Deadline applies per redirect hop so a redirected replay
+        // still gets the full budget against the ultimate target.
+        let resp = self
+            .send_following_redirects(
+                "/sessions/replay",
+                &body,
+                Some(Duration::from_secs(300)),
+            )
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -556,32 +879,31 @@ impl RsclawProvider {
         delta: &TurnDelta,
         req: &LlmRequest,
     ) -> Result<TurnOutcome> {
-        let url = format!("{}/sessions/{}/turn", self.base_url, session_id);
+        let path = format!("/sessions/{}/turn", session_id);
         let body = TurnReq {
             delta,
             options: Some(TurnOptions::from_request(req)),
             stream: true,
         };
-        // No `.timeout()` on the builder: reqwest's `.timeout()` is a
+        // No per-hop builder timeout: reqwest's `.timeout()` is a
         // total deadline that includes the streaming body, so a 180s
         // cap would kill long generations (reasoning models with
         // extended thinking + large outputs routinely run past three
         // minutes). Instead bound only the time-to-response-headers
-        // with `tokio::time::timeout` around the send so a wedged
-        // server still surfaces fast — once headers arrive, the body
-        // stream is allowed to take as long as it needs. Connection
-        // liveness during streaming is covered by the client-level
-        // `tcp_keepalive(30s)` configured in `http_client_with_ua`.
-        let mut builder = self.client.post(&url).json(&body);
-        if let Some((k, v)) = self.auth_header() {
-            builder = builder.header(k, v);
-        }
-        let send_fut = super::send_with_transport_retry(builder);
+        // (PLUS any redirect-following hops along the way) with
+        // `tokio::time::timeout` around the entire helper call so a
+        // wedged server still surfaces fast — once headers arrive,
+        // the body stream is allowed to take as long as it needs.
+        // Connection liveness during streaming is covered by the
+        // client-level `tcp_keepalive(30s)` configured above.
+        let send_fut = self.send_following_redirects(&path, &body, None);
         let resp = match tokio::time::timeout(TURN_HEADERS_TIMEOUT, send_fut).await {
-            Ok(r) => r.with_context(|| format!("rsclaw POST {url}"))?,
+            Ok(r) => r?,
             Err(_) => anyhow::bail!(
-                "rsclaw turn: timed out waiting for response headers after {}s ({url})",
-                TURN_HEADERS_TIMEOUT.as_secs()
+                "rsclaw turn: timed out waiting for response headers after {}s ({}{})",
+                TURN_HEADERS_TIMEOUT.as_secs(),
+                self.base_url,
+                path,
             ),
         };
         let status = resp.status();
@@ -604,12 +926,21 @@ impl RsclawProvider {
         let byte_stream = resp.bytes_stream();
         let line_buffer = Arc::new(tokio::sync::Mutex::new(String::new()));
         let utf8_remainder = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        // sse_state lives for the duration of this stream — tracks
+        // in-progress `tool_use` blocks so their input JSON can be
+        // accumulated across `content_block_delta` frames before
+        // emitting a fully-formed `StreamEvent::ToolCall` on the
+        // matching `content_block_stop`.
+        let sse_state = Arc::new(tokio::sync::Mutex::new(SseState::default()));
         let event_stream = byte_stream
             .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
             .then(move |chunk| {
                 let line_buffer = line_buffer.clone();
                 let utf8_remainder = utf8_remainder.clone();
-                async move { parse_sse_chunk(chunk, &line_buffer, &utf8_remainder).await }
+                let sse_state = sse_state.clone();
+                async move {
+                    parse_sse_chunk(chunk, &line_buffer, &utf8_remainder, &sse_state).await
+                }
             })
             .flat_map(futures::stream::iter);
 
@@ -671,15 +1002,7 @@ struct ReplayReq<'a> {
 #[derive(Debug, Deserialize, Clone)]
 struct CreateSessionResp {
     session_id: String,
-    /// Per protocol §2.1.6 the create response carries `prefix_id` (the
-    /// resolved canonical id, possibly different from the requested
-    /// alias). Per §2.2 the **replay** response does NOT include it —
-    /// rsclaw-server's backend passes the upstream JSON straight
-    /// through, so the field is absent on replay.
-    ///
-    /// Pre-rename clients receive `rsclaw_version` instead; we accept
-    /// either spelling via `serde alias` until the field is removed
-    /// upstream in v2.0.
+    /// Post-rename canonical id from protocol §2.1.6 (`<namespace>/<id>`).
     ///
     /// Modeled as `Option<String>` rather than `#[serde(default)]
     /// String` so we accept three shapes:
@@ -687,17 +1010,27 @@ struct CreateSessionResp {
     ///   - field present, string     → `Some(v)` (open path)
     ///   - field present, JSON null  → `None`
     ///
-    /// The third case is the trap: serde's `String` deserializer
-    /// rejects `null` outright (`invalid type: null, expected a
-    /// string`), tanking the entire response parse and surfacing as a
-    /// `rsclaw open: parse response` error to the caller. Upstream
-    /// nodes occasionally emit `"prefix_id": null` when the version
-    /// registry is mid-roll — accept that gracefully.
+    /// The null case is the trap: serde's `String` deserializer rejects
+    /// `null` outright with `invalid type: null, expected a string` and
+    /// the whole response parse dies. Upstream nodes occasionally emit
+    /// `"prefix_id": null` mid-roll — accept that gracefully.
+    ///
+    /// We do NOT use `#[serde(alias = "rsclaw_version")]` here. The
+    /// pre-rename `rsclaw_version` field is being dropped server-side;
+    /// in the meantime some builds still emit it alongside `prefix_id`
+    /// in the same payload. With an `alias` serde would treat the
+    /// second occurrence as a duplicate field and bail the whole
+    /// response parse with `duplicate field`prefix_id``, which surfaced
+    /// to callers as the opaque `rsclaw open: parse response` error
+    /// (seen in production e2e against `:8443`). Without the alias,
+    /// the legacy `rsclaw_version` field is just an unknown key serde
+    /// ignores by default — exactly what we want as the field gets
+    /// retired.
     ///
     /// Parsed for forward compat / observability only. NOT used as the
     /// session cache key — see the SessionEntry construction sites for
     /// why caching the upstream canonical breaks alias-based requests.
-    #[serde(default, alias = "rsclaw_version")]
+    #[serde(default)]
     #[allow(dead_code)]
     prefix_id: Option<String>,
 }
@@ -1189,13 +1522,56 @@ fn serialize_replay_history(messages: &[&Message]) -> Vec<Value> {
 }
 
 // ---------------------------------------------------------------------------
-// SSE parsing — protocol §2.3 stream events
+// SSE parsing — protocol §2.3.1 Anthropic Messages event shape
 // ---------------------------------------------------------------------------
+//
+// The wire format mirrors Anthropic's SDK accumulator pattern so clients
+// written against `/v1/messages` can plug in with near-zero translation
+// (rsclaw-server's own `/v1/messages` bridge is a thin passthrough).
+//
+// Event sequence for a text-only turn:
+//   message_start
+//   content_block_start { content_block: { type: "text", text: "" } }
+//   content_block_delta { delta: { type: "text_delta", text: "..." } }
+//   ... one delta per generated token ...
+//   content_block_stop
+//   message_delta { delta: { stop_reason }, usage, timing }
+//   message_stop
+//
+// v1.7 will add `thinking_delta` blocks (StreamEvent::ReasoningDelta) and
+// `tool_use` blocks with `input_json_delta` streaming. To keep the worker
+// rollout decoupled, this parser recognises those event shapes now and
+// emits the matching `StreamEvent` variants — if a worker speaking v1.6
+// never produces them, no harm; if a v1.7 worker shows up they Just Work.
+
+/// State carried across multiple SSE chunks for a single stream. Tracks
+/// in-progress `tool_use` content blocks: Anthropic streams the input
+/// JSON one `partial_json` chunk per delta and only emits the complete
+/// id/name on the `content_block_start`. We must accumulate until the
+/// matching `content_block_stop` before we can emit a fully-formed
+/// `StreamEvent::ToolCall`.
+#[derive(Debug, Default)]
+struct SseState {
+    /// `index` (from `content_block_*` events) → pending tool_use info.
+    /// HashMap rather than Vec because the protocol reserves the right
+    /// to interleave content blocks at different indices.
+    tools: HashMap<u64, PendingToolUse>,
+}
+
+#[derive(Debug, Default)]
+struct PendingToolUse {
+    id: String,
+    name: String,
+    /// Concatenation of every `input_json_delta.partial_json` chunk seen
+    /// so far. Parsed once on `content_block_stop`.
+    partial_json: String,
+}
 
 async fn parse_sse_chunk(
     chunk: Result<bytes::Bytes>,
     line_buffer: &Arc<tokio::sync::Mutex<String>>,
     utf8_remainder: &Arc<tokio::sync::Mutex<Vec<u8>>>,
+    sse_state: &Arc<tokio::sync::Mutex<SseState>>,
 ) -> Vec<Result<StreamEvent>> {
     let mut events: Vec<Result<StreamEvent>> = Vec::new();
     let bytes = match chunk {
@@ -1247,18 +1623,26 @@ async fn parse_sse_chunk(
     };
     drop(remainder);
 
+    let mut state = sse_state.lock().await;
     let mut buf = line_buffer.lock().await;
     buf.push_str(&decoded);
     while let Some(idx) = buf.find('\n') {
         let line = buf[..idx].trim_end_matches('\r').to_string();
         buf.drain(..=idx);
-        // Per WHATWG SSE the space after the colon is optional, so
-        // `data:{...}` is just as valid as `data: {...}`. Accept both
-        // — matches the openai/anthropic/gemini providers in this
-        // crate. Strip the colon, then trim leading ASCII spaces.
+        // SSE has two relevant line shapes: `event: <name>` (the named
+        // event channel) and `data: <json>` (the payload). Anthropic
+        // shape uses both: `event:` mirrors the JSON's `"type"` field
+        // for SDK compatibility. We key off the JSON `"type"` since
+        // that's authoritative — `event:` lines without a body, comment
+        // lines (`:keepalive`), and stray blank lines are dropped here.
         let Some(payload) = line.strip_prefix("data:").map(|s| s.trim_start_matches(' ')) else {
             continue;
         };
+        // No `data: [DONE]` sentinel on the native rsclaw protocol —
+        // spec §2.3.1 explicitly says message_stop is the terminator
+        // and only the `/v1/chat/completions` OAI translator emits
+        // [DONE]. Still defensive-skip if a misconfigured proxy injects
+        // one; pushing a parse error here would tank the turn.
         if payload == "[DONE]" {
             continue;
         }
@@ -1279,66 +1663,152 @@ async fn parse_sse_chunk(
                 continue;
             }
         };
-        match value.get("type").and_then(|v| v.as_str()) {
-            Some("delta") => {
-                let s = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                if !s.is_empty() {
-                    events.push(Ok(StreamEvent::TextDelta(s.to_string())));
+        let kind = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match kind {
+            // Block start: stash tool_use metadata so subsequent
+            // `input_json_delta`s know which pending block to append to.
+            // Text-block starts carry no useful payload (block starts
+            // empty and every codepoint arrives via content_block_delta);
+            // we don't synthesise a StreamEvent for them.
+            "content_block_start" => {
+                let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let block = value.get("content_block");
+                let block_type = block
+                    .and_then(|b| b.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if block_type == "tool_use" {
+                    let id = block
+                        .and_then(|b| b.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let name = block
+                        .and_then(|b| b.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    state.tools.insert(
+                        index,
+                        PendingToolUse {
+                            id,
+                            name,
+                            partial_json: String::new(),
+                        },
+                    );
                 }
             }
-            Some("thinking") => {
-                let s = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                if !s.is_empty() {
-                    events.push(Ok(StreamEvent::ReasoningDelta(s.to_string())));
+            // The token-by-token content stream. The inner `delta.type`
+            // discriminates text vs thinking vs tool_use input chunks.
+            "content_block_delta" => {
+                let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let delta = value.get("delta");
+                let delta_type = delta
+                    .and_then(|d| d.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                match delta_type {
+                    "text_delta" => {
+                        let s = delta
+                            .and_then(|d| d.get("text"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        if !s.is_empty() {
+                            events.push(Ok(StreamEvent::TextDelta(s.to_string())));
+                        }
+                    }
+                    "thinking_delta" => {
+                        let s = delta
+                            .and_then(|d| d.get("thinking"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        if !s.is_empty() {
+                            events.push(Ok(StreamEvent::ReasoningDelta(s.to_string())));
+                        }
+                    }
+                    "input_json_delta" => {
+                        // Append to the pending tool's accumulating
+                        // JSON. If no pending block exists at this
+                        // index, drop silently — server bug or
+                        // out-of-order frames shouldn't tank the turn.
+                        if let Some(pending) = state.tools.get_mut(&index) {
+                            let frag = delta
+                                .and_then(|d| d.get("partial_json"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            pending.partial_json.push_str(frag);
+                        }
+                    }
+                    _ => {}
                 }
             }
-            Some("tool_call") => {
-                let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let name = value.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                // Default to an empty JSON object — `Value::Null` would
-                // make downstream `input.as_object()` calls return None
-                // and force every consumer to `unwrap_or(&empty_map)`.
-                // The other three providers in this crate (anthropic,
-                // gemini, openai) all default to an empty object; align
-                // here so the runtime can treat the field uniformly.
-                let input = match value.get("input").cloned() {
-                    Some(Value::Null) | None => Value::Object(Default::default()),
-                    Some(other) => other,
-                };
-                events.push(Ok(StreamEvent::ToolCall { id, name, input }));
+            // Block end: emit a fully-formed ToolCall once we have
+            // the complete input JSON. Text blocks just close — their
+            // content already streamed via content_block_delta.
+            "content_block_stop" => {
+                let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
+                if let Some(pending) = state.tools.remove(&index) {
+                    // Empty partial_json means the worker emitted a
+                    // tool_use with no arguments — represent as an
+                    // empty object, matching the other providers'
+                    // null-vs-empty-object policy.
+                    let input: Value = if pending.partial_json.is_empty() {
+                        Value::Object(Default::default())
+                    } else {
+                        match serde_json::from_str(&pending.partial_json) {
+                            Ok(v) => v,
+                            Err(_) => Value::Object(Default::default()),
+                        }
+                    };
+                    events.push(Ok(StreamEvent::ToolCall {
+                        id: pending.id,
+                        name: pending.name,
+                        input,
+                    }));
+                }
             }
-            Some("done") => {
-                // If `usage` is present AND a JSON object, surface it —
-                // even partially. Defaulting missing fields to 0 (rather
-                // than dropping the entire TokenUsage on a single missing
-                // field) matches the anthropic provider's pattern and
-                // means a server that ships e.g. `input_tokens` without
-                // `output_tokens` still gets the input count through to
-                // cost-tracking instead of losing both.
-                //
-                // The `as_object` filter is load-bearing: a plain
-                // `value.get("usage").map(...)` would treat `"usage":
-                // null` as present, yielding `Some(TokenUsage{0,0})` —
-                // a phantom zero-token turn that corrupts accounting.
-                // `null` is the explicit "no usage data" signal and must
-                // collapse to `None`, same as the field being absent.
+            // Final usage + stop_reason. We don't propagate
+            // `stop_reason` separately — the runtime treats Done as
+            // "stream complete," and stop_reason variants we'd care
+            // about (max_tokens, end_turn) are already implicit in the
+            // text accumulated above.
+            "message_delta" => {
+                // Per protocol §2.3 the `usage` field on `message_delta`
+                // carries the terminal counts. As with the legacy
+                // `done` event, defaulting missing fields to 0 (rather
+                // than dropping the entire TokenUsage on a single
+                // missing field) keeps partial-usage workers usable.
+                // `as_object` filter is load-bearing: `"usage": null`
+                // must collapse to None, not Some(zeros).
                 let usage = value
                     .get("usage")
                     .and_then(Value::as_object)
                     .map(|u| TokenUsage {
-                        input: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
-                        output: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+                        input: u
+                            .get("input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as u32,
+                        output: u
+                            .get("output_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as u32,
                     });
                 events.push(Ok(StreamEvent::Done { usage }));
             }
-            Some("error") => {
-                // Protocol §2.3: error event carries both `code` and
-                // `detail`. Preserve both so downstream consumers can
-                // discriminate by code (e.g. `slot_evicted` →
-                // replay-and-retry) and operators see the full message
-                // in tail logs.
-                let code = value.get("code").and_then(|v| v.as_str()).unwrap_or("");
-                let detail = value.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+            // Mid-stream error frame per spec §2.3.1. Anthropic shape
+            // is `{type:"error", error:{type:"...", message:"..."}}`
+            // — pull the error sub-object's fields, fall through to a
+            // generic message if either is missing.
+            "error" => {
+                let err = value.get("error");
+                let code = err
+                    .and_then(|e| e.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let detail = err
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 let msg = match (code.is_empty(), detail.is_empty()) {
                     (false, false) => format!("rsclaw stream error [{code}]: {detail}"),
                     (false, true) => format!("rsclaw stream error [{code}]"),
@@ -1347,6 +1817,16 @@ async fn parse_sse_chunk(
                 };
                 events.push(Ok(StreamEvent::Error(msg)));
             }
+            // Terminal frame — clients should close after this. No
+            // StreamEvent emitted; the runtime drains the stream after
+            // Done from message_delta and a trailing message_stop is
+            // just acknowledgement.
+            "message_stop" => {}
+            // `message_start` and any unknown event types fall through
+            // — message_start carries only diagnostic info (session_id,
+            // cached_tokens count) that the runtime doesn't surface,
+            // and forward-compat means unknown shapes should be ignored
+            // rather than producing errors that tank the whole turn.
             _ => {}
         }
     }
@@ -1387,22 +1867,174 @@ mod tests {
     use super::*;
     use crate::provider::ToolDef;
 
+    #[test]
+    fn origin_of_extracts_origin() {
+        assert_eq!(origin_of("https://api.rsclaw.ai/v1/agent/sessions"), Some("https://api.rsclaw.ai"));
+        assert_eq!(origin_of("http://localhost:8443/path"), Some("http://localhost:8443"));
+        assert_eq!(origin_of("https://host"), Some("https://host"));
+        assert_eq!(origin_of("not-a-url"), None);
+    }
+
+    #[test]
+    fn rewrite_origin_preserves_path_and_query() {
+        let url = "https://api.rsclaw.ai/v1/agent/sessions/rs_w7_abc/turn";
+        let new = rewrite_origin(url, "https://server.rsclaw.ai:8443");
+        assert_eq!(new, "https://server.rsclaw.ai:8443/v1/agent/sessions/rs_w7_abc/turn");
+    }
+
+    #[test]
+    fn resolve_location_handles_absolute_and_relative() {
+        // Absolute URL: returned as-is.
+        assert_eq!(
+            resolve_location(
+                "https://api.rsclaw.ai/v1/agent/sessions",
+                "https://server.rsclaw.ai:8443/v1/agent/sessions",
+            ),
+            Some("https://server.rsclaw.ai:8443/v1/agent/sessions".into()),
+        );
+        // Absolute path: rebased on caller origin.
+        assert_eq!(
+            resolve_location("https://api.rsclaw.ai/v1/agent/sessions", "/other/path"),
+            Some("https://api.rsclaw.ai/other/path".into()),
+        );
+        // Empty / relative-to-current-path explicitly unsupported —
+        // rsclaw-server doesn't emit those and supporting them invites
+        // path-confusion bugs.
+        assert_eq!(
+            resolve_location("https://api.rsclaw.ai/v1/agent/sessions", ""),
+            None,
+        );
+        assert_eq!(
+            resolve_location("https://api.rsclaw.ai/v1/agent/sessions", "other"),
+            None,
+        );
+    }
+
+    #[test]
+    fn parse_max_age_extracts_seconds() {
+        assert_eq!(parse_max_age(Some("max-age=3600")), Some(Duration::from_secs(3600)));
+        assert_eq!(parse_max_age(Some("public, max-age=300, must-revalidate")), Some(Duration::from_secs(300)));
+        assert_eq!(parse_max_age(Some("MAX-AGE=120")), Some(Duration::from_secs(120))); // case-insensitive
+    }
+
+    #[test]
+    fn parse_max_age_returns_none_when_missing() {
+        assert_eq!(parse_max_age(None), None);
+        assert_eq!(parse_max_age(Some("public")), None);
+        assert_eq!(parse_max_age(Some("private, must-revalidate")), None);
+    }
+
+    #[test]
+    fn parse_max_age_returns_none_on_no_store_or_no_cache() {
+        // RFC 7234 says no-store / no-cache forbid the response from
+        // being stored regardless of max-age. Honour that override so
+        // a server that wants to forcibly disable our redirect cache
+        // can do so by adding `no-store` to the 308's Cache-Control.
+        assert_eq!(parse_max_age(Some("no-store")), None);
+        assert_eq!(parse_max_age(Some("max-age=3600, no-store")), None);
+        assert_eq!(parse_max_age(Some("no-cache, max-age=300")), None);
+    }
+
+    #[test]
+    fn redirect_cache_lookup_returns_target_when_fresh() {
+        let mut cache = RedirectCache::default();
+        cache.store(
+            "https://api.rsclaw.ai".into(),
+            "https://server.rsclaw.ai:8443".into(),
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            cache.lookup("https://api.rsclaw.ai"),
+            Some("https://server.rsclaw.ai:8443".into()),
+        );
+        // Miss key → None.
+        assert_eq!(cache.lookup("https://other.example.com"), None);
+    }
+
+    #[test]
+    fn redirect_cache_expires_stale_entries_lazily() {
+        let mut cache = RedirectCache::default();
+        // Negative TTL → immediately expired. (`Instant::now()` already
+        // past the computed `expires_at`.)
+        cache.entries.insert(
+            "https://api.rsclaw.ai".into(),
+            RedirectEntry {
+                target_origin: "https://server.rsclaw.ai:8443".into(),
+                expires_at: std::time::Instant::now() - Duration::from_secs(1),
+            },
+        );
+        assert!(cache.lookup("https://api.rsclaw.ai").is_none());
+        // Entry should be evicted as a side-effect — subsequent
+        // lookups don't keep re-walking a dead row.
+        assert!(!cache.entries.contains_key("https://api.rsclaw.ai"));
+    }
+
+    #[test]
+    fn redirect_cache_invalidate_removes_entry() {
+        let mut cache = RedirectCache::default();
+        cache.store(
+            "https://api.rsclaw.ai".into(),
+            "https://server.rsclaw.ai:8443".into(),
+            Duration::from_secs(3600),
+        );
+        cache.invalidate("https://api.rsclaw.ai");
+        assert!(cache.lookup("https://api.rsclaw.ai").is_none());
+    }
+
+    #[test]
+    fn provider_resolve_url_returns_origin_when_cache_empty() {
+        let provider = RsclawProvider::new("https://api.rsclaw.ai/v1/agent", None);
+        assert_eq!(
+            provider.resolve_url("/sessions"),
+            "https://api.rsclaw.ai/v1/agent/sessions",
+        );
+    }
+
+    #[test]
+    fn provider_resolve_url_rewrites_when_cache_fresh() {
+        let provider = RsclawProvider::new("https://api.rsclaw.ai/v1/agent", None);
+        if let Ok(mut cache) = provider.redirect_cache.lock() {
+            cache.store(
+                "https://api.rsclaw.ai".into(),
+                "https://server.rsclaw.ai:8443".into(),
+                Duration::from_secs(3600),
+            );
+        }
+        assert_eq!(
+            provider.resolve_url("/sessions/rs_w7_abc/turn"),
+            "https://server.rsclaw.ai:8443/v1/agent/sessions/rs_w7_abc/turn",
+        );
+    }
+
+    /// Test wrapper: most tests don't care about per-stream tool_use
+    /// state (they exercise one event in isolation), so mint a fresh
+    /// `SseState` per call. Multi-call tests construct their own state
+    /// to keep it shared across chunks.
+    async fn parse_sse_test(
+        chunk: Result<bytes::Bytes>,
+        buf: &Arc<tokio::sync::Mutex<String>>,
+        rem: &Arc<tokio::sync::Mutex<Vec<u8>>>,
+    ) -> Vec<Result<StreamEvent>> {
+        let state = Arc::new(tokio::sync::Mutex::new(SseState::default()));
+        parse_sse_chunk(chunk, buf, rem, &state).await
+    }
+
     #[tokio::test]
     async fn parse_sse_chunk_recovers_split_utf8() {
-        // SSE delta line carrying "你好" (U+4F60 = E4 BD A0, U+597D =
-        // E5 A5 BD), with the byte split landing in the middle of the
-        // first character.
-        let line_full = b"data: {\"type\":\"delta\",\"content\":\"\xe4\xbd\xa0\xe5\xa5\xbd\"}\n";
-        let split = 14; // "data: {\"type\":" prefix is 14 bytes
+        // SSE content_block_delta line carrying "你好"
+        // (U+4F60 = E4 BD A0, U+597D = E5 A5 BD), with the byte split
+        // landing in the middle of the first character.
+        let line_full = b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"\xe4\xbd\xa0\xe5\xa5\xbd\"}}\n";
+        let split = 30;
         let (a, b) = line_full.split_at(split);
-        let (b, c) = b.split_at(11); // straddles the first 你 (E4 BD A0)
+        let (b, c) = b.split_at(line_full.len() / 2 - split);
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
 
         for piece in [a, b, c] {
-            let _ = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(piece)), &buf, &rem).await;
+            let _ = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(piece)), &buf, &rem).await;
         }
-        let evs = parse_sse_chunk(Ok(bytes::Bytes::from_static(b"")), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::from_static(b"")), &buf, &rem).await;
 
         let texts: Vec<_> = evs
             .into_iter()
@@ -1432,7 +2064,7 @@ mod tests {
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
 
         // Chunk 1: just an invalid byte. error_len() = Some(1).
-        let evs = parse_sse_chunk(Ok(bytes::Bytes::from_static(b"\xff")), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::from_static(b"\xff")), &buf, &rem).await;
         assert!(
             evs.iter().all(|e| e.is_ok()),
             "stray 0xFF must not surface as Err — got {evs:?}"
@@ -1448,9 +2080,9 @@ mod tests {
 
         // Chunk 2: a complete SSE event. The stream must recover and
         // emit it normally — no contamination from the prior bad byte.
-        let evs = parse_sse_chunk(
+        let evs = parse_sse_test(
             Ok(bytes::Bytes::from_static(
-                b"data: {\"type\":\"delta\",\"content\":\"hi\"}\n",
+                b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n",
             )),
             &buf,
             &rem,
@@ -1480,7 +2112,7 @@ mod tests {
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
         for _ in 0..50 {
-            let _ = parse_sse_chunk(Ok(bytes::Bytes::from_static(b"\xff")), &buf, &rem).await;
+            let _ = parse_sse_test(Ok(bytes::Bytes::from_static(b"\xff")), &buf, &rem).await;
         }
         let r = rem.lock().await;
         assert!(
@@ -1499,8 +2131,8 @@ mod tests {
         // event and assert: only the real text delta fires, no Err.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data:\ndata: {\"type\":\"delta\",\"content\":\"hi\"}\n";
-        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let line = b"data:\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
         let mut texts: Vec<String> = Vec::new();
         for e in evs {
             match e {
@@ -1520,7 +2152,7 @@ mod tests {
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
         let line = b"data:    \n";
-        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
         for e in evs {
             if let Err(err) = e {
                 panic!("whitespace-only data: must not surface as Err — got {err}");
@@ -1536,8 +2168,8 @@ mod tests {
         // `data:{...}` without a space. Both forms must parse.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data:{\"type\":\"delta\",\"content\":\"hi\"}\n";
-        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let line = b"data:{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
         let texts: Vec<_> = evs
             .into_iter()
             .filter_map(|e| match e {
@@ -1552,8 +2184,8 @@ mod tests {
     async fn parse_sse_chunk_emits_done_with_usage() {
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data: {\"type\":\"done\",\"usage\":{\"input_tokens\":17,\"output_tokens\":42}}\n";
-        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let line = b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"input_tokens\":17,\"output_tokens\":42}}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
         let mut saw_done = false;
         for e in evs {
             if let Ok(StreamEvent::Done { usage }) = e {
@@ -1571,8 +2203,8 @@ mod tests {
         // Server may omit usage on early termination — Done must still fire.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data: {\"type\":\"done\"}\n";
-        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let line = b"data: {\"type\":\"message_delta\",\"delta\":{}}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
         let mut saw_done = false;
         for e in evs {
             if let Ok(StreamEvent::Done { usage }) = e {
@@ -1584,24 +2216,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parse_sse_chunk_tool_call_defaults_input_to_empty_object() {
-        // Tools without parameters legitimately ship `input: {}`, which
-        // already arrives as Value::Object — verify pass-through.
-        // But missing input or null input should ALSO produce an empty
-        // object, matching the anthropic/gemini/openai providers, so
-        // runtime consumers can call .as_object() without first
-        // matching Null.
+    async fn parse_sse_chunk_tool_use_empty_input_yields_empty_object() {
+        // Anthropic shape: tool_use needs start + (optional deltas) +
+        // stop. With NO input_json_delta between (tool with zero args),
+        // the parser MUST still emit a ToolCall with input = {} —
+        // anthropic/gemini/openai providers all default to an empty
+        // object so runtime consumers can call `.as_object()` without
+        // first matching Null. The three frames share state.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data: {\"type\":\"tool_call\",\"id\":\"toolu_xyz\",\"name\":\"get_time\"}\n";
-        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
-        let input = evs
+        let state = Arc::new(tokio::sync::Mutex::new(SseState::default()));
+        let start = br#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_xyz","name":"get_time","input":{}}}
+"#;
+        let stop = br#"data: {"type":"content_block_stop","index":0}
+"#;
+        let _ = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(start)), &buf, &rem, &state).await;
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(stop)), &buf, &rem, &state).await;
+        let (id, name, input) = evs
             .into_iter()
             .find_map(|e| match e {
-                Ok(StreamEvent::ToolCall { input, .. }) => Some(input),
+                Ok(StreamEvent::ToolCall { id, name, input }) => Some((id, name, input)),
                 _ => None,
             })
             .expect("expected one ToolCall event");
+        assert_eq!(id, "toolu_xyz");
+        assert_eq!(name, "get_time");
         assert!(
             input.as_object().is_some_and(|m| m.is_empty()),
             "expected empty object, got {input:?}"
@@ -1609,14 +2248,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parse_sse_chunk_tool_call_normalizes_explicit_null_input() {
-        // A misbehaving server might emit `"input": null`. Don't pass
-        // the Null through — coerce to {} so downstream stays uniform.
+    async fn parse_sse_chunk_tool_use_malformed_partial_json_falls_back_to_empty_object() {
+        // If a buggy worker streams partial_json that doesn't parse as
+        // a complete JSON object on content_block_stop, fall back to
+        // {} rather than tanking the whole stream. Downstream
+        // consumers rely on the input always being an object.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line =
-            b"data: {\"type\":\"tool_call\",\"id\":\"t\",\"name\":\"n\",\"input\":null}\n";
-        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let state = Arc::new(tokio::sync::Mutex::new(SseState::default()));
+        let start = br#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"n","input":{}}}
+"#;
+        let delta = br#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"truncat"}}
+"#;
+        let stop = br#"data: {"type":"content_block_stop","index":0}
+"#;
+        let _ = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(start)), &buf, &rem, &state).await;
+        let _ = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(delta)), &buf, &rem, &state).await;
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(stop)), &buf, &rem, &state).await;
         let input = evs
             .into_iter()
             .find_map(|e| match e {
@@ -1626,31 +2274,59 @@ mod tests {
             .expect("expected one ToolCall event");
         assert!(
             input.as_object().is_some_and(|m| m.is_empty()),
-            "explicit null should normalize to empty object, got {input:?}"
+            "malformed partial JSON should fall back to {{}}, got {input:?}"
         );
     }
 
     #[tokio::test]
-    async fn parse_sse_chunk_tool_call_preserves_populated_input() {
-        // Round-trip a real input — the normalization must NOT clobber
-        // a non-null object. Regression test for the obvious foot-gun
-        // of a too-eager fallback.
+    async fn parse_sse_chunk_tool_use_assembles_partial_json_across_deltas() {
+        // The happy path: input arrives across multiple input_json_delta
+        // frames. Parser concatenates all `partial_json` fragments and
+        // serde-parses on content_block_stop to emit a complete input.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = br#"data: {"type":"tool_call","id":"t","name":"read_file","input":{"path":"x.rs"}}
+        let state = Arc::new(tokio::sync::Mutex::new(SseState::default()));
+        let start = br#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"read_file","input":{}}}
 "#;
-        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
-        let input = evs
+        let d1 = br#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}
+"#;
+        let d2 = br#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"x.rs\"}"}}
+"#;
+        let stop = br#"data: {"type":"content_block_stop","index":0}
+"#;
+        let _ = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(start)), &buf, &rem, &state).await;
+        let _ = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(d1)), &buf, &rem, &state).await;
+        let _ = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(d2)), &buf, &rem, &state).await;
+        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(stop)), &buf, &rem, &state).await;
+        let (name, input) = evs
             .into_iter()
             .find_map(|e| match e {
-                Ok(StreamEvent::ToolCall { input, .. }) => Some(input),
+                Ok(StreamEvent::ToolCall { name, input, .. }) => Some((name, input)),
                 _ => None,
             })
             .expect("expected one ToolCall event");
+        assert_eq!(name, "read_file");
         assert_eq!(
             input.get("path").and_then(Value::as_str),
             Some("x.rs"),
-            "populated input must round-trip; got {input:?}"
+            "concatenated partial_json must parse cleanly; got {input:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_ignores_message_start_and_message_stop() {
+        // message_start carries diagnostic info the runtime doesn't
+        // surface; message_stop is the terminal frame. Neither should
+        // produce a StreamEvent — they're just protocol structure.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let frames = br#"data: {"type":"message_start","session_id":"rs_w7_x","input_tokens":10,"cached_tokens":20,"n_tokens_at_start":30}
+data: {"type":"message_stop"}
+"#;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem).await;
+        assert!(
+            evs.is_empty(),
+            "message_start / message_stop should produce no StreamEvents; got {evs:?}"
         );
     }
 
@@ -1663,8 +2339,8 @@ mod tests {
         // each side to 0 keeps the half we DID get.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data: {\"type\":\"done\",\"usage\":{\"input_tokens\":17}}\n";
-        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let line = b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"input_tokens\":17}}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
         let usage = evs
             .into_iter()
             .find_map(|e| match e {
@@ -1687,8 +2363,8 @@ mod tests {
         // a successful "free" turn from a buggy / older server build.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data: {\"type\":\"done\",\"usage\":null}\n";
-        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let line = b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":null}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
         let mut saw_done = false;
         for e in evs {
             if let Ok(StreamEvent::Done { usage }) = e {
@@ -1711,8 +2387,8 @@ mod tests {
         // "usage was zero".
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data: {\"type\":\"done\",\"usage\":[1,2,3]}\n";
-        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let line = b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":[1,2,3]}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
         let mut saw_done = false;
         for e in evs {
             if let Ok(StreamEvent::Done { usage }) = e {
@@ -1731,9 +2407,9 @@ mod tests {
         // see the detail in tail logs.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = br#"data: {"type":"error","code":"slot_evicted","detail":"slot was reclaimed mid-decode"}
+        let line = br#"data: {"type":"error","error":{"type":"slot_evicted","message":"slot was reclaimed mid-decode"}}
 "#;
-        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
         let mut msgs = Vec::new();
         for e in evs {
             if let Ok(StreamEvent::Error(m)) = e {
@@ -1753,9 +2429,9 @@ mod tests {
     async fn parse_sse_chunk_error_falls_back_when_code_missing() {
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = br#"data: {"type":"error","detail":"upstream hung up"}
+        let line = br#"data: {"type":"error","error":{"message":"upstream hung up"}}
 "#;
-        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
         let msg = evs
             .into_iter()
             .find_map(|e| match e {
@@ -1771,9 +2447,9 @@ mod tests {
     async fn parse_sse_chunk_error_falls_back_when_detail_missing() {
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = br#"data: {"type":"error","code":"version_drift"}
+        let line = br#"data: {"type":"error","error":{"type":"version_drift"}}
 "#;
-        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
         let msg = evs
             .into_iter()
             .find_map(|e| match e {
@@ -1789,8 +2465,8 @@ mod tests {
     async fn parse_sse_chunk_error_uses_default_when_both_missing() {
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data: {\"type\":\"error\"}\n";
-        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let line = b"data: {\"type\":\"error\",\"error\":{}}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
         let msg = evs
             .into_iter()
             .find_map(|e| match e {
@@ -2839,17 +3515,30 @@ mod tests {
     }
 
     #[test]
-    fn create_session_resp_accepts_legacy_rsclaw_version_alias() {
-        // Pre-rename servers (and rsclaw-server's auto-assembly path
-        // for very old workers) still emit `rsclaw_version`. The
-        // `#[serde(alias = "rsclaw_version")]` on the field keeps both
-        // spellings working until v2.0 drops the alias.
+    fn create_session_resp_ignores_unknown_legacy_rsclaw_version() {
+        // Pre-rename `rsclaw_version` is being dropped server-side
+        // entirely. While some builds still emit it alongside
+        // `prefix_id` mid-roll, our struct treats it as an unknown
+        // key and serde ignores it silently. Production e2e against
+        // `:8443` sends exactly this shape:
+        //   {"prefix_id":"dynamic/...","prefix_source":"dynamic_miss",
+        //    "rsclaw_version":""}
+        // Without this regression test the prior `serde(alias)`
+        // approach would resurface and trip `duplicate field` errors
+        // again.
         let body = r#"{
-            "session_id": "rs_w7_8a3c1f2b",
-            "rsclaw_version": "2026.5.5"
+            "session_id":"rs_w7_8cebc736",
+            "prefix_id":"dynamic/9e8598684ad34ff0a615899fefb811de",
+            "prefix_source":"dynamic_miss",
+            "rsclaw_version":""
         }"#;
-        let resp: CreateSessionResp = serde_json::from_str(body).expect("legacy alias parses");
-        assert_eq!(resp.prefix_id.as_deref(), Some("2026.5.5"));
+        let resp: CreateSessionResp = serde_json::from_str(body)
+            .expect("mixed post-rename + legacy fields must parse");
+        assert_eq!(resp.session_id, "rs_w7_8cebc736");
+        assert_eq!(
+            resp.prefix_id.as_deref(),
+            Some("dynamic/9e8598684ad34ff0a615899fefb811de"),
+        );
     }
 
     #[test]
