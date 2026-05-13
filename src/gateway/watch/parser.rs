@@ -142,9 +142,12 @@ fn is_windows_drive_path(s: &str) -> bool {
         && matches!(chars.next(), Some('\\') | Some('/'))
 }
 
-/// Split the source-args body at the first flag token. Flags begin with
-/// ` -H `, ` --grep `, ` --jq `, ` --rate `, ` --only `, ` --tee ` (note the
-/// leading space — flags inside a path or URL shouldn't trigger the split).
+/// Split the source-args body at the first flag token. A flag is either one
+/// of the known short/long heads (e.g. ` -H `, ` --grep `) **or any unknown
+/// long flag** of the form ` --<alpha>...` — those still split so apply_flags
+/// can raise an "unknown flag" error. Single-letter `-x` is NOT treated as a
+/// flag boundary unless it's a known head, so `shell tail -f x` correctly
+/// keeps `-f` as part of the shell command.
 fn split_source_and_flags(s: &str) -> (&str, &str) {
     const FLAG_HEADS: &[&str] = &[" -H ", " --grep ", " --jq ", " --rate ", " --only ", " --tee "];
     let mut best_idx = s.len();
@@ -155,11 +158,25 @@ fn split_source_and_flags(s: &str) -> (&str, &str) {
             }
         }
     }
+    // Also catch unknown long flags (`--xxx`) so apply_flags can reject them.
+    let bytes = s.as_bytes();
+    let mut i: usize = 0;
+    while i + 3 < bytes.len() {
+        if bytes[i] == b' '
+            && bytes[i + 1] == b'-'
+            && bytes[i + 2] == b'-'
+            && bytes[i + 3].is_ascii_alphabetic()
+            && i < best_idx
+        {
+            best_idx = i;
+            break;
+        }
+        i += 1;
+    }
     if best_idx == s.len() {
         (s, "")
     } else {
         (&s[..best_idx], s[best_idx + 1..].trim_start())
-        // Note: best_idx points at the leading space, so +1 skips it.
     }
 }
 
@@ -386,6 +403,17 @@ mod tests {
         let p = parse("/var/log/x").unwrap();
         if let ParsedCommand::Start(spec) = p {
             assert_eq!(spec.rate_ms, 2000);
+        }
+    }
+
+    #[test]
+    fn shell_source_preserves_single_letter_dash_args() {
+        let p = parse("shell tail -f /var/log/x").unwrap();
+        if let ParsedCommand::Start(spec) = p {
+            assert_eq!(spec.kind, SourceKind::Shell);
+            assert_eq!(spec.raw_source, "tail -f /var/log/x");
+        } else {
+            panic!("expected Start");
         }
     }
 }
