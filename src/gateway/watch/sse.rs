@@ -1,7 +1,7 @@
 //! SSE wire parser + single-connection runner.
 //!
-//! See spec §"SseSource 实现策略". Reconnect / heartbeat / Last-Event-ID /
-//! ${VAR} substitution are added in Tasks 11/12/13/14.
+//! See spec §"SseSource 实现策略". Heartbeat / ${VAR} substitution are added in
+//! Tasks 12/13/14. Reconnect + Last-Event-ID + `retry:` are wired in Task 11.
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -26,11 +26,12 @@ pub(super) enum SseOutcome {
     Disconnect(String),
 }
 
-pub(super) async fn run_sse_single(
+async fn run_sse_single_tracking(
     src: &SseSource,
-    last_event_id: Option<&str>,
     tx: &mpsc::Sender<EventRecord>,
     stop: &mut oneshot::Receiver<()>,
+    out_last_id: &mut Option<String>,
+    out_backoff_ms: &mut u64,
 ) -> SseOutcome {
     let client = match reqwest::Client::builder().build() {
         Ok(c) => c,
@@ -45,7 +46,8 @@ pub(super) async fn run_sse_single(
     for (name, value) in &src.headers {
         req = req.header(name.as_str(), value.as_str());
     }
-    if let Some(id) = last_event_id {
+    // Resume header from prior connection's last seen id.
+    if let Some(id) = out_last_id.as_deref() {
         req = req.header("Last-Event-ID", id);
     }
 
@@ -69,6 +71,9 @@ pub(super) async fn run_sse_single(
         return SseOutcome::Fatal(format!("non-SSE content type: {ct}"));
     }
 
+    // First success of this attempt → reset the backoff.
+    *out_backoff_ms = 2000;
+
     let mut stream = resp.bytes_stream();
     let mut parser = SseParser::default();
 
@@ -78,9 +83,15 @@ pub(super) async fn run_sse_single(
             chunk = stream.next() => match chunk {
                 Some(Ok(bytes)) => {
                     for ev in parser.feed(&bytes) {
+                        if let Some(id) = &ev.event_id {
+                            *out_last_id = Some(id.clone());
+                        }
                         if tx.send(ev).await.is_err() {
                             return SseOutcome::Stopped;
                         }
+                    }
+                    if let Some(rt) = parser.last_retry_ms.take() {
+                        *out_backoff_ms = rt.min(30_000);
                     }
                 }
                 Some(Err(e)) => return SseOutcome::Disconnect(format!("stream: {e}")),
@@ -194,20 +205,49 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Caller-facing single connection driver. Reconnect is added in Task 11.
 pub(super) async fn run_sse(
     src: SseSource,
     tx: mpsc::Sender<EventRecord>,
     mut stop: oneshot::Receiver<()>,
 ) {
-    let outcome = run_sse_single(&src, None, &tx, &mut stop).await;
-    let _ = tx
-        .send(EventRecord::lifecycle(
-            "_disconnect",
-            serde_json::json!({"reason": format!("{outcome:?}")}),
-            now_ms(),
-        ))
+    let mut last_event_id: Option<String> = None;
+    let mut backoff_ms: u64 = 2000;
+
+    loop {
+        let outcome = run_sse_single_tracking(
+            &src,
+            &tx,
+            &mut stop,
+            &mut last_event_id,
+            &mut backoff_ms,
+        )
         .await;
+
+        match outcome {
+            SseOutcome::Stopped => return,
+            SseOutcome::Fatal(msg) => {
+                let _ = tx
+                    .send(EventRecord::lifecycle(
+                        "_error",
+                        serde_json::json!({ "fatal": true, "msg": msg }),
+                        now_ms(),
+                    ))
+                    .await;
+                return;
+            }
+            SseOutcome::Disconnect(_msg) => {
+                // Wait `backoff_ms` (capped at 30s) before reconnecting,
+                // unless a `retry:` header overrode it inside the connection.
+                let delay = backoff_ms.min(30_000);
+                tokio::select! {
+                    _ = &mut stop => return,
+                    _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+                }
+                // Exponential backoff with 30s cap.
+                backoff_ms = (backoff_ms * 2).min(30_000);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
