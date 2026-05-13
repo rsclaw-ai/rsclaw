@@ -336,3 +336,49 @@ mod tests {
         assert_eq!(evs2[0].data, serde_json::json!({"x": 1}));
     }
 }
+
+/// Replace every `${VAR}` occurrence in `s` with `std::env::var("VAR")`.
+/// Returns `Err(VAR)` for the first unresolved or empty-valued variable.
+pub(crate) fn substitute_env_vars(s: &str) -> Result<String> {
+    let re = regex::Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").unwrap();
+    let mut last = 0usize;
+    let mut out = String::with_capacity(s.len());
+    for cap in re.captures_iter(s) {
+        let m = cap.get(0).unwrap();
+        let name = cap.get(1).unwrap().as_str();
+        out.push_str(&s[last..m.start()]);
+        let val = std::env::var(name).unwrap_or_default();
+        if val.is_empty() {
+            return Err(anyhow!("{name}"));
+        }
+        out.push_str(&val);
+        last = m.end();
+    }
+    out.push_str(&s[last..]);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod subst_tests {
+    use super::*;
+    #[test]
+    fn passes_through_without_vars() {
+        assert_eq!(substitute_env_vars("plain").unwrap(), "plain");
+    }
+    #[test]
+    fn substitutes_set_var() {
+        // Use a unique name so other tests don't race.
+        unsafe { std::env::set_var("WATCH_TEST_TOKEN", "xyz") };
+        assert_eq!(
+            substitute_env_vars("Bearer ${WATCH_TEST_TOKEN}").unwrap(),
+            "Bearer xyz"
+        );
+        unsafe { std::env::remove_var("WATCH_TEST_TOKEN") };
+    }
+    #[test]
+    fn errors_on_missing_var() {
+        unsafe { std::env::remove_var("WATCH_TEST_MISSING") };
+        let err = substitute_env_vars("Bearer ${WATCH_TEST_MISSING}").unwrap_err();
+        assert!(err.to_string().contains("WATCH_TEST_MISSING"));
+    }
+}

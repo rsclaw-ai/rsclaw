@@ -90,6 +90,25 @@ pub struct SseSource {
     pub headers: Vec<(String, String)>,
 }
 
+impl SseSource {
+    /// Build with `${VAR}` substitution applied to url + every header value.
+    /// Returns `WatchStartError::UnresolvedEnv(name)` on the first unset / empty var.
+    pub fn build(
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<Self, WatchStartError> {
+        let url = crate::gateway::watch::sse::substitute_env_vars(url)
+            .map_err(|e| WatchStartError::UnresolvedEnv(e.to_string()))?;
+        let mut subst_headers = Vec::with_capacity(headers.len());
+        for (k, v) in headers {
+            let v2 = crate::gateway::watch::sse::substitute_env_vars(v)
+                .map_err(|e| WatchStartError::UnresolvedEnv(e.to_string()))?;
+            subst_headers.push((k.clone(), v2));
+        }
+        Ok(Self { url, headers: subst_headers })
+    }
+}
+
 impl SourceImpl {
     /// Drive the source. Send each emitted event to `tx`; exit on either
     /// `stop` signal or natural EOF / fatal error.
