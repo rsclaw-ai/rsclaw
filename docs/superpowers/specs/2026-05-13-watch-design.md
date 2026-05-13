@@ -23,8 +23,9 @@
 | Rate limit | 默认 2s/event + batch 合并 | IM 平台心理阈值；`--rate 0` 关 |
 | Filter | `--grep <regex>`（must）+ `--jq <expr>`（stretch） | grep 覆盖 90% 场景；jq 等 jaq 集成 |
 | SSE auth | `${ENV_VAR}` 替换 + 字面量 header | 安全用户自负，两种都支持 |
-| SSE reconnect | 1/2/4/8s 指数退避 ×5，401/403 fatal | 跟 quick_stream.py 一致 |
-| Last-Event-ID | **不支持** | 目标服务器都不发 `id:`，YAGNI |
+| SSE reconnect | 指数退避 2s→30s cap，无重试上限；4xx (401/403/404) fatal | 配错不该死循环；其他暂时性错误持续重连 |
+| SSE 客户端心跳超时 | 90s 没收到任何 byte → 主动断开重连 | TCP keepalive 常被中间代理无声 drop |
+| Last-Event-ID | **客户端实现，记录 `id:` 并在重连时发 header** | server 现在不发，但客户端先实现 = server 上线即生效 |
 | 安全 | 用户自负 | 不挡 shell 注入 / SSRF / 内网 URL |
 | Windows 兼容 | file/SSE Rust 原生 + shell 留 escape hatch | 90% 场景跨平台，shell 用户自知差异 |
 
@@ -43,10 +44,12 @@ SOURCE_ARGS:
   shell: <quoted-or-rest-of-line>
 
 FLAGS:
-  -H 'Header: value'      # SSE only，可多次
+  -H 'Header: value'      # SSE only，可多次；value 可含 ${VAR}
   --grep <regex>          # 任意 source
-  --jq <expr>             # 任意 source (stretch)
+  --jq <expr>             # 任意 source (stretch goal v1)
   --rate <ms>             # 默认 2000；0 = 不限流
+  --only <types>          # nice-to-have，按 event type 白名单（如 hit,error）
+  --tee <path>            # nice-to-have，事件同步落本地 jsonl
 
 LIST ::= /watch list
 STOP ::= /watch stop <watch-id> | /watch stop all
@@ -144,9 +147,10 @@ pub enum WatchStartError {
 ```rust
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct EventRecord {
-    pub event: String,             // "message" | "hit" | "line" | "_disconnect" | ...
+    pub event: String,                  // "message" | "hit" | "line" | "_disconnect" | "_timeout" | ...
     pub data: serde_json::Value,
-    pub raw: Option<String>,       // 原始字符串（grep 用）
+    pub raw: Option<String>,            // 原始字符串（grep 用）
+    pub event_id: Option<String>,       // SSE `id:` 字段，用于 Last-Event-ID resume
     pub ts_ms: u64,
 }
 
@@ -156,7 +160,13 @@ pub trait EventSource: Send {
 }
 
 pub struct FileSource  { pub path: PathBuf }
-pub struct SseSource   { pub url: String, pub headers: Vec<(String, String)> }
+pub struct SseSource   {
+    pub url: String,                    // ${VAR} 替换后的最终值
+    pub headers: Vec<(String, String)>, // ${VAR} 替换后的最终值
+    // 运行时状态（不在 spec 表面，但实现需要）：
+    //   last_event_id: Option<String>     -- 重连时塞进 Last-Event-ID header
+    //   last_byte_at:  Instant            -- 90s 心跳超时检测
+}
 pub struct ShellSource { pub cmd: String }
 ```
 
@@ -168,15 +178,56 @@ pub struct ShellSource { pub cmd: String }
   - 读 remaining bytes，按行切，每行发 `EventRecord { event: "line", data: Value::String(line), raw: Some(line), ts_ms }`
 - 不引入 `notify` crate；200ms 延迟在 chat rate-limit（2s）阴影里
 
-#### SseSource 实现策略（对齐 `quick_stream.py`）
+#### SseSource 实现策略（对齐 `quick_stream.py` + 加固）
 
-- `reqwest::Client::get(url).headers(...).send()` → `bytes_stream()`
-- 手写 SSE 解析状态机：`event:` / `data:` / `:` 注释 / 空行 = 边界
-- `event` 字段默认 `"message"`，`data:` 多行用 `\n` 拼接
-- JSON parse 失败 → `data: { "_parse_error": "...", "_raw": "..." }`
-- Reconnect：1/2/4/8s 指数退避 ×5，401/403 fatal 不重试
-- Server clean close → 推一条 `EventRecord { event: "_disconnect", data: { reason: "server_closed", url } }` 再重连
-- **不**发 `Last-Event-ID` header
+**Request headers**（必发）：
+
+```
+Accept: text/event-stream
+Cache-Control: no-cache
+Accept-Encoding: identity            ← 关键，禁 gzip。gzip 会缓冲整个响应，SSE 完全废
+Authorization: ...                   ← 如用户传 -H 且 ${VAR} 替换后非空
+Last-Event-ID: <last seen id>        ← 重连时若客户端已记录到 id，必发
+```
+
+**SSE wire 解析**（状态机）：
+
+- 行分隔符：`\n` 或 `\r\n`，按字节流读，不假设行边界对齐 chunk 边界
+- `event: <type>` → 当前 event 的 type（默认 `"message"`）
+- `data: <text>` → 累积到 data buffer；**多个 data: 行用 `\n` 拼接**（SSE spec）
+- `id: <id>` → 记录到客户端 `last_event_id` 状态，**重连时塞 Last-Event-ID header**
+- `retry: <ms>` → 服务器建议的重连延迟，覆盖客户端 backoff（如果有）
+- `:` 开头 → comment，**忽略**（很多服务器发 `: ping\n\n` 当应用层心跳）
+- 空行 → event 终止，flush 一个 `EventRecord`
+- 连续空行 → no-op（不发空 event）
+
+`event` 字段默认 `"message"`，`data:` JSON parse 失败 → `data: { "_parse_error": "...", "_raw": "..." }`。
+
+**心跳超时**（很容易漏 — TCP keepalive 不靠谱）：
+
+- 维护 `last_byte_at: Instant`，每收到任意字节更新
+- tokio interval 5s tick 检查 `now - last_byte_at > 90s` → 主动断开 + 推 `EventRecord { event: "_timeout" }` + 进入重连
+- 不依赖 TCP keepalive（中间代理常无声 drop）
+- 90s 是「服务器一般 30s 一次 heartbeat，给 3× 容忍」的经验值
+
+**Reconnect 策略**：
+
+| 触发 | 处理 |
+|---|---|
+| 网络断 / EOF / 心跳超时 | 指数退避 **2s→4s→8s→16s→30s 封顶**，无重试上限 |
+| 5xx 响应 | 同上（暂时性） |
+| `retry: <ms>` 头 | 服务器建议，覆盖下次退避 |
+| 401 / 403 / 404 | **fatal，立即终止 watch + 删 entry + 推 chat 错误** |
+| Server clean close（200 但流结束） | 推一条 `EventRecord { event: "_disconnect", data: { reason: "server_closed", url } }` 然后重连 |
+
+无重试上限 vs 之前的 ×5：用户场景包括「盯 24h 生产 SSE」，5 次太少；只要不是配错（4xx），就一直试。心跳超时机制保证不会因为 stale connection 永远阻塞。
+
+**${VAR} 替换**：
+
+- URL 和 header value 都做替换（URL 也可能含 token query param）
+- 启动时（`start()`）一次性替换，结果保存在 `SseSource { url, headers }`
+- 任一 `${VAR}` 未定义或值为空 → `WatchStartError::UnresolvedEnv(var_name)`，拒绝启动；**不允许悄悄发出空 bearer**
+- 替换后的 URL/headers **不进 tracing log**（机密泄漏）：log 只记 `host + path`，不记 query；只记 header name，不记 value
 
 #### ShellSource 实现策略
 
@@ -368,14 +419,17 @@ mpsc buffer 满时 source `try_send` 失败 → `dropped_count += 1`，不阻塞
 | 路径不存在 / 不可读 | `start()` 同步检查 | 拒绝注册 | "invalid path: /no/such" |
 | shell 立即 exit (≠0) | spawn 后 100ms 内 wait | 拒绝注册 | "shell exited immediately (code=N)" |
 | shell 中途 crash | reader 看到 EOF | 走 EOF 路径，删 entry | "watch w_xxx ended: process exited (code=N)" |
-| SSE 401/403 | HTTP status | fatal，删 entry | "watch w_xxx errored: 403 (fatal)" |
-| SSE 网络断 | bytes_stream Err / EOF | 1/2/4/8s ×5 重试，全失败 → 删 entry | 重试期间不告知；全失败："connection lost after 5 retries. Removed." |
-| SSE 非 event-stream | 首个 chunk 检查 Content-Type | fatal | "watch w_xxx errored: server returned text/html" |
+| SSE 401/403/404 | HTTP status | fatal，删 entry | "watch w_xxx errored: 4xx (fatal)" |
+| SSE 网络断 / 5xx / EOF | bytes_stream Err | 2s→30s cap 指数退避，无上限重试 | 不告知（高频事件，避免 chat 噪声）；进入 reconnect 状态 |
+| SSE 心跳超时 (90s 无 byte) | 5s interval tick 检查 | 主动断开 + 走重连路径 | 推一条 `_timeout` 事件（默认 filter 过滤；用 `--only` 才看见）|
+| SSE 非 event-stream | 首个 chunk Content-Type 检查 | fatal | "watch w_xxx errored: server returned text/html" |
+| SSE `retry: <ms>` 头 | 解析 | 用这个值覆盖下次 backoff | (透明) |
 | `data:` 非 JSON | parse catch | fallback `{_parse_error, _raw}` | (透明) |
 | `--grep` 编译失败 | `start()` 同步检查 | 拒绝注册 | "invalid regex: <err>" |
 | `--jq` 解析失败 | `start()` 同步检查 | 拒绝注册 | "invalid jq expression: <err>" |
 | `--jq` 运行时 err | filter apply catch | skip + error_count++ | (透明)；`/watch list` 显示 `N events / M jq errors` |
-| `${ENV}` 未定义 | `start()` 替换时 | 拒绝注册 | "unresolved env var: API_KEY" |
+| `${ENV}` 未定义 / 空值 | `start()` 替换时（URL 和 headers 都查）| 拒绝注册（**不允许悄悄发空 bearer**）| "unresolved env var: API_KEY" |
+| 替换后 header / URL 出 log | tracing 调用点检查 | log 只写 host+path（不含 query），header name（不含 value）| (透明) |
 | 并发上限 | `start()` count check | 拒绝注册 | "limit reached (5/5)" |
 | Dedup 命中（User）| `start()` HashMap lookup | 返已有 id | "already running (5m 142evt). /watch stop w_xxx" |
 | Dedup 命中（Cron）| 同上 | 返已有 id | (静默，silent=true) |
@@ -492,11 +546,20 @@ tests/watch_origin.rs
 ## Known Gaps（v1 不解决，v2 再说）
 
 - WebSocket source
-- Last-Event-ID resume
 - watch.json5 持久化（跨重启自愈用 `/loop` 组合）
 - Monitor agent tool（共享核心，末端 sink 改 drain queue）
 - `--id <name>` 显式标签（YAGNI，dedup 用 source 字符串够了）
 - jq runtime（如果 jaq 集成成本高，v1 只交付 grep）
+
+### 已实现但 server 端未配合（client-only）
+
+- **Last-Event-ID resume**：客户端记录 `id:` 字段并在重连时发 header；rsclaw / astock gateway 目前不发 `id:` 也不识别 header，client 部分先 ship，server 上线时无须改 client
+
+### Nice-to-have（v1 有余力就做，否则 v2）
+
+- `--only <types>`：按 event type 白名单过滤，如 `--only hit,error` 静默 heartbeat
+- `--tee <path>`：事件同步追加到本地 jsonl 文件，配合 `/loop` 离线分析
+- JSON pretty-print：UI 端把 `data` 当 JSON 渲染，关键字段高亮（属 UI 层，gateway 端 spec 不管）
 
 ## Implementation Order
 
@@ -505,7 +568,12 @@ tests/watch_origin.rs
 3. `filter.rs`（grep 优先，jq stretch）
 4. `source.rs::FileSource`（最简单，能 e2e）
 5. `source.rs::ShellSource`（复用 preparse 已有 sh/powershell 分支）
-6. `source.rs::SseSource`（最复杂，参考 quick_stream.py）
+6. `source.rs::SseSource`（最复杂；分子步骤如下）
+   - 6a. 最小可用：headers + wire 解析（含 comment / multi-data / id），单连
+   - 6b. Reconnect 状态机（2s→30s cap，4xx fatal，retry: 头）
+   - 6c. 心跳超时检测（90s no-byte → 主动断）
+   - 6d. Last-Event-ID 记录 + 重连塞 header
+   - 6e. ${VAR} 替换（URL + headers）+ 空值拒绝 + log 脱敏
 7. `mod.rs` WatchRegistry + handle_command（串起来）
 8. `preparse.rs` 接入 + `PreparseOrigin` 重构
 9. `cron/mod.rs:1703` 改 origin=Cron
