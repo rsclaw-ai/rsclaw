@@ -9,4 +9,6 @@ pub mod filter;
 pub mod source;
 pub mod delivery;
 
+mod sse;
+
 // Re-exported types and entry points are added in Task 16 (Registry).

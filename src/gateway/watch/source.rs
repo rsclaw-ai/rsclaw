@@ -97,7 +97,7 @@ impl SourceImpl {
         match self {
             SourceImpl::File(s) => run_file(s, tx, stop).await,
             SourceImpl::Shell(s) => run_shell(s, tx, stop).await,
-            SourceImpl::Sse(_) => unimplemented!("Task 10–14: SseSource"),
+            SourceImpl::Sse(s) => crate::gateway::watch::sse::run_sse(s, tx, stop).await,
         }
     }
 
