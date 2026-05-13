@@ -601,6 +601,12 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // All channels registered - now wrap for sharing with cron runner
     let channel_manager = Arc::new(channel_manager);
 
+    // /watch registry — events fly directly from sources to chat without going
+    // through the agent. Must be initialized after channels are registered so
+    // delivery can resolve any channel name (esp. for /loop /watch composition).
+    crate::gateway::watch::WatchRegistry::init(Arc::clone(&channel_manager));
+    tracing::info!("watch registry initialized");
+
     // Create cron reload broadcast channel (used to notify CronRunner of new jobs)
     let (cron_reload_tx, _cron_reload_rx) = tokio::sync::broadcast::channel::<()>(16);
     // Make the sender reachable from non-server paths (fast preparse `/loop`).
