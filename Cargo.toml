@@ -55,6 +55,13 @@ crossterm = "0.28"
 # Utilities
 uuid    = { version = "1", features = ["v4"] }
 regex   = "1"
+
+# jq interpreter for /watch --jq <expr> and built-in templates.
+# `sync` feature makes jaq_json::Val use Arc instead of Rc, so the
+# compiled filter can cross tokio task boundaries.
+jaq-core = "3"
+jaq-json = { version = "2", features = ["sync"] }
+jaq-std  = "3"
 chrono  = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 tracing = "0.1"

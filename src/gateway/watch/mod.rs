@@ -4,9 +4,11 @@ pub mod dedup;
 pub mod parser;
 pub mod rate_limit;
 pub mod filter;
+pub mod jq;
 pub mod source;
 pub mod delivery;
 mod sse;
+pub mod template;
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -67,6 +69,12 @@ struct WatchTask {
     event_count: Arc<std::sync::atomic::AtomicU64>,
     error_count: Arc<std::sync::atomic::AtomicU64>,
     stop_tx: Option<oneshot::Sender<()>>,
+    /// Originating account for multi-account channels (e.g. feishu with
+    /// two `appId`s). Stored so subsequent event deliveries route via the
+    /// same app that received the `/watch` command. `None` means "use the
+    /// bare channel name", which is the right default for single-account
+    /// channels and the safe fallback when the caller can't supply it.
+    account: Option<String>,
 }
 
 pub struct WatchRegistry {
@@ -107,6 +115,7 @@ impl WatchRegistry {
         self: Arc<Self>,
         channel: &str,
         peer: &str,
+        account: Option<String>,
         body: &str,
         origin: Origin,
     ) -> WatchCommandReply {
@@ -125,7 +134,7 @@ impl WatchRegistry {
                     format!("No active watch `{id}` for this channel/peer.")
                 })
             }
-            Ok(ParsedCommand::Start(spec)) => self.handle_start(channel, peer, spec, origin).await,
+            Ok(ParsedCommand::Start(spec)) => self.handle_start(channel, peer, account, spec, origin).await,
         }
     }
 
@@ -133,6 +142,7 @@ impl WatchRegistry {
         self: Arc<Self>,
         channel: &str,
         peer: &str,
+        account: Option<String>,
         spec: WatchSpec,
         origin: Origin,
     ) -> WatchCommandReply {
@@ -179,7 +189,17 @@ impl WatchRegistry {
                 return WatchCommandReply::Reply(format!("/watch failed: {e}"));
             }
         };
-        let filter = match Filter::from_spec(spec.grep.as_deref(), spec.jq.as_deref()) {
+        // Resolve `--template <name>` defaults into any flag slots the
+        // user left empty. User flags always win — the template only
+        // fills holes — so `--template astock --grep ERR` keeps the
+        // template's jq/event-filter while overriding nothing.
+        let (effective_grep, effective_jq, effective_event_filter) =
+            resolve_template_defaults(&spec);
+        let filter = match Filter::from_spec(
+            effective_grep.as_deref(),
+            effective_jq.as_deref(),
+            effective_event_filter,
+        ) {
             Ok(f) => f,
             Err(e) => {
                 drop(inner);
@@ -206,6 +226,7 @@ impl WatchRegistry {
                 event_count: event_count.clone(),
                 error_count: error_count.clone(),
                 stop_tx: Some(stop_tx),
+                account: account.clone(),
             },
         );
         drop(inner); // Release the lock BEFORE we spawn long-running tasks.
@@ -218,11 +239,13 @@ impl WatchRegistry {
         let peer_s = peer.to_owned();
         let id_clone = id.clone();
         let rate_ms = spec.rate_ms;
+        let account_for_loop = account.clone();
         tokio::spawn(async move {
             registry
                 .processor_loop(
                     channel_s,
                     peer_s,
+                    account_for_loop,
                     id_clone,
                     filter,
                     rate_ms,
@@ -261,6 +284,7 @@ impl WatchRegistry {
         self: Arc<Self>,
         channel: String,
         peer: String,
+        account: Option<String>,
         id: WatchId,
         filter: Filter,
         rate_ms: u64,
@@ -282,6 +306,17 @@ impl WatchRegistry {
         let mut heartbeat_tick = tokio::time::interval(HEARTBEAT_INTERVAL);
         heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_count_at_tick = 0u64;
+        // Deduplicate consecutive identical lifecycle events so a SSE
+        // source that's stuck in connect-refused reconnect-loop (e.g.
+        // upstream's intraday_heal cron just bounced it) doesn't spam
+        // chat with `_disconnect ... _disconnect ... _disconnect ...`
+        // every backoff cycle (2s→4s→8s→...→30s). The first occurrence
+        // is informative; identical repeats are noise. Reset on the
+        // next non-lifecycle event (proves connection is healthy again).
+        // Lifecycle signature = `event_type|reason`; carrying `reason`
+        // lets a DIFFERENT failure mode (e.g. heartbeat_timeout after
+        // a streak of connect errors) still surface as fresh.
+        let mut last_lifecycle_sig: Option<String> = None;
 
         loop {
             tokio::select! {
@@ -290,20 +325,40 @@ impl WatchRegistry {
                         event_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         // Lifecycle events: pass through to chat as a plain message (no rate limit).
                         if ev.event.starts_with('_') {
-                            let _ = delivery::deliver(
-                                &self.channels,
-                                &channel,
-                                &peer,
-                                format!("watch {id}: {} {}", ev.event, ev.data),
-                            ).await;
+                            let reason = ev
+                                .data
+                                .get("reason")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let sig = format!("{}|{}", ev.event, reason);
+                            let is_new = last_lifecycle_sig.as_deref() != Some(&sig);
+                            if is_new {
+                                last_lifecycle_sig = Some(sig);
+                                let _ = delivery::deliver(
+                                    &self.channels,
+                                    &channel,
+                                    account.as_deref(),
+                                    &peer,
+                                    format!("watch {id}: {} {}", ev.event, ev.data),
+                                ).await;
+                            }
                             if matches!(ev.event.as_str(), "_error" | "_disconnect") && ev.data.get("fatal").and_then(|v| v.as_bool()).unwrap_or(false) {
                                 break;
                             }
                             continue;
                         }
-                        if let Some(display) = filter.apply(&ev) {
+                        // Real data event arrived — connection is healthy
+                        // again. Clear the lifecycle dedup so any future
+                        // disconnect surfaces as fresh (we want users to
+                        // see "stream just dropped" if it happens after
+                        // working normally for a while).
+                        last_lifecycle_sig = None;
+                        // jq with array expansion (e.g. `.codes[]`)
+                        // produces multiple lines from one event; each
+                        // goes through the rate limiter independently.
+                        for display in filter.apply(&ev) {
                             if let Some(out) = limiter.admit(display, now_ms()) {
-                                self.send_delivery(&channel, &peer, out).await;
+                                self.send_delivery(&channel, account.as_deref(), &peer, out).await;
                             }
                         }
                     }
@@ -311,7 +366,7 @@ impl WatchRegistry {
                 },
                 _ = rate_tick.tick() => {
                     if let Some(out) = limiter.flush_pending(now_ms()) {
-                        self.send_delivery(&channel, &peer, out).await;
+                        self.send_delivery(&channel, account.as_deref(), &peer, out).await;
                     }
                 }
                 _ = heartbeat_tick.tick() => {
@@ -320,6 +375,7 @@ impl WatchRegistry {
                         let _ = delivery::deliver(
                             &self.channels,
                             &channel,
+                            account.as_deref(),
                             &peer,
                             format!("watch {id} active, 0 events in last 10m"),
                         ).await;
@@ -336,14 +392,14 @@ impl WatchRegistry {
         info!(channel = %channel, peer = %peer, id = %id, "watch processor exited");
     }
 
-    async fn send_delivery(&self, channel: &str, peer: &str, msg: DeliveryMsg) {
+    async fn send_delivery(&self, channel: &str, account: Option<&str>, peer: &str, msg: DeliveryMsg) {
         let body = match msg {
             DeliveryMsg::Single(s) => s,
             DeliveryMsg::Batch { last, dropped } => {
                 format!("{dropped} more events in 2s, last: {last}")
             }
         };
-        if let Err(e) = delivery::deliver(&self.channels, channel, peer, body).await {
+        if let Err(e) = delivery::deliver(&self.channels, channel, account, peer, body).await {
             warn!(channel = %channel, peer = %peer, "watch delivery failed: {e}");
         }
     }
@@ -424,20 +480,66 @@ impl WatchRegistry {
     }
 }
 
-fn build_source_impl(spec: &WatchSpec) -> Result<SourceImpl, WatchStartError> {
+/// Public alias used by the `rsclaw watch` CLI (`src/cmd/watch.rs`) so
+/// it can share the same template-resolution logic as the chat-side
+/// `/watch` slash command.
+pub fn resolve_template_defaults_for_cli(
+    spec: &WatchSpec,
+) -> (Option<String>, Option<String>, Option<parser::EventFilter>) {
+    resolve_template_defaults(spec)
+}
+
+/// Resolve `--template <name>` against a spec, returning the effective
+/// `(grep, jq, event_filter)` triple that should drive the filter
+/// pipeline. User-supplied flags always win — the template only fills
+/// slots the user left empty. The parser already validated the
+/// template name, so an unknown name here is a programming error.
+fn resolve_template_defaults(
+    spec: &WatchSpec,
+) -> (Option<String>, Option<String>, Option<parser::EventFilter>) {
+    let template = spec.template.as_deref().and_then(|name| template::lookup(name).ok());
+    let jq = spec.jq.clone().or_else(|| {
+        template
+            .and_then(|t| t.jq)
+            .map(|s| s.to_owned())
+    });
+    let event_filter = spec.event_filter.clone().or_else(|| {
+        template
+            .and_then(|t| t.event_filter)
+            .and_then(|raw| parser::EventFilter::parse(raw).ok())
+    });
+    (spec.grep.clone(), jq, event_filter)
+}
+
+pub(crate) fn build_source_impl(spec: &WatchSpec) -> Result<SourceImpl, WatchStartError> {
+    // Resolve `${VAR}` references in raw_source up-front so every source kind
+    // gets consistent env-var support. Without this, file paths would be
+    // taken literally and shell commands would depend on the platform's
+    // shell to expand vars (works in `sh -c` on Unix, breaks on Windows
+    // `powershell -Command` which uses `$env:VAR` syntax instead).
+    // SSE headers are still substituted inside SseSource::build because
+    // they live outside raw_source.
+    let resolved_source = crate::gateway::watch::sse::substitute_env_vars(&spec.raw_source)
+        .map_err(|e| WatchStartError::UnresolvedEnv(e.to_string()))?;
+
     match spec.kind {
         SourceKind::File => {
-            let path = std::path::PathBuf::from(&spec.raw_source);
+            // Also expand a leading `~` / `~/` / `~\` so users can write paths
+            // the way they'd type them in a shell.
+            let path = crate::config::loader::expand_tilde_path_pub(&resolved_source);
             if !path.exists() {
-                return Err(WatchStartError::InvalidPath(spec.raw_source.clone()));
+                return Err(WatchStartError::InvalidPath(resolved_source));
             }
             Ok(SourceImpl::File(FileSource { path }))
         }
         SourceKind::Shell => Ok(SourceImpl::Shell(ShellSource {
-            cmd: spec.raw_source.clone(),
+            cmd: resolved_source,
         })),
         SourceKind::Sse => {
-            let sse = SseSource::build(&spec.raw_source, &spec.headers)?;
+            // SseSource::build runs substitute_env_vars on the URL again, which
+            // is a no-op (the regex finds no remaining `${...}` after our pass)
+            // but keeps the SSE-headers substitution logic local to that path.
+            let sse = SseSource::build(&resolved_source, &spec.headers)?;
             Ok(SourceImpl::Sse(sse))
         }
     }
@@ -472,4 +574,53 @@ fn now_ms() -> u64 {
 pub enum Origin {
     User,
     Cron,
+}
+
+#[cfg(test)]
+mod build_tests {
+    use super::*;
+    use crate::gateway::watch::parser::SourceKind;
+
+    fn spec_file(raw: &str) -> WatchSpec {
+        WatchSpec {
+            kind: SourceKind::File,
+            raw_source: raw.to_owned(),
+            headers: vec![],
+            grep: None,
+            jq: None,
+            rate_ms: 0,
+            event_filter: None,
+            template: None,
+        }
+    }
+
+    #[test]
+    fn file_source_expands_env_var() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("app.log");
+        std::fs::write(&log_path, b"line\n").unwrap();
+
+        // Unique env var name so other tests don't race.
+        unsafe { std::env::set_var("WATCH_BUILD_TEST_DIR", dir.path().to_str().unwrap()) };
+        let impl_ = build_source_impl(&spec_file("${WATCH_BUILD_TEST_DIR}/app.log"))
+            .expect("env var should resolve and path should exist");
+        unsafe { std::env::remove_var("WATCH_BUILD_TEST_DIR") };
+
+        match impl_ {
+            SourceImpl::File(f) => assert_eq!(f.path, log_path),
+            _ => panic!("expected File source"),
+        }
+    }
+
+    #[test]
+    fn file_source_unset_env_var_errors() {
+        unsafe { std::env::remove_var("WATCH_BUILD_TEST_MISSING") };
+        match build_source_impl(&spec_file("${WATCH_BUILD_TEST_MISSING}/x.log")) {
+            Ok(_) => panic!("missing env var should error"),
+            Err(WatchStartError::UnresolvedEnv(name)) => {
+                assert!(name.contains("WATCH_BUILD_TEST_MISSING"), "got: {name}");
+            }
+            Err(other) => panic!("expected UnresolvedEnv, got {other:?}"),
+        }
+    }
 }

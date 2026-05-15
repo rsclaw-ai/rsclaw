@@ -647,6 +647,15 @@ impl ChannelManager {
     }
 
     pub fn register(&mut self, ch: Arc<dyn Channel>) -> Result<()> {
+        let name = ch.name().to_owned();
+        self.register_with_name(name, ch)
+    }
+
+    /// Register a channel under a specific name (defaults to `ch.name()`).
+    /// Used for multi-account channels that need both an account-keyed
+    /// alias (e.g. `"feishu/main"`) and a bare-name fallback so callers
+    /// can route by account when they know it.
+    pub fn register_with_name(&mut self, name: String, ch: Arc<dyn Channel>) -> Result<()> {
         if self.channels.len() >= self.max_concurrent() {
             anyhow::bail!(
                 "channel limit reached ({}) for memory tier {:?}",
@@ -654,7 +663,7 @@ impl ChannelManager {
                 self.tier
             );
         }
-        self.channels.insert(ch.name().to_owned(), ch);
+        self.channels.insert(name, ch);
         Ok(())
     }
 

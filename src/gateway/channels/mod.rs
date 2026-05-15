@@ -53,7 +53,7 @@ use crate::{
 };
 
 use super::preparse::{
-    btw_direct_call, is_fast_preparse, try_preparse_locally,
+    btw_direct_call, is_fast_preparse, try_preparse_locally, try_preparse_locally_with_account,
 };
 use super::startup::handle_pending_analysis;
 

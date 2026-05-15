@@ -40,6 +40,23 @@ pub(crate) async fn try_preparse_locally(
     peer_id: &str,
     origin: PreparseOrigin,
 ) -> Option<OutboundMessage> {
+    try_preparse_locally_with_account(text, handle, channel, peer_id, None, origin).await
+}
+
+/// Account-aware variant. Channels that need multi-account routing
+/// (e.g. feishu with several `appId`s) call this with the account name
+/// so deliveries to long-running registrations (notably `/watch`) can
+/// route back through the SAME app that received the inbound message.
+/// Open IDs are per-app in feishu — sending via the wrong app fails
+/// with 99992361 "open_id cross app".
+pub(crate) async fn try_preparse_locally_with_account(
+    text: &str,
+    handle: &crate::agent::AgentHandle,
+    channel: &str,
+    peer_id: &str,
+    account: Option<&str>,
+    origin: PreparseOrigin,
+) -> Option<OutboundMessage> {
     use std::sync::atomic::Ordering;
     let t = text.trim();
     let lower = t.to_lowercase();
@@ -485,7 +502,7 @@ $g.Dispose();$b.Dispose()"#
             PreparseOrigin::Cron => crate::gateway::watch::Origin::Cron,
         };
         return match registry
-            .handle_command(channel, peer_id, body, origin_for_watch)
+            .handle_command(channel, peer_id, account.map(str::to_owned), body, origin_for_watch)
             .await
         {
             crate::gateway::watch::WatchCommandReply::Reply(s) => Some(txt(s)),
