@@ -37,6 +37,27 @@ use super::channels::{start_channels, start_custom_channels};
 use super::providers::build_providers;
 
 // ---------------------------------------------------------------------------
+// Sync-only channel allow-list
+// ---------------------------------------------------------------------------
+
+/// Channels whose responses arrive back at the caller through a non-
+/// notification transport — currently the HTTP `/api/v1/message`
+/// endpoint, which uses a `oneshot::reply_tx` on the `AgentMessage`
+/// plus an optional SSE byte stream.
+///
+/// The agent runtime still fans the assistant reply out onto the
+/// notification bus for observers (UI, telemetry), so this list
+/// suppresses the otherwise-misleading `WARN: no channel sender
+/// registered` log for those known-by-design absences. Future
+/// sync-only entry points (stdio MCP, in-process embeds, etc.)
+/// should be added here.
+const SYNC_ONLY_CHANNELS: &[&str] = &["api"];
+
+fn is_sync_only_channel(name: &str) -> bool {
+    SYNC_ONLY_CHANNELS.contains(&name)
+}
+
+// ---------------------------------------------------------------------------
 // Gateway entry point
 // ---------------------------------------------------------------------------
 
@@ -423,6 +444,21 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                         if let Err(e) = tx.send(msg.clone()).await {
                             tracing::warn!(error = %e, "notification send failed");
                         }
+                    } else if is_sync_only_channel(ch_name) {
+                        // sync-only channels (HTTP /api/v1/message, future stdio
+                        // MCP, etc.) carry their reply back through their own
+                        // transport — the oneshot reply_tx on the AgentMessage,
+                        // an SSE byte stream, etc. The notification fan-out
+                        // here is a fire-and-forget event-bus emit for
+                        // observers (UI, telemetry) and the absence of a
+                        // registered sender is by design, not a misconfig.
+                        // Surface at debug so operators can still see the
+                        // dispatch path without flooding logs on every API
+                        // call.
+                        tracing::debug!(
+                            channel = %ch_name,
+                            "notification: sync-only channel, no sender expected"
+                        );
                     } else {
                         warn!(channel = %ch_name, "no channel sender registered for notification");
                     }
