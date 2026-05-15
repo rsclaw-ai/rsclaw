@@ -514,70 +514,20 @@ impl AgentRuntime {
             }
         }
 
-        // --- Auto-fetch relevant results for deeper content ---
-        // Score each result by relevance to the query, only deep-fetch those
-        // that are likely useful.  This avoids wasting time on unrelated pages.
-        let query_terms: Vec<String> = query.to_lowercase()
-            .split_whitespace()
-            .filter(|w| w.len() > 1)
-            .map(String::from)
-            .collect();
-
-        let fetch_urls: Vec<String> = results.iter()
-            .filter(|r| {
-                let title = r["title"].as_str().unwrap_or("").to_lowercase();
-                let snippet = r["snippet"].as_str().unwrap_or("").to_lowercase();
-                let haystack = format!("{title} {snippet}");
-
-                // Count how many query terms appear in title+snippet.
-                let hits = query_terms.iter()
-                    .filter(|t| haystack.contains(t.as_str()))
-                    .count();
-
-                // Require at least half the query terms to match, or always
-                // include the first 2 results as fallback.
-                hits * 2 >= query_terms.len() || hits > 0
-            })
-            .take(5)
-            .filter_map(|r| r["url"].as_str().map(String::from))
-            .collect();
-
-        if !fetch_urls.is_empty() {
-            let fetch_client = reqwest::Client::builder()
-                .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-                    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                .timeout(Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::limited(5))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new());
-
-            // Fetch all URLs concurrently.
-            let fetches = fetch_urls.iter().map(|url| {
-                let client = fetch_client.clone();
-                let url = url.clone();
-                async move {
-                    let resp = client.get(&url).send().await.ok()?;
-                    let html = resp.text().await.ok()?;
-                    let content_type = "text/html"; // assume HTML
-                    let md = if content_type.contains("text/html") {
-                        html_dehydrate_to_text(&html)
-                    } else {
-                        html
-                    };
-                    // Truncate to 2000 chars.
-                    let truncated = truncate_chars(&md, 2000);
-                    Some((url, truncated))
-                }
-            });
-            let fetched: Vec<Option<(String, String)>> = futures::future::join_all(fetches).await;
-
-            // Attach content to matching results.
-            for (url, content) in fetched.into_iter().flatten() {
-                for r in results.iter_mut() {
-                    if r["url"].as_str() == Some(url.as_str()) {
-                        r["content"] = json!(content);
-                        break;
-                    }
+        // Cap each snippet at 400 chars so a chatty provider can't bloat
+        // the search result blob. Snippets from search engines are normally
+        // 150-300 chars; the 400 cap is a safety net for providers like
+        // Firecrawl whose `description` can run longer. We do NOT auto-fetch
+        // page content here — `web_search` returns snippets only, and the
+        // agent calls `web_fetch` on URLs it wants to read. This keeps each
+        // search-result blob ~2 KB instead of the 12-15 KB the previous
+        // parallel auto-fetch pipeline produced (5 results × 2 KB content
+        // each), which routinely evicted the main session's prefix cache
+        // when results were stored verbatim into conversation history.
+        for r in results.iter_mut() {
+            if let Some(s) = r["snippet"].as_str() {
+                if s.chars().count() > 400 {
+                    r["snippet"] = json!(truncate_chars(s, 400));
                 }
             }
         }

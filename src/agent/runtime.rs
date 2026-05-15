@@ -1188,9 +1188,17 @@ impl AgentRuntime {
             format!("User question: {user_question}\n\nTool ({tool_name}) returned:\n{capped}")
         };
 
-        // Step 5: single LLM call — extract the answer, no cache markers,
-        // no tools.  Like vision: raw content goes in, structured answer comes out.
-        let model = self.resolve_model_name();
+        // Step 5: single LLM call on the flash model — raw content + the
+        // user question goes in, a targeted compressed answer comes out.
+        // Routing to the flash model (configured via
+        // `agents.defaults.model.flash`) means this auxiliary call never
+        // competes with the agent's primary-model KV cache; on the rsclaw
+        // provider it rides an incremental session (kv_cache_mode=2 with a
+        // stable session_key) so the system prompt stays warm across the
+        // many compression calls a single web_browser-heavy turn produces.
+        // Non-rsclaw providers silently ignore kv_cache_mode / session_key
+        // and behave as stateless calls — same code path for both.
+        let model = self.resolve_flash_model_name();
         let req = LlmRequest {
             model,
             messages: vec![Message {
@@ -1211,8 +1219,8 @@ impl AgentRuntime {
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None,
-            kv_cache_mode: 0,
-            session_key: None,
+            kv_cache_mode: 2,
+            session_key: Some(format!("flash:compress:{}", session_key)),
             system_shared: None,
             system_user: None,
         };
@@ -5542,127 +5550,97 @@ impl AgentRuntime {
                     }
                 }
 
-                // Compress or truncate tool result for session storage.
+                // Cap or compress tool result for session storage.
                 //
-                // Web tools (web_fetch / web_browser / web_search) with large
-                // results go through an ephemeral LLM call that extracts only
-                // the answer.  Raw HTML / search-result JSON never enters the
-                // conversation history.  Other tools are truncated as before.
+                // Routing per tool:
+                //   - web_search       -> truncate to limits.web_search (snippets
+                //                         only; no inline page content since the
+                //                         auto-fetch pipeline was removed).
+                //   - web_fetch        -> compress on the flash model when raw
+                //                         exceeds limits.web_fetch, else truncate.
+                //   - web_browser/browser -> compress on the flash model when raw
+                //                         exceeds limits.web_browser, else
+                //                         truncate. Stateful browser tasks fire
+                //                         many snapshots per turn, so compression
+                //                         must NOT compete with the primary
+                //                         model's KV cache — see
+                //                         compress_tool_result_for_session.
+                //   - everything else  -> per-tool truncate, with use_skill
+                //                         kept large because SKILL.md must
+                //                         arrive verbatim.
                 let session_text = {
-                    // Was 1000 bytes — too aggressive. Any clean JSON / API
-                    // response above 1KB triggered a 30-60 s LLM "compression"
-                    // pass that lost structure for no benefit. The threshold
-                    // now reflects what *actually* needs compression: raw HTML
-                    // dumps that survive the dehydrate pipeline.
-                    const WEB_COMPRESS_THRESHOLD: usize = 32_000;
-                    let is_web_tool = matches!(
+                    use super::web_parsers::truncate_chars;
+
+                    let limits_owned = self
+                        .live
+                        .ext
+                        .read()
+                        .await
+                        .tools
+                        .as_ref()
+                        .and_then(|t| t.session_result_limits.clone());
+                    let limits = limits_owned.as_ref();
+
+                    let max_chars = match tool_name.as_str() {
+                        "execute_command" | "exec" => {
+                            limits.and_then(|l| l.exec).unwrap_or(3000)
+                        }
+                        "web_search" => {
+                            limits.and_then(|l| l.web_search).unwrap_or(2000)
+                        }
+                        "web_fetch" => {
+                            limits.and_then(|l| l.web_fetch).unwrap_or(5000)
+                        }
+                        "web_browser" | "browser" => {
+                            limits.and_then(|l| l.web_browser).unwrap_or(2000)
+                        }
+                        // use_skill returns SKILL.md, which is a contract
+                        // document the LLM MUST see in full. Truncating it
+                        // caused the agent to hallucinate CLI invocations
+                        // (e.g. flyai's SKILL.md says `npm i -g
+                        // @fly-ai/flyai-cli` on line 60 — past the 3000-char
+                        // cut — so the agent saw only `runtime: node` in
+                        // frontmatter and made up `node index.js` instead).
+                        "use_skill" => {
+                            limits.and_then(|l| l.default).unwrap_or(60_000)
+                        }
+                        "read_file" | "read" => {
+                            limits.and_then(|l| l.default).unwrap_or(3000)
+                        }
+                        _ => limits.and_then(|l| l.default).unwrap_or(3000),
+                    };
+
+                    let needs_compression = matches!(
                         tool_name.as_str(),
-                        "web_fetch" | "web_browser" | "browser" | "web_search"
+                        "web_fetch" | "web_browser" | "browser"
                     );
 
-                    // Structured responses (JSON / Atom XML / RSS / plain
-                    // markdown lists) are already useful as-is; sending them
-                    // through an LLM "extractor" just truncates and reformats
-                    // for no gain. Detect heuristically by the first
-                    // non-whitespace byte.
-                    let starts_structured = result_text
-                        .trim_start()
-                        .as_bytes()
-                        .first()
-                        .is_some_and(|b| matches!(b, b'{' | b'[' | b'<'));
-
-                    if is_web_tool
-                        && starts_structured
-                        && result_text.len() <= 50_000
-                    {
-                        // Structured web response (JSON / Atom / XML) under
-                        // 50KB: pass through verbatim so the agent reads the
-                        // raw structured data. Truncating to the generic 3KB
-                        // default in the non-web branch would clip useful
-                        // fields (e.g. multiple Stack Exchange questions).
-                        result_text.clone()
-                    } else if is_web_tool
-                        && !starts_structured
-                        && result_text.len() > WEB_COMPRESS_THRESHOLD
-                    {
+                    if needs_compression && result_text.chars().count() > max_chars {
                         let sk = ctx.session_key.clone();
                         let tn = tool_name.clone();
-                        match self.compress_tool_result_for_session(&sk, &tn, &result_text).await {
+                        match self
+                            .compress_tool_result_for_session(&sk, &tn, &result_text)
+                            .await
+                        {
                             Ok(summary) => {
                                 debug!(
                                     tool = %tn,
                                     orig = result_text.len(),
                                     compressed = summary.len(),
-                                    "tool result compressed for session"
+                                    "tool result compressed via flash model"
                                 );
-                                summary
+                                truncate_chars(&summary, max_chars)
                             }
                             Err(e) => {
-                                warn!(tool = %tn, error = %e, "tool result compression failed, truncating");
-                                let max = 3000usize;
-                                if result_text.len() > max {
-                                    let end = result_text
-                                        .char_indices()
-                                        .nth(max)
-                                        .map(|(i, _)| i)
-                                        .unwrap_or(result_text.len());
-                                    format!(
-                                        "{}\n[...truncated, {}/{} chars]",
-                                        &result_text[..end],
-                                        max,
-                                        result_text.len()
-                                    )
-                                } else {
-                                    result_text.clone()
-                                }
+                                warn!(tool = %tn, error = %e,
+                                    "tool result compression failed, truncating");
+                                truncate_chars(&result_text, max_chars)
                             }
                         }
+                    } else if result_text.chars().count() > max_chars {
+                        truncate_chars(&result_text, max_chars)
                     } else {
-                        // Non-web tools: keep existing per-tool limits.
-                        let limits_owned = self
-                            .live
-                            .ext
-                            .read()
-                            .await
-                            .tools
-                            .as_ref()
-                            .and_then(|t| t.session_result_limits.clone());
-                        let limits = limits_owned.as_ref();
-                        let max_chars = match tool_name.as_str() {
-                            "execute_command" | "exec" => {
-                                limits.and_then(|l| l.exec).unwrap_or(3000)
-                            }
-                            "read_file" | "read" => {
-                                limits.and_then(|l| l.default).unwrap_or(3000)
-                            }
-                            // use_skill returns SKILL.md, which is a contract
-                            // document the LLM MUST see in full. Truncating
-                            // it caused the agent to hallucinate CLI
-                            // invocations (e.g. flyai's SKILL.md says
-                            // `npm i -g @fly-ai/flyai-cli` on line 60 — past
-                            // the 3000-char cut — so the agent saw only
-                            // `runtime: node` in frontmatter and made up
-                            // `node index.js` instead).
-                            "use_skill" => {
-                                limits.and_then(|l| l.default).unwrap_or(60_000)
-                            }
-                            _ => limits.and_then(|l| l.default).unwrap_or(3000),
-                        };
-                        if result_text.len() > max_chars {
-                            let end = result_text
-                                .char_indices()
-                                .nth(max_chars)
-                                .map(|(i, _)| i)
-                                .unwrap_or(result_text.len());
-                            format!(
-                                "{}\n[...truncated, {}/{} chars]",
-                                &result_text[..end],
-                                max_chars,
-                                result_text.len()
-                            )
-                        } else {
-                            result_text.clone()
-                        }
+                        result_text.clone()
                     }
                 };
 
