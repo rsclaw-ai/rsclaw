@@ -271,21 +271,74 @@ impl AgentRuntime {
             })
         };
 
-        // Summarise the old portion.
-        // KV cache mode: append summary instruction to existing session messages
-        // so the LLM reuses the already-cached prefix. Only the summary prompt
-        // itself needs to be computed. Falls back to standalone mode on failure.
-        let summary = if kv_cache_mode >= 1 && mode != CompactionMode::Safeguard {
-            let result = self.compact_with_kv_cache(
-                session_key,
-                compaction_model,
-                &old_text,
-                previous_summary.as_deref(),
-            ).await;
+        // Summarise the old portion. Three mutually-exclusive paths
+        // keyed off the agent's `kv_cache_mode`:
+        //
+        //   mode = 2  →  rsclaw stateful incremental protocol. The
+        //                summary request rides the SAME `/sessions/<id>/turn`
+        //                as a normal turn — worker has prefix+history
+        //                cached, delta is just the "summarize" instruction
+        //                (~200 tokens). On failure we DO NOT fall back to
+        //                `compact_single`: that path sends mode=0 with the
+        //                full history as a fresh user message, which the
+        //                rsclaw provider rejects up-front (so the fallback
+        //                is also useless) AND if it somehow reached the
+        //                worker, would force a 150-270s cold prefill of
+        //                the entire 30-50k-token history — wedging a slot
+        //                the whole time, at exactly the moment the worker
+        //                is already stressed. Skip this round, retry next
+        //                turn. Also ignore `CompactionMode::Safeguard`:
+        //                its chunked-replay design fights the incremental
+        //                session model.
+        //
+        //   mode = 1  →  legacy slot-cache. Worker keeps the prefix in
+        //                its slot; the compact-with-kv-cache fast path
+        //                appends a summary message and lets the slot
+        //                cache amortize the prefix. On failure, falling
+        //                back to `compact_single` is safe: same provider,
+        //                same prefix bytes, slot still re-uses the cache.
+        //                No worker-side protocol mismatch.
+        //
+        //   mode = 0 / Safeguard
+        //             →  no KV cache assumption — always standalone
+        //                `compact_single` (or chunked variant). Same as
+        //                pre-incremental behavior.
+        let summary = if kv_cache_mode == 2 {
+            match self
+                .compact_with_kv_cache(
+                    session_key,
+                    compaction_model,
+                    &old_text,
+                    previous_summary.as_deref(),
+                )
+                .await
+            {
+                Some(s) => Some(s),
+                None => {
+                    warn!(
+                        session = session_key,
+                        "rsclaw KV-cache compaction failed; skipping this round (no fallback \
+                         to standalone — would force a 150-270s worker re-prefill of the \
+                         entire history). Next turn will retry. Investigate the \
+                         kv_cache_mode=2 turn in the rsclaw provider log."
+                    );
+                    None
+                }
+            }
+        } else if kv_cache_mode == 1 && mode != CompactionMode::Safeguard {
+            let result = self
+                .compact_with_kv_cache(
+                    session_key,
+                    compaction_model,
+                    &old_text,
+                    previous_summary.as_deref(),
+                )
+                .await;
             if result.is_some() {
                 result
             } else {
-                // Fallback to standalone summarization
+                // Legacy slot-cache fallback is harmless: same provider,
+                // same prefix bytes, worker slot still amortizes.
                 info!(session = session_key, "KV cache compact failed, falling back to standalone");
                 self.compact_single(compaction_model, &old_text, previous_summary.as_deref()).await
             }
