@@ -1215,6 +1215,39 @@ struct SplitRequest<'a> {
     options: TurnOptions,
 }
 
+/// Walk a `serde_json::Value`, returning a deep copy with every
+/// `Object` map's keys reordered alphabetically. Arrays preserve
+/// input order (they're inherently positional). Primitives are
+/// cloned as-is.
+///
+/// Purpose: the crate-wide `preserve_order` feature on `serde_json`
+/// makes `Map<String, Value>` an `IndexMap` that keeps insertion
+/// order — fine for round-tripping JSON5 configs, but it lets the
+/// non-determinism of upstream `HashMap` iteration leak into the
+/// wire JSON sent to rsclaw-server. The worker hashes the
+/// `dynamic_prefix.tools` payload byte-by-byte to form its prefix
+/// cache key, so even one swapped key triggers a `dynamic_miss`
+/// and a full prefill (~200s on a 28k-token prefix). Sorting keys
+/// here gives a content-addressed canonical form: identical tool
+/// definitions → identical bytes → identical hash → `dynamic_hit`.
+fn to_canonical_value(v: serde_json::Value) -> serde_json::Value {
+    use std::collections::BTreeMap;
+    match v {
+        serde_json::Value::Object(map) => {
+            // BTreeMap forces alphabetical key order regardless of
+            // the original IndexMap's insertion sequence.
+            let sorted: BTreeMap<String, serde_json::Value> =
+                map.into_iter().map(|(k, v)| (k, to_canonical_value(v))).collect();
+            let canon: serde_json::Map<String, serde_json::Value> = sorted.into_iter().collect();
+            serde_json::Value::Object(canon)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(to_canonical_value).collect())
+        }
+        other => other,
+    }
+}
+
 fn split_request<'a>(req: &'a LlmRequest) -> Result<SplitRequest<'a>> {
     // `parse_model` strips any leading `rsclaw/` before the request
     // reaches this provider, so by the time we see `req.model` it's
@@ -1228,12 +1261,25 @@ fn split_request<'a>(req: &'a LlmRequest) -> Result<SplitRequest<'a>> {
         format!("rsclaw/{}", req.model)
     };
 
+    // Each tool's wire JSON is `to_canonical_value`-flattened to give
+    // byte-stable output across gateway runs. Without this pass the
+    // serialized `input_schema` carries whatever key order `serde_json`
+    // observed when each field was inserted — and because the crate is
+    // compiled with the `preserve_order` feature globally, ordering is
+    // whatever the source `HashMap` / macro / derive happened to emit,
+    // which is non-deterministic across runs. A flipped key in any of
+    // the dozens of schema entries flips the worker-side dynamic_prefix
+    // hash, forces `dynamic_miss`, and triggers a fresh 30-200s prefill
+    // on every gateway restart even though the agent's tool list is
+    // logically unchanged. Worker hash is content-addressed, so
+    // alphabetical key order alone makes "same tools" map to the same
+    // slot reliably.
     let tool_json = |t: &super::ToolDef| {
-        json!({
+        to_canonical_value(json!({
             "name": t.name,
             "description": t.description,
             "input_schema": t.parameters,
-        })
+        }))
     };
 
     let (dynamic_system, dynamic_user_suffix, dynamic_tools) =
@@ -2607,6 +2653,128 @@ data: {"type":"message_stop"}
             session_key: key.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn canonical_value_sorts_object_keys_alphabetically() {
+        // `preserve_order` keeps the IndexMap insertion order; passing
+        // a JSON literal in a non-alphabetical order verifies the
+        // canonical pass reorders keys.
+        let input = json!({
+            "z_last": 1,
+            "a_first": 2,
+            "m_mid": 3,
+        });
+        let canon = to_canonical_value(input);
+        let serialized = serde_json::to_string(&canon).unwrap();
+        // BTreeMap-sourced canonical output must emit keys alphabetically.
+        assert_eq!(serialized, r#"{"a_first":2,"m_mid":3,"z_last":1}"#);
+    }
+
+    #[test]
+    fn canonical_value_recurses_into_nested_objects() {
+        // The whole point of canonicalization is that nested schema
+        // bodies (input_schema.properties.{...}) also get a stable
+        // order — that's where actual tool parameter HashMaps surface.
+        let input = json!({
+            "outer_b": {"y": 1, "x": 2},
+            "outer_a": {"inner": {"z": 0, "a": 1}},
+        });
+        let canon = to_canonical_value(input);
+        let s = serde_json::to_string(&canon).unwrap();
+        assert_eq!(
+            s,
+            r#"{"outer_a":{"inner":{"a":1,"z":0}},"outer_b":{"x":2,"y":1}}"#
+        );
+    }
+
+    #[test]
+    fn canonical_value_preserves_array_order() {
+        // Arrays are positional, not associative — order is meaningful
+        // (e.g. tool ordering, message history). Don't touch.
+        let input = json!([3, 1, 2, {"b": 1, "a": 2}]);
+        let canon = to_canonical_value(input);
+        let s = serde_json::to_string(&canon).unwrap();
+        assert_eq!(s, r#"[3,1,2,{"a":2,"b":1}]"#);
+    }
+
+    #[test]
+    fn canonical_value_is_idempotent() {
+        // Running canonicalization twice must produce identical output —
+        // worker prefix hashing depends on byte equality across runs,
+        // so the operation must be a fixed point.
+        let input = json!({
+            "tools": [{
+                "name": "search",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}, "k": {"type": "integer"}},
+                    "required": ["q"]
+                }
+            }]
+        });
+        let once = to_canonical_value(input.clone());
+        let twice = to_canonical_value(once.clone());
+        assert_eq!(
+            serde_json::to_string(&once).unwrap(),
+            serde_json::to_string(&twice).unwrap()
+        );
+    }
+
+    #[test]
+    fn canonical_value_byte_stable_across_input_orderings() {
+        // The smoking-gun assertion: two logically-identical JSON
+        // values constructed with different insertion orders MUST
+        // serialize to the same bytes after canonicalization. This
+        // is the exact property the worker's prefix hash depends on.
+        let a = json!({
+            "z": [{"b": 1, "a": 2}],
+            "a": {"inner_z": 1, "inner_a": 2},
+        });
+        let b = json!({
+            "a": {"inner_a": 2, "inner_z": 1},
+            "z": [{"a": 2, "b": 1}],
+        });
+        let canon_a = to_canonical_value(a);
+        let canon_b = to_canonical_value(b);
+        assert_eq!(
+            serde_json::to_string(&canon_a).unwrap(),
+            serde_json::to_string(&canon_b).unwrap()
+        );
+    }
+
+    #[test]
+    fn split_request_dynamic_tools_are_canonical() {
+        // End-to-end: feed a tool whose input_schema has keys in a
+        // non-alphabetical order, verify the dynamic_tools entry the
+        // provider would put on the wire is in alphabetical order.
+        let mut req = req_with(vec![], 2, Some("k"));
+        req.tools = vec![crate::provider::ToolDef {
+            name: "search".into(),
+            description: "look stuff up".into(),
+            parameters: json!({
+                "type": "object",
+                "required": ["q"],
+                "properties": {
+                    "q": {"type": "string"},
+                    "k": {"type": "integer"},
+                }
+            }),
+        }];
+        let split = split_request(&req).unwrap();
+        assert_eq!(split.dynamic_tools.len(), 1);
+        let serialized = serde_json::to_string(&split.dynamic_tools[0]).unwrap();
+        // Top level keys: description, input_schema, name (alphabetical).
+        // input_schema body: properties, required, type. properties body: k, q.
+        // Property bodies: type only (single key — order irrelevant).
+        assert_eq!(
+            serialized,
+            concat!(
+                r#"{"description":"look stuff up","input_schema":"#,
+                r#"{"properties":{"k":{"type":"integer"},"q":{"type":"string"}},"#,
+                r#""required":["q"],"type":"object"},"name":"search"}"#
+            )
+        );
     }
 
     #[test]
