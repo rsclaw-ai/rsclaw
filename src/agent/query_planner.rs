@@ -157,7 +157,7 @@ Output ONLY valid JSON matching this schema (no prose, no markdown, no code fenc
 {{"sub_queries":[{{"q":"<cleaned keywords>","intent":{{"kind":"<intent>", ...fields}}}}]}}
 
 Intent kinds and required fields:
-  weather      : {{"kind":"weather","location":"<city in English>"}}
+  weather      : {{"kind":"weather","location":"<city, KEEP user's original language>"}}
   currency     : {{"kind":"currency","from":"<ISO code>","to":"<ISO code>"}}
   timezone     : {{"kind":"timezone","location":"<IANA zone ONLY, e.g. Asia/Shanghai>"}}
   wikipedia    : {{"kind":"wikipedia","topic":"<topic phrase>"}}
@@ -203,7 +203,11 @@ Rules:
 - CLEAN keywords: drop filler words and dates. The current time is already
   known, so never include dates/years in the "q" field for live-data queries
   (weather, currency, stock, etc.).
-- PREFER English city names for "weather" intent so API lookups hit.
+- PRESERVE the user's original language for "weather" location: wttr.in
+  accepts both Chinese and English natively, and weather.com.cn (the
+  authoritative CN source for 15-day forecasts) ONLY matches against
+  Chinese names. Translating Chinese inputs to English silently
+  downgrades CN-city responses to wttr's 3-day window.
 - KEEP Chinese keywords for Chinese sites: movie, restaurant, concert, shopping,
   stock, express, news, recipe, poem, idiom, sports, job, video, book, forum, law.
 - For date fields: use YYYY-MM-DD if user specifies a date, empty string if not.
@@ -214,9 +218,15 @@ Examples:
 
 Input: "曼谷、广州、武汉未来7天的天气"
 Output: {{"sub_queries":[
+  {{"q":"曼谷 天气","intent":{{"kind":"weather","location":"曼谷"}}}},
+  {{"q":"广州 天气","intent":{{"kind":"weather","location":"广州"}}}},
+  {{"q":"武汉 天气","intent":{{"kind":"weather","location":"武汉"}}}}
+]}}
+
+Input: "Bangkok, Sydney weather next week"
+Output: {{"sub_queries":[
   {{"q":"Bangkok weather","intent":{{"kind":"weather","location":"Bangkok"}}}},
-  {{"q":"Guangzhou weather","intent":{{"kind":"weather","location":"Guangzhou"}}}},
-  {{"q":"Wuhan weather","intent":{{"kind":"weather","location":"Wuhan"}}}}
+  {{"q":"Sydney weather","intent":{{"kind":"weather","location":"Sydney"}}}}
 ]}}
 
 Input: "美元兑人民币汇率"

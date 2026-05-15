@@ -15,6 +15,7 @@ pub mod btw;
 pub mod collaboration;
 pub mod compaction;
 pub mod context_mgr;
+pub mod direct_apis;
 pub mod doc;
 pub mod exec_pool;
 pub mod loop_detection;
