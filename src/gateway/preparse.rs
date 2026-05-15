@@ -901,7 +901,7 @@ pub(crate) async fn btw_direct_call(
         max_tokens: Some(500),
         temperature: None,
         frequency_penalty: None,
-        thinking_budget: None, kv_cache_mode: 0, session_key: None,
+        thinking_budget: None, endpoint: Default::default(), kv_cache_mode: 0, session_key: None,
         system_shared: None, system_user: None,
     };
 

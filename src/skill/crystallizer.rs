@@ -332,6 +332,7 @@ pub async fn distill_with_llm(
         temperature: Some(0.3),
         frequency_penalty: None,
         thinking_budget: None,
+        endpoint: Default::default(),
         kv_cache_mode: 0,
         session_key: None,
         system_shared: None,

@@ -657,7 +657,7 @@ pub(crate) async fn extract_entities_via_llm(
         max_tokens: Some(512),
         temperature: Some(0.0),
         frequency_penalty: None,
-        thinking_budget: None, kv_cache_mode: 0, session_key: None,
+        thinking_budget: None, endpoint: Default::default(), kv_cache_mode: 0, session_key: None,
         system_shared: None, system_user: None,
     };
 
@@ -810,7 +810,7 @@ pub(crate) async fn describe_image_via_llm(
         max_tokens: Some(300),
         temperature: Some(0.0),
         frequency_penalty: None,
-        thinking_budget: None, kv_cache_mode: 0, session_key: None,
+        thinking_budget: None, endpoint: Default::default(), kv_cache_mode: 0, session_key: None,
         system_shared: None, system_user: None,
     };
 

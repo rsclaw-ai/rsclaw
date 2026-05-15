@@ -386,6 +386,7 @@ async fn try_plan(
         temperature: Some(0.0),
         frequency_penalty: None,
         thinking_budget: None,
+        endpoint: Default::default(),
         kv_cache_mode: 0,
         session_key: None,
         system_shared: None,

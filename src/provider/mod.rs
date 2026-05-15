@@ -201,6 +201,39 @@ pub struct ToolDef {
     pub parameters: serde_json::Value,
 }
 
+/// Which logical endpoint family a request belongs to.
+///
+/// The rsclaw-server fleet exposes three sibling endpoint families
+/// under `/v1/agent/*` — `sessions` for the primary agent loop,
+/// `fastshot` for cheap auxiliary calls (compression, query rewrite,
+/// personal-info extraction), and `vision` for VL grounding. Each is
+/// filtered to a different worker pool server-side
+/// (`sessions_enabled` / `fastshot_enabled` / `vision_enabled`), so
+/// auxiliary traffic never competes with the primary loop's KV-cache
+/// slots.
+///
+/// The client encodes this routing decision **explicitly** on the
+/// request rather than parsing it out of the model name. The agent
+/// runtime knows what kind of call it is making (primary turn vs
+/// flash compression vs vision describe); this enum captures that
+/// intent and the rsclaw provider maps it to the right URL prefix.
+///
+/// Non-rsclaw providers (OpenAI, Anthropic, Gemini, …) ignore this
+/// field — they have no equivalent server-side concept.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentEndpoint {
+    /// `/v1/agent/sessions/*` — main agent conversation traffic.
+    #[default]
+    Primary,
+    /// `/v1/agent/fastshot/*` — auxiliary cheap-and-fast calls
+    /// (compression, query rewrite, side queries). Worker pool runs
+    /// a smaller model and never overlaps with `Primary` slots.
+    Flash,
+    /// `/v1/agent/vision/*` — VL grounding (image description,
+    /// computer_use screenshot reasoning).
+    Vision,
+}
+
 /// Full request to an LLM provider.
 #[derive(Debug, Clone, Default)]
 pub struct LlmRequest {
@@ -213,6 +246,10 @@ pub struct LlmRequest {
     pub frequency_penalty: Option<f32>,
     /// If > 0, the provider should enable extended thinking with this budget.
     pub thinking_budget: Option<u32>,
+    /// Which rsclaw-server endpoint family this request targets.
+    /// Defaults to `Primary` so existing call sites need no change.
+    /// Non-rsclaw providers ignore this field.
+    pub endpoint: AgentEndpoint,
     /// KV cache mode: 0=off, 1=append-only (default), 2=incremental (cache_id + delta).
     pub kv_cache_mode: u8,
     /// Session key for cache_id tracking (used when kv_cache_mode=2).

@@ -73,8 +73,8 @@ use crate::{
     gateway::live_config::LiveConfig,
     plugin::PluginRegistry,
     provider::{
-        ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent, ToolDef,
-        failover::FailoverManager, registry::ProviderRegistry,
+        AgentEndpoint, ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent,
+        ToolDef, failover::FailoverManager, registry::ProviderRegistry,
     },
     skill::{RunOptions, SkillRegistry, run_tool},
     store::Store,
@@ -1092,6 +1092,7 @@ impl AgentRuntime {
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None,
+            endpoint: Default::default(),
             kv_cache_mode: 0,
             session_key: None,
             system_shared: None,
@@ -1190,14 +1191,14 @@ impl AgentRuntime {
 
         // Step 5: single LLM call on the flash model — raw content + the
         // user question goes in, a targeted compressed answer comes out.
-        // Routing to the flash model (configured via
-        // `agents.defaults.model.flash`) means this auxiliary call never
-        // competes with the agent's primary-model KV cache; on the rsclaw
-        // provider it rides an incremental session (kv_cache_mode=2 with a
-        // stable session_key) so the system prompt stays warm across the
-        // many compression calls a single web_browser-heavy turn produces.
-        // Non-rsclaw providers silently ignore kv_cache_mode / session_key
-        // and behave as stateless calls — same code path for both.
+        // Routes via the rsclaw fastshot endpoint
+        // (`AgentEndpoint::Flash` → POST /v1/agent/fastshot) which is a
+        // one-shot stateless OpenAI-compat stream — no session, no
+        // kv_cache_mode, no session_key. The fastshot worker pool is
+        // filtered server-side via `fastshot_enabled`, so this call
+        // never competes with the primary agent's session slots.
+        // Non-rsclaw providers (OpenAI, Anthropic, etc.) ignore the
+        // endpoint field and just see a normal chat completion.
         let model = self.resolve_flash_model_name();
         let req = LlmRequest {
             model,
@@ -1219,11 +1220,16 @@ impl AgentRuntime {
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None,
-            kv_cache_mode: 2,
-            session_key: Some(format!("flash:compress:{}", session_key)),
+            endpoint: AgentEndpoint::Flash,
+            kv_cache_mode: 0,
+            session_key: None,
             system_shared: None,
             system_user: None,
         };
+        // session_key keeps it lints-quiet now that fastshot doesn't
+        // route through a stateful session — callers still pass one
+        // and we may revive use for telemetry / cache-tag later.
+        let _ = session_key;
 
         let providers = Arc::clone(&self.providers);
         let mut stream = self.failover.call(req, &providers).await?;
@@ -4378,6 +4384,7 @@ impl AgentRuntime {
                 temperature,
                 frequency_penalty,
                 thinking_budget,
+                endpoint: Default::default(),
                 kv_cache_mode,
                 session_key: if kv_cache_mode >= 2 { Some(ctx.session_key.clone()) } else { None },
                 system_shared,

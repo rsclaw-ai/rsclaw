@@ -751,6 +751,7 @@ impl AgentRuntime {
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None,
+            endpoint: Default::default(),
             kv_cache_mode,
             session_key: session_key_opt,
             system_shared: None,
@@ -868,7 +869,7 @@ impl AgentRuntime {
             max_tokens: Some(4096),
             temperature: None,
             frequency_penalty: None,
-            thinking_budget: None, kv_cache_mode: 0, session_key: None,
+            thinking_budget: None, endpoint: Default::default(), kv_cache_mode: 0, session_key: None,
             system_shared: None, system_user: None,
         };
 
@@ -936,7 +937,7 @@ impl AgentRuntime {
             max_tokens: Some(1024),
             temperature: None,
             frequency_penalty: None,
-            thinking_budget: None, kv_cache_mode: 0, session_key: None,
+            thinking_budget: None, endpoint: Default::default(), kv_cache_mode: 0, session_key: None,
             system_shared: None, system_user: None,
         };
 

@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    ContentPart, LlmProvider, LlmRequest, LlmStream, Message, MessageContent, Role, StreamEvent,
-    TokenUsage,
+    AgentEndpoint, ContentPart, LlmProvider, LlmRequest, LlmStream, Message, MessageContent, Role,
+    StreamEvent, TokenUsage,
 };
 
 /// Default base for the rsclaw-server fleet. The `/v1/agent` suffix
@@ -417,6 +417,13 @@ impl LlmProvider for RsclawProvider {
 
     fn stream(&self, mut req: LlmRequest) -> BoxFuture<'_, Result<LlmStream>> {
         Box::pin(async move {
+            // Dispatch by endpoint family. fastshot/vision are one-shot
+            // OpenAI-compat chat-completion-chunk endpoints; the primary
+            // sessions endpoint is the stateful kvCacheMode=2 protocol
+            // that the rest of this method implements.
+            if !matches!(req.endpoint, AgentEndpoint::Primary) {
+                return self.stream_oneshot(req).await;
+            }
             if req.kv_cache_mode != 2 {
                 anyhow::bail!(
                     "rsclaw provider only handles kv_cache_mode=2 (got {}); \
@@ -885,6 +892,123 @@ impl RsclawProvider {
         resp.json::<CreateSessionResp>()
             .await
             .context("rsclaw replay: parse response")
+    }
+
+    /// Dispatch a one-shot request to `/fastshot` or `/vision`.
+    ///
+    /// Wire shape per protocol spec (see `docs/adr` notes 2026-05-15):
+    ///
+    /// ```text
+    /// POST {base_url}/fastshot
+    /// {
+    ///   "prompt": "...",
+    ///   "max_tokens": N,
+    ///   "options": { "temperature": 0.7 },
+    ///   "stream": true,
+    ///   "model": "rsclaw-fast-v1"
+    /// }
+    /// ```
+    ///
+    /// `/vision` adds an `images: [...]` array (base64 data URLs or
+    /// remote URLs). The response is OAI chat.completion.chunk SSE
+    /// (when `stream: true`) or a one-shot chat.completion JSON. We
+    /// always stream — the agent's stream consumer collapses to a
+    /// single `Done` event for non-streaming callers.
+    ///
+    /// Reuses the OpenAI SSE chunk parser since the response shape
+    /// is byte-for-byte identical.
+    async fn stream_oneshot(&self, req: LlmRequest) -> Result<LlmStream> {
+        use futures::StreamExt;
+
+        let path = match req.endpoint {
+            AgentEndpoint::Flash => "/fastshot",
+            AgentEndpoint::Vision => "/vision",
+            // unreachable in practice — caller already filtered out
+            // AgentEndpoint::Primary in stream(); guard anyway for
+            // future variants.
+            AgentEndpoint::Primary => {
+                anyhow::bail!("rsclaw stream_oneshot called with Primary endpoint");
+            }
+        };
+
+        let prompt = flatten_prompt_for_oneshot(&req);
+        if prompt.trim().is_empty() {
+            anyhow::bail!("rsclaw {path}: empty prompt after flattening req.messages");
+        }
+
+        let mut body = serde_json::Map::new();
+        body.insert("prompt".to_owned(), Value::String(prompt));
+        body.insert("stream".to_owned(), Value::Bool(true));
+        if let Some(mt) = req.max_tokens {
+            body.insert("max_tokens".to_owned(), Value::from(mt));
+        }
+        // Strip the rsclaw/ namespace prefix so the server records the
+        // bare model id in its response. The model field is documented
+        // as "response only" on the server side — we send it for
+        // logging symmetry with the chat.completion.model echo.
+        let bare_model = req.model.strip_prefix("rsclaw/").unwrap_or(&req.model);
+        if !bare_model.is_empty() {
+            body.insert("model".to_owned(), Value::String(bare_model.to_owned()));
+        }
+        let mut options = serde_json::Map::new();
+        if let Some(t) = req.temperature {
+            options.insert("temperature".to_owned(), super::json_f32(t));
+        }
+        if !options.is_empty() {
+            body.insert("options".to_owned(), Value::Object(options));
+        }
+        if matches!(req.endpoint, AgentEndpoint::Vision) {
+            let images = extract_images_for_oneshot(&req);
+            if images.is_empty() {
+                anyhow::bail!("rsclaw /vision: request has no image content");
+            }
+            body.insert(
+                "images".to_owned(),
+                Value::Array(images.into_iter().map(Value::String).collect()),
+            );
+        }
+        let body = Value::Object(body);
+
+        // Send via the same redirect-cache + 308-aware pipeline that
+        // session traffic uses, so a fastshot worker pinned under the
+        // LB benefits from the same per-origin caching as the primary
+        // pool.
+        let resp = self
+            .send_following_redirects(path, &body, Some(Duration::from_secs(60)))
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("rsclaw {path} failed {status}: {body}");
+        }
+
+        // Native rsclaw fastshot/vision SSE — distinct from the
+        // primary sessions endpoint's OAI-style frames. The three
+        // event types per `docs/fastshot-vision-protocol.md §3`:
+        //
+        //   data: {"type":"delta","content":"..."}
+        //   data: {"type":"done","finish_reason":"stop","usage":{...}}
+        //   data: {"type":"error","error":"..."}
+        //   data: [DONE]
+        //
+        // Line buffering + UTF-8 boundary handling mirrors the
+        // openai.rs implementation (worker can split frames across
+        // TCP segments) but the JSON shape is fastshot-native so we
+        // parse it locally.
+        let byte_stream = resp.bytes_stream();
+        let line_buffer = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let utf8_remainder = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let event_stream = byte_stream
+            .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
+            .then(move |chunk| {
+                let line_buffer = line_buffer.clone();
+                let utf8_remainder = utf8_remainder.clone();
+                async move {
+                    parse_oneshot_sse_chunk(chunk, &line_buffer, &utf8_remainder).await
+                }
+            })
+            .flat_map(|events| futures::stream::iter(events));
+        Ok(Box::pin(event_stream) as LlmStream)
     }
 
     async fn turn(
@@ -1504,6 +1628,179 @@ fn split_request<'a>(req: &'a LlmRequest) -> Result<SplitRequest<'a>> {
 /// must drop every consecutive trailing `Role::Tool` — dropping just
 /// one would leave the other N-1 in history, the server would replay
 /// them into the KV, and then the turn would re-send the same
+/// Flatten an `LlmRequest`'s system + messages into a single prompt
+/// string for the one-shot `/fastshot` and `/vision` endpoints, which
+/// take a bare `prompt` field instead of OpenAI-style messages.
+///
+/// Concatenation order: system → message texts in order, joined by
+/// blank lines. Image parts are skipped here (the caller pulls them
+/// into the `images` array via `extract_images_for_oneshot`). Tool
+/// use/result parts and reasoning parts are also skipped — fastshot
+/// is a tool-less endpoint and historical tool traffic isn't
+/// meaningful in that context.
+fn flatten_prompt_for_oneshot(req: &LlmRequest) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(sys) = req.system.as_deref() {
+        let trimmed = sys.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_owned());
+        }
+    }
+    for msg in &req.messages {
+        match &msg.content {
+            MessageContent::Text(t) => {
+                let trimmed = t.trim();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed.to_owned());
+                }
+            }
+            MessageContent::Parts(content_parts) => {
+                for p in content_parts {
+                    if let ContentPart::Text { text } = p {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            parts.push(trimmed.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    parts.join("\n\n")
+}
+
+/// Parse one SSE chunk from the native fastshot/vision wire and
+/// emit `StreamEvent`s. Buffers partial lines across chunks so a
+/// frame split mid-JSON resolves cleanly; mirrors the strategy used
+/// by `openai::parse_sse_chunk_with_buffer` but with the
+/// fastshot-native JSON shape.
+async fn parse_oneshot_sse_chunk(
+    chunk: anyhow::Result<bytes::Bytes>,
+    line_buffer: &tokio::sync::Mutex<String>,
+    utf8_remainder: &tokio::sync::Mutex<Vec<u8>>,
+) -> Vec<anyhow::Result<StreamEvent>> {
+    let bytes = match chunk {
+        Ok(b) => b,
+        Err(e) => return vec![Err(e)],
+    };
+
+    // Carry forward any UTF-8 continuation bytes that landed at the
+    // tail of the previous chunk — without this, CJK / emoji
+    // characters that straddle a chunk boundary corrupt into U+FFFD.
+    let mut remainder = utf8_remainder.lock().await;
+    let combined = if remainder.is_empty() {
+        bytes.to_vec()
+    } else {
+        let mut c = std::mem::take(&mut *remainder);
+        c.extend_from_slice(&bytes);
+        c
+    };
+    let text: String = match std::str::from_utf8(&combined) {
+        Ok(t) => {
+            drop(remainder);
+            t.to_owned()
+        }
+        Err(e) => {
+            let valid_up_to = e.valid_up_to();
+            *remainder = combined[valid_up_to..].to_vec();
+            drop(remainder);
+            if valid_up_to == 0 {
+                return Vec::new();
+            }
+            // SAFETY: valid_up_to is at a valid UTF-8 boundary by
+            // construction of the `Utf8Error`.
+            unsafe { std::str::from_utf8_unchecked(&combined[..valid_up_to]) }.to_owned()
+        }
+    };
+
+    let mut buffer = line_buffer.lock().await;
+    buffer.push_str(&text);
+    let Some(last_newline) = buffer.rfind('\n') else {
+        return Vec::new();
+    };
+    let complete = buffer[..last_newline].to_owned();
+    let leftover = buffer[last_newline + 1..].to_owned();
+    buffer.clear();
+    buffer.push_str(&leftover);
+    drop(buffer);
+
+    let mut events: Vec<anyhow::Result<StreamEvent>> = Vec::new();
+    for line in complete.lines() {
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim_start();
+        if payload.is_empty() {
+            continue;
+        }
+        if payload == "[DONE]" {
+            // Spec §3: server always sends `data: [DONE]` after the
+            // terminal frame. We only emit our own Done if the
+            // worker never sent one — typical path is `done` event
+            // first (which we already turned into StreamEvent::Done
+            // with usage) then `[DONE]` which we swallow here.
+            continue;
+        }
+        let val: Value = match serde_json::from_str(payload) {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::debug!(payload, "rsclaw fastshot: ignoring unparseable SSE line");
+                continue;
+            }
+        };
+        let ty = val.get("type").and_then(Value::as_str).unwrap_or("");
+        match ty {
+            "delta" => {
+                if let Some(content) = val.get("content").and_then(Value::as_str) {
+                    if !content.is_empty() {
+                        events.push(Ok(StreamEvent::TextDelta(content.to_owned())));
+                    }
+                }
+            }
+            "done" => {
+                let usage = val.get("usage").and_then(|u| {
+                    let input = u.get("input_tokens").and_then(Value::as_u64)? as u32;
+                    let output = u.get("output_tokens").and_then(Value::as_u64)? as u32;
+                    Some(TokenUsage { input, output })
+                });
+                events.push(Ok(StreamEvent::Done { usage }));
+            }
+            "error" => {
+                let msg = val
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown fastshot error")
+                    .to_owned();
+                events.push(Ok(StreamEvent::Error(msg)));
+            }
+            other => {
+                tracing::debug!(ty = other, payload, "rsclaw fastshot: unknown event type");
+            }
+        }
+    }
+    events
+}
+
+/// Pull every image URL/data-URI out of an `LlmRequest`'s message
+/// content parts, preserving order. Used by the `/vision` one-shot
+/// endpoint which expects an `images: [...]` array alongside the
+/// flattened prompt.
+fn extract_images_for_oneshot(req: &LlmRequest) -> Vec<String> {
+    let mut images = Vec::new();
+    for msg in &req.messages {
+        if let MessageContent::Parts(parts) = &msg.content {
+            for p in parts {
+                if let ContentPart::Image { url } = p {
+                    if !url.is_empty() {
+                        images.push(url.clone());
+                    }
+                }
+            }
+        }
+    }
+    images
+}
+
 /// tool_results, hydrating duplicates.
 ///
 /// For a User-trailing list (the iter-1 case after
