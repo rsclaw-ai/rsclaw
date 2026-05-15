@@ -59,6 +59,13 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     //     pre-runtime, while the process is still single-threaded.
     propagate_skill_registry_env(&config);
 
+    // 0c. Propagate the root-level `env: { … }` map into process env.
+    //     Same purpose as 0b but generic: lets users define arbitrary
+    //     KV pairs (e.g. ASTOCK, LOG_DIR) used by /watch slash command
+    //     and gateway-spawned subprocesses. Shell-provided env wins so
+    //     `ASTOCK=... cargo run -- gateway restart` still overrides.
+    propagate_user_env(&config);
+
     // 1. Resolve data directory — respects RSCLAW_BASE_DIR for --dev/--profile.
     let base_dir = crate::config::loader::base_dir();
     let data_dir = base_dir.join("var/data");
@@ -945,6 +952,42 @@ fn registry_env_names(name: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// Read the root-level `env: { K: V, ... }` map and export each entry to
+/// the gateway process env. Values may reference other env vars via
+/// `${VAR}` — those are expanded against the current process env at the
+/// time this function runs (so `${HOME}` etc work out of the box).
+///
+/// **Precedence:** shell-provided env wins. If a key already exists in
+/// the process env (e.g. inherited from the launching shell), the config
+/// value is skipped. This lets users override per-launch without editing
+/// rsclaw.json5.
+///
+/// SAFETY: called once during single-threaded gateway startup, before
+/// any async runtime tasks spawn — matches the existing precedent in
+/// `apply_proxy_env` and `propagate_skill_registry_env`.
+fn propagate_user_env(config: &RuntimeConfig) {
+    let Some(env_map) = config.raw.env.as_ref() else { return };
+    apply_user_env_map(&env_map.0);
+}
+
+/// Inner helper, separated from `propagate_user_env` so it can be unit-tested
+/// without constructing a full `RuntimeConfig`.
+fn apply_user_env_map(env_map: &std::collections::HashMap<String, String>) {
+    for (key, raw_val) in env_map {
+        if key.is_empty() {
+            continue;
+        }
+        if std::env::var(key).is_ok() {
+            // Already set by shell / launchd / systemd — don't clobber.
+            continue;
+        }
+        let expanded = crate::config::loader::expand_env_vars(raw_val);
+        // SAFETY: pre-async-runtime, single-threaded.
+        unsafe { std::env::set_var(key, &expanded) };
+        info!(key = %key, "exported user env var from rsclaw.json5");
+    }
+}
+
 /// Read `skill_registries.<name>.{apiKey,baseUrl}` from the resolved
 /// config and export each non-empty value to the corresponding env var.
 /// SAFETY: called once during single-threaded gateway startup, before any
@@ -1825,4 +1868,55 @@ pub(crate) fn publish_restart(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod user_env_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn sets_unset_variables() {
+        unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_NEW") };
+        let mut map = HashMap::new();
+        map.insert("RSCLAW_TEST_USER_ENV_NEW".to_owned(), "from-config".to_owned());
+        apply_user_env_map(&map);
+        assert_eq!(
+            std::env::var("RSCLAW_TEST_USER_ENV_NEW").as_deref(),
+            Ok("from-config")
+        );
+        unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_NEW") };
+    }
+
+    #[test]
+    fn preexisting_shell_value_wins() {
+        unsafe { std::env::set_var("RSCLAW_TEST_USER_ENV_KEEP", "from-shell") };
+        let mut map = HashMap::new();
+        map.insert("RSCLAW_TEST_USER_ENV_KEEP".to_owned(), "from-config".to_owned());
+        apply_user_env_map(&map);
+        assert_eq!(
+            std::env::var("RSCLAW_TEST_USER_ENV_KEEP").as_deref(),
+            Ok("from-shell"),
+            "shell-provided value must not be overwritten"
+        );
+        unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_KEEP") };
+    }
+
+    #[test]
+    fn expands_nested_var_refs() {
+        unsafe { std::env::set_var("RSCLAW_TEST_USER_ENV_REF", "/var/log/foo") };
+        unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_TARGET") };
+        let mut map = HashMap::new();
+        map.insert(
+            "RSCLAW_TEST_USER_ENV_TARGET".to_owned(),
+            "${RSCLAW_TEST_USER_ENV_REF}/app.log".to_owned(),
+        );
+        apply_user_env_map(&map);
+        assert_eq!(
+            std::env::var("RSCLAW_TEST_USER_ENV_TARGET").as_deref(),
+            Ok("/var/log/foo/app.log")
+        );
+        unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_REF") };
+        unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_TARGET") };
+    }
 }
