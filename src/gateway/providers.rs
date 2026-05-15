@@ -60,6 +60,12 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     "gemini" => ApiFormat::Gemini,
                     "doubao" | "bytedance" => ApiFormat::OpenAiResponses,
                     "ollama" => ApiFormat::Ollama,
+                    // Bare `rsclaw` name implies the stateful session
+                    // protocol — same shortcut as `anthropic`/`gemini`
+                    // above. Users who name their provider differently
+                    // (e.g. a self-hosted worker called `local-llm`)
+                    // must set `api: "rsclaw"` explicitly.
+                    "rsclaw" => ApiFormat::Rsclaw,
                     _ => ApiFormat::OpenAiCompletions,
                 }
             });
@@ -92,6 +98,24 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     let url = base_url
                         .unwrap_or_else(|| crate::provider::openai::OPENAI_API_BASE.to_owned());
                     Arc::new(OpenAiProvider::responses_with_ua(url, key, user_agent))
+                }
+                (_, &crate::config::schema::ApiFormat::Rsclaw) => {
+                    // rsclaw stateful session protocol (kvCacheMode=2).
+                    // `baseUrl` should point at either rsclaw-server
+                    // (e.g. `https://api.rsclaw.ai/v1/agent`) or a
+                    // direct rsclaw-llm worker (e.g.
+                    // `http://localhost:9999`). `apiKey` is the bearer
+                    // token; falls back to RSCLAW_KEY env, then to
+                    // None (acceptable when targeting an unauth'd
+                    // local worker).
+                    let key = api_key
+                        .or_else(|| std::env::var("RSCLAW_KEY").ok())
+                        .or_else(|| std::env::var("RSCLAW_SERVER_KEY").ok())
+                        .filter(|s| !s.is_empty());
+                    let url = base_url.unwrap_or_else(|| {
+                        crate::provider::rsclaw::RSCLAW_DEFAULT_BASE.to_owned()
+                    });
+                    Arc::new(crate::provider::rsclaw::RsclawProvider::new(url, key))
                 }
                 _ => {
                     // OpenAI-compatible (covers openai-completions,

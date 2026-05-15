@@ -706,6 +706,15 @@ pub enum ApiFormat {
     AnthropicMessages,
     Gemini,
     Ollama,
+    /// rsclaw stateful incremental session protocol (kvCacheMode=2).
+    /// Provider sends `POST /sessions` / `POST /sessions/<id>/turn` /
+    /// `POST /sessions/replay`. The runtime auto-forces kv_cache_mode=2
+    /// when the resolved provider is `rsclaw`, so model entries don't
+    /// need their own `kvCacheMode` field. Set on a `models.providers.*`
+    /// entry whose `baseUrl` points at either `rsclaw-server` (e.g.
+    /// `https://api.rsclaw.ai/v1/agent`) or a self-hosted rsclaw-llm
+    /// worker (e.g. `http://localhost:9999`).
+    Rsclaw,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
