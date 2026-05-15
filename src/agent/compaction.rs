@@ -665,6 +665,30 @@ impl AgentRuntime {
         // If the LLM still tries, we ignore the tool call in the stream handler.
         let tools = self.cached_tools.clone();
 
+        // Pick the right transport based on the model's resolved provider.
+        //
+        // For rsclaw kvCacheMode=2: the worker already has the entire
+        // `messages` history cached in its KV slot (we're literally
+        // continuing the agent's main session). Sending the request as
+        // a normal stateful turn means the worker only decodes the
+        // newly-appended summary instruction (~200-300 tokens) and
+        // streams back the summary. The legacy mode=0 path with
+        // `session_key: None` looked like a fresh standalone request
+        // to the provider — it would either be rejected (rsclaw
+        // requires mode=2) or re-decode all 30-40k tokens from
+        // scratch, taking tens of seconds.
+        //
+        // For non-rsclaw providers (anthropic, openai, ollama, ...):
+        // mode=0 is the legacy slot-cache-aware path that those
+        // providers already understand. Keep that behavior so the
+        // change is rsclaw-only and doesn't disturb other backends.
+        let (resolved_provider, _) = self.providers.resolve_model(model);
+        let (kv_cache_mode, session_key_opt) = if resolved_provider == "rsclaw" {
+            (2, Some(session_key.to_owned()))
+        } else {
+            (0, None)
+        };
+
         let req = LlmRequest {
             model: model.to_owned(),
             messages,
@@ -673,8 +697,11 @@ impl AgentRuntime {
             max_tokens: Some(4096),
             temperature: None,
             frequency_penalty: None,
-            thinking_budget: None, kv_cache_mode: 0, session_key: None,
-            system_shared: None, system_user: None,
+            thinking_budget: None,
+            kv_cache_mode,
+            session_key: session_key_opt,
+            system_shared: None,
+            system_user: None,
         };
 
         let providers = Arc::clone(&self.providers);

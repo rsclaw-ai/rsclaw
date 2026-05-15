@@ -4323,13 +4323,22 @@ impl AgentRuntime {
             // defaults migrate in. Pull every default this iteration
             // needs at once; drop the guard before constructing the
             // request so the LLM call doesn't hold the lock.
-            let (kv_cache_mode, frequency_penalty) = {
+            let (mut kv_cache_mode, frequency_penalty) = {
                 let agents = self.live.agents.read().await;
                 (
                     agents.defaults.kv_cache_mode.unwrap_or(1),
                     agents.defaults.frequency_penalty,
                 )
             };
+            // rsclaw provider only handles kv_cache_mode=2 — force it
+            // when this turn's resolved provider is rsclaw, regardless
+            // of agents.defaults.kv_cache_mode. The provider IS the
+            // mode-2 protocol implementation, so routing-to-rsclaw is
+            // itself the opt-in: no per-agent override needed.
+            let (resolved_provider, _) = self.providers.resolve_model(&model);
+            if resolved_provider == "rsclaw" {
+                kv_cache_mode = 2;
+            }
             // For kvCacheMode=2 expose the shared/user split so the rsclaw
             // provider can populate `dynamic_prefix.system` (cacheable across
             // every client of this RsClaw version) separately from
