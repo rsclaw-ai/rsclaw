@@ -542,8 +542,20 @@ pub fn build_user_system_suffix(
     }
 
     if !skills.is_empty() {
-        let lines: Vec<_> = skills
-            .all()
+        // Collect first, then sort by name. SkillRegistry stores skills
+        // in a HashMap whose `values()` iteration order is non-
+        // deterministic — each gateway start re-randomizes the listing
+        // order in the rendered system prompt. That non-determinism
+        // leaks into the rsclaw `dynamic_prefix.system` payload, the
+        // worker hashes the differing bytes to a different prefix_id,
+        // and the cached KV slot misses every gateway restart even
+        // though the skill set is logically identical. Sorting by name
+        // here is the byte-stable canonical order; choice of order
+        // doesn't matter as long as it's stable.
+        let mut skill_refs: Vec<_> = skills.all().collect();
+        skill_refs.sort_by(|a, b| a.name.cmp(&b.name));
+        let lines: Vec<_> = skill_refs
+            .iter()
             .map(|s| {
                 let desc = s
                     .description

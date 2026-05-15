@@ -257,7 +257,14 @@ pub(crate) fn build_tool_list(
     // web_browser / execute_command. Only registered when at least one
     // skill is installed; otherwise it'd be dead surface area.
     if skills.all().next().is_some() {
-        let skill_names: Vec<String> = skills.all().map(|s| s.name.clone()).collect();
+        // Sort the embedded skill-name list — `skills.all()` iterates a
+        // HashMap whose order is non-deterministic across runs, and this
+        // string ends up inside the `use_skill` tool's description which
+        // becomes part of the rsclaw dynamic_prefix payload the worker
+        // hashes byte-by-byte. Non-deterministic order → different hash
+        // every gateway start → forced KV-cache cold start.
+        let mut skill_names: Vec<String> = skills.all().map(|s| s.name.clone()).collect();
+        skill_names.sort();
         let names_hint = if skill_names.is_empty() {
             String::new()
         } else {
