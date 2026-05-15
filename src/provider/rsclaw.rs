@@ -489,6 +489,20 @@ impl LlmProvider for RsclawProvider {
             };
 
             let delta = TurnDelta::from_request(&req)?;
+
+            // Optional debug dump — when RSCLAW_DUMP_TURN env is set we
+            // write the full request shape (LlmRequest + rsclaw turn body
+            // + rsclaw replay body + equivalent OpenAI chat-completions
+            // body) to `<base_dir>/debug/turn-<ms>-<sess>.json`. Lets
+            // operators replay the SAME turn against different worker
+            // endpoints (rsclaw `/sessions/<id>/turn`, `/sessions/replay`,
+            // vanilla `/v1/chat/completions`) to bisect protocol-vs-model
+            // truncation behavior. No-op when the env var is unset, so
+            // production stays untouched.
+            if std::env::var("RSCLAW_DUMP_TURN").is_ok() {
+                dump_turn_for_debug(&session_key, &entry, &split, &delta, &req);
+            }
+
             // Forget the cached session entry on any non-recoverable
             // turn failure. Without this, an Err here leaves the
             // SessionEntry in cache with a `last_seen_msgs_len` that
@@ -1213,6 +1227,157 @@ struct SplitRequest<'a> {
     dynamic_user_suffix: &'a str,
     dynamic_tools: Vec<Value>,
     options: TurnOptions,
+}
+
+/// Dump the full request shape for one turn so the operator can
+/// replay the same logical input against several rsclaw-llm endpoints
+/// (rsclaw stateful `/sessions/<id>/turn`, `/sessions/replay`, vanilla
+/// `/v1/chat/completions`) and compare the model's output. Used to
+/// bisect a "truncation happens via rsclaw protocol but not via OpenAI
+/// compat" symptom into "rsclaw-llm side problem" vs "model side
+/// problem".
+///
+/// Writes one JSON file per turn to:
+///   `<base_dir>/debug/turn-<unix_ms>-<session_suffix>.json`
+///
+/// Gated on `RSCLAW_DUMP_TURN` env var being set (any non-empty value).
+/// Write failures are logged at WARN but don't abort the turn.
+fn dump_turn_for_debug(
+    session_key: &str,
+    entry: &SessionEntry,
+    split: &SplitRequest<'_>,
+    delta: &TurnDelta,
+    req: &LlmRequest,
+) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    // Compose the replay history slice (everything before the trailing
+    // delta — same logic `replay()` uses on the recovery path).
+    let history_owned: Vec<&Message> = history_for_replay(&req.messages).iter().collect();
+    let history_values = serialize_replay_history(&history_owned);
+
+    // Equivalent OpenAI-compatible chat body — message-array + tools
+    // shape that vanilla `/v1/chat/completions` accepts. The model id
+    // is the bare form (no `rsclaw/` namespace prefix) since the local
+    // llama-server's OpenAI surface doesn't recognize prefixed names.
+    let openai_model = req.model.strip_prefix("rsclaw/").unwrap_or(&req.model);
+    let openai_messages: Vec<Value> = req
+        .messages
+        .iter()
+        .filter_map(|m| serde_json::to_value(m).ok())
+        .collect();
+    let openai_tools: Vec<Value> = req
+        .tools
+        .iter()
+        .map(|t| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                }
+            })
+        })
+        .collect();
+
+    let opts = TurnOptions::from_request(req);
+
+    // Wire body of the actual `/sessions/<id>/turn` request we're about
+    // to send. Must match what `Provider::turn()` puts on the wire: the
+    // TurnDelta uses `#[serde(flatten)]` inside TurnReq, so `user_message`
+    // or `tool_results` sit at the TOP level alongside `options`/`stream`.
+    // Nesting them under a `delta` wrapper would make the dump non-replayable
+    // — the worker returns 400 `invalid_request: turn must include exactly
+    // one of user_message (string) or tool_results (non-empty array)`.
+    let turn_body = serde_json::to_value(&TurnReq {
+        delta,
+        options: Some(opts.clone()),
+        stream: true,
+    })
+    .unwrap_or(Value::Null);
+
+    // Wire body that would rehydrate this session from scratch via
+    // `/sessions/replay`. Useful when the session_id is no longer alive
+    // on the worker and the operator wants to recreate the exact state.
+    let replay_body = json!({
+        "prefix_id": split.prefix_id,
+        "dynamic_prefix": {
+            "system": split.dynamic_system,
+            "tools": split.dynamic_tools,
+            "user_suffix": split.dynamic_user_suffix,
+        },
+        "history": history_values,
+        "options": serde_json::to_value(&opts).unwrap_or(Value::Null),
+    });
+
+    let dump = json!({
+        "schema_version": 1,
+        "timestamp_ms": now_ms,
+        "session_key": session_key,
+        "model": req.model,
+        "rsclaw_session": {
+            "session_id": entry.session_id,
+            "prefix_id": entry.prefix_id,
+            "last_seen_msgs_len": entry.last_seen_msgs_len,
+        },
+        "llm_request_summary": {
+            "msg_count": req.messages.len(),
+            "tool_count": req.tools.len(),
+            "system_len": req.system.as_deref().map(|s| s.len()).unwrap_or(0),
+            "max_tokens": req.max_tokens,
+            "temperature": req.temperature,
+            "kv_cache_mode": req.kv_cache_mode,
+        },
+        "rsclaw_turn_body": turn_body,
+        "rsclaw_replay_body": replay_body,
+        "openai_chat_completions_body": {
+            "model": openai_model,
+            "messages": openai_messages,
+            "tools": openai_tools,
+            "temperature": req.temperature,
+            "max_tokens": req.max_tokens,
+            "stream": true,
+        },
+        "replay_instructions": [
+            "Pick ONE of the three replay paths and POST against the worker:",
+            "  A. Stateful turn against a LIVE session (only works while session is alive):",
+            "     curl -X POST $BASE/sessions/<session_id>/turn -d @<this-file>[.rsclaw_turn_body]",
+            "  B. Re-hydrate then turn — recreates session deterministically:",
+            "     curl -X POST $BASE/sessions/replay  -d @<this-file>[.rsclaw_replay_body]",
+            "     curl -X POST $BASE/sessions/<new_session_id>/turn -d @<this-file>[.rsclaw_turn_body]",
+            "  C. Stateless OpenAI-compat for comparison (no session, full history each time):",
+            "     curl -X POST $BASE/v1/chat/completions -d @<this-file>[.openai_chat_completions_body]"
+        ]
+    });
+
+    // Pick a short suffix for the file name — session_id's tail hex is
+    // unique enough to disambiguate within one millisecond.
+    let sess_suffix: String = entry
+        .session_id
+        .rsplit('_')
+        .next()
+        .unwrap_or("unknown")
+        .chars()
+        .take(8)
+        .collect();
+    let dir = crate::config::loader::base_dir().join("debug");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(error = %e, "RSCLAW_DUMP_TURN: create_dir_all failed");
+        return;
+    }
+    let path = dir.join(format!("turn-{now_ms}-{sess_suffix}.json"));
+    match serde_json::to_string_pretty(&dump) {
+        Ok(s) => match std::fs::write(&path, s) {
+            Ok(_) => tracing::info!(path = %path.display(), "RSCLAW_DUMP_TURN: turn dumped"),
+            Err(e) => tracing::warn!(error = %e, path = %path.display(), "RSCLAW_DUMP_TURN: write failed"),
+        },
+        Err(e) => tracing::warn!(error = %e, "RSCLAW_DUMP_TURN: serialize failed"),
+    }
 }
 
 /// Walk a `serde_json::Value`, returning a deep copy with every
