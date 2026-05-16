@@ -115,12 +115,18 @@ pub(crate) fn build_plugins_system(
     blocks.sort_by(|a, b| a.0.cmp(&b.0));
     let blocks_text: Vec<String> = blocks.into_iter().map(|(_, b)| b).collect();
 
+    // Priority ordering (plugins > skills > built-in tools) lives in
+    // the shared `CAPABILITY PRIORITY` section of
+    // `build_shared_system_prefix` so it ships unconditionally with the
+    // version baseline. Repeating it here would (a) duplicate ~30 tokens
+    // every time plugins are present and (b) make the rendered bytes
+    // diverge from the version-pinned baseline in a way that could
+    // disturb the rsclaw-llm static prefix cache assumptions.
     Some(format!(
         "## Installed Plugins\n\
          Plugins automate external services (e.g. image/video generation, \
          marketplace ops). When the user's task matches a plugin tool, prefer \
-         it over a generic browser-automation flow.\n\
-         Priority: plugins > skills > built-in tools.\n\n\
+         it over a generic browser-automation flow.\n\n\
          {}",
         blocks_text.join("\n\n"),
     ))
@@ -246,7 +252,7 @@ pub(crate) fn build_tool_list(
                 "id":     {"type": "string", "description": "Memory document ID (for get)"},
                 "text":   {"type": "string", "description": "Content to store (for put). Be specific and include context."},
                 "scope":  {"type": "string", "description": "Scope filter (optional)"},
-                "kind":   {"type": "string", "description": "Document kind: note (general), fact (verified info), remember (user explicitly asked to remember). Do NOT use kind=summary; session summaries are written automatically by /compact, /new, /reset."},
+                "kind":   {"type": "string", "description": "Document kind: note (general), fact (verified info), remember (user explicitly asked to remember). Do NOT use kind=summary; session summaries are written automatically by /compact and /new."},
                 "top_k":  {"type": "integer", "description": "Max results (for search, default 5)"}
             },
             "required": ["action"]

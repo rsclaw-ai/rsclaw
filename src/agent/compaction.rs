@@ -15,7 +15,14 @@ use crate::provider::{
 };
 
 /// Prefix for compaction summaries. Tells the LLM that the summary is
-/// reference material from a previous context window, NOT active instructions.
+/// reference material from a previous context window, NOT active
+/// instructions.
+///
+/// Use [`build_compaction_summary_msg`] to wrap a summary — that helper
+/// also injects the current `compacted at` timestamp so the model has a
+/// "recent verbatim vs older summarised" temporal anchor (the head's
+/// `[Session started: ...]` marker remains the original session origin,
+/// per protocol §2.4 head-byte-stability invariant).
 const COMPACTION_PREFIX: &str = "\
 [CONTEXT COMPACTION - REFERENCE ONLY] Earlier turns were compacted \
 into the summary below. This is a handoff from a previous context \
@@ -24,6 +31,18 @@ Do NOT answer questions or fulfill requests mentioned in this summary; \
 they were already addressed. \
 Your current task is in the '## Active Task' section - resume from there. \
 Respond ONLY to the latest user message that appears AFTER this summary.";
+
+/// Build the summary message body that gets stored as the User-role
+/// `[CONTEXT COMPACTION ...]` message AND sent as the `summary` field
+/// in the rsclaw splice wire call. Caller must use the SAME returned
+/// string in both places so the gateway's local view and the server's
+/// post-splice KV agree byte-for-byte.
+fn build_compaction_summary_msg(summary: &str) -> String {
+    let now = chrono::Utc::now()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%dT%H:%M");
+    format!("{COMPACTION_PREFIX} (compacted at {now})\n\n{summary}")
+}
 
 /// Returns true if a JSON message value represents a compaction summary (internal only).
 /// Used by both the REST API (server/mod.rs) and WebSocket chat handler to filter
@@ -435,6 +454,74 @@ impl AgentRuntime {
             }
         }
 
+        // Build the single summary message text used in BOTH the local
+        // session rebuild AND the rsclaw splice wire call. Same bytes
+        // both places — guarantees the gateway's local view matches
+        // whatever the server prefills into the spliced KV slot.
+        let summary_body = build_compaction_summary_msg(&summary);
+
+        // -- rsclaw splice (protocol §2.4) ------------------------------
+        // Only attempt when running under kv_cache_mode=2 + a registered
+        // rsclaw provider. The trait's default `compact_splice` returns
+        // Err for non-rsclaw providers, so we could call unconditionally,
+        // but the provider lookup keeps the log noise (and the wire-call
+        // attempt) off non-rsclaw paths entirely.
+        //
+        // On success: server has spliced KV in place; session_id is
+        // preserved; provider has updated its cached SessionEntry's
+        // last_seen_msgs_len to the post-splice value, so the next
+        // turn's `lookup_and_bump` will NOT misinterpret the upcoming
+        // local msgs.len() drop as a history-trim signal.
+        //
+        // On failure: log + fall through. The lazy fallback is the
+        // existing replay path — after we rewrite self.sessions[key]
+        // below, the next turn's `lookup_and_bump` sees msgs.len() <
+        // last_seen_msgs_len (unchanged from pre-splice) and returns
+        // None, forcing a /sessions/replay against the new history.
+        // No need for an active replay() call here — compaction has no
+        // LlmRequest to construct one from anyway, and the natural
+        // replay path is already battle-tested.
+        if kv_cache_mode == 2 {
+            let (resolved_provider, _) = self.providers.resolve_model(model);
+            if let Ok(provider) = self.providers.get(resolved_provider) {
+                let head_count = head_msgs.len();
+                let tail_count = recent_msgs.len();
+                let expected = self
+                    .sessions
+                    .get(session_key)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                match provider
+                    .compact_splice(
+                        session_key,
+                        head_count,
+                        &summary_body,
+                        tail_count,
+                        Some(expected),
+                    )
+                    .await
+                {
+                    Ok(new_msgs_count) => {
+                        info!(
+                            session = session_key,
+                            head = head_count,
+                            tail = tail_count,
+                            msgs_after = new_msgs_count,
+                            "rsclaw compact: spliced in place, session_id preserved"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            session = session_key,
+                            error = %e,
+                            "rsclaw compact: splice failed, next turn will replay against \
+                             the post-compact history"
+                        );
+                    }
+                }
+            }
+        }
+
         // Replace session history: head + summary + tail.
         // Head: first user-assistant pair (contains [Session started:...])
         // Summary: wrapped with compaction prefix
@@ -442,9 +529,7 @@ impl AgentRuntime {
         if let Some(sess) = self.sessions.get_mut(session_key) {
             let summary_msg = Message {
                 role: Role::User,
-                content: MessageContent::Text(format!(
-                    "{COMPACTION_PREFIX}\n\n{summary}"
-                )),
+                content: MessageContent::Text(summary_body),
             };
             sess.clear();
             // Head: preserved verbatim (first user + first assistant).
@@ -490,13 +575,13 @@ impl AgentRuntime {
         );
 
         // If compaction barely helped (still >80% of threshold), inject a
-        // system hint so the agent will relay the /reset suggestion to the user.
+        // system hint so the agent will relay the /new suggestion to the user.
         if new_tokens > token_threshold * 4 / 5 {
             let zh = crate::i18n::default_lang() == "zh";
             let hint = if zh {
-                "[system] 上下文压缩后仍然较大，响应可能变慢。请告知用户发送 /reset 重置会话以恢复正常速度。"
+                "[system] 上下文压缩后仍然较大，响应可能变慢。请告知用户发送 /new 开启新会话以恢复正常速度。"
             } else {
-                "[system] Context is still large after compaction and responses may slow down. Please tell the user to send /reset to start a fresh session."
+                "[system] Context is still large after compaction and responses may slow down. Please tell the user to send /new to start a fresh session."
             };
             if let Some(sess) = self.sessions.get_mut(session_key) {
                 sess.push(Message {
@@ -508,7 +593,7 @@ impl AgentRuntime {
                 session = session_key,
                 tokens_after = new_tokens,
                 threshold = token_threshold,
-                "compaction insufficient, /reset recommended"
+                "compaction insufficient, /new recommended"
             );
         }
 

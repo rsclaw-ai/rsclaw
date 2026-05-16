@@ -42,6 +42,18 @@ use super::{
 /// goes direct, so steady-state latency matches a direct deployment.
 pub const RSCLAW_DEFAULT_BASE: &str = "https://api.rsclaw.ai/v1/agent";
 
+/// Default `prefix_id` per protocol §2.1.1 / §2.10.1 — namespaced
+/// `<ns>/<ver>` string the gateway sends on `POST /sessions`. It's a
+/// STATIC identifier (config-driven, never derived from `req.model` or
+/// any hash of the request body) so the worker can route the call to
+/// its static-registry prefix when one is registered, and otherwise
+/// fall back to the dynamic-LRU keyed by `hash(system + tools)`
+/// computed worker-side. `req.model` deliberately does NOT participate
+/// in prefix_id construction — model selection is independent from the
+/// prefix-cache identity. Override via the per-provider config field
+/// `prefix_id` (see `ProviderConfig::prefix_id`).
+pub const RSCLAW_DEFAULT_PREFIX_ID: &str = "rsclaw/2026.5.5";
+
 /// How long to wait for `/sessions/<id>/turn` to start responding
 /// (TCP connect + TLS + send body + receive headers + first byte).
 /// Once the body stream begins this deadline no longer applies — the
@@ -99,6 +111,16 @@ pub struct RsclawProvider {
     client: Client,
     base_url: String,
     bearer: Option<String>,
+    /// Namespaced `<ns>/<ver>` string sent verbatim as the wire
+    /// `prefix_id` on every `POST /sessions` / `POST /sessions/replay`.
+    /// Resolved at provider construction from the per-provider config
+    /// `prefix_id` field, falling back to [`RSCLAW_DEFAULT_PREFIX_ID`]
+    /// when the field is absent. It is intentionally static for the
+    /// lifetime of the provider: the worker-side dynamic-LRU is keyed
+    /// by `hash(system + tools)` (not `user_suffix`, not `req.model`),
+    /// so threading model or per-request data into this field would
+    /// only fragment the cache.
+    prefix_id: String,
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
     /// Cache of 308 redirects, keyed by *origin* (scheme + host + port)
     /// of the requested URL. Lets a single LB call amortise across the
@@ -288,9 +310,24 @@ impl RsclawProvider {
             client,
             base_url,
             bearer,
+            prefix_id: RSCLAW_DEFAULT_PREFIX_ID.to_owned(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             redirect_cache: Arc::new(Mutex::new(RedirectCache::default())),
         }
+    }
+
+    /// Override the default `prefix_id` sent on the wire. Used by the
+    /// provider builder in `gateway::providers` when the config carries
+    /// an explicit `prefix_id`. Trims whitespace and ignores empty
+    /// strings (dotenv-style trailing newlines or unset config keys
+    /// would otherwise produce an invalid wire value — protocol §2.10.1
+    /// rejects `prefix_id` without exactly one `/` separator).
+    pub fn with_prefix_id(mut self, prefix_id: impl Into<String>) -> Self {
+        let s = prefix_id.into().trim().to_owned();
+        if !s.is_empty() {
+            self.prefix_id = s;
+        }
+        self
     }
 
     fn auth_header(&self) -> Option<(String, String)> {
@@ -445,7 +482,7 @@ impl LlmProvider for RsclawProvider {
             // preceding User delta so the model still gets the context.
             normalize_trailing_system(&mut req.messages);
 
-            let split = split_request(&req)?;
+            let split = split_request(&req, &self.prefix_id)?;
 
             // Lookup or hydrate. Cache miss / mutation happens on first
             // call, version drift, after a prior replay failure, or
@@ -590,6 +627,80 @@ impl LlmProvider for RsclawProvider {
                 Arc::clone(&self.sessions),
                 session_key,
             ))
+        })
+    }
+
+    /// Resolve `session_key` → wire `session_id` via the cached
+    /// `SessionEntry`, then delegate to the inner `compact_splice`
+    /// helper. On HTTP success, update the cached entry's
+    /// `last_seen_msgs_len` to the post-splice value so subsequent
+    /// `lookup_and_bump` calls don't (incorrectly) detect the message
+    /// drop as "history was trimmed under us" and force a replay.
+    ///
+    /// Per the 2026-05-16 decision (Listen-first), the cached
+    /// `last_seen_msgs_len` is updated from the gateway-local
+    /// computation (`keep_head_messages + 1 + keep_tail_messages`) NOT
+    /// from `resp.msgs_count`. The server-reported `msgs_count` is
+    /// returned to the caller for cross-check / telemetry only.
+    ///
+    /// Returns `Err` when no `SessionEntry` exists for `session_key`
+    /// (no point splicing what we don't think is open) — caller falls
+    /// back to the replay path which will re-open the session anyway.
+    fn compact_splice<'a>(
+        &'a self,
+        session_key: &'a str,
+        keep_head_messages: usize,
+        summary: &'a str,
+        keep_tail_messages: usize,
+        expected_msgs_count: Option<usize>,
+    ) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async move {
+            // Snapshot the session_id under the lock, drop the lock
+            // before the network call. Holding the mutex across an
+            // await would block every other turn on this provider for
+            // the duration of the splice.
+            let session_id = {
+                let map = self.lock_sessions();
+                map.get(session_key)
+                    .map(|e| e.session_id.clone())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "rsclaw compact splice: no cached session for key {session_key} — \
+                             falling back to replay"
+                        )
+                    })?
+            };
+
+            let resp = self
+                .compact_splice_inner(
+                    &session_id,
+                    keep_head_messages,
+                    summary,
+                    keep_tail_messages,
+                    expected_msgs_count,
+                )
+                .await?;
+
+            // Optimistically update last_seen_msgs_len with the
+            // gateway-local computation (head + summary(1) + tail).
+            // The server's resp.msgs_count is also tracked but kept as
+            // a sanity cross-check at log level.
+            let local_msgs_count = keep_head_messages + 1 + keep_tail_messages;
+            if resp.msgs_count != local_msgs_count {
+                tracing::warn!(
+                    session_key,
+                    server_count = resp.msgs_count,
+                    local_count = local_msgs_count,
+                    "rsclaw compact splice: server msgs_count diverges from gateway computation"
+                );
+            }
+            {
+                let mut map = self.lock_sessions();
+                if let Some(entry) = map.get_mut(session_key) {
+                    entry.last_seen_msgs_len = local_msgs_count;
+                }
+            }
+            Ok(resp.msgs_count)
         })
     }
 }
@@ -894,6 +1005,69 @@ impl RsclawProvider {
             .context("rsclaw replay: parse response")
     }
 
+    /// In-place compact splice (protocol §2.4). Issues
+    /// `POST /v1/agent/sessions/<session_id>/compact` to ask the server to
+    /// drop the KV pages for the middle of the conversation, prefill the
+    /// new summary in their place, and leave head/tail KV unchanged. The
+    /// session's KV slot — and therefore its `session_id` — survives.
+    ///
+    /// Caller responsibilities:
+    /// - Provide `session_id` from the cached `SessionEntry`. Server
+    ///   returns 410 if the slot has been evicted.
+    /// - Choose `keep_head_messages` consistently across the lifetime of
+    ///   a session (typically 2 = first user/assistant pair carrying
+    ///   `[Session started: ...]`). Changing it mid-session breaks the
+    ///   head-byte-stability invariant and forces a head re-prefill on
+    ///   the server.
+    /// - Provide a self-contained `summary` (no `[Session started:]` —
+    ///   that's preserved in head — but a fresh `[CONTEXT COMPACTION
+    ///   compacted at <ISO ts>]` header is the convention so the model
+    ///   has a "recent-vs-summarized" temporal anchor; this struct does
+    ///   not enforce that format).
+    /// - On any `Err`, callers MUST fall back to `/sessions/replay` —
+    ///   `compact_inner` does this unconditionally (per user 2026-05-16
+    ///   decision). 409 / 410 / 422 are the documented fallback codes but
+    ///   the contract is "any non-2xx + any transport error → replay".
+    ///
+    /// Timeout: 180s. The server-side splice involves dropping KV pages
+    /// and prefilling the summary (~2K tokens by default), which is
+    /// fast — comparable to a small turn prefill. The deadline matches
+    /// `open()` so we don't have an inconsistent ceiling between the
+    /// two new-KV-content code paths.
+    ///
+    /// Named with the `_inner` suffix to disambiguate from the
+    /// `LlmProvider::compact_splice` trait method, which sits one layer
+    /// above and resolves `session_key` → `session_id` before delegating
+    /// here. The trait method is the public API; this is the wire-level
+    /// implementation.
+    async fn compact_splice_inner(
+        &self,
+        session_id: &str,
+        keep_head_messages: usize,
+        summary: &str,
+        keep_tail_messages: usize,
+        expected_msgs_count: Option<usize>,
+    ) -> Result<CompactSpliceResp> {
+        let path = format!("/sessions/{}/compact", session_id);
+        let body = CompactSpliceReq {
+            keep_head_messages,
+            summary,
+            keep_tail_messages,
+            expected_msgs_count,
+        };
+        let resp = self
+            .send_following_redirects(&path, &body, Some(Duration::from_secs(180)))
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("rsclaw compact splice failed {status}: {body}");
+        }
+        resp.json::<CompactSpliceResp>()
+            .await
+            .context("rsclaw compact: parse response")
+    }
+
     /// Dispatch a one-shot request to `/fastshot` or `/vision`.
     ///
     /// Wire shape per protocol spec (see `docs/adr` notes 2026-05-15):
@@ -1135,6 +1309,43 @@ struct ReplayReq<'a> {
     history: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<TurnOptions>,
+}
+
+/// Wire body for `POST /v1/agent/sessions/<id>/compact` per protocol §2.4.
+/// In-place splice: keep first `keep_head_messages` messages' KV unchanged,
+/// drop the middle KV pages, prefill `summary` in place, keep the last
+/// `keep_tail_messages` messages' KV unchanged. Server returns the same
+/// `session_id` (no slot reallocation).
+///
+/// `expected_msgs_count` is optimistic concurrency — gateway tells server
+/// what total `msgs_count` it thinks the session has right now. Mismatch
+/// returns 409 and gateway must fall back to `/sessions/replay`.
+///
+/// The wire excludes `prefix_id` / `dynamic_prefix` because compact targets
+/// an already-open session by `session_id`; the slot's existing prefix
+/// stays bound to whatever was used at open time.
+#[derive(Debug, Serialize)]
+struct CompactSpliceReq<'a> {
+    keep_head_messages: usize,
+    summary: &'a str,
+    keep_tail_messages: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_msgs_count: Option<usize>,
+}
+
+/// Response from `POST /sessions/<id>/compact`. `session_id` mirrors the
+/// path parameter and exists for sanity-check / log correlation only —
+/// the §2.4 spec guarantees it does NOT change across splice. `msgs_count`
+/// and `tokens_count` are server's authoritative post-splice counts; the
+/// gateway uses them for cross-check against its own local computation
+/// (head_count + 1 summary + tail_count, summed tokens of those).
+#[derive(Debug, Deserialize, Clone)]
+struct CompactSpliceResp {
+    #[allow(dead_code)] // kept for log correlation / future telemetry
+    session_id: String,
+    msgs_count: usize,
+    #[allow(dead_code)] // kept for future telemetry (kv_cache_tokens gauge)
+    tokens_count: usize,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1537,18 +1748,13 @@ fn to_canonical_value(v: serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn split_request<'a>(req: &'a LlmRequest) -> Result<SplitRequest<'a>> {
-    // `parse_model` strips any leading `rsclaw/` before the request
-    // reaches this provider, so by the time we see `req.model` it's
-    // typically the bare id (`qwen3-235b`). Re-namespace it before
-    // putting it on the wire — protocol §2.10.1 mandates exactly one
-    // `/` separator, and `400 prefix_id_invalid` rejects unprefixed
-    // ids at the worker layer.
-    let prefix_id = if req.model.contains('/') {
-        req.model.clone()
-    } else {
-        format!("rsclaw/{}", req.model)
-    };
+fn split_request<'a>(req: &'a LlmRequest, prefix_id: &str) -> Result<SplitRequest<'a>> {
+    // `prefix_id` is config-driven (provider-level, default
+    // [`RSCLAW_DEFAULT_PREFIX_ID`]) — NOT derived from `req.model` or
+    // any per-turn data. Protocol §2.10.1 only mandates exactly one
+    // `/` separator; the provider builder is responsible for keeping
+    // the wire shape valid, so this function passes it through as-is.
+    let prefix_id = prefix_id.to_owned();
 
     // Each tool's wire JSON is `to_canonical_value`-flattened to give
     // byte-stable output across gateway runs. Without this pass the
@@ -3223,7 +3429,7 @@ data: {"type":"message_stop"}
                 }
             }),
         }];
-        let split = split_request(&req).unwrap();
+        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
         assert_eq!(split.dynamic_tools.len(), 1);
         let serialized = serde_json::to_string(&split.dynamic_tools[0]).unwrap();
         // Top level keys: description, input_schema, name (alphabetical).
@@ -3240,24 +3446,45 @@ data: {"type":"message_stop"}
     }
 
     #[test]
-    fn split_request_namespaces_bare_model_id() {
-        // `parse_model` strips the `rsclaw/` prefix before reaching the
-        // provider, so by the time we see `req.model` it's the bare id.
-        // `split_request` MUST re-namespace it — protocol §2.10.1 rejects
-        // `prefix_id` without exactly one `/` separator.
-        let req = req_with(vec![], 2, Some("k"));
-        let split = split_request(&req).unwrap();
+    fn split_request_uses_provided_prefix_id_verbatim() {
+        // prefix_id is config-driven; split_request passes it through
+        // without inspecting req.model. Two distinct model strings on
+        // the same request must yield the SAME wire prefix_id when the
+        // caller supplied the same value.
+        let mut req = req_with(vec![], 2, Some("k"));
+        req.model = "qwen3-235b".into();
+        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
         assert_eq!(split.prefix_id, "rsclaw/2026.5.5");
+
+        req.model = "myorg/qwen3-235b".into();
+        let split2 = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
+        assert_eq!(split2.prefix_id, "rsclaw/2026.5.5");
     }
 
     #[test]
-    fn split_request_keeps_already_namespaced_model() {
-        // If the caller already gave a namespaced id (e.g. configured a
-        // direct prefix_id, no alias), don't double-prefix.
+    fn split_request_honours_custom_prefix_id_override() {
+        // Provider configured with a non-default prefix_id (e.g. a
+        // tenant's private namespace) — split_request forwards the
+        // override verbatim, independent of req.model.
         let mut req = req_with(vec![], 2, Some("k"));
-        req.model = "myorg/qwen3-235b".into();
-        let split = split_request(&req).unwrap();
-        assert_eq!(split.prefix_id, "myorg/qwen3-235b");
+        req.model = "qwen3-235b".into();
+        let split = split_request(&req, "myorg/2026.5.5").unwrap();
+        assert_eq!(split.prefix_id, "myorg/2026.5.5");
+    }
+
+    #[test]
+    fn with_prefix_id_overrides_default_and_ignores_blank() {
+        // Builder swaps in the override; whitespace-only / empty input
+        // is rejected so a misconfigured config file can't produce a
+        // §2.10.1-invalid wire value.
+        let p = RsclawProvider::new("http://x", None);
+        assert_eq!(p.prefix_id, RSCLAW_DEFAULT_PREFIX_ID);
+
+        let p = RsclawProvider::new("http://x", None).with_prefix_id("tenant/2026.6.1");
+        assert_eq!(p.prefix_id, "tenant/2026.6.1");
+
+        let p = RsclawProvider::new("http://x", None).with_prefix_id("   \n  ");
+        assert_eq!(p.prefix_id, RSCLAW_DEFAULT_PREFIX_ID);
     }
 
     #[test]
@@ -3285,7 +3512,7 @@ data: {"type":"message_stop"}
             description: "memory tool".into(),
             parameters: json!({"type":"object","properties":{}}),
         });
-        let split = split_request(&req).unwrap();
+        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
         assert_eq!(split.dynamic_tools.len(), 2);
         assert_eq!(
             split.dynamic_tools[0]["name"], "memory",
@@ -3308,7 +3535,7 @@ data: {"type":"message_stop"}
             description: "search".into(),
             parameters: json!({"type":"object"}),
         });
-        let split = split_request(&req).unwrap();
+        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
         assert_eq!(split.dynamic_tools.len(), 1);
         assert_eq!(split.dynamic_tools[0]["name"], "search");
         assert_eq!(split.dynamic_system, "you are an agent");
@@ -3331,7 +3558,7 @@ data: {"type":"message_stop"}
             description: "memory tool".into(),
             parameters: json!({"type":"object"}),
         });
-        let split = split_request(&req).unwrap();
+        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
         let body = CreateSessionReq {
             prefix_id: &split.prefix_id,
             dynamic_prefix: DynamicPrefixWire {
@@ -4227,5 +4454,75 @@ data: {"type":"message_stop"}
             Err(e) => e,
         };
         assert!(err.to_string().contains("session_key"));
+    }
+
+    // ----- compact splice wire shape (§2.4) -------------------------------
+
+    #[test]
+    fn compact_splice_req_serialises_post_2_4_shape() {
+        // Pin the wire shape so rsclaw-server and gateway can't drift
+        // independently. expected_msgs_count is optional; when None it
+        // MUST be omitted from the body (not emitted as `"expected_msgs_count": null`)
+        // so a server that hasn't shipped the field yet doesn't 400.
+        let body = CompactSpliceReq {
+            keep_head_messages: 2,
+            summary: "<sum>",
+            keep_tail_messages: 10,
+            expected_msgs_count: Some(80),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["keep_head_messages"], 2);
+        assert_eq!(v["summary"], "<sum>");
+        assert_eq!(v["keep_tail_messages"], 10);
+        assert_eq!(v["expected_msgs_count"], 80);
+
+        let body_no_expect = CompactSpliceReq {
+            keep_head_messages: 2,
+            summary: "<sum>",
+            keep_tail_messages: 10,
+            expected_msgs_count: None,
+        };
+        let v_no_expect = serde_json::to_value(&body_no_expect).unwrap();
+        assert!(
+            v_no_expect.get("expected_msgs_count").is_none(),
+            "None must be omitted from the wire body, not emitted as null"
+        );
+    }
+
+    #[test]
+    fn compact_splice_resp_parses_happy_shape() {
+        let body = r#"{"session_id":"rs_w7_abc","msgs_count":13,"tokens_count":8421}"#;
+        let resp: CompactSpliceResp =
+            serde_json::from_str(body).expect("happy compact response must parse");
+        assert_eq!(resp.session_id, "rs_w7_abc");
+        assert_eq!(resp.msgs_count, 13);
+        assert_eq!(resp.tokens_count, 8421);
+    }
+
+    #[test]
+    fn compact_splice_trait_default_returns_err_for_non_rsclaw() {
+        // Trait-level default impl: non-rsclaw providers should bail
+        // with a "not supported" error so callers can fall back cleanly.
+        // Sanity-check on a placeholder provider via the public trait.
+        use crate::provider::LlmProvider;
+        struct StubProvider;
+        impl LlmProvider for StubProvider {
+            fn name(&self) -> &str { "stub" }
+            fn stream(
+                &self,
+                _req: crate::provider::LlmRequest,
+            ) -> futures::future::BoxFuture<'_, anyhow::Result<crate::provider::LlmStream>> {
+                Box::pin(async { anyhow::bail!("stub provider has no streaming") })
+            }
+        }
+        let p = StubProvider;
+        let err = futures::executor::block_on(
+            p.compact_splice("k", 2, "x", 10, None)
+        ).expect_err("default impl must Err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not supported") && msg.contains("stub"),
+            "default impl Err should name the provider: {msg}"
+        );
     }
 }

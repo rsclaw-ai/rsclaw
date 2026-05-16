@@ -135,14 +135,6 @@ pub(crate) async fn try_preparse_locally_with_account(
         handle.new_session_signal.store(true, Ordering::SeqCst);
         return Some(txt(crate::i18n::t("session_new", crate::i18n::default_lang()).to_owned()));
     }
-    // /reset — reset current session (no summary, same generation)
-    if lower == "/reset" {
-        let flags = handle.abort_flags.read().expect("abort_flags lock poisoned");
-        for f in flags.values() { f.store(true, Ordering::SeqCst); }
-        drop(flags);
-        handle.reset_signal.store(true, Ordering::SeqCst);
-        return Some(txt(crate::i18n::t("session_reset", crate::i18n::default_lang()).to_owned()));
-    }
     // /status
     if lower == "/status" {
         return Some(txt(handle.format_status()));
@@ -595,7 +587,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
     matches!(
         lower.as_str(),
         "/ls" | "/status" | "/version" | "/help" | "/?" | "/health" | "/uptime"
-            | "/model" | "/models" | "/cron" | "/clear" | "/new" | "/reset" | "/abort" | "/sessions"
+            | "/model" | "/models" | "/cron" | "/clear" | "/new" | "/abort" | "/sessions"
             | "/loop" | "/task" | "/watch"
     )
     // Commands with optional/required args
@@ -688,7 +680,6 @@ fn help_text(lang: &str) -> String {
          会话\n\
          \u{0020}\u{0020}/new      新会话\n\
          \u{0020}\u{0020}/clear    清当前会话历史\n\
-         \u{0020}\u{0020}/reset    重置会话（含中止）\n\
          \u{0020}\u{0020}/abort    中止当前/所有运行中的回合\n\
          \u{0020}\u{0020}/sessions 列出会话\n\n\
          模型\n\
@@ -718,7 +709,6 @@ fn help_text(lang: &str) -> String {
          Session\n\
          \u{0020}\u{0020}/new      start a new session\n\
          \u{0020}\u{0020}/clear    wipe current session history\n\
-         \u{0020}\u{0020}/reset    full reset (incl. abort)\n\
          \u{0020}\u{0020}/abort    abort the current / all running turns\n\
          \u{0020}\u{0020}/sessions list sessions\n\n\
          Model\n\

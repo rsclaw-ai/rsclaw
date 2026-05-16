@@ -320,6 +320,44 @@ pub trait LlmProvider: Send + Sync {
     /// Stream a completion. The returned stream emits `StreamEvent`s until
     /// `StreamEvent::Done` or `StreamEvent::Error`.
     fn stream(&self, req: LlmRequest) -> BoxFuture<'_, Result<LlmStream>>;
+
+    /// In-place compact splice (rsclaw protocol §2.4 — kvCacheMode=2 only).
+    ///
+    /// Asks the provider to splice an existing server-side session:
+    /// preserve the first `keep_head_messages` messages' KV unchanged,
+    /// drop the middle KV pages, prefill `summary` in their place, and
+    /// preserve the last `keep_tail_messages` messages' KV unchanged.
+    /// `session_key` is the gateway-side stable key; the provider
+    /// resolves it to the wire `session_id` internally.
+    ///
+    /// `expected_msgs_count` is optimistic concurrency — the total
+    /// message count the gateway believes the session has right now.
+    /// Server returns 409 on mismatch and the caller MUST fall back to
+    /// the replay path.
+    ///
+    /// Returns the server-reported `msgs_count` after the splice. On any
+    /// `Err` callers MUST fall back to `/sessions/replay` (see
+    /// `agent/compaction.rs::compact_inner`).
+    ///
+    /// Default implementation: `Err`. Only rsclaw implements this — it's
+    /// kvCacheMode=2-specific and no stateless provider (anthropic /
+    /// openai / gemini / ollama) can support it. Adding a default impl
+    /// here keeps the trait small and lets callers branch on `Err`
+    /// instead of feature-detecting concrete provider types.
+    #[allow(unused_variables)]
+    fn compact_splice<'a>(
+        &'a self,
+        session_key: &'a str,
+        keep_head_messages: usize,
+        summary: &'a str,
+        keep_tail_messages: usize,
+        expected_msgs_count: Option<usize>,
+    ) -> BoxFuture<'a, Result<usize>> {
+        let name = self.name().to_owned();
+        Box::pin(async move {
+            anyhow::bail!("compact splice not supported by provider {name}")
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

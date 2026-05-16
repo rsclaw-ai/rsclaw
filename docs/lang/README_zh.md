@@ -128,7 +128,6 @@ rsclaw gateway start
 | `/models` | 列出可用模型 |
 | `/model <name>` | 切换主模型 |
 | `/clear` | 清除当前会话 |
-| `/reset` | 重置会话 |
 | `/history [n]` | 显示最近 N 条消息（默认 20） |
 | `/sessions` | 列出所有会话 |
 | `/cron list` | 列出定时任务 |

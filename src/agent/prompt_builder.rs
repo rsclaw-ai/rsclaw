@@ -119,7 +119,6 @@ pub(crate) fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
     h.push_str(if zh { "  /clear            清除会话\n" } else { "  /clear            Clear session\n" });
     h.push_str(if zh { "  /compact          压缩会话并保存记忆\n" } else { "  /compact          Compact session & save to memory\n" });
     h.push_str(if zh { "  /abort            终止当前任务\n" } else { "  /abort            Abort running task\n" });
-    if has("/reset") { h.push_str(if zh { "  /reset            重置会话\n" } else { "  /reset            Reset session\n" }); }
     h.push_str(if zh { "  /voice            语音回复模式\n" } else { "  /voice            Voice reply mode\n" });
     h.push_str(if zh { "  /text             文字回复模式\n" } else { "  /text             Text reply mode\n" });
     h.push_str(if zh { "  /history [n]      查看历史\n" } else { "  /history [n]      Show history\n" });
@@ -360,6 +359,31 @@ fn build_shared_system_prefix_uncached() -> String {
     );
 
     parts.push(
+        "## CAPABILITY PRIORITY (read before every action)\n\
+         \n\
+         For every user request, evaluate sources in this order and use \
+         the FIRST one that fits. Do not skip ahead.\n\n\
+         1. **Plugins** — installed runtime plugins (registered via the \
+         plugin registry). Highest priority. When present, listed below.\n\
+         2. **Skills** — when installed, listed below under \"## Installed Skills\". \
+         Each skill description states the domains it covers (flights, \
+         stocks, weather, …). If ANY description matches the user's \
+         intent, you MUST use that skill — even if a built-in tool could \
+         also do the job.\n\
+         3. **Built-in tools** (web_fetch, web_browser, execute_command, \
+         read_file, …) — fallback ONLY when no plugin or skill applies.\n\n\
+         Common failure mode (avoid):\n\
+         > User asks about flights → you call web_fetch(ctrip.com) →\n\
+         > result is brittle / blocked / wrong data.\n\
+         > A flyai skill with `intents: [flight_search]` was sitting right\n\
+         > above and you ignored it.\n\n\
+         If you catch yourself reaching for web_fetch / web_browser /\n\
+         execute_command on a domain a plugin or skill description covers, STOP\n\
+         and use the plugin/skill instead."
+            .to_owned(),
+    );
+
+    parts.push(
         "[Output format rules]\n\
          - Avoid Markdown headings (#, ##, ###) in chat replies.\n\
          - Use **bold text** or section markers for sections.\n\
@@ -417,7 +441,15 @@ fn build_shared_system_prefix_uncached() -> String {
            (click, search, scroll, type) MUST go through 'computer_use action=ui_tars'.\n\
            You may call 'get_app_rule' to read WeChat strategy (trigger conditions,\n\
            reply rules, Quote method), but never execute manual screenshot+click\n\
-           workflows described inside it."
+           workflows described inside it.\n\
+         ### Screenshot routing\n\
+         - \"screenshot\" / \"截图\" / \"截屏\" with no URL → tell user to type \
+         `/ss` (desktop screencapture). Do NOT call web_browser.\n\
+         - \"screenshot of <url>\" / \"网页截图\" → tell user to type \
+         `/webshot <url>` (headless-Chrome web-page screenshot).\n\
+         - `web_browser action=screenshot` is ONLY for multi-step browser \
+         inspection AFTER you've already navigated. A blank-URL call \
+         captures a near-black Chrome new tab."
             .to_owned(),
     );
 

@@ -110,7 +110,6 @@ impl AgentSpawner {
             last_msg_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             clear_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             new_session_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            reset_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             memory: None,
             context_window,
         });

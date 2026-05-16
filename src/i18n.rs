@@ -277,19 +277,6 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "de" => "Sitzung gelöscht.",
     );
 
-    msg!("session_reset",
-        "en" => "Session reset.",
-        "zh" => "会话已重置。",
-        "th" => "รีเซ็ตเซสชันแล้ว",
-        "vi" => "Phien lam viec da dat lai.",
-        "ja" => "セッションをリセットしました。",
-        "es" => "Sesion restablecida.",
-        "ko" => "세션이 재설정되었습니다.",
-        "ru" => "Сессия сброшена.",
-        "fr" => "Session réinitialisée.",
-        "de" => "Sitzung zurückgesetzt.",
-    );
-
     msg!("session_new",
         "en" => "New session started.",
         "zh" => "已开启新会话。",

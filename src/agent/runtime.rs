@@ -1398,26 +1398,6 @@ impl AgentRuntime {
             self.invalidate_plugins_skills_cache();
         }
 
-        // /reset — clear current session without summary or generation change.
-        if self.handle.reset_signal.load(Ordering::SeqCst) {
-            self.handle.reset_signal.store(false, Ordering::SeqCst);
-            info!("reset_signal received, resetting sessions");
-
-            // Save session summary to memory before clearing.
-            let compaction_model2 = self.live.agents.read().await.defaults.compaction
-                .as_ref().and_then(|c| c.model.clone())
-                .or_else(|| self.handle.config.model.as_ref()?.primary.clone())
-                .unwrap_or_else(|| "default".to_owned());
-            self.save_session_summaries_to_memory(&compaction_model2).await;
-
-            self.sessions.clear();
-            self.compaction_state.clear();
-            if let Ok(mut map) = self.handle.session_tokens.write() { map.clear(); }
-            for key in self.store.db.list_sessions().unwrap_or_default() {
-                let _ = self.store.db.delete_session(&key);
-            }
-        }
-
         // Reclaim idle browser session (kills Chrome process) to free memory.
         // Uses try_lock to avoid blocking if the browser is actively in use.
         if let Ok(mut guard) = self.browser.try_lock() {
@@ -1858,15 +1838,6 @@ impl AgentRuntime {
                         } else {
                             "No active task found for this session.".to_owned()
                         }
-                    }
-                    "__RESET__" => {
-                        // Clear in-memory cache AND redb session data.
-                        let key = self.resolve_session_key(session_key).to_owned();
-                        self.sessions.remove(&key);
-                        let _ = self.store.db.delete_session(&key);
-                        self.voice_mode_sessions.remove(&key);
-                        self.handle.remove_session_tokens(&key);
-                        crate::i18n::t("session_reset", crate::i18n::default_lang()).to_owned()
                     }
                     "__TEXT_MODE__" => {
                         self.voice_mode_sessions.remove(session_key);
@@ -3432,8 +3403,8 @@ impl AgentRuntime {
 
     /// Save summaries of all active sessions to long-term memory.
     ///
-    /// Called before `/new` and `/reset` — since no summary is injected into
-    /// the new session, memory is the only way the LLM can find prior context.
+    /// Called before `/new` — since no summary is injected into the new
+    /// session, memory is the only way the LLM can find prior context.
     /// Uses KV cache mode when available (session is still in memory).
     async fn save_session_summaries_to_memory(&mut self, model: &str) {
         if self.memory.is_none() { return; }
@@ -3522,37 +3493,17 @@ impl AgentRuntime {
             .collect::<Vec<_>>()
             .join("\n\n");
 
+        // CAPABILITY PRIORITY (plugin/skill > built-in tools, failure
+        // mode warning, screenshot routing) lives in
+        // `build_shared_system_prefix` so it ships unconditionally with
+        // the version baseline — even for zero-plugin / zero-skill
+        // installs. That's deliberate: dropping it on empty installs
+        // would let the shared prefix diverge between users and break
+        // the byte-stable `prefix_id` static cache hit on rsclaw-llm.
+        // Here we only emit the per-install enumeration + use_skill
+        // calling convention.
         let msg = format!(
-            "## CAPABILITY PRIORITY (read before every action)\n\
-             \n\
-             For every user request, evaluate sources in this order and use \
-             the FIRST one that fits. Do not skip ahead.\n\n\
-             1. **Plugins** — installed runtime plugins (registered via the \
-             plugin registry). Highest priority.\n\
-             2. **Skills** — listed under \"## Installed Skills\" below. \
-             Each skill description states the domains it covers (flights, \
-             stocks, weather, …). If ANY description matches the user's \
-             intent, you MUST use that skill — even if a built-in tool could \
-             also do the job.\n\
-             3. **Built-in tools** (web_fetch, web_browser, execute_command, \
-             read_file, …) — fallback ONLY when no plugin or skill applies.\n\n\
-             Common failure mode (avoid):\n\
-             > User asks about flights → you call web_fetch(ctrip.com) →\n\
-             > result is brittle / blocked / wrong data.\n\
-             > A flyai skill with `intents: [flight_search]` was sitting right\n\
-             > above and you ignored it.\n\n\
-             If you catch yourself reaching for web_fetch / web_browser / \n\
-             execute_command on a domain a skill description covers, STOP \n\
-             and use the skill instead.\n\n\
-             ## Screenshot routing\n\
-             - \"screenshot\" / \"截图\" / \"截屏\" with no URL → tell user to type \
-             `/ss` (desktop screencapture). Do NOT call web_browser.\n\
-             - \"screenshot of <url>\" / \"网页截图\" → tell user to type \
-             `/webshot <url>` (headless-Chrome web-page screenshot).\n\
-             - `web_browser action=screenshot` is ONLY for multi-step browser \
-             inspection AFTER you've already navigated. A blank-URL call \
-             captures a near-black Chrome new tab.\n\n\
-             ## Installed Skills\n\
+            "## Installed Skills\n\
              \n\
              Only the frontmatter description is shown for each skill below \
              (full SKILL.md bodies live on disk to save context). To use a \
@@ -7183,6 +7134,7 @@ mod tests {
             models: Some(models),
             enabled: Some(true),
             user_agent: None,
+            prefix_id: None,
         };
         let mut providers = std::collections::HashMap::new();
         providers.insert(provider_name.to_owned(), pc);

@@ -115,7 +115,12 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     let url = base_url.unwrap_or_else(|| {
                         crate::provider::rsclaw::RSCLAW_DEFAULT_BASE.to_owned()
                     });
-                    Arc::new(crate::provider::rsclaw::RsclawProvider::new(url, key))
+                    let provider = crate::provider::rsclaw::RsclawProvider::new(url, key);
+                    let provider = match provider_cfg.prefix_id.clone() {
+                        Some(pid) => provider.with_prefix_id(pid),
+                        None => provider,
+                    };
+                    Arc::new(provider)
                 }
                 _ => {
                     // OpenAI-compatible (covers openai-completions,
