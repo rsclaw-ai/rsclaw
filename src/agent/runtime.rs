@@ -1133,7 +1133,7 @@ impl AgentRuntime {
             kv_cache_mode: 0,
             session_key: None,
             system_shared: None,
-            system_user: None,
+            user_system: None,
         };
 
         let providers = Arc::clone(&self.providers);
@@ -1261,7 +1261,7 @@ impl AgentRuntime {
             kv_cache_mode: 0,
             session_key: None,
             system_shared: None,
-            system_user: None,
+            user_system: None,
         };
         // session_key keeps it lints-quiet now that fastshot doesn't
         // route through a stateful session — callers still pass one
@@ -2894,10 +2894,10 @@ impl AgentRuntime {
             }
 
             let shared_prefix = crate::agent::prompt_builder::build_shared_system_prefix();
-            // user_suffix is what's left after the shared prefix +
+            // user_system is what's left after the shared prefix +
             // "\n\n". Recompute by trimming since the prompt was built
             // by concatenation with that exact separator.
-            let user_suffix = system_prompt
+            let user_system = system_prompt
                 .strip_prefix(&shared_prefix)
                 .map(|rest| rest.trim_start_matches("\n\n").to_owned())
                 .unwrap_or_else(|| system_prompt.clone());
@@ -2910,8 +2910,8 @@ impl AgentRuntime {
                 // SHARED: cacheable, byte-identical for every client of this version.
                 "shared_prefix": shared_prefix,
                 "builtin_tools": builtin_tools,
-                // USER: per-machine, never cached.
-                "user_suffix": user_suffix,
+                // USER: per-machine, per-session.
+                "user_system": user_system,
                 "user_tools": user_tools,
                 // Convenience: full reconstructed prompt.
                 "system_prompt": system_prompt,
@@ -2926,7 +2926,7 @@ impl AgentRuntime {
                             builtin_tool_count = builtin_tools.len(),
                             user_tool_count = user_tools.len(),
                             shared_prefix_len = shared_prefix.len(),
-                            user_suffix_len = user_suffix.len(),
+                            user_system_len = user_system.len(),
                             "dumped prompt-spec JSON"
                         );
                     }
@@ -4346,13 +4346,13 @@ impl AgentRuntime {
             // For kvCacheMode=2 expose the shared/user split so the rsclaw
             // provider can populate `dynamic_prefix.system` (cacheable across
             // every client of this RsClaw version) separately from
-            // `dynamic_prefix.user_suffix` (per-client). Only the rsclaw
+            // `dynamic_prefix.user_system` (per-client). Only the rsclaw
             // provider reads these; openai/anthropic ignore them. Internal
             // sessions use a minimal prompt that doesn't follow the
             // shared-prefix layout — leave the split unset for those (the
             // provider falls back to `system` as a single blob, with no
             // cross-client cache reuse, which matches today's behaviour).
-            let (system_shared, system_user) = if kv_cache_mode >= 2
+            let (system_shared, user_system) = if kv_cache_mode >= 2
                 && !is_minimal_context_session(&ctx.session_key)
             {
                 let shared = crate::agent::prompt_builder::build_shared_system_prefix();
@@ -4378,7 +4378,7 @@ impl AgentRuntime {
                 kv_cache_mode,
                 session_key: if kv_cache_mode >= 2 { Some(ctx.session_key.clone()) } else { None },
                 system_shared,
-                system_user,
+                user_system,
             };
 
             // Update live status: LLM call starting.

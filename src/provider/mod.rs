@@ -262,11 +262,13 @@ pub struct LlmRequest {
     /// `system` (loses cross-client cache reuse but stays correct).
     /// Other providers ignore this field.
     pub system_shared: Option<String>,
-    /// (kvCacheMode=2 only) Per-client system suffix — workspace,
-    /// language, skills, platform info. Sent as
-    /// `dynamic_prefix.user_suffix` and is the slot's per-session text.
-    /// Other providers ignore this field.
-    pub system_user: Option<String>,
+    /// (kvCacheMode=2 only) Per-client `user_system` segment — workspace
+    /// MDs, language, skills, platform info. Sent as
+    /// `dynamic_prefix.user_system` and is the slot's per-session text
+    /// (worker's layer-2 KV cache between `base` and `session_tail`,
+    /// rsclaw-protocol §2.1.2 post-2026-05-16 rename). Other providers
+    /// ignore this field.
+    pub user_system: Option<String>,
 }
 
 /// Serialize an `f32` to a JSON number with 2 decimal places.

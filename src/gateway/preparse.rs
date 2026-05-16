@@ -892,7 +892,7 @@ pub(crate) async fn btw_direct_call(
         temperature: None,
         frequency_penalty: None,
         thinking_budget: None, endpoint: Default::default(), kv_cache_mode: 0, session_key: None,
-        system_shared: None, system_user: None,
+        system_shared: None, user_system: None,
     };
 
     // 3. Create a simple failover manager (no fallbacks needed for /btw).

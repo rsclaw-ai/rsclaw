@@ -10,7 +10,7 @@
 use anyhow::{Context as _, Result};
 use serde_json::json;
 
-use crate::agent::prompt_builder::{build_shared_system_prefix, build_user_system_suffix};
+use crate::agent::prompt_builder::{build_shared_system_prefix, build_user_system};
 use crate::agent::tools_builder::build_tool_list;
 use crate::agent::workspace::WorkspaceContext;
 use crate::cli::{DebugCommand, DumpPromptSpecArgs};
@@ -103,7 +103,7 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
 
     // 5. Build the prompt halves.
     let shared_prefix = build_shared_system_prefix();
-    let user_suffix = build_user_system_suffix(&ws_ctx, &skills, &config.raw);
+    let user_system = build_user_system(&ws_ctx, &skills, &config.raw);
 
     // 6. Build the merged tool list, then split by name into the
     //    cacheable built-ins vs the per-machine remainder.
@@ -169,10 +169,10 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
             .as_ref()
             .and_then(|m| m.primary.clone())
             .unwrap_or_default();
-        let system_prompt = if user_suffix.is_empty() {
+        let system_prompt = if user_system.is_empty() {
             shared_prefix.clone()
         } else {
-            format!("{shared_prefix}\n\n{user_suffix}")
+            format!("{shared_prefix}\n\n{user_system}")
         };
         json!({
             "rsclaw_version": env!("CARGO_PKG_VERSION"),
@@ -180,7 +180,7 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
             "model": model,
             "shared_prefix": shared_prefix,
             "builtin_tools": builtin_tools,
-            "user_suffix": user_suffix,
+            "user_system": user_system,
             "user_tools": user_tools,
             "system_prompt": system_prompt,
         })

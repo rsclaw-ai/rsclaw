@@ -400,7 +400,7 @@ async fn try_plan(
         kv_cache_mode: 0,
         session_key: None,
         system_shared: None,
-        system_user: None,
+        user_system: None,
     };
 
     // Stream the response and accumulate — we don't need streaming semantics

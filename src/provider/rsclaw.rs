@@ -117,7 +117,7 @@ pub struct RsclawProvider {
     /// `prefix_id` field, falling back to [`RSCLAW_DEFAULT_PREFIX_ID`]
     /// when the field is absent. It is intentionally static for the
     /// lifetime of the provider: the worker-side dynamic-LRU is keyed
-    /// by `hash(system + tools)` (not `user_suffix`, not `req.model`),
+    /// by `hash(system + tools)` (not `user_system`, not `req.model`),
     /// so threading model or per-request data into this field would
     /// only fragment the cache.
     prefix_id: String,
@@ -945,7 +945,7 @@ impl RsclawProvider {
             dynamic_prefix: DynamicPrefixWire {
                 system: split.dynamic_system,
                 tools: &split.dynamic_tools,
-                user_suffix: split.dynamic_user_suffix,
+                user_system: split.dynamic_user_system,
             },
             options: Some(split.options.clone()),
         };
@@ -980,26 +980,26 @@ impl RsclawProvider {
         // dynamic /ctx blocks (see agent/runtime.rs ~4054). Sending
         // those through as-is would trigger `400 invalid_history`
         // and tank every replay. Pull them out and append their
-        // text to `user_suffix` so the content still reaches the
+        // text to `user_system` so the content still reaches the
         // server — at the static-prefix slot, the only place the
         // protocol allows non-conversational system content.
         let (filtered, extra_suffix) = split_system_messages(messages);
         // System-Role messages threaded through the conversation list
         // (plugins/skills/ctx blocks — see comment above) get folded
-        // back into `dynamic_prefix.user_suffix`, the only protocol
+        // back into `dynamic_prefix.user_system`, the only protocol
         // slot that accepts non-conversational system content. Without
         // this they'd hit `400 invalid_history` on the worker side.
-        let user_suffix_owned: String = if extra_suffix.is_empty() {
+        let user_system_owned: String = if extra_suffix.is_empty() {
             String::new()
-        } else if split.dynamic_user_suffix.is_empty() {
+        } else if split.dynamic_user_system.is_empty() {
             extra_suffix
         } else {
-            format!("{}\n\n{}", split.dynamic_user_suffix, extra_suffix)
+            format!("{}\n\n{}", split.dynamic_user_system, extra_suffix)
         };
-        let user_suffix: &str = if user_suffix_owned.is_empty() {
-            split.dynamic_user_suffix
+        let user_system: &str = if user_system_owned.is_empty() {
+            split.dynamic_user_system
         } else {
-            &user_suffix_owned
+            &user_system_owned
         };
         let history: Vec<Value> = serialize_replay_history(&filtered);
         let body = ReplayReq {
@@ -1007,7 +1007,7 @@ impl RsclawProvider {
             dynamic_prefix: DynamicPrefixWire {
                 system: split.dynamic_system,
                 tools: &split.dynamic_tools,
-                user_suffix,
+                user_system,
             },
             history,
             options: Some(split.options.clone()),
@@ -1299,7 +1299,12 @@ enum TurnOutcome {
 // Wire types — mirror rsclaw-protocol.md §2
 // ---------------------------------------------------------------------------
 
-/// Wire shape of `dynamic_prefix` per protocol §2.1.2.
+/// Wire shape of `dynamic_prefix` per protocol §2.1.2 (post-2026-05-16
+/// rename: the per-session non-hashed segment is named `user_system`,
+/// not `user_suffix`). Both `system` and `tools` participate in the
+/// worker's content-addressed LRU hash; `user_system` does NOT — it's
+/// stored as a per-session prefix layer between `base` (builtin tools
+/// + base_system) and `session_tail` (history + delta).
 #[derive(Debug, Serialize)]
 struct DynamicPrefixWire<'a> {
     #[serde(skip_serializing_if = "str::is_empty")]
@@ -1314,8 +1319,12 @@ struct DynamicPrefixWire<'a> {
     /// LCP trim something to share between clients whose only
     /// difference is per-machine MCP / plugin tools.
     tools: &'a [Value],
+    /// Per-session text that does NOT participate in the worker's
+    /// system+tools hash. Maps to the worker's `user_system` KV cache
+    /// layer. Server treats this as opaque text to prefill after the
+    /// base layer and before session_tail.
     #[serde(skip_serializing_if = "str::is_empty")]
-    user_suffix: &'a str,
+    user_system: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -1565,13 +1574,15 @@ impl TurnOptions {
 /// Maps an `LlmRequest` onto the protocol's split fields per
 /// rsclaw-protocol §2.1 (post-rename, hybrid path).
 ///
-/// When the runtime populated `req.system_shared` / `req.system_user`
+/// When the runtime populated `req.system_shared` / `req.user_system`
 /// (kvCacheMode=2 path on the main agent loop), the split lands in the
 /// "real" hybrid shape:
 /// - `dynamic_system`        ← shared system prefix (byte-stable across
 ///   every RsClaw client of this version) → wire `dynamic_prefix.system`
-/// - `dynamic_user_suffix`   ← per-machine user suffix → wire
-///   `dynamic_prefix.user_suffix`
+/// - `dynamic_user_system`   ← per-machine non-hashed segment → wire
+///   `dynamic_prefix.user_system` (worker layer-2 cache key
+///   intentionally EXCLUDES this, so it can vary per session without
+///   collapsing the hit rate)
 /// - `dynamic_tools`         ← all tools, builtin-first then per-client.
 ///   Encoded as a single array because rsclaw-server's post-rename
 ///   contract drops top-level `user_tools` (verified by its own
@@ -1582,13 +1593,13 @@ impl TurnOptions {
 /// When the split fields are missing (internal sessions / non-runtime
 /// callers) we degrade gracefully: stuff `req.system` into
 /// `dynamic_system`, every tool into `dynamic_tools` in input order,
-/// leave `dynamic_user_suffix` empty. Same effective cache behaviour
+/// leave `dynamic_user_system` empty. Same effective cache behaviour
 /// as before this change.
 struct SplitRequest<'a> {
     /// Namespaced `rsclaw/<id>` per protocol §2.10.1.
     prefix_id: String,
     dynamic_system: &'a str,
-    dynamic_user_suffix: &'a str,
+    dynamic_user_system: &'a str,
     dynamic_tools: Vec<Value>,
     options: TurnOptions,
 }
@@ -1673,7 +1684,7 @@ fn dump_turn_for_debug(
         "dynamic_prefix": {
             "system": split.dynamic_system,
             "tools": split.dynamic_tools,
-            "user_suffix": split.dynamic_user_suffix,
+            "user_system": split.dynamic_user_system,
         },
         "history": history_values,
         "options": serde_json::to_value(&opts).unwrap_or(Value::Null),
@@ -1806,8 +1817,8 @@ fn split_request<'a>(req: &'a LlmRequest, prefix_id: &str) -> Result<SplitReques
         }))
     };
 
-    let (dynamic_system, dynamic_user_suffix, dynamic_tools) =
-        if req.system_shared.is_some() || req.system_user.is_some() {
+    let (dynamic_system, dynamic_user_system, dynamic_tools) =
+        if req.system_shared.is_some() || req.user_system.is_some() {
             // Real split — sort tools [builtin..., per-client...] so
             // the rendered chat-template prefix is byte-stable across
             // every client of this version up to the per-client tool
@@ -1826,7 +1837,7 @@ fn split_request<'a>(req: &'a LlmRequest, prefix_id: &str) -> Result<SplitReques
             builtin_t.extend(user_t);
             (
                 req.system_shared.as_deref().unwrap_or(""),
-                req.system_user.as_deref().unwrap_or(""),
+                req.user_system.as_deref().unwrap_or(""),
                 builtin_t,
             )
         } else {
@@ -1845,7 +1856,7 @@ fn split_request<'a>(req: &'a LlmRequest, prefix_id: &str) -> Result<SplitReques
     Ok(SplitRequest {
         prefix_id,
         dynamic_system,
-        dynamic_user_suffix,
+        dynamic_user_system,
         dynamic_tools,
         options: TurnOptions::from_request(req),
     })
@@ -2060,7 +2071,7 @@ fn history_for_replay(messages: &[Message]) -> &[Message] {
 /// system text). The runtime threads `Role::System` messages through
 /// the conversation list for plugins/skills/ctx blocks, but protocol
 /// §2.2 only accepts `user` / `assistant` in history — so we lift the
-/// system text out and let the caller append it to `user_suffix`.
+/// system text out and let the caller append it to `user_system`.
 /// Order of system blocks is preserved within the returned String;
 /// blocks are joined with a blank line. Non-text content on a
 /// `Role::System` message is dropped (system messages are documented
@@ -2072,7 +2083,7 @@ fn split_system_messages(messages: &[Message]) -> (Vec<&Message>, String) {
         if matches!(m.role, Role::System) {
             // Text(t) and Parts(...) must skip empties symmetrically —
             // otherwise an empty System(Text("")) leaks a blank entry
-            // into sys_parts and pollutes user_suffix with a leading
+            // into sys_parts and pollutes user_system with a leading
             // `\n\n` once `sys_parts.join("\n\n")` runs.
             let txt = match &m.content {
                 MessageContent::Text(t) => t.clone(),
@@ -2112,7 +2123,7 @@ fn split_system_messages(messages: &[Message]) -> (Vec<&Message>, String) {
 /// `Role::Tool` (parallel tool_results case, theoretical — runtime
 /// doesn't currently inject System after Tool, but defend anyway),
 /// drop the System text. Persistent system content already lives in
-/// `user_suffix` from the prior open/replay; only the per-iteration
+/// `user_system` from the prior open/replay; only the per-iteration
 /// dynamic context would be lost, which the protocol has no slot
 /// for in a tool_results delta.
 fn normalize_trailing_system(messages: &mut Vec<Message>) {
@@ -3549,7 +3560,7 @@ data: {"type":"message_stop"}
         // `v1 top-level user_tools must not be sent` test.
         let mut req = req_with(vec![], 2, Some("k"));
         req.system_shared = Some("<shared system>".into());
-        req.system_user = Some("<user suffix>".into());
+        req.user_system = Some("<user suffix>".into());
         // Push user-tool first to prove the split sorts it after the
         // builtin regardless of input order.
         req.tools.push(ToolDef {
@@ -3570,7 +3581,7 @@ data: {"type":"message_stop"}
         );
         assert_eq!(split.dynamic_tools[1]["name"], "search");
         assert_eq!(split.dynamic_system, "<shared system>");
-        assert_eq!(split.dynamic_user_suffix, "<user suffix>");
+        assert_eq!(split.dynamic_user_system, "<user suffix>");
     }
 
     #[test]
@@ -3589,20 +3600,22 @@ data: {"type":"message_stop"}
         assert_eq!(split.dynamic_tools.len(), 1);
         assert_eq!(split.dynamic_tools[0]["name"], "search");
         assert_eq!(split.dynamic_system, "you are an agent");
-        assert_eq!(split.dynamic_user_suffix, "");
+        assert_eq!(split.dynamic_user_system, "");
     }
 
     #[test]
     fn create_session_req_serialises_post_rename_shape() {
         // Matches the wire body rsclaw-server's backend/rsclaw_llm.rs
         // tests assert: `prefix_id` + `dynamic_prefix{system,tools,
-        // user_suffix}` + `options`, and explicitly NO top-level
+        // user_system}` + `options`, and explicitly NO top-level
         // `user_tools` / `rsclaw_version` / `user_suffix` /
-        // `plugins_system` / `skills_system`. Those are all pre-rename
-        // fields that the user said will be retired soon.
+        // `user_system` / `plugins_system` / `skills_system`. The
+        // `user_suffix` legacy name (and `user_system` accidentally
+        // promoted to top-level) is asserted absent so a refactor that
+        // re-emits either at top-level gets caught by the test.
         let mut req = req_with(vec![], 2, Some("k"));
         req.system_shared = Some("<sys>".into());
-        req.system_user = Some("<suf>".into());
+        req.user_system = Some("<suf>".into());
         req.tools.push(ToolDef {
             name: "memory".into(),
             description: "memory tool".into(),
@@ -3614,18 +3627,19 @@ data: {"type":"message_stop"}
             dynamic_prefix: DynamicPrefixWire {
                 system: split.dynamic_system,
                 tools: &split.dynamic_tools,
-                user_suffix: split.dynamic_user_suffix,
+                user_system: split.dynamic_user_system,
             },
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
         assert_eq!(v["prefix_id"], "rsclaw/2026.5.5");
         assert_eq!(v["dynamic_prefix"]["system"], "<sys>");
-        assert_eq!(v["dynamic_prefix"]["user_suffix"], "<suf>");
+        assert_eq!(v["dynamic_prefix"]["user_system"], "<suf>");
         assert_eq!(v["dynamic_prefix"]["tools"][0]["name"], "memory");
         assert!(v.get("user_tools").is_none(), "post-rename body must omit top-level user_tools");
         assert!(v.get("rsclaw_version").is_none(), "rsclaw_version is the pre-rename name; never send");
-        assert!(v.get("user_suffix").is_none(), "user_suffix lives inside dynamic_prefix");
+        assert!(v.get("user_suffix").is_none(), "user_suffix is the legacy name; never send (top-level or otherwise)");
+        assert!(v.get("user_system").is_none(), "user_system lives inside dynamic_prefix, never at top-level");
         assert!(v.get("plugins_system").is_none(), "pre-rename field; folded into dynamic_prefix.system");
         assert!(v.get("skills_system").is_none(), "pre-rename field; folded into dynamic_prefix.system");
     }

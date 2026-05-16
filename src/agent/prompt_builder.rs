@@ -309,7 +309,7 @@ pub(crate) fn build_base_system_prompt(config: &crate::config::schema::Config) -
 ///
 /// Everything that varies per machine (platform info, language,
 /// workspace, skills, plugins, agent persona) lives in
-/// [`build_user_system_suffix`].
+/// [`build_user_system`].
 ///
 /// Backed by [`SHARED_SYSTEM_PREFIX`] (a `LazyLock<String>`) — first
 /// call builds the prefix; every subsequent call clones the cached
@@ -518,7 +518,7 @@ fn build_shared_system_prefix_uncached() -> String {
 /// - Installed skills + their on-disk paths
 ///
 /// Never goes into the shared kvCache prefix — sent fresh each turn.
-pub fn build_user_system_suffix(
+pub fn build_user_system(
     ws_ctx: &WorkspaceContext,
     skills: &SkillRegistry,
     config: &crate::config::schema::Config,
@@ -628,14 +628,14 @@ pub fn build_user_system_suffix(
 /// Layout: `<shared prefix>\n\n<user suffix>`. The shared prefix is
 /// byte-identical across all RsClaw clients of the same version (see
 /// [`build_shared_system_prefix`]); the user suffix carries platform /
-/// language / workspace / skills (see [`build_user_system_suffix`]).
+/// language / workspace / skills (see [`build_user_system`]).
 pub(crate) fn build_system_prompt(
     ws_ctx: &WorkspaceContext,
     skills: &SkillRegistry,
     config: &crate::config::schema::Config,
 ) -> String {
     let prefix = build_shared_system_prefix();
-    let suffix = build_user_system_suffix(ws_ctx, skills, config);
+    let suffix = build_user_system(ws_ctx, skills, config);
     if suffix.is_empty() {
         prefix
     } else {

@@ -863,7 +863,7 @@ impl AgentRuntime {
             kv_cache_mode,
             session_key: session_key_opt,
             system_shared: None,
-            system_user: None,
+            user_system: None,
         };
 
         let providers = Arc::clone(&self.providers);
@@ -978,7 +978,7 @@ impl AgentRuntime {
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None, endpoint: Default::default(), kv_cache_mode: 0, session_key: None,
-            system_shared: None, system_user: None,
+            system_shared: None, user_system: None,
         };
 
         let providers = Arc::clone(&self.providers);
@@ -1046,7 +1046,7 @@ impl AgentRuntime {
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None, endpoint: Default::default(), kv_cache_mode: 0, session_key: None,
-            system_shared: None, system_user: None,
+            system_shared: None, user_system: None,
         };
 
         let providers = Arc::clone(&self.providers);
