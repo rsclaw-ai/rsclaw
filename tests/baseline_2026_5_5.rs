@@ -39,6 +39,7 @@ use rsclaw::provider::ToolDef;
 use rsclaw::skill::SkillRegistry;
 use rsclaw::skill::manifest::SkillManifest;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const FIXTURE_PATH: &str = "tests/fixtures/baseline-2026.5.5.json";
 
@@ -202,4 +203,133 @@ fn baseline_builtin_tools_byte_stable() {
          If a builtin tool was added or removed intentionally, regenerate the fixture.",
         builtin.len()
     );
+}
+
+#[test]
+fn baseline_prefix_id_and_metadata_pinned() {
+    let fixture = load_baseline();
+    assert_eq!(
+        fixture["prefix_id"].as_str(),
+        Some("rsclaw/2026.5.5"),
+        "fixture's prefix_id field must match the wire identifier the gateway sends"
+    );
+    assert_eq!(
+        fixture["ingested"].as_bool(),
+        Some(true),
+        "fixture documents a baseline that IS ingested into the worker's static registry"
+    );
+    let toks = fixture["n_prefix_tokens"]
+        .as_u64()
+        .expect("n_prefix_tokens is an integer");
+    assert!(
+        toks > 0,
+        "n_prefix_tokens must be a positive estimate; got {toks}"
+    );
+}
+
+#[test]
+fn baseline_version_hash_matches_live_build() {
+    // End-to-end fingerprint check: compute SHA-256 of the byte-exact
+    // base-layer content the live build emits, then assert it equals
+    // the `version_hash` baked into the fixture. This is a single
+    // assertion that subsumes the shared_prefix + builtin_tools byte
+    // checks; the dedicated tests above remain for actionable diff
+    // messages on failure.
+    //
+    // Hash recipe (must match the regen script in the fixture's _doc):
+    //   sha256( shared_prefix.utf8 ||
+    //           b"\n" ||
+    //           canonical_json(builtin_tools).utf8 )
+    //
+    // canonical_json = JSON with keys sorted, no whitespace between
+    // tokens, ensure_ascii=False (preserves UTF-8 of skill/tool text).
+
+    let fixture = load_baseline();
+    let expected_hash = fixture["version_hash"]
+        .as_str()
+        .expect("fixture version_hash is a string")
+        .to_owned();
+
+    // Live shared_prefix.
+    let shared_prefix = build_shared_system_prefix();
+
+    // Live builtin_tools — same setup as the byte-stable test.
+    let skills = baseline_skill_registry();
+    let all_tools = build_tool_list(&skills, None, "main", &[]);
+    let builtin: Vec<&ToolDef> = all_tools
+        .iter()
+        .filter(|t| BUILTIN_TOOL_NAMES.contains(&t.name.as_str()))
+        .collect();
+    let tools_json: Value = Value::Array(
+        builtin
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.parameters,
+                })
+            })
+            .collect(),
+    );
+    // Canonical-key sort, compact (no whitespace). Mirrors Python's
+    // `json.dumps(..., sort_keys=True, separators=(',', ':'))` which
+    // the fixture regen script uses.
+    let tools_canonical = canonical_json(&tools_json);
+
+    let mut hasher = Sha256::new();
+    hasher.update(shared_prefix.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(tools_canonical.as_bytes());
+    let actual_hash = format!("{:x}", hasher.finalize());
+
+    assert_eq!(
+        actual_hash, expected_hash,
+        "version_hash drifted from 2026.5.5 baseline.\n\
+         actual   = {actual_hash}\n\
+         expected = {expected_hash}\n\
+         Either shared_prefix or builtin_tools changed bytes. Run the\n\
+         other tests in this file for a localised diff; regenerate the\n\
+         fixture per the module-level docstring if the change was intentional."
+    );
+}
+
+/// Serialize `v` to JSON with keys sorted recursively and no whitespace.
+/// Mirrors Python's `json.dumps(v, sort_keys=True, ensure_ascii=False,
+/// separators=(',', ':'))`. Used so the version_hash recipe stays
+/// consistent between the fixture regen script (Python) and this test
+/// (Rust).
+fn canonical_json(v: &Value) -> String {
+    match v {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut s = String::from("{");
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push('"');
+                s.push_str(&k.replace('\\', "\\\\").replace('"', "\\\""));
+                s.push_str("\":");
+                s.push_str(&canonical_json(&map[*k]));
+            }
+            s.push('}');
+            s
+        }
+        Value::Array(arr) => {
+            let mut s = String::from("[");
+            for (i, item) in arr.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&canonical_json(item));
+            }
+            s.push(']');
+            s
+        }
+        // serde_json::to_string already produces JSON-compliant output
+        // for scalars; reuse it for strings, numbers, bool, null.
+        _ => serde_json::to_string(v).expect("scalar serializable"),
+    }
 }
