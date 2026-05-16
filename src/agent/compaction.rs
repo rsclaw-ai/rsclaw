@@ -196,14 +196,32 @@ impl AgentRuntime {
             let msgs = self.sessions.get(session_key).cloned().unwrap_or_default();
 
             // Head: protect first user + first assistant (2 messages).
-            // If first message is a compaction summary from a previous round,
-            // don't protect it (it will be updated via iterative summary).
+            //
+            // Iterative compaction note (relevant to rsclaw §2.4 splice's
+            // "head sanctuary" invariant):
+            //
+            // The session rebuild below uses `[head_msgs + summary +
+            // recent_msgs]` order, so after the first compact `msgs[0]`
+            // is STILL the original first user message — NOT the summary.
+            // Subsequent compacts therefore find the same head boundary
+            // (head_end = 2) and `keep_head_messages = 2` is stable
+            // across N compactions, preserving the server-side KV pages
+            // that hold the original `[Session started: ...]` marker.
+            //
+            // The `first_is_summary` branch below intentionally
+            // surrenders head sanctuary in the rare case where the
+            // session starts with a compaction summary as `msgs[0]` —
+            // i.e. AFTER a `/clear` (which sets sess to a single summary
+            // msg) when the conversation has since grown back over
+            // threshold. In that case the original session head is
+            // already lost (/clear discarded it) and `keep_head_messages
+            // = 0` is the honest wire value.
             let head_end = {
                 let first_is_summary = msgs.first()
                     .and_then(|m| if let MessageContent::Text(t) = &m.content { Some(t.starts_with("[CONTEXT COMPACTION")) } else { None })
                     .unwrap_or(false);
                 if first_is_summary {
-                    0 // don't protect old summary as head
+                    0 // post-/clear path — head sanctuary already lost
                 } else {
                     // Protect first user + first assistant pair
                     let mut count = 0usize;
@@ -486,18 +504,23 @@ impl AgentRuntime {
             if let Ok(provider) = self.providers.get(resolved_provider) {
                 let head_count = head_msgs.len();
                 let tail_count = recent_msgs.len();
-                let expected = self
+                // Honest Option: when there's no cached session locally
+                // we send None instead of misleading Some(0) — the
+                // server would 409 against 0 and the log would
+                // erroneously claim "drift" instead of "we didn't have
+                // a baseline". Server treats `None` as "skip the
+                // optimistic check".
+                let expected: Option<usize> = self
                     .sessions
                     .get(session_key)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                    .map(|m| m.len());
                 match provider
                     .compact_splice(
                         session_key,
                         head_count,
                         &summary_body,
                         tail_count,
-                        Some(expected),
+                        expected,
                     )
                     .await
                 {

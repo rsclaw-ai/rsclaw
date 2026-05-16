@@ -320,13 +320,31 @@ impl RsclawProvider {
     /// provider builder in `gateway::providers` when the config carries
     /// an explicit `prefix_id`. Trims whitespace and ignores empty
     /// strings (dotenv-style trailing newlines or unset config keys
-    /// would otherwise produce an invalid wire value — protocol §2.10.1
-    /// rejects `prefix_id` without exactly one `/` separator).
+    /// would otherwise produce an invalid wire value).
+    ///
+    /// Also validates the §2.10.1 contract: exactly one `/` separator.
+    /// Inputs like `"rsclaw-2026.5.5"` (zero slashes) or
+    /// `"foo/bar/baz"` (two slashes) are rejected at the builder so a
+    /// typo in config doesn't survive gateway boot and only surface as
+    /// a per-session 400 from the server. Rejected inputs are logged at
+    /// `warn` and the override is dropped (falls back to the default).
     pub fn with_prefix_id(mut self, prefix_id: impl Into<String>) -> Self {
         let s = prefix_id.into().trim().to_owned();
-        if !s.is_empty() {
-            self.prefix_id = s;
+        if s.is_empty() {
+            return self;
         }
+        let slash_count = s.matches('/').count();
+        if slash_count != 1 {
+            tracing::warn!(
+                requested_prefix_id = %s,
+                slash_count,
+                default_prefix_id = RSCLAW_DEFAULT_PREFIX_ID,
+                "rsclaw with_prefix_id: ignoring override that violates §2.10.1 \
+                 (need exactly one '/' separator); falling back to default"
+            );
+            return self;
+        }
+        self.prefix_id = s;
         self
     }
 
@@ -694,6 +712,18 @@ impl LlmProvider for RsclawProvider {
                     "rsclaw compact splice: server msgs_count diverges from gateway computation"
                 );
             }
+            // Emit the server's authoritative post-splice counters here
+            // (rather than at the call site in `compact_inner`) because
+            // tokens_count is exposed only by the wire response — the
+            // trait surface itself returns msgs_count alone. Telemetry
+            // tools that need to track KV slot tokens over time should
+            // scrape this log.
+            tracing::info!(
+                session_key,
+                msgs_count = resp.msgs_count,
+                tokens_count = resp.tokens_count,
+                "rsclaw compact splice: server-side splice complete"
+            );
             {
                 let mut map = self.lock_sessions();
                 if let Some(entry) = map.get_mut(session_key) {
@@ -1341,10 +1371,9 @@ struct CompactSpliceReq<'a> {
 /// (head_count + 1 summary + tail_count, summed tokens of those).
 #[derive(Debug, Deserialize, Clone)]
 struct CompactSpliceResp {
-    #[allow(dead_code)] // kept for log correlation / future telemetry
+    #[allow(dead_code)] // kept for log correlation when paired with session_id-keyed metrics
     session_id: String,
     msgs_count: usize,
-    #[allow(dead_code)] // kept for future telemetry (kv_cache_tokens gauge)
     tokens_count: usize,
 }
 
@@ -3488,6 +3517,27 @@ data: {"type":"message_stop"}
     }
 
     #[test]
+    fn with_prefix_id_rejects_invalid_slash_count() {
+        // §2.10.1 mandates exactly one '/' separator. A config typo with
+        // zero slashes (e.g. "rsclaw-2026.5.5") or two+ ("foo/bar/baz")
+        // would survive boot and only fail on the first wire call, which
+        // is annoying to debug. Validate at the builder so the override
+        // is dropped early and we boot with the safe default.
+        let default = RSCLAW_DEFAULT_PREFIX_ID;
+
+        let p = RsclawProvider::new("http://x", None).with_prefix_id("rsclaw-2026.5.5");
+        assert_eq!(p.prefix_id, default, "no slash → reject");
+
+        let p = RsclawProvider::new("http://x", None).with_prefix_id("foo/bar/baz");
+        assert_eq!(p.prefix_id, default, "two slashes → reject");
+
+        // Surrounding whitespace gets trimmed before validation — a
+        // valid value with stray dotenv newline still works.
+        let p = RsclawProvider::new("http://x", None).with_prefix_id("  tenant/v1\n");
+        assert_eq!(p.prefix_id, "tenant/v1", "trim before count");
+    }
+
+    #[test]
     fn split_request_orders_builtin_before_user_tools_when_split_present() {
         // With `system_shared` populated, the runtime is in real-split
         // mode: tools are ordered [builtin..., user...] inside
@@ -4523,6 +4573,94 @@ data: {"type":"message_stop"}
         assert!(
             msg.contains("not supported") && msg.contains("stub"),
             "default impl Err should name the provider: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_splice_errs_when_no_cached_session() {
+        // Splice short-circuits BEFORE any HTTP call when the cached
+        // SessionEntry for `session_key` is missing — no point splicing
+        // a session we don't think is open. Caller (compact_inner)
+        // observes the Err and falls back to replay path.
+        use crate::provider::LlmProvider;
+        let provider = RsclawProvider::new("http://nonexistent-host.invalid", None);
+        let err = provider
+            .compact_splice("missing-key", 2, "summary", 10, None)
+            .await
+            .expect_err("should Err when no cached SessionEntry exists");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no cached session"),
+            "Err message should mention missing cached session, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_splice_updates_last_seen_msgs_len_on_success() {
+        // Pin the critical post-splice state mutation: on HTTP success
+        // the cached SessionEntry.last_seen_msgs_len MUST be updated to
+        // the gateway-local computation (head + 1 + tail). Without this
+        // update, the next turn's lookup_and_bump would (incorrectly)
+        // see msgs.len() < last_seen and force an unnecessary replay.
+        use crate::provider::LlmProvider;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let session_id = "rs_w7_abc";
+
+        Mock::given(method("POST"))
+            .and(path(format!("/sessions/{}/compact", session_id)))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "session_id": session_id,
+                    "msgs_count": 13,
+                    "tokens_count": 8421,
+                })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let provider = RsclawProvider::new(mock_server.uri(), None);
+
+        // Pre-populate the cached SessionEntry so the splice has
+        // something to operate against. last_seen_msgs_len starts at 50
+        // (a typical pre-compact value) so we can verify it's updated
+        // to 13 (head=2 + summary=1 + tail=10) after success.
+        {
+            let mut map = provider.lock_sessions();
+            map.insert(
+                "test-key".to_owned(),
+                SessionEntry {
+                    session_id: session_id.to_owned(),
+                    prefix_id: RSCLAW_DEFAULT_PREFIX_ID.to_owned(),
+                    last_seen_msgs_len: 50,
+                },
+            );
+        }
+
+        let result = provider
+            .compact_splice("test-key", 2, "<summary>", 10, Some(50))
+            .await
+            .expect("happy-path splice should succeed");
+        assert_eq!(result, 13, "trait method returns server's msgs_count");
+
+        let map = provider.lock_sessions();
+        let entry = map
+            .get("test-key")
+            .expect("SessionEntry must still exist after splice — id is preserved");
+        assert_eq!(
+            entry.last_seen_msgs_len, 13,
+            "last_seen_msgs_len must be updated to head(2) + summary(1) + tail(10)"
+        );
+        assert_eq!(
+            entry.session_id, session_id,
+            "session_id MUST be unchanged across splice (§2.4 invariant)"
+        );
+        assert_eq!(
+            entry.prefix_id, RSCLAW_DEFAULT_PREFIX_ID,
+            "prefix_id must be unchanged"
         );
     }
 }

@@ -4,6 +4,68 @@ All notable changes to RsClaw will be documented in this file.
 
 ## Unreleased
 
+### rsclaw protocol §2.4 — in-place compact splice
+
+- New trait method `LlmProvider::compact_splice` (default `Err` for
+  non-rsclaw providers). `RsclawProvider` implements it as
+  `POST /v1/agent/sessions/<id>/compact` with body
+  `{keep_head_messages, summary, keep_tail_messages, expected_msgs_count}`.
+  Server keeps head/tail KV pages, drops the middle, prefills the new
+  summary, returns the same `session_id` (slot survives compaction).
+- `compact_inner` integrates splice: on success the cached
+  `SessionEntry.last_seen_msgs_len` is updated to the post-splice value
+  so the next turn does NOT misinterpret the local `msgs.len()` drop as
+  a history-trim signal and force a replay. On `Err` (server doesn't
+  support the §2.4 shape yet, 409 drift, 410 evicted, etc.) gateway
+  falls through to the legacy replay path via `lookup_and_bump`.
+- Each summary now embeds `[CONTEXT COMPACTION compacted at
+  YYYY-MM-DDTHH:MM]` so the model has a recent-verbatim-vs-summarized
+  temporal anchor; the head's `[Session started: ...]` marker remains
+  byte-stable across iterative compactions (head sanctuary).
+
+### `prefix_id` is config-driven (no longer derived from `req.model`)
+
+- New `RSCLAW_DEFAULT_PREFIX_ID = "rsclaw/2026.5.5"` constant.
+- `RsclawProvider::with_prefix_id` builder + `ProviderConfig.prefix_id`
+  config field thread the override through `gateway/providers.rs`.
+- Builder validates §2.10.1 (exactly one `/` separator) and silently
+  falls back to the default on malformed input; typos in config no
+  longer survive gateway boot.
+- `split_request` takes `prefix_id: &str` verbatim — `req.model` no
+  longer participates in prefix-cache identity, restoring the per-version
+  static prefix-cache hit rate that the old derivation accidentally
+  fragmented per-model.
+
+### Shared system prefix restructuring (byte-stability for static cache)
+
+- `## CAPABILITY PRIORITY` (plugin/skill > built-in tools priority +
+  failure-mode warning + screenshot routing) moved from
+  `cached_skills_system` to `build_shared_system_prefix`. Ships
+  unconditionally even on 0-plugin / 0-skill installs so the shared
+  prefix bytes are stable across every client of the same version —
+  required for rsclaw-server's static-prefix-cache lookup to hit.
+- Dropped the duplicated `"Priority: plugins > skills > built-in tools"`
+  line from `build_plugins_system` (now covered by shared CAPABILITY
+  PRIORITY).
+
+### `/reset` removed
+
+- **Breaking user-visible change**: `/reset` is no longer recognized as
+  a slash command. The previous semantic (wipe session + save summary
+  to memory, but no archive / no generation bump) was a weaker `/new`
+  variant with two inconsistent code paths (`reset_signal` consumed in
+  runtime vs `__RESET__` pseudo-token in chat-stream) that drifted on
+  whether the memory save actually happened.
+- Users wanting the "wipe + save summary" behavior should now use
+  `/new` (additionally archives the old session into a new generation
+  for later retrieval, and invalidates the plugins/skills cache).
+- Code removed: `reset_signal` AtomicBool on `AgentHandle`, its consumer
+  block, the `__RESET__` chat-stream handler, the `session_reset` i18n
+  key, all help-text entries (CLI + `docs/lang/README_*.md`), and the
+  `/reset` allowlist entry.
+- The "compaction insufficient — suggest reset" hint string now points
+  users at `/new` instead of `/reset`.
+
 ### `/watch` — live event stream → chat slash command
 
 - `/watch <source>` subscribes to a file tail, SSE stream, or shell

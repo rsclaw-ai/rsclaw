@@ -364,12 +364,14 @@ fn build_shared_system_prefix_uncached() -> String {
          For every user request, evaluate sources in this order and use \
          the FIRST one that fits. Do not skip ahead.\n\n\
          1. **Plugins** — installed runtime plugins (registered via the \
-         plugin registry). Highest priority. When present, listed below.\n\
-         2. **Skills** — when installed, listed below under \"## Installed Skills\". \
-         Each skill description states the domains it covers (flights, \
-         stocks, weather, …). If ANY description matches the user's \
-         intent, you MUST use that skill — even if a built-in tool could \
-         also do the job.\n\
+         plugin registry). Highest priority. When the install has any \
+         plugins they appear in a later \"## Installed Plugins\" section; \
+         if no such section is present, the install has zero plugins.\n\
+         2. **Skills** — when installed, listed in a later \"## Installed Skills\" \
+         section (absent if zero are installed). Each skill description \
+         states the domains it covers (flights, stocks, weather, …). \
+         If ANY description matches the user's intent, you MUST use \
+         that skill — even if a built-in tool could also do the job.\n\
          3. **Built-in tools** (web_fetch, web_browser, execute_command, \
          read_file, …) — fallback ONLY when no plugin or skill applies.\n\n\
          Common failure mode (avoid):\n\
