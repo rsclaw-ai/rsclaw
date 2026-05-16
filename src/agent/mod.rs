@@ -30,6 +30,8 @@ pub mod runtime;
 pub mod security;
 pub mod spawner;
 pub mod tool_call_repair;
+pub mod sft_exporter;
+pub mod trace_capture;
 pub mod tools_acp;
 pub mod tools_agent;
 pub mod tools_builder;
