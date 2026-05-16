@@ -286,6 +286,13 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .nest("/api/v1", api)
+        // Convenience alias: bare `/health` resolves to the same handler
+        // as `/api/v1/health`. Container orchestrators (Docker, k8s,
+        // generic uptime monitors) default to `/health`; aliasing avoids
+        // a misleading 401 in their logs when they probe an unmatched
+        // path. See auth_middleware's bypass list for the matching
+        // allowance.
+        .route("/health", get(health))
         .route("/hooks/feishu", post(feishu_webhook))
         .route("/hooks/wecom", get(wecom_verify).post(wecom_webhook))
         .route(
@@ -358,8 +365,19 @@ async fn auth_middleware(
 ) -> Response {
     // Health, agent card discovery, WS, and internal reload endpoints are always open
     // (WS performs its own handshake-level auth).
+    //
+    // Both the bare `/health` and the namespaced `/api/v1/health` are
+    // listed: the bare path is the default for container orchestrators
+    // (Docker HEALTHCHECK, k8s probes, generic uptime monitors) and
+    // operator muscle memory; without the bypass the auth middleware
+    // would respond 401 BEFORE the request reached the routing layer,
+    // surfacing as a misleading "unauthorized" instead of the honest
+    // "path does not exist on this server". Both routes resolve to the
+    // same handler — see the top-level alias just below the `nest`
+    // call in `build_router`.
     let path = request.uri().path();
     if path == "/"
+        || path == "/health"
         || path == "/api/v1/health"
         || path == "/.well-known/agent.json"
         || path == "/ws"
