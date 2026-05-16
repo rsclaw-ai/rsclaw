@@ -52,6 +52,19 @@ pub const RSCLAW_DEFAULT_BASE: &str = "https://api.rsclaw.ai/v1/agent";
 /// in prefix_id construction — model selection is independent from the
 /// prefix-cache identity. Override via the per-provider config field
 /// `prefix_id` (see `ProviderConfig::prefix_id`).
+///
+/// The `<ver>` component here is the **baseline** version, NOT the
+/// gateway's `CARGO_PKG_VERSION`. They are decoupled on purpose:
+/// rsclaw-llm has to manually pre-register a base-layer KV slot for
+/// each unique prefix_id, and a typical Cargo bump (patch release,
+/// channel hot-fix, debug toggle) does not change the canonical
+/// `shared_prefix + builtin_tools` payload that this identifier
+/// names. Auto-tracking `CARGO_PKG_VERSION` would invalidate the
+/// worker's registered slot on every gateway release. Bump this
+/// string by hand only when the canonical baseline (asserted by
+/// `tests/fixtures/baseline-<ver>.json`) actually changes, and
+/// coordinate with rsclaw-llm to re-ingest the new fixture under
+/// the new identifier.
 pub const RSCLAW_DEFAULT_PREFIX_ID: &str = "rsclaw/2026.5.5";
 
 /// How long to wait for `/sessions/<id>/turn` to start responding

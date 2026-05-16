@@ -161,32 +161,32 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
     // 7. Emit. `--shared-only` strips per-user fields entirely so the
     //    output is suitable for ingest into rsclaw-llm without any
     //    machine-specific state leaking through.
+    //
+    // `rsclaw_version` here is the BASELINE version (the `<ver>`
+    // component of `RSCLAW_DEFAULT_PREFIX_ID`), NOT the Cargo crate
+    // version. The two are deliberately decoupled — see the doc on
+    // `RSCLAW_DEFAULT_PREFIX_ID` for why. This dump documents the
+    // canonical wire bytes for a specific prefix_id, so its version
+    // label must track the prefix_id, not the gateway release.
+    let rsclaw_version = crate::provider::rsclaw::RSCLAW_DEFAULT_PREFIX_ID
+        .split('/')
+        .nth(1)
+        .unwrap_or(env!("CARGO_PKG_VERSION"));
+
     let payload = if args.shared_only {
         json!({
-            "rsclaw_version": env!("CARGO_PKG_VERSION"),
+            "rsclaw_version": rsclaw_version,
             "shared_prefix": shared_prefix,
             "builtin_tools": builtin_tools,
         })
     } else {
-        let model = agent_cfg
-            .model
-            .as_ref()
-            .and_then(|m| m.primary.clone())
-            .unwrap_or_default();
-        let system_prompt = if user_system.is_empty() {
-            shared_prefix.clone()
-        } else {
-            format!("{shared_prefix}\n\n{user_system}")
-        };
         json!({
-            "rsclaw_version": env!("CARGO_PKG_VERSION"),
+            "rsclaw_version": rsclaw_version,
             "agent_id": agent_id,
-            "model": model,
             "shared_prefix": shared_prefix,
-            "builtin_tools": builtin_tools,
             "user_system": user_system,
+            "builtin_tools": builtin_tools,
             "user_tools": user_tools,
-            "system_prompt": system_prompt,
         })
     };
     let s = serde_json::to_string_pretty(&payload)
