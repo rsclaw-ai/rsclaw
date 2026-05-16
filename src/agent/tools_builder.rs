@@ -262,23 +262,18 @@ pub(crate) fn build_tool_list(
     // EARLY in the tool list so the LLM notices it before web_fetch /
     // web_browser / execute_command. Only registered when at least one
     // skill is installed; otherwise it'd be dead surface area.
+    //
+    // Critical invariant: this description does NOT enumerate installed
+    // skill names. The skill list lives in `user_system` (rendered by
+    // `build_user_system` as "## Installed Skills"), which the worker
+    // treats as a per-session layer that does NOT participate in the
+    // base layer hash. Embedding skill names HERE — inside `tools` —
+    // would put them in the base-layer hash input and break cross-host
+    // cache reuse for clients with different skill sets installed.
     if skills.all().next().is_some() {
-        // Sort the embedded skill-name list — `skills.all()` iterates a
-        // HashMap whose order is non-deterministic across runs, and this
-        // string ends up inside the `use_skill` tool's description which
-        // becomes part of the rsclaw dynamic_prefix payload the worker
-        // hashes byte-by-byte. Non-deterministic order → different hash
-        // every gateway start → forced KV-cache cold start.
-        let mut skill_names: Vec<String> = skills.all().map(|s| s.name.clone()).collect();
-        skill_names.sort();
-        let names_hint = if skill_names.is_empty() {
-            String::new()
-        } else {
-            format!(" Installed skill names: {}.", skill_names.join(", "))
-        };
         tools.push(ToolDef {
             name: "use_skill".to_owned(),
-            description: format!(
+            description:
                 "ACTIVATE an installed skill. Use this BEFORE web_fetch / web_browser / \
                 execute_command whenever the user's task matches any skill description \
                 shown in the system prompt under '## Installed Skills' (flights, hotels, \
@@ -287,15 +282,14 @@ pub(crate) fn build_tool_list(
                 After calling use_skill you typically call execute_command with the CLI \
                 from skill_md.\n\n\
                 Common failure to avoid: defaulting to web_fetch on a domain a skill \
-                already covers. If a skill description matches, you MUST use_skill \
-                first.{names_hint}"
-            ),
+                already covers. If a skill description matches, you MUST use_skill first."
+                    .to_owned(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Exact skill name from the Installed Skills list (e.g. 'flyai', 'hithink-market-query'). Case-sensitive."
+                        "description": "Exact skill name from the '## Installed Skills' list in the system prompt (e.g. 'flyai', 'hithink-market-query'). Case-sensitive."
                     }
                 },
                 "required": ["name"]

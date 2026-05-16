@@ -101,9 +101,13 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
     )
     .unwrap_or_default();
 
-    // 5. Build the prompt halves.
+    // 5. Build the prompt halves. `rsclaw debug` runs offline without
+    // any live plugin runtime; pass empty plugin sources so the
+    // resulting user_system reflects "no plugins installed" rather
+    // than a divergent live state. Skills load from disk via the
+    // SkillRegistry above; that's enough for the prompt-spec dump.
     let shared_prefix = build_shared_system_prefix();
-    let user_system = build_user_system(&ws_ctx, &skills, &config.raw);
+    let user_system = build_user_system(&ws_ctx, &skills, &[], None, &config.raw);
 
     // 6. Build the merged tool list, then split by name into the
     //    cacheable built-ins vs the per-machine remainder.

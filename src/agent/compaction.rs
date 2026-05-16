@@ -580,9 +580,9 @@ impl AgentRuntime {
             }
         }
 
-        // Invalidate plugins/skills cache so they are rebuilt (sorted) on
-        // the next turn, merging any trailing additions into [1]/[2].
-        self.invalidate_plugins_skills_cache();
+        // Note: plugins/skills no longer cached at runtime level — they
+        // are rebuilt every turn inside `build_user_system`, so no
+        // explicit invalidation is needed here.
 
         let new_tokens: usize = self
             .sessions

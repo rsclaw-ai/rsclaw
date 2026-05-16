@@ -473,13 +473,6 @@ pub struct AgentRuntime {
     /// Cached minimal system prompt for internal sessions (heartbeat/cron/system).
     /// Built on first internal session use.
     pub(crate) cached_minimal_prompt: Option<String>,
-    /// Cached plugins system message — frozen at session start, rebuilt
-    /// on compact or `/new`. Sorted by name for byte-stable output.
-    pub(crate) cached_plugins_system: Option<String>,
-    /// Cached skills system message — same lifecycle as plugins.
-    pub(crate) cached_skills_system: Option<String>,
-    /// Snapshot of installed skill names (sorted) for change detection.
-    pub(crate) cached_skills_snapshot: Vec<String>,
     /// Cached tool definitions from the last run_turn — reused by compaction
     /// to match the KV cache prefix exactly.
     pub(crate) cached_tools: Vec<crate::provider::ToolDef>,
@@ -568,9 +561,6 @@ impl AgentRuntime {
             workspace_cache: None,
             cached_system_prompt: None,
             cached_minimal_prompt: None,
-            cached_plugins_system: None,
-            cached_skills_system: None,
-            cached_skills_snapshot: Vec::new(),
             cached_tools: Vec::new(),
             pending_task_results: Arc::new(std::sync::Mutex::new(Vec::new())),
             voice_mode_sessions: std::collections::HashSet::new(),
@@ -1428,7 +1418,6 @@ impl AgentRuntime {
                     Err(e) => tracing::warn!("failed to start new generation: {e:#}"),
                 }
             }
-            self.invalidate_plugins_skills_cache();
         }
 
         // Reclaim idle browser session (kills Chrome process) to free memory.
@@ -2585,7 +2574,13 @@ impl AgentRuntime {
             self.cached_minimal_prompt.clone().expect("just set")
         } else {
             if self.cached_system_prompt.is_none() {
-                let prompt = build_system_prompt(&ws_ctx, &self.skills, &self.config.raw);
+                let prompt = build_system_prompt(
+                    &ws_ctx,
+                    &self.skills,
+                    &self.wasm_plugins,
+                    self.plugins.as_deref(),
+                    &self.config.raw,
+                );
                 // DEBUG: dump full system prompt to file for inspection
                 if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
                     let dump_path = crate::config::loader::base_dir().join("debug_system_prompt.txt");
@@ -2993,60 +2988,21 @@ impl AgentRuntime {
             full_trace: init_full_trace(text),
         };
 
-        // --- Plugins & Skills: cached, frozen at session start ---
-        // On first turn: build and cache. On subsequent turns: detect new
-        // additions and append as trailing system messages. On compact/`/new`:
-        // rebuild (handled by invalidate_plugins_skills_cache()).
-
-        // Build/cache plugins system message.
-        if self.cached_plugins_system.is_none() {
-            self.cached_plugins_system = super::tools_builder::build_plugins_system(
-                &self.wasm_plugins,
-                self.plugins.as_deref(),
-            );
-        }
-
-        // Build/cache skills system message.
-        if self.cached_skills_system.is_none() {
-            let (msg, snapshot) = Self::build_skills_system_msg(&self.skills);
-            self.cached_skills_system = msg;
-            self.cached_skills_snapshot = snapshot;
-        }
-
-        // Detect newly added skills since cache was frozen.
-        // New skills are appended as trailing system messages, not merged
-        // into the cached [2] — this preserves KV cache prefix.
-        let mut new_skills_tail: Vec<String> = Vec::new();
-        {
-            let mut current_names: Vec<String> = self.skills.all()
-                .map(|s| s.name.clone())
-                .collect();
-            current_names.sort();
-            for name in &current_names {
-                if !self.cached_skills_snapshot.contains(name) {
-                    if let Some(skill) = self.skills.all().find(|s| &s.name == name) {
-                        new_skills_tail.push(format!(
-                            "<skill name=\"{}\" version=\"{}\">\n{}\n</skill>",
-                            skill.name,
-                            skill.version.as_deref().unwrap_or(""),
-                            skill.prompt.trim(),
-                        ));
-                    }
-                }
-            }
-        }
-
-        let plugins_system = self.cached_plugins_system.clone();
-        let skills_system = self.cached_skills_system.clone();
+        // Plugins + Skills rendering now lives inside `build_user_system`
+        // (called when assembling `system_prompt` above). No separate
+        // Role::System injection / cached_*_system / new_skills_tail
+        // diff path needed: every turn rebuilds user_system from the
+        // current SkillRegistry + plugin state, so freshly installed
+        // skills show up in the next turn's `## Installed Skills`
+        // section automatically. Worker-side KV layer-2 cache re-prefills
+        // when the user_system bytes change (i.e. install/uninstall),
+        // which is the correct behaviour.
 
         let reply = time::timeout(
             Duration::from_secs(timeout_secs),
             self.agent_loop(
                 &mut ctx, &model, &system_prompt,
-                plugins_system.as_deref(),
-                skills_system.as_deref(),
                 tools, extra_tools, abort_flag.clone(),
-                new_skills_tail,
             ),
         )
         .await
@@ -3367,77 +3323,6 @@ impl AgentRuntime {
         }
     }
 
-    /// Build the skills system message from the registry (sorted by name).
-    /// Returns (message, sorted_name_snapshot).
-    fn build_skills_system_msg(skills: &crate::skill::SkillRegistry) -> (Option<String>, Vec<String>) {
-        let mut all_skills: Vec<_> = skills.all().collect();
-        all_skills.sort_by(|a, b| a.name.cmp(&b.name));
-        let snapshot: Vec<String> = all_skills.iter().map(|s| s.name.clone()).collect();
-
-        if all_skills.is_empty() {
-            return (None, snapshot);
-        }
-
-        // Inject only `name + version + description + dir`, NOT the full
-        // SKILL.md body. With ~22 hithink-* skills installed the bodies
-        // sum to ~260KB which torpedoes the prompt budget. The agent
-        // discovers the full SKILL.md on demand via read_file when it
-        // matches a description and decides to invoke a skill.
-        let skill_prompts: String = all_skills
-            .iter()
-            .map(|s| {
-                let desc = s.description.as_deref().unwrap_or("(no description)");
-                let trimmed_desc = desc.trim();
-                let one_line = trimmed_desc.replace('\n', " ");
-                format!(
-                    "<skill name=\"{}\" version=\"{}\" dir=\"{}\">\n{}\n</skill>",
-                    s.name,
-                    s.version.as_deref().unwrap_or(""),
-                    s.dir.display(),
-                    one_line,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
-
-        // CAPABILITY PRIORITY (plugin/skill > built-in tools, failure
-        // mode warning, screenshot routing) lives in
-        // `build_shared_system_prefix` so it ships unconditionally with
-        // the version baseline — even for zero-plugin / zero-skill
-        // installs. That's deliberate: dropping it on empty installs
-        // would let the shared prefix diverge between users and break
-        // the byte-stable `prefix_id` static cache hit on rsclaw-llm.
-        // Here we only emit the per-install enumeration + use_skill
-        // calling convention.
-        let msg = format!(
-            "## Installed Skills\n\
-             \n\
-             Only the frontmatter description is shown for each skill below \
-             (full SKILL.md bodies live on disk to save context). To use a \
-             skill:\n\
-             1. Pick the skill whose description matches the user's intent.\n\
-             2. Call the **`use_skill`** function tool with `name=<slug>` — \
-             returns the full SKILL.md.\n\
-             3. If SKILL.md mentions `references/<command>.md`, read_file that too.\n\
-             4. Then invoke the CLI with the exact flags from SKILL.md via \
-             `execute_command`.\n\n\
-             `use_skill` is registered as a function-call tool — prefer it \
-             over manually `read_file`-ing SKILL.md so the discovery shows \
-             up cleanly in tool history. Guessing CLI flags from the \
-             description alone is the #1 failure mode.\n\n\
-             {skill_prompts}"
-        );
-        (Some(msg), snapshot)
-    }
-
-    /// Invalidate cached plugins and skills system messages.
-    /// Called after compaction or `/new` to force a rebuild on the next turn.
-    pub(crate) fn invalidate_plugins_skills_cache(&mut self) {
-        self.cached_plugins_system = None;
-        self.cached_skills_system = None;
-        self.cached_skills_snapshot.clear();
-    }
-
     /// Load session history from in-memory cache, falling back to redb.
     /// Session key should already be resolved through `resolve_session_key`
     /// (done in `run_turn`) so aliases are transparent.
@@ -3554,12 +3439,9 @@ impl AgentRuntime {
         ctx: &mut RunContext,
         model: &str,
         system_prompt: &str,
-        plugins_system: Option<&str>,
-        skills_system: Option<&str>,
         tools: Vec<ToolDef>,
         extra_tools: Vec<ToolDef>,
         abort_flag: Arc<AtomicBool>,
-        new_skills_tail: Vec<String>,
     ) -> Result<AgentReply> {
         // Pull both defaults the agent loop's prelude needs under a
         // single read guard. Previously these were two adjacent
@@ -3900,16 +3782,13 @@ impl AgentRuntime {
             // Build API copy of messages for this LLM call.
             //
             // Final message order (stable prefix → volatile tail):
-            //   [0]   system  — main prompt           (KV-cache anchor, never changes)
-            //   [1]   system  — plugins               (inserted at front)
-            //   [2]   system  — skills                (inserted at front)
-            //   [3…n] history — session user/assistant messages
-            //   [n+1] system  — new_skills_tail        (rare, appended)
-            //   [tail] …      — turn_scratchpad        (grows per iteration, cleared next turn)
-            //
-            // Session storage is NOT modified — the Role::System
-            // overlays (plugins/skills/new_skills_tail) live only in
-            // the in-memory `raw` for one LLM call.
+            //   [0]   system  — main prompt   (KV-cache anchor; contains
+            //                                  ## Installed Plugins +
+            //                                  ## Installed Skills via
+            //                                  build_user_system — see
+            //                                  prompt_builder.rs)
+            //   [1…n] history — session user/assistant messages
+            //   [tail] …      — turn_scratchpad  (per-iteration tools)
             let mut messages = {
                 let mut raw = self
                     .sessions
@@ -3927,32 +3806,6 @@ impl AgentRuntime {
                             *last = ctx.user_msg_with_images.clone().unwrap_or(last.clone());
                         }
                     }
-                }
-
-                // Insert plugins and skills as system messages at the front
-                // of history. Insert in reverse order since each insert(0, …)
-                // pushes previous ones down.
-                if let Some(skills) = skills_system {
-                    raw.insert(0, Message {
-                        role: Role::System,
-                        content: MessageContent::Text(skills.to_owned()),
-                    });
-                }
-                if let Some(plugins) = plugins_system {
-                    raw.insert(0, Message {
-                        role: Role::System,
-                        content: MessageContent::Text(plugins.to_owned()),
-                    });
-                }
-
-                // Append newly installed skills as trailing system messages.
-                for skill_block in &new_skills_tail {
-                    raw.push(Message {
-                        role: Role::System,
-                        content: MessageContent::Text(format!(
-                            "## New Skill Installed\n{skill_block}"
-                        )),
-                    });
                 }
 
                 // Append current-turn scratch-paper (tool calls + results).

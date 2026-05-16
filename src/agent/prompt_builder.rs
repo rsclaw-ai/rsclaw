@@ -5,6 +5,8 @@
 use std::sync::LazyLock;
 
 use super::workspace::WorkspaceContext;
+use crate::plugin::PluginRegistry;
+use crate::plugin::wasm_runtime::WasmPlugin;
 use crate::skill::SkillRegistry;
 
 /// Cached output of [`build_shared_system_prefix`]. The shared prefix is
@@ -372,7 +374,18 @@ fn build_shared_system_prefix_uncached() -> String {
          > above and you ignored it.\n\n\
          If you catch yourself reaching for web_fetch / web_browser /\n\
          execute_command on a domain a plugin or skill description covers, STOP\n\
-         and use the plugin/skill instead."
+         and use the plugin/skill instead.\n\n\
+         ### How to invoke an installed skill\n\
+         When a task matches a skill description listed under \"## Installed Skills\":\n\
+         1. Pick the skill whose description matches the user's intent.\n\
+         2. Call the `use_skill` function tool with `name=<slug>` — returns \
+         the full SKILL.md body.\n\
+         3. If SKILL.md mentions `references/<command>.md`, read_file that too.\n\
+         4. Then invoke the CLI with the exact flags from SKILL.md via \
+         `execute_command`.\n\n\
+         Prefer `use_skill` over manually `read_file`-ing SKILL.md so the \
+         discovery shows up cleanly in tool history. Guessing CLI flags from \
+         the description alone is the #1 failure mode."
             .to_owned(),
     );
 
@@ -512,6 +525,8 @@ fn build_shared_system_prefix_uncached() -> String {
 pub fn build_user_system(
     ws_ctx: &WorkspaceContext,
     skills: &SkillRegistry,
+    wasm_plugins: &[WasmPlugin],
+    shell_plugins: Option<&PluginRegistry>,
     config: &crate::config::schema::Config,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -566,48 +581,42 @@ pub fn build_user_system(
         parts.push(ws_segment);
     }
 
+    // ## Installed Plugins — rendered via the existing helper. Sort
+    // happens inside that helper, byte-stable for given plugin set.
+    if let Some(plugins_block) = super::tools_builder::build_plugins_system(wasm_plugins, shell_plugins) {
+        parts.push(plugins_block);
+    }
+
+    // ## Installed Skills — pure enumeration, sorted by name.
+    //
+    // The generic "how to invoke a skill" guide lives in
+    // `build_shared_system_prefix` (under CAPABILITY PRIORITY → "How to
+    // invoke an installed skill"). Keeping it out of this per-user
+    // block keeps user_system bytes minimal and lets the shared base
+    // layer carry the invocation instructions to every client.
+    //
+    // SkillRegistry iterates a HashMap whose order is non-deterministic
+    // across gateway starts. Sorting by name produces a byte-stable
+    // payload so worker-side hashing of system+tools doesn't churn.
     if !skills.is_empty() {
-        // Collect first, then sort by name. SkillRegistry stores skills
-        // in a HashMap whose `values()` iteration order is non-
-        // deterministic — each gateway start re-randomizes the listing
-        // order in the rendered system prompt. That non-determinism
-        // leaks into the rsclaw `dynamic_prefix.system` payload, the
-        // worker hashes the differing bytes to a different prefix_id,
-        // and the cached KV slot misses every gateway restart even
-        // though the skill set is logically identical. Sorting by name
-        // here is the byte-stable canonical order; choice of order
-        // doesn't matter as long as it's stable.
         let mut skill_refs: Vec<_> = skills.all().collect();
         skill_refs.sort_by(|a, b| a.name.cmp(&b.name));
-        let lines: Vec<_> = skill_refs
+        let blocks: Vec<String> = skill_refs
             .iter()
             .map(|s| {
-                let desc = s
-                    .description
-                    .as_deref()
-                    .map(|d| {
-                        let oneline = d.replace('\n', " ");
-                        let trimmed = oneline.trim();
-                        if trimmed.chars().count() > 200 {
-                            let cut: String = trimmed.chars().take(200).collect();
-                            format!(" — {cut}…")
-                        } else if trimmed.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" — {trimmed}")
-                        }
-                    })
-                    .unwrap_or_default();
-                format!("- {}{desc}\n  dir: {}", s.name, s.dir.display())
+                let desc = s.description.as_deref().unwrap_or("(no description)");
+                let one_line = desc.trim().replace('\n', " ");
+                format!(
+                    "<skill name=\"{}\" version=\"{}\" dir=\"{}\">\n{}\n</skill>",
+                    s.name,
+                    s.version.as_deref().unwrap_or(""),
+                    s.dir.display(),
+                    one_line,
+                )
             })
             .collect();
-        if !lines.is_empty() {
-            parts.push(format!(
-                "Available skills (read each skill's SKILL.md and any references/*.md \
-                 BEFORE invoking its CLI for the first time — exact flag names live \
-                 there, guessing them is the #1 failure mode):\n{}",
-                lines.join("\n")
-            ));
+        if !blocks.is_empty() {
+            parts.push(format!("## Installed Skills\n\n{}", blocks.join("\n\n")));
         }
     }
 
@@ -623,10 +632,12 @@ pub fn build_user_system(
 pub(crate) fn build_system_prompt(
     ws_ctx: &WorkspaceContext,
     skills: &SkillRegistry,
+    wasm_plugins: &[WasmPlugin],
+    shell_plugins: Option<&PluginRegistry>,
     config: &crate::config::schema::Config,
 ) -> String {
     let prefix = build_shared_system_prefix();
-    let suffix = build_user_system(ws_ctx, skills, config);
+    let suffix = build_user_system(ws_ctx, skills, wasm_plugins, shell_plugins, config);
     if suffix.is_empty() {
         prefix
     } else {
