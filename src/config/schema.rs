@@ -279,7 +279,8 @@ pub struct AgentDefaults {
     pub context_tokens: Option<u32>,
     /// KV cache mode: 0 = off, 1 = full/append-only (default), 2 = delta/incremental.
     pub kv_cache_mode: Option<u8>,
-    /// Maximum token budget for /ctx (btw) side queries. Default: 10000.
+    /// Maximum token budget for `/btw` side-channel quick queries
+    /// (handled by `handle_side_query`). Default: 10000.
     pub btw_tokens: Option<u32>,
     pub timezone: Option<String>,
     pub timestamp: Option<Value>,

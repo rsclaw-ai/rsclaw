@@ -18,7 +18,7 @@ static SHARED_SYSTEM_PREFIX: LazyLock<String> = LazyLock::new(build_shared_syste
 /// Read-only commands that are always allowed for any agent (regardless of
 /// allowedCommands).
 pub(crate) const READONLY_COMMANDS: &[&str] = &[
-    "/help", "/version", "/status", "/health", "/uptime", "/models", "/ctx", "/btw", "/clear",
+    "/help", "/version", "/status", "/health", "/uptime", "/models", "/btw", "/clear",
     "/compact", "/history", "/cron", "/abort", "/loop", "/task",
 ];
 
@@ -85,17 +85,8 @@ pub(crate) fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
         h.push('\n');
     }
 
-    h.push_str(if zh { "背景上下文：\n" } else { "Background Context:\n" });
-    h.push_str(if zh { "  /ctx <文本>              添加持久上下文\n" } else { "  /ctx <text>              Add persistent context\n" });
-    h.push_str(if zh { "  /ctx --ttl <N> <文本>    添加上下文（N轮后过期）\n" } else { "  /ctx --ttl <N> <text>    Add context (expires in N turns)\n" });
-    if full { h.push_str(if zh { "  /ctx --global <文本>     添加全局上下文\n" } else { "  /ctx --global <text>     Add global context (all sessions)\n" }); }
-    h.push_str(if zh { "  /ctx --list              列出活跃上下文\n" } else { "  /ctx --list              List active context entries\n" });
-    h.push_str(if zh { "  /ctx --remove <id>       移除指定上下文\n" } else { "  /ctx --remove <id>       Remove entry by id\n" });
-    h.push_str(if zh { "  /ctx --clear             清除当前会话所有上下文\n" } else { "  /ctx --clear             Clear all context for this session\n" });
-    h.push('\n');
-
     h.push_str(if zh { "快速提问：\n" } else { "Side Query:\n" });
-    h.push_str(if zh { "  /btw <问题>              快速查询（不调用工具）\n" } else { "  /btw <question>          Quick query (no tools, ephemeral)\n" });
+    h.push_str(if zh { "  /btw <问题>              快速查询（不调用工具，旁路）\n" } else { "  /btw <question>          Quick query (no tools, ephemeral, bypass)\n" });
     h.push('\n');
 
     if full {

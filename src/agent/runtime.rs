@@ -483,8 +483,6 @@ pub struct AgentRuntime {
     /// Cached tool definitions from the last run_turn — reused by compaction
     /// to match the KV cache prefix exactly.
     pub(crate) cached_tools: Vec<crate::provider::ToolDef>,
-    /// Background context manager (/ctx command, formerly /btw).
-    btw_manager: super::btw::BtwManager,
     pub(crate) notification_tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
     pub(crate) opencode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
     pub(crate) claudecode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
@@ -533,7 +531,6 @@ impl AgentRuntime {
             fallback_models,
         );
         let session_aliases = store.db.load_all_aliases().unwrap_or_default();
-        let btw_manager = super::btw::BtwManager::new(Some(Arc::clone(&store.db)));
         let live_status = Arc::clone(&handle.live_status);
         let max_concurrent = config
             .agents
@@ -575,7 +572,6 @@ impl AgentRuntime {
             cached_skills_system: None,
             cached_skills_snapshot: Vec::new(),
             cached_tools: Vec::new(),
-            btw_manager,
             pending_task_results: Arc::new(std::sync::Mutex::new(Vec::new())),
             voice_mode_sessions: std::collections::HashSet::new(),
             notification_tx,
@@ -2050,97 +2046,6 @@ impl AgentRuntime {
                             ),
                         }
                     }
-                    // --- Background context (/ctx, formerly /btw) ---
-                    s if s.starts_with("__CTX_ADD__:") => {
-                        let content = s.strip_prefix("__CTX_ADD__:").unwrap_or("");
-                        let id = self
-                            .btw_manager
-                            .add(
-                                content,
-                                super::btw::BtwScope::Session(session_key.to_owned()),
-                                None,
-                            )
-                            .await;
-                        let lang = crate::i18n::default_lang();
-                        crate::i18n::t_fmt("btw_added", lang, &[("id", &id.to_string())])
-                    }
-                    s if s.starts_with("__CTX_TTL__:") => {
-                        let rest = s.strip_prefix("__CTX_TTL__:").unwrap_or("");
-                        let (turns_str, content) = rest.split_once(':').unwrap_or(("0", rest));
-                        let turns: u32 = turns_str.parse().unwrap_or(0);
-                        let id = self
-                            .btw_manager
-                            .add(
-                                content,
-                                super::btw::BtwScope::Session(session_key.to_owned()),
-                                Some(turns),
-                            )
-                            .await;
-                        let lang = crate::i18n::default_lang();
-                        crate::i18n::t_fmt(
-                            "btw_added_ttl",
-                            lang,
-                            &[("id", &id.to_string()), ("turns", &turns.to_string())],
-                        )
-                    }
-                    s if s.starts_with("__CTX_GLOBAL__:") => {
-                        if !is_default {
-                            format!("Command not available on agent `{}`.", self.handle.id)
-                        } else {
-                            let content = s.strip_prefix("__CTX_GLOBAL__:").unwrap_or("");
-                            let id = self.btw_manager.add(
-                                content,
-                                super::btw::BtwScope::Global,
-                                None,
-                            ).await;
-                            let lang = crate::i18n::default_lang();
-                            crate::i18n::t_fmt("btw_added_global", lang, &[("id", &id.to_string())])
-                        }
-                    }
-                    "__CTX_LIST__" => {
-                        let entries = self.btw_manager.list(session_key, channel).await;
-                        if entries.is_empty() {
-                            let lang = crate::i18n::default_lang();
-                            crate::i18n::t("btw_list_empty", lang)
-                        } else {
-                            let mut lines = Vec::new();
-                            for e in &entries {
-                                let ttl_info = if let Some(remaining) = e.remaining_turns {
-                                    format!("{remaining} turns left")
-                                } else {
-                                    "permanent".to_owned()
-                                };
-                                let scope_info = match &e.scope {
-                                    super::btw::BtwScope::Session(_) => "",
-                                    super::btw::BtwScope::Channel(_) => " [channel]",
-                                    super::btw::BtwScope::Global => " [global]",
-                                };
-                                lines.push(format!(
-                                    "[{}] ({}{}) {}",
-                                    e.id, ttl_info, scope_info, e.content
-                                ));
-                            }
-                            lines.join("\n")
-                        }
-                    }
-                    "__CTX_CLEAR__" => {
-                        self.btw_manager.clear(Some(session_key)).await;
-                        let lang = crate::i18n::default_lang();
-                        crate::i18n::t("btw_cleared", lang)
-                    }
-                    s if s.starts_with("__CTX_REMOVE__:") => {
-                        let id_str = s.strip_prefix("__CTX_REMOVE__:").unwrap_or("0");
-                        let id: u32 = id_str.parse().unwrap_or(0);
-                        let lang = crate::i18n::default_lang();
-                        if self.btw_manager.remove(id).await {
-                            crate::i18n::t_fmt("btw_removed", lang, &[("id", &id.to_string())])
-                        } else {
-                            crate::i18n::t_fmt("btw_not_found", lang, &[("id", &id.to_string())])
-                        }
-                    }
-                    "__CTX_USAGE__" => {
-                        "Usage:\n  /ctx <text>           Add context (session)\n  /ctx --ttl <N> <text> Add context (expires in N turns)\n  /ctx --global <text>  Add global context\n  /ctx --list           List entries\n  /ctx --remove <id>    Remove entry\n  /ctx --clear          Clear all".to_owned()
-                    }
                     // --- Side-channel quick query (/btw) ---
                     s if s.starts_with("__SIDE_QUERY__:") => {
                         let question = s.strip_prefix("__SIDE_QUERY__:").unwrap_or("");
@@ -2694,45 +2599,11 @@ impl AgentRuntime {
             self.cached_system_prompt.clone().expect("just set")
         };
 
-        // --- Dynamic context: injected into system prompt suffix ---
-        // Only truly dynamic, per-turn content goes here. Static rules belong
-        // in the base system prompt. Auto-recall memories are removed — LLM
-        // uses the memory tool to search when needed.
-        let mut dynamic_ctx = Vec::<String>::new();
-
-        // Inject current date/time — essential for file naming, scheduling, etc.
-        // This is per-turn dynamic content, NOT part of the KV cache stable prefix.
-        let now = chrono::Local::now();
-        use chrono::Datelike;
-        let weekday = now.date_naive().weekday().num_days_from_monday();
-        let last_friday = if weekday >= 4 {
-            now.date_naive() - chrono::Duration::days((weekday - 4) as i64)
-        } else {
-            now.date_naive() - chrono::Duration::days((weekday + 3) as i64)
-        };
-        let yesterday = now.date_naive() - chrono::Duration::days(1);
-        dynamic_ctx.push(format!(
-            "Current date: {} ({}). Yesterday: {}. Last Friday: {}.",
-            now.format("%Y-%m-%d %H:%M"),
-            now.format("%A"),
-            yesterday.format("%Y-%m-%d"),
-            last_friday.format("%Y-%m-%d"),
-        ));
-
         // Loop A (organic evolution): collect recalled memory IDs for feedback.
         // Auto-recall is disabled — LLM uses the memory tool to search when needed.
         // This avoids injecting dynamic content into user messages which would break
         // prefix KV cache across turns.
         let auto_recalled_ids = std::collections::HashSet::<String>::new();
-
-        // Background context injection (/ctx).
-        let btw_block = self
-            .btw_manager
-            .to_prompt_block_relevant(session_key, channel, text)
-            .await;
-        if !btw_block.is_empty() {
-            dynamic_ctx.push(btw_block);
-        }
 
         // Plugin hook: before_prompt_build (AGENTS.md §20).
         self.fire_hook(
@@ -3175,7 +3046,7 @@ impl AgentRuntime {
                 plugins_system.as_deref(),
                 skills_system.as_deref(),
                 tools, extra_tools, abort_flag.clone(),
-                dynamic_ctx, new_skills_tail,
+                new_skills_tail,
             ),
         )
         .await
@@ -3348,9 +3219,6 @@ impl AgentRuntime {
 
         // Evict stale sessions if the cache has grown too large.
         self.evict_stale_sessions();
-
-        // Tick ctx TTL counters after each turn.
-        self.btw_manager.tick_turn(session_key).await;
 
         // Auto-TTS: if session is in voice mode, generate audio for the reply.
         let mut reply = reply;
@@ -3691,7 +3559,6 @@ impl AgentRuntime {
         tools: Vec<ToolDef>,
         extra_tools: Vec<ToolDef>,
         abort_flag: Arc<AtomicBool>,
-        dynamic_ctx: Vec<String>,
         new_skills_tail: Vec<String>,
     ) -> Result<AgentReply> {
         // Pull both defaults the agent loop's prelude needs under a
@@ -4038,12 +3905,11 @@ impl AgentRuntime {
             //   [2]   system  — skills                (inserted at front)
             //   [3…n] history — session user/assistant messages
             //   [n+1] system  — new_skills_tail        (rare, appended)
-            //   [n+2] system  — dynamic_ctx (/ctx/btw) (stable within a turn)
             //   [tail] …      — turn_scratchpad        (grows per iteration, cleared next turn)
             //
-            // Keeping dynamic_ctx before turn_scratchpad means the prefix
-            // [session + ctx] is identical on every LLM call within a turn,
-            // allowing the KV cache to cover it. Session storage is NOT modified.
+            // Session storage is NOT modified — the Role::System
+            // overlays (plugins/skills/new_skills_tail) live only in
+            // the in-memory `raw` for one LLM call.
             let mut messages = {
                 let mut raw = self
                     .sessions
@@ -4086,16 +3952,6 @@ impl AgentRuntime {
                         content: MessageContent::Text(format!(
                             "## New Skill Installed\n{skill_block}"
                         )),
-                    });
-                }
-
-                // Inject dynamic context (/ctx, btw) before the scratchpad so
-                // the [session + ctx] prefix stays stable across loop iterations.
-                if !dynamic_ctx.is_empty() {
-                    let ctx_block = dynamic_ctx.join("\n\n");
-                    raw.push(Message {
-                        role: Role::System,
-                        content: MessageContent::Text(ctx_block),
                     });
                 }
 
