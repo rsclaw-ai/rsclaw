@@ -358,6 +358,43 @@ pub struct RunContext {
     /// so the workflow distiller has the verbatim ask without re-walking
     /// session history.
     pub user_text: String,
+    /// Optional lossless trace for SFT data export. Populated only when
+    /// `RSCLAW_CAPTURE_TRACES=1`; flushed to the JSONL path in
+    /// `RSCLAW_TRACES_PATH` on normal turn completion.
+    pub full_trace: Option<super::trace_capture::FullTrace>,
+}
+
+fn init_full_trace(user_text: &str) -> Option<super::trace_capture::FullTrace> {
+    if std::env::var("RSCLAW_CAPTURE_TRACES").ok().as_deref() != Some("1") {
+        return None;
+    }
+    let trace_id = format!(
+        "trace-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let mut t = super::trace_capture::FullTrace::new(
+        trace_id,
+        String::new(),
+        String::new(),
+        json!([]),
+    );
+    t.push_user(user_text);
+    Some(t)
+}
+
+fn maybe_emit_trace(trace: &super::trace_capture::FullTrace) {
+    let Ok(path_str) = std::env::var("RSCLAW_TRACES_PATH") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(&path_str);
+    if let Err(e) =
+        super::sft_exporter::write_sharegpt_jsonl(&path, std::slice::from_ref(trace))
+    {
+        warn!(?path, "trace export failed: {e:#}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2182,6 +2219,7 @@ impl AgentRuntime {
                             loop_warning_triggered: false,
                             turn_metrics: super::turn_metrics::TurnMetrics::new(),
                             user_text: String::new(),
+                            full_trace: None,
                         },
                         "",
                         &tool,
@@ -3081,6 +3119,7 @@ impl AgentRuntime {
             loop_warning_triggered: false,
             turn_metrics: super::turn_metrics::TurnMetrics::new(),
             user_text: text.to_owned(),
+            full_trace: init_full_trace(text),
         };
 
         // --- Plugins & Skills: cached, frozen at session start ---
@@ -4864,6 +4903,14 @@ impl AgentRuntime {
                 // (non-error_streak / non-max-iter / non-abort) completion
                 // path so we never persist failed workflows as skills.
                 ctx.turn_metrics.final_text_len = final_text.len();
+                if let Some(ft) = ctx.full_trace.as_mut() {
+                    if !final_text.is_empty() {
+                        ft.push_assistant_text(&final_text);
+                    }
+                }
+                if let Some(ft) = ctx.full_trace.as_ref() {
+                    maybe_emit_trace(ft);
+                }
                 self.maybe_crystallize_workflow(&ctx, &final_text);
 
                 if !tool_images.is_empty() {
@@ -5191,6 +5238,14 @@ impl AgentRuntime {
                             result_summary,
                             has_error,
                         );
+                        if let Some(ft) = ctx.full_trace.as_mut() {
+                            ft.push_tool_call(
+                                &tool_name,
+                                tool_input_for_metrics.clone(),
+                                &tool_id,
+                            );
+                            ft.push_tool_result(&tool_id, v.to_string(), has_error);
+                        }
                         // Record result for progress-aware loop detection.
                         // Same args + different results = making progress, not a loop.
                         // For exec tool: exclude task_id (uuid changes each call) to properly detect loops.
