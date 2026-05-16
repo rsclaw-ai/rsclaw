@@ -226,7 +226,7 @@ pub(crate) fn toolset_allowed_names(
 ///
 /// Includes built-in tools, per-agent A2A tools, external agent tools,
 /// and skill-derived tools.
-pub(crate) fn build_tool_list(
+pub fn build_tool_list(
     skills: &SkillRegistry,
     agents: Option<&AgentRegistry>,
     caller_id: &str,
