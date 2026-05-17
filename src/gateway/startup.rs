@@ -1167,20 +1167,27 @@ fn spawn_agent_tasks(
                     images,
                     files,
                     account: _,
-                    ..
+                    cancel_token,
+                    event_tx: _a2a_event_tx,
+                    input_request_tx: _a2a_input_req_tx,
                 } = msg;
-                let result = runtime
-                    .run_turn(
-                        &session_key,
-                        &text,
-                        &channel,
-                        &peer_id,
-                        &chat_id,
-                        extra_tools,
-                        images,
-                        files,
-                    )
-                    .await;
+                // Honor an A2A cancel_token at the turn level. Cancellation
+                // doesn't reach inside the LLM/tool loop yet — that needs
+                // runtime-internal plumbing — but at least the worker stops
+                // waiting on a long turn and reports Canceled cleanly.
+                let turn_fut = runtime.run_turn(
+                    &session_key, &text, &channel, &peer_id, &chat_id,
+                    extra_tools, images, files,
+                );
+                let result = if let Some(token) = cancel_token.as_ref() {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => Err(anyhow::anyhow!("canceled by A2A CancelTask")),
+                        r = turn_fut => r,
+                    }
+                } else {
+                    turn_fut.await
+                };
                 let turn_errored = result.is_err();
                 let reply = result.unwrap_or_else(|e| {
                     error!(agent = %handle.id, "turn error: {e:#}");
