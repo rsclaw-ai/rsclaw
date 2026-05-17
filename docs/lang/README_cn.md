@@ -79,7 +79,7 @@ rsclaw start
 | 上传运行时调参 | /set_upload_size, /set_upload_chars | -- |
 | 技能仓库 | ClawHub + SkillHub（自动回退） | 仅 ClawHub |
 | computer_use | 原生截图/鼠标/键盘控制 | 仅通过浏览器 |
-| A2A 协议 | Google A2A v0.3（跨网络 agent 协作） | -- |
+| A2A 协议 | Google A2A v1.0（跨网络 agent 协作） | -- |
 | 配置格式 | JSON5 | JSON5 |
 | 热重载 | 通道变更自动重启 | 支持 |
 | 自更新 | `rsclaw update` 从 GitHub 下载 | npm update |
@@ -635,12 +635,12 @@ rsclaw --profile test gateway run # 使用 ~/.rsclaw-test
 
 ### A2A 协议（Agent-to-Agent）
 
-rsclaw 实现了 [Google A2A Protocol v0.3](https://a2a-protocol.org/latest/specification/)，支持跨网络的 agent 间通信。这是 rsclaw 的独有功能，OpenClaw 不支持此协议。
+rsclaw 实现了 [Google A2A Protocol v1.0](https://a2a-protocol.org/latest/specification/)，支持跨网络的 agent 间通信。这是 rsclaw 的独有功能，OpenClaw 不支持此协议。
 
 **核心能力：**
 
 - **Agent Card 自动发现** -- 符合规范的 `/.well-known/agent.json` 端点，远程 agent 可自动发现本网关的能力和技能列表
-- **JSON-RPC 2.0 任务分发** -- 通过标准 `tasks/send` 方法向指定 agent 发送任务，支持会话保持和超时控制
+- **JSON-RPC 2.0 任务分发** -- 通过标准 `SendMessage` 方法向指定 agent 发送任务，支持会话保持和超时控制
 - **跨机器 agent 协作** -- 本地 agent 和远程 agent 通过 A2A 协议无缝协作，Bearer token 认证
 - **三种协作模式** -- 顺序执行（链式）、并行执行（扇出）、编排执行（LLM 驱动的 `agent_<id>` 工具调用）
 - **流式支持** -- Agent Card 声明 streaming 能力，支持流式任务响应
@@ -650,7 +650,7 @@ rsclaw 实现了 [Google A2A Protocol v0.3](https://a2a-protocol.org/latest/spec
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/.well-known/agent.json` | GET | Agent Card 发现，返回网关所有 agent 的能力描述 |
-| `/api/v1/a2a` | POST | JSON-RPC 2.0 任务端点，接收 `tasks/send` 请求 |
+| `/api/v1/a2a` | POST | JSON-RPC 2.0 任务端点，接收 `SendMessage` 请求 |
 
 **配置示例 -- 启用跨网络 A2A：**
 
@@ -708,7 +708,7 @@ rsclaw 实现了 [Google A2A Protocol v0.3](https://a2a-protocol.org/latest/spec
 {
   "jsonrpc": "2.0",
   "id": "task-001",
-  "method": "tasks/send",
+  "method": "SendMessage",
   "params": {
     "id": "task-001",
     "message": {
@@ -834,7 +834,7 @@ src/
   ws/          # WebSocket 协议 v3
   cmd/         # CLI 命令：setup、configure、security 等
   acp/         # ACP 协议（智能体 spawn/connect/run）
-  a2a/         # Google A2A v0.3 协议（server + client，跨网络 agent 协作）
+  a2a/         # Google A2A v1.0 协议（server + client，跨网络 agent 协作）
 ```
 
 ### Matrix E2EE

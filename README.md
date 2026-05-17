@@ -30,7 +30,7 @@ Built from scratch in Rust, RsClaw (Crab AI / 螃蟹 AI) persists every interact
 
 - 🧠 **Three-layer persistent memory** — redb KV + tantivy full-text + hnsw_rs vector search, built in, fully local
 - 🔌 **Four agent backends in one gateway** — mix Native Rust, Claude Code, OpenCode, and any ACP-compatible agent in a single workflow
-- 🌐 **A2A cross-machine orchestration** — agents on different machines collaborate via [Google A2A v0.3](https://a2a-protocol.org/)
+- 🌐 **A2A v1.0 cross-machine orchestration** — full [Google A2A protocol v1.0](https://a2a-protocol.org/) (streaming, push notifications, task persistence, cancellation, INPUT_REQUIRED interrupts)
 - 🪶 **15MB binary, ~20MB idle RAM** — runs reliably on low-spec servers and edge devices
 - 🔒 **Local-first** — memory and data stay in `~/.rsclaw/`, never leave your machine
 
@@ -214,7 +214,7 @@ Permission model:
 
 ### A2A Protocol
 
-Implements [Google A2A v0.3](https://a2a-protocol.org/) for cross-network agent collaboration. Auto-discovery via `/.well-known/agent.json`, JSON-RPC 2.0 task dispatch, streaming support.
+Implements [Google A2A v1.0](https://a2a-protocol.org/) for cross-network agent collaboration. Auto-discovery via `/.well-known/agent.json`, JSON-RPC 2.0 task dispatch, streaming support.
 
 ### Security
 
@@ -223,6 +223,41 @@ Implements [Google A2A v0.3](https://a2a-protocol.org/) for cross-network agent 
 - **File upload**: two-layer confirmation (size gate + token gate)
 - **Per-agent permissions**: configurable command ACL
 - **Tool loop detection**: sliding window (12-call, 8-threshold)
+
+---
+
+## A2A v1.0 Protocol
+
+RsClaw implements the full [Google A2A Protocol v1.0](https://a2a-protocol.org/latest/specification/) via JSON-RPC.
+
+**Discovery**
+
+```
+GET  /.well-known/agent.json
+```
+
+**Endpoint** (JSON-RPC 2.0; use `Accept: text/event-stream` for streaming methods)
+
+```
+POST /api/v1/a2a
+```
+
+**Methods** — `SendMessage`, `SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask`, `CreateTaskPushNotificationConfig`, `GetTaskPushNotificationConfig`, `ListTaskPushNotificationConfigs`, `DeleteTaskPushNotificationConfig`, `GetExtendedAgentCard`.
+
+**Auth** — bearer token or `X-API-Key` header (declared in Agent Card `securitySchemes`). Configure via env:
+
+```bash
+export RSCLAW_A2A_BEARER_TOKENS="token-1,token-2"
+export RSCLAW_A2A_API_KEYS="key-1,key-2"
+```
+
+When both env vars are empty, the endpoint is open (dev mode).
+
+**Push notifications** — register a webhook per task with a shared secret; the gateway POSTs HMAC-SHA256 signed payloads with `X-A2A-Signature` and `X-A2A-Task-Id` headers, 3-attempt exponential backoff.
+
+**Tasks** persist to `var/data/a2a/tasks.redb` so `GetTask` / `ListTasks` survive restarts.
+
+See [tests/a2a_interop_python.md](tests/a2a_interop_python.md) for end-to-end harness against the Python SDK.
 
 ---
 
@@ -291,7 +326,7 @@ Import copies config, workspace, and sessions into `~/.rsclaw/`. OpenClaw data i
 | **Long-term memory** | Three-layer (redb + tantivy + hnsw_rs) | — |
 | **Self-learning** | Learns from your usage patterns | — |
 | **Multi-backend agents** | Native Rust / Claude Code / OpenCode / ACP | — |
-| **A2A cross-machine** | Google A2A v0.3 | — |
+| **A2A cross-machine** | Google A2A v1.0 | — |
 | **Browser automation** | Built-in headless Chrome (CDP) | — |
 | **Exec safety** | 50+ deny patterns, deny/confirm/allow | — |
 
@@ -339,7 +374,7 @@ src/
   server/      Axum HTTP, REST API, OpenAI-compat endpoints
   store/       redb + tantivy + hnsw_rs
   browser/     Chrome CDP automation
-  a2a/         Google A2A v0.3
+  a2a/         Google A2A v1.0
   acp/         ACP protocol
   ws/          WebSocket v3
 ```

@@ -26,7 +26,7 @@ RsClaw ist eine komplette Neuentwicklung von [OpenClaw](https://github.com/openc
 - **32 integrierte Werkzeuge** -- Dateien, Shell, Websuche/Browser, Bildgenerierung, Speicher, Messaging, Cron, A2A
 - **40+ PreParse-Befehle** -- Umgehen LLM, null Token, Sub-Millisekunden-Antwort
 - **CDP-Browser-Automatisierung** -- Integrierte headless Chrome-Steuerung (20 Aktionen)
-- **A2A-Protokoll** -- Google A2A v0.3 (netzwerkuebergreifende Agenten-Zusammenarbeit)
+- **A2A-Protokoll** -- Google A2A v1.0 (netzwerkuebergreifende Agenten-Zusammenarbeit)
 - **Ausfuehrungssicherheit** -- deny/confirm/allow-Regeln, 50+ Ablehnungsmuster
 
 ## Schnellinstallation

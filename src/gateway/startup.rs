@@ -700,6 +700,19 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         }
     }
 
+    // A2A v1.0 plumbing — task event bus, persistent store, push dispatcher
+    // all share the same instances so events flow end-to-end.
+    let a2a_bus = crate::a2a::event::TaskEventBus::new();
+    let a2a_task_store = {
+        let path = crate::config::loader::base_dir()
+            .join("var/data/a2a/tasks.redb");
+        Arc::new(crate::a2a::store::TaskStore::open(&path).expect("open A2A task store"))
+    };
+    let a2a_push_dispatcher = Arc::new(crate::a2a::push::PushDispatcher::new(
+        Arc::clone(&a2a_task_store),
+        a2a_bus.clone(),
+    ));
+
     let state = AppState {
         config: Arc::clone(&config),
         live: Arc::clone(&live),
@@ -727,6 +740,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         restart_request_tx: restart_request_tx.clone(),
         pending_restart: Arc::clone(&pending_restart),
         shutdown: shutdown.clone(),
+        task_event_bus: a2a_bus,
+        task_cancels: Arc::new(dashmap::DashMap::new()),
+        suspended_tasks: Arc::new(dashmap::DashMap::new()),
+        task_store: a2a_task_store,
+        push_dispatcher: a2a_push_dispatcher,
     };
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
 
@@ -1149,22 +1167,44 @@ fn spawn_agent_tasks(
                     images,
                     files,
                     account: _,
+                    task_id,
+                    context_id,
+                    cancel_token,
+                    event_tx,
+                    input_request_tx,
                 } = msg;
+                // Build a TurnContext from the A2A wires on AgentMessage;
+                // empty for non-A2A callers. The runtime polls
+                // `is_cancelled()` between iterations and at every
+                // tool-dispatch boundary, so the worker stops waiting on
+                // a long turn as soon as the cancel token fires —
+                // no outer tokio::select shim needed.
+                let turn_ctx = crate::agent::registry::TurnContext {
+                    task_id,
+                    context_id,
+                    event_tx,
+                    cancel_token,
+                    input_request_tx,
+                };
                 let result = runtime
                     .run_turn(
-                        &session_key,
-                        &text,
-                        &channel,
-                        &peer_id,
-                        &chat_id,
-                        extra_tools,
-                        images,
-                        files,
+                        &session_key, &text, &channel, &peer_id, &chat_id,
+                        extra_tools, images, files, turn_ctx,
                     )
                     .await;
                 let turn_errored = result.is_err();
                 let reply = result.unwrap_or_else(|e| {
                     error!(agent = %handle.id, "turn error: {e:#}");
+                    // A2A consumers key off `outcome` to publish the right
+                    // terminal status (Failed vs Canceled). Without this
+                    // distinction the A2A reply-watcher saw `Ok(reply)` and
+                    // always published Completed — so cancellations and
+                    // LLM/tool errors were silently reported as success.
+                    let outcome = if e.to_string().contains("canceled by A2A CancelTask") {
+                        crate::agent::registry::ReplyOutcome::Canceled
+                    } else {
+                        crate::agent::registry::ReplyOutcome::Error
+                    };
                     AgentReply {
                         text: format!("[error: {e}]"),
                         is_empty: false,
@@ -1173,6 +1213,7 @@ fn spawn_agent_tasks(
                         files: vec![],
                         pending_analysis: None,
                         needs_outer_done_emit: false,
+                        outcome,
                     }
                 });
                 // Emit to event_bus for any reply path that bypassed
@@ -1328,6 +1369,11 @@ pub(crate) async fn handle_pending_analysis(
         peer_id: analysis.peer_id.clone(),
         chat_id: String::new(),
         reply_tx,
+        task_id: None,
+        context_id: None,
+        event_tx: None,
+        cancel_token: None,
+        input_request_tx: None,
         extra_tools: vec![],
         images: vec![],
         files: vec![],

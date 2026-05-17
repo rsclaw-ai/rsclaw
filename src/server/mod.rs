@@ -160,6 +160,19 @@ pub struct AppState {
     /// in-flight HTTP requests, task queue tasks, and channel handlers
     /// before re-exec.
     pub shutdown: crate::gateway::ShutdownCoordinator,
+    /// A2A v1.0 per-task event broadcast bus (fan-out for SSE subscribers
+    /// and the push notification dispatcher).
+    pub task_event_bus: crate::a2a::event::TaskEventBus,
+    /// Cancellation tokens for in-flight A2A tasks, keyed by task_id.
+    /// Inserted on SendMessage / SendStreamingMessage entry; fired by CancelTask.
+    pub task_cancels: Arc<dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+    /// Tasks paused on TASK_STATE_INPUT_REQUIRED / AUTH_REQUIRED, keyed by task_id.
+    /// Resumed when the client sends another SendMessage with the matching taskId.
+    pub suspended_tasks: Arc<dashmap::DashMap<String, crate::a2a::event::SuspendedTask>>,
+    /// Persistent A2A task / push-config store (redb).
+    pub task_store: Arc<crate::a2a::store::TaskStore>,
+    /// Push notification dispatcher (subscribes to event bus, signs payloads).
+    pub push_dispatcher: Arc<crate::a2a::push::PushDispatcher>,
 }
 
 // AgentEvent is defined in crate::events to avoid circular deps with agent.
@@ -268,7 +281,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/workspace/files", get(list_workspace_files))
         .route("/workspace/files/{*path}", get(read_workspace_file).put(write_workspace_file))
         .route("/stream", get(stream_sse))
-        .route("/a2a", post(crate::a2a::server::a2a_rpc_handler))
+        .route(
+            "/a2a",
+            post(crate::a2a::server::a2a_dispatch)
+                .layer(axum::middleware::from_fn(crate::a2a::version::a2a_version_layer))
+                .layer(axum::middleware::from_fn(crate::a2a::auth::a2a_auth_layer)),
+        )
         .route("/tools/execute", post(execute_tool))
         .route("/computer-use/permissions", get(computer_use_permissions_list))
         .route(
@@ -304,7 +322,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/hooks/{*path}", post(crate::hooks::handle_webhook))
         .route(
             "/.well-known/agent.json",
-            get(crate::a2a::server::agent_card_handler),
+            get(crate::a2a::server::agent_card_handler).layer(axum::middleware::from_fn(
+                crate::a2a::version::a2a_version_layer,
+            )),
         )
         // OpenAI-compatible endpoints — allow any OpenAI API client to connect.
         .route("/v1/chat/completions", post(openai_chat_completions))
@@ -387,6 +407,12 @@ async fn auth_middleware(
         || path == "/api/v1/shutdown"
         || path == "/api/v1/restart"
         || path == "/api/v1/restart-dismiss"
+        // A2A v1.0: bypass gateway-level auth so the protocol's own
+        // bearer/X-API-Key schemes (declared in Agent Card securitySchemes
+        // and enforced by `a2a_auth_layer`) are the authoritative gate.
+        // Otherwise the gateway token would override the A2A-advertised
+        // auth and any A2A v1.0 client following the spec would 401.
+        || path == "/api/v1/a2a"
     {
         return next.run(request).await;
     }
@@ -475,6 +501,11 @@ async fn send_message(
         peer_id: req.peer_id.unwrap_or_else(|| "api-client".to_string()),
         chat_id: String::new(),
         reply_tx,
+        task_id: None,
+        context_id: None,
+        event_tx: None,
+        cancel_token: None,
+        input_request_tx: None,
         extra_tools: vec![],
         images: file_images,
         files: file_files,
@@ -1524,6 +1555,11 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
             peer_id: format!("cron:{id}"),
             chat_id: String::new(),
             reply_tx,
+            task_id: None,
+            context_id: None,
+            event_tx: None,
+            cancel_token: None,
+            input_request_tx: None,
             extra_tools: vec![],
             images: vec![],
             files: vec![],
@@ -2073,6 +2109,11 @@ async fn openai_chat_completions(
         peer_id,
         chat_id: String::new(),
         reply_tx,
+        task_id: None,
+        context_id: None,
+        event_tx: None,
+        cancel_token: None,
+        input_request_tx: None,
         extra_tools,
         images: file_images,
         files: file_files,

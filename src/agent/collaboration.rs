@@ -60,6 +60,7 @@ pub async fn run_sequential(
             files: vec![],
             pending_analysis: None,
             needs_outer_done_emit: false,
+            outcome: crate::agent::registry::ReplyOutcome::Ok,
         });
     }
 
@@ -80,6 +81,7 @@ pub async fn run_sequential(
         files: vec![],
         pending_analysis: None,
         needs_outer_done_emit: false,
+        outcome: crate::agent::registry::ReplyOutcome::Ok,
     })
 }
 
@@ -218,6 +220,11 @@ pub(crate) async fn invoke_agent(
             peer_id: peer_id.to_owned(),
             chat_id: String::new(),
             reply_tx,
+            task_id: None,
+            context_id: None,
+            event_tx: None,
+            cancel_token: None,
+            input_request_tx: None,
             extra_tools: vec![],
             images: vec![],
             files: vec![],

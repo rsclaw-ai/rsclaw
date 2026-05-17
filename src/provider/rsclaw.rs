@@ -4879,15 +4879,26 @@ data: {"type":"message_stop"}
         assert!(err.to_string().contains("kv_cache_mode=2"));
     }
 
-    #[test]
-    fn rejects_missing_session_key() {
+    // Renamed + re-scoped: the previous version expected an error when
+    // session_key was `None` with kv_cache_mode=2, but the dispatch
+    // refactor (commit cc6314a) now routes session_key=None to /oneshot
+    // regardless of kv_cache_mode. The remaining session-mode contract
+    // worth pinning is the inverse: session_key=Some + kv_cache_mode!=2
+    // must error rather than silently mis-route. (Also: tokio::test
+    // instead of futures::executor::block_on — provider.stream calls
+    // into reqwest, which needs a tokio reactor on the current thread.)
+    #[tokio::test]
+    async fn rejects_session_mode_without_kv_cache_mode_2() {
         let provider = RsclawProvider::new("http://x", None);
-        let req = req_with(vec![], 2, None);
-        let err = match futures::executor::block_on(provider.stream(req)) {
-            Ok(_) => panic!("expected error for missing session_key"),
+        let req = req_with(vec![], 0, Some("session-xyz"));
+        let err = match provider.stream(req).await {
+            Ok(_) => panic!("expected error for session_key + kv_cache_mode!=2"),
             Err(e) => e,
         };
-        assert!(err.to_string().contains("session_key"));
+        assert!(
+            err.to_string().contains("kv_cache_mode=2"),
+            "unexpected error text: {err}"
+        );
     }
 
     // ----- compact splice wire shape (§2.4) -------------------------------

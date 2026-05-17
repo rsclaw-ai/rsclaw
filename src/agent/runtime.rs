@@ -362,6 +362,12 @@ pub struct RunContext {
     /// `RSCLAW_CAPTURE_TRACES=1`; flushed to the JSONL path in
     /// `RSCLAW_TRACES_PATH` on normal turn completion.
     pub full_trace: Option<super::trace_capture::FullTrace>,
+    /// Per-turn observability/control wires for A2A callers
+    /// (cancel_token, event_tx, input_request_tx, task/context ids).
+    /// Default-constructed for non-A2A turns; `agent_loop` polls
+    /// `is_cancelled()` between iterations and at tool-dispatch
+    /// boundaries, and calls `emit_working()` before each tool.
+    pub turn_ctx: super::registry::TurnContext,
 }
 
 fn init_full_trace(user_text: &str) -> Option<super::trace_capture::FullTrace> {
@@ -1294,6 +1300,7 @@ impl AgentRuntime {
             pending_analysis: None,
             // /btw bypasses agent_loop — outer must emit done.
             needs_outer_done_emit: true,
+            outcome: crate::agent::registry::ReplyOutcome::Ok,
         })
     }
 
@@ -1428,6 +1435,7 @@ impl AgentRuntime {
         extra_tools: Vec<ToolDef>,
         images: Vec<super::registry::ImageAttachment>,
         files: Vec<super::registry::FileAttachment>,
+        turn_ctx: super::registry::TurnContext,
     ) -> Result<AgentReply> {
         // Resolve @file references (e.g. @up_i_202604271325ab.png → full path
         // under workspace/uploads/, @dl_v_... → ~/Downloads/rsclaw/videos/).
@@ -1683,6 +1691,7 @@ impl AgentRuntime {
                             pending_analysis: None,
                             // File-handling short-circuit bypasses agent_loop.
                             needs_outer_done_emit: true,
+                            outcome: crate::agent::registry::ReplyOutcome::Ok,
                         });
                     }
                     // Has extractable text: return "analyzing..." immediately,
@@ -1701,6 +1710,7 @@ impl AgentRuntime {
                         }),
                         // pending_analysis short-circuit bypasses agent_loop.
                         needs_outer_done_emit: true,
+                        outcome: crate::agent::registry::ReplyOutcome::Ok,
                     });
                 }
                 "2" => {
@@ -1760,6 +1770,7 @@ impl AgentRuntime {
                             pending_analysis: None,
                             // File-handling short-circuit bypasses agent_loop.
                             needs_outer_done_emit: true,
+                            outcome: crate::agent::registry::ReplyOutcome::Ok,
                         });
                     }
                     // Has extractable text: return "analyzing..." immediately,
@@ -1784,6 +1795,7 @@ impl AgentRuntime {
                         }),
                         // pending_analysis short-circuit bypasses agent_loop.
                         needs_outer_done_emit: true,
+                        outcome: crate::agent::registry::ReplyOutcome::Ok,
                     });
                 }
                 _ => {
@@ -1801,6 +1813,7 @@ impl AgentRuntime {
                         pending_analysis: None,
                         // File-handling short-circuit bypasses agent_loop.
                         needs_outer_done_emit: true,
+                        outcome: crate::agent::registry::ReplyOutcome::Ok,
                     });
                 }
             }
@@ -2195,6 +2208,7 @@ impl AgentRuntime {
                             files: vec![],
                             pending_analysis: None,
                             needs_outer_done_emit: true,
+                            outcome: crate::agent::registry::ReplyOutcome::Ok,
                         });
                     }
                     other => other.to_owned(),
@@ -2208,6 +2222,7 @@ impl AgentRuntime {
                         files: vec![],
                         pending_analysis: None,
                         needs_outer_done_emit: true,
+                        outcome: crate::agent::registry::ReplyOutcome::Ok,
                     });
                 }
                 // Fall through to LLM for unhandled directives
@@ -2226,6 +2241,7 @@ impl AgentRuntime {
                         files: vec![],
                         pending_analysis: None,
                         needs_outer_done_emit: true,
+                        outcome: crate::agent::registry::ReplyOutcome::Ok,
                     });
                 }
                 info!(tool = %tool, "pre-parse: executing tool directly");
@@ -2256,6 +2272,7 @@ impl AgentRuntime {
                             turn_metrics: super::turn_metrics::TurnMetrics::new(),
                             user_text: String::new(),
                             full_trace: None,
+                            turn_ctx: super::registry::TurnContext::default(),
                         },
                         "",
                         &tool,
@@ -2280,6 +2297,7 @@ impl AgentRuntime {
                             files: vec![],
                             pending_analysis: None,
                             needs_outer_done_emit: true,
+                            outcome: crate::agent::registry::ReplyOutcome::Ok,
                         });
                     }
                     Err(e) => {
@@ -2291,6 +2309,7 @@ impl AgentRuntime {
                             files: vec![],
                             pending_analysis: None,
                             needs_outer_done_emit: true,
+                            outcome: crate::agent::registry::ReplyOutcome::Ok,
                         });
                     }
                 }
@@ -2314,6 +2333,7 @@ impl AgentRuntime {
                         files: vec![],
                         pending_analysis: None,
                         needs_outer_done_emit: true,
+                        outcome: crate::agent::registry::ReplyOutcome::Ok,
                     });
                 }
                 // Safety off: fall through to execute anyway
@@ -2338,6 +2358,7 @@ impl AgentRuntime {
                         files: vec![],
                         pending_analysis: None,
                         needs_outer_done_emit: true,
+                        outcome: crate::agent::registry::ReplyOutcome::Ok,
                     });
                 }
                 // Safety off: fall through to execute anyway
@@ -2354,6 +2375,7 @@ impl AgentRuntime {
                     files: vec![],
                     pending_analysis: None,
                     needs_outer_done_emit: true,
+                    outcome: crate::agent::registry::ReplyOutcome::Ok,
                 });
             }
         }
@@ -2372,6 +2394,7 @@ impl AgentRuntime {
                 pending_analysis: None,
                 // __DIRECT_REPLY__ bypasses agent_loop.
                 needs_outer_done_emit: true,
+                outcome: crate::agent::registry::ReplyOutcome::Ok,
             });
         }
 
@@ -2459,6 +2482,7 @@ impl AgentRuntime {
                     extra_tools,
                     images,
                     vec![],
+                    turn_ctx,
                 ))
                 .await;
             } else if !transcriptions.is_empty() {
@@ -2477,6 +2501,7 @@ impl AgentRuntime {
                     extra_tools,
                     images,
                     files,
+                    turn_ctx,
                 ))
                 .await;
             }
@@ -2533,6 +2558,7 @@ impl AgentRuntime {
                     pending_analysis: None,
                     // File-size-exceeded short-circuit bypasses agent_loop.
                     needs_outer_done_emit: true,
+                    outcome: crate::agent::registry::ReplyOutcome::Ok,
                 });
             }
             let files = accepted;
@@ -2560,6 +2586,7 @@ impl AgentRuntime {
                     pending_analysis: None,
                     // Disk-low short-circuit bypasses agent_loop.
                     needs_outer_done_emit: true,
+                    outcome: crate::agent::registry::ReplyOutcome::Ok,
                 });
             }
 
@@ -2674,6 +2701,7 @@ impl AgentRuntime {
                 pending_analysis: None,
                 // File-saved short-circuit bypasses agent_loop.
                 needs_outer_done_emit: true,
+                outcome: crate::agent::registry::ReplyOutcome::Ok,
             });
         }
 
@@ -3078,6 +3106,7 @@ impl AgentRuntime {
                 pending_analysis: None,
                 // Pre-loop abort bypasses agent_loop.
                 needs_outer_done_emit: true,
+                outcome: crate::agent::registry::ReplyOutcome::Ok,
             });
         }
 
@@ -3148,6 +3177,7 @@ impl AgentRuntime {
             turn_metrics: super::turn_metrics::TurnMetrics::new(),
             user_text: text.to_owned(),
             full_trace: init_full_trace(text),
+            turn_ctx,
         };
 
         // Plugins + Skills rendering now lives inside `build_user_system`
@@ -3819,7 +3849,17 @@ impl AgentRuntime {
                     files: vec![],
                     pending_analysis: None,
                     needs_outer_done_emit: false,
+                    outcome: crate::agent::registry::ReplyOutcome::Ok,
                 });
+            }
+            // Check A2A cancel_token at start of each iteration. Same intent
+            // as the user-side /abort path below, just from a different source
+            // (the AppState.task_cancels entry that handle_cancel_task fires).
+            // Returns Err so the gateway worker reports `canceled by A2A
+            // CancelTask` and the dispatcher publishes TaskState::Canceled.
+            if ctx.turn_ctx.is_cancelled() {
+                info!(session = %ctx.session_key, iteration, "agent_loop: canceled by A2A");
+                return Err(anyhow!("canceled by A2A CancelTask"));
             }
             // Check abort flag at start of each iteration (allows /abort to
             // interrupt even when tool dispatch is blocking between LLM calls).
@@ -3846,6 +3886,7 @@ impl AgentRuntime {
                     files: vec![],
                     pending_analysis: None,
                     needs_outer_done_emit: false,
+                    outcome: crate::agent::registry::ReplyOutcome::Ok,
                 });
             }
             if iteration > max_iterations {
@@ -3881,6 +3922,7 @@ impl AgentRuntime {
                     files: vec![],
                     pending_analysis: None,
                     needs_outer_done_emit: false,
+                    outcome: crate::agent::registry::ReplyOutcome::Ok,
                 });
             }
             // Check consecutive tool errors — stop early when tools keep failing.
@@ -3919,6 +3961,7 @@ impl AgentRuntime {
                     files: tool_files,
                     pending_analysis: None,
                     needs_outer_done_emit: false,
+                    outcome: crate::agent::registry::ReplyOutcome::Ok,
                 });
             }
             // Apply legacy context pruning (hard clear / soft trim) as fallback.
@@ -4834,6 +4877,7 @@ impl AgentRuntime {
                     files: tool_files,
                     pending_analysis: None,
                     needs_outer_done_emit: false,
+                    outcome: crate::agent::registry::ReplyOutcome::Ok,
                 });
             }
 
@@ -4940,6 +4984,7 @@ impl AgentRuntime {
                     files: vec![],
                     pending_analysis: None,
                     needs_outer_done_emit: false,
+                    outcome: crate::agent::registry::ReplyOutcome::Ok,
                 });
             }
 
@@ -5033,6 +5078,7 @@ impl AgentRuntime {
                             files: vec![],
                             pending_analysis: None,
                             needs_outer_done_emit: false,
+                            outcome: crate::agent::registry::ReplyOutcome::Ok,
                         });
                     }
                 } else {
@@ -5068,6 +5114,16 @@ impl AgentRuntime {
                 // Clone for the per-turn metrics record (after dispatch
                 // moves the value).
                 let tool_input_for_metrics = tool_input.clone();
+                // A2A progress signal: publish "calling tool X" before
+                // dispatch so the client / push subscribers can render
+                // tool-level progress. No-op for non-A2A turns. Cancel
+                // check too — a long-running prior tool may have
+                // observed the token between iterations.
+                ctx.turn_ctx
+                    .emit_working(&format!("calling tool {tool_name}"));
+                if ctx.turn_ctx.is_cancelled() {
+                    return Err(anyhow!("canceled by A2A CancelTask"));
+                }
                 let result = self
                     .dispatch_tool(ctx, &tool_id, &tool_name, tool_input)
                     .await;
@@ -5623,6 +5679,18 @@ impl AgentRuntime {
             "agent" | "subagents" => return self.tool_agent_consolidated(ctx, args).await,
             "channel" => return self.tool_channel_consolidated(args).await,
 
+            // A2A v1.0 INPUT_REQUIRED / AUTH_REQUIRED suspend-resume bridge.
+            // When the LLM calls this tool the runtime publishes
+            // TASK_STATE_INPUT_REQUIRED (or AUTH_REQUIRED), registers a
+            // resume handle on `state.suspended_tasks`, and awaits the
+            // client's next SendMessage on the same taskId — which the
+            // dispatcher routes through the resume short-path. The new
+            // text becomes this tool's return value, and the agent loop
+            // continues with that text as a fresh tool result. No-op on
+            // non-A2A turns: returns an error instead of hanging the loop.
+            "wait_input" => return self.tool_wait_input(ctx, args).await,
+            "wait_auth" => return self.tool_wait_input(ctx, inject_auth(args)).await,
+
             // --- Backward compat: old names map to consolidated handlers ---
             "memory_search" => {
                 return self
@@ -5957,6 +6025,11 @@ impl AgentRuntime {
                 peer_id: ctx.agent_id.clone(),
                 chat_id: String::new(),
                 reply_tx,
+                task_id: None,
+                context_id: None,
+                event_tx: None,
+                cancel_token: None,
+                input_request_tx: None,
                 extra_tools: vec![],
                 images: vec![],
                 files: vec![],
@@ -6083,6 +6156,45 @@ impl AgentRuntime {
             })
             .collect();
         Ok(json!({"count": results.len(), "results": results}))
+    }
+
+    /// A2A v1.0 INPUT_REQUIRED / AUTH_REQUIRED bridge tool.
+    ///
+    /// The agent calls this when it needs the client to supply more text
+    /// (e.g. a credential, a confirmation, a missing parameter) before it
+    /// can finish the turn. The runtime publishes a TASK_STATE_INPUT_REQUIRED
+    /// (or AUTH_REQUIRED if `auth=true`) status event with `prompt` as the
+    /// agent-role message, registers a one-shot resume handle on
+    /// `state.suspended_tasks`, and awaits the client's reply.
+    ///
+    /// Resume protocol: the client sends a fresh SendMessage / SendStreamingMessage
+    /// with the **same taskId** and the new text. The dispatcher detects the
+    /// existing `SuspendedTask` entry, pops it, and pushes the text into the
+    /// `resume_tx`. This tool then returns the text as its result and the
+    /// agent loop continues.
+    ///
+    /// Non-A2A turns (TurnContext default) have no `input_request_tx`, so
+    /// this returns an error — the LLM can recover with a plain reply.
+    pub(crate) async fn tool_wait_input(&self, ctx: &RunContext, args: Value) -> Result<Value> {
+        let prompt = args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Please provide additional input to continue.");
+        let auth = args
+            .get("auth")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if ctx.turn_ctx.input_request_tx.is_none() {
+            return Ok(json!({
+                "error": "wait_input is only supported on A2A turns",
+            }));
+        }
+        match ctx.turn_ctx.request_input(prompt, auth).await {
+            Some(text) => Ok(json!({ "input": text })),
+            None => Err(anyhow!(
+                "resume channel dropped while awaiting input"
+            )),
+        }
     }
 
     pub(crate) async fn tool_memory_get(&self, args: Value) -> Result<Value> {
@@ -6771,6 +6883,15 @@ fn rrf_fuse(
 fn inject_action(mut args: Value, action: &str) -> Value {
     if let Some(obj) = args.as_object_mut() {
         obj.entry("action").or_insert_with(|| json!(action));
+    }
+    args
+}
+
+/// Force `auth=true` on the wait-input args so the `wait_auth` alias
+/// routes to the AUTH_REQUIRED variant of the suspend-resume bridge.
+fn inject_auth(mut args: Value) -> Value {
+    if let Some(obj) = args.as_object_mut() {
+        obj.insert("auth".to_owned(), json!(true));
     }
     args
 }
