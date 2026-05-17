@@ -449,11 +449,10 @@ pub fn seed_workspace_with_lang(workspace: &Path, lang: Option<&str>) -> Result<
 /// guidance.
 pub fn tool_prompts_for_system() -> String {
     let parts: &[&str] = &[
-        EN_TOOL_EXEC.trim(),
+        EN_TOOL_SHELL.trim(),
         EN_TOOL_WEB_SEARCH.trim(),
         EN_TOOL_WEB_FETCH.trim(),
         EN_TOOL_WEB_BROWSER.trim(),
-        EN_TOOL_COMPUTER_USE.trim(),
     ];
     parts.join("\n\n")
 }
@@ -517,13 +516,13 @@ const EN_TOOL_WEB_BROWSER: &str = r#"# web_browser Usage Guide
 - Just reply "done" without actually downloading and sending the generated content to user
 "#;
 
-const EN_TOOL_EXEC: &str = r#"# exec Usage Guide
+const EN_TOOL_SHELL: &str = r#"# shell Usage Guide
 
 ## Tool Mastery — Choose the Right Tool
 | Task | Best Tool |
 |------|-----------|
-| HTTP requests, REST APIs, fetching pages | **`web_fetch`** (NOT curl/wget/exec) |
-| File downloads (images/videos/binaries) | **`web_download`** (NOT curl/wget/exec) |
+| HTTP requests, REST APIs, fetching pages | **`web_fetch`** (NOT curl/wget/shell) |
+| File downloads (images/videos/binaries) | **`web_download`** (NOT curl/wget/shell) |
 | File/text ops, pipes, system info | bash/zsh (macOS/Linux) or PowerShell (Windows) |
 | Data processing (CSV/JSON local files) | Python (`python3 -c "..."` or write script) |
 | Package install | pip/npm, or `install_tool` for system tools |
@@ -615,7 +614,7 @@ Use direct API first. web_search for open-ended or unstructured questions only.
 const EN_TOOL_WEB_FETCH: &str = r#"# web_fetch Usage Guide
 
 - **PREFERRED for any HTTP request** — web pages, JSON APIs, REST endpoints, documentation, articles
-- **Do NOT** use `execute_command` with `curl`/`wget`/`Invoke-WebRequest` for HTTP — use web_fetch
+- **Do NOT** use `shell` with `curl`/`wget`/`Invoke-WebRequest` for HTTP — use web_fetch
 - HTML pages are auto-converted to clean text/markdown
 - JSON / plain-text / non-HTML responses are returned **as-is (raw body)** — works for wttr.in, openweather, github, ipinfo, etc.
 - Use web_fetch for static content; only use web_browser when interaction is needed (login, clicking, form filling)
@@ -646,29 +645,5 @@ Example — authenticated POST:
 - path is relative to workspace/downloads/. Pass filename like `video.mp4` or `subdir/file.pdf`.
 - Do NOT use `~/`, `~/Downloads/`, or absolute paths.
 - After downloading, use `send_file` to send the file to the user.
-"#;
-
-const EN_TOOL_COMPUTER_USE: &str = r#"# computer_use Usage Guide
-
-## Desktop automation workflow
-
-Before controlling ANY desktop application (WeChat, Finder, Safari, etc.), you MUST load the relevant app-rule first:
-
-1. **List available app-rules**: `computer_use` action=`list_app_rules`
-2. **Load the specific rule**: `computer_use` action=`get_app_rule` name=`<app-name>`
-
-Available app-rules include:
-- **wechat** — WeChat (微信) desktop client automation: send messages, monitor group chats, auto-reply via Quote
-- **doubao** — Doubao (豆包) desktop client automation
-- **douyin** — Douyin (抖音) desktop client automation
-- **tonghuashun** — Tonghuashun (同花顺) desktop client automation
-
-## Critical rules
-
-- **ALWAYS load the app-rule BEFORE taking the first screenshot.** The app-rule contains version-specific workflows, coordinate heuristics, and failure recovery steps that you cannot guess.
-- **Never say "I cannot control the desktop"** — you have `computer_use` with screenshot, click, type, key, and get_app_rule. Use them.
-- After loading the app-rule, follow its instructions exactly. Do not improvise shortcuts unless the app-rule explicitly suggests them.
-- Re-activate the target app between every action. Screenshots capture whatever is frontmost at the moment of the call.
-- Trust the screenshot, not your assumption. Verify every step visually.
 "#;
 

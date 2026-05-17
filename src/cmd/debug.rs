@@ -26,7 +26,7 @@ use crate::skill::loader::load_skills;
 /// new built-in tool is added, both lists must grow together.
 const BUILTIN_TOOLS: &[&str] = &[
     "memory", "use_skill", "task", "read_file", "write_file", "send_file",
-    "execute_command", "agent", "install_tool", "list_dir", "search_file",
+    "shell", "agent", "install_tool", "list_dir", "search_file",
     "search_content", "web_search", "web_fetch", "web_download", "web_browser",
     "computer_use", "image_gen", "video_gen", "pdf", "text_to_voice",
     "send_message", "cron", "session", "gateway", "opencode", "claudecode",

@@ -185,14 +185,14 @@ mod tests {
         let mut m = TurnMetrics::new();
         m.record_tool("read_file", "{}".into(), "ok".into(), false);
         m.record_tool(
-            "execute_command",
+            "shell",
             r#"{"cmd":"ls"}"#.into(),
             "permission denied".into(),
             true,
         );
         let p = build_workflow_prompt("list files", "done", &m);
         assert!(p.contains("read_file"));
-        assert!(p.contains("execute_command"));
+        assert!(p.contains("shell"));
         assert!(p.contains("[ERROR]"));
         assert!(p.contains("[OK]"));
         assert!(p.contains("permission denied"));

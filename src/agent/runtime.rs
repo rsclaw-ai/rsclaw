@@ -727,11 +727,17 @@ pub fn resolve_primary_model_for(
 ///   2. per-agent `flash_model.primary` (legacy)
 ///   3. `defaults.model.flash`
 ///   4. `defaults.flash_model.primary` (legacy)
+///   5. **RsClaw provider inference**: if the effective primary lives
+///      under the `rsclaw/` namespace (managed fleet), auto-pick
+///      [`RSCLAW_DEFAULT_FLASH`]. Saves users from having to repeat the
+///      rsclaw flash slot when their primary already names a rsclaw
+///      model — the same "convention over configuration" treatment the
+///      provider gets for api/baseUrl/prefix_id.
 pub fn resolve_flash_model_for(
     per_agent: &crate::config::schema::AgentEntry,
     defaults: &crate::config::schema::AgentDefaults,
 ) -> Option<String> {
-    per_agent
+    let explicit = per_agent
         .model
         .as_ref()
         .and_then(|m| m.flash.as_deref())
@@ -753,7 +759,28 @@ pub fn resolve_flash_model_for(
                 .as_ref()
                 .and_then(|m| m.primary.as_deref())
         })
-        .map(str::to_owned)
+        .map(str::to_owned);
+    if explicit.is_some() {
+        return explicit;
+    }
+
+    // RsClaw fleet inference (see RSCLAW_DEFAULT_FLASH).
+    let primary = per_agent
+        .model
+        .as_ref()
+        .and_then(|m| m.primary.as_deref())
+        .or_else(|| {
+            defaults
+                .model
+                .as_ref()
+                .and_then(|m| m.primary.as_deref())
+        });
+    if let Some(p) = primary {
+        if p.starts_with("rsclaw/") {
+            return Some(crate::provider::rsclaw::RSCLAW_DEFAULT_FLASH.to_owned());
+        }
+    }
+    None
 }
 
 /// Outcome of vision-model resolution. The four cases are distinguished
@@ -805,6 +832,35 @@ pub fn resolve_vision_model_for(
     {
         return VisionResolution::Configured(name);
     }
+
+    // No explicit vision configured. Before declaring a primary fallback,
+    // check if the primary lives under the `rsclaw/` namespace — in that
+    // case the fleet exposes a dedicated vision slot
+    // ([`RSCLAW_DEFAULT_VISION`]) which is what the user almost
+    // certainly wants. The default `rsclaw/rsclaw-agent-v1` primary is
+    // text-only, so falling back to it would surface a "primary is
+    // text-only" error to the user even though a perfectly good vision
+    // slot is sitting one HTTP hop away. Treat the inferred rsclaw
+    // vision model as `Configured` (not `FallbackToPrimary`) so callers
+    // skip the text-only check below — the rsclaw fleet vouches for it.
+    let primary = per_agent
+        .model
+        .as_ref()
+        .and_then(|m| m.primary.as_deref())
+        .or_else(|| {
+            defaults
+                .model
+                .as_ref()
+                .and_then(|m| m.primary.as_deref())
+        });
+    if let Some(p) = primary {
+        if p.starts_with("rsclaw/") {
+            return VisionResolution::Configured(
+                crate::provider::rsclaw::RSCLAW_DEFAULT_VISION.to_owned(),
+            );
+        }
+    }
+
     if let Some(name) = per_agent
         .model
         .as_ref()
@@ -2161,7 +2217,7 @@ impl AgentRuntime {
             {
                 // Group chat safety: block dangerous preparse commands (/run, /ls, /cat, etc.)
                 let is_group = session_key.contains(":group:");
-                if is_group && matches!(tool.as_str(), "execute_command" | "exec" | "read_file" | "read" | "write_file" | "write") {
+                if is_group && matches!(tool.as_str(), "shell" | "execute_command" | "exec" | "read_file" | "read" | "write_file" | "write") {
                     return Ok(AgentReply {
                         text: "[Blocked] Shell/file commands are not allowed in group chats for security.".to_owned(),
                         is_empty: false,
@@ -2698,20 +2754,35 @@ impl AgentRuntime {
         .await;
 
         // Resolve model.
-        let model = agent_cfg
-            .model
-            .as_ref()
-            .and_then(|m| m.primary.as_deref())
-            .or_else(|| {
-                self.config
-                    .agents
-                    .defaults
-                    .model
-                    .as_ref()
-                    .and_then(|m| m.primary.as_deref())
-            })
-            .unwrap_or("rsclaw/rsclaw-agent-v1")
-            .to_owned();
+        //
+        // Internal auto-tick sessions (heartbeat / system) only hold the
+        // `memory` tool and run on a cadence — the primary slot is wasted
+        // on memory upkeep / HEARTBEAT_OK replies. Route them through the
+        // flash model when configured. `resolve_flash_model_name` already
+        // falls back to the primary if no flash model is set, so this is
+        // safe with any provider configuration.
+        //
+        // Cron is intentionally excluded from this fast path: cron-fired
+        // agentTurns carry real user instructions and need primary-tier
+        // reasoning.
+        let model = if is_internal {
+            self.resolve_flash_model_name()
+        } else {
+            agent_cfg
+                .model
+                .as_ref()
+                .and_then(|m| m.primary.as_deref())
+                .or_else(|| {
+                    self.config
+                        .agents
+                        .defaults
+                        .model
+                        .as_ref()
+                        .and_then(|m| m.primary.as_deref())
+                })
+                .unwrap_or("rsclaw/rsclaw-agent-v1")
+                .to_owned()
+        };
 
         // Build tool list from skills and registered agents (local + remote).
         // Tool selection: toolsEnabled -> toolset level -> tools whitelist
@@ -2751,8 +2822,13 @@ impl AgentRuntime {
             }
 
             // Apply toolset level + custom tools list
-            // Default agent uses "full", others use "standard"
-            let is_default = self.handle.config.default.unwrap_or(false);
+            // Default agent uses "full", others use "standard". Fall back to
+            // `id == "main"` so configs that omit the explicit `default: true`
+            // flag (newer setup template) still resolve main as the default —
+            // matches the convention used at runtime.rs:1763 and
+            // RuntimeConfig::default_agent.
+            let is_default = self.handle.config.default.unwrap_or(false)
+                || self.handle.id == "main";
             let default_toolset = if is_default { "full" } else { "standard" };
             let toolset = model_cfg
                 .and_then(|m| m.toolset.as_deref())
@@ -2768,7 +2844,7 @@ impl AgentRuntime {
             // Group chat safety: strip dangerous tools to prevent exec via LLM
             let is_group = session_key.contains(":group:");
             if is_group {
-                const GROUP_BLOCKED_TOOLS: &[&str] = &["execute_command", "exec", "read_file", "read", "write_file", "write", "computer_use"];
+                const GROUP_BLOCKED_TOOLS: &[&str] = &["shell", "execute_command", "exec", "read_file", "read", "write_file", "write", "computer_use"];
                 all.retain(|t| !GROUP_BLOCKED_TOOLS.contains(&t.name.as_str()));
             }
 
@@ -4624,7 +4700,7 @@ impl AgentRuntime {
                         parts.iter().any(|p| {
                             matches!(p, crate::provider::ContentPart::ToolUse { name, .. }
                                 if name == "opencode" || name == "claudecode" || name == "codex"
-                                    || name == "web_search" || name == "execute_command")
+                                    || name == "web_search" || name == "shell" || name == "execute_command")
                         })
                     } else {
                         false
@@ -4967,7 +5043,7 @@ impl AgentRuntime {
                 // Upgrade iteration limit when complex or multi-step tools are used.
                 if matches!(tool_name.as_str(),
                     "web_browser" | "opencode" | "claudecode" | "agent"
-                    | "search_content" | "search_file" | "execute_command" | "exec"
+                    | "search_content" | "search_file" | "shell" | "execute_command" | "exec"
                 ) {
                     max_iterations = max_iterations.max(configured_complex);
                 }
@@ -5071,7 +5147,7 @@ impl AgentRuntime {
                         // Record result for progress-aware loop detection.
                         // Same args + different results = making progress, not a loop.
                         // For exec tool: exclude task_id (uuid changes each call) to properly detect loops.
-                        let result_for_loop = if tool_name == "exec" || tool_name == "execute_command" {
+                        let result_for_loop = if tool_name == "shell" || tool_name == "exec" || tool_name == "execute_command" {
                             // Strip task_id from exec results - it's a uuid that changes every call
                             match &v {
                                 serde_json::Value::Object(obj) => {
@@ -5173,7 +5249,7 @@ impl AgentRuntime {
                     if let Some(ref bus) = self.event_bus {
                         // Prepend `$ command` line for exec tools so the
                         // desktop UI can show a command preview in the header.
-                        let display_out = if matches!(tool_name.as_str(), "execute_command" | "exec") {
+                        let display_out = if matches!(tool_name.as_str(), "shell" | "execute_command" | "exec") {
                             if let Ok(a) = serde_json::from_str::<serde_json::Value>(&args_str) {
                                 if let Some(cmd) = a.get("command").and_then(|c| c.as_str()) {
                                     format!("$ {cmd}\n{out_str}")
@@ -5253,7 +5329,7 @@ impl AgentRuntime {
                 }
 
                 // Collect sendable file attachments from write/exec tool results.
-                if matches!(tool_name.as_str(), "write_file" | "write" | "execute_command" | "exec") {
+                if matches!(tool_name.as_str(), "write_file" | "write" | "shell" | "execute_command" | "exec") {
                     let workspace = self.handle.config.workspace.as_deref()
                         .or(self.live.agents.read().await.defaults.workspace.as_deref())
                         .map(expand_tilde)
@@ -5417,7 +5493,7 @@ impl AgentRuntime {
                     let limits = limits_owned.as_ref();
 
                     let max_chars = match tool_name.as_str() {
-                        "execute_command" | "exec" => {
+                        "shell" | "execute_command" | "exec" => {
                             limits.and_then(|l| l.exec).unwrap_or(3000)
                         }
                         "web_search" => {
@@ -5705,7 +5781,7 @@ impl AgentRuntime {
             }
             "read_file" | "read" => return self.tool_read(args).await,
             "write_file" | "write" => return self.tool_write(args).await,
-            "execute_command" | "exec" => return self.tool_exec(ctx, _id, args).await,
+            "shell" | "execute_command" | "exec" => return self.tool_exec(ctx, _id, args).await,
             "use_skill" => return self.tool_use_skill(args),
             "task" => return self.tool_task(ctx, args).await,
             "install_tool" | "tool_install" => return self.tool_install(args).await,
@@ -6028,7 +6104,7 @@ impl AgentRuntime {
     /// model would reach for `web_fetch`/`web_browser` even when a skill's
     /// description matched the task. Returns the skill's full SKILL.md so
     /// the LLM can derive the exact CLI invocation, then call
-    /// `execute_command` to run it.
+    /// `shell` to run it.
     /// Escalate the user's current request into a multi-turn background
     /// task. The LLM is the one judging when this is warranted (see the
     /// `task` ToolDef description). The original `looks_like_task`
@@ -6129,7 +6205,7 @@ impl AgentRuntime {
             "dir": dir,
             "skill_md": skill_md,
             "next_step": "Read skill_md to find the exact CLI command and flags, \
-                          then call execute_command to run it. \
+                          then call shell to run it. \
                           Pass the user's actual question / parameters via the \
                           flags documented in skill_md."
         }))
@@ -6958,7 +7034,7 @@ mod tests {
         let tools = build_tool_list(&skills, None, "test-agent", &[]);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         for expected in &[
-            "memory", "session", "agent", "channel", "read_file", "write_file", "execute_command",
+            "memory", "session", "agent", "channel", "read_file", "write_file", "shell",
         ] {
             assert!(
                 names.contains(expected),

@@ -185,103 +185,6 @@ pub(crate) fn build_date_context() -> String {
 // System prompt builder
 // ---------------------------------------------------------------------------
 
-/// Build the base system prompt shared by main agent and sub agents.
-///
-/// Contains: language directive, platform info, command safety rules.
-/// Date/time and other dynamic content is injected per-turn into the user
-/// message by the runtime, NOT here, to preserve KV cache prefix stability.
-pub(crate) fn build_base_system_prompt(config: &crate::config::schema::Config) -> Vec<String> {
-    let mut parts: Vec<String> = Vec::new();
-
-    // Language directive is stable (doesn't change per-turn).
-    if let Some(lang) = config.gateway.as_ref().and_then(|g| g.language.as_deref()) {
-        parts.push(format!(
-            "Default response language: {lang}. Always reply in {lang} unless the user explicitly uses another language."
-        ));
-    }
-
-    // Platform information so LLM generates correct shell commands.
-    let platform_info = if cfg!(target_os = "windows") {
-        "Platform: Windows. Shell: PowerShell. \
-         Use PowerShell commands: Get-ChildItem (or dir), Get-Content, Get-Date, Select-Object -Last N (tail). \
-         Pipes and filters work naturally: | Where-Object, | Select-Object, | Sort-Object. \
-         Paths: backslash or forward slash both work. \
-         Examples: Get-Date -Format 'yyyy-MM-dd'; Get-ChildItem | Select-Object -Last 5; Get-Content file.txt."
-    } else if cfg!(target_os = "macos") {
-        "Platform: macOS. Shell: bash/zsh. Standard Unix commands available (ls, cat, grep, tail, date)."
-    } else {
-        "Platform: Linux. Shell: bash/sh. Standard Unix commands available (ls, cat, grep, tail, date)."
-    };
-    parts.push(platform_info.to_string());
-
-    // Windows command safety rules (only on Windows builds).
-    if cfg!(target_os = "windows") {
-        parts.push(
-            "<windows_command_safety>\n\
-             Windows command safety rules (ALL mandatory):\n\
-             1. Do not wrap a command in an extra shell layer such as `cmd /c`, `powershell -Command`, or `pwsh -Command` unless strictly necessary.\n\
-             2. For destructive file operations, only use a fully specified absolute path.\n\
-             3. Never generate a command whose quoting, escaping, or trailing backslashes could cause the target path to be truncated or reinterpreted.\n\
-             4. Any destructive operation outside the workspace requires explicit user approval.\n\
-             5. If a destructive command fails, do NOT retry with workarounds or alternate commands. Stop, explain the failure, and ask the user.\n\
-             </windows_command_safety>"
-                .to_owned(),
-        );
-    }
-
-    // Agent loop guidance (helps small models understand the iteration pattern).
-    parts.push(
-        "<agent_loop>\n\
-         You are operating in an agent loop:\n\
-         1. Analyze: understand the user's intent and current state\n\
-         2. Plan: decide which tool to use next\n\
-         3. Execute: call the tool\n\
-         4. Observe: check the result\n\
-         5. Iterate: repeat until the task is complete, then reply to the user\n\
-         If a tool call fails, do NOT retry with the same arguments. Try a different approach or inform the user.\n\
-         \n\
-         [ANTI-HALLUCINATION — HARD RULES]\n\
-         1. DO NOT fabricate numbers, dates, temperatures, prices, names, URLs, or any concrete facts.\n\
-         2. DO NOT claim to have executed an action unless you actually made the tool call.\n\
-            - If you say \"I searched\", \"I checked\", \"I delegated to X\", \"I ran Y\" — there MUST be a tool_call.\n\
-            - Claiming an action without calling the tool is LYING to the user.\n\
-            - If a tool is unavailable or you don't want to use it, say that honestly.\n\
-         3. If a tool cannot retrieve real data (search empty, API down, access denied):\n\
-            - Tell the user EXACTLY which tool failed and why.\n\
-            - Ask the user if they want you to try a different approach.\n\
-         Fabricating facts or pretending to have executed actions destroys user trust.\n\
-         It is always better to say \"我没查到\" / \"I couldn't retrieve that\" / \"I haven't called that tool yet\"\n\
-         than to invent plausible-looking but made-up values or fake action claims.\n\
-         \n\
-         When you need a Unix timestamp or today's date, use a shell command (e.g. `date`) — never assume or calculate it yourself.\n\
-         \n\
-         [Voice — HARD RULE]\n\
-         Always speak directly to the user in second person (你/您/you). Never produce\n\
-         third-person after-action reports about the user (e.g. \"用户东升通过...完成了...\")\n\
-         or narrate what \"the user\" did. Reports, summaries, and status updates are\n\
-         addressed TO the user, not ABOUT them. Do not invent completed steps — only\n\
-         report what tools actually returned.\n\
-         </agent_loop>"
-            .to_owned(),
-    );
-
-    // Output formatting and data integrity rules (always included).
-    parts.push(
-        "[Output format rules]\n\
-         - Avoid Markdown headings (#, ##, ###) in chat replies.\n\
-         - Use **bold text** or section markers for sections.\n\
-         - Use 1. or - for lists.\n\
-         - Do NOT use Markdown tables (|---|). Use \"label: value\" format instead.\n\
-         \n[Data integrity rules]\n\
-         - NEVER truncate or shorten ANY text, strings, numbers, or identifiers.\n\
-         - Copy ALL values EXACTLY: UUIDs, IDs, IP addresses, paths, URLs, code, data.\n\
-         - If you see truncated data in context, report it as incomplete."
-            .to_owned(),
-    );
-
-    parts
-}
-
 /// Build the **shared** system-prompt prefix.
 ///
 /// Byte-identical for every RsClaw client of the same RsClaw version,
@@ -365,7 +268,7 @@ fn build_shared_system_prefix_uncached() -> String {
          states the domains it covers (flights, stocks, weather, …). \
          If ANY description matches the user's intent, you MUST use \
          that skill — even if a built-in tool could also do the job.\n\
-         3. **Built-in tools** (web_fetch, web_browser, execute_command, \
+         3. **Built-in tools** (web_fetch, web_browser, shell, \
          read_file, …) — fallback ONLY when no plugin or skill applies.\n\n\
          Common failure mode (avoid):\n\
          > User asks about flights → you call web_fetch(ctrip.com) →\n\
@@ -373,7 +276,7 @@ fn build_shared_system_prefix_uncached() -> String {
          > A flyai skill with `intents: [flight_search]` was sitting right\n\
          > above and you ignored it.\n\n\
          If you catch yourself reaching for web_fetch / web_browser /\n\
-         execute_command on a domain a plugin or skill description covers, STOP\n\
+         shell on a domain a plugin or skill description covers, STOP\n\
          and use the plugin/skill instead.\n\n\
          ### How to invoke an installed skill\n\
          When a task matches a skill description listed under \"## Installed Skills\":\n\
@@ -382,7 +285,7 @@ fn build_shared_system_prefix_uncached() -> String {
          the full SKILL.md body.\n\
          3. If SKILL.md mentions `references/<command>.md`, read_file that too.\n\
          4. Then invoke the CLI with the exact flags from SKILL.md via \
-         `execute_command`.\n\n\
+         `shell`.\n\n\
          Prefer `use_skill` over manually `read_file`-ing SKILL.md so the \
          discovery shows up cleanly in tool history. Guessing CLI flags from \
          the description alone is the #1 failure mode."
@@ -404,11 +307,11 @@ fn build_shared_system_prefix_uncached() -> String {
 
     parts.push(
         "## Tool Usage Guidelines\n\
-         ### File Operations (use dedicated tools, NOT execute_command)\n\
+         ### File Operations (use dedicated tools, NOT shell)\n\
          - List directory: `list_dir`. Find files: `search_file`. Search contents: `search_content`.\n\
          - Read file: `read_file`. Write/create file: `write_file`.\n\
          - Documents (xlsx/docx/pdf/pptx): use `doc` tool.\n\
-         - Reserve `execute_command` for system commands with no dedicated tool.\n\
+         - Reserve `shell` for system commands with no dedicated tool.\n\
          ### Completion Discipline\n\
          - Have enough info to answer? STOP and reply immediately.\n\
          - Do NOT repeat a tool call that already returned useful results.\n\
@@ -440,14 +343,12 @@ fn build_shared_system_prefix_uncached() -> String {
          - **ALWAYS prefer 'computer_use action=vlm_drive' with a natural-language instruction.**\n\
            The configured VLM handles screenshot -> analysis -> execution internally.\n\
            Example: computer_use action=vlm_drive instruction='Open WeChat and send a message to File Transfer'.\n\
+         - If an app-rule exists for the target app, call 'get_app_rule' FIRST to\n\
+           read its policy (trigger conditions, reply rules, pre-conditions).\n\
+           The app-rule tells you *what to do and when*; vlm_drive handles *how*.\n\
+           Use 'list_app_rules' to discover available rules.\n\
          - Only fall back to manual 'screenshot' + individual 'click'/'type'/'key' calls\n\
            if 'vlm_drive' is unavailable (not configured) or explicitly fails after retry.\n\
-         - Do NOT use 'get_app_rule' for apps that have been moved/removed from app-rules.\n\
-         - For WeChat specifically: even if a wechat app-rule exists, ALL GUI operations\n\
-           (click, search, scroll, type) MUST go through 'computer_use action=vlm_drive'.\n\
-           You may call 'get_app_rule' to read WeChat strategy (trigger conditions,\n\
-           reply rules, Quote method), but never execute manual screenshot+click\n\
-           workflows described inside it.\n\
          ### Screenshot routing\n\
          - \"screenshot\" / \"截图\" / \"截屏\" with no URL → tell user to type \
          `/ss` (desktop screencapture). Do NOT call web_browser.\n\
@@ -472,7 +373,7 @@ fn build_shared_system_prefix_uncached() -> String {
          - Periodic meditation deduplicates and cleans up stale memories.\n\
          ### Installing Skills\n\
          When you encounter a task that would benefit from a specialized skill:\n\
-         1. Search: use execute_command to run `rsclaw skills search <query>`\n\
+         1. Search: use shell to run `rsclaw skills search <query>`\n\
          2. Install: `rsclaw skills install <name>`\n\
          3. The skill auto-matches and injects on future relevant requests.\n\
          Proactively find and install skills you need — do NOT ask permission.\n\
@@ -567,7 +468,7 @@ pub fn build_user_system(
     parts.push(format!(
         "## Workspace\n\
          Your workspace is `{ws}`. ALL relative paths in tool calls (read_file, \
-         write_file, list_dir, search_file, execute_command cwd) resolve against \
+         write_file, list_dir, search_file, shell cwd) resolve against \
          this directory. When the user says \"my files\" / \"my .md files\" / \
          \"the workspace\", they mean files inside this directory — NOT the \
          rsclaw base dir at `~/.rsclaw/` which contains internal state \
@@ -576,10 +477,12 @@ pub fn build_user_system(
         ws = ws_ctx.workspace_dir.display()
     ));
 
-    let ws_segment = ws_ctx.to_prompt_segment();
-    if !ws_segment.is_empty() {
-        parts.push(ws_segment);
-    }
+    // KV-cache ordering rationale: append blocks from most-stable to most-volatile
+    // so the worker-side prefix match runs as deep as possible before hitting a
+    // changed byte. Plugins/skills only mutate on install/uninstall events, while
+    // ws_segment carries MEMORY.md / memory_today / memory_yesterday — content
+    // that rolls over daily. Putting plugins/skills BEFORE ws_segment keeps their
+    // KV slot hot across day-boundary memory churn.
 
     // ## Installed Plugins — rendered via the existing helper. Sort
     // happens inside that helper, byte-stable for given plugin set.
@@ -620,6 +523,15 @@ pub fn build_user_system(
         }
     }
 
+    // ws_segment last — its memory_today / memory_yesterday blocks roll
+    // over daily. Keeping them at the very tail of user_system means a
+    // day-boundary KV miss only re-hydrates this trailing block, not the
+    // plugins/skills enumeration above it.
+    let ws_segment = ws_ctx.to_prompt_segment();
+    if !ws_segment.is_empty() {
+        parts.push(ws_segment);
+    }
+
     parts.join("\n\n")
 }
 
@@ -655,7 +567,7 @@ pub(crate) fn build_system_prompt(
 /// `RSCLAW_DUMP_PROMPT` debug payload.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "memory","use_skill","task","read_file","write_file","send_file",
-    "execute_command","agent","install_tool","list_dir","search_file",
+    "shell","agent","install_tool","list_dir","search_file",
     "search_content","web_search","web_fetch","web_download","web_browser",
     "computer_use","image_gen","video_gen","pdf","text_to_voice",
     "send_message","cron","session","gateway","opencode","claudecode",

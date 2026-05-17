@@ -139,7 +139,7 @@ pub(crate) fn toolset_allowed_names(
     custom_tools: Option<&Vec<String>>,
 ) -> Option<std::collections::HashSet<String>> {
     const MINIMAL: &[&str] = &[
-        "execute_command",
+        "shell",
         "read_file",
         "write_file",
         "send_file",
@@ -165,7 +165,7 @@ pub(crate) fn toolset_allowed_names(
         "use_skill",
     ];
     const CODE: &[&str] = &[
-        "execute_command",
+        "shell",
         "read_file",
         "write_file",
         "list_dir",
@@ -175,7 +175,7 @@ pub(crate) fn toolset_allowed_names(
         "use_skill",
     ];
     const STANDARD: &[&str] = &[
-        "execute_command",
+        "shell",
         "read_file",
         "write_file",
         "list_dir",
@@ -260,7 +260,7 @@ pub fn build_tool_list(
     });
     // `use_skill` — first-class entry point for installed skills. Listed
     // EARLY in the tool list so the LLM notices it before web_fetch /
-    // web_browser / execute_command. Only registered when at least one
+    // web_browser / shell. Only registered when at least one
     // skill is installed; otherwise it'd be dead surface area.
     //
     // Critical invariant: this description does NOT enumerate installed
@@ -275,11 +275,11 @@ pub fn build_tool_list(
             name: "use_skill".to_owned(),
             description:
                 "ACTIVATE an installed skill. Use this BEFORE web_fetch / web_browser / \
-                execute_command whenever the user's task matches any skill description \
+                shell whenever the user's task matches any skill description \
                 shown in the system prompt under '## Installed Skills' (flights, hotels, \
                 stocks, weather, finance data, etc.).\n\n\
                 Returns the full SKILL.md so you know the exact CLI command and flags. \
-                After calling use_skill you typically call execute_command with the CLI \
+                After calling use_skill you typically call shell with the CLI \
                 from skill_md.\n\n\
                 Common failure to avoid: defaulting to web_fetch on a domain a skill \
                 already covers. If a skill description matches, you MUST use_skill first."
@@ -350,7 +350,7 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "write_file".to_owned(),
-        description: "Write/create a file. Use this for ALL file creation and writing — do NOT use execute_command with notepad, echo, or any other editor/command to create files.\n\
+        description: "Write/create a file. Use this for ALL file creation and writing — do NOT use shell with notepad, echo, or any other editor/command to create files.\n\
             Creates parent directories as needed. Path is relative to workspace root.\n\
             Both 'path' and 'content' are required.\n\
             CRITICAL: When writing user-provided content, copy it EXACTLY character-by-character. \
@@ -381,12 +381,12 @@ pub fn build_tool_list(
         }),
     });
     tools.push(ToolDef {
-        name: "execute_command".to_owned(),
+        name: "shell".to_owned(),
         description: if cfg!(target_os = "windows") {
             "Run a shell command (PowerShell) on Windows.\n\
-             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use exec for commands that have no dedicated tool.\n\
-             Use exec for: git operations, running scripts (node/python/cargo), system info (systeminfo, ipconfig, Get-Process), package management (npm/pip), process management (Start-Process, Stop-Process, taskkill).\n\
-             Do NOT use exec for HTTP requests (curl/wget/Invoke-WebRequest) or file downloads — use `web_fetch` / `web_download` instead.\n\
+             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use shell for commands that have no dedicated tool.\n\
+             Use shell for: git operations, running scripts (node/python/cargo), system info (systeminfo, ipconfig, Get-Process), package management (npm/pip), process management (Start-Process, Stop-Process, taskkill).\n\
+             Do NOT use shell for HTTP requests (curl/wget/Invoke-WebRequest) or file downloads — use `web_fetch` / `web_download` instead.\n\
              \n\
              Tool selection: PowerShell for file/system ops; python for data processing (CSV/JSON/automation).\n\
              Check tool availability first (`Get-Command python`, `Get-Command node`). Use `install_tool` for system tools.\n\
@@ -399,15 +399,15 @@ pub fn build_tool_list(
              Python patterns: `python -c \"import json; ...\"` for one-liners, write to $env:TEMP\\script.py for multi-line.\n\
              \n\
              Best practices: Do NOT wrap commands in extra cmd /c or powershell -Command layers. Use `| Select-Object -First 10` to limit output.\n\
-             Do NOT use exec for destructive operations on personal directories (Desktop, Downloads, Documents).\n\
+             Do NOT use shell for destructive operations on personal directories (Desktop, Downloads, Documents).\n\
              Commands run in background by default (wait=false). Use wait=true only for short commands where you need the output immediately.\n\
              If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user."
                 .to_owned()
         } else if cfg!(target_os = "macos") {
             "Run a shell command (bash/zsh) on macOS.\n\
-             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use exec for commands that have no dedicated tool.\n\
-             Use exec for: git operations, running scripts (node/python/cargo), system info (uname, df, top), package management (brew/npm/pip), process management (ps, kill).\n\
-             Do NOT use exec for HTTP requests (curl/wget) or file downloads — use `web_fetch` / `web_download` instead.\n\
+             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use shell for commands that have no dedicated tool.\n\
+             Use shell for: git operations, running scripts (node/python/cargo), system info (uname, df, top), package management (brew/npm/pip), process management (ps, kill).\n\
+             Do NOT use shell for HTTP requests (curl/wget) or file downloads — use `web_fetch` / `web_download` instead.\n\
              \n\
              Tool selection: bash for file/text/system ops; python3 for data processing (CSV/JSON/automation).\n\
              Check tool availability first (`which python3`, `which node`). Use `install_tool` for system tools.\n\
@@ -420,9 +420,9 @@ pub fn build_tool_list(
                 .to_owned()
         } else {
             "Run a shell command (bash/sh) on Linux.\n\
-             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use exec for commands that have no dedicated tool.\n\
-             Use exec for: git operations, running scripts (node/python/cargo), system info (uname, df, top), package management (apt/npm/pip), process management (ps, kill).\n\
-             Do NOT use exec for HTTP requests (curl/wget) or file downloads — use `web_fetch` / `web_download` instead.\n\
+             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use shell for commands that have no dedicated tool.\n\
+             Use shell for: git operations, running scripts (node/python/cargo), system info (uname, df, top), package management (apt/npm/pip), process management (ps, kill).\n\
+             Do NOT use shell for HTTP requests (curl/wget) or file downloads — use `web_fetch` / `web_download` instead.\n\
              \n\
              Tool selection: bash for file/text/system ops; python3 for data processing (CSV/JSON/automation).\n\
              Check tool availability first (`which python3`, `which node`). Use `install_tool` for system tools.\n\
@@ -513,7 +513,7 @@ pub fn build_tool_list(
     tools.push(ToolDef {
         name: "list_dir".to_owned(),
         description: "List files and directories in a given path.\n\
-            Use this instead of execute_command with ls/dir.\n\
+            Use this instead of shell with ls/dir.\n\
             - Returns file names, sizes, and types.\n\
             - Does not display hidden/dot files by default.\n\
             - Use 'pattern' to filter by glob (e.g. '*.json').\n\
@@ -530,7 +530,7 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "search_file".to_owned(),
-        description: "Search for files by name pattern. Use this instead of execute_command with find.\n\
+        description: "Search for files by name pattern. Use this instead of shell with find.\n\
             - Supports wildcard patterns for flexible matching.\n\
             - Returns relative file paths.\n\
             - Prefer this over list_dir when you have a specific file pattern.\n\
@@ -548,7 +548,7 @@ pub fn build_tool_list(
     tools.push(ToolDef {
         name: "search_content".to_owned(),
         description: "Search file contents by regex or text pattern. Built on ripgrep.\n\
-            Use this instead of execute_command with grep/rg. This tool is faster and respects .gitignore.\n\
+            Use this instead of shell with grep/rg. This tool is faster and respects .gitignore.\n\
             - Supports full regex syntax: 'log.*Error', 'function\\s+\\w+', 'TODO|FIXME'\n\
             - Escape special chars for literal matches: 'functionCall\\('\n\
             - Use 'include' to filter by file type: '*.py', '*.rs'\n\
@@ -592,7 +592,7 @@ pub fn build_tool_list(
     tools.push(ToolDef {
         name: "web_fetch".to_owned(),
         description: "PREFERRED tool for HTTP requests — web pages, REST APIs, documentation, articles.\n\
-            Do NOT use execute_command with curl/wget/Invoke-WebRequest — use web_fetch instead.\n\
+            Do NOT use shell with curl/wget/Invoke-WebRequest — use web_fetch instead.\n\
             - URL must be fully-formed (https://...)\n\
             - HTTP auto-upgraded to HTTPS\n\
             - HTML pages are dehydrated to clean text/markdown\n\
@@ -610,7 +610,7 @@ pub fn build_tool_list(
               - headers: object — Authorization, X-API-Key, Cookie, custom Content-Type, etc.\n\
               - body: string (raw) OR object/array (auto JSON-serialized + Content-Type set)\n\
             \n\
-            FALL BACK to execute_command + curl only when you need:\n\
+            FALL BACK to shell + curl only when you need:\n\
               - File upload via multipart/form-data\n\
               - Streaming responses (SSE, chunked transfers consumed incrementally)\n\
               - Sites behind interactive login (use web_browser when interaction is needed)".to_owned(),
@@ -632,7 +632,7 @@ pub fn build_tool_list(
             - Supports resume for large files\n\
             - Use use_browser_cookies=true for authenticated downloads (e.g. after logging in via web_browser)\n\
             - Path is relative to workspace/downloads/ — just use filename like 'photo.jpg'\n\
-            - Do NOT use execute_command with curl/wget — always use this tool\n\
+            - Do NOT use shell with curl/wget — always use this tool\n\
             - After downloading, use send_file to deliver the file to the user".to_owned(),
         parameters: json!({
             "type": "object",
