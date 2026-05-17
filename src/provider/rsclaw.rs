@@ -3799,6 +3799,7 @@ data: {"type":"message_stop"}
         let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
         let body = CreateSessionReq {
             prefix_id: &split.prefix_id,
+            model: &split.model,
             dynamic_prefix: DynamicPrefixWire {
                 system: split.dynamic_system,
                 tools: &split.dynamic_tools,
