@@ -306,6 +306,23 @@ async fn handle_send_message(
         .task_cancels
         .insert(task_id.clone(), cancel_token.clone());
 
+    // Publish Submitted → Working status events on the bus so any SSE
+    // subscriber (or push webhook listener) can observe progress.
+    state.task_event_bus.publish(crate::a2a::event::AgentEvent::Status {
+        task_id: task_id.clone(),
+        context_id: session_key.clone(),
+        state: TaskState::Submitted,
+        message: None,
+        final_: false,
+    });
+    state.task_event_bus.publish(crate::a2a::event::AgentEvent::Status {
+        task_id: task_id.clone(),
+        context_id: session_key.clone(),
+        state: TaskState::Working,
+        message: None,
+        final_: false,
+    });
+
     let (reply_tx, reply_rx) = oneshot::channel::<AgentReply>();
     let msg = AgentMessage {
         session_key: session_key.clone(),
@@ -364,6 +381,24 @@ async fn handle_send_message(
     let _ = state.task_store.append_artifact(&task_id, artifact.clone());
     let _ = state.task_store.set_status(&task_id, TaskState::Completed);
     state.task_cancels.remove(&task_id);
+
+    // Publish artifact + final Completed status, then close the bus.
+    state.task_event_bus.publish(crate::a2a::event::AgentEvent::Artifact {
+        task_id: task_id.clone(),
+        context_id: session_key.clone(),
+        artifact_id: artifact.artifact_id.clone(),
+        parts: artifact.parts.clone(),
+        append: false,
+        last_chunk: true,
+    });
+    state.task_event_bus.publish(crate::a2a::event::AgentEvent::Status {
+        task_id: task_id.clone(),
+        context_id: session_key.clone(),
+        state: TaskState::Completed,
+        message: None,
+        final_: true,
+    });
+    state.task_event_bus.close(&task_id);
 
     let result = json!({
         "id": task_id,
@@ -486,6 +521,22 @@ async fn handle_cancel_task(
         Some((_, token)) => {
             token.cancel();
             let _ = state.task_store.set_status(&params.id, TaskState::Canceled);
+            // Publish a terminal Canceled status so any SSE subscriber sees it.
+            let ctx = state
+                .task_store
+                .get(&params.id)
+                .ok()
+                .flatten()
+                .and_then(|t| t.context_id)
+                .unwrap_or_default();
+            state.task_event_bus.publish(crate::a2a::event::AgentEvent::Status {
+                task_id: params.id.clone(),
+                context_id: ctx,
+                state: TaskState::Canceled,
+                message: None,
+                final_: true,
+            });
+            state.task_event_bus.close(&params.id);
             match state.task_store.get(&params.id) {
                 Ok(Some(task)) => Json(JsonRpcResponse::ok(
                     id,

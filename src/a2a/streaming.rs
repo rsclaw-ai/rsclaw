@@ -123,9 +123,9 @@ async fn spawn_streaming_task(state: AppState, params: Value) -> String {
         return task_id;
     };
 
-    // Reply oneshot — kept alive but the streaming path doesn't await it
-    // (status events on the bus carry final state).
-    let (reply_tx, _reply_rx) = oneshot::channel::<AgentReply>();
+    // Reply oneshot — we await this in a spawned task so we can publish
+    // Completed/Failed and the final Artifact when the agent's turn finishes.
+    let (reply_tx, reply_rx) = oneshot::channel::<AgentReply>();
 
     // mpsc channel from runtime → bus bridge.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<AgentEvent>(64);
@@ -207,6 +207,61 @@ async fn spawn_streaming_task(state: AppState, params: Value) -> String {
 
     // Push notification fan-out.
     state.push_dispatcher.clone().watch(task_id.clone());
+
+    // Publish Submitted → Working status events so SSE subscribers see progress.
+    state.task_event_bus.publish(AgentEvent::Status {
+        task_id: task_id.clone(),
+        context_id: session_key.clone(),
+        state: TaskState::Submitted,
+        message: None,
+        final_: false,
+    });
+    state.task_event_bus.publish(AgentEvent::Status {
+        task_id: task_id.clone(),
+        context_id: session_key.clone(),
+        state: TaskState::Working,
+        message: None,
+        final_: false,
+    });
+
+    // Spawn a watcher that, when the agent's reply arrives, publishes the
+    // final artifact + Completed status (or Failed if the channel dropped).
+    let bus_for_reply = state.task_event_bus.clone();
+    let task_id_for_reply = task_id.clone();
+    let ctx_id_for_reply = session_key.clone();
+    let cancels_for_reply = state.task_cancels.clone();
+    tokio::spawn(async move {
+        match reply_rx.await {
+            Ok(reply) => {
+                let artifact_id = uuid::Uuid::new_v4().to_string();
+                bus_for_reply.publish(AgentEvent::Artifact {
+                    task_id: task_id_for_reply.clone(),
+                    context_id: ctx_id_for_reply.clone(),
+                    artifact_id,
+                    parts: vec![A2aPart::Text { text: reply.text }],
+                    append: false,
+                    last_chunk: true,
+                });
+                bus_for_reply.publish(AgentEvent::Status {
+                    task_id: task_id_for_reply.clone(),
+                    context_id: ctx_id_for_reply,
+                    state: TaskState::Completed,
+                    message: None,
+                    final_: true,
+                });
+            }
+            Err(_) => {
+                bus_for_reply.publish(AgentEvent::Status {
+                    task_id: task_id_for_reply.clone(),
+                    context_id: ctx_id_for_reply,
+                    state: TaskState::Failed,
+                    message: None,
+                    final_: true,
+                });
+            }
+        }
+        cancels_for_reply.remove(&task_id_for_reply);
+    });
 
     let msg = AgentMessage {
         session_key,
