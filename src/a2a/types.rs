@@ -117,14 +117,40 @@ pub struct A2aTaskStatus {
     pub message: Option<A2aMessage>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TaskState {
+    #[serde(rename = "TASK_STATE_UNSPECIFIED")]
+    Unspecified,
+    #[serde(rename = "TASK_STATE_SUBMITTED")]
     Submitted,
+    #[serde(rename = "TASK_STATE_WORKING")]
     Working,
+    #[serde(rename = "TASK_STATE_COMPLETED")]
     Completed,
+    #[serde(rename = "TASK_STATE_FAILED")]
     Failed,
+    #[serde(rename = "TASK_STATE_CANCELED")]
     Canceled,
+    #[serde(rename = "TASK_STATE_INPUT_REQUIRED")]
+    InputRequired,
+    #[serde(rename = "TASK_STATE_AUTH_REQUIRED")]
+    AuthRequired,
+    #[serde(rename = "TASK_STATE_REJECTED")]
+    Rejected,
+}
+
+impl TaskState {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Canceled | Self::Rejected
+        )
+    }
+
+    pub fn is_interrupted(self) -> bool {
+        matches!(self, Self::InputRequired | Self::AuthRequired)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
