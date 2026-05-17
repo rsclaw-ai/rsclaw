@@ -1,6 +1,8 @@
-//! A2A HTTP client — sends tasks to remote agents.
+//! A2A HTTP client — sends messages to remote agents.
 
 use anyhow::{Context, Result, anyhow};
+use eventsource_stream::Eventsource;
+use futures::stream::{Stream, StreamExt};
 use reqwest::Client;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -80,6 +82,65 @@ impl A2aClient {
             .result
             .ok_or_else(|| anyhow!("A2A: empty result"))?;
         extract_reply_text(&result)
+    }
+
+    /// Send a streaming message and return a `Stream` of JSON-RPC frames.
+    /// Each yielded value is the full `result` payload of one SSE event,
+    /// e.g. `{"kind":"status-update","taskId":...,"status":...}`.
+    pub async fn send_streaming_message(
+        &self,
+        base_url: &str,
+        agent_id: &str,
+        text: &str,
+        session_key: &str,
+        auth_token: Option<&str>,
+    ) -> Result<impl Stream<Item = Result<Value>> + Send + 'static> {
+        let message_id = Uuid::new_v4().to_string();
+        let rpc = JsonRpcRequest {
+            jsonrpc: "2.0".to_owned(),
+            id: json!(message_id),
+            method: "SendStreamingMessage".to_owned(),
+            params: json!({
+                "message": {
+                    "messageId": message_id,
+                    "role": "ROLE_USER",
+                    "parts": [{ "type": "text", "text": text }],
+                    "contextId": session_key,
+                },
+                "metadata": if agent_id.is_empty() {
+                    json!({})
+                } else {
+                    json!({ "agentId": agent_id })
+                }
+            }),
+        };
+
+        let url = format!("{}/api/v1/a2a", base_url.trim_end_matches('/'));
+        let mut req = self
+            .client
+            .post(&url)
+            .header("Accept", "text/event-stream")
+            .json(&rpc);
+        if let Some(token) = auth_token {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().await.context("SendStreamingMessage HTTP")?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("A2A SSE remote {}", resp.status()));
+        }
+
+        Ok(resp
+            .bytes_stream()
+            .eventsource()
+            .filter_map(|ev| async move {
+                match ev {
+                    Ok(e) => match serde_json::from_str::<Value>(&e.data) {
+                        Ok(frame) => Some(Ok(frame["result"].clone())),
+                        Err(err) => Some(Err(anyhow!("parse SSE: {err}"))),
+                    },
+                    Err(e) => Some(Err(anyhow!("SSE: {e}"))),
+                }
+            }))
     }
 }
 
