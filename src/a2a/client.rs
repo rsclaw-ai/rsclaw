@@ -27,7 +27,7 @@ impl A2aClient {
         }
     }
 
-    /// Send a `tasks/send` request to `base_url` targeting `agent_id`.
+    /// Send a `SendMessage` request to `base_url` targeting `agent_id`.
     ///
     /// `base_url` is the remote gateway base (e.g. "http://host:18888").
     /// The A2A endpoint is `{base_url}/api/v1/a2a`.
@@ -39,17 +39,17 @@ impl A2aClient {
         session_key: &str,
         auth_token: Option<&str>,
     ) -> Result<String> {
-        let task_id = Uuid::new_v4().to_string();
+        let message_id = Uuid::new_v4().to_string();
         let rpc = JsonRpcRequest {
             jsonrpc: "2.0".to_owned(),
-            id: json!(task_id),
-            method: "tasks/send".to_owned(),
+            id: json!(message_id),
+            method: "SendMessage".to_owned(),
             params: json!({
-                "id": task_id,
-                "sessionId": session_key,
                 "message": {
-                    "role": "user",
-                    "parts": [{ "type": "text", "text": text }]
+                    "messageId": message_id,
+                    "role": "ROLE_USER",
+                    "parts": [{ "type": "text", "text": text }],
+                    "contextId": session_key,
                 },
                 "metadata": if agent_id.is_empty() { json!({}) } else { json!({ "agentId": agent_id }) }
             }),

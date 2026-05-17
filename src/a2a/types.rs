@@ -1,3 +1,5 @@
+//! Wire-format types for the Google A2A v1.0 protocol.
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -44,6 +46,14 @@ impl JsonRpcResponse {
             }),
         }
     }
+    pub fn err_struct(id: Value, error: JsonRpcError) -> Self {
+        Self {
+            jsonrpc: "2.0".to_owned(),
+            id,
+            result: None,
+            error: Some(error),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,26 +68,41 @@ pub struct JsonRpcError {
 // Agent Card  (GET /.well-known/agent.json)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentCard {
     pub protocol_version: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Base URL where this gateway's A2A endpoint lives.
     pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<AgentProvider>,
+    #[serde(default)]
+    pub version: String,
     pub capabilities: AgentCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_schemes: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security: Option<Vec<Value>>,
     pub default_input_modes: Vec<String>,
     pub default_output_modes: Vec<String>,
     pub skills: Vec<AgentSkill>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<AgentExtension>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signatures: Vec<AgentCardSignature>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<AgentInterface>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentCapabilities {
     pub streaming: bool,
     pub push_notifications: bool,
+    #[serde(default)]
+    pub extended_agent_card: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +116,42 @@ pub struct AgentSkill {
     pub output_modes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProvider {
+    pub organization: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentExtension {
+    pub uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCardSignature {
+    pub protected: String,
+    pub signature: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentInterface {
+    pub url: String,
+    pub transport: String,
+}
+
 // ---------------------------------------------------------------------------
 // Task (A2A work unit)
 // ---------------------------------------------------------------------------
@@ -99,13 +160,14 @@ pub struct AgentSkill {
 #[serde(rename_all = "camelCase")]
 pub struct A2aTask {
     pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_id: Option<String>,
     pub status: A2aTaskStatus,
-    pub message: A2aMessage,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub artifacts: Option<Vec<A2aArtifact>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<A2aMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<A2aArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
 }
 
@@ -113,8 +175,10 @@ pub struct A2aTask {
 #[serde(rename_all = "camelCase")]
 pub struct A2aTaskStatus {
     pub state: TaskState,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<A2aMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -154,9 +218,17 @@ impl TaskState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct A2aMessage {
-    pub role: String, // "user" | "agent"
+    pub message_id: String,
+    pub role: String,
     pub parts: Vec<A2aPart>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,27 +252,50 @@ pub enum A2aPart {
         )]
         mime_type: Option<String>,
     },
-    Data { data: Value },
+    Data {
+        data: Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct A2aArtifact {
+    pub artifact_id: String,
     pub parts: Vec<A2aPart>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
 }
 
 // ---------------------------------------------------------------------------
-// tasks/send params
+// SendMessage / SendStreamingMessage params (v1.0)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TaskSendParams {
-    pub id: String,
+pub struct SendMessageParams {
     pub message: A2aMessage,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+}
+
+// ---------------------------------------------------------------------------
+// Push notification config
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PushNotificationConfig {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub task_id: String,
+    pub url: String,
+    /// Shared secret used for HMAC-SHA256 signing of webhook payloads.
+    pub token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authentication: Option<Value>,
 }
