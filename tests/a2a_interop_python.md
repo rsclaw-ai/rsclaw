@@ -178,13 +178,92 @@ async def main():
 asyncio.run(main())
 ```
 
+## Test 6: INPUT_REQUIRED suspend / resume (`wait_input`)
+
+Requires a working LLM with tool-use support (DeepSeek, Qwen, Claude,
+GPT, etc.). Verifies the `wait_input` built-in tool and the same-`taskId`
+resume short-path end-to-end.
+
+```python
+import asyncio, httpx, json, uuid
+
+BASE = "http://localhost:18888/api/v1/a2a"
+
+async def main():
+    # 1) Stream a turn that forces the LLM to call wait_input.
+    body = {
+        "jsonrpc": "2.0", "id": "w1",
+        "method": "SendStreamingMessage",
+        "params": {"message": {
+            "messageId": str(uuid.uuid4()),
+            "role": "ROLE_USER",
+            "parts": [{"type": "text",
+                "text": "Use the wait_input tool to ask the user for their "
+                        "favorite color. Echo their answer back as the final "
+                        "reply, no other text."}],
+        }},
+    }
+    headers = {"Accept": "text/event-stream"}
+    task_id = None
+    seen_input_required = False
+    artifact_text = None
+
+    async with httpx.AsyncClient(timeout=120) as c:
+        async with c.stream("POST", BASE, json=body, headers=headers) as r:
+            async for line in r.aiter_lines():
+                if not line.startswith("data:"): continue
+                frame = json.loads(line[5:].strip())
+                res = frame.get("result", {})
+                if res.get("kind") == "status-update":
+                    state = res["status"]["state"]
+                    print("status:", state)
+                    task_id = res["taskId"]
+                    if state == "TASK_STATE_INPUT_REQUIRED" and not seen_input_required:
+                        seen_input_required = True
+                        # 2) Resume via SendMessage on the SAME taskId.
+                        resume = await c.post(BASE, json={
+                            "jsonrpc": "2.0", "id": "r1",
+                            "method": "SendMessage",
+                            "params": {"message": {
+                                "messageId": str(uuid.uuid4()),
+                                "taskId": task_id,         # ← same id triggers resume
+                                "role": "ROLE_USER",
+                                "parts": [{"type": "text", "text": "chartreuse"}],
+                            }},
+                        })
+                        print("resume RPC ok:", resume.status_code)
+                elif res.get("kind") == "artifact-update":
+                    artifact_text = res["artifact"]["parts"][0]["text"]
+                if res.get("final"): break
+
+    assert seen_input_required, "expected TASK_STATE_INPUT_REQUIRED frame"
+    assert artifact_text and "chartreuse" in artifact_text, \
+        f"expected resumed text in final artifact, got: {artifact_text!r}"
+    print("OK — wait_input resumed and final artifact contained the answer")
+
+asyncio.run(main())
+```
+
+Expected SSE timeline:
+
+```
+SUBMITTED
+WORKING
+WORKING  (message: "calling tool wait_input")
+INPUT_REQUIRED  (message: "What is your favorite color?")
+   ↳ client POSTs SendMessage with same taskId carrying "chartreuse"
+artifact-update  (parts[0].text contains "chartreuse")
+COMPLETED  (final: true)
+```
+
 ## Expected outcomes
 
-- All 5 tests run without protocol errors
+- All 6 tests run without protocol errors
 - Agent Card shows `protocolVersion: "1.0"` and all 3 capabilities `true`
 - SendMessage returns `TASK_STATE_COMPLETED` with an artifact
 - SendStreamingMessage delivers at least one `status-update` event with `final: true`
 - Push sink receives signed POSTs with `X-A2A-Signature` and `X-A2A-Task-Id` headers
+- `wait_input` round-trip: INPUT_REQUIRED observed → resume RPC succeeds → final artifact contains the resumed text
 
 ## Recording
 

@@ -230,34 +230,115 @@ Implements [Google A2A v1.0](https://a2a-protocol.org/) for cross-network agent 
 
 RsClaw implements the full [Google A2A Protocol v1.0](https://a2a-protocol.org/latest/specification/) via JSON-RPC.
 
-**Discovery**
+### Endpoints
 
 ```
-GET  /.well-known/agent.json
+GET  /.well-known/agent.json           Agent Card (discovery)
+POST /api/v1/a2a                       JSON-RPC dispatch
+                                       — sync responses for non-streaming methods
+                                       — Accept: text/event-stream for SendStreamingMessage / SubscribeToTask
 ```
 
-**Endpoint** (JSON-RPC 2.0; use `Accept: text/event-stream` for streaming methods)
+### Methods
 
-```
-POST /api/v1/a2a
-```
+| Method | Purpose |
+|---|---|
+| `SendMessage` | Submit a task, block until terminal state, return the final Task |
+| `SendStreamingMessage` | Submit a task, stream `status-update` + `artifact-update` SSE events |
+| `SubscribeToTask` | Tap into an in-flight task's SSE stream by id |
+| `GetTask` / `ListTasks` | Read task snapshots (pagination supported on List) |
+| `CancelTask` | Fire the cancel token; runtime exits at the next agent-loop boundary |
+| `CreateTaskPushNotificationConfig` | Register a webhook for a task's lifecycle events |
+| `GetTaskPushNotificationConfig` / `ListTaskPushNotificationConfigs` / `DeleteTaskPushNotificationConfig` | Webhook CRUD |
+| `GetExtendedAgentCard` | Full Agent Card (extended metadata) |
 
-**Methods** — `SendMessage`, `SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask`, `CreateTaskPushNotificationConfig`, `GetTaskPushNotificationConfig`, `ListTaskPushNotificationConfigs`, `DeleteTaskPushNotificationConfig`, `GetExtendedAgentCard`.
-
-**Auth** — bearer token or `X-API-Key` header (declared in Agent Card `securitySchemes`). Configure via env:
+### Quick example
 
 ```bash
-export RSCLAW_A2A_BEARER_TOKENS="token-1,token-2"
-export RSCLAW_A2A_API_KEYS="key-1,key-2"
+curl -sS -X POST http://127.0.0.1:18888/api/v1/a2a \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc":"2.0","id":"1","method":"SendMessage",
+    "params":{"message":{"messageId":"m1","role":"user",
+      "parts":[{"type":"text","text":"reply with ack"}]}}
+  }'
+# → { "result": { "status": { "state": "TASK_STATE_COMPLETED" },
+#                 "artifacts": [{ "parts": [{"type":"text","text":"ack"}] }], ... } }
 ```
 
-When both env vars are empty, the endpoint is open (dev mode).
+### Auth
 
-**Push notifications** — register a webhook per task with a shared secret; the gateway POSTs HMAC-SHA256 signed payloads with `X-A2A-Signature` and `X-A2A-Task-Id` headers, 3-attempt exponential backoff.
+The `/api/v1/a2a` endpoint bypasses gateway-level auth; A2A's own bearer / `X-API-Key` schemes (declared in the Agent Card `securitySchemes`) are the authoritative gate. Configure via env:
 
-**Tasks** persist to `var/data/a2a/tasks.redb` so `GetTask` / `ListTasks` survive restarts.
+```bash
+export RSCLAW_A2A_BEARER_TOKENS="token-1,token-2"   # Authorization: Bearer <token>
+export RSCLAW_A2A_API_KEYS="key-1,key-2"            # X-API-Key: <key>
+```
 
-See [tests/a2a_interop_python.md](tests/a2a_interop_python.md) for end-to-end harness against the Python SDK.
+When **both** env vars are empty/unset, the endpoint is open (dev mode). Set either to enable enforcement; clients must present one matching credential.
+
+### Push notifications
+
+Register a webhook per task with a shared secret. The gateway POSTs to your URL on every lifecycle event with HMAC-SHA256 signed payloads:
+
+```
+POST <your-url>
+Content-Type: application/json
+X-A2A-Signature: <base64(hmac_sha256(token, body))>
+X-A2A-Task-Id:   <taskId>
+
+{"kind":"status-update","taskId":"...","contextId":"...",
+ "status":{"state":"TASK_STATE_WORKING"},"final":false}
+```
+
+Verify in Python:
+
+```python
+import hmac, hashlib, base64
+expected = base64.b64encode(hmac.new(token.encode(), body, hashlib.sha256).digest()).decode()
+assert expected == request.headers["X-A2A-Signature"]
+```
+
+Retry policy: 3 attempts with exponential backoff (2s / 4s / 8s).
+
+### INPUT_REQUIRED suspend / resume
+
+Every agent gets a built-in `wait_input(prompt, auth?)` tool. When the LLM calls it mid-turn, the runtime:
+
+1. Publishes `TASK_STATE_INPUT_REQUIRED` (or `TASK_STATE_AUTH_REQUIRED` when `auth: true`) with the prompt as a `role: agent` message
+2. Suspends the turn awaiting a `SendMessage` with the **same `taskId`**
+3. Resumes by feeding the client's text back as the tool's result
+
+Resume protocol — client receives `TASK_STATE_INPUT_REQUIRED`, then:
+
+```bash
+curl -X POST http://127.0.0.1:18888/api/v1/a2a -H "Content-Type: application/json" -d '{
+  "jsonrpc":"2.0","id":"r1","method":"SendMessage",
+  "params":{"message":{
+    "messageId":"m-resume-1",
+    "taskId":"<the same taskId>",     // ← critical: same id routes to resume short-path
+    "role":"user",
+    "parts":[{"type":"text","text":"<your answer>"}]
+  }}
+}'
+```
+
+Streaming subscribers see the agent loop continue and produce the final artifact + `TASK_STATE_COMPLETED`.
+
+### Cancellation semantics
+
+`CancelTask` fires the task's cancel token. The runtime checks the token:
+
+- At the top of every agent-loop iteration
+- Before every tool dispatch
+
+So cancellation is honored *between* tool calls, not *inside* a running LLM stream or tool. A 30-second blocking tool runs to completion; the cancel kicks in afterwards. The `CancelTask` dispatcher additionally publishes a terminal `TASK_STATE_CANCELED` event and closes the SSE stream immediately, so clients aren't blocked on the long-running call.
+
+### Persistence
+
+Tasks (history + artifacts + push configs + status) persist to `var/data/a2a/tasks.redb` so `GetTask` / `ListTasks` and webhook registrations survive restarts.
+
+See [tests/a2a_interop_python.md](tests/a2a_interop_python.md) for an end-to-end harness against the Google Python SDK (covers all 11 methods + the `wait_input` resume flow).
 
 ---
 
