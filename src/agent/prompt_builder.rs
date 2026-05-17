@@ -437,14 +437,14 @@ fn build_shared_system_prefix_uncached() -> String {
          \n\
          ### GUI / Desktop Automation (computer_use)\n\
          For any GUI or desktop automation task (WeChat, Finder, Safari, etc.):\n\
-         - **ALWAYS prefer 'computer_use action=ui_tars' with a natural-language instruction.**\n\
-           The UI-TARS vision model handles screenshot -> analysis -> execution internally.\n\
-           Example: computer_use action=ui_tars instruction='Open WeChat and send a message to File Transfer'.\n\
+         - **ALWAYS prefer 'computer_use action=vlm_drive' with a natural-language instruction.**\n\
+           The configured VLM handles screenshot -> analysis -> execution internally.\n\
+           Example: computer_use action=vlm_drive instruction='Open WeChat and send a message to File Transfer'.\n\
          - Only fall back to manual 'screenshot' + individual 'click'/'type'/'key' calls\n\
-           if 'ui_tars' is unavailable (not configured) or explicitly fails after retry.\n\
+           if 'vlm_drive' is unavailable (not configured) or explicitly fails after retry.\n\
          - Do NOT use 'get_app_rule' for apps that have been moved/removed from app-rules.\n\
          - For WeChat specifically: even if a wechat app-rule exists, ALL GUI operations\n\
-           (click, search, scroll, type) MUST go through 'computer_use action=ui_tars'.\n\
+           (click, search, scroll, type) MUST go through 'computer_use action=vlm_drive'.\n\
            You may call 'get_app_rule' to read WeChat strategy (trigger conditions,\n\
            reply rules, Quote method), but never execute manual screenshot+click\n\
            workflows described inside it.\n\

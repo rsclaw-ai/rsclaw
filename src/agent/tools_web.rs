@@ -20,7 +20,7 @@ use super::web_parsers::{
 };
 
 use crate::config::loader::{applicable_site_rules, applicable_site_rules_body};
-use crate::provider::{Message, MessageContent, Role, StreamEvent};
+use crate::provider::{AgentEndpoint, Message, MessageContent, Role, StreamEvent};
 use crate::agent::query_planner::{Intent, QueryPlan};
 
 /// Extract host from a URL without pulling in the `url` crate. Strips the
@@ -1088,10 +1088,22 @@ impl AgentRuntime {
             }
         };
 
+        // Hard cap on the flash-compression input so a huge page (already
+        // dehydrated by lol-html but still >100K chars) doesn't blow the
+        // flash model's context window or balloon per-call cost. Matches
+        // the cap used by compress_tool_result_for_session.
+        // 40K chars ≈ 10K tokens (ASCII) / ~27K tokens (CJK).
+        const FLASH_INPUT_CAP_CHARS: usize = 40_000;
+        let content_capped: String = if content.chars().count() > FLASH_INPUT_CAP_CHARS {
+            content.chars().take(FLASH_INPUT_CAP_CHARS).collect()
+        } else {
+            content.to_owned()
+        };
+
         let messages = vec![Message {
             role: Role::User,
             content: MessageContent::Text(format!(
-                "Web page content:\n---\n{content}\n---\n\n{prompt}\n\n\
+                "Web page content:\n---\n{content_capped}\n---\n\n{prompt}\n\n\
                  Provide a concise response based on the content above."
             )),
         }];
@@ -1104,7 +1116,7 @@ impl AgentRuntime {
             max_tokens: Some(2000),
             temperature: None,
             frequency_penalty: None,
-            thinking_budget: None, endpoint: Default::default(), kv_cache_mode: 0, session_key: None,
+            thinking_budget: None, endpoint: AgentEndpoint::Flash, kv_cache_mode: 0, session_key: None,
             system_shared: None, user_system: None,
         };
 

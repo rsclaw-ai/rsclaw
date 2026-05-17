@@ -433,7 +433,7 @@ pub struct AgentRuntime {
     pub computer_status_tx:
         Option<broadcast::Sender<crate::computer::status::ComputerUseStatus>>,
     /// Shared registry of in-flight `computer_use` run abort flags.
-    /// `tool_ui_tars` inserts on driver start and removes on exit; the
+    /// `tool_vlm_drive` inserts on driver start and removes on exit; the
     /// HTTP abort endpoint flips the bool to wake the driver loop.
     /// `None` outside the gateway.
     pub computer_runs: Option<
@@ -627,9 +627,33 @@ impl AgentRuntime {
                     .as_ref()
                     .and_then(|m| m.primary.as_deref())
             })
-            .unwrap_or("anthropic/claude-sonnet-4-6")
+            .unwrap_or("rsclaw/rsclaw-agent-v1")
             .to_owned()
     }
+}
+
+/// Resolve the primary model name from per-agent + defaults config,
+/// without needing an `AgentRuntime` instance. Returns `None` if nothing
+/// is configured — caller decides on a fallback.
+///
+/// Lookup chain mirrors [`AgentRuntime::resolve_model_name`]:
+///   1. per-agent `model.primary`
+///   2. `defaults.model.primary`
+pub fn resolve_primary_model_for(
+    per_agent: &crate::config::schema::AgentEntry,
+    defaults: &crate::config::schema::AgentDefaults,
+) -> Option<String> {
+    per_agent
+        .model
+        .as_ref()
+        .and_then(|m| m.primary.as_deref())
+        .or_else(|| {
+            defaults
+                .model
+                .as_ref()
+                .and_then(|m| m.primary.as_deref())
+        })
+        .map(str::to_owned)
 }
 
 /// Resolve the flash (cheap/fast) model name from per-agent + defaults config,
@@ -987,7 +1011,7 @@ impl AgentRuntime {
     /// surfaces this directly to the user.
     ///
     /// Use this from anywhere that wants to drive a VLM-backed loop
-    /// (`computer_use ui_tars`).
+    /// (`computer_use vlm_drive`).
     pub(crate) fn resolve_vision_model_name(&self) -> Result<String, String> {
         match resolve_vision_model_for(
             &self.handle.config,
@@ -1115,7 +1139,7 @@ impl AgentRuntime {
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None,
-            endpoint: Default::default(),
+            endpoint: AgentEndpoint::Flash,
             kv_cache_mode: 0,
             session_key: None,
             system_shared: None,
@@ -2624,7 +2648,7 @@ impl AgentRuntime {
                     .as_ref()
                     .and_then(|m| m.primary.as_deref())
             })
-            .unwrap_or("anthropic/claude-sonnet-4-6")
+            .unwrap_or("rsclaw/rsclaw-agent-v1")
             .to_owned();
 
         // Build tool list from skills and registered agents (local + remote).
@@ -3072,7 +3096,7 @@ impl AgentRuntime {
             if !candidates.is_empty() {
                 let mem_clone = Arc::clone(mem);
                 let providers = Arc::clone(&self.providers);
-                let flash_model = self.resolve_flash_model_name();
+                let primary_model = self.resolve_model_name();
                 // Crystallized skills go to the global skill directory so the
                 // existing load_skills() call sites pick them up on next reload.
                 let skills_dir = crate::skill::default_global_skills_dir()
@@ -3085,7 +3109,7 @@ impl AgentRuntime {
                             &doc_id,
                             &scope,
                             &providers,
-                            &flash_model,
+                            &primary_model,
                             &skills_dir,
                         )
                         .await
@@ -3389,7 +3413,7 @@ impl AgentRuntime {
         // Snapshot the data the background task needs — agent_loop's stack
         // frame goes away as soon as we return.
         let providers = Arc::clone(&self.providers);
-        let flash_model = self.resolve_flash_model_name();
+        let primary_model = self.resolve_model_name();
         let skills_dir = crate::skill::default_global_skills_dir()
             .unwrap_or_else(|| crate::config::loader::base_dir().join("skills"));
         let user_text = ctx.user_text.clone();
@@ -3410,7 +3434,7 @@ impl AgentRuntime {
                 &metrics,
                 signature,
                 &providers,
-                &flash_model,
+                &primary_model,
                 &skills_dir,
             )
             .await

@@ -174,7 +174,7 @@ fn default_config(lang: &str) -> String {
       {{
         id: "main",
         default: true,
-        model: {{ primary: "anthropic/claude-sonnet-4-6" }},
+        model: {{ primary: "rsclaw/rsclaw-agent-v1" }},
       }},
     ],
   }},

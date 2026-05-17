@@ -485,17 +485,62 @@ impl LlmProvider for RsclawProvider {
 
     fn stream(&self, mut req: LlmRequest) -> BoxFuture<'_, Result<LlmStream>> {
         Box::pin(async move {
-            // Dispatch by endpoint family. fastshot/vision are one-shot
-            // OpenAI-compat chat-completion-chunk endpoints; the primary
-            // sessions endpoint is the stateful kvCacheMode=2 protocol
-            // that the rest of this method implements.
-            if !matches!(req.endpoint, AgentEndpoint::Primary) {
-                return self.stream_oneshot(req).await;
+            // Unified dispatch. Server enforces per-route model whitelists
+            // (400 model_slot_mismatch on violations), so canonical model
+            // names take priority over endpoint variants. The endpoint
+            // variant only matters when the model name is non-canonical.
+            //
+            // Precedence:
+            //   1. model rsclaw-flash-*                            → /fastshot
+            //   2. model rsclaw-vision-*                           → /vision
+            //   3. model rsclaw-agent-* + session_key=None         → /oneshot (stateless agent call)
+            //   4. model rsclaw-agent-* + session_key=Some         → /sessions (kvCacheMode=2 enforced)
+            //   5. non-canonical model + endpoint=Flash            → /fastshot (server may 400)
+            //   6. non-canonical model + endpoint=Vision           → /vision (server may 400)
+            //   7. Primary + session_key=Some                      → /sessions
+            //   8. Primary + session_key=None                      → /oneshot
+            //
+            // Trailing-dash on prefixes prevents collisions with
+            // hypothetical names like `rsclaw-flashy`.
+            let bare_model = req.model.strip_prefix("rsclaw/").unwrap_or(&req.model);
+            let is_flash_model = bare_model.starts_with("rsclaw-flash-");
+            let is_vision_model = bare_model.starts_with("rsclaw-vision-");
+            let is_agent_model = bare_model.starts_with("rsclaw-agent-");
+
+            // Rules 1–3: canonical model name decides the route.
+            if is_flash_model {
+                return self.stream_oneshot(req, "/fastshot").await;
             }
+            if is_vision_model {
+                return self.stream_oneshot(req, "/vision").await;
+            }
+            if is_agent_model && req.session_key.is_none() {
+                return self.stream_oneshot(req, "/oneshot").await;
+            }
+
+            // Rules 5–6: non-canonical model — honor endpoint variant hint.
+            // Skip these when the model is agent-* (rule 4 handled in
+            // session path below).
+            if !is_agent_model {
+                if matches!(req.endpoint, AgentEndpoint::Flash) {
+                    return self.stream_oneshot(req, "/fastshot").await;
+                }
+                if matches!(req.endpoint, AgentEndpoint::Vision) {
+                    return self.stream_oneshot(req, "/vision").await;
+                }
+            }
+
+            // Rule 8: stateless primary → /oneshot.
+            if req.session_key.is_none() {
+                return self.stream_oneshot(req, "/oneshot").await;
+            }
+
+            // Rules 4/7: session-mode primary → /sessions, kvCacheMode=2
+            // required (agent-* models live here in the typical case).
             if req.kv_cache_mode != 2 {
                 anyhow::bail!(
-                    "rsclaw provider only handles kv_cache_mode=2 (got {}); \
-                     route mode 0/1 traffic through openai/anthropic providers",
+                    "rsclaw session-mode call requires kv_cache_mode=2 (got {}); \
+                     pass session_key=None to route to /oneshot instead",
                     req.kv_cache_mode
                 );
             }
@@ -1111,42 +1156,31 @@ impl RsclawProvider {
             .context("rsclaw compact: parse response")
     }
 
-    /// Dispatch a one-shot request to `/fastshot` or `/vision`.
+    /// Dispatch a one-shot stateless request to `/fastshot`, `/vision`,
+    /// or `/oneshot`. Route selection is made by the unified dispatcher
+    /// in `stream()`; this method just sends the bytes.
     ///
-    /// Wire shape per protocol spec (see `docs/adr` notes 2026-05-15):
+    /// Wire shape (identical across all three paths — only `/vision`
+    /// adds the `images: [...]` array; see protocol spec
+    /// `docs/adr` notes 2026-05-15):
     ///
     /// ```text
-    /// POST {base_url}/fastshot
+    /// POST {base_url}/{fastshot|vision|oneshot}
     /// {
     ///   "prompt": "...",
     ///   "max_tokens": N,
     ///   "options": { "temperature": 0.7 },
     ///   "stream": true,
-    ///   "model": "rsclaw-fast-v1"
+    ///   "model": "rsclaw-flash-v1"
     /// }
     /// ```
     ///
-    /// `/vision` adds an `images: [...]` array (base64 data URLs or
-    /// remote URLs). The response is OAI chat.completion.chunk SSE
-    /// (when `stream: true`) or a one-shot chat.completion JSON. We
-    /// always stream — the agent's stream consumer collapses to a
-    /// single `Done` event for non-streaming callers.
-    ///
-    /// Reuses the OpenAI SSE chunk parser since the response shape
-    /// is byte-for-byte identical.
-    async fn stream_oneshot(&self, req: LlmRequest) -> Result<LlmStream> {
+    /// Response is OAI chat.completion.chunk SSE. We always stream —
+    /// the agent's stream consumer collapses to a single `Done` event
+    /// for non-streaming callers. Reuses the OpenAI SSE chunk parser
+    /// since the response shape is byte-for-byte identical.
+    async fn stream_oneshot(&self, req: LlmRequest, path: &'static str) -> Result<LlmStream> {
         use futures::StreamExt;
-
-        let path = match req.endpoint {
-            AgentEndpoint::Flash => "/fastshot",
-            AgentEndpoint::Vision => "/vision",
-            // unreachable in practice — caller already filtered out
-            // AgentEndpoint::Primary in stream(); guard anyway for
-            // future variants.
-            AgentEndpoint::Primary => {
-                anyhow::bail!("rsclaw stream_oneshot called with Primary endpoint");
-            }
-        };
 
         let prompt = flatten_prompt_for_oneshot(&req);
         if prompt.trim().is_empty() {
@@ -1160,13 +1194,14 @@ impl RsclawProvider {
             body.insert("max_tokens".to_owned(), Value::from(mt));
         }
         // Strip the rsclaw/ namespace prefix so the server records the
-        // bare model id in its response. The model field is documented
-        // as "response only" on the server side — we send it for
-        // logging symmetry with the chat.completion.model echo.
+        // bare model id in its response. The model field is REQUIRED on
+        // /v1/agent/* — server returns 400 model_slot_mismatch if it
+        // doesn't match the route's whitelisted slot.
         let bare_model = req.model.strip_prefix("rsclaw/").unwrap_or(&req.model);
-        if !bare_model.is_empty() {
-            body.insert("model".to_owned(), Value::String(bare_model.to_owned()));
+        if bare_model.is_empty() {
+            anyhow::bail!("rsclaw {path}: model field is required");
         }
+        body.insert("model".to_owned(), Value::String(bare_model.to_owned()));
         let mut options = serde_json::Map::new();
         if let Some(t) = req.temperature {
             options.insert("temperature".to_owned(), super::json_f32(t));
@@ -1174,7 +1209,7 @@ impl RsclawProvider {
         if !options.is_empty() {
             body.insert("options".to_owned(), Value::Object(options));
         }
-        if matches!(req.endpoint, AgentEndpoint::Vision) {
+        if path == "/vision" {
             let images = extract_images_for_oneshot(&req);
             if images.is_empty() {
                 anyhow::bail!("rsclaw /vision: request has no image content");

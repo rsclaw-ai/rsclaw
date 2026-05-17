@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use super::context_mgr::{compress_tool_results, estimate_tokens, msg_tokens};
 use super::runtime::AgentRuntime;
 use crate::provider::{
-    ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent,
+    AgentEndpoint, ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent,
 };
 
 /// Prefix for compaction summaries. Tells the LLM that the summary is
@@ -977,7 +977,7 @@ impl AgentRuntime {
             max_tokens: Some(4096),
             temperature: None,
             frequency_penalty: None,
-            thinking_budget: None, endpoint: Default::default(), kv_cache_mode: 0, session_key: None,
+            thinking_budget: None, endpoint: AgentEndpoint::Flash, kv_cache_mode: 0, session_key: None,
             system_shared: None, user_system: None,
         };
 
@@ -1045,7 +1045,7 @@ impl AgentRuntime {
             max_tokens: Some(1024),
             temperature: None,
             frequency_penalty: None,
-            thinking_budget: None, endpoint: Default::default(), kv_cache_mode: 0, session_key: None,
+            thinking_budget: None, endpoint: AgentEndpoint::Flash, kv_cache_mode: 0, session_key: None,
             system_shared: None, user_system: None,
         };
 

@@ -11,7 +11,7 @@ use crate::{
     channel::OutboundMessage,
     config::runtime::RuntimeConfig,
     provider::{
-        LlmRequest, Message, MessageContent, Role, StreamEvent,
+        AgentEndpoint, LlmRequest, Message, MessageContent, Role, StreamEvent,
         failover::FailoverManager,
         registry::ProviderRegistry,
     },
@@ -872,7 +872,7 @@ pub(crate) async fn btw_direct_call(
         .model
         .as_ref()
         .and_then(|m| m.primary.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4-6");
+        .unwrap_or("rsclaw/rsclaw-agent-v1");
 
     let system = format!(
         "You are answering a quick side question (/btw). Be concise and direct. \
@@ -891,7 +891,7 @@ pub(crate) async fn btw_direct_call(
         max_tokens: Some(500),
         temperature: None,
         frequency_penalty: None,
-        thinking_budget: None, endpoint: Default::default(), kv_cache_mode: 0, session_key: None,
+        thinking_budget: None, endpoint: AgentEndpoint::Flash, kv_cache_mode: 0, session_key: None,
         system_shared: None, user_system: None,
     };
 

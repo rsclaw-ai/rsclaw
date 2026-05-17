@@ -39,9 +39,9 @@ use crate::store::redb_store::RedbStore;
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GrantScope {
-    /// Just for this single ui_tars run.
+    /// Just for this single vlm_drive run.
     Once,
-    /// All ui_tars runs in this gateway session.
+    /// All vlm_drive runs in this gateway session.
     Session,
     /// Persisted to redb; survives gateway restarts.
     Always,

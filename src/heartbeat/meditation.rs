@@ -167,7 +167,7 @@ pub async fn crystallize_phase(
     store: &Arc<tokio::sync::Mutex<MemoryStore>>,
     scope: &str,
     providers: &Arc<ProviderRegistry>,
-    flash_model: &str,
+    primary_model: &str,
     skills_dir: &std::path::Path,
 ) -> Result<usize> {
     let max_per_cycle = crate::agent::evolution::evolution_config()
@@ -192,7 +192,7 @@ pub async fn crystallize_phase(
             &doc_id,
             scope,
             providers,
-            flash_model,
+            primary_model,
             skills_dir,
         )
         .await

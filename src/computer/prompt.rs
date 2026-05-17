@@ -50,13 +50,13 @@ pub fn build_system_prompt(inputs: &PromptInputs) -> String {
     let _ = inputs.screen_size; // kept for forward compatibility; not in prompt
     out.push_str(
         "## Coordinate Space\n\
-         All `(x, y)` you write inside `start_box` / `end_box` are on a fixed **0-1000 normalized grid**, regardless of the actual screen resolution. Top-left of the screen is `(0, 0)`, centre is `(500, 500)`, bottom-right is `(1000, 1000)`. Use integers in this range; fractions, percentages, or raw screen pixels will be rejected.\n\n",
+         All numbers you write inside `start_box` / `end_box` are on a fixed **0-1000 normalized grid**, regardless of the actual screen resolution. Top-left of the screen is `0, 0`, centre is `500, 500`, bottom-right is `1000, 1000`. Use the form `<box>x, y</box>` for a point, or `<box>x1, y1, x2, y2</box>` for a bounding box (parser collapses to centre). Use integers in this range; fractions, percentages, or raw screen pixels will be rejected.\n\n",
     );
 
     out.push_str("## Output Format\n");
     out.push_str("Every reply MUST be exactly two lines:\n");
     out.push_str("```\nThought: <one-paragraph reasoning grounded in what you see in the screenshot>\nAction: <one call from the Action Space below>\n```\n\n");
-    out.push_str("Do NOT propose calling any tool such as `computer_use`, `ui_tars`, `screenshot`, or `analyze`. Those are wrappers AROUND you — invoking them inside your output is a no-op that wastes a turn. The only valid output is the two-line Thought + Action pair using the Action Space.\n\n");
+    out.push_str("Do NOT propose calling any tool such as `computer_use`, `vlm_drive`, `screenshot`, or `analyze`. Those are wrappers AROUND you — invoking them inside your output is a no-op that wastes a turn. The only valid output is the two-line Thought + Action pair using the Action Space.\n\n");
 
     out.push_str("## Action Space\n");
     for spec in inputs.action_spaces {
@@ -126,7 +126,7 @@ Action: activate_app(app='WeChat')
 
 Example 2 — Click search box to find group:
 Thought: 微信主界面已打开，左侧最上方有搜索框，placeholder 是 \"搜索\"，位置大约屏幕的左上角，约在 (40, 50) 这一带（0-1000 grid 中）。点搜索框比滚动会话列表更快。
-Action: click(start_box='<|box_start|>(40, 50)<|box_end|>')
+Action: click(start_box='<box>40, 50</box>')
 
 Example 3 — Type group name (Chinese):
 Thought: 搜索框已经获得焦点（光标在闪），下一步直接敲群名。中文输入用 type(content='...')，enigo 会原样投递。
@@ -134,7 +134,7 @@ Action: type(content='RsClaw测试群')
 
 Example 4 — Reply with quote, right-click on message bubble:
 Thought: 已经进入研发群，最新一条是 12:03 张三 \"@我 螃蟹有 bug\"，气泡大约在屏幕中间偏上 (400, 300) 附近。\"@我\" 命中关键词，需要引用回复，先右键唤出菜单。
-Action: right_single(start_box='<|box_start|>(400, 300)<|box_end|>')
+Action: right_single(start_box='<box>400, 300</box>')
 
 Example 5 — Wait for context menu after right-click:
 Thought: 刚才 right_single 之后 0.5s 内菜单还没渲染完，直接按 down 可能漏选。先等一下。
@@ -152,7 +152,7 @@ Action: activate_app(app='WeChat')
 
 Example 2 — Click search box to find group:
 Thought: WeChat's main window is up with the search box at the top of the left sidebar, around (40, 50) on the 0-1000 grid. Clicking the search box and typing the group name is faster than scrolling the conversation list.
-Action: click(start_box='<|box_start|>(40, 50)<|box_end|>')
+Action: click(start_box='<box>40, 50</box>')
 
 Example 3 — Type a search query:
 Thought: The search box is focused (cursor visible). Type the group name directly. type(content='...') passes the string through to enigo as-is.
@@ -160,7 +160,7 @@ Action: type(content='RsClaw test group')
 
 Example 4 — Right-click on message bubble:
 Thought: Inside the R&D group, the latest message is 12:03 Zhang San \"@me crab bug\". The bubble sits roughly mid-screen, around (400, 300) on the 0-1000 grid. The \"@me\" mention triggers reply mode — first right-click the bubble to open the context menu.
-Action: right_single(start_box='<|box_start|>(400, 300)<|box_end|>')
+Action: right_single(start_box='<box>400, 300</box>')
 
 Example 5 — Wait for context menu after right-click:
 Thought: Half a second after right_single the menu may still be rendering; pressing down immediately could miss the first item. Wait briefly.
@@ -173,12 +173,12 @@ Action: finished(content='Scanned all visible messages; no new @-mentions for me
 
 const OUTPUT_EXAMPLE_ZH: &str = "\
 Thought: 这里写中文思考，按上面的 Thought Examples 风格 …
-Action: click(start_box='<|box_start|>(120, 90)<|box_end|>')
+Action: click(start_box='<box>120, 90</box>')
 ";
 
 const OUTPUT_EXAMPLE_EN: &str = "\
 Thought: Write your English thought here, following the style of the Thought Examples above ...
-Action: click(start_box='<|box_start|>(120, 90)<|box_end|>')
+Action: click(start_box='<box>120, 90</box>')
 ";
 
 /// True if the string contains any common CJK / Hiragana / Katakana

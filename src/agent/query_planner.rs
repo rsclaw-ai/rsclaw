@@ -27,7 +27,7 @@ use anyhow::{Result, anyhow};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use crate::provider::{LlmRequest, Message, MessageContent, Role};
+use crate::provider::{AgentEndpoint, LlmRequest, Message, MessageContent, Role};
 use crate::provider::registry::ProviderRegistry;
 
 /// A single planned sub-query with its recognized intent.
@@ -396,7 +396,7 @@ async fn try_plan(
         temperature: Some(0.0),
         frequency_penalty: None,
         thinking_budget: None,
-        endpoint: Default::default(),
+        endpoint: AgentEndpoint::Flash,
         kv_cache_mode: 0,
         session_key: None,
         system_shared: None,

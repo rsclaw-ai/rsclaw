@@ -479,7 +479,7 @@ pub struct ModelConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flash: Option<String>,
     /// Vision model used by the GUI agent (`computer_use`) — must support
-    /// image inputs. Resolution chain when ui_tars / VlmDriver runs:
+    /// image inputs. Resolution chain when vlm_drive / VlmDriver runs:
     ///   1. per-agent `model.vision`
     ///   2. `agents.defaults.model.vision`
     ///   3. per-agent `model.primary`  ← fallback (assumes primary handles vision)

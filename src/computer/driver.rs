@@ -42,7 +42,8 @@ use super::prompt::{PromptInputs, build_system_prompt};
 use super::status::ComputerUseStatus;
 
 use crate::provider::{
-    ContentPart, LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
+    AgentEndpoint, ContentPart, LlmProvider, LlmRequest, Message, MessageContent, Role,
+    StreamEvent,
 };
 
 // ---------------------------------------------------------------------------
@@ -112,7 +113,7 @@ pub struct VlmDriver<'a> {
         Option<Arc<dyn Fn(ComputerUseStatus) + Send + Sync + 'a>>,
     /// Stable identifier for this run, included in every emitted status
     /// event so the UI can correlate them. Caller-minted (typically
-    /// `ui_tars-<uuid>`).
+    /// `vlm_drive-<uuid>`).
     pub run_id: String,
 }
 
@@ -230,7 +231,7 @@ impl VlmDriver<'_> {
                 temperature: Some(0.0),
                 frequency_penalty: None,
                 thinking_budget: None,
-                endpoint: Default::default(),
+                endpoint: AgentEndpoint::Vision,
                 kv_cache_mode: 0,
                 session_key: None,
                 system_shared: None,

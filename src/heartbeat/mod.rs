@@ -435,26 +435,11 @@ impl HeartbeatRunner {
                     return Ok(());
                 }
             };
-            let flash_model = crate::agent::runtime::resolve_flash_model_for(
+            let primary_model = crate::agent::runtime::resolve_primary_model_for(
                 &handle.config,
                 &deps.config.agents.defaults,
             )
-            .unwrap_or_else(|| {
-                handle
-                    .config
-                    .model
-                    .as_ref()
-                    .and_then(|m| m.primary.clone())
-                    .or_else(|| {
-                        deps.config
-                            .agents
-                            .defaults
-                            .model
-                            .as_ref()
-                            .and_then(|m| m.primary.clone())
-                    })
-                    .unwrap_or_else(|| "anthropic/claude-sonnet-4-6".to_owned())
-            });
+            .unwrap_or_else(|| "rsclaw/rsclaw-agent-v1".to_owned());
             let skills_dir = crate::skill::default_global_skills_dir()
                 .unwrap_or_else(|| crate::config::loader::base_dir().join("skills"));
 
@@ -462,7 +447,7 @@ impl HeartbeatRunner {
                 mem,
                 &scope,
                 &handle.providers,
-                &flash_model,
+                &primary_model,
                 &skills_dir,
             )
             .await

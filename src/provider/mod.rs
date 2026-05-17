@@ -225,14 +225,33 @@ pub enum AgentEndpoint {
     /// `/v1/agent/sessions/*` — main agent conversation traffic.
     #[default]
     Primary,
-    /// `/v1/agent/fastshot/*` — auxiliary cheap-and-fast calls
-    /// (compression, query rewrite, side queries). Worker pool runs
-    /// a smaller model and never overlaps with `Primary` slots.
+    /// `/v1/agent/fastshot/*` — fastshot worker pool. Auto-selected
+    /// when caller sets this variant OR `model` matches the prefix
+    /// `rsclaw/rsclaw-flash-*` (e.g. `rsclaw-flash-v1`).
     Flash,
     /// `/v1/agent/vision/*` — VL grounding (image description,
-    /// computer_use screenshot reasoning).
+    /// computer_use screenshot reasoning). Auto-selected when
+    /// caller sets this variant OR `model` matches the prefix
+    /// `rsclaw/rsclaw-vision-*`.
     Vision,
 }
+
+// Routing rule on the rsclaw provider (single source of truth).
+// Server enforces per-route model whitelists with 400 model_slot_mismatch
+// on violations, so canonical model names take priority over the endpoint
+// variant. The endpoint variant is only consulted for non-canonical models.
+//
+//   1. model rsclaw/rsclaw-flash-*                          → /v1/agent/fastshot
+//   2. model rsclaw/rsclaw-vision-*                         → /v1/agent/vision
+//   3. model rsclaw/rsclaw-agent-* + session_key=None       → /v1/agent/oneshot   (stateless agent call)
+//   4. model rsclaw/rsclaw-agent-* + session_key=Some       → /v1/agent/sessions  (kvCacheMode=2)
+//   5. non-canonical model + endpoint=Flash                  → /v1/agent/fastshot  (server may 400)
+//   6. non-canonical model + endpoint=Vision                 → /v1/agent/vision    (server may 400)
+//   7. endpoint=Primary + session_key=Some                   → /v1/agent/sessions  (kvCacheMode=2)
+//   8. endpoint=Primary + session_key=None                   → /v1/agent/oneshot
+//
+// Non-rsclaw providers (OpenAI/Anthropic/Gemini/…) ignore `endpoint` and
+// route purely by `model`.
 
 /// Full request to an LLM provider.
 #[derive(Debug, Clone, Default)]

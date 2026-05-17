@@ -102,20 +102,20 @@ pub async fn crystallize_workflow(
     metrics: &TurnMetrics,
     signature: u64,
     providers: &Arc<ProviderRegistry>,
-    flash_model: &str,
+    primary_model: &str,
     skills_dir: &Path,
 ) -> Result<Option<PathBuf>> {
     if !crate::agent::evolution::evolution_config().enabled {
         return Ok(None);
     }
-    if flash_model.is_empty() {
-        tracing::debug!("workflow distill: no flash model resolved, skipping");
+    if primary_model.is_empty() {
+        tracing::debug!("workflow distill: no primary model resolved, skipping");
         return Ok(None);
     }
 
     let prompt = build_workflow_prompt(user_text, reply_text, metrics);
 
-    let (provider_name, model_id) = providers.resolve_model(flash_model);
+    let (provider_name, model_id) = providers.resolve_model(primary_model);
     let provider_arc = match providers.get(provider_name) {
         Ok(p) => p,
         Err(e) => {

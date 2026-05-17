@@ -109,7 +109,7 @@ pub struct AppState {
         broadcast::Sender<crate::computer::status::ComputerUseStatus>,
     /// Live registry of in-flight `computer_use` runs.
     /// Maps `run_id` -> the driver's abort flag. Inserted when
-    /// `tool_ui_tars` mints a run and removed on driver exit. The
+    /// `tool_vlm_drive` mints a run and removed on driver exit. The
     /// `POST /computer-use/runs/{run_id}/abort` HTTP endpoint sets the
     /// flag; the driver's loop checks it between steps and exits with
     /// `DriverOutcome::UserAbort` -> `Finished { outcome_kind: "user_abort" }`,

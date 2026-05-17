@@ -1121,7 +1121,7 @@ fn spawn_agent_tasks(
         runtime.wasm_plugins = Arc::clone(&wasm_plugins);
 
         // Share the computer_use permission store + broadcast channel
-        // so `tool_ui_tars` can register pending requests that the WS
+        // so `tool_vlm_drive` can register pending requests that the WS
         // handler can resolve.
         runtime.computer_permission = Some(Arc::clone(&computer_permission));
         runtime.computer_permission_tx = Some(computer_permission_tx.clone());
